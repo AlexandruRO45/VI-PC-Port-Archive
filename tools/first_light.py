@@ -1,11 +1,11 @@
-"""First light: draw one real game model with its own translated vertex and pixel shaders.
+"""First light: draw an exported game model with a selected pair of translated game shaders.
 
 This assembles the smallest end-to-end path from the user's package to a Vulkan image: carve the game's
 `shaders.rpf`, translate one real VS/PS pair with the repository's translator, convert one exported model to the
 mesh the GPU harness reads, and run it on the device. Nothing is written outside `--work`, and no game data is
 committed: the tool is the recipe, the user's copy is the input.
 
-The default pair is a vertex shader that forwards POSITION and TEXCOORD to clip space and a pixel shader that
+Without a DDS texture, the vertex shader forwards clip-space POSITION and TEXCOORD. The default pixel shader
 writes the interpolated TEXCOORD, so the first image is the model's own UV map. Both are ordinary game shaders;
 `--vs` and `--ps` take other names from the carve index.
 
@@ -253,9 +253,16 @@ def read_obj(
                 if len(p) < 3:
                     raise SystemExit(f"{path}: short texture-coordinate line: {line.strip()!r}")
                 try:
-                    uvs.append(tuple(float(x) for x in p[1:3]))
+                    u, v = map(float, p[1:3])
                 except ValueError:
                     raise SystemExit(f"{path}: invalid texture coordinates: {line.strip()!r}") from None
+                if not (math.isfinite(u) and math.isfinite(v)):
+                    raise SystemExit(f"{path}: non-finite texture coordinates: {line.strip()!r}")
+                try:
+                    struct.pack("<2f", u, v)  # Validate the mesh encoding before opening the output.
+                except OverflowError:
+                    raise SystemExit(f"{path}: texture coordinates exceed the binary32 range: {line.strip()!r}") from None
+                uvs.append((u, v))
             elif p[0] == "f":
                 face = []
                 for word in p[1:]:
@@ -711,6 +718,12 @@ def uv_at(vertices, indices, px: int, py: int, width: int, height: int):
             q = (weights[0] / a[5], weights[1] / b[5], weights[2] / c[5])
             weights = tuple(w / sum(q) for w in q)
         if weights:
+            if not (0 <= a[2] <= 1 and 0 <= b[2] <= 1 and 0 <= c[2] <= 1):
+                # The passthrough VS has w=1. Use the float32 depths written to mesh.bin.
+                za, zb, zc = struct.unpack("<3f", struct.pack("<3f", a[2], b[2], c[2]))
+                z = za + weights[1] * (zb - za) + weights[2] * (zc - za)
+                if not 0 <= z <= 1:
+                    continue
             found = (
                 weights[0] * a[3] + weights[1] * b[3] + weights[2] * c[3],
                 weights[0] * a[4] + weights[1] * b[4] + weights[2] * c[4],
@@ -891,7 +904,22 @@ def check_image(data: bytes, manifest: dict) -> dict:
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
+    def check_rgba_shape(values: object, field: str) -> None:
+        if not isinstance(values, (list, tuple)) or len(values) != 4:
+            raise AssertionError(f"{field} must contain exactly four RGBA values")
+
     width, height = manifest["width"], manifest["height"]
+
+    def pixel_offset(point, field: str) -> int:
+        if (
+            not isinstance(point, (list, tuple)) or len(point) != 2
+            or any(type(coord) is not int for coord in point)
+            or not (0 <= point[0] < width and 0 <= point[1] < height)
+        ):
+            raise AssertionError(f"invalid {field} coordinates {point!r} for {width}x{height} image")
+        x, y = point
+        return (y * width + x) * 4
+
     if len(data) != width * height * 16:
         raise AssertionError(
             f"raw is {len(data)} bytes, expected {width * height * 16}"
@@ -924,7 +952,7 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"[{manifest.get('min_coverage', 0.0)}, {manifest.get('max_coverage', 1.0)}]"
         )
     if (clear := manifest.get("clear_pixel")) is not None:
-        i = (clear[1] * width + clear[0]) * 4
+        i = pixel_offset(clear, "clear_pixel")
         if any(not _close(pixels[i + c], clear_val, 1e-5) for c in range(4)):
             raise AssertionError(
                 f"clear pixel {clear} is {pixels[i : i + 4]}, expected {clear_val}"
@@ -944,18 +972,20 @@ def check_image(data: bytes, manifest: dict) -> dict:
             raise AssertionError(
                 f"textured manifest has no expected colour distinguishable from fallback {FALLBACK_RGBA} (tol {tol})"
             )
+    centre = manifest.get("centre_pixel")
+    if centre is None or centre == []:
+        centre = [width // 2, height // 2]
     if (rgba := manifest.get("centre_rgba")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+        i = pixel_offset(centre, "centre_pixel")
         tol = manifest.get("rgba_tolerance", 0.02)
+        check_rgba_shape(rgba, "centre_rgba")
         for c, want in enumerate(rgba):
             if not _close(pixels[i + c], want, tol):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {rgba} (tol {tol})"
                 )
     elif (uv := manifest.get("centre_uv")) is not None:
-        centre = manifest.get("centre_pixel") or [width // 2, height // 2]
-        i = (centre[1] * width + centre[0]) * 4
+        i = pixel_offset(centre, "centre_pixel")
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
             if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
@@ -964,24 +994,27 @@ def check_image(data: bytes, manifest: dict) -> dict:
     if (rgba_probes := manifest.get("rgba_probes")) is not None:
         tol = manifest.get("rgba_tolerance", 0.02)
         for probe in rgba_probes:
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
+            i = pixel_offset(probe.get("pixel"), "rgba_probes pixel")
             want_rgba = probe["rgba"]
+            check_rgba_shape(want_rgba, "rgba_probes[].rgba")
             for c, want in enumerate(want_rgba):
                 if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
-    else:
-        for probe in manifest.get("uv_probes", []):
-            px, py = probe["pixel"]
-            i = (py * width + px) * 4
-            u, v = probe["uv"]
-            for c, want in enumerate((u, v, 0.0, 1.0)):
-                if not _close(pixels[i + c], want, 2e-3):
-                    raise AssertionError(
-                        f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
-                    )
+    uv_probes = manifest.get("uv_probes")
+    if uv_probes is None:
+        uv_probes = []
+    for probe in uv_probes:
+        i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
+        if rgba_probes is not None:
+            continue
+        u, v = probe["uv"]
+        for c, want in enumerate((u, v, 0.0, 1.0)):
+            if not _close(pixels[i + c], want, 2e-3):
+                raise AssertionError(
+                    f"UV probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want} at {c}"
+                )
     undecided = 0
     if (want := manifest.get("colour")) is not None:
         # A constant-colour draw: the shape must match the CPU's prediction, and every covered pixel must carry
@@ -1024,10 +1057,8 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         raise SystemExit("first-light draw requires an OBJ with faces. Prepare this output with --obj before drawing.")
     harness = find_harness(args.harness)
     raw = os.path.join(out_dir, "image.raw")
-    if os.path.exists(raw):
-        os.unlink(
-            raw
-        )  # a harness that exits 0 without writing must not pass on a stale file
+    ppm = os.path.join(out_dir, "image.ppm")
+    manifest_path = os.path.join(out_dir, "manifest.json")
     env = harness_env(manifest, out_dir)
     cmd = [
         harness,
@@ -1037,6 +1068,14 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         str(manifest["width"]),
         str(manifest["height"]),
     ]
+    # A new draw must not reuse an old readback or leave an old success report on failure.
+    for path in (raw, ppm):
+        if os.path.exists(path):
+            os.unlink(path)
+    if "result" in manifest:
+        del manifest["result"]
+        with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f, indent=1)
     subprocess.run(cmd, check=True, env=env)
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
@@ -1046,7 +1085,6 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         result = check_image(data, manifest)
     except AssertionError as e:
         raise SystemExit(str(e)) from e
-    ppm = os.path.join(out_dir, "image.ppm")
     write_ppm(ppm, result["pixels"], manifest["width"], manifest["height"])
     print(
         f"covered {result['covered']}/{manifest['width'] * manifest['height']} "
@@ -1059,7 +1097,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
-    with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+    with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(manifest, f, indent=1)
     return result
 
@@ -1107,7 +1145,7 @@ def load_json(
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Draw one real game model with its own translated VS/PS."
+        description="Draw an exported model with translated game shaders. Display its UVs or supply a texture with --dds."
     )
     ap.add_argument("--game", help="the package folder")
     ap.add_argument("--obj", help="an OBJ exported by rpf9dump models")

@@ -1,9 +1,9 @@
-# First light: a game model's UVs drawn with translated game shaders
+# Drawing model UVs and textures with First Light
 
 **Status: measured** on the 1.0.2.1 package and an NVIDIA RTX 2060 SUPER (driver 620.73.04, Vulkan 1.4.357,
-CachyOS). The fixture draws a model from the package with a vertex and pixel shader chosen to display its UVs. The image
-stays in the user's work folder; this note records the counts and the recipe, not the model, the shaders or a
-screenshot.
+CachyOS). The untextured fixture draws a model from the package with a shader pair chosen to display its UVs.
+With `--dds`, the default pixel shader samples the supplied texture at those UVs. Section 6 gives the textured
+draw recipe. The image stays in the user's work folder.
 
 ## 1. What was drawn
 
@@ -14,7 +14,7 @@ those counts and has SHA-256
 assembles it, `tools/first_light.py`, centres and fits X/Y to NDC and flattens Z (the chosen VS applies no
 matrix), so the draw is an orthographic projection of the model's own geometry.
 
-The shaders are two ordinary containers from `shaders.rpf`, carved and translated by the repository's own tools:
+The untextured fixture uses two containers from `shaders.rpf`, carved and translated by the repository's tools.
 
 | stage | FSSM SHA-256 | what it does |
 |---|---|---|
@@ -25,7 +25,7 @@ The model's authored shader assignment can be checked separately. In the model e
 above, `MeshShaders[0]` selects material slot 0, the only slot. Looking up its `Materials[0].Shader` in the
 native shader database yields one effect with one technique and four compute-only passes. The VS and PS
 in the table are the fixture's chosen pair. The model's use during gameplay remains unverified.
-See the [effect lookup](https://github.com/ItsNotRexed/Leonida/pull/3036) and the
+See the [effect lookup tool](../tools/sgd5_effects.py) and the
 [Windows reproduction of the UV draw](https://github.com/ItsNotRexed/Leonida/pull/2893#issuecomment-7084947193).
 
 Both disassemble with no invalid word, translate, and pass `spirv-val`; `tools/shader_link_check.py check` reports
@@ -86,6 +86,9 @@ Each run stages its pair in `<work>/first_light/dxbc` and translates it into `<w
 are removed at the start of a run, so they hold that run's two shaders and nothing an earlier run selected; do not
 keep files there. The output folder (`first_light/out` or `--out`) and `<work>/shaders` are not emptied. If either
 folder is a symlink or a junction, or a file in it cannot be removed, the run stops and names it.
+With `--keep-z` or `--no-fit`, a triangle can cross the near or far clip plane. For the
+passthrough VS, the CPU predicts a UV only where the interpolated depth is between 0 and 1,
+inclusive. If several triangles cover a probe there, the last one drawn supplies its UV.
 
 ## 4. The harness mode
 
@@ -139,9 +142,10 @@ The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bili
 `centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
 magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
 (driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
-`python -I tests/test_first_light.py -v` runs **14 tests: 11 passed, 3 skipped** (the 3 package-gated
-`FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`; the 4 `OracleTests` and 7 `TexturedOracleTests` run without a
-package). With `LEONIDA_FIRST_LIGHT_DIR` set against a local package run, all **14/14** tests pass.
+`python -I tests/test_first_light.py -v` runs **19 tests: 15 passed, 4 skipped** (the 3 package-gated
+`FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`, and `test_harness_rejects_wrapped_tsharp_va_overflow` needs a
+built `vk_harness`; the 4 `OracleTests` and the other 6 `TexturedOracleTests` run without a package). With
+`LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 19 is skipped.
 
 ```sh
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \

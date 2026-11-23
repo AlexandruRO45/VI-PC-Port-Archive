@@ -71,6 +71,36 @@ class MeshOutputTests(unittest.TestCase):
         self.assertEqual(encoded[-12:], struct.pack("<3I", 0, 1, 2))
 
 
+class ProbeDepthTests(unittest.TestCase):
+    @staticmethod
+    def triangle(depths, uv):
+        return [(x, y, z, *uv) for (x, y), z in zip(((-1, -1), (1, -1), (-1, 1)), depths)]
+
+    def test_only_visible_fragments_replace_an_earlier_triangle(self):
+        first, last = (0.125, 0.75), (0.75, 0.125)
+        back = self.triangle((0.25,) * 3, first)
+        for depths, left, right in (
+            ((-1, -1, -1), first, first),
+            ((2, 2, 2), first, first),
+            ((-1, 1, -1), first, last),
+            ((2, 0, 2), first, last),
+            ((0, 0, 0), last, last),
+            ((1, 1, 1), last, last),
+            ((1 + 2**-25,) * 3, last, last),  # Stored as exactly 1 in mesh.bin.
+        ):
+            with self.subTest(depths=depths):
+                vertices = back + self.triangle(depths, last)
+                self.assertEqual(fl.uv_at(vertices, range(6), 0, 0, 8, 8), left)
+                self.assertEqual(fl.uv_at(vertices, range(6), 5, 0, 8, 8), right)
+
+    def test_clipped_region_can_be_clear_and_supplies_no_uv_probes(self):
+        vertices = self.triangle((-1, 1, -1), (0.75, 0.125))
+        self.assertEqual(fl.clear_pixel(vertices, range(3), 8, 8), [0, 0])
+        probes = fl.uv_probes(vertices, range(3), 8, 8)
+        self.assertTrue(probes)
+        self.assertTrue(all(p["pixel"][0] >= 4 for p in probes), probes)
+
+
 class FirstLightTests(unittest.TestCase):
     def setUp(self):
         self.out = os.environ.get("LEONIDA_FIRST_LIGHT_DIR")
@@ -145,6 +175,52 @@ class FirstLightTests(unittest.TestCase):
             self.assertTrue(
                 os.path.isfile(os.path.join(self.out, self.manifest["files"][key]))
             )
+
+
+class DrawOutputTests(unittest.TestCase):
+    def test_failed_recheck_clears_previous_preview_and_result(self) -> None:
+        manifest = {
+            "width": 2,
+            "height": 1,
+            "min_coverage": 0.5,
+            "max_coverage": 0.99,
+            "files": {"mesh": "mesh.bin"},
+        }
+        first = struct.pack("<8f", 1, 0, 0, 1, 0, 0, 0, 0)
+        blank = bytes(32)
+        retry = struct.pack("<8f", 0, 1, 0, 1, 0, 0, 0, 0)
+        frames = iter((first, blank, retry))
+
+        def write_readback(cmd: list[str], *, check: bool, env: dict[str, str]) -> None:
+            Path(cmd[3]).write_bytes(next(frames))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            manifest_path = out / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            ppm = out / "image.ppm"
+            argv = ["--out", tmp, "--check"]
+            with (
+                patch.object(fl, "find_harness", return_value="stub.exe"),
+                patch.object(fl.subprocess, "run", side_effect=write_readback),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(fl.main(argv), 0)
+                self.assertEqual(ppm.read_bytes(), b"P6\n2 1\n255\n\xff\0\0\0\0\0")
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["result"]["ratio"], 0.5)
+
+                with self.assertRaisesRegex(SystemExit, "coverage 0.0000 outside"):
+                    fl.main(argv)
+                self.assertEqual((out / "image.raw").read_bytes(), blank)
+                self.assertFalse(ppm.exists())
+                self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
+
+                self.assertEqual(fl.main(argv), 0)
+                self.assertEqual((out / "image.raw").read_bytes(), retry)
+                self.assertEqual(ppm.read_bytes(), b"P6\n2 1\n255\n\0\xff\0\0\0\0")
+                saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved["result"]["ratio"], 0.5)
 
 
 class PpmTests(unittest.TestCase):
@@ -903,6 +979,91 @@ class CameraTests(unittest.TestCase):
                     os.environ[k] = v
 
 
+class ProbeCoordinateTests(unittest.TestCase):
+    rgba = (0.25, 0.75, 0.0, 1.0)
+    image = struct.pack("<16f", *([CLEAR] * 8 + list(rgba) * 2))
+
+    def setUp(self):
+        self.manifest = {"width": 2, "height": 2, "min_coverage": 0.5, "max_coverage": 0.5}
+
+    def test_rejects_invalid_coordinates_in_every_probe_path(self):
+        for point in ([-1, 1], [-1, 0], [2, 0], [0, 2], [0, -1], {}, [0], [True, 1], [0, 1.0]):
+            probes = (
+                ("clear_pixel", {"clear_pixel": point}),
+                ("centre_pixel", {"centre_pixel": point, "centre_uv": self.rgba[:2]}),
+                ("centre_pixel", {"centre_pixel": point, "centre_rgba": self.rgba}),
+                ("uv_probes", {"uv_probes": [{"pixel": point, "uv": self.rgba[:2]}]}),
+                ("rgba_probes", {"rgba_probes": [{"pixel": point, "rgba": self.rgba}]}),
+            )
+            for field, probe in probes:
+                with self.subTest(point=point, probe=probe):
+                    with self.assertRaisesRegex(AssertionError, f"invalid {field}.*coordinates"):
+                        check_image(self.image, self.manifest | probe)
+
+    def test_accepts_edges_and_optional_probes(self):
+        for probe in (
+            {},
+            {"clear_pixel": None, "centre_pixel": None, "centre_uv": self.rgba[:2]},
+            {"centre_uv": self.rgba[:2]},
+            {
+                "clear_pixel": [1, 0],
+                "centre_pixel": [0, 1],
+                "centre_uv": self.rgba[:2],
+                "uv_probes": [{"pixel": [1, 1], "uv": self.rgba[:2]}],
+            },
+            {
+                "centre_pixel": [1, 1],
+                "centre_rgba": self.rgba,
+                "centre_uv": [0.0, 0.0],
+                "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+                "uv_probes": [{"pixel": [1, 1], "uv": [0.0, 0.0]}],
+            },
+        ):
+            with self.subTest(probe=probe):
+                self.assertEqual(check_image(self.image, self.manifest | probe)["covered"], 2)
+
+    def test_empty_centre_pixel_uses_the_image_centre(self):
+        for key, expected in (("centre_uv", self.rgba[:2]), ("centre_rgba", self.rgba)):
+            with self.subTest(key=key):
+                manifest = self.manifest | {"centre_pixel": [], key: expected}
+                self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+
+    def test_rgba_probes_still_reject_invalid_uv_coordinates(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": [{"pixel": [99, -5]}],
+        }
+        with self.assertRaisesRegex(AssertionError, r"invalid uv_probes pixel coordinates \[99, -5\]"):
+            check_image(self.image, manifest)
+
+    def test_null_uv_probes_are_optional_with_rgba(self):
+        manifest = self.manifest | {
+            "rgba_probes": [{"pixel": [0, 1], "rgba": self.rgba}],
+            "uv_probes": None,
+        }
+        self.assertEqual(check_image(self.image, manifest)["covered"], 2)
+        with self.assertRaises(TypeError):
+            check_image(self.image, manifest | {"uv_probes": False})
+
+    def test_check_reports_invalid_coordinates(self):
+        def draw(command, **kwargs):
+            Path(command[3]).write_bytes(self.image)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            manifest = self.manifest | {
+                "files": {"mesh": "mesh.bin"},
+                "centre_uv": self.rgba[:2],
+                "centre_pixel": [2, 0],
+            }
+            (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            with (patch.object(fl, "find_harness", return_value="vk_harness"),
+                  patch.object(fl.subprocess, "run", side_effect=draw),
+                  self.assertRaisesRegex(SystemExit, r"invalid centre_pixel coordinates \[2, 0\] for 2x2 image")):
+                fl.main(["--check", "--out", tmp])
+            self.assertFalse((out / "image.ppm").exists())
+
+
 class ReadObjTests(unittest.TestCase):
     """Wavefront OBJ parsing in tools/first_light.py without a GPU or game package."""
 
@@ -913,6 +1074,33 @@ class ReadObjTests(unittest.TestCase):
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         return path
+
+    def test_requires_finite_texture_coordinates(self):
+        def triangle(u, v):
+            return self._write_obj(
+                "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                f"vt {u} {v}\n"
+                "f 1/1 2/1 3/1\n"
+            )
+
+        vertices, indices = fl.read_obj(triangle("-0.25", "1.5"))
+        self.assertEqual(indices, [0, 1, 2])
+        self.assertEqual([vertex[3:] for vertex in vertices], [(-0.25, 1.5)] * 3)
+        for u, v in (("nan", "0.75"), ("0.25", "inf"), ("-inf", "0.75"), ("0.25", "1e999")):
+            with self.subTest(u=u, v=v):
+                with self.assertRaisesRegex(SystemExit, "non-finite texture coordinates"):
+                    fl.read_obj(triangle(u, v))
+
+        large_finite = triangle("1e38", "-1e38")
+        mesh = Path(large_finite).with_suffix(".bin")
+        fl.write_mesh(str(mesh), *fl.read_obj(large_finite))
+        previous = mesh.read_bytes()
+        self.assertEqual(len(previous), 80)
+        for u, v in (("1e39", "0.75"), ("0.25", "-1e39")):
+            with self.subTest(u=u, v=v):
+                with self.assertRaisesRegex(SystemExit, "texture coordinates exceed the binary32 range"):
+                    fl.write_mesh(str(mesh), *fl.read_obj(triangle(u, v)))
+                self.assertEqual(mesh.read_bytes(), previous)
 
     def test_negative_relative_indices_inline_comments_and_continuations(self):
         positive = self._write_obj(
@@ -993,6 +1181,30 @@ class TexturedOracleTests(unittest.TestCase):
     def test_rejects_wrong_textured_probe(self):
         with self.assertRaises(AssertionError):
             check_image(self.image(probe=(0.1, 0.2, 0.8, 1.0)), self.manifest)
+
+    def test_rejects_expected_rgba_with_wrong_channel_count(self):
+        for field, colour, next_red in (
+            ("centre_rgba", self.manifest["centre_rgba"], CLEAR),
+            ("rgba_probes", self.manifest["rgba_probes"][0]["rgba"], 0.2),
+        ):
+            for values in ([], colour[:3], [*colour, next_red]):
+                with self.subTest(field=field, values=values):
+                    manifest = self.manifest.copy()
+                    if field == "centre_rgba":
+                        manifest[field] = values
+                    else:
+                        manifest[field] = [{**self.manifest[field][0], "rgba": values}]
+                    with self.assertRaisesRegex(AssertionError, f"{field}.*exactly four"):
+                        check_image(self.image(), manifest)
+
+    def test_compares_alpha_for_four_channel_expectations(self):
+        for probe, readback in (
+            ("centre", self.image(centre=(0.2, 0.4, 0.6, 0.75))),
+            ("offset", self.image(probe=(0.8, 0.2, 0.1, 0.75))),
+        ):
+            with self.subTest(probe=probe):
+                with self.assertRaises(AssertionError):
+                    check_image(readback, self.manifest)
 
     def test_sample_rgba_bilinear(self):
         rgba = bytes(
