@@ -71,5 +71,58 @@ class SXorB32ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(oracle_xor_b32(0, 0), (0, 0))
         self.assertEqual(oracle_xor_b32(MASK32, MASK32), (0, 0))
 
+class RegKind(enum.Enum):
+    SGPR = "sgpr"
+    IMM = "imm"
+    SPECIAL = "special"
+
+
+@dataclass(frozen=True)
+class Operand32:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand32
+    src0: Operand32
+    src1: Operand32
+
+
+class SXorB32AstValidationTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = InstructionAST(
+            mnemonic="s_xor_b32",
+            dst=Operand32(RegKind.SGPR, index=2),
+            src0=Operand32(RegKind.SGPR, index=0),
+            src1=Operand32(RegKind.SGPR, index=1),
+        )
+        self.assertEqual(ast.mnemonic, "s_xor_b32")
+        self.assertEqual(ast.dst.index, 2)
+        self.assertEqual(ast.src0.index, 0)
+        self.assertEqual(ast.src1.index, 1)
+
+    def test_ast_imm_operand(self):
+        ast = InstructionAST(
+            mnemonic="s_xor_b32",
+            dst=Operand32(RegKind.SGPR, index=0),
+            src0=Operand32(RegKind.SGPR, index=0),
+            src1=Operand32(RegKind.IMM, raw_val=0x1234),
+        )
+        self.assertEqual(ast.src1.kind, RegKind.IMM)
+        self.assertEqual(ast.src1.raw_val, 0x1234)
+
+    def test_ast_special_operand(self):
+        ast = InstructionAST(
+            mnemonic="s_xor_b32",
+            dst=Operand32(RegKind.SPECIAL, raw_val=0, index=0),
+            src0=Operand32(RegKind.SGPR, index=0),
+            src1=Operand32(RegKind.IMM, raw_val=0xFFFFFFFF),
+        )
+        self.assertEqual(ast.dst.kind, RegKind.SPECIAL)
+
 if __name__ == "__main__":
     unittest.main()
