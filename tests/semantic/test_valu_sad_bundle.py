@@ -542,5 +542,38 @@ class TestVMsadU8ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[0], 12)
 
 
+def step_simd_msad_u8(wave: WaveState, instr: Instruction) -> None:
+    if instr.opcode != "v_msad_u8":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.read_lane_u32(lane, instr.src0)
+            s1 = wave.read_lane_u32(lane, instr.src1)
+            s2 = wave.read_lane_u32(lane, instr.src2)
+            wave.write_lane_u32(lane, instr.dst.index_or_val, ref_msad_u8(s0, s1, s2))
+
+
+class TestVMsadU8SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and byte-masking handling for v_msad_u8."""
+
+    def test_simd_masking(self):
+        wave = WaveState(wave_size=32)
+        wave.exec_mask = 0x0000FFFF
+        for lane in range(32):
+            wave.vgprs[lane][1] = 0x04030201
+            wave.vgprs[lane][2] = 0x00010001
+            wave.vgprs[lane][3] = 0
+            wave.vgprs[lane][0] = 99
+
+        instr = Instruction("v_msad_u8", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_simd_msad_u8(wave, instr)
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(wave.vgprs[lane][0], 2)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 99)
+
+
 if __name__ == "__main__":
     unittest.main()
