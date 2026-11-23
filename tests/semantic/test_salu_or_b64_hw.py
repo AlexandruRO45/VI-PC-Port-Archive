@@ -489,5 +489,57 @@ class TestSOrB64Aliasing(unittest.TestCase):
         self.assertEqual(state.get_sgpr_pair(2), val)
         self.assertEqual(state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestSOrB64ConditionCodes(unittest.TestCase):
+    """Unit tests for SCC flag generation under s_or_b64."""
+
+    def test_scc_cleared_strictly_when_zero(self):
+        # Must be exactly 0 (S0=0, S1=0)
+        d, scc = s_or_b64_oracle(0, 0)
+        self.assertEqual(d, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_set_for_any_single_bit(self):
+        for bit in (0, 1, 15, 16, 31, 32, 47, 48, 63):
+            with self.subTest(bit=bit):
+                d, scc = s_or_b64_oracle(1 << bit, 0)
+                self.assertEqual(d, 1 << bit)
+                self.assertEqual(scc, 1)
+
+    def test_scc_transitions_state_machine(self):
+        state = ScalarHardwareState()
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+
+        # 1. 0 -> 0 transition (0 | 0 = 0)
+        state.scc = 0
+        state.set_sgpr_pair(2, 0)
+        state.set_sgpr_pair(4, 0)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+        # 2. 0 -> 1 transition (1 | 0 = 1)
+        state.set_sgpr_pair(2, 1)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 3. 1 -> 1 transition (ALL64 | 0 = ALL64)
+        state.set_sgpr_pair(2, ALL64)
+        state.set_sgpr_pair(4, 0)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 4. 1 -> 0 transition (0 | 0 = 0)
+        state.set_sgpr_pair(2, 0)
+        state.set_sgpr_pair(4, 0)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
