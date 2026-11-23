@@ -411,8 +411,9 @@ on the executable, the rest is not:
 - **Offline answers:** the game license is active and not a trial; a package's license is acquirable and valid;
   there are no add-on licenses, no products in any query and no package updates. License-changed and license-lost
   registrations hand out tokens; the callbacks never run.
-- **Not available offline:** purchases, consumables, license tokens, collections and purchase ids, downloads and
-  every store UI fail before starting (`E_FAIL`, logged once). The docs' three unnamed slots and
+- **Not available offline:** purchases, downloads and every store UI fail before starting (`E_FAIL`, logged once).
+  Consumable balance and fulfillment, license token, collections id and purchase id requests return `S_OK`, stay
+  pending until the queue is dispatched, call their callback once and complete with `E_FAIL`. The docs' three unnamed slots and
   `XStoreIsAvailabilityPurchasable` (no documented signature) answer `E_NOTIMPL`.
 - **Measured on the executable:** `XStoreGameLicense` is 104 bytes. The title's `XStoreQueryGameLicenseResult`
   call passes a 104-byte stack buffer and reads the SKU id as a C string at +0x00, the three booleans at
