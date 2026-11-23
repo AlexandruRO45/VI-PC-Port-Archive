@@ -247,17 +247,27 @@ HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std
     return mock_query(child, riid, out);
 }
 
-// PC CreateCommittedResource (27) and CreateCommittedResource1 (53) take seven and eight words after `this`; the generic
-// thunk keeps five, so these two record the rest as well (a6..a8 in tail).
+// PC CreateCommittedResource (27) and CreatePlacedResource (29) take seven words after `this`, and
+// CreateCommittedResource1 (53) takes eight; the generic thunk keeps five, so these record the rest in `tail`.
 template <unsigned Slot>
-std::uint64_t WINAPI mock_committed_resource(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                                             std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
-                                             std::uint64_t a8) {
+std::uint64_t WINAPI mock_resource7(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                    std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7) {
     ++self->calls[Slot];
     const std::uint64_t head[] = {a1, a2, a3, a4, a5};
-    const std::uint64_t rest[] = {a6, a7, a8};
+    const std::uint64_t rest[] = {a6, a7, 0};
     std::memcpy(self->args[Slot], head, sizeof(head));
     std::memcpy(self->tail[Slot], rest, sizeof(rest));
+    return S_OK;
+}
+
+std::uint64_t WINAPI mock_committed_resource1(Mock* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                              std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                              std::uint64_t a8) {
+    ++self->calls[53];
+    const std::uint64_t head[] = {a1, a2, a3, a4, a5};
+    const std::uint64_t rest[] = {a6, a7, a8};
+    std::memcpy(self->args[53], head, sizeof(head));
+    std::memcpy(self->tail[53], rest, sizeof(rest));
     return S_OK;
 }
 
@@ -271,8 +281,9 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
-        table[27] = reinterpret_cast<void*>(&mock_committed_resource<27>);
-        table[53] = reinterpret_cast<void*>(&mock_committed_resource<53>);
+        table[27] = reinterpret_cast<void*>(&mock_resource7<27>);
+        table[29] = reinterpret_cast<void*>(&mock_resource7<29>);
+        table[53] = reinterpret_cast<void*>(&mock_committed_resource1);
         return true;
     }();
     (void)filled;
@@ -787,18 +798,26 @@ int check_xbox_slots() {
 #endif
 }
 
-// ---- 7b. Console initial state 0x6 on a committed texture (slots 27, 53 and 76) ----
+// ---- 7b. Console D3D12_BARRIER_LAYOUT initial states on textures (slots 27, 29, 53 and 76) ----
 //
-// The console creates render-target and depth textures with state 0x6, which the PC runtime refuses for a texture. The
-// mock device records the state it was given (slot 27's fourth word, a4 in args[27][3] / args[53][3]).
-D3D12_RESOURCE_DESC resource_desc(D3D12_RESOURCE_DIMENSION dimension, D3D12_RESOURCE_FLAGS flags) {
+// Console CreateCommittedResource (27), CreatePlacedResource (29), CreateCommittedResource1 (53) and slot 76 pass a
+// D3D12_BARRIER_LAYOUT in the initial-state word, which the PC runtime refuses on textures when its ordinal carries
+// buffer-only or conflicting bits. The mock device records the fourth word it receives (args[slot][3]).
+D3D12_RESOURCE_DESC resource_desc(D3D12_RESOURCE_DIMENSION dimension, D3D12_RESOURCE_FLAGS flags,
+                                  DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM, UINT64 width = 64,
+                                  UINT height = 64) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = dimension;
-    desc.Width = 64;
-    desc.Height = 64;
+    desc.Width = width;
+    desc.Height = dimension == D3D12_RESOURCE_DIMENSION_BUFFER || dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                      ? 1
+                      : height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
+    desc.Format = dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? DXGI_FORMAT_UNKNOWN : format;
     desc.SampleDesc.Count = 1;
+    desc.Layout = dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                               : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     desc.Flags = flags;
     return desc;
 }
@@ -815,71 +834,175 @@ int check_committed_resource_states() {
     void* device = make_device(mock, 9, true);
     EXPECT(device && xs::device_proxy_slot_count(device) == 76);
     const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
-    const D3D12_RESOURCE_DESC rt = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    const D3D12_RESOURCE_DESC ds = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    const std::uint64_t fake_heap = 0x4EA90000;
     const D3D12_RESOURCE_DESC plain = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE);
-    const D3D12_RESOURCE_DESC buffer = resource_desc(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
-    const std::uint64_t kConsole = 0x6;
-    const std::uint64_t kRender = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    const std::uint64_t kDepth = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    const D3D12_RESOURCE_DESC bc4 =
+        resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_NONE, DXGI_FORMAT_BC4_UNORM, 512, 512);
+    const D3D12_RESOURCE_DESC tex1d = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE1D, D3D12_RESOURCE_FLAG_NONE);
+    const D3D12_RESOURCE_DESC tex3d = resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_NONE);
+    const D3D12_RESOURCE_DESC rt =
+        resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    const D3D12_RESOURCE_DESC uav =
+        resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_RESOURCE_DESC rt_uav = resource_desc(
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_RESOURCE_DESC ds =
+        resource_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                      DXGI_FORMAT_D32_FLOAT);
+    const D3D12_RESOURCE_DESC ds_no_srv = resource_desc(
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE, DXGI_FORMAT_D32_FLOAT);
+    const D3D12_RESOURCE_DESC buffer =
+        resource_desc(D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const D3D12_RESOURCE_DESC unknown_dim =
+        resource_desc(D3D12_RESOURCE_DIMENSION_UNKNOWN, D3D12_RESOURCE_FLAG_NONE);
 
-    // Slot 27 (the title's CreateCommittedResource) and slot 53 (CreateCommittedResource1): the real device sees
-    // the mapped state; the description and the other words arrive as they were.
-    // The words after the state (clear value, protected session, riid, out) are distinct, so their positions show.
-    for (const unsigned slot : {27u, 53u}) {
+    // Argument forwarding on slots 27 (CreateCommittedResource), 29 (CreatePlacedResource) and 53
+    // (CreateCommittedResource1): only word 4 (initial state) changes; surrounding words keep their positions.
+    for (const unsigned slot : {27u, 29u, 53u}) {
         const std::uint64_t before = mock->calls[slot];
+        const std::uint64_t a1 = slot == 29 ? fake_heap : word(&props);
+        const std::uint64_t a2 = slot == 29 ? 0x20000 : 0x40;
         const std::uint64_t clear = 0xC1EA, session = 0x5E55, riid = 0x41D, out = 0x0B7;
-        const std::uint64_t first = slot == 27 ? riid : session;
-        EXPECT(hr_of(raw8(device, slot, word(&props), 0x40, word(&rt), kConsole, clear, first, slot == 27 ? out : riid,
-                          slot == 27 ? 0 : out)) == S_OK);
-        EXPECT(mock->args[slot][1] == 0x40 && mock->args[slot][4] == clear);
-        EXPECT(mock->tail[slot][0] == first && mock->tail[slot][1] == (slot == 27 ? out : riid));
-        EXPECT(slot == 27 || mock->tail[slot][2] == out);
-        EXPECT(mock->calls[slot] == before + 1 && state_of(mock->args[slot][3]) == kRender);
-        EXPECT(mock->args[slot][0] == word(&props) && mock->args[slot][2] == word(&rt));
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&ds), kConsole)) == S_OK);
-        EXPECT(state_of(mock->args[slot][3]) == kDepth);
-        // Left alone: a buffer with 0x6, a render target with state 0, a texture without a use flag, any other state.
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0)) == S_OK && state_of(mock->args[slot][3]) == 0);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&plain), kConsole)) == S_OK && state_of(mock->args[slot][3]) == kConsole);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), 0x4)) == S_OK && state_of(mock->args[slot][3]) == 0x4);
+        const std::uint64_t a6 = slot == 53 ? session : riid;
+        const std::uint64_t a7 = slot == 53 ? riid : out;
+        const std::uint64_t a8 = slot == 53 ? out : 0xDEAD;
+        EXPECT(hr_of(raw8(device, slot, a1, a2, word(&bc4), 0x6, clear, a6, a7, a8)) == S_OK);
+        EXPECT(mock->calls[slot] == before + 1);
+        EXPECT(mock->args[slot][0] == a1 && mock->args[slot][1] == a2 && mock->args[slot][2] == word(&bc4));
+        EXPECT(state_of(mock->args[slot][3]) == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+        EXPECT(mock->args[slot][4] == clear);
+        EXPECT(mock->tail[slot][0] == a6 && mock->tail[slot][1] == a7);
+        // Slots 27 and 29 are seven-word calls and never forward a8.
+        EXPECT(slot == 53 ? mock->tail[slot][2] == out : mock->tail[slot][2] == 0);
     }
-    EXPECT(rt.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && ds.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+
+    auto expect_mapped = [&](const D3D12_RESOURCE_DESC* desc, std::uint64_t in_state,
+                             D3D12_RESOURCE_STATES expected) -> bool {
+        for (const unsigned slot : {27u, 29u, 53u}) {
+            const std::uint64_t a1 = slot == 29 ? fake_heap : word(&props);
+            if (hr_of(raw(device, slot, a1, 0, word(desc), in_state)) != S_OK) return false;
+            if (state_of(mock->args[slot][3]) != static_cast<std::uint32_t>(expected)) return false;
+        }
+        return true;
+    };
+
+    // 0 (COMMON) and 0xFFFFFFFF (BARRIER_LAYOUT_UNDEFINED) + queue COMMON (18, 24) -> COMMON (0).
+    EXPECT(expect_mapped(&plain, 0, D3D12_RESOURCE_STATE_COMMON));
+    EXPECT(expect_mapped(&plain, 0xFFFFFFFFu, D3D12_RESOURCE_STATE_COMMON));
+    EXPECT(expect_mapped(&plain, 18, D3D12_RESOURCE_STATE_COMMON));
+    EXPECT(expect_mapped(&plain, 24, D3D12_RESOURCE_STATE_COMMON));
+
+    // 1, 19, 25 (GENERIC_READ) -> D3D12_RESOURCE_STATE_GENERIC_READ across 1D/2D/3D textures.
+    EXPECT(expect_mapped(&plain, 1, D3D12_RESOURCE_STATE_GENERIC_READ));
+    EXPECT(expect_mapped(&tex1d, 1, D3D12_RESOURCE_STATE_GENERIC_READ));
+    EXPECT(expect_mapped(&tex3d, 1, D3D12_RESOURCE_STATE_GENERIC_READ));
+    EXPECT(expect_mapped(&plain, 19, D3D12_RESOURCE_STATE_GENERIC_READ));
+    EXPECT(expect_mapped(&plain, 25, D3D12_RESOURCE_STATE_GENERIC_READ));
+
+    // 2 (RENDER_TARGET) -> RENDER_TARGET (0x4) iff ALLOW_RENDER_TARGET; legacy 0x4 stays 0x4 on RT.
+    EXPECT(expect_mapped(&rt, 2, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    EXPECT(expect_mapped(&rt_uav, 2, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    EXPECT(expect_mapped(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    EXPECT(expect_mapped(&plain, 2, static_cast<D3D12_RESOURCE_STATES>(2)));
+    EXPECT(expect_mapped(&ds, 2, static_cast<D3D12_RESOURCE_STATES>(2)));
+
+    // 3, 20, 26 (UNORDERED_ACCESS) -> UNORDERED_ACCESS (0x8) iff ALLOW_UNORDERED_ACCESS (UAV-only and RT+UAV).
+    EXPECT(expect_mapped(&uav, 3, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&rt_uav, 3, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&uav, 20, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&uav, 26, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&plain, 3, static_cast<D3D12_RESOURCE_STATES>(3)));
+    EXPECT(expect_mapped(&rt, 3, static_cast<D3D12_RESOURCE_STATES>(3)));
+
+    // 4 disambiguated by Flags: DEPTH_STENCIL_WRITE -> DEPTH_WRITE (0x10) when ALLOW_DEPTH_STENCIL && !ALLOW_RENDER_TARGET;
+    // legacy 0x4 (RENDER_TARGET) preserved when ALLOW_RENDER_TARGET is set.
+    EXPECT(expect_mapped(&ds, 4, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+    EXPECT(expect_mapped(&ds_no_srv, 4, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+    EXPECT(expect_mapped(&plain, 4, static_cast<D3D12_RESOURCE_STATES>(4)));
+
+    // 5 (DEPTH_STENCIL_READ) -> DEPTH_READ (0x20) iff ALLOW_DEPTH_STENCIL.
+    EXPECT(expect_mapped(&ds, 5, D3D12_RESOURCE_STATE_DEPTH_READ));
+    EXPECT(expect_mapped(&ds_no_srv, 5, D3D12_RESOURCE_STATE_DEPTH_READ));
+    EXPECT(expect_mapped(&plain, 5, static_cast<D3D12_RESOURCE_STATES>(5)));
+
+    // 6, 21, 27 (SHADER_RESOURCE) -> ALL_SHADER_RESOURCE (0xC0) unless DENY_SHADER_RESOURCE is set.
+    EXPECT(expect_mapped(&bc4, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&tex1d, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&tex3d, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&rt, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&uav, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&ds, 6, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, 21, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, 27, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&ds_no_srv, 6, static_cast<D3D12_RESOURCE_STATES>(6)));
+
+    // 7, 22, 28 (COPY_SOURCE) -> COPY_SOURCE (0x800).
+    EXPECT(expect_mapped(&plain, 7, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    EXPECT(expect_mapped(&bc4, 7, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    EXPECT(expect_mapped(&plain, 22, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    EXPECT(expect_mapped(&plain, 28, D3D12_RESOURCE_STATE_COPY_SOURCE));
+
+    // 8 disambiguated by Flags: without ALLOW_UNORDERED_ACCESS, 8 is COPY_DEST -> COPY_DEST (0x400);
+    // with ALLOW_UNORDERED_ACCESS, 0x8 is preserved as UNORDERED_ACCESS. Queue COPY_DEST (23, 29) -> COPY_DEST.
+    EXPECT(expect_mapped(&plain, 8, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&bc4, 8, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&rt, 8, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&ds, 8, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&uav, 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&rt_uav, 8, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+    EXPECT(expect_mapped(&uav, 23, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&uav, 29, D3D12_RESOURCE_STATE_COPY_DEST));
+
+    // 9 (RESOLVE_SOURCE) and 10 (RESOLVE_DEST).
+    EXPECT(expect_mapped(&plain, 9, D3D12_RESOURCE_STATE_RESOLVE_SOURCE));
+    EXPECT(expect_mapped(&plain, 10, D3D12_RESOURCE_STATE_RESOLVE_DEST));
+
+    // Valid PC texture state masks (including 0x10 DEPTH_WRITE, which must not collide with video layout 16) stay intact.
+    EXPECT(expect_mapped(&ds, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+    EXPECT(expect_mapped(&ds, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_READ));
+    EXPECT(expect_mapped(&plain, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE));
+    EXPECT(expect_mapped(&plain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_DEST));
+    EXPECT(expect_mapped(&plain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE));
+
+    // Buffers, UNKNOWN dimension and null descriptions are never altered (0x1, 0x2, 0x3, 0x6, 0x8 stay as passed).
+    for (const std::uint32_t s : {0x1u, 0x2u, 0x3u, 0x6u, 0x8u, 0xFFFFFFFFu}) {
+        EXPECT(expect_mapped(&buffer, s, static_cast<D3D12_RESOURCE_STATES>(s)));
+        EXPECT(expect_mapped(&unknown_dim, s, static_cast<D3D12_RESOURCE_STATES>(s)));
+        EXPECT(expect_mapped(nullptr, s, static_cast<D3D12_RESOURCE_STATES>(s)));
+    }
+    EXPECT(rt.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET && ds.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL &&
+           bc4.Flags == D3D12_RESOURCE_FLAG_NONE);
 
     // Slot 76 (the Xbox resource creation) reaches the PC device's slot 27 with the same mapping.
     const IID resource_iid = __uuidof(ID3D12Resource);
     void* resource = nullptr;
-    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(state_of(mock->args[27][3]) == kRender);
-    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&ds), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(state_of(mock->args[27][3]) == kDepth);
-    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), kConsole, 0, word(&resource_iid), word(&resource))) == S_OK);
-    EXPECT(state_of(mock->args[27][3]) == kConsole);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&bc4), 6, 0, word(&resource_iid), word(&resource))) == S_OK &&
+           state_of(mock->args[27][3]) == D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt), 2, 0, word(&resource_iid), word(&resource))) == S_OK &&
+           state_of(mock->args[27][3]) == D3D12_RESOURCE_STATE_RENDER_TARGET);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt_uav), 3, 0, word(&resource_iid), word(&resource))) ==
+               S_OK &&
+           state_of(mock->args[27][3]) == D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&ds), 4, 0, word(&resource_iid), word(&resource))) == S_OK &&
+           state_of(mock->args[27][3]) == D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&bc4), 8, 0, word(&resource_iid), word(&resource))) == S_OK &&
+           state_of(mock->args[27][3]) == D3D12_RESOURCE_STATE_COPY_DEST);
+    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&buffer), 2, 0, word(&resource_iid), word(&resource))) ==
+               S_OK &&
+           state_of(mock->args[27][3]) == 2);
 
-    // D3D-837: console barrier layout 0x3 (UNORDERED_ACCESS) on a committed RT+UAV texture.
-    const D3D12_RESOURCE_DESC rt_uav = resource_desc(
-        D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    const std::uint64_t kUavLayout = 0x3;
-    const std::uint64_t kUav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    for (const unsigned slot : {27u, 53u}) {
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt_uav), kUavLayout)) == S_OK);
-        EXPECT(state_of(mock->args[slot][3]) == kUav);
-        // Without ALLOW_UNORDERED_ACCESS, 0x3 is left alone (still looks like buffer-only bits to the PC device).
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&rt), kUavLayout)) == S_OK &&
-               state_of(mock->args[slot][3]) == kUavLayout);
-        EXPECT(hr_of(raw(device, slot, word(&props), 0, word(&buffer), kUavLayout)) == S_OK &&
-               state_of(mock->args[slot][3]) == kUavLayout);
-    }
-    EXPECT(hr_of(raw8(device, 76, word(&props), 0, word(&rt_uav), kUavLayout, 0, word(&resource_iid),
-                      word(&resource))) == S_OK);
-    EXPECT(state_of(mock->args[27][3]) == kUav);
-
-    EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(53));
+    EXPECT(xs::device_slot_overridden(27) && xs::device_slot_overridden(29) && xs::device_slot_overridden(53));
     EXPECT(release(device) == 0 && mock->refs == 0);
-    std::printf("%s: committed textures with state 0x6 reach the PC device as RENDER_TARGET or DEPTH_WRITE; layout 0x3 "
-                "on RT+UAV reaches it as UNORDERED_ACCESS; buffers and other states are unchanged\n", g_label);
+    std::printf("%s: texture barrier layouts on slots 27, 29, 53 and 76 map to PC resource states; buffers and "
+                "legacy PC states are unchanged\n",
+                g_label);
     return 0;
 }
 

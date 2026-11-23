@@ -379,6 +379,179 @@ int main(int argc, char** argv) {
         check(rt::d3d12_xs::device_slot_hits(73) == 1, "slot 73 hit counter is 1");
     }
 
+    // Slots 27 (CreateCommittedResource), 29 (CreatePlacedResource), 53 (CreateCommittedResource1) and 76:
+    // console D3D12_BARRIER_LAYOUT ordinals on textures map to PC D3D12_RESOURCE_STATES, while buffers and legacy PC
+    // texture states reach WARP unchanged.
+    check(rt::d3d12_xs::device_slot_overridden(27) && rt::d3d12_xs::device_slot_overridden(29) &&
+              rt::d3d12_xs::device_slot_overridden(53),
+          "device slots 27, 29 and 53 are initial-state overrides");
+    {
+        auto make_tex2d = [](DXGI_FORMAT fmt, UINT64 w, UINT h, D3D12_RESOURCE_FLAGS flags) {
+            D3D12_RESOURCE_DESC d{};
+            d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            d.Width = w;
+            d.Height = h;
+            d.DepthOrArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = fmt;
+            d.SampleDesc.Count = 1;
+            d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            d.Flags = flags;
+            return d;
+        };
+
+        const D3D12_RESOURCE_DESC bc4_desc = make_tex2d(DXGI_FORMAT_BC4_UNORM, 512, 512, D3D12_RESOURCE_FLAG_NONE);
+        const D3D12_RESOURCE_DESC srv_desc =
+            make_tex2d(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, D3D12_RESOURCE_FLAG_NONE);
+        const D3D12_RESOURCE_DESC rt_desc =
+            make_tex2d(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+        const D3D12_RESOURCE_DESC uav_desc =
+            make_tex2d(DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const D3D12_RESOURCE_DESC rt_uav_desc = make_tex2d(
+            DXGI_FORMAT_R8G8B8A8_UNORM, 64, 64,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const D3D12_RESOURCE_DESC ds_desc =
+            make_tex2d(DXGI_FORMAT_D32_FLOAT, 64, 64, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        const D3D12_RESOURCE_DESC ds_deny_srv_desc = make_tex2d(
+            DXGI_FORMAT_D32_FLOAT, 64, 64,
+            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
+
+        auto make_placed_heap = [&](const D3D12_RESOURCE_DESC& d, D3D12_HEAP_FLAGS flags, ComPtr<ID3D12Heap>& out_heap) {
+            const D3D12_RESOURCE_ALLOCATION_INFO info = device->GetResourceAllocationInfo(0, 1, &d);
+            D3D12_HEAP_DESC hd{};
+            hd.SizeInBytes = info.SizeInBytes ? info.SizeInBytes : 65536;
+            hd.Properties = heap_properties;
+            hd.Alignment = info.Alignment;
+            hd.Flags = flags;
+            return SUCCEEDED(device->CreateHeap(&hd, IID_PPV_ARGS(out_heap.GetAddressOf()))) && out_heap != nullptr;
+        };
+
+        ComPtr<ID3D12Heap> tex_heap;
+        ComPtr<ID3D12Heap> rtds_heap;
+        check(make_placed_heap(bc4_desc, D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES, tex_heap),
+              "CreateHeap succeeds for non-RT/DS placed textures");
+        check(make_placed_heap(rt_uav_desc, D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES, rtds_heap),
+              "CreateHeap succeeds for RT/DS placed textures");
+
+        // Negative control on the raw WARP device: unmapped console barrier layouts 0x6 (SHADER_RESOURCE) and 0x8
+        // (COPY_DEST on a non-UAV texture) are rejected with E_INVALIDARG on both committed and placed textures.
+        if (real && tex_heap) {
+            ComPtr<ID3D12Resource> rejected;
+            hr = real->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &bc4_desc,
+                                               static_cast<D3D12_RESOURCE_STATES>(0x6), nullptr,
+                                               IID_PPV_ARGS(rejected.ReleaseAndGetAddressOf()));
+            check(hr == E_INVALIDARG && !rejected,
+                  "raw WARP CreateCommittedResource rejects state 0x6 on BC4_UNORM TEXTURE2D");
+            hr = real->CreatePlacedResource(tex_heap.Get(), 0, &bc4_desc, static_cast<D3D12_RESOURCE_STATES>(0x6),
+                                            nullptr, IID_PPV_ARGS(rejected.ReleaseAndGetAddressOf()));
+            check(hr == E_INVALIDARG && !rejected,
+                  "raw WARP CreatePlacedResource rejects state 0x6 on BC4_UNORM TEXTURE2D");
+            hr = real->CreatePlacedResource(tex_heap.Get(), 0, &bc4_desc, static_cast<D3D12_RESOURCE_STATES>(0x8),
+                                            nullptr, IID_PPV_ARGS(rejected.ReleaseAndGetAddressOf()));
+            check(hr == E_INVALIDARG && !rejected,
+                  "raw WARP CreatePlacedResource rejects state 0x8 on non-UAV BC4_UNORM TEXTURE2D");
+        }
+
+        auto both_ok = [&](ID3D12Heap* placed_heap, const D3D12_RESOURCE_DESC& d, std::uint32_t state) {
+            ComPtr<ID3D12Resource> r_committed;
+            ComPtr<ID3D12Resource> r_placed;
+            const auto st = static_cast<D3D12_RESOURCE_STATES>(state);
+            const HRESULT hr_c = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &d, st,
+                                                                 nullptr, IID_PPV_ARGS(r_committed.GetAddressOf()));
+            const HRESULT hr_p = placed_heap
+                                     ? device->CreatePlacedResource(placed_heap, 0, &d, st, nullptr,
+                                                                    IID_PPV_ARGS(r_placed.GetAddressOf()))
+                                     : E_FAIL;
+            return SUCCEEDED(hr_c) && r_committed != nullptr && SUCCEEDED(hr_p) && r_placed != nullptr;
+        };
+
+        // 6 (SHADER_RESOURCE) on 512x512 BC4_UNORM TEXTURE2D with Flags=0 (#8344) and on RT/DS textures without
+        // DENY_SHADER_RESOURCE; rejected when DENY_SHADER_RESOURCE is set.
+        check(both_ok(tex_heap.Get(), bc4_desc, 0x6),
+              "slots 27 & 29 accept layout 6 (SHADER_RESOURCE) on 512x512 BC4_UNORM TEXTURE2D");
+        check(both_ok(rtds_heap.Get(), rt_desc, 0x6) && both_ok(rtds_heap.Get(), ds_desc, 0x6),
+              "slots 27 & 29 accept layout 6 (SHADER_RESOURCE) on RT and DS textures");
+        {
+            ComPtr<ID3D12Resource> denied;
+            hr = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &ds_deny_srv_desc,
+                                                 static_cast<D3D12_RESOURCE_STATES>(0x6), nullptr,
+                                                 IID_PPV_ARGS(denied.GetAddressOf()));
+            check(hr == E_INVALIDARG && !denied,
+                  "slot 27 leaves state 0x6 unmapped when DENY_SHADER_RESOURCE is set");
+        }
+
+        // 1 (GENERIC_READ), 7 (COPY_SOURCE), 8 (COPY_DEST on non-UAV), 9 (RESOLVE_SOURCE), 10 (RESOLVE_DEST).
+        check(both_ok(tex_heap.Get(), bc4_desc, 1), "slots 27 & 29 accept layout 1 (GENERIC_READ) on TEXTURE2D");
+        check(both_ok(tex_heap.Get(), bc4_desc, 7), "slots 27 & 29 accept layout 7 (COPY_SOURCE) on TEXTURE2D");
+        check(both_ok(tex_heap.Get(), bc4_desc, 8),
+              "slots 27 & 29 accept layout 8 (COPY_DEST) on non-UAV BC4_UNORM TEXTURE2D");
+        check(both_ok(tex_heap.Get(), srv_desc, 9) && both_ok(tex_heap.Get(), srv_desc, 10),
+              "slots 27 & 29 accept layouts 9 and 10 (RESOLVE_SOURCE / RESOLVE_DEST) on TEXTURE2D");
+
+        // 2 (RENDER_TARGET) vs legacy 0x4 on ALLOW_RENDER_TARGET; 2 without ALLOW_RENDER_TARGET is rejected.
+        check(both_ok(rtds_heap.Get(), rt_desc, 2) &&
+                  both_ok(rtds_heap.Get(), rt_desc, D3D12_RESOURCE_STATE_RENDER_TARGET),
+              "slots 27 & 29 accept layout 2 and legacy 0x4 on ALLOW_RENDER_TARGET TEXTURE2D");
+        {
+            ComPtr<ID3D12Resource> bad_rt;
+            hr = device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &srv_desc,
+                                                 static_cast<D3D12_RESOURCE_STATES>(2), nullptr,
+                                                 IID_PPV_ARGS(bad_rt.GetAddressOf()));
+            check(hr == E_INVALIDARG && !bad_rt,
+                  "slot 27 leaves layout 2 unmapped when ALLOW_RENDER_TARGET is absent");
+        }
+
+        // 3 (UNORDERED_ACCESS) and legacy 0x8 on UAV-only and RT+UAV textures.
+        check(both_ok(tex_heap.Get(), uav_desc, 3) &&
+                  both_ok(tex_heap.Get(), uav_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+              "slots 27 & 29 accept layout 3 and legacy 0x8 on UAV TEXTURE2D");
+        check(both_ok(rtds_heap.Get(), rt_uav_desc, 3) &&
+                  both_ok(rtds_heap.Get(), rt_uav_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+              "slots 27 & 29 accept layout 3 and legacy 0x8 on RT+UAV TEXTURE2D");
+
+        // 4 (DEPTH_STENCIL_WRITE), 5 (DEPTH_STENCIL_READ) and legacy 0x10 / 0x20 on ALLOW_DEPTH_STENCIL.
+        check(both_ok(rtds_heap.Get(), ds_desc, 4) && both_ok(rtds_heap.Get(), ds_desc, 5) &&
+                  both_ok(rtds_heap.Get(), ds_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE) &&
+                  both_ok(rtds_heap.Get(), ds_desc, D3D12_RESOURCE_STATE_DEPTH_READ),
+              "slots 27 & 29 accept layouts 4/5 and legacy DEPTH_WRITE/DEPTH_READ on DS TEXTURE2D");
+
+        // Slot 53 (CreateCommittedResource1 via ID3D12Device4) and slot 76 also map texture barrier layouts.
+        ComPtr<ID3D12Device4> device4;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(device4.GetAddressOf()))) && device4) {
+            ComPtr<ID3D12Resource> r53;
+            hr = device4->CreateCommittedResource1(&heap_properties, D3D12_HEAP_FLAG_NONE, &bc4_desc,
+                                                   static_cast<D3D12_RESOURCE_STATES>(0x6), nullptr, nullptr,
+                                                   IID_PPV_ARGS(r53.GetAddressOf()));
+            check(SUCCEEDED(hr) && r53 != nullptr,
+                  "slot 53 CreateCommittedResource1 accepts layout 6 on BC4_UNORM TEXTURE2D");
+        }
+        {
+            D3D12_RESOURCE_DESC xbox_bc4 = bc4_desc;
+            xbox_bc4.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+            ComPtr<ID3D12Resource> r76;
+            hr = create_resource(device.Get(), &heap_properties, D3D12_HEAP_FLAG_NONE, &xbox_bc4,
+                                 static_cast<D3D12_RESOURCE_STATES>(0x6), nullptr, iid_resource,
+                                 reinterpret_cast<void**>(r76.GetAddressOf()));
+            check(SUCCEEDED(hr) && r76 != nullptr,
+                  "slot 76 accepts layout 6 on tiled BC4_UNORM TEXTURE2D");
+        }
+
+        // DIMENSION_BUFFER initial states 0x1, 0x2 and 0x8 stay untouched on both CreateCommittedResource and
+        // CreatePlacedResource (if 0x2 were mapped to RENDER_TARGET 0x4, WARP would refuse a buffer without
+        // ALLOW_RENDER_TARGET with E_INVALIDARG).
+        D3D12_RESOURCE_DESC pc_buf = buffer_desc();
+        pc_buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_RESOURCE_DESC uav_buf = pc_buf;
+        uav_buf.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Heap> buf_heap;
+        check(make_placed_heap(uav_buf, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS, buf_heap),
+              "CreateHeap succeeds for placed buffers");
+        check(both_ok(buf_heap.Get(), pc_buf, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) &&
+                  both_ok(buf_heap.Get(), pc_buf, D3D12_RESOURCE_STATE_INDEX_BUFFER) &&
+                  both_ok(buf_heap.Get(), uav_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+              "slots 27 & 29 preserve DIMENSION_BUFFER states 0x1, 0x2 and 0x8");
+    }
+
     // Slot 62: an empty root signature and a trivial compute shader through the Xbox signature. The PC entry at
     // slot 62 is CreateStateObject, so success here proves the override reached CreateComputePipelineState.
     D3D12_ROOT_SIGNATURE_DESC root_desc{};

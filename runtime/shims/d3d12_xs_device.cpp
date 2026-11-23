@@ -24,6 +24,7 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "../src/command_list.h"    // leonida::d3d12_layout for pc_initial_state_word
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -129,6 +130,7 @@ const char* slot_name(unsigned slot) {
         case 16: return "CreateRootSignature";
         case 25: return "GetResourceAllocationInfo";
         case 27: return "CreateCommittedResource (initial state mapped)";
+        case 29: return "CreatePlacedResource (initial state mapped)";
         case 31: return "CreateSharedHandle (proxies unwrapped)";
         case 32: return "OpenSharedHandle (a fence comes back wrapped)";
         case 34: return "MakeResident (proxies unwrapped)";
@@ -1453,30 +1455,86 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
-// The console's CreateCommittedResource / CreateCommittedResourceX pass a D3D12_BARRIER_LAYOUT in the initial-state
-// slot (measured by @dracbat on slot 133; @Jadiac5 / D3D-837 on a committed RT+UAV texture). As a legacy
-// D3D12_RESOURCE_STATES value those layouts look like buffer-only bits and the PC runtime refuses them.
+// The console's CreateCommittedResource / CreatePlacedResource / CreateCommittedResourceX pass a D3D12_BARRIER_LAYOUT
+// in the initial-state slot (measured by @dracbat on slot 133; @Jadiac5 / D3D-837 on committed RT+UAV, UAV-only and
+// plain textures). As a legacy D3D12_RESOURCE_STATES value most barrier-layout ordinals carry buffer-only bits (0x1,
+// 0x2) or conflicting write bits and the PC runtime refuses them on textures.
 //
-// 0x6 (SHADER_RESOURCE layout): a texture whose flags name a write use still gets that use's state, as #7356 fixed
-// for the retail boot (ALLOW_RENDER_TARGET -> RENDER_TARGET, ALLOW_DEPTH_STENCIL -> DEPTH_WRITE). 0x3
-// (UNORDERED_ACCESS layout): an RT+UAV texture (flags ALLOW_RENDER_TARGET | ALLOW_UNORDERED_ACCESS) maps to
-// UNORDERED_ACCESS so create_committed_validated no longer refuses "buffer-only or undefined bits". Every other
-// state and every buffer goes on unchanged. The description is only read; the title's words are never written.
-constexpr std::uint32_t kConsoleShaderResourceLayout = 0x6;
-constexpr std::uint32_t kConsoleUnorderedAccessLayout = 0x3;
-
+// Every unambiguous texture barrier layout (Dimension == TEXTURE1D / TEXTURE2D / TEXTURE3D) maps to its PC
+// D3D12_RESOURCE_STATES equivalent, gated by the resource flags that layout requires:
+//   0xFFFFFFFF (UNDEFINED), 18/24 (DIRECT/COMPUTE_QUEUE_COMMON) -> COMMON (0)
+//   1, 19, 25 (GENERIC_READ)                                    -> GENERIC_READ (0xAC3)
+//   2 (RENDER_TARGET) with ALLOW_RENDER_TARGET                  -> RENDER_TARGET (0x4)
+//   3, 20, 26 (UNORDERED_ACCESS) with ALLOW_UNORDERED_ACCESS    -> UNORDERED_ACCESS (0x8)
+//   4: legacy RENDER_TARGET (0x4) is valid iff ALLOW_RENDER_TARGET is set; with ALLOW_DEPTH_STENCIL (and not
+//      ALLOW_RENDER_TARGET), 4 is DEPTH_STENCIL_WRITE -> DEPTH_WRITE (0x10)
+//   5 (DEPTH_STENCIL_READ) with ALLOW_DEPTH_STENCIL             -> DEPTH_READ (0x20)
+//   6, 21, 27 (SHADER_RESOURCE) without DENY_SHADER_RESOURCE    -> ALL_SHADER_RESOURCE (0xC0)
+//   7, 22, 28 (COPY_SOURCE)                                     -> COPY_SOURCE (0x800)
+//   8: legacy UNORDERED_ACCESS (0x8) is valid iff ALLOW_UNORDERED_ACCESS is set (where 0x8 is ambiguous between
+//      legacy UNORDERED_ACCESS and BARRIER_LAYOUT_COPY_DEST, and PC D3D12 accepts 0x8); without
+//      ALLOW_UNORDERED_ACCESS, 8 cannot be UNORDERED_ACCESS and maps to COPY_DEST (0x400), as 23/29 do unconditionally
+//   9 (RESOLVE_SOURCE), 10 (RESOLVE_DEST)                       -> RESOLVE_SOURCE (0x2000), RESOLVE_DEST (0x1000)
+// Valid PC texture state masks (0x10 DEPTH_WRITE, 0x20 DEPTH_READ, 0x40/0x80/0xC0 shader reads, etc.) and all
+// non-texture dimensions (BUFFER, UNKNOWN) go on unchanged. The description is only read; the title's words are never
+// written.
 std::uint64_t pc_initial_state_word(std::uint64_t desc_word, std::uint64_t state_word) {
     if (!desc_word) return state_word;
     const auto* desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(desc_word);
-    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return state_word;
-    const auto layout = static_cast<std::uint32_t>(state_word);
-    if (layout == kConsoleUnorderedAccessLayout &&
-        (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
-        return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    if (layout != kConsoleShaderResourceLayout) return state_word;
-    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
-    if (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    return state_word;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        return state_word;
+
+    namespace layout = leonida::d3d12_layout;
+    const D3D12_RESOURCE_FLAGS flags = desc->Flags;
+    switch (static_cast<std::uint32_t>(state_word)) {
+    case layout::undefined:
+    case layout::direct_queue_common:
+    case layout::compute_queue_common:
+        return D3D12_RESOURCE_STATE_COMMON;
+    case layout::generic_read:
+    case layout::direct_queue_generic_read:
+    case layout::compute_queue_generic_read:
+        return D3D12_RESOURCE_STATE_GENERIC_READ;
+    case layout::render_target:
+        if (flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) return D3D12_RESOURCE_STATE_RENDER_TARGET;
+        return state_word;
+    case layout::unordered_access:
+    case layout::direct_queue_unordered_access:
+    case layout::compute_queue_unordered_access:
+        if (flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        return state_word;
+    case layout::depth_stencil_write:
+        if ((flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            !(flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        return state_word;
+    case layout::depth_stencil_read:
+        if (flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return D3D12_RESOURCE_STATE_DEPTH_READ;
+        return state_word;
+    case layout::shader_resource:
+    case layout::direct_queue_shader_resource:
+    case layout::compute_queue_shader_resource:
+        if (!(flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) return D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
+        return state_word;
+    case layout::copy_source:
+    case layout::direct_queue_copy_source:
+    case layout::compute_queue_copy_source:
+        return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    case layout::copy_dest:
+        if (!(flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return D3D12_RESOURCE_STATE_COPY_DEST;
+        return state_word;
+    case layout::direct_queue_copy_dest:
+    case layout::compute_queue_copy_dest:
+        return D3D12_RESOURCE_STATE_COPY_DEST;
+    case layout::resolve_source:
+        return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    case layout::resolve_dest:
+        return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    default:
+        return state_word;
+    }
 }
 
 D3D12_RESOURCE_STATES pc_initial_state(const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state) {
@@ -1484,23 +1542,26 @@ D3D12_RESOURCE_STATES pc_initial_state(const D3D12_RESOURCE_DESC* desc, D3D12_RE
         pc_initial_state_word(reinterpret_cast<std::uint64_t>(desc), static_cast<std::uint32_t>(state))));
 }
 
-// Device slots 27 CreateCommittedResource(props, heap_flags, desc, state, clear, riid, out) and 53
-// CreateCommittedResource1 (a protected session before riid): the PC call with the initial state mapped above. The PC
-// method is called by its table entry with the caller's words, so a null riid or output reaches the real device as it did.
+// Device slots 27 CreateCommittedResource(props, heap_flags, desc, state, clear, riid, out), 29
+// CreatePlacedResource(heap, heap_offset, desc, state, clear, riid, out) and 53 CreateCommittedResource1 (a protected
+// session before riid): the PC call with the initial state mapped above. Each helper takes only the words its PC
+// prototype has so a seven-argument call never touches a8, and a null riid or output reaches the real device as it did.
 template <unsigned Slot>
-std::uint64_t proxy_create_committed_resource(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
-                                              std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
-                                              std::uint64_t a8) {
+std::uint64_t proxy_create_resource_state7(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                           std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7) {
     const std::uint64_t state = pc_initial_state_word(a3, a4);
-    if constexpr (Slot == 27) {
-        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                          std::uint64_t, std::uint64_t, std::uint64_t);
-        return reinterpret_cast<Fn>(self->real_vtable[27])(self->real, a1, a2, a3, state, a5, a6, a7);
-    } else {
-        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
-        return reinterpret_cast<Fn>(self->real_vtable[53])(self->real, a1, a2, a3, state, a5, a6, a7, a8);
-    }
+    using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                      std::uint64_t, std::uint64_t, std::uint64_t);
+    return reinterpret_cast<Fn>(self->real_vtable[Slot])(self->real, a1, a2, a3, state, a5, a6, a7);
+}
+
+std::uint64_t proxy_create_committed_resource1(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                                               std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
+                                               std::uint64_t a8) {
+    const std::uint64_t state = pc_initial_state_word(a3, a4);
+    using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                      std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+    return reinterpret_cast<Fn>(self->real_vtable[53])(self->real, a1, a2, a3, state, a5, a6, a7, a8);
 }
 
 HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
@@ -1610,8 +1671,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                                          reinterpret_cast<void**>(a5)));
         }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
-        if constexpr (Slot == 27 || Slot == 53) {
-            return proxy_create_committed_resource<Slot>(self, a1, a2, a3, a4, a5, a6, a7, a8);
+        if constexpr (Slot == 27 || Slot == 29) {
+            return proxy_create_resource_state7<Slot>(self, a1, a2, a3, a4, a5, a6, a7);
+        } else if constexpr (Slot == 53) {
+            return proxy_create_committed_resource1(self, a1, a2, a3, a4, a5, a6, a7, a8);
         } else {
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
         // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
@@ -1758,9 +1821,9 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 }
 
 bool device_slot_overridden(unsigned slot) {
-    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 27 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 53 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+    if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 27 || slot == 29 || slot == 31 || slot == 32 ||
+        slot == 34 || slot == 35 || slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 53 || slot == 62 ||
+        slot == 67 || slot == 75 || slot == 76)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
