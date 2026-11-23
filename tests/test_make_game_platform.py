@@ -270,17 +270,22 @@ class RuntimePackagingTest(unittest.TestCase):
         self.assertIn("gta6rt_tls_host.dll", err.getvalue())
         self.assertFalse(os.path.exists(self.out))
 
-    def test_runtime_build_starts_powershell_by_its_full_path(self):
-        # The stage started "powershell" by name. CreateProcess searches System32 but not
-        # System32\WindowsPowerShell\v1.0, so on a PC whose PATH had lost that folder the stage ended in a
-        # FileNotFoundError traceback after the earlier stages had run.
-        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+    def fake_powershell(self):
+        """A Windows folder holding an empty powershell.exe where Windows keeps it; returns (folder, file)."""
         system_root = os.path.join(self.root, "Windows")
         folder = os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0")
         os.makedirs(folder)
         exe = os.path.join(folder, "powershell.exe")
         with open(exe, "wb"):
             pass
+        return system_root, exe
+
+    def test_runtime_build_starts_powershell_by_its_full_path(self):
+        # The stage started "powershell" by name. CreateProcess searches System32 but not
+        # System32\WindowsPowerShell\v1.0, so on a PC whose PATH had lost that folder the stage ended in a
+        # FileNotFoundError traceback after the earlier stages had run.
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        system_root, exe = self.fake_powershell()
         with mock.patch.object(make_game.os, "name", "nt"), \
                 mock.patch.object(make_game, "ROOT", self.root), \
                 mock.patch.dict(os.environ, {"SystemRoot": system_root, "PATH": ""}), \
@@ -295,6 +300,54 @@ class RuntimePackagingTest(unittest.TestCase):
     def test_powershell_is_the_bare_name_where_the_file_is_not_at_its_usual_place(self):
         with mock.patch.dict(os.environ, {"SystemRoot": os.path.join(self.root, "nowhere")}):
             self.assertEqual(make_game.windows_powershell(), "powershell")
+
+    def test_powershell_is_found_through_windir_where_systemroot_is_not_set(self):
+        system_root, exe = self.fake_powershell()
+        with mock.patch.dict(os.environ, {"windir": system_root}):
+            os.environ.pop("SystemRoot", None)
+            self.assertEqual(make_game.windows_powershell(), exe)
+
+    def test_powershell_can_be_started_from_its_usual_place_or_through_path(self):
+        system_root, _ = self.fake_powershell()
+        nowhere = os.path.join(self.root, "nowhere")
+        with mock.patch.dict(os.environ, {"SystemRoot": system_root, "PATH": ""}):
+            self.assertTrue(make_game.windows_powershell_ok())
+        with mock.patch.dict(os.environ, {"SystemRoot": nowhere}), \
+                mock.patch.object(make_game.shutil, "which", return_value="powershell.exe") as which:
+            self.assertTrue(make_game.windows_powershell_ok())
+        which.assert_called_once_with("powershell")
+        with mock.patch.dict(os.environ, {"SystemRoot": nowhere, "PATH": ""}):
+            self.assertFalse(make_game.windows_powershell_ok())
+
+    def runtime_preflight(self, name, powershell, runtime_build=None):
+        with mock.patch.object(make_game.os, "name", name), \
+                mock.patch.object(make_game.sys, "version_info", (3, 12, 0)), \
+                mock.patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
+                mock.patch.object(make_game, "cross_build_missing", return_value=[]), \
+                mock.patch.object(make_game, "cross_configure"), \
+                mock.patch.object(make_game, "windows_powershell_ok", return_value=powershell) as asked:
+            make_game.preflight(["runtime"], os.path.join(self.root, "w"), runtime_build=runtime_build)
+        return asked
+
+    def test_preflight_names_a_missing_powershell_before_any_work(self):
+        # Without the check the build got as far as the runtime stage, hours in, and stopped there with the
+        # FileNotFoundError of the launch.
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err), self.assertRaises(SystemExit) as ctx:
+            self.runtime_preflight("nt", powershell=False)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("Windows PowerShell 5.1 (powershell.exe", err.getvalue())
+        self.assertIn(r"%SystemRoot%\System32\WindowsPowerShell\v1.0", err.getvalue())
+        self.assertFalse(os.path.exists(os.path.join(self.root, "w")))
+
+    def test_preflight_passes_with_powershell_and_asks_only_where_the_stage_starts_it(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"TLS host")
+        asked = self.runtime_preflight("nt", powershell=True)
+        asked.assert_called_once_with()
+        asked = self.runtime_preflight("nt", powershell=False, runtime_build=self.build)
+        asked.assert_not_called()
+        asked = self.runtime_preflight("posix", powershell=False)
+        asked.assert_not_called()
 
 
 class ConfiguredCrossToolsTest(unittest.TestCase):

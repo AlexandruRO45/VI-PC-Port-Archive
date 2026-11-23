@@ -596,6 +596,9 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
                            "https://dotnet.microsoft.com/download/dotnet/8.0")
     if os.name == "nt" and "runtime" in stages and not runtime_build and not visual_cpp_tools_ok():
         missing.append("Visual Studio 2022 with 'Desktop development with C++'")
+    if os.name == "nt" and "runtime" in stages and not runtime_build and not windows_powershell_ok():
+        missing.append("Windows PowerShell 5.1 (powershell.exe, which starts scripts\\build_runtime.ps1 for the "
+                       "runtime stage): it is not in %SystemRoot%\\System32\\WindowsPowerShell\\v1.0 and not on PATH")
     if os.name != "nt" and not runtime_build and any(s in WINDOWS_ONLY for s in stages):
         missing.extend(f"{s} (for the runtime stage, or pass --runtime-build)" for s in cross_build_missing())
     # The pipelines stage needs a checker the runtime stage builds (on Windows only with VULKAN_SDK set).
@@ -681,6 +684,15 @@ def windows_powershell() -> str:
     root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
     exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
     return exe if os.path.isfile(exe) else "powershell"
+
+
+def windows_powershell_ok() -> bool:
+    """Whether the runtime stage can start Windows PowerShell: the file is at its usual place, or PATH has it.
+
+    Checked in preflight, so a PC without it hears so before the shader and asset stages run, not after them.
+    """
+    exe = windows_powershell()
+    return os.path.isfile(exe) or bool(shutil.which(exe))
 
 
 def xwin_dir() -> "str | None":
