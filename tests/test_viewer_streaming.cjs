@@ -827,3 +827,26 @@ test('camera hash round-trips and malformed hashes are ignored', () => {
         assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
     }
 });
+
+test('a parsed GLB with null scene fails with backoff instead of adding null or throwing on dispose', async () => {
+    const f = fixture(2);
+    f.frame();
+    await f.receive(0);
+    await f.receive(1);
+    const c1 = f.object();
+    await f.finish(1, c1);
+    let traverses = 0;
+    const origTraverse = c1.traverse.bind(c1);
+    c1.traverse = (fn) => { traverses++; return origTraverse(fn); };
+
+    // Active chunk resolving with g.scene === null must count as a failure with backoff and must not re-traverse c1.
+    await f.finish(0, null);
+    assert.equal(traverses, 0, 'null scene must not trigger applyClay/applyWire over other loaded chunks');
+    assert.equal(f.state.failed, 1);
+    assert.equal(Array.from(f.added).includes(null), false);
+    f.frame(1);
+    assert.equal(f.requests.length, 2, 'must wait for retry backoff before re-fetching');
+
+    // disposeObject(null) must be a no-op (e.g. when a stale parse resolves with g.scene === null).
+    assert.doesNotThrow(() => vm.runInContext('disposeObject(null)', f.context));
+});

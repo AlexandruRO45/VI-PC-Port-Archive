@@ -272,6 +272,7 @@ function applyWire(root) {
     }));
 }
 function disposeObject(obj) {
+  if (!obj) return;
   const disposedGeo = new Set(), disposedMat = new Set(), disposedTex = new Set();
   const bitmaps = new Set();
   obj.traverse(n => {
@@ -341,7 +342,8 @@ async function loadChunk(entry) {
     const resourcePath = THREE.LoaderUtils.extractUrlBase(url.split(/[?#]/, 1)[0]);
     const g = await loader.parseAsync(bytes, resourcePath);
     // GLTFLoader cannot cancel a parse already underway. Dispose its late result.
-    if (live.get(def.id) !== entry) { disposeObject(g.scene); return; }
+    if (live.get(def.id) !== entry) { disposeObject(g?.scene); return; }
+    if (!g?.scene) throw new Error("Chunk GLB has no scene");
     entry.obj = g.scene; scene.add(g.scene); applyClay(g.scene); applyWire(g.scene);
   } catch {
     if (live.get(def.id) !== entry) return;
