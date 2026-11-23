@@ -6965,6 +6965,7 @@ class Gen:
                     "image_sample_d", "image_sample_d_cl", "image_load", "image_gather4_lz", "image_gather4_l",
                     "image_gather4_lz_o", "image_gather4_l_o") or op in self.GATHER4_LOD_OPS:
             self.image_op(op, a, mods)
+            self.image_status(op, a, mods)
         elif op in ("v_sin_f16", "v_cos_f16"):
             u = self.src_h(a[1])
             v2, f, r = self.tmp(), self.tmp(), self.tmp()
@@ -7380,6 +7381,8 @@ class Gen:
         elif op in ("image_get_resinfo", "image_load_mip", "image_store", "image_atomic_cmpswap") \
                 or op in self.IMG_ATOMICS or op in self.IMG_ATOMICS_EXTRA:
             self.image_misc(op, a, mods)
+            if op == "image_load_mip":      # the only read here; stores and atomics have no status dword
+                self.image_status(op, a, mods)
         elif op in ("v_cubema_f32", "v_cubeid_f32", "v_cubesc_f32", "v_cubetc_f32"):
             # Cube face selection (standard table): major axis Z if |z|>=|x| and |z|>=|y|, else Y if |y|>=|x|,
             # else X.   face: +X0 -X1 +Y2 -Y3 +Z4 -Z5
@@ -12450,6 +12453,23 @@ class Gen:
         self.emit(f"{d} = OpFMul %float {fl} {self.fconst(2.0)}")
         self.emit(f"{layer} = OpFSub %float {f[2]} {d}")
         return [s, t, layer] + f[3:]
+
+    def image_status(self, op, a, mods):
+        """SHADER-1266: with tfe or lwe an image read returns one more dword after its data, the fetch status
+        (vdata[data_count]; rdna2_decode sizes vdata the same way). Nothing here is partially resident, so every
+        fetch succeeds and the status is 0; without this write a shader reading it got the register's old value.
+        Data words: four for a gather, one per dmask bit otherwise (at least one), two per VGPR under d16."""
+        if "tfe" not in mods and "lwe" not in mods:
+            return
+        vdata = a[0]
+        if op.startswith("image_gather4"):
+            n = 4
+        else:
+            dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
+            n = bin(int(dm.split(":")[1], 0) & 0xF).count("1") or 1
+        if "d16" in mods:
+            n = (n + 1) // 2
+        self.dst({"k": "vgpr", "r": vdata["r"] + n, "n": 1}, self.cu(0))
 
     def image_op(self, op, a, mods):
         a16 = "a16" in mods
