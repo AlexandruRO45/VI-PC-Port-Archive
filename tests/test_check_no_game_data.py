@@ -250,6 +250,16 @@ class CheckNoGameData(unittest.TestCase):
                 self.assertIn("python3 -I scripts/check_no_game_data.py", result.stdout)
                 self.assertEqual(result.stderr, "")
 
+    def test_unknown_option_is_a_usage_error_instead_of_a_skipped_path(self):
+        # A misspelt option used to be checked like a path, skipped, and the guard exited 0.
+        for flag in ("--frobnicate", "-x"):
+            with self.subTest(flag=flag):
+                result = run([flag])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(f"unknown option {flag}", result.stderr)
+                self.assertIn("usage: check_no_game_data.py", result.stderr)
+                self.assertEqual(result.stdout, "")
+
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_default_mode_reads_tracked_files_only(self):
         git = ["git", "-c", "init.defaultBranch=main"]

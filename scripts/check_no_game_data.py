@@ -267,10 +267,17 @@ def display(path):
     return path.replace("\n", "\\n").replace("\r", "\\r")  # one line per file, even for a name with a newline
 
 
+USAGE = "usage: check_no_game_data.py [-h] [PATH...]"
+
+
 def main(argv):
     if argv[:1] in (["-h"], ["--help"]):
         print(__doc__.strip())  # the usage at its head; it checks nothing
         return 0
+    if argv and argv[0].startswith("-"):
+        print(f"unknown option {argv[0]}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
     paths = argv or tracked_files(os.getcwd())
     found = check(paths)
     for path, name in found:
