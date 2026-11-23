@@ -84,14 +84,25 @@ def find_guarded_texel_block(spv):
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
                 br = insns[i + 1]
                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m and m.group(1) in active_loads:
+                if m and (m.group(1) in active_loads or m.group(1) == "%true"):   # %true: EXEC never changes
                     guarded_targets.add(m.group(2))
+    # The texel pointer may sit one level deeper, in the block entered when the coordinate is inside the image
+    # (OpImageQuerySize bounds test, EGEN-IMGATOMIC-OOB); that block's parent is the active-guarded one.
+    parent = {}
+    for lbl, insns in blocks.items():
+        for i, ln in enumerate(insns):
+            m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", ln)
+            if m:
+                parent.setdefault(m.group(2), lbl)
     found = []
     for lbl, insns in blocks.items():
         if any("= OpImageTexelPointer " in ln for ln in insns):
-            if lbl not in guarded_targets:
+            if lbl in guarded_targets:
+                found.append((lbl, insns))
+            elif parent.get(lbl) in guarded_targets:
+                found.append((lbl, blocks[parent[lbl]] + insns))
+            else:
                 raise AssertionError(f"OpImageTexelPointer in unguarded block {lbl}")
-            found.append((lbl, insns))
     if not found:
         raise AssertionError("No OpImageTexelPointer emitted")
     return found
