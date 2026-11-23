@@ -567,6 +567,15 @@ if(BUILD_TESTING)
     target_compile_options(cpu_ud_monitorx_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     add_test(NAME cpu_ud_monitorx COMMAND cpu_ud_monitorx_test)
 
+    # #UD emulation of CLWB: instruction lengths for many addressing forms, from synthetic CONTEXT/EXCEPTION_RECORD.
+    add_executable(cpu_ud_emulate_clwb_test
+      test/cpu_ud_emulate_clwb_test.cpp
+      src/cpu_ud_emulate.cpp
+    )
+    target_compile_definitions(cpu_ud_emulate_clwb_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(cpu_ud_emulate_clwb_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    add_test(NAME cpu_ud_emulate_clwb COMMAND cpu_ud_emulate_clwb_test)
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
     # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
@@ -2955,16 +2964,6 @@ if(TARGET Vulkan::Headers)
     add_executable(arena_size_test test/arena_size_test.cpp)
     target_link_libraries(arena_size_test PRIVATE Vulkan::Headers)
     add_test(NAME arena_size COMMAND arena_size_test)
-    if(WIN32)
-      # #UD emulation of CLWB: instruction lengths for many addressing forms, from synthetic CONTEXT/EXCEPTION_RECORD.
-      add_executable(cpu_ud_emulate_clwb_test
-        test/cpu_ud_emulate_clwb_test.cpp
-        src/cpu_ud_emulate.cpp
-      )
-      target_compile_definitions(cpu_ud_emulate_clwb_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-      target_compile_options(cpu_ud_emulate_clwb_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-      add_test(NAME cpu_ud_emulate_clwb COMMAND cpu_ud_emulate_clwb_test)
-    endif()
   endif()
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
