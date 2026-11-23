@@ -147,5 +147,58 @@ class RcpF16ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(oracle_rcp_f16(F16_TWO, omod="mul:2"), F16_ONE)   # 0.5 * 2 = 1.0
         self.assertEqual(oracle_rcp_f16(F16_TWO, omod="div:2"), F16_QUARTER) # 0.5 / 2 = 0.25
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class ModifierFlags:
+    neg: bool = False
+    abs_val: bool = False
+    clamp: bool = False
+    omod: str | None = None
+    op_sel: tuple[int, int] = (0, 0)  # (src_hi, dst_hi)
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    mods: ModifierFlags = ModifierFlags()
+
+
+class RcpF16AstValidationTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = InstructionAST(
+            mnemonic="v_rcp_f16",
+            dst=Operand(RegKind.VGPR, 1),
+            src0=Operand(RegKind.VGPR, 0),
+            mods=ModifierFlags(clamp=True, omod="mul:2", op_sel=(1, 0)),
+        )
+        self.assertEqual(ast.mnemonic, "v_rcp_f16")
+        self.assertEqual(ast.dst.index, 1)
+        self.assertTrue(ast.mods.clamp)
+        self.assertEqual(ast.mods.omod, "mul:2")
+        self.assertEqual(ast.mods.op_sel, (1, 0))
+
+    def test_ast_imm_operand(self):
+        ast = InstructionAST(
+            mnemonic="v_rcp_f16",
+            dst=Operand(RegKind.VGPR, 2),
+            src0=Operand(RegKind.IMM, raw_val=F16_TWO),
+        )
+        self.assertEqual(ast.src0.kind, RegKind.IMM)
+        self.assertEqual(ast.src0.raw_val, F16_TWO)
+
 if __name__ == "__main__":
     unittest.main()
