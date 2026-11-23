@@ -384,5 +384,40 @@ class TestMax3I32RegisterAliasing(unittest.TestCase):
         self.assertEqual(machine.vgprs[0], 0xFFFF_FFFE)
 
 
+# ==============================================================================
+# Condition Codes, Status Flags, and Invariance
+# ==============================================================================
+
+class TestMax3I32StatusFlags(unittest.TestCase):
+    def test_scc_invariance(self):
+        machine = ScalarMachine()
+        machine.scc = 1
+        machine.vgprs[1] = -5
+        machine.vgprs[2] = 10
+        machine.vgprs[3] = 2
+        insn = VMax3I32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        machine.step(insn)
+        # VOP3 integer operations do not alter SCC
+        self.assertEqual(machine.scc, 1)
+
+    def test_exec_mask_invariance(self):
+        wave = SIMDWave(wave_size=64)
+        orig_mask = 0xAAAA_5555_AAAA_5555
+        wave.exec_mask = orig_mask
+        insn = VMax3I32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        wave.step(insn)
+        self.assertEqual(wave.exec_mask, orig_mask)
+
+
 if __name__ == '__main__':
     unittest.main()
