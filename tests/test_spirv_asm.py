@@ -177,6 +177,17 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertEqual(len(spv64), len(spv) + 8)  # one extra word per case literal
         _validate(spv64)
 
+        # OpLoad with memory operands uses the general instruction encoder for its result type.
+        asm_load64 = (asm
+                      .replace("OpTypePointer Function %uint", "OpTypePointer Function %ulong")
+                      .replace("OpStore %var %c_hex Nontemporal|Aligned 4", "OpStore %var %c64 Nontemporal|Aligned 8")
+                      .replace("OpLoad %uint %var Aligned|Nontemporal 4", "OpLoad %ulong %var Aligned|Nontemporal 8")
+                      .replace("OpSwitch %ld %def 0 %case0 1 %case1", "OpSwitch %ld %def 0 %case0 0x100000001 %case1")
+                      .replace("%c1 %case1 %ld %def", "%c1 %case1 %c0 %def"))
+        spv_load64 = spirv_asm.assemble(asm_load64, target_env="vulkan1.2")
+        self.assertEqual(len(spv_load64), len(spv) + 8)
+        _validate(spv_load64)
+
     def test_subword_integer_literals_use_the_declared_signedness(self) -> None:
         for width, signed, token, expected in (
             (8, 1, "0x80", 0xFFFFFF80),
