@@ -70,6 +70,15 @@ is zero. Together, the compact 2D, multi-slice and DXGI 11 rules resolve all 697
 descriptors, 14,011 2D compact descriptors and 5 DXGI 11 descriptors, leaving only BCPack
 under zlib/raw.
 
+## Checking an existing texture export
+
+Run `python -I tools/check_texture_pools.py <work>/assets` to check DDS files listed in the `ttpf` and
+`ttpf_pack` manifests. Pass a single texture pool directory to check just that pool. The tool reads the
+DDS header and compares the file size with the declared mip levels, layers, cube faces and depth slices.
+It reports totals and identifies pools with missing, unreadable, malformed, truncated or unsupported files.
+Rows with `File: null` are counted separately. The command returns 1 if a file or manifest fails verification,
+and 2 if it finds no pool manifests.
+
 ## Skip breakdown
 
 | Cause | Before | After (zlib/raw) |

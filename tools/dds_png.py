@@ -111,6 +111,9 @@ _DXGI_MAP: dict[int, str] = {
     54: "R16_FLOAT",
 }
 
+# These exported formats have a known byte layout even though PNG conversion does not decode them.
+_LAYOUT_ONLY_DXGI = {11: "RGBA16_UNORM", 61: "R8_UNORM", 95: "BC6H", 96: "BC6H"}
+
 # Bytes per texel and channels per texel of the half-float formats.
 _HALF_FLOAT_LAYOUT = {"RGBA16_FLOAT": (8, 4), "R16_FLOAT": (2, 1)}
 _HALF_TO_U8: bytes | None = None
@@ -208,6 +211,10 @@ class DdsError(ValueError):
     """Raised when DDS header or payload data is invalid or unsupported."""
 
 
+class UnsupportedDdsFormat(DdsError):
+    """Raised when the requested DDS operation does not support the format."""
+
+
 def _validate_mask(mask: int) -> tuple[int, int]:
     """Return (shift, max_value) for a contiguous 32-bit bitmask, or (0, 0) if zero."""
     if mask == 0:
@@ -235,6 +242,7 @@ class _DdsHeader(TypedDict):
 
 def _parse_header_internal(
     data: bytes | bytearray | memoryview,
+    *, layout_only: bool = False,
 ) -> tuple[_DdsHeader, tuple[int, int, int, int] | None, int]:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise DdsError(f"Expected bytes-like object, got {type(data).__name__}")
@@ -270,8 +278,10 @@ def _parse_header_internal(
                 masks = (0x000003FF, 0x000FFC00, 0x3FF00000, 0xC0000000)
             else:
                 fmt = _DXGI_MAP.get(dxgi_format)
+                if fmt is None and layout_only:
+                    fmt = _LAYOUT_ONLY_DXGI.get(dxgi_format)
             if fmt is None:
-                raise DdsError(f"Unsupported DXGI format: {dxgi_format}")
+                raise UnsupportedDdsFormat(f"Unsupported DXGI format: {dxgi_format}")
             data_offset = DDS_DX10_HEADER_SIZE
             alpha_mode = struct.unpack_from("<I", data, 144)[0] & DDS_ALPHA_MODE_MASK
         else:
@@ -279,10 +289,10 @@ def _parse_header_internal(
             if fourcc in (b"DXT2", b"DXT4"):
                 alpha_mode = DDS_ALPHA_MODE_PREMULTIPLIED
             if fmt is None:
-                raise DdsError(f"Unsupported DDS FourCC: {fourcc!r}")
+                raise UnsupportedDdsFormat(f"Unsupported DDS FourCC: {fourcc!r}")
     elif pf_flags & DDPF_RGB:
         if rgb_bit_count not in (24, 32):
-            raise DdsError(
+            raise UnsupportedDdsFormat(
                 f"Unsupported uncompressed RGB bit count: {rgb_bit_count} (only 24- and 32-bit supported)"
             )
         if not (pf_flags & DDPF_ALPHAPIXELS):
@@ -295,7 +305,7 @@ def _parse_header_internal(
         if rgb_bit_count == 24:
             fmt = _RGB24_LAYOUTS.get(masks)
             if fmt is None:
-                raise DdsError(
+                raise UnsupportedDdsFormat(
                     "Unsupported 24-bit RGB bitmask layout: "
                     f"0x{r_mask:08X}/0x{g_mask:08X}/0x{b_mask:08X}"
                 )
@@ -304,7 +314,7 @@ def _parse_header_internal(
             if fmt is None:
                 fmt = "RGBA8" if a_mask != 0 else "RGBX8"
     else:
-        raise DdsError(f"Unsupported DDS pixel format flags: 0x{pf_flags:08X}")
+        raise UnsupportedDdsFormat(f"Unsupported DDS pixel format flags: 0x{pf_flags:08X}")
 
     caps2 = struct.unpack_from("<I", data, 112)[0]
     if dxgi_format is not None:
@@ -368,7 +378,7 @@ class _Plane(NamedTuple):
 _TEXEL_BYTES = {
     "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4, "R11G11B10_FLOAT": 4,
     "BGR8": 3, "RGB8": 3, "R16_UNORM": 2, "A8_UNORM": 1,
-    "R32_FLOAT": 4,
+    "R32_FLOAT": 4, "RGBA16_UNORM": 8, "R8_UNORM": 1,
     **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
 }
 
@@ -420,6 +430,19 @@ def _locate_plane(info: _DdsHeader, *, mip: int = 0, layer: int = 0,
                            slice_bytes - row_pitch + row_bytes)
         chain_bytes += slice_bytes * max(1, info["depth"] >> level)
     return plane._replace(offset=info["data_offset"] + image_index * chain_bytes + plane.offset)
+
+
+def minimum_dds_size(header: bytes) -> int:
+    """Return the file size needed for all declared subresources, using only header bytes."""
+    if len(header) >= DDS_HEADER_SIZE:
+        if struct.unpack_from("<I", header, 4)[0] != 124 or struct.unpack_from("<I", header, 76)[0] != 32:
+            raise DdsError("Invalid DDS header or pixel format structure size")
+    info, _, _ = _parse_header_internal(header, layout_only=True)
+    mip = info["mip_count"] - 1
+    last = _locate_plane(info, mip=mip, layer=info["array_size"] - 1,
+                         face=info["faces"][-1] if info["faces"] else None,
+                         z=max(1, info["depth"] >> mip) - 1)
+    return last.offset + last.byte_length
 
 
 def _decode_uncompressed_32(
