@@ -379,5 +379,100 @@ class TestDsPermuteScalarInterpreter(unittest.TestCase):
         self.assertEqual(target, 0)
         self.assertEqual(data, 0x9999)
 
+
+class SIMDPermuteEngine:
+    """Architectural SIMD engine simulating vector execution under 32-bit and 64-bit EXEC masks."""
+
+    def __init__(self, lanes: int = 32) -> None:
+        self.lanes = lanes
+        self.vgprs: dict[int, list[int]] = {r: [0] * lanes for r in range(256)}
+        self.exec_mask: int = (1 << lanes) - 1
+
+    def set_vgpr(self, r: int, values: list[int]) -> None:
+        self.vgprs[r] = [v & MASK32 for v in values[:self.lanes]]
+
+    def get_vgpr(self, r: int) -> list[int]:
+        return list(self.vgprs.get(r, [0] * self.lanes))
+
+    def step_ds_permute(self, dst_idx: int, addr_idx: int, data_idx: int, offset: int = 0) -> None:
+        addrs = self.get_vgpr(addr_idx)
+        datas = self.get_vgpr(data_idx)
+        old_dsts = self.get_vgpr(dst_idx)
+
+        res = ref_ds_permute_wave(
+            addrs=addrs,
+            datas=datas,
+            exec_mask=self.exec_mask,
+            offset=offset,
+            lanes=self.lanes,
+            old_dsts=old_dsts,
+        )
+        self.vgprs[dst_idx] = res
+
+
+class TestDsPermuteSIMDExecution(unittest.TestCase):
+    """Part 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_full_exec_wave32_rotation(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        # Each lane i sends its data (1000 + i) to lane (i + 1) % 32
+        # Address in bytes: (i + 1) * 4
+        addrs = [((i + 1) % 32) * 4 for i in range(32)]
+        datas = [1000 + i for i in range(32)]
+        engine.set_vgpr(1, addrs)
+        engine.set_vgpr(2, datas)
+        engine.set_vgpr(0, [OLD_VDST] * 32)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        # Lane 0 receives lane 31's data; lane 1 receives lane 0's data
+        self.assertEqual(res[0], 1000 + 31)
+        for i in range(1, 32):
+            self.assertEqual(res[i], 1000 + i - 1)
+
+    def test_divergent_alternating_exec_even_active(self) -> None:
+        engine = SIMDPermuteEngine(lanes=32)
+        engine.exec_mask = 0x55555555  # Even lanes active (0, 2, 4, ...)
+        # Even lane i writes to i; odd lane i writes to i (but is inactive)
+        addrs = [i * 4 for i in range(32)]
+        datas = [700 + i for i in range(32)]
+        engine.set_vgpr(1, addrs)
+        engine.set_vgpr(2, datas)
+        engine.set_vgpr(0, [OLD_VDST] * 32)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(res[i], 700 + i)
+            else:
+                # Inactive destination lane preserves old vdst
+                self.assertEqual(res[i], OLD_VDST)
+
+    def test_wave64_divergent_halves(self) -> None:
+        engine = SIMDPermuteEngine(lanes=64)
+        # Lower half: full EXEC. Upper half: low 16 active (0xFFFF0000FFFF)
+        engine.exec_mask = (0x0000FFFF << 32) | 0xFFFFFFFF
+        addrs = [(i * 4) for i in range(64)]
+        datas = [2000 + i for i in range(64)]
+        engine.set_vgpr(1, addrs)
+        engine.set_vgpr(2, datas)
+        engine.set_vgpr(0, [OLD_VDST] * 64)
+
+        engine.step_ds_permute(dst_idx=0, addr_idx=1, data_idx=2)
+        res = engine.get_vgpr(0)
+
+        # Lower half all active
+        for i in range(32):
+            self.assertEqual(res[i], 2000 + i)
+        # Upper half lanes 32..47 active
+        for i in range(32, 48):
+            self.assertEqual(res[i], 2000 + i)
+        # Upper half lanes 48..63 inactive -> preserve OLD_VDST
+        for i in range(48, 64):
+            self.assertEqual(res[i], OLD_VDST)
+
 if __name__ == "__main__":
     unittest.main()
