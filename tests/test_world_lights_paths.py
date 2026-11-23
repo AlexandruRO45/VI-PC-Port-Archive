@@ -460,6 +460,41 @@ class ScanTest(unittest.TestCase):
                 self.assertIn("--start must be non-negative", err.getvalue())
                 self.assertFalse(os.path.exists(out))
 
+    def test_cli_rejects_start_at_or_past_the_end_of_the_archive(self):
+        # Before: a --start at or past the archive size scanned nothing and wrote a summary of 0 resources with
+        # exit 0, which reads exactly like an archive with no lights. Now: one ERROR line, exit 2, no report.
+        size = os.path.getsize(self.rpf)
+        for start in (size, size + 0x100000):
+            with self.subTest(start=hex(start)):
+                out = os.path.join(self.tmp.name, "summary.json")
+                lights = os.path.join(self.tmp.name, "lights.jsonl")
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = T.main([self.rpf, "--start", hex(start), "--out", out, "--lights-out", lights])
+                self.assertEqual(rc, 2)
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertTrue(lines[0].startswith(f"ERROR: {self.rpf}: --start {start:#x}"), lines[0])
+                self.assertIn(f"data area is 0x40..{size:#x}", lines[0])
+                self.assertFalse(os.path.exists(out))
+                self.assertFalse(os.path.exists(lights))
+                self.assertFalse(os.path.exists(lights + ".partial"))
+
+    def test_start_inside_the_archive_and_header_only_archive_still_scan(self):
+        # A start inside the data area still scans; one before the data area is clamped to it as before.
+        whole = T.summarize(T.scan(self.rpf))
+        self.assertEqual(T.summarize(T.scan(self.rpf, start=0x10)), whole)
+        self.assertEqual(T.summarize(T.scan(self.rpf, start=0x40)), whole)
+        self.assertEqual(T.scan(self.rpf, start=os.path.getsize(self.rpf) - 1)["resources"], 0)
+        # A header-only archive scanned without --start is still an empty summary, not an error.
+        empty = os.path.join(self.tmp.name, "header-only.rpf")
+        write_rpf(empty, [])
+        out = os.path.join(self.tmp.name, "empty.json")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(T.main([empty, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["resources_0x7a"], 0)
+
     def test_cli_rejects_shared_report_destination(self):
         out = os.path.join(self.tmp.name, "lights.json")
         alias = os.path.join(self.tmp.name, ".", "lights.json")

@@ -643,6 +643,9 @@ def scan(path, jobs=1, start=None, limit=None, lights_out=False):
         data_start = 0
     lo = max(data_start, start or 0)
     hi = size if limit is None else min(size, lo + limit)
+    if start is not None and lo >= hi:
+        # A start at or past the end would scan nothing and read like an archive with no lights.
+        raise ValueError(f"--start {start:#x} leaves nothing to scan: the data area is {data_start:#x}..{size:#x}")
     # Each window walks its own byte range; a resource that starts inside it is read to its end even past the
     # window, and the next window walks over it in its warm-up.
     step = 64 << 20
@@ -849,7 +852,7 @@ def main(argv=None):
                 ap.error("%s must use a different path than %s" % (rname, iname))
     try:
         total = scan(a.archive, a.jobs, a.start, a.limit, bool(a.lights_out))
-    except ValueError as e:  # a truncated RPF9 header: one error line, not a struct.error traceback
+    except ValueError as e:  # a truncated RPF9 header or a --start past the data: one error line, not a traceback
         print(f"ERROR: {a.archive}: {e}", file=sys.stderr)
         return 2
     try:
