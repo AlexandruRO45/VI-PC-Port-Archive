@@ -105,6 +105,8 @@ jobs:
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
         run: python -I tests/test_rpf9dump_exit_codes.py
+      # The standard-library loops run these files before any job builds tools/bcpack_calibration, so the tests that
+      # need the library skip there and run only here.
       - name: Build the calibrated BCPack reader and test the texture pipeline
         env:
           RPF9DUMP_DLL: tools/rpf9dump/bin/Release/net8.0/rpf9dump.dll
@@ -113,6 +115,7 @@ jobs:
           python -m pip install -c tests/requirements.txt numpy
           CARGO_HOME="$(mktemp -d)" cargo build --release --locked --offline --manifest-path tools/bcpack_calibration/Cargo.toml
           python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
+          python -I tests/test_bcpack_native.py
           python -I tests/test_calibrated_texture.py
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
