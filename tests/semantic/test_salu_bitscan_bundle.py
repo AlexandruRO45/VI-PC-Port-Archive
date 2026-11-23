@@ -158,5 +158,22 @@ class TestSFf0I32B32ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)  # SCC preserved
 
 
+class TestSFf0I32B32Bounds(unittest.TestCase):
+    """Bit scanning boundary and edge cases for s_ff0_i32_b32."""
+
+    def test_isolated_zero_bits(self):
+        for b in (0, 1, 7, 15, 23, 30, 31):
+            mask = (~(1 << b)) & MASK32
+            self.assertEqual(ref_ff0_i32_b32(mask), b)
+
+    def test_alternating_bit_patterns(self):
+        self.assertEqual(ref_ff0_i32_b32(0x55555555), 1)
+        self.assertEqual(ref_ff0_i32_b32(0xAAAAAAAA), 0)
+
+    def test_sign_and_high_masking(self):
+        self.assertEqual(ref_ff0_i32_b32(-1), MASK32)
+        self.assertEqual(ref_ff0_i32_b32(-2), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
