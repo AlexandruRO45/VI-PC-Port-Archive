@@ -1,4 +1,4 @@
-"""Every tool that imports a sibling module starts under the project's own `python -I` convention.
+"""Every tool that imports a sibling module or package starts under the project's own `python -I` convention.
 
 `-I` implies `-P`, so the script's directory is not put on `sys.path`; a tool that imports the module next to it
 has to add that directory itself (the pattern in `tools/anim_clips.py:40`). Two tools did not and died with
@@ -15,12 +15,13 @@ import importlib.util
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 TOOLS = os.path.join(ROOT, "tools")
-TOOL_NAMES = {os.path.splitext(os.path.basename(path))[0] for path in glob.glob(os.path.join(TOOLS, "*.py"))}
 NUMERIC = {"amd_swizzle", "calibrated_texture", "swizzle_search", "tex_export", "tex_mode_probe", "tile_probe"}
 
 # One process per tool is a few seconds in total; a hung import is a failure, not an infinite test.
@@ -40,11 +41,13 @@ def imports(path):
     return names
 
 
-def sibling_importers():
+def sibling_importers(tools=TOOLS):
+    scripts = sorted(glob.glob(os.path.join(tools, "*.py")))
+    names = {Path(path).stem for path in scripts}
+    names.update(Path(path).parent.name for path in glob.glob(os.path.join(tools, "*", "__init__.py")))
     found = []
-    for path in sorted(glob.glob(os.path.join(TOOLS, "*.py"))):
-        own = os.path.splitext(os.path.basename(path))[0]
-        if imports(path) & (TOOL_NAMES - {own}):
+    for path in scripts:
+        if imports(path) & (names - {Path(path).stem}):
             found.append(path)
     return found
 
@@ -63,6 +66,23 @@ class ToolStartupTests(unittest.TestCase):
                                       timeout=TIMEOUT, errors="replace")
                 self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
                 self.assertNotIn("Traceback", proc.stderr)
+
+    def test_discovers_tools_importing_sibling_modules_and_packages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tools = Path(directory)
+            package = tools / "sample_package"
+            package.mkdir()
+            (package / "__init__.py").write_text("TOKEN = 1\n", encoding="utf-8")
+            (tools / "sample_module.py").write_text("TOKEN = 1\n", encoding="utf-8")
+            for dependency in ("sample_module", "sample_package"):
+                (tools / f"use_{dependency}.py").write_text(
+                    f"from {dependency} import TOKEN\nimport argparse\nargparse.ArgumentParser().parse_args()\n",
+                    encoding="utf-8",
+                )
+            found = {Path(path).name for path in sibling_importers(directory)}
+
+            self.assertIn("use_sample_module.py", found)
+            self.assertIn("use_sample_package.py", found)
 
     def test_the_two_fixed_tools_are_in_the_scan(self):
         names = {os.path.splitext(os.path.basename(path))[0] for path in sibling_importers()}
