@@ -345,5 +345,37 @@ class TestVBfeU32ConditionCodes(unittest.TestCase):
         self.assertEqual(res, 0)
 
 
+class TestVBfeU32IEEE754(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_sign_bit_extraction_floats(self):
+        pos_zero = struct.unpack("<I", struct.pack("<f", +0.0))[0]
+        neg_zero = struct.unpack("<I", struct.pack("<f", -0.0))[0]
+        pos_inf = struct.unpack("<I", struct.pack("<f", math.inf))[0]
+        neg_inf = struct.unpack("<I", struct.pack("<f", -math.inf))[0]
+
+        self.assertEqual(ref_bfe_u32(pos_zero, 31, 1), 0)
+        self.assertEqual(ref_bfe_u32(neg_zero, 31, 1), 1)
+        self.assertEqual(ref_bfe_u32(pos_inf, 31, 1), 0)
+        self.assertEqual(ref_bfe_u32(neg_inf, 31, 1), 1)
+
+    def test_exponent_and_mantissa_extraction(self):
+        val = struct.unpack("<I", struct.pack("<f", 1.5))[0]
+        exp = ref_bfe_u32(val, 23, 8)
+        mant = ref_bfe_u32(val, 0, 23)
+        self.assertEqual(exp, 0x7F)
+        self.assertEqual(mant, 0x400000)
+
+    def test_subnormal_no_denorm_flushing(self):
+        subnormal_bits = 0x00000001
+        self.assertEqual(ref_bfe_u32(subnormal_bits, 0, 1), 1)
+        self.assertEqual(ref_bfe_u32(subnormal_bits, 23, 8), 0)
+
+    def test_nan_payload_preservation(self):
+        nan_bits = 0x7F800000 | 0x12345
+        payload = ref_bfe_u32(nan_bits, 0, 23)
+        self.assertEqual(payload, 0x12345)
+
+
 if __name__ == '__main__':
     unittest.main()
