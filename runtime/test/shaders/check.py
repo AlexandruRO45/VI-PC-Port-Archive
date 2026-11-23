@@ -1129,10 +1129,14 @@ def bindless_test(tools, spirv, pixel="ps_tex"):
 # Samples with a16 coordinates after whole-VGPR arguments (gradients, a bias, a clamp). On the 8x8 gradient every
 # pixel must be the texel its own (u, v) reads. ps_texture_grad_cl_a16 draws on the two-mip texture instead, where its
 # clamp picks mip 0 left of x = 32 and mip 1 from there on.
-GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16", "ps_texture_cl", "ps_texture_b_cl")
+GRADIENT_TESTS = ("ps_texture_grad_a16", "ps_texture_bias_a16", "ps_texture_grad_cl_a16", "ps_texture_cl", "ps_texture_b_cl",
+                  "ps_texture_cl_o")
 # ps_texture_cl / ps_texture_b_cl (image_sample_cl / _b_cl) draw on the two-mip texture too: the left half reads mip 0 (red,
-# the top-left quadrant), the right half mip 1 (cyan) where the clamp is 1.
-CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl")
+# the top-left quadrant), the right half mip 1 (cyan) where the clamp is 1. ps_texture_cl_o (image_sample_cl_o) samples
+# mip-0 texel 63 with a texel offset of (1, 0), so its left half reads texel 64 (green, the top-right quadrant); without
+# the offset it would read red.
+CLAMP_TESTS = ("ps_texture_cl", "ps_texture_b_cl", "ps_texture_cl_o")
+CLAMP_OFFSET_TESTS = ("ps_texture_cl_o",)
 
 
 def table_fetch_test(tools, spirv):
@@ -1169,7 +1173,9 @@ def texture_gradient_a16_test(tools: str, spirv: str, name: str = "ps_texture_gr
     first = ""
     for index, pixel in enumerate(struct.iter_unpack("<4f", data)):
         x, y = index % 64, index // 64
-        if name in CLAMP_TESTS:   # mip 1 (cyan) where the clamp is 1, else mip 0's top-left quadrant (red)
+        if name in CLAMP_OFFSET_TESTS:   # mip 1 (cyan) where the clamp is 1, else mip 0's top-right quadrant (green)
+            want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (0.0, 1.0, 0.0, 1.0)
+        elif name in CLAMP_TESTS:   # mip 1 (cyan) where the clamp is 1, else mip 0's top-left quadrant (red)
             want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0)
         elif two_mip:   # mip 1 (cyan) where the clamp is 1, else mip 0's red and blue quadrants
             want = (0.0, 1.0, 1.0, 1.0) if x >= 32 else (1.0, 0.0, 0.0, 1.0) if y < 32 else (0.0, 0.0, 1.0, 1.0)
