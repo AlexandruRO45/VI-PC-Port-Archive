@@ -35,11 +35,17 @@ function(check_protected_input name)
 endfunction()
 
 file(WRITE "${TEST_DIR}/skip.txt" "example\n")
+file(WRITE "${TEST_DIR}/seed.bin" "cache\n")
 file(SHA256 "${TEST_DIR}/index.json" index_before)
 file(SHA256 "${TEST_DIR}/skip.txt" skip_before)
+file(SHA256 "${TEST_DIR}/seed.bin" seed_before)
 check_protected_input("index.json" "${TEST_DIR}/index.json")
 check_protected_input("index.json" --stats "${TEST_DIR}/./index.json")
 check_protected_input("--skip-file" --skip-file "${TEST_DIR}/skip.txt" --inflight-file "${TEST_DIR}/skip.txt")
+check_protected_input("--merge-cache" "${TEST_DIR}/merged.bin" --merge-cache "${TEST_DIR}/seed.bin"
+                      --stats "${TEST_DIR}/seed.bin")
+check_protected_input("--merge-cache" "${TEST_DIR}/merged.bin" --merge-cache "${TEST_DIR}/skip.txt"
+                      --merge-cache "${TEST_DIR}/seed.bin" --inflight-file "${TEST_DIR}/./seed.bin")
 
 # A hard link has a distinct path even after normalization. Some filesystems cannot create one.
 file(CREATE_LINK "${TEST_DIR}/skip.txt" "${TEST_DIR}/skip-link.txt" RESULT hard_link)
@@ -47,11 +53,18 @@ if(hard_link STREQUAL "0")
   check_protected_input("--skip-file" --skip-file "${TEST_DIR}/skip.txt" --inflight-file "${TEST_DIR}/skip-link.txt")
   file(REMOVE "${TEST_DIR}/skip-link.txt")
 endif()
+file(CREATE_LINK "${TEST_DIR}/seed.bin" "${TEST_DIR}/seed-link.bin" RESULT hard_link)
+if(hard_link STREQUAL "0")
+  check_protected_input("--merge-cache" "${TEST_DIR}/merged.bin" --merge-cache "${TEST_DIR}/seed.bin"
+                        --stats "${TEST_DIR}/seed-link.bin")
+  file(REMOVE "${TEST_DIR}/seed-link.bin")
+endif()
 
 file(SHA256 "${TEST_DIR}/index.json" index_after)
 file(SHA256 "${TEST_DIR}/skip.txt" skip_after)
-if(NOT index_before STREQUAL index_after OR NOT skip_before STREQUAL skip_after)
-  message(FATAL_ERROR "Input/output conflicts modified the index or the skip file")
+file(SHA256 "${TEST_DIR}/seed.bin" seed_after)
+if(NOT index_before STREQUAL index_after OR NOT skip_before STREQUAL skip_after OR NOT seed_before STREQUAL seed_after)
+  message(FATAL_ERROR "Input/output conflicts modified the index, the skip file or a --merge-cache file")
 endif()
 
 execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}"

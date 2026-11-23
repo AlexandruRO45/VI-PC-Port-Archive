@@ -908,6 +908,11 @@ int main(int argc, char** argv) {
         const char* input = nullptr;
         if (same_file(*output, index_path)) input = "index.json";
         else if (!skip_path.empty() && same_file(*output, skip_path)) input = "--skip-file";
+        // The cache is written only after every --merge-cache file is read; the reports are opened while they are.
+        else if (output != &cache_path) {
+            for (const auto& merge : merge_paths)
+                if (same_file(*output, merge)) input = "--merge-cache";
+        }
         if (input) {
             std::fprintf(stderr, "error: %s must not overwrite %s\n", option, input);
             return 2;
