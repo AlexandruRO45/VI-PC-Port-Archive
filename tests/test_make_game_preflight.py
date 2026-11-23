@@ -364,6 +364,10 @@ class PreflightPrerequisiteTest(PreflightTestBase):
         patcher = mock.patch("make_game.dotnet_sdk_ok", side_effect=lambda: bool(shutil.which("dotnet")))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The spirv-val option probe (SpirvValOptionsTest below) runs the binary, which these tests fake by name.
+        patcher = mock.patch("make_game.spirv_val_options_ok", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_preflight_success_all_tools_present_and_space_sufficient(self):
         with tempfile.TemporaryDirectory() as tmp_work:
@@ -1299,6 +1303,77 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
             finally:
                 if os.name == "nt":
                     os.rmdir(link)
+
+
+class SpirvValOptionsTest(PreflightTestBase):
+    """A spirv-val that does not know the options rdna2spirv.py validates with refuses every module, so the shaders
+    stage would translate the whole corpus and keep nothing. preflight runs it once with those options first."""
+
+    def test_probe_passes_the_options_then_version(self):
+        done = subprocess.CompletedProcess([], 0, "SPIRV-Tools 2026.4\n", "")
+        with mock.patch("subprocess.run", return_value=done) as run:
+            self.assertTrue(make_game.spirv_val_options_ok("spirv-val"))
+        self.assertEqual(run.call_args.args[0], ["spirv-val", *make_game.SPIRV_VAL_OPTIONS, "--version"])
+
+    def test_probe_refuses_a_spirv_val_that_prints_its_usage(self):
+        # SPIRV-Tools v2024.4 (Vulkan SDK 1.3.296): an unknown option prints the usage and exits 1.
+        usage = subprocess.CompletedProcess([], 1, "spirv-val - Validate a SPIR-V binary file.\n", "")
+        with mock.patch("subprocess.run", return_value=usage):
+            self.assertFalse(make_game.spirv_val_options_ok("spirv-val"))
+
+    def test_probe_refuses_a_spirv_val_that_cannot_run(self):
+        with mock.patch("subprocess.run", side_effect=OSError("not a program")):
+            self.assertFalse(make_game.spirv_val_options_ok("spirv-val"))
+
+    def _tools(self, tmp_work):
+        """llvm-mc, spirv-as and spirv-val as real files, so preflight runs the probe on spirv-val's path."""
+        paths = {}
+        for name in ("llvm-mc", "spirv-as", "spirv-val"):
+            path = os.path.join(tmp_work, name + ".exe")
+            with open(path, "wb"):
+                pass
+            paths[name] = path
+        return paths
+
+    def test_preflight_refuses_an_old_spirv_val(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            paths = self._tools(tmp_work)
+            with mock.patch.dict(os.environ, {"LLVM_MC": paths["llvm-mc"]}), \
+                 mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("shutil.which", side_effect=lambda t: paths.get(t, t if t == paths["llvm-mc"] else None)), \
+                 mock.patch("make_game.spirv_val_options_ok", return_value=False) as probe, \
+                 mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+                err = self.assert_fails(make_game.preflight, ["shaders"], tmp_work, match="a newer spirv-val")
+            probe.assert_called_once_with(paths["spirv-val"])
+            self.assertIn("--allow-offset-texture-operand", err)
+            self.assertNotIn("spirv-as:", err)
+
+    def test_preflight_accepts_a_spirv_val_that_knows_the_options(self):
+        with tempfile.TemporaryDirectory() as tmp_work:
+            paths = self._tools(tmp_work)
+            with mock.patch.dict(os.environ, {"LLVM_MC": paths["llvm-mc"]}), \
+                 mock.patch("sys.version_info", (3, 12, 0)), \
+                 mock.patch("shutil.which", side_effect=lambda t: paths.get(t, t if t == paths["llvm-mc"] else None)), \
+                 mock.patch("make_game.spirv_val_options_ok", return_value=True) as probe, \
+                 mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+                make_game.preflight(["shaders"], tmp_work)
+            probe.assert_called_once_with(paths["spirv-val"])
+
+    def test_preflight_does_not_probe_without_the_shaders_stage(self):
+        with tempfile.TemporaryDirectory() as tmp_work, \
+             mock.patch("sys.version_info", (3, 12, 0)), \
+             mock.patch("make_game.spirv_val_options_ok") as probe, \
+             mock.patch("shutil.disk_usage", return_value=Usage(100 * 2**30, 0, 100 * 2**30)):
+            make_game.preflight(["check"], tmp_work)
+        probe.assert_not_called()
+
+    def test_options_match_what_rdna2spirv_validates_with(self):
+        with open(os.path.join(ROOT, "tools", "rdna2spirv.py"), encoding="utf-8") as f:
+            source = f.read()
+        calls = re.findall(r'_run_spirv_tool\(\[\s*"spirv-val",((?:\s*"[^"]*",)+)', source)
+        self.assertEqual(len(calls), 1, "expected one spirv-val call in tools/rdna2spirv.py")
+        self.assertEqual(tuple(re.findall(r'"([^"]*)"', calls[0][0] if isinstance(calls[0], tuple) else calls[0])),
+                         make_game.SPIRV_VAL_OPTIONS)
 
 
 if __name__ == "__main__":

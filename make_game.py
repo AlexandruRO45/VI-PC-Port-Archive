@@ -844,6 +844,13 @@ def preflight(stages: list, work: str, wav: bool = False, runtime_build: str | N
         for t in ("spirv-as", "spirv-val"):
             if not shutil.which(t):
                 missing.append(f"{t}: install the Vulkan SDK, https://vulkan.lunarg.com/ (then reopen the terminal)")
+        # Only a spirv-val that is a file on disk is run: the one on PATH, as rdna2spirv.py will run it.
+        spirv_val = shutil.which("spirv-val")
+        if spirv_val and os.path.isfile(spirv_val) and not spirv_val_options_ok(spirv_val):
+            missing.append(
+                f"a newer spirv-val: {spirv_val} does not accept {' '.join(SPIRV_VAL_OPTIONS)}, which every shader "
+                "is validated with, so no shader would pass (SPIRV-Tools v2024.4 from Vulkan SDK 1.3.296 is too old). "
+                "Install a current Vulkan SDK, https://vulkan.lunarg.com/, or SPIRV-Tools, first on PATH")
     if "assets" in stages:
         if not dotnet_sdk_ok():
             missing.append(".NET 8 SDK (the .NET runtime alone can't build rpf9dump): "
@@ -1011,6 +1018,23 @@ def cross_build_missing() -> list:
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "
                        "~/.local/share/xwin-sdk, see docs/testing.md, \"The Windows runtime on Linux\"")
     return missing
+
+
+# The options tools/rdna2spirv.py validates every module with (assemble_spirv; tests/test_make_game_preflight.py
+# checks the two lists match). A spirv-val that does not know one of them prints its usage and exits 1 for every
+# shader, so the shaders stage translates the whole corpus, keeps no module and stops at --merge. SPIRV-Tools
+# v2024.4 (Vulkan SDK 1.3.296) does not know --allow-offset-texture-operand; 2026.4 does.
+SPIRV_VAL_OPTIONS = ("--target-env", "vulkan1.2", "--allow-offset-texture-operand")
+
+
+def spirv_val_options_ok(spirv_val: str) -> bool:
+    """True if `spirv_val` accepts SPIRV_VAL_OPTIONS. With `--version` after them it parses the options and exits
+    without a module: 0 when it knows them all, 1 with its usage text when it does not."""
+    try:
+        r = subprocess.run([spirv_val, *SPIRV_VAL_OPTIONS, "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
 
 
 def dotnet_sdk_ok() -> bool:

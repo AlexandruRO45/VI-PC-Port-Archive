@@ -104,7 +104,8 @@ Your game folder is the one that holds `MicrosoftGame.Config` and the `.rpf` arc
 - **Windows 10/11 x64**, with about **400 GB** free for work files (an assets export alone measured about 337 GB before its audio step, in about 2 h 35 min). Disk sizes here are as Windows Explorer shows them, which are GiB: 400 GiB is about 430 GB in decimal units. They can go on another drive with `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (tick "Add python.exe to PATH").
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
-- [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`.
+- [Vulkan SDK](https://vulkan.lunarg.com/), for `spirv-as` / `spirv-val`. A current one: the `spirv-val` of SDK
+  1.3.296 (SPIRV-Tools v2024.4) lacks an option every shader is validated with, and the build stops before translating.
 - [LLVM 21+](https://github.com/llvm/llvm-project/releases) with the **AMDGPU target** for `llvm-mc`. The official
   Windows build has no AMDGPU target. On Windows, `scripts\build_llvm_mc.ps1` builds a native `llvm-mc.exe` with it
   (no WSL; needs git and the Visual Studio C++ tools below) and sets `LLVM_MC`; it takes about 20-40 minutes. A faster
