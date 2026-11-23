@@ -7,14 +7,14 @@
 #include <new>
 #include <thread>
 #include <utility>
+#include <utility>
 
 // Fail one ordinary allocation on this test thread. Keep the injection confined to this executable.
 static thread_local bool fail_next_allocation = false;
 
 void* operator new(std::size_t size) {
-    if (!std::exchange(fail_next_allocation, false)) {
-        if (void* memory = std::malloc(size ? size : 1)) return memory;
-    }
+    if (std::exchange(fail_next_allocation, false)) throw std::bad_alloc{};
+    if (void* memory = std::malloc(size ? size : 1)) return memory;
     throw std::bad_alloc{};
 }
 
