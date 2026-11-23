@@ -78,7 +78,7 @@ target_link_options(xmem_shim_check PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi
 target_include_directories(xmem_shim_check PRIVATE src)
 target_compile_features(xmem_shim_check PRIVATE cxx_std_17)
 # working_set_aggregation feeds synthetic adapter readings to src/xmem_gpu_usage.h.
-foreach(scenario IN ITEMS exports allocation default_allocation query working_set working_set_aggregation)
+foreach(scenario IN ITEMS exports allocation default_allocation physical_pages query working_set working_set_aggregation)
     add_test(NAME xmem_shim_${scenario} COMMAND xmem_shim_check ${scenario})
 endforeach()
 # XMemGetWorkingSetStatistics differences around D3D12 heap and committed-resource lifetimes.
@@ -2480,6 +2480,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     target_link_libraries(cpu_two_imports PRIVATE cpu_import_provider cpu_register_probe)
     add_library(pe_map SHARED tools/pe_map.cpp)
     target_link_libraries(pe_map PRIVATE bcrypt)
+    add_executable(cpu_xmem_physical tests/cpu/xmem_physical.asm)
+    set_target_properties(cpu_xmem_physical PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_options(cpu_xmem_physical PRIVATE /ENTRY:native_entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    target_link_libraries(cpu_xmem_physical PRIVATE xmem_shim)
+    add_test(NAME cpu_native_xmem_physical COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/xmem_physical_check.py" "$<TARGET_FILE:pe_map>"
+        "$<TARGET_FILE:cpu_xmem_physical>" "$<TARGET_FILE:xmem_shim>")
     add_library(cpu_shim_startup_guest SHARED tests/cpu/shim_startup.cpp)
     target_compile_features(cpu_shim_startup_guest PRIVATE cxx_std_17)
     set_target_properties(cpu_shim_startup_guest PROPERTIES MSVC_RUNTIME_LIBRARY MultiThreaded)

@@ -31,6 +31,8 @@ extern "C" __declspec(dllimport) void* XMemAllocDefault(SIZE_T bytes, ULONGLONG 
 extern "C" __declspec(dllimport) void XMemFreeDefault(void* allocation, ULONGLONG attributes);
 extern "C" __declspec(dllimport) BOOL XMemVirtualQuery(HANDLE process, LPCVOID address, void* buffer);
 extern "C" __declspec(dllimport) BOOL XMemGetWorkingSetStatistics(UINT32 selector, void* statistics);
+extern "C" __declspec(dllimport) BOOL XMemAllocatePhysicalPages(ULONGLONG flags, SIZE_T* page_count, ULONGLONG* pages);
+extern "C" __declspec(dllimport) BOOL XMemFreePhysicalPages(SIZE_T page_count, ULONGLONG* pages);
 
 using namespace std::literals;
 using Byte = unsigned char;
@@ -68,11 +70,14 @@ bool export_checks()
     if (!module) return false;
     unsigned found = 0;
     for (const char* name : {"XMemAlloc", "XMemFree", "XMemAllocDefault", "XMemFreeDefault",
-                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics"}) {
+                             "XMemVirtualQuery", "XMemGetWorkingSetStatistics",
+                             "XMemAllocatePhysicalPages", "XMemFreePhysicalPages"}) {
         if (!GetProcAddress(module, name)) return false;
         ++found;
     }
-    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery"};
+    const char* existing[] = {"XMemAlloc", "XMemFree", "XMemGetWorkingSetStatistics", "XMemVirtualQuery",
+                              "XMemAllocDefault", "XMemFreeDefault", "XMemAllocatePhysicalPages",
+                              "XMemFreePhysicalPages"};
     for (WORD ordinal = 1; ordinal <= std::size(existing); ++ordinal) {
         if (GetProcAddress(module, MAKEINTRESOURCEA(ordinal)) != GetProcAddress(module, existing[ordinal - 1]))
             return false;
@@ -114,6 +119,63 @@ bool allocation_checks(decltype(&XMemAlloc) allocate, decltype(&XMemFree) releas
     release(nullptr, amd_word);
     return allocate(0, bink_word) == nullptr && allocate(64, bink_word | (ULONGLONG{1} << 40)) == nullptr &&
            allocate(512, (amd_word & ~(ULONGLONG{15} << 29)) | (ULONGLONG{7} << 29)) == nullptr;
+}
+
+bool physical_pages_checks()
+{
+    constexpr ULONGLONG pages_64k = 0x20400000;
+    constexpr ULONGLONG pages_large = 0x20000000;
+    ULONGLONG pages[2] = {};
+    SIZE_T count = std::size(pages);
+
+    // A valid 64 KiB request returns distinct nonzero PFNs and leaves the count alone.
+    if (!XMemAllocatePhysicalPages(pages_64k, &count, pages) || count != std::size(pages) ||
+        pages[0] == 0 || pages[1] == 0 || pages[0] == pages[1]) return false;
+    if (!XMemFreePhysicalPages(count, pages)) return false;
+    SetLastError(0);
+    if (XMemFreePhysicalPages(1, pages) || GetLastError() != ERROR_INVALID_PARAMETER) return false;
+
+    // Zero pages are accepted with a null array; a missing count or array is rejected.
+    count = 0;
+    if (!XMemAllocatePhysicalPages(pages_64k, &count, nullptr) || !XMemFreePhysicalPages(0, nullptr)) return false;
+    SetLastError(0);
+    if (XMemAllocatePhysicalPages(pages_64k, nullptr, pages) || GetLastError() != ERROR_INVALID_PARAMETER) return false;
+    count = 1;
+    SetLastError(0);
+    if (XMemAllocatePhysicalPages(pages_64k, &count, nullptr) || count != 0 ||
+        GetLastError() != ERROR_INVALID_PARAMETER) return false;
+
+    // The large-page flag requires a 32-page multiple.
+    count = 3;
+    SetLastError(0);
+    if (XMemAllocatePhysicalPages(pages_large, &count, pages) || count != 0 ||
+        GetLastError() != ERROR_INVALID_PARAMETER) return false;
+    std::vector<ULONGLONG> large_pages(32);
+    count = large_pages.size();
+    if (!XMemAllocatePhysicalPages(pages_large, &count, large_pages.data()) || count != large_pages.size() ||
+        !XMemFreePhysicalPages(count, large_pages.data())) return false;
+
+    // Release failures do not consume a valid set, so the same set can be released once.
+    SetLastError(0);
+    if (XMemFreePhysicalPages(1, nullptr) || GetLastError() != ERROR_NOACCESS) return false;
+    ULONGLONG unknown[] = {0xdeadbeef};
+    SetLastError(0);
+    if (XMemFreePhysicalPages(std::size(unknown), unknown) || GetLastError() != ERROR_INVALID_PARAMETER) return false;
+    count = std::size(pages);
+    if (!XMemAllocatePhysicalPages(pages_64k, &count, pages)) return false;
+    ULONGLONG duplicate[] = {pages[0], pages[0]};
+    SetLastError(0);
+    if (XMemFreePhysicalPages(std::size(duplicate), duplicate) || GetLastError() != ERROR_INVALID_PARAMETER) return false;
+    if (!XMemFreePhysicalPages(count, pages)) return false;
+
+    // An impossible request fails without changing the array or keeping the count.
+    count = SIZE_MAX;
+    SetLastError(0);
+    if (XMemAllocatePhysicalPages(pages_64k, &count, pages) || count != 0 ||
+        GetLastError() != ERROR_NOT_ENOUGH_MEMORY) return false;
+
+    std::printf("physical pages: allocation, failure and chunked release checks\n");
+    return true;
 }
 
 bool query_checks()
@@ -477,6 +539,8 @@ int main(int argc, char** argv)
         passed = allocation_checks(XMemAlloc, XMemFree);
     } else if (scenario == "default_allocation"sv) {
         passed = allocation_checks(XMemAllocDefault, XMemFreeDefault);
+    } else if (scenario == "physical_pages"sv) {
+        passed = physical_pages_checks();
     } else if (scenario == "query"sv) {
         passed = query_checks();
     } else if (scenario == "working_set"sv) {
