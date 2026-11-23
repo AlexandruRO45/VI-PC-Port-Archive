@@ -543,3 +543,11 @@ class FmaFusedSuite(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Float64SkipTest(unittest.TestCase):
+    def test_missing_float64_is_a_skip(self):
+        ok, msg = rgt.judge_cs_dump(77, "unsupported: x uses Float64 and the device has no shaderFloat64", [0],
+                                    wave64=False, partial=False, emulated=False)
+        self.assertIsNone(ok)
+        self.assertIn("shaderFloat64", msg)

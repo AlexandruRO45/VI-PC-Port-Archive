@@ -345,6 +345,8 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
     reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
     no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
+    if rc == 77 and "shaderFloat64" in msg:
+        return None, "SKIP (no shaderFloat64 on this device)"
     if (wave64 and rc == 77) or (no64 and rc == 0):
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if rc == 0 and wave64 and "compute subgroup size: 64" not in msg.splitlines():
