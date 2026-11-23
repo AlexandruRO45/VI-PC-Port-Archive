@@ -106,10 +106,8 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       # The pinned SDL3 release, the same SHA-256 as URL_HASH in runtime/CMakeLists.txt; the SDL3 cache below is
-      # keyed on it. Bump SDL3_CACHE_SALT when the SDL3 build options change - the cache holds objects and
-      # generated files, and no toolchain version notices an option change.
+      # keyed on it.
       SDL3_TARBALL_SHA256: f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f
-      SDL3_CACHE_SALT: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -239,11 +237,12 @@ jobs:
           Copy-Item -LiteralPath (Join-Path $bin 'glslang.exe') -Destination (Join-Path $bin 'glslangValidator.exe')
           Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8
       # Every run that builds the shim compiles SDL3 from the pinned release. Cache the fetched sources and that
-      # build tree so a run with the same tarball and the same toolchain reuses them. The toolchain versions are in
-      # the key as well as the salt, so a new cl, CMake or Ninja, or a changed SDL3 build option, starts empty instead
-      # of reusing objects and generated files another toolchain wrote. Ninja's own log and deps database sit in
-      # runtime/build, not in _deps, and ninja treats an output with no log entry as dirty: without them a restored
-      # _deps tree is recompiled edge by edge, which was measured at 246 of 246 SDL3 edges against 6 with them.
+      # build tree so a run with the same tarball and the same toolchain reuses them. Ninja's own log and deps
+      # database sit in runtime/build, not in _deps, and ninja treats an output with no log entry as dirty: without
+      # them a restored _deps tree is recompiled edge by edge, measured at 246 of 246 SDL3 edges against 6 with them.
+      # The toolchain versions are in the key because a compiler upgraded in place keeps its path, so a command line
+      # is unchanged and the log alone would reuse the old objects; a changed SDL3 build option does change the
+      # command lines and rebuilds the affected edges by itself, which is why there is no separate salt.
       - name: Read the tool versions for the SDL3 cache key
         id: sdl3-toolset
         shell: pwsh
@@ -268,7 +267,7 @@ jobs:
             runtime/build/_deps/sdl3-build
             runtime/build/.ninja_log
             runtime/build/.ninja_deps
-          key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ env.SDL3_CACHE_SALT }}-${{ steps.sdl3-toolset.outputs.version }}
+          key: sdl3-3.4.20-${{ env.SDL3_TARBALL_SHA256 }}-${{ steps.sdl3-toolset.outputs.version }}
       - name: Configure
         env:
           VULKAN_SDK: ${{ github.workspace }}/.vulkan-headers
