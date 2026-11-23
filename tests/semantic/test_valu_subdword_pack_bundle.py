@@ -131,6 +131,28 @@ class TestPackB32F16Aliasing(unittest.TestCase):
         spv = support.translate_lines("ps_pack_alias_s1", code)
         self.assertEqual(support.mrt0_words(spv)[0], 0x4444_3333)
 
+class TestPackB32F16Constants(unittest.TestCase):
+    def test_literal_operand(self):
+        code = [
+            "v_mov_b32_e32 v1, 0x5555",
+            "v_pack_b32_f16 v0, v1, 0x6666",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pack_literal", code)
+        self.assertEqual(support.mrt0_words(spv)[0], 0x6666_5555)
+
+    def test_inline_float_constant(self):
+        code = [
+            "v_mov_b32_e32 v1, 0x7777",
+            "v_pack_b32_f16 v0, 1.0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_pack_fimm", code)
+        # 1.0 in f16 is 0x3C00
+        self.assertEqual(support.mrt0_words(spv)[0], 0x7777_3C00)
+
 
 if __name__ == "__main__":
     unittest.main()
