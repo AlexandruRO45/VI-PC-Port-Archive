@@ -33,6 +33,7 @@ be passed directly. The texture column keeps its display name or hash. A separat
 
 ``--json`` writes the full per-material report and ``--csv`` one row per
 binding; neither may overwrite an input. Standard library only.
+Usage: `python -I tools/character_textures.py --help` lists the options.
 """
 import argparse
 import csv
