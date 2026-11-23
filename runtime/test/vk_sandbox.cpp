@@ -271,7 +271,7 @@ int main(int argc, char** argv) {
     if (window) { ici.enabledExtensionCount = 2; ici.ppEnabledExtensionNames = inst_ext; }
     if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS) { std::fprintf(stderr, "unsupported: no Vulkan instance\n"); return 77; }
     LI(vkEnumeratePhysicalDevices); LI(vkGetPhysicalDeviceProperties); LI(vkGetPhysicalDeviceQueueFamilyProperties);
-    LI(vkGetPhysicalDeviceMemoryProperties); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
+    LI(vkGetPhysicalDeviceMemoryProperties); LI(vkGetPhysicalDeviceFeatures2); LI(vkCreateDevice); LI(vkGetDeviceProcAddr);
     uint32_t n = 0;
     CHECK(vkEnumeratePhysicalDevices(inst, &n, nullptr));
     if (!n) { std::fprintf(stderr, "unsupported: no Vulkan physical device\n"); return 77; }
@@ -287,6 +287,12 @@ int main(int argc, char** argv) {
     constexpr uint32_t push_words = 36, push_bytes = push_words * 4;
     if (props.limits.maxPushConstantsSize < push_bytes) { std::fprintf(stderr, "unsupported: push constants\n"); return 77; }
     std::fprintf(stderr, "device: %s\n", props.deviceName);
+    // The translated vertex shaders declare DrawParameters for zero-based v0/v3, so the device must enable the
+    // feature the same way vk_harness does; a shader module that declares it cannot be used without it.
+    VkPhysicalDeviceVulkan11Features have11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 have{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &have11};
+    vkGetPhysicalDeviceFeatures2(pd, &have);
+    if (!have11.shaderDrawParameters) { std::fprintf(stderr, "unsupported: shaderDrawParameters\n"); return 77; }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
     uint32_t qi = 0;
@@ -317,8 +323,12 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     f12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
-    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
+    VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    f11.shaderDrawParameters = VK_TRUE;
+    f11.pNext = &f12;
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f11;
     f2.features.shaderInt64 = VK_TRUE;
+    f2.features.samplerAnisotropy = have.features.samplerAnisotropy;
     const char* dev_ext[1] = {"VK_KHR_swapchain"};
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
@@ -439,6 +449,8 @@ int main(int argc, char** argv) {
     VkSamplerCreateInfo sci = leonida::gfx10::vulkan_sampler(leonida::gfx10::decode(
         leonida::gfx10::SamplerWords{ssharp[0], ssharp[1], ssharp[2], ssharp[3]}));
     sci.maxLod = 0;   // the scene stores mip 0 only
+    // The literal S# decodes to an anisotropic sampler; a device without samplerAnisotropy must sample without it.
+    if (!have.features.samplerAnisotropy) { sci.anisotropyEnable = VK_FALSE; sci.maxAnisotropy = 1.0f; }
     VkSampler smp; CHECK(vkCreateSampler(dev, &sci, nullptr, &smp));
 
     // Targets: RGBA8 colour + D32 depth.
