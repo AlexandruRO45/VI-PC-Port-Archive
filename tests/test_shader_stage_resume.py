@@ -6,6 +6,7 @@ import ast
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -54,7 +55,7 @@ class EmptyUnpackTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with open(os.path.join(d, "junk.dxbc"), "wb") as f:
                 f.write(b"DXBC" + bytes(60))     # no parts: nothing to unpack
-            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("ERROR", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
@@ -62,7 +63,7 @@ class EmptyUnpackTest(unittest.TestCase):
 
     def test_empty_folder_fails_clearly(self):
         with tempfile.TemporaryDirectory() as d:
-            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True)
+            r = subprocess.run([sys.executable, "-I", UNPACK, d], capture_output=True, text=True, errors="replace")
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
@@ -94,7 +95,9 @@ class ShaderStageResumeTest(unittest.TestCase):
             elif p == os.path.join(self.dxbc, "fssm_index.json"):
                 json.dump([{"name": "s0"}], f)
             elif p == os.path.join(self.spirv, "index.json"):
-                json.dump({}, f)
+                json.dump({"s0": {"stage": "cs"}}, f)
+                with open(os.path.join(self.spirv, "s0.spv"), "wb") as module:
+                    module.write(b"\x03\x02\x23\x07" + bytes(32))
             elif p.endswith(".s"):
                 f.write("synthetic listing\n")
 
@@ -111,7 +114,13 @@ class ShaderStageResumeTest(unittest.TestCase):
 
     def fake_translate(self, disasm, spirv, jobs, emulate=False, fallbacks=()):
         self.ran.append("translate (emulated)" if emulate else "translate")
-        self.touch(spirv, "index.json")
+        names = [Path(listing).stem for listing in os.listdir(disasm) if listing.endswith(".s")]
+        os.makedirs(spirv, exist_ok=True)
+        for name in names:
+            with open(os.path.join(spirv, name + ".spv"), "wb") as f:
+                f.write(b"\x03\x02\x23\x07" + bytes(32))
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({name: {"stage": "cs"} for name in names}, f)
 
     def run_stage(self, emulate=None, jobs=2):
         self.ran = []
@@ -232,9 +241,9 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.touch(self.dxbc, "index.json")
         self.touch(self.dxbc, "fssm_index.json")
         with open(os.path.join(self.dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump([{"file": name + ".dxbc"} for name in ("s0", "s1", "unsupported")], f)
+            json.dump([{"file": name + ".dxbc"} for name in ("s0", "s1")], f)
         with open(os.path.join(self.dxbc, "fssm_index.json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump([{"name": name} for name in ("s0", "s1", "unsupported")], f)
+            json.dump([{"name": name} for name in ("s0", "s1")], f)
 
         original = self.fake_py
 
@@ -273,6 +282,22 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertGreater(os.path.getsize(listing), 0)
+        self.assertEqual(self.run_stage(), [])
+
+    def test_deleting_every_listing_and_the_translation_disassembles_again(self):
+        # README.md, "Low disk space": deleting the .s files with spirv/index.json must not leave the stage
+        # looking finished with zero shaders.
+        self.assertEqual(self.run_stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"])
+        disasm = os.path.join(self.dxbc, "disasm")
+        for name in os.listdir(disasm):
+            if name.endswith(".s"):
+                os.remove(os.path.join(disasm, name))
+        os.remove(os.path.join(self.spirv, "index.json"))
+
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+        self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(os.path.isfile(os.path.join(disasm, "s0.s")))
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
         self.assertEqual(self.run_stage(), [])
 
     def test_translation_stopped_after_many_files_runs_again(self):
@@ -323,6 +348,28 @@ class ShaderStageResumeTest(unittest.TestCase):
         self.touch(self.spirv, "index.json")                # translated by a build from before disasm.done
         self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
         self.assertTrue(os.path.isfile(os.path.join(self.dxbc, "disasm.done")))
+        self.assertEqual(self.run_stage(), [])
+
+    def test_legacy_completion_marker_with_a_missing_listing_disassembles_everything_again(self):
+        # A disasm.done from before the listings were recorded holds only the llvm-mc signature: with a listing
+        # missing it can't tell which ones are current, so the whole disassembly runs again, not a resume.
+        self.touch(self.dxbc, "index.json")
+        self.touch(self.dxbc, "fssm_index.json")
+        self.touch(self.spirv, "index.json")
+        with open(os.path.join(self.dxbc, "disasm.done"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(make_game.llvm_mc_signature() + "\n")
+        os.makedirs(os.path.join(self.dxbc, "disasm"))
+        self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+
+        original = self.fake_py
+
+        def disassemble(tool, *args):
+            self.assertNotIn("--skip-existing", args)
+            original(tool, *args)
+
+        with mock.patch.object(self, "fake_py", side_effect=disassemble):
+            self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+        self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
         self.assertEqual(self.run_stage(), [])
 
     def test_old_disassembly_layout_is_rebuilt_in_the_current_location(self):
@@ -532,7 +579,8 @@ class MergePublishesLastTest(unittest.TestCase):
 
     def merge(self, out):
         tool = os.path.join(make_game.TOOLS, "rdna2spirv.py")
-        return subprocess.run([sys.executable, "-I", tool, out, "--out", out, "--merge"], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", tool, out, "--out", out, "--merge"],
+                              capture_output=True, text=True, errors="replace")
 
     def test_a_failed_stub_write_leaves_no_index_and_a_retry_publishes_it(self):
         with tempfile.TemporaryDirectory() as out:
