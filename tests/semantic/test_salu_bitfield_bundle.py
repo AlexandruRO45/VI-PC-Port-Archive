@@ -433,5 +433,19 @@ class TestSBfeI64ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.scc, 1)
 
 
+class TestSBfeI64Bounds(unittest.TestCase):
+    """Status flags and 64-bit sign-extension handling for s_bfe_i64."""
+
+    def test_sign_bit_at_bit_63(self):
+        val, scc = ref_bfe_i64(0x80000000_00000000, 63 | (1 << 16))
+        self.assertEqual(val, MASK64)
+        self.assertEqual(scc, 1)
+
+    def test_positive_bit_at_bit_63(self):
+        val, scc = ref_bfe_i64(0x00000000_00000000, 63 | (1 << 16))
+        self.assertEqual(val, 0)
+        self.assertEqual(scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
