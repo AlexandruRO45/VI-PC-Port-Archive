@@ -5,6 +5,7 @@ No third-party TUI libraries. When stdin/stdout are not TTYs, callers skip this 
 from __future__ import annotations
 
 import contextvars
+import locale
 import os
 import shutil
 import subprocess
@@ -1108,16 +1109,51 @@ def capture_popen_kwargs() -> dict:
     On Windows, cmake/ninja/MSBuild often WriteConsole past a piped stdout when they still
     have a console handle — that is the brief flash on top of the LEONIDA frame. CREATE_NO_WINDOW
     removes the console handle so those tools fall back to the pipe.
+
+    Text mode keeps universal newlines, so a lone CR (ninja status) still ends a line. The pipe is
+    decoded as UTF-8 with surrogateescape: cmake/ninja/clang write UTF-8, while Python children and
+    MSVC write the ANSI code page, whose escaped bytes pump_process re-decodes (see fix_child_line).
     """
     kw: dict = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
         "text": True,
-        "errors": "replace",
+        "encoding": "utf-8",
+        "errors": "surrogateescape",
     }
     if os.name == "nt":
         kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     return kw
+
+
+def _fallback_encoding() -> str:
+    """Locale encoding for child output that is not UTF-8 (the ANSI code page on Windows).
+
+    locale.getencoding() ignores UTF-8 mode (PYTHONUTF8=1, default from Python 3.15), where
+    getpreferredencoding(False) would answer "utf-8" and make the fallback a no-op.
+    """
+    getencoding = getattr(locale, "getencoding", None)
+    enc = getencoding() if getencoding is not None else locale.getpreferredencoding(False)
+    return enc or "utf-8"
+
+
+def decode_child_line(raw: bytes) -> str:
+    """Decode one line of child output: strict UTF-8 first, else the locale encoding with replacement."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(_fallback_encoding(), errors="replace")
+
+
+def fix_child_line(line: str) -> str:
+    """Fix one line read with encoding="utf-8", errors="surrogateescape".
+
+    No lone surrogate (U+DC80..U+DCFF) means the line was valid UTF-8: it is kept. Otherwise its
+    original bytes are recovered and decoded with the locale encoding, with replacement.
+    """
+    if not any("\udc80" <= ch <= "\udcff" for ch in line):
+        return line
+    return line.encode("utf-8", "surrogateescape").decode(_fallback_encoding(), errors="replace")
 
 
 def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
@@ -1134,9 +1170,9 @@ def pump_process(proc, stage: str | None, board: LeonidaBoard | None) -> int:
                 if raw == "" or raw == b"":
                     break
                 if isinstance(raw, bytes):
-                    line = raw.decode("utf-8", errors="replace")
+                    line = decode_child_line(raw)
                 else:
-                    line = raw
+                    line = fix_child_line(raw)
                 # Ninja status uses \\r; treat each chunk as a line so progress is visible.
                 line = line.replace("\r", "\n").rstrip("\n")
                 if not line:

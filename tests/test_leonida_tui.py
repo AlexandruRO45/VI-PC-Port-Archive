@@ -111,6 +111,61 @@ class CapturePopenTest(unittest.TestCase):
             self.assertEqual(kw["creationflags"], __import__("subprocess").CREATE_NO_WINDOW)
         else:
             self.assertNotIn("creationflags", kw)
+        # Text mode (universal newlines split on a lone \r); UTF-8 with surrogateescape so pump_process can
+        # re-decode non-UTF-8 lines with the locale encoding.
+        self.assertIs(kw["text"], True)
+        self.assertEqual(kw["encoding"], "utf-8")
+        self.assertEqual(kw["errors"], "surrogateescape")
+
+
+class PumpProcessTest(unittest.TestCase):
+    def test_lone_carriage_return_splits_progress_lines(self):
+        """Ninja status rewrites its line with a lone \\r: each chunk must reach the pane as its own line."""
+        import subprocess
+        child = (
+            "import sys;"
+            "b = sys.stdout.buffer;"
+            "b.write(b'10%\\rprogress 20%\\n');"
+            "b.flush()"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            board = leonida_tui.LeonidaBoard(["shaders"], tmp)  # not entered: nothing is drawn
+            try:
+                proc = subprocess.Popen([sys.executable, "-I", "-c", child], **leonida_tui.capture_popen_kwargs())
+                rc = leonida_tui.pump_process(proc, "shaders", board)
+            finally:
+                for console in board.consoles.values():
+                    console.close()
+            self.assertEqual(rc, 0)
+            self.assertEqual(list(board.consoles["shaders"].lines), ["10%", "progress 20%"])
+
+    def test_decodes_utf8_lines_and_falls_back_to_locale_encoding(self):
+        """cmake/ninja/clang write UTF-8, Python children and MSVC the ANSI code page: each line is decoded
+        as UTF-8 when it is valid UTF-8 and with the locale encoding otherwise."""
+        import subprocess
+        expected = ["C:/Users/Zo\u00eb/build utf8", "caf\u00e9 ansi"]
+        child = (
+            "import sys;"
+            "b = sys.stdout.buffer;"
+            "b.write(b'C:/Users/Zo\\xc3\\xab/build utf8\\n');"
+            "b.write(b'caf\\xe9 ansi\\n');"
+            "b.flush()"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            board = leonida_tui.LeonidaBoard(["shaders"], tmp)  # not entered: nothing is drawn
+            try:
+                # The locale fallback is pinned to cp1252 so the test reads the same on any host locale.
+                with mock.patch.object(leonida_tui, "_fallback_encoding", return_value="cp1252", create=True):
+                    proc = subprocess.Popen([sys.executable, "-I", "-c", child],
+                                            **leonida_tui.capture_popen_kwargs())
+                    rc = leonida_tui.pump_process(proc, "shaders", board)
+            finally:
+                for console in board.consoles.values():
+                    console.close()
+            self.assertEqual(rc, 0)
+            self.assertEqual(list(board.consoles["shaders"].lines), expected)
+            with open(os.path.join(tmp, "shaders.log"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "".join(line + "\n" for line in expected))
 
 
 class InterruptKeyTest(unittest.TestCase):
