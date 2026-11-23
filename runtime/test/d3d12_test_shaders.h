@@ -7,10 +7,13 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace d3d12test {
@@ -19,13 +22,26 @@ inline void put32(std::vector<std::uint8_t>& out, std::uint32_t v) {
     for (int i = 0; i < 4; ++i) out.push_back(std::uint8_t(v >> (8 * i)));
 }
 
-// zlib with one stored block (RFC 1950/1951), enough to wrap a test program.
+// zlib stored stream (RFC 1950 / RFC 1951 section 3.2.4), splitting payloads larger than 65,535 bytes across multiple
+// non-compressed blocks so multi-64 KiB synthetic FSSM containers inflate cleanly.
 inline std::vector<std::uint8_t> zlib_stored(const std::vector<std::uint8_t>& data) {
-    std::vector<std::uint8_t> out = {0x78, 0x01, 0x01};
-    const auto length = std::uint16_t(data.size());
-    out.insert(out.end(), {std::uint8_t(length), std::uint8_t(length >> 8), std::uint8_t(~length),
-                           std::uint8_t(~length >> 8)});
-    out.insert(out.end(), data.begin(), data.end());
+    static constexpr std::size_t kMaxBlockBytes = 65535;
+    const std::size_t block_count = data.empty() ? 1 : (data.size() + kMaxBlockBytes - 1) / kMaxBlockBytes;
+    std::vector<std::uint8_t> out;
+    out.reserve(2 + block_count * 5 + data.size() + 4);
+    out.push_back(0x78);
+    out.push_back(0x01);
+    std::size_t offset = 0;
+    do {
+        const std::size_t chunk = std::min<std::size_t>(data.size() - offset, kMaxBlockBytes);
+        const bool last = (offset + chunk == data.size());
+        const auto length = std::uint16_t(chunk);
+        const auto nlen = std::uint16_t(~length);
+        out.insert(out.end(), {std::uint8_t(last ? 0x01 : 0x00), std::uint8_t(length), std::uint8_t(length >> 8),
+                               std::uint8_t(nlen), std::uint8_t(nlen >> 8)});
+        out.insert(out.end(), data.begin() + std::ptrdiff_t(offset), data.begin() + std::ptrdiff_t(offset + chunk));
+        offset += chunk;
+    } while (offset < data.size());
     std::uint32_t a = 1, b = 0;
     for (const std::uint8_t x : data) {
         a = (a + x) % 65521;
@@ -71,15 +87,22 @@ using SerializeFn = HRESULT(WINAPI*)(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*,
 
 inline std::vector<std::uint8_t> serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
     const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    const auto fn = d3d12 ? reinterpret_cast<SerializeFn>(
-                                reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")))
-                          : nullptr;
+    if (!d3d12) return {};
+    struct ModuleGuard {
+        HMODULE module;
+        ~ModuleGuard() { FreeLibrary(module); }
+    } const module_guard{d3d12};
+    const auto fn = reinterpret_cast<SerializeFn>(
+        reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12SerializeVersionedRootSignature")));
     std::vector<std::uint8_t> out;
     ID3DBlob* blob = nullptr;
     if (fn && SUCCEEDED(fn(&desc, &blob, nullptr)) && blob) {
+        struct BlobGuard {
+            ID3DBlob* ptr;
+            ~BlobGuard() { ptr->Release(); }
+        } const blob_guard{blob};
         const auto* p = static_cast<const std::uint8_t*>(blob->GetBufferPointer());
         out.assign(p, p + blob->GetBufferSize());
-        blob->Release();
     }
     return out;
 }
@@ -111,14 +134,31 @@ inline D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource, D3D12_RESOURC
 template<class T>
 struct Ref {
     T* p = nullptr;
-    ~Ref() { reset(); }
-    void reset() {
-        if (p) p->Release();
-        p = nullptr;
+
+    Ref() noexcept = default;
+    explicit Ref(T* ptr) noexcept : p(ptr) {}
+    Ref(const Ref&) = delete;
+    Ref& operator=(const Ref&) = delete;
+    Ref(Ref&& other) noexcept : p(std::exchange(other.p, nullptr)) {}
+    Ref& operator=(Ref&& other) noexcept {
+        if (this != &other) {
+            reset();
+            p = std::exchange(other.p, nullptr);
+        }
+        return *this;
     }
-    T* operator->() const { return p; }
+    ~Ref() { reset(); }
+
+    void reset() noexcept {
+        if (T* old = std::exchange(p, nullptr)) old->Release();
+    }
+    T* operator->() const noexcept { return p; }
 };
 
-inline void* slot(void* object, unsigned index) { return (*reinterpret_cast<void***>(object))[index]; }
+inline void* slot(void* object, unsigned index) {
+    if (!object) return nullptr;
+    void** const vtable = *reinterpret_cast<void***>(object);
+    return vtable ? vtable[index] : nullptr;
+}
 
 }  // namespace d3d12test
