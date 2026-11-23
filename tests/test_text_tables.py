@@ -408,6 +408,40 @@ class TestCli(unittest.TestCase):
             self.assertEqual(cm.exception.code, 2)
             self.assertIn("distinct", err.getvalue())
 
+    def test_relative_and_case_colliding_outputs_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
+            sub = os.path.join(tmp, "sub")
+            os.mkdir(sub)
+            out_a = os.path.join(tmp, "report.csv")
+            out_rel = os.path.join(sub, "..", "report.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--dialogue", out_a, "--tables", out_rel])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("distinct", err.getvalue())
+            self.assertFalse(os.path.exists(out_a))
+
+            # Relative-path spelling that names an input must also be refused before writing.
+            src_rel = os.path.join(sub, "..", "en.bin")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                T.main([src, "--strings", src_rel])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input", err.getvalue())
+
+            # Case-only collision via report_paths.same_report_path (native on Windows/macOS,
+            # or simulated folding volume on case-sensitive POSIX mounts).
+            out_upper = os.path.join(tmp, "REPORT.CSV")
+            with patch("report_paths.same_name_on_folding_volume", return_value=True):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    T.main([src, "--dialogue", out_a, "--tables", out_upper])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("distinct", err.getvalue())
+                self.assertFalse(os.path.exists(out_a))
+                self.assertFalse(os.path.exists(out_upper))
+
     def test_invalid_json_labels_is_clean_error_not_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = write(os.path.join(tmp, "en.bin"), make_resource(EN))
