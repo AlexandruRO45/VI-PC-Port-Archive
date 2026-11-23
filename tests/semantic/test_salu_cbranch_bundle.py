@@ -338,5 +338,33 @@ class SCbranchScc1ScalarInterpreterTests(unittest.TestCase):
         state0 = SaluMachineState(pc=10, scc=0)
         self.assertEqual(step_branch(instr, state0), 11)  # 10 + 1
 
+class SCbranchScc1TranslatorTests(unittest.TestCase):
+    def test_branches_registry(self):
+        self.assertIn("s_cbranch_scc1", rdna2spirv.BRANCHES)
+
+    def test_execution_taken_when_scc1(self):
+        lines = [
+            "v_mov_b32 v0, 1.0 ; encoding: [0x00,0x00,0x00,0x00]",
+            "s_mov_b32 scc, 1 ; encoding: [0x00,0x00,0x00,0x00]",
+            "s_cbranch_scc1 1 ; encoding: [0x00,0x00,0x00,0x00]",
+            "v_mov_b32 v0, 2.0 ; encoding: [0x00,0x00,0x00,0x00]",
+            "exp mrt0 v0, v0, v0, v0 done vm ; encoding: [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00]",
+            "s_endpgm ; encoding: [0x00,0x00,0x00,0x00]",
+        ]
+        spv = translate_lines("ps_cbranch_scc1_taken", lines)
+        self.assertEqual(mrt0_words(spv)[0], 0x3F800000)  # 1.0
+
+    def test_execution_not_taken_when_scc0(self):
+        lines = [
+            "v_mov_b32 v0, 1.0 ; encoding: [0x00,0x00,0x00,0x00]",
+            "s_mov_b32 scc, 0 ; encoding: [0x00,0x00,0x00,0x00]",
+            "s_cbranch_scc1 1 ; encoding: [0x00,0x00,0x00,0x00]",
+            "v_mov_b32 v0, 2.0 ; encoding: [0x00,0x00,0x00,0x00]",
+            "exp mrt0 v0, v0, v0, v0 done vm ; encoding: [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00]",
+            "s_endpgm ; encoding: [0x00,0x00,0x00,0x00]",
+        ]
+        spv = translate_lines("ps_cbranch_scc1_not_taken", lines)
+        self.assertEqual(mrt0_words(spv)[0], 0x40000000)  # 2.0
+
 if __name__ == '__main__':
     unittest.main()
