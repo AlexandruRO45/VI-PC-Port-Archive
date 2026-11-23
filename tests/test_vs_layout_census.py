@@ -176,14 +176,21 @@ class TestSurvey(unittest.TestCase):
         self.assertEqual(r["disassembled_unlisted"], 0)
 
     def test_cli_json(self):
+        without_record = bytearray(fssm(0, 4))
+        without_record[0x100:0x108] = bytes(8)  # Remove the fixture's only PAL stage record.
+        with open(os.path.join(self.dx, "e_empty.dxbc"), "wb") as f:
+            f.write(dxbc([xbch(without_record)]))
         out = os.path.join(self._tmp.name, "out.json")
         result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_layout_census.py"),
                                  self.dx, "--json", out],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("6 payloads (1 without a PAL record)", result.stdout)
         with open(out, encoding="utf-8") as f:
             document = json.load(f)
-        self.assertEqual(document["payloads"], 5)
+        self.assertEqual(document["payloads"], 6)
+        self.assertEqual(document["payloads_without_record"], 1)
+        self.assertEqual(sum(document["by_stage_hw"].values()), 5)
         self.assertEqual(document["vs_by_hw"], {"2": 1, "4": 2})
         # The CLI disassembles the unlisted ES payload with llvm-mc; a synthetic blob has no code, so the
         # marker count for hw 2 stays empty and the run still succeeds.

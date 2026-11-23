@@ -158,7 +158,7 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
 
     return {
         "containers": len(names),
-        "payloads": sum(by_stage_hw.values()),
+        "payloads": sum(by_stage_hw.values()) + no_record,
         "payloads_without_record": no_record,
         "descriptors_per_blob": dict(sorted(descriptors_per_blob.items())),
         "api_stage_mismatches": api_mismatch,
