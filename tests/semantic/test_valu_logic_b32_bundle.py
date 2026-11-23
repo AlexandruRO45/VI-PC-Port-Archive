@@ -486,3 +486,53 @@ class TestXorB32Oracle(unittest.TestCase):
             "v_xor_b32 v0, v1, v2",
         ])
         self.assertEqual(val_id, 0xFEEDFACE)
+
+
+# ------------------------------------------------------------------------------
+# v_xor_b32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VXorB32Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    src1: Union[RegisterOperand, LiteralOperand]
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+
+
+def step_xor(machine: ScalarMachineLogic, insn: VXorB32Instruction):
+    s0 = machine.read_operand(insn.src0)
+    s1 = machine.read_operand(insn.src1)
+    machine.vgprs[insn.dst.index] = ref_xor_b32(s0, s1)
+
+
+class TestXorB32ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineLogic()
+        machine.vgprs[1] = 0xAAAA_BBBB
+        machine.vgprs[2] = 0xAAAA_0000
+        insn = VXorB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        step_xor(machine, insn)
+
+        val_hw, _ = run_shader("ps_xor_ast_scalar", [
+            "v_mov_b32 v1, 0xAAAABBBB",
+            "v_mov_b32 v2, 0xAAAA0000",
+            "v_xor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(machine.vgprs[0], val_hw)
+        self.assertEqual(val_hw, 0x0000_BBBB)
+
+    def test_scalar_in_place_hardware(self):
+        val_inplace, _ = run_shader("ps_xor_inplace", [
+            "v_mov_b32 v0, 0xFF00FF00",
+            "v_mov_b32 v1, 0x00FF00FF",
+            "v_xor_b32 v0, v0, v1",
+        ])
+        self.assertEqual(val_inplace, 0xFFFFFFFF)
