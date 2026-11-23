@@ -702,10 +702,6 @@ Checks:
   |dot| ≥ 0.9999 on 29,124 of 29,125 entities matched by position and archetype, and the minimum is 0.99894.
   Scales are equal on all 29,125. The instance TRS equals that transform (see the tests).
 
-The pin's 41.3% is a model-recovery gap, not a naming gap: almost every archetype name resolves (99.85%, see
-*What is readable* above), but only recovered models can be placed. The archetypes that #8/#10 add are `.#ft`
-fragments. The pinned `LooksLikeFragment` now accepts the null optional pointers covered by
-`breadbbbb/rpf9-explorer#8`, so that header filter no longer explains the remaining model-recovery gap.
 Although 99.85% of archetype names resolve (see *What is readable* above), only 41.3% of HD and ORPHAN_HD
 placements had a recovered model at `917e9b9`. The additional archetypes recovered with #8/#10 were `.#ft`
 fragments. The pinned explorer (`e2939175`) includes both changes. Its fragment check accepts null pointers
