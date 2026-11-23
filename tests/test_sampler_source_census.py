@@ -609,6 +609,31 @@ class SamplerSourceCensus(unittest.TestCase):
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)             # and the carve index still holds what it did
 
+    def test_json_report_refuses_a_hard_link_to_an_input(self):
+        """A second name for an input the run reads is that input; the volume, not the spelling, decides."""
+        self.work.add("a", "ps", USER_TABLE)
+        out = os.path.join(self.work.root, "out")
+        os.makedirs(out)
+        for source in (os.path.join(self.work.root, "a.dxbc"), os.path.join(self.work.disasm, "a.s")):
+            link = os.path.join(out, "census.json")
+            if os.path.exists(link):
+                os.remove(link)
+            try:
+                os.link(source, link)
+            except (AttributeError, NotImplementedError, OSError) as e:
+                self.skipTest(f"hard links are not available here: {e}")
+            p = subprocess.run([sys.executable, "-I", TOOL, self.work.disasm, "--json", link],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+            self.assertIn("--json would overwrite an input the census reads", p.stderr)
+            os.remove(link)
+        # Negative control: the same name with no link to an input is written as before.
+        ok = os.path.join(out, "report.json")
+        p = subprocess.run([sys.executable, "-I", TOOL, self.work.disasm, "--json", ok],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(os.path.isfile(ok))
+
 
 if __name__ == "__main__":
     unittest.main()
