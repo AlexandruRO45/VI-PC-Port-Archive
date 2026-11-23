@@ -167,7 +167,7 @@ Current limits, by design:
   drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
   and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
   (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
-  64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
+  64 KiB pages of pagefile-backed sections, mapped one view per run of consecutive pages into the placeholder that a reserve-only
   64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an

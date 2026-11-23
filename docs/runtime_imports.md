@@ -112,8 +112,10 @@ Seven more `xmem.dll` imports follow argument shapes measured locally at a title
   non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
 - `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
   `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
-  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
-  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Pages that follow each other in one allocation
+  are mapped as one view with `MapViewOfFile3`, because Wine's cost per view grows with the number of views; remapping
+  or unmapping part of a view later splits it, so every other page keeps its mapping, contents and protection. A page
+  keeps its contents across remaps and can be mapped twice, and a call that fails part-way is undone.
 - The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
   keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
   `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both

@@ -474,6 +474,155 @@ void test_placeholders(const PhysicalApi& api) {
     check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
+MEMORY_BASIC_INFORMATION query(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    VirtualQuery(address, &info, sizeof(info));
+    return info;
+}
+
+// The host view holding `address` starts at `start` and spans `pages` 64 KiB pages.
+bool one_view(const uint8_t* address, const uint8_t* start, uint64_t pages) {
+    const MEMORY_BASIC_INFORMATION inner = query(address);
+    const MEMORY_BASIC_INFORMATION whole = query(start);
+    return inner.State == MEM_COMMIT && inner.Type == MEM_MAPPED && inner.AllocationBase == start &&
+           whole.AllocationBase == start && whole.RegionSize == pages * kPage64k;
+}
+
+// Pages that follow each other in one allocation share a view; changing part of it later keeps every other page.
+void test_physical_runs(const PhysicalApi& api) {
+    constexpr uint64_t kPages = 1024;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    auto* const other = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 16 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    static uint64_t pages[kPages];
+    uint64_t count = kPages;
+    uint64_t extra[2]{};
+    uint64_t extra_count = 2;
+    const bool setup = window && other && api.allocate(0x280, &count, pages) == TRUE && count == kPages &&
+                       api.allocate(0x280, &extra_count, extra) == TRUE;
+    check(setup, "runs: reserve windows and allocate pages");
+    if (!setup) return;
+    auto page = [&](uint64_t i) { return window + i * kPage64k; };
+    auto tag = [](uint64_t i) { return 0x100000u * static_cast<uint32_t>(i + 1); };
+
+    check(api.map(window, kPages, pages) == window, "runs: map 1024 pages in one call");
+    check(one_view(page(500), window, kPages), "runs: 1024 pages of one allocation are one view");
+    for (uint64_t i = 0; i < kPages; ++i) fill_page(page(i), tag(i));
+
+    // Remap one page inside the run: the view splits around it.
+    check(api.map(page(100), 1, &extra[0]) == page(100), "runs: remap a page inside the run");
+    check(read_u32(page(100), 0) == 0 && page_holds(page(99), tag(99)) && page_holds(page(101), tag(101)) &&
+              page_holds(page(0), tag(0)) && page_holds(page(kPages - 1), tag(kPages - 1)),
+          "runs: the remapped page is the new one and its neighbours keep their data");
+    check(one_view(page(0), window, 100) && one_view(page(101), page(101), kPages - 101),
+          "runs: the view is split into the parts before and after the page");
+
+    // Unmap a sub-range.
+    check(api.map(page(200), 10, nullptr) == page(200), "runs: unmap ten pages inside the run");
+    check(reserved_only(page(200)) && reserved_only(page(209)) && page_holds(page(199), tag(199)) &&
+              page_holds(page(210), tag(210)),
+          "runs: the sub-range is reserved again and the pages around it keep their data");
+
+    // A protection a title set on part of a view survives a split of that view.
+    DWORD old = 0;
+    check(VirtualProtect(page(300), 0x1000, PAGE_READONLY, &old) == TRUE, "runs: protect one host page read-only");
+    const uint64_t zero = 0;
+    check(api.map(page(400), 1, &zero) == page(400) && reserved_only(page(400)), "runs: a 0 entry unmaps one page");
+    check(query(page(300)).Protect == PAGE_READONLY && query(page(300) + 0x1000).Protect == PAGE_READWRITE &&
+              page_holds(page(300), tag(300)),
+          "runs: a split keeps the protection and data of the other pages");
+    check(VirtualProtect(page(300), 0x1000, PAGE_READWRITE, &old) == TRUE, "runs: restore read-write");
+
+    // Mapping the whole range again merges the split placeholders into one view.
+    check(api.map(window, kPages, pages) == window, "runs: map the whole range again");
+    bool all = true;
+    for (uint64_t i = 0; i < kPages; ++i) all &= page_holds(page(i), tag(i));
+    check(all, "runs: every page shows its own data after the remap");
+    check(one_view(page(700), window, kPages), "runs: the remapped range is one view again");
+
+    // The same run in two places is one memory.
+    check(api.map(other, 16, pages + 32) == other, "runs: map part of the run into a second window");
+    static_cast<volatile uint32_t*>(static_cast<void*>(other + 5 * kPage64k))[3] = 0xc0ffee11u;
+    check(read_u32(page(37), 12) == 0xc0ffee11u, "runs: both mappings of a run see the same memory");
+
+    // Scatter: consecutive addresses with consecutive pages share a view; repeated addresses apply in order.
+    check(api.map(window, 64, nullptr) == window, "runs: unmap the first 64 pages");
+    void* addresses[9];
+    uint64_t scattered[9];
+    for (uint64_t i = 0; i < 8; ++i) {
+        addresses[i] = page(i);
+        scattered[i] = pages[16 + i];
+    }
+    addresses[8] = page(3);
+    scattered[8] = extra[1];
+    check(api.scatter(addresses, 9, scattered) == TRUE, "runs: scatter eight consecutive pages and one repeat");
+    check(page_holds(page(0), tag(16)) && page_holds(page(7), tag(23)) && read_u32(page(3), 0) == 0,
+          "runs: scattered pages land in order and the later entry wins");
+    check(one_view(page(0), window, 3) && one_view(page(4), page(4), 4), "runs: the consecutive entries share views");
+
+    // A page freed while mapped keeps its memory, also when its view is split later.
+    check(api.free_pages(kPages, pages) == TRUE, "runs: free the pages while they are mapped");
+    check(api.map(page(600), 1, nullptr) == page(600) && page_holds(page(599), tag(599)) &&
+              page_holds(page(601), tag(601)),
+          "runs: splitting a view of freed pages keeps their data");
+
+    check(api.map(window, kPages, nullptr) == window && api.map(other, 16, nullptr) == other,
+          "runs: unmap both windows");
+    check(reserved_only(page(0)) && reserved_only(page(601)) && reserved_only(other), "runs: everything is unmapped");
+    api.free_pages(2, extra);
+    VirtualFree(window, 0, MEM_RELEASE);
+    VirtualFree(other, 0, MEM_RELEASE);
+}
+
+// A host failure part-way through a call restores the mappings and protections from before it.
+void test_physical_rollback(const PhysicalApi& api) {
+    const auto alloc2 = reinterpret_cast<PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*,
+                                                        ULONG)>(
+        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+    auto* const region = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    const bool setup = alloc2 && region && api.allocate(0x280, &count, pages) == TRUE &&
+                       api.map(region, 2, pages) == region;
+    check(setup, "rollback: setup");
+    if (!setup) return;
+    uint8_t* const second = region + kPage64k;
+    region[0] = 0x11;
+    second[0] = 0x22;
+    DWORD old = 0;
+    check(VirtualProtect(region, 0x1000, PAGE_READONLY, &old) == TRUE, "rollback: protect the first host page");
+    check(api.map(second, 1, nullptr) == second, "rollback: unmap the second page out of the shared view");
+    // Native memory in the second placeholder makes the host refuse a view there.
+    void* const obstruction = alloc2(GetCurrentProcess(), second, kPage64k,
+                                     MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    check(obstruction == second, "rollback: occupy the second placeholder with native memory");
+    if (!obstruction) return;
+
+    const uint64_t swapped[2] = {pages[1], pages[0]};
+    SetLastError(ERROR_SUCCESS);
+    check(api.map(region, 2, swapped) == nullptr && GetLastError() != ERROR_SUCCESS,
+          "rollback: the host refuses the second page of the map");
+    check(region[0] == 0x11 && query(region).Protect == PAGE_READONLY &&
+              query(region + 0x1000).Protect == PAGE_READWRITE,
+          "rollback: the first page is mapped again with its protection");
+
+    void* addresses[3] = {region, region, second};
+    const uint64_t scattered[3] = {pages[1], 0, pages[0]};
+    SetLastError(ERROR_SUCCESS);
+    check(api.scatter(addresses, 3, scattered) == FALSE && GetLastError() != ERROR_SUCCESS,
+          "rollback: the host refuses the last scatter entry");
+    check(region[0] == 0x11 && query(region).Protect == PAGE_READONLY,
+          "rollback: scatter restores the first page when its address appears twice");
+
+    check(VirtualFree(obstruction, kPage64k, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) == TRUE,
+          "rollback: release the native memory");
+    check(api.map(region, 2, pages) == region && region[0] == 0x11 && second[0] == 0x22,
+          "rollback: both pages map again afterwards");
+    check(api.map(region, 4, nullptr) == region && api.free_pages(2, pages) == TRUE, "rollback: unmap and free");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -719,6 +868,8 @@ int main() {
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
         test_placeholders(physical);
+        test_physical_runs(physical);
+        test_physical_rollback(physical);
     }
 
     print_result();

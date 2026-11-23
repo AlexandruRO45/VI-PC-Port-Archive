@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -231,11 +232,6 @@ DWORD host_protect(DWORD p) {
 //
 // ASSUMPTION: a title does not commit memory inside such a window with kernel32!VirtualAlloc. A placeholder refuses a
 // plain commit; the measured windows are only ever passed to the map calls.
-struct Window {
-    SIZE_T size;
-    DWORD protect;
-};
-
 struct Section {
     HANDLE handle;
     explicit Section(HANDLE h) : handle(h) {}
@@ -245,8 +241,22 @@ struct Section {
 };
 
 struct PhysicalPage {
-    std::shared_ptr<Section> section;  // a mapped view holds its own reference to the section
+    std::shared_ptr<Section> section;
     uint64_t offset;
+};
+
+// The host layout of a window, kept here so a map needs no VirtualQuery: segments cover the window back to back, each
+// a placeholder (no section) or one view of `size` bytes of `section` from `offset`. A view can hold many pages.
+struct Segment {
+    uint64_t size;
+    std::shared_ptr<Section> section;  // keeps the backing for a later split after XMemFreePhysicalPages
+    uint64_t offset;
+};
+
+struct Window {
+    SIZE_T size;
+    DWORD protect;
+    std::map<uintptr_t, Segment> segments;  // start -> segment
 };
 
 constexpr uint64_t kPhysicalPageSize = 0x10000;
@@ -261,7 +271,6 @@ std::map<uintptr_t, Window> g_windows;              // base -> window
 std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
-std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
 
 // With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
 // kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
@@ -274,11 +283,14 @@ void record_window(void* base, SIZE_T size, DWORD protect) {
         if (prev->first + prev->second.size > start) it = prev;
     }
     while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
-    g_windows[start] = Window{size, protect};
+    Window& window = g_windows[start];
+    window.size = size;
+    window.protect = protect;
+    window.segments[start] = Segment{size, nullptr, 0};
 }
 
 // With g_phys_mutex held: the window holding [address, address + bytes), if one does.
-const Window* find_window(uintptr_t address, uint64_t bytes) {
+Window* find_window(uintptr_t address, uint64_t bytes) {
     auto it = g_windows.upper_bound(address);
     if (it == g_windows.begin()) return nullptr;
     --it;
@@ -425,42 +437,223 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     return VirtualAlloc(address, size, host_type, host_prot);
 }
 
-// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
-bool unmap_page(uintptr_t address) {
-    const auto it = g_mapped.find(address);
-    if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
+using SegmentIt = std::map<uintptr_t, Segment>::iterator;
+
+// With g_phys_mutex held, here and in the helpers below. The segment holding `address`, which is inside `window`.
+SegmentIt segment_at(Window& window, uintptr_t address) { return std::prev(window.segments.upper_bound(address)); }
+
+// [address, address + size), inside one placeholder segment, as a placeholder of its own.
+bool carve(Window& window, uintptr_t address, uint64_t size) {
+    const auto it = segment_at(window, address);
+    const uintptr_t start = it->first;
+    const uintptr_t end = start + it->second.size;
+    if (it->second.section || address + size > end) {
+        SetLastError(ERROR_INVALID_ADDRESS);
         return false;
     }
-    g_mapped.erase(it);
+    if (start == address && end == address + size) return true;
+    if (!VirtualFree(reinterpret_cast<void*>(address), size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return false;
+    if (start < address) {
+        it->second.size = address - start;
+        window.segments[address] = Segment{size, nullptr, 0};
+    } else {
+        it->second.size = size;
+    }
+    if (address + size < end) window.segments[address + size] = Segment{end - address - size, nullptr, 0};
     return true;
 }
 
-// With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
-// mapped there. The caller has found the window.
-bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
-    if (!unmap_page(address)) return false;
-    if (page == 0) return true;
-    const auto it = g_pages.find(page);
-    if (it == g_pages.end()) {
-        SetLastError(ERROR_INVALID_PARAMETER);
+bool map_view(Window& window, uintptr_t address, uint64_t size, const std::shared_ptr<Section>& section,
+              uint64_t offset, DWORD protect) {
+    if (!carve(window, address, size)) return false;
+    if (!placeholder_api().map_view3(section->handle, GetCurrentProcess(), reinterpret_cast<void*>(address), offset,
+                                     size, MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0)) {
         return false;
     }
-    void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
-                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
-                                                   protect, nullptr, 0);
-    if (!view) return false;
-    g_mapped[address] = page;
+    window.segments[address] = Segment{size, section, offset};
     return true;
+}
+
+bool unmap_view(SegmentIt it) {
+    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(it->first),
+                                       MEM_PRESERVE_PLACEHOLDER)) {
+        return false;
+    }
+    it->second.section.reset();  // the view's range is one placeholder again
+    it->second.offset = 0;
+    return true;
+}
+
+// Maps [address, address + size), all placeholder, as one view of `section` from `offset`. Placeholders under it are
+// merged first; where the host refuses that, each placeholder gets its own view.
+bool map_run(Window& window, uintptr_t address, uint64_t size, const std::shared_ptr<Section>& section, uint64_t offset,
+             DWORD protect) {
+    const uintptr_t end = address + size;
+    const auto first = segment_at(window, address);
+    const auto last = segment_at(window, end - 1);
+    for (auto it = first;; ++it) {
+        if (it->second.section) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        if (it == last) break;
+    }
+    if (first != last) {
+        const uintptr_t low = first->first;
+        const uintptr_t high = last->first + last->second.size;
+        if (VirtualFree(reinterpret_cast<void*>(low), high - low, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+            window.segments.erase(std::next(first), std::next(last));
+            first->second.size = high - low;
+        } else {
+            for (uintptr_t at = address; at < end;) {
+                const auto it = segment_at(window, at);
+                const uint64_t piece = (std::min)(static_cast<uint64_t>(end), it->first + it->second.size) - at;
+                if (!map_view(window, at, piece, section, offset + (at - address), protect)) return false;
+                at += piece;
+            }
+            return true;
+        }
+    }
+    return map_view(window, address, size, section, offset, protect);
 }
 
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
 // GPU memory, which the D3D12 layer reads on the CPU.
 DWORD view_protect(const Window& window) {
     return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+}
+
+// Where a title's VirtualProtect changed part of a view: ranges whose protection is not the window's.
+struct Protection {
+    uintptr_t address;
+    uint64_t size;
+    DWORD protect;
+};
+
+bool capture_protections(uintptr_t address, uint64_t size, DWORD protect, std::vector<Protection>& out) {
+    for (uintptr_t at = address; at < address + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) || info.State != MEM_COMMIT) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        const uintptr_t piece_end = (std::min)(region_end, address + size);
+        if (piece_end <= at) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return false;
+        }
+        if (info.Protect != protect) out.push_back(Protection{at, piece_end - at, info.Protect});
+        at = piece_end;
+    }
+    return true;
+}
+
+// What a change replaced: the views it unmapped, with their protections, and the range it may have remapped.
+struct OldView {
+    uintptr_t address;
+    uint64_t size;
+    std::shared_ptr<Section> section;
+    uint64_t offset;
+};
+
+struct Undo {
+    Window* window;
+    uintptr_t low;
+    uintptr_t high;
+    std::vector<OldView> views;
+    std::vector<Protection> protections;
+};
+
+// Sets the `count` pages from `address` to `pages` (0 or a null array: unmapped). Runs of pages that follow each other
+// in one section become one view. A view that reaches outside the range is unmapped whole and its outer parts mapped
+// again, so every other page keeps its mapping and protection. Each live page number was checked by the caller.
+bool set_range(Window& window, uintptr_t address, uint64_t count, const uint64_t* pages, std::vector<Undo>& journal) {
+    const uintptr_t end = address + count * kPhysicalPageSize;
+    const DWORD protect = view_protect(window);
+    Undo undo{&window, address, end, {}, {}};
+    for (auto it = segment_at(window, address); it != window.segments.end() && it->first < end; ++it) {
+        if (!it->second.section) continue;
+        undo.low = (std::min)(undo.low, it->first);
+        undo.high = (std::max)(undo.high, it->first + it->second.size);
+        undo.views.push_back(OldView{it->first, it->second.size, it->second.section, it->second.offset});
+        if (!capture_protections(it->first, it->second.size, protect, undo.protections)) return false;
+    }
+    journal.push_back(std::move(undo));
+    const Undo& change = journal.back();
+
+    for (const OldView& view : change.views) {
+        if (!unmap_view(window.segments.find(view.address))) return false;
+    }
+    for (const OldView& view : change.views) {
+        const uintptr_t view_end = view.address + view.size;
+        if (view.address < address &&
+            !map_run(window, view.address, address - view.address, view.section, view.offset, protect)) {
+            return false;
+        }
+        if (view_end > end &&
+            !map_run(window, end, view_end - end, view.section, view.offset + (end - view.address), protect)) {
+            return false;
+        }
+    }
+    for (const Protection& range : change.protections) {
+        const uintptr_t range_end = range.address + range.size;
+        DWORD old = 0;
+        if (range.address < address &&
+            !VirtualProtect(reinterpret_cast<void*>(range.address), (std::min)(range_end, address) - range.address,
+                            range.protect, &old)) {
+            return false;
+        }
+        if (range_end > end) {
+            const uintptr_t from = (std::max)(range.address, end);
+            if (!VirtualProtect(reinterpret_cast<void*>(from), range_end - from, range.protect, &old)) return false;
+        }
+    }
+
+    for (uint64_t i = 0; pages && i < count;) {
+        if (pages[i] == 0) {
+            ++i;
+            continue;
+        }
+        const PhysicalPage& first = g_pages.find(pages[i])->second;
+        uint64_t j = i + 1;
+        for (; j < count && pages[j] != 0; ++j) {
+            const PhysicalPage& next = g_pages.find(pages[j])->second;
+            if (next.section != first.section || next.offset != first.offset + (j - i) * kPhysicalPageSize) break;
+        }
+        if (!map_run(window, address + i * kPhysicalPageSize, (j - i) * kPhysicalPageSize, first.section, first.offset,
+                     protect)) {
+            return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+// Undoes a failed call's changes, newest first, and keeps the error that failed it.
+void roll_back(std::vector<Undo>& journal) {
+    DWORD error = GetLastError();
+    if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+    bool restored = true;
+    for (auto undo = journal.rbegin(); undo != journal.rend(); ++undo) {
+        Window& window = *undo->window;
+        for (auto it = segment_at(window, undo->low); it != window.segments.end() && it->first < undo->high; ++it) {
+            if (it->second.section && !unmap_view(it)) restored = false;
+        }
+        for (const OldView& view : undo->views) {
+            if (!map_run(window, view.address, view.size, view.section, view.offset, view_protect(window))) {
+                restored = false;
+            }
+        }
+        for (const Protection& range : undo->protections) {
+            DWORD old = 0;
+            if (!VirtualProtect(reinterpret_cast<void*>(range.address), range.size, range.protect, &old)) {
+                restored = false;
+            }
+        }
+    }
+    if (!restored) std::fprintf(stderr, "[rt] xmem: could not restore every view after a physical-page map failed\n");
+    SetLastError(error);
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
@@ -556,8 +749,8 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
 // success. A page number of 0 in the array unmaps that one page.
 //
-// Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
-// without touching its neighbours. A failure part-way leaves the pages before it mapped.
+// Pages that follow each other in one section are mapped as one view (MapViewOfFile3), since the host's cost per view
+// grows with the number of views; remapping or unmapping part of a view later splits it. A failure undoes the call.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
@@ -569,21 +762,37 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
+    const uintptr_t end = start + page_count * kPhysicalPageSize;
     const std::lock_guard lock(g_phys_mutex);
+    std::vector<Undo> journal;
     if (!page_array) {
-        for (uint64_t i = 0; i < page_count; ++i) {
-            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+        // Only pages inside a window can be mapped; unmap there.
+        auto it = g_windows.upper_bound(start);
+        if (it != g_windows.begin() && std::prev(it)->first + std::prev(it)->second.size > start) --it;
+        for (; it != g_windows.end() && it->first < end; ++it) {
+            const uintptr_t low = (std::max)(start, it->first);
+            const uintptr_t high = (std::min)(end, it->first + it->second.size);
+            if (!set_range(it->second, low, (high - low) / kPhysicalPageSize, nullptr, journal)) {
+                roll_back(journal);
+                return nullptr;
+            }
         }
         return address;
     }
-    const Window* const window = find_window(start, page_count * kPhysicalPageSize);
+    Window* const window = find_window(start, page_count * kPhysicalPageSize);
     if (!window) {
         SetLastError(ERROR_INVALID_ADDRESS);
         return nullptr;
     }
-    const DWORD protect = view_protect(*window);
     for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+        if (page_array[i] != 0 && g_pages.find(page_array[i]) == g_pages.end()) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
+    if (!set_range(*window, start, page_count, page_array, journal)) {
+        roll_back(journal);
+        return nullptr;
     }
     return address;
 }
@@ -591,7 +800,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
 // BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:
 // RCX is an array of addresses, EDX a 32-bit count, R8 the page for each address (an entry of 0, or a null array,
 // unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
-// addresses[i].
+// addresses[i], in order. Entries at consecutive addresses are applied together, so they can share a view.
 BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
     if (page_count && !addresses) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -604,21 +813,35 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
     const std::lock_guard lock(g_phys_mutex);
     for (uint32_t i = 0; i < page_count; ++i) {
         const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
-        if (!aligned_page_address(address)) {
+        const uint64_t page = page_array ? page_array[i] : 0;
+        if (!aligned_page_address(address) || (page != 0 && g_pages.find(page) == g_pages.end())) {
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
-        const uint64_t page = page_array ? page_array[i] : 0;
-        if (page == 0) {
-            if (!unmap_page(address)) return FALSE;
-            continue;
-        }
-        const Window* const window = find_window(address, kPhysicalPageSize);
-        if (!window) {
+        if (page != 0 && !find_window(address, kPhysicalPageSize)) {
             SetLastError(ERROR_INVALID_ADDRESS);
             return FALSE;
         }
-        if (!map_page(address, page, view_protect(*window))) return FALSE;
+    }
+    std::vector<Undo> journal;
+    for (uint32_t i = 0; i < page_count;) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
+        Window* const window = find_window(address, kPhysicalPageSize);
+        if (!window) {  // an unmap outside every window: nothing is mapped there
+            ++i;
+            continue;
+        }
+        uint32_t j = i + 1;
+        while (j < page_count &&
+               reinterpret_cast<uintptr_t>(addresses[j]) == address + (j - i) * kPhysicalPageSize &&
+               find_window(reinterpret_cast<uintptr_t>(addresses[j]), kPhysicalPageSize) == window) {
+            ++j;
+        }
+        if (!set_range(*window, address, j - i, page_array ? page_array + i : nullptr, journal)) {
+            roll_back(journal);
+            return FALSE;
+        }
+        i = j;
     }
     return TRUE;
 }

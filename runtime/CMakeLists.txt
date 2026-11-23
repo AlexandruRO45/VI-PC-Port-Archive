@@ -212,6 +212,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
+  # Wall time of the physical-page calls on synthetic memory; ctest runs a small smoke size, run it alone for numbers.
+  add_executable(xmem_phys_bench
+    test/xmem_phys_bench.cpp
+    shims/xmem.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xmem_phys_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xmem_phys_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xmem_phys_bench PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xmem_phys_bench PRIVATE /OPT:NOREF)
+  target_link_libraries(xmem_phys_bench PRIVATE psapi)
+
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
     test/process_cmdline_test.cpp
@@ -997,6 +1009,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET xmem_phys_bench)
+    add_test(NAME xmem_phys_bench_smoke COMMAND xmem_phys_bench 256)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
