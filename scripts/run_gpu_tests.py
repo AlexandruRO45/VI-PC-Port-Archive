@@ -333,9 +333,10 @@ def subgroup_pin_skip(msg: str, cs_env: dict | None) -> Skip | None:
 
 
 # Dumps whose expected words depend on the wave width but are not lane-mask dumps (those are WAVE32_LANE_DUMPS):
-# cs_barrier_loop's trip count is 4 waves of 32, so at 64 lanes it writes a different pattern and the words would
-# report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64 only).
-WAVE32_PIN_DUMPS = ("cs_barrier_loop",)
+# cs_barrier_loop's trip count is 4 waves of 32 (cs_barrier_lds' too), so at 64 lanes they write a different
+# pattern and the words would report a failure that is really an unpinnable wave size (GCN3/GCN4 expose 64..64
+# only).
+WAVE32_PIN_DUMPS = ("cs_barrier_loop", "cs_barrier_lds")
 
 
 def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: bool, emulated: bool,
@@ -989,6 +990,7 @@ def run_suite(a, work: str) -> int:
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
                       "cs_bpermute32", "cs_w64x_partial_scmp", "cs_w32_partial_scmp", "cs_barrier_early_end",
+                      "cs_barrier_lds",
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec"):
             cs_dump_wants = {
@@ -1074,6 +1076,8 @@ def run_suite(a, work: str) -> int:
                 # differs per wave (cs_barrier_loop.asm)
                 "cs_barrier_early_end": [127, 126, 125, 124, 123, 122, 121, 120],
                 "cs_barrier_loop": [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE],
+                # SHADER-579: the same rounds on a 32 KiB LDS, where the count borrows LDS word 0 (cs_barrier_lds.asm)
+                "cs_barrier_lds": [128, 96, 64, 32, 0x5A5A0579, 0x5A5A0579, 0x5A5A0579, 0xEEEEEEEE],
                 # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC —
                 # inactive lanes keep the old VGPR (cs_mask_vgpr_exec.asm)
                 "cs_mask_vgpr_exec": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
@@ -1081,7 +1085,8 @@ def run_suite(a, work: str) -> int:
             }
             want = cs_dump_wants[name]
             # Every dump but cs_store / cs_smem_soffset_imm / cs_w32_lane_wrap / cs_movrelsd_2 / cs_w32_permute /
-            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops / cs_signed_zero_nan, the wave32
+            # cs_w32_lds_u8_d16 / cs_w32_sincos / cs_w32_int_ext / cs_w32_salu64 / cs_w32_misc_ext / cs_w32_new_ops /
+            # cs_signed_zero_nan / cs_barrier_lds, the wave32
             # cs_wqm_w32 / cs_bpermute32 and the DPP tests is a whole-wave (wave64) mask test: ask for a 64-wide subgroup and skip,
             # as check.py does, where the device has none
             # (vk_compute_test exits 77) instead of reporting a failure. With LEONIDA_W64_EMULATE=1 they were
@@ -1092,6 +1097,7 @@ def run_suite(a, work: str) -> int:
             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
+                                  "cs_barrier_lds",
                                   "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_sincos",
