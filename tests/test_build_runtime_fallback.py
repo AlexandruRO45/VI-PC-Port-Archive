@@ -101,26 +101,28 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
     def test_cmake_exe_is_invoked_without_call(self):
         """cmd's CALL doubles ^ in the rest of the line, so cmake.exe must not be launched with it (#3554).
 
-        .cmd/.bat wrappers are launched with nested cmd /c (no CALL) so they return and carets stay intact.
+        .cmd/.bat wrappers are launched with nested cmd /v:on (no CALL) so they return and carets stay intact.
         """
         text = SCRIPT.read_text(encoding="utf-8-sig")
         self.assertNotRegex(
             text, r'(?m)^call "\$cmake"',
-            "call \"$cmake\" doubles ^ in the checkout path; use Get-BatchCommand so cmake.exe is quoted only",
+            "call \"$cmake\" doubles ^ in the checkout path; invoke cmake.exe quoted, with no CALL",
         )
-        start = text.index("function Get-BatchCommand")
+        start = text.index("function Get-CmakeExeBatchBody")
         end = text.index("$root = Split-Path")
         helper = text[start:end]
-        self.assertIn(r"\.(cmd|bat)$", helper)
-        self.assertIn("cmd /d /s /c", helper)
-        self.assertNotRegex(helper, r'return "call')
-        self.assertIn('return "`"$Tool`" $CommandArgs"', helper)
-        self.assertIn("$runConfigure = Get-BatchCommand $cmake", text)
-        self.assertIn("$runBuild = Get-BatchCommand $cmake", text)
-        start = text.index("$runConfigure = Get-BatchCommand $cmake")
-        cmake_body = text[start:text.index("} else {", start)]
-        self.assertIn("$runConfigure || exit /b 1", cmake_body)
-        self.assertIn("$runBuild || exit /b 1", cmake_body)
+        self.assertIn("function Get-CmakeExeBatchBody", helper)
+        self.assertIn("function Get-CmakeWrapperBatchBody", helper)
+        self.assertIn("cmd /d /v:on /s /c", helper)
+        self.assertNotRegex(helper, r'return "call|\bcall "')
+        self.assertIn('set `"LEONIDA_CMAKE=$Tool`"', helper)
+        self.assertIn('return "`"$Tool`" -S', helper)
+        start = text.index("if ($cmake -and $ninja) {")
+        exe_assign = text.index("$body = Get-CmakeExeBatchBody", start)
+        cmake_body = text[start:text.index("} else {", exe_assign)]
+        self.assertIn(r"\.(cmd|bat)$", cmake_body)
+        self.assertIn("Get-CmakeWrapperBatchBody $cmake", cmake_body)
+        self.assertIn("Get-CmakeExeBatchBody $cmake", cmake_body)
         self.assertNotIn("call", cmake_body)
 
     @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell")
@@ -203,11 +205,14 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "win32", "requires Windows PowerShell and cmd.exe")
     def test_cmake_batch_wrapper_preserves_caret_paths_and_status(self):
-        """Get-BatchCommand's .cmd/.bat path must keep a single ^ in the wrapper, checkout, and Ninja paths,
-        return after the wrapper, and pass the wrapper's exit status through to || exit /b 1."""
+        """The .cmd/.bat path must keep a single ^ in the wrapper, checkout, and Ninja paths
+        when those lines are written into a .cmd file, return after the wrapper, and pass the
+        wrapper's exit status through to || exit /b 1."""
         text = SCRIPT.read_text(encoding="utf-8-sig")
-        helper = text[text.index("function Get-BatchCommand"):text.index("$root = Split-Path")]
-        cmake_block = text[text.index("if ($cmake -and $ninja) {"):text.index("} else {", text.index("if ($cmake -and $ninja) {"))]
+        helper = text[text.index("function Get-CmakeExeBatchBody"):text.index("$root = Split-Path")]
+        cmake_if = text.index("if ($cmake -and $ninja) {")
+        exe_assign = text.index("$body = Get-CmakeExeBatchBody", cmake_if)
+        cmake_block = text[cmake_if:text.index("} else {", exe_assign)]
 
         wrapper_src = (
             "@echo off\r\n"
@@ -253,16 +258,23 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
                 LEONIDA_OUT=str(out),
                 LEONIDA_BODY=str(body_path),
             )
-            subprocess.run(
+            res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-File", str(driver)],
-                env=env, check=True, timeout=30, capture_output=True, text=True,
+                env=env, timeout=30, capture_output=True, text=True,
             )
-            return body_path.read_text(encoding="utf-8")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            raw = body_path.read_bytes()
+            self.assertIn(b"\r\n", raw)
+            self.assertEqual(raw.replace(b"\r\n", b"").find(b"\n"), -1, "generated body must use CRLF")
+            return raw.decode("utf-8")
 
-        def run_body(directory: Path, body: str, env_extra: dict[str, str]) -> tuple[int, str]:
+        def run_body(directory: Path, body: str, env_extra: dict[str, str]) -> tuple[int, str, str]:
+            payload = "@echo off\r\n" + body.replace("\r\n", "\n").replace("\n", "\r\n")
+            if not payload.endswith("\r\n"):
+                payload += "\r\n"
             batch = directory / "run-cmake.cmd"
-            batch.write_bytes(("@echo off\r\n" + body).encode("utf-8"))
+            batch.write_bytes(payload.encode("utf-8"))
             log = directory / "caret^dir" / "cmake-log.txt"
             if log.is_file():
                 log.unlink()
@@ -272,7 +284,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
                 cwd=directory, env=env, capture_output=True, timeout=30,
             )
             logged = log.read_text(encoding="utf-8") if log.is_file() else ""
-            return res.returncode, logged
+            err = res.stderr.decode("utf-8", "replace")
+            return res.returncode, logged, err
 
         def invocations(logged: str) -> list[list[str]]:
             blocks = []
@@ -304,17 +317,19 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
                     cmake.write_bytes(wrapper_src.encode("ascii"))
                     body = emit_body(cmake, ninja, src, out, directory / "cmake-body.txt")
                     self.assertNotIn("call ", body.lower())
-                    self.assertIn("cmd /d /s /c", body)
+                    self.assertIn("cmd /d /v:on /s /c", body)
+                    self.assertIn('set "LEONIDA_CMAKE=', body)
                     self.assertIn("caret^dir", body)
                     self.assertNotIn("caret^^dir", body)
                     self.assertIn(str(cmake), body)
-                    self.assertIn(f"-DCMAKE_MAKE_PROGRAM={ninja}", body)
+                    self.assertIn(f'set "LEONIDA_NINJA={ninja}"', body)
+                    self.assertIn(f'set "LEONIDA_SRC={src}"', body)
 
-                    code, logged = run_body(directory, body, {
+                    code, logged, err = run_body(directory, body, {
                         "CMAKE_FAKE_CONFIG_EXIT": "0",
                         "CMAKE_FAKE_BUILD_EXIT": "0",
                     })
-                    self.assertEqual(code, 0, logged)
+                    self.assertEqual(code, 0, f"log={logged!r} stderr={err!r}")
                     self.assertNotIn("caret^^dir", logged)
                     calls = invocations(logged)
                     self.assertEqual(len(calls), 2, logged)
@@ -322,26 +337,28 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
                     self.assertIn(str(src), calls[0])
                     self.assertIn(str(out), calls[0])
                     self.assertIn(f"-DCMAKE_MAKE_PROGRAM={ninja}", calls[0])
+                    self.assertIn("-DCMAKE_BUILD_TYPE=RelWithDebInfo", calls[0])
                     self.assertIn("--build", calls[1])
                     self.assertIn(str(out), calls[1])
                     for arg in calls[0] + calls[1]:
-                        self.assertIn("caret^dir", arg)
-                        self.assertNotIn("caret^^dir", arg)
+                        if "caret" in arg:
+                            self.assertIn("caret^dir", arg)
+                            self.assertNotIn("caret^^dir", arg)
 
-                    code, logged = run_body(directory, body, {
+                    code, logged, err = run_body(directory, body, {
                         "CMAKE_FAKE_CONFIG_EXIT": "42",
                     })
-                    self.assertEqual(code, 1, logged)
+                    self.assertEqual(code, 1, f"log={logged!r} stderr={err!r}")
                     calls = invocations(logged)
                     self.assertEqual(len(calls), 1, logged)
                     self.assertIn("-S", calls[0])
                     self.assertFalse(any("--build" in c for c in calls))
 
-                    code, logged = run_body(directory, body, {
+                    code, logged, err = run_body(directory, body, {
                         "CMAKE_FAKE_CONFIG_EXIT": "0",
                         "CMAKE_FAKE_BUILD_EXIT": "42",
                     })
-                    self.assertEqual(code, 1, logged)
+                    self.assertEqual(code, 1, f"log={logged!r} stderr={err!r}")
                     calls = invocations(logged)
                     self.assertEqual(len(calls), 2, logged)
                     self.assertIn("--build", calls[1])

@@ -34,11 +34,30 @@ function Find-BuildTool([string]$Preferred, [string]$CommandName, [scriptblock]$
     return ""
 }
 
-function Get-BatchCommand([string]$Tool, [string]$CommandArgs) {
-    # cmd's CALL doubles ^ in the remaining command and cannot find a .cmd/.bat whose own
-    # path contains ^ (#3554). Nested cmd /c returns without CALL; cmake.exe stays quoted.
-    if ($Tool -match '\.(cmd|bat)$') { return "cmd /d /s /c `"`"$Tool`" $CommandArgs`"" }
-    return "`"$Tool`" $CommandArgs"
+function Get-CmakeExeBatchBody([string]$Tool, [string]$Src, [string]$Out, [string]$Ninja, [string]$Cfg, [string]$Jobs, [string]$Sdl, [string]$Vk) {
+    # cmake.exe: quoted, no CALL, so a ^ in the path stays a single ^ (#3554).
+    return "`"$Tool`" -S `"$Src`" -B `"$Out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$Ninja`" -DCMAKE_BUILD_TYPE=$Cfg $Sdl $Vk || exit /b 1`r`n`"$Tool`" --build `"$Out`" -j $Jobs || exit /b 1"
+}
+
+function Get-CmakeWrapperBatchBody([string]$Tool, [string]$Src, [string]$Out, [string]$Ninja, [string]$Cfg, [string]$Jobs, [string]$Sdl, [string]$Vk) {
+    # cmd's CALL doubles ^ and cannot find a .cmd/.bat whose own path contains ^ (#3554).
+    # Writing cmd /c ""wrapper" args" into a .cmd file also breaks: the leading "" ends the
+    # quote, so ^ is unquoted and escapes the next character. Put paths in set "VAR=..." (quoted,
+    # so ^ is literal) and let a nested cmd /v:on expand !VAR!. ^" escapes the child's quotes
+    # for the parent parser; /s leaves "wrapper" args for the child, which then returns.
+    $extra = ""
+    if ($Sdl) { $extra += " `"$Sdl`"" }
+    if ($Vk) { $extra += " `"$Vk`"" }
+    return @(
+        "set `"LEONIDA_CMAKE=$Tool`"",
+        "set `"LEONIDA_SRC=$Src`"",
+        "set `"LEONIDA_OUT=$Out`"",
+        "set `"LEONIDA_NINJA=$Ninja`"",
+        "set `"LEONIDA_CFG=$Cfg`"",
+        "set `"LEONIDA_JOBS=$Jobs`"",
+        "cmd /d /v:on /s /c ^`"`"!LEONIDA_CMAKE!`" -S `"!LEONIDA_SRC!`" -B `"!LEONIDA_OUT!`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=!LEONIDA_NINJA!`" `"-DCMAKE_BUILD_TYPE=!LEONIDA_CFG!`"$extra^`" || exit /b 1",
+        "cmd /d /v:on /s /c ^`"`"!LEONIDA_CMAKE!`" --build `"!LEONIDA_OUT!`" -j !LEONIDA_JOBS!^`" || exit /b 1"
+    ) -join "`r`n"
 }
 
 $root = Split-Path $PSScriptRoot -Parent
@@ -68,12 +87,11 @@ $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
 
 if ($cmake -and $ninja) {
-    $runConfigure = Get-BatchCommand $cmake "-S `"$src`" -B `"$out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$ninja`" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk"
-    $runBuild = Get-BatchCommand $cmake "--build `"$out`" -j $jobs"
-    $body = @"
-$runConfigure || exit /b 1
-$runBuild || exit /b 1
-"@
+    if ($cmake -match '\.(cmd|bat)$') {
+        $body = Get-CmakeWrapperBatchBody $cmake $src $out $ninja $cfg "$jobs" $sdl $vk
+    } else {
+        $body = Get-CmakeExeBatchBody $cmake $src $out $ninja $cfg "$jobs" $sdl $vk
+    }
 } else {
     # Keep this list in step with runtime\CMakeLists.txt. Optional parts that need a dependency are left out here:
     # the GameInput shim (SDL3), so controllers go through the host's GameInput.dll, if any, as without the shim.
