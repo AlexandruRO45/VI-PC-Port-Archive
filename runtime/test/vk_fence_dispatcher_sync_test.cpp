@@ -8,7 +8,7 @@
 //      of spinning forever.
 //   5. cancel() blocks until a callback already dispatched for that semaphore has stopped using it.
 //   6. A re-entrant cancel() for a later callback in the same ready batch skips that callback.
-// Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
+// Skips with exit code 77 when Vulkan is unavailable. Setup errors fail the test. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
@@ -97,10 +97,12 @@ int main() {
     using namespace leonida;
 
     vktest::Device d;
-    if (!d.create(false)) {
-        std::fprintf(stderr, "vk_fence_dispatcher_sync_test: no Vulkan 1.3 device, skipped\n");
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "vk_fence_dispatcher_sync_test: Vulkan unavailable, skipped\n");
         return 77;
     }
+    if (status != vktest::DeviceStatus::ready) return 1;
     driver::install(d.device_proc, d.device);
 
     // 1. Re-entrant completion callback in run(): callback calls enqueue_fence_callback() and cancel_fence_waits().

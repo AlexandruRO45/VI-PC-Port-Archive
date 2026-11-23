@@ -6,7 +6,7 @@
 //      submission-order query state (no data race on QueryPool::ended / QueryPool::occlusion and no stale zero-fill).
 //   3. A transient vkQueueSubmit failure must preserve pending VulkanQueue::wait() timeline semaphores for the retry.
 //   4. Concurrent multi-queue query End/Resolve + add/remove_query_pool stress with zero Vulkan validation errors.
-// Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
+// Skips with exit code 77 when Vulkan is unavailable. Setup errors fail the test. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 
@@ -125,10 +125,12 @@ int main() {
     using namespace leonida;
 
     vktest::Device d;
-    if (!d.create(false)) {
-        std::fprintf(stderr, "vk_queue_query_sync_test: no Vulkan 1.3 device, skipped\n");
+    const auto status = d.initialize();
+    if (status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "vk_queue_query_sync_test: Vulkan unavailable, skipped\n");
         return 77;
     }
+    if (status != vktest::DeviceStatus::ready) return 1;
     driver::install(d.device_proc, d.device);
     driver::counter_test_thread = std::this_thread::get_id();
 
