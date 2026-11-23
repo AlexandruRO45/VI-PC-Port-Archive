@@ -277,5 +277,51 @@ class TreeAndRegionGuardTest(unittest.TestCase):
         self.assertEqual(out, [("guard", 2, [("block", 1)])])
 
 
+class B32MaskBarrierClassificationTest(unittest.TestCase):
+    def test_cross_half_b32_mask_reads_and_live_scc_votes_are_barriers(self):
+        # 1) Cross-half 32-bit mask logic (exec_lo <- vcc_hi, vcc_lo <- exec_hi, cselect_b32) emits wave_mask
+        #    even when SCC is dead.
+        and_cross = ins("s_and_b32", special("vcc_lo"), special("vcc_lo"), special("vcc_hi"))
+        lm_vcc = {id(and_cross): {"vcc": "mask"}}
+        self.assertTrue(w._insn_may_barrier(and_cross, lm_vcc, set()))
+        self.assertFalse(w._classify_block_body([and_cross], lm_vcc, set(), frozenset())[0])
+
+        not_cross = ins("s_not_b32", special("vcc_lo"), special("exec_hi"))
+        self.assertTrue(w._insn_may_barrier(not_cross, {id(not_cross): {"vcc": "mask"}}, set()))
+        self.assertFalse(w._classify_block_body([not_cross], {id(not_cross): {"vcc": "mask"}}, set(), frozenset())[0])
+
+        csel_cross = ins("s_cselect_b32", special("exec_lo"), special("vcc_hi"), {"k": "imm", "v": 1})
+        self.assertTrue(w._insn_may_barrier(csel_cross, {id(csel_cross): {"vcc": "mask"}}, set()))
+        self.assertFalse(w._classify_block_body([csel_cross], {id(csel_cross): {"vcc": "mask"}}, set(), frozenset())[0])
+
+        # Same-half 32-bit mask logic with dead SCC stays lane-local (no barrier).
+        and_same = ins("s_and_b32", special("vcc_lo"), special("vcc_lo"), special("exec_lo"))
+        lm_same = {id(and_same): {"vcc": "mask"}}
+        self.assertFalse(w._insn_may_barrier(and_same, lm_same, set()))
+        self.assertTrue(w._classify_block_body([and_same], lm_same, set(), frozenset())[0])
+
+        # 2) Live-SCC 32-bit mask logic (writing mask vcc_lo or reading a lane mask) emits scc_logic vote.
+        and_live_vcc = ins("s_and_b32", special("vcc_lo"), {"k": "imm", "v": 1}, {"k": "imm", "v": 1})
+        lm_live = {id(and_live_vcc): {"vcc": "mask"}}
+        self.assertTrue(w._insn_may_barrier(and_live_vcc, lm_live, {id(and_live_vcc)}))
+        self.assertFalse(w._classify_block_body([and_live_vcc], lm_live, {id(and_live_vcc)}, frozenset())[0])
+
+        # 3) *_saveexec_b32 and *_wrexec_b32 reading a high-half mask or writing exec_hi/vcc_hi emit wave_mask
+        #    even when SCC is dead.
+        save_hi_src = ins("s_and_saveexec_b32", sgpr(6), special("vcc_hi"))
+        lm_save = {id(save_hi_src): {"vcc": "mask"}}
+        self.assertTrue(w._insn_may_barrier(save_hi_src, lm_save, set()))
+        self.assertFalse(w._classify_block_body([save_hi_src], lm_save, set(), frozenset())[0])
+
+        wrexec_hi_dst = ins("s_andn2_wrexec_b32", special("vcc_hi"), sgpr(6))
+        self.assertTrue(w._insn_may_barrier(wrexec_hi_dst, {}, set()))
+        self.assertFalse(w._classify_block_body([wrexec_hi_dst], {}, set(), frozenset())[0])
+
+        # Same-half *_saveexec_b32 with dead SCC stays lane-local.
+        save_lo = ins("s_and_saveexec_b32", sgpr(6), special("vcc_lo"))
+        self.assertFalse(w._insn_may_barrier(save_lo, {id(save_lo): {"vcc": "mask"}}, set()))
+        self.assertTrue(w._classify_block_body([save_lo], {id(save_lo): {"vcc": "mask"}}, set(), frozenset())[0])
+
+
 if __name__ == "__main__":
     unittest.main()

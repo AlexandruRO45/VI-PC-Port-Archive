@@ -1711,6 +1711,51 @@ class StructuredEmulationTests(unittest.TestCase):
         self.assertEqual(plan["dirty_in"][3], frozenset({("mem", "r")}))
         self.assertEqual(plan["dirty_in"][4], frozenset({("mem", "r")}))
 
+    def test_cross_half_b32_masks_and_live_scc_b32_votes_in_fold_and_multiwave(self):
+        # 1) Single-wave s_cbranch_execz candidates with cross-half b32 mask reads (s_and_b32, s_not_b32,
+        #    s_and_saveexec_b32) or live-SCC b32 mask logic must not fold inline (they emit wave_mask / g_vote).
+        for name, body in (
+            ("cs_fold_b32_crosshalf", [("s_and_b32 vcc_lo, vcc_lo, vcc_hi", 4)]),
+            ("cs_fold_not_b32_crosshalf", [("s_not_b32 vcc_lo, exec_hi", 4)]),
+            ("cs_fold_saveexec_b32_crosshalf", [("s_and_saveexec_b32 s6, vcc_hi", 4)]),
+            ("cs_fold_b32_livescc", [("s_and_b32 vcc_lo, vcc_lo, 1", 4), ("s_cselect_b32 s6, 1, 2", 4)]),
+        ):
+            with self.subTest(name=name):
+                insns = [
+                    ("v_cmp_lt_u32_e32 vcc, 16, v0", 4),
+                    ("s_and_saveexec_b64 s[4:5], vcc", 4),
+                    (f"s_cbranch_execz {len(body) + 1}", 4),
+                    *body,
+                    ("v_mov_b32_e32 v4, 1", 4),
+                    ("s_or_b64 exec, exec, s[4:5]", 4),
+                    ("s_endpgm", 4),
+                ]
+                spv, _ = _translate_encoded(name, insns, (64, 1, 1), emulate=True)
+                self.assertIn("OpControlBarrier", spv)
+
+        # 2) Multi-wave (128-lane) divergent s_cbranch_scc1 guards containing cross-half b32 mask reads or
+        #    live-SCC b32 mask votes must be routed to a mini-scheduler rather than inline_sync_free.
+        for name, body in (
+            ("cs_mw_b32_crosshalf", [("s_and_b32 exec_lo, exec_lo, vcc_hi", 4)]),
+            ("cs_mw_cselect_b32_crosshalf", [("s_cselect_b32 exec_lo, vcc_hi, 1", 4)]),
+            ("cs_mw_saveexec_b32_crosshalf", [("s_and_saveexec_b32 s6, vcc_hi", 4)]),
+            ("cs_mw_b32_vcclo_livescc", [("s_and_b32 vcc_lo, 1, 1", 4), ("s_cselect_b32 s6, 1, 2", 4)]),
+        ):
+            with self.subTest(name=name):
+                insns = [
+                    ("s_mov_b64 exec, -1", 4),
+                    ("v_cmp_eq_u32_e32 vcc, 0, v0", 4),
+                    ("s_cmp_eq_u32 s0, 0", 4),
+                    (f"s_cbranch_scc1 {len(body) + 1}", 4),
+                    *body,
+                    ("v_mov_b32_e32 v1, 1", 4),
+                    ("s_barrier", 4),
+                    ("s_endpgm", 4),
+                ]
+                spv, gen = _translate_encoded(name, insns, (128, 1, 1), emulate=True, rsrc2=0x20088)
+                self.assertEqual(gen.emulate_plan["mode"], "structured_hybrid")
+                self.assertEqual(len(gen.emulate_plan["mini_blocks"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

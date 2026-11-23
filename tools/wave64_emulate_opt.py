@@ -178,6 +178,7 @@ _FLAG_WRITES_EXEC_OP = 16
 _FLAG_SCC_VOTE_ALWAYS_MASK = 32
 _FLAG_SOP2_B32_LOGIC = 64
 _FLAG_VOTED_BRANCH = 128
+_FLAG_B32_MASK_BARRIER_CHK = 256
 
 # Mask check categories in meta[11]
 _MASK_CHK_NONE = 0
@@ -318,7 +319,9 @@ def _get_op_meta(raw_op):
     if op in _MASK_SCC_VOTE_OPS and ("saveexec" in op or "wrexec" in op or op.endswith("_mask")):
         flags |= _FLAG_SCC_VOTE_ALWAYS_MASK
     if op in _SOP2_B32_LOGIC:
-        flags |= _FLAG_SOP2_B32_LOGIC
+        flags |= _FLAG_SOP2_B32_LOGIC | _FLAG_B32_MASK_BARRIER_CHK
+    elif op == "s_cselect_b32" or op.endswith(("_saveexec_b32", "_wrexec_b32")):
+        flags |= _FLAG_B32_MASK_BARRIER_CHK
     if op in _VOTED_BRANCHES:
         flags |= _FLAG_VOTED_BRANCH
 
@@ -785,6 +788,68 @@ def _x_memory_order_access(op):
     return kind, reads, writes
 
 
+def _mask_half(x, lm_map):
+    """Matches Gen.mask_half in tools/rdna2spirv.py for wave64 ('lo', 'hi', or None)."""
+    k = x.get("k")
+    if k == "special":
+        t = x.get("t", "")
+        if t in ("exec_lo", "vcc_lo"):
+            return "lo"
+        if t in ("exec_hi", "vcc_hi"):
+            return "hi"
+        return None
+    if k == "sgpr" and x.get("n", 1) == 1:
+        mk = lm_map.get(x["r"])
+        if mk == _lane_masks.MASK_LO:
+            return "lo"
+        if mk == _lane_masks.MASK_HI:
+            return "hi"
+    return None
+
+
+def _maskable_b32(x):
+    """Matches Gen._maskable_b32 in tools/rdna2spirv.py."""
+    k = x.get("k")
+    return k in ("sgpr", "imm") or (
+        k == "special" and (x.get("t", "").startswith(("exec", "vcc")) or x.get("t") == "null")
+    )
+
+
+def _mask_b32_dst_half(d, srcs, ins, lm_map):
+    """Matches Gen._mask_b32_dst_half in tools/rdna2spirv.py for wave64 -> (to_mask_dst, half)."""
+    if d.get("k") != "special":
+        return False, None
+    t = d.get("t", "")
+    if t in ("exec_lo", "exec_hi"):
+        return True, "hi" if t == "exec_hi" else "lo"
+    if t in ("vcc_lo", "vcc_hi") and ("vcc" in lm_map or any(_holds_lane_mask(ins, s, lm_map) for s in srcs)):
+        return True, "hi" if t == "vcc_hi" else "lo"
+    return False, None
+
+
+def _b32_mask_op_may_barrier(ins, op, a, lm_map, scc_live):
+    """True when a 32-bit mask SALU op emits wave_mask or scc_logic -> x_round under --wave64-emulate."""
+    if op.endswith(("_saveexec_b32", "_wrexec_b32")):
+        if len(a) > 1 and _holds_lane_mask(ins, a[1], lm_map) and _mask_half(a[1], lm_map) == "hi":
+            return True
+        if a and a[0].get("k") == "special" and a[0].get("t") in ("exec_hi", "vcc_hi"):
+            return True
+        return False
+    if op not in _SOP2_B32_LOGIC and op != "s_cselect_b32":
+        return False
+    if not a:
+        return False
+    srcs = a[1:2] if op == "s_not_b32" else a[1:3]
+    to_mask_dst, dst_half = _mask_b32_dst_half(a[0], srcs, ins, lm_map)
+    if to_mask_dst and dst_half is not None and all(_maskable_b32(x) for x in srcs):
+        if any(_holds_lane_mask(ins, s, lm_map) and _mask_half(s, lm_map) not in (None, dst_half) for s in srcs):
+            return True
+    if op in _SOP2_B32_LOGIC and scc_live and id(ins) in scc_live:
+        if to_mask_dst or any(_holds_lane_mask(ins, s, lm_map) for s in srcs):
+            return True
+    return False
+
+
 def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
     """Inspect non-terminator instructions of a block for lane-local region safety.
 
@@ -864,6 +929,10 @@ def _classify_block_body(insns, lane_masks, scc_live, mask_writes):
                 lm = lane_masks.get(id(ins), {})
                 if any(_holds_lane_mask(ins, x, lm) for x in a):
                     return False, _EMPTY_MEM_STATS, 0, (), ()
+        if (flags & _FLAG_B32_MASK_BARRIER_CHK) and _b32_mask_op_may_barrier(
+            ins, m[0], a, lane_masks.get(id(ins), {}), scc_live
+        ):
+            return False, _EMPTY_MEM_STATS, 0, (), ()
 
         # 3. Track scalar writes and EXEC writes.
         _, ins_mw, _ = _scalar_rw_with_meta(ins, m)
@@ -1234,6 +1303,11 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                     if any(_holds_lane_mask(ins, x, lm) for x in a):
                         clean = False
                         continue
+            if (flags & _FLAG_B32_MASK_BARRIER_CHK) and _b32_mask_op_may_barrier(
+                ins, m[0], a, lane_masks.get(id(ins), {}), scc_live
+            ):
+                clean = False
+                continue
 
             may_w |= ins_mw
             s_bits = ins_mw & _ALL_SGPRS
@@ -1449,10 +1523,14 @@ def _insn_may_barrier_with_meta(ins, meta, lane_masks, scc_live):
     flags = meta[8]
     if flags & _FLAG_ALWAYS_BARRIER:
         return True
+    a = ins["args"]
+    if (flags & _FLAG_B32_MASK_BARRIER_CHK) and _b32_mask_op_may_barrier(
+        ins, meta[0], a, lane_masks.get(id(ins), {}), scc_live
+    ):
+        return True
     mask_chk = meta[11]
     if not mask_chk:
         return False
-    a = ins["args"]
     if mask_chk == _MASK_CHK_SCC_VOTE:
         if not scc_live or id(ins) not in scc_live:
             return False
