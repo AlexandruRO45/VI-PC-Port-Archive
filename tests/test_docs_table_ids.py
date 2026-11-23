@@ -17,16 +17,28 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOLD_ID = re.compile(r"^\*\*[^*]+\*\*$")  # the whole first cell is bold
 SEPARATOR = re.compile(r"^\|\s*:?-{3}")
+FENCE_START = re.compile(r"^(`{3,}|~{3,})")
 
 
 def repeated_ids(text):
     """[(line a, line b, id)] for two rows of one table whose first cells are the same bold ID."""
-    found, in_fence, seen, in_table = [], False, {}, False
+    found, seen, in_table = [], {}, False
+    fence_char, fence_len = None, 0
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
-            in_table = False
-            continue
+        stripped = line.lstrip()
+        if fence_char is None:
+            m = FENCE_START.match(stripped)
+            if m:
+                fence_char, fence_len = m.group(1)[0], len(m.group(1))
+                in_table = False
+                continue
+        else:
+            close_pat = r"^" + re.escape(fence_char) + r"{" + str(fence_len) + r",}\s*$"
+            if re.match(close_pat, stripped):
+                fence_char, fence_len = None, 0
+                in_table = False
+                continue
+        in_fence = fence_char is not None
         row = not in_fence and line.startswith("|") and not SEPARATOR.match(line)
         if row and not in_table:
             seen = {}
@@ -63,6 +75,8 @@ class RepeatedTableIds(unittest.TestCase):
             "",
             "| # | Scope |", "|---|---|", "| **M2** | another table |",       # a new table starts over
             "```", "| **M3** | in a fence |", "| **M3** | in a fence |", "```",
+            "````markdown", "```", "| **M4** | nested |", "| **M4** | nested |", "```", "````",
+            "~~~", "| **M5** | tilde |", "| **M5** | tilde |", "~~~",
         ])
         self.assertEqual(repeated_ids(text), [(3, 5, "**M2**")])
 
