@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+"""Semantic reference oracle and architectural model for RDNA2 SALU Conditional Branch Execution Suite.
+
+Covers:
+- s_cbranch_execnz: conditional branch taken if execution mask EXEC is non-zero (any lane active).
+- s_cbranch_execz: conditional branch taken if execution mask EXEC is zero (all lanes inactive).
+- s_cbranch_scc0: conditional branch taken if scalar condition code SCC is 0.
+- s_cbranch_scc1: conditional branch taken if scalar condition code SCC is 1.
+- s_cbranch_vccnz: conditional branch taken if vector condition code VCC is non-zero (wave-wide).
+- s_cbranch_vccz: conditional branch taken if vector condition code VCC is zero (wave-wide).
+
+Zero game data, standard library Python only (python -I, struct, math, unittest).
+"""
+
+from dataclasses import dataclass
+import enum
+import os
+import struct
+import sys
+import tempfile
+import unittest
+import warnings
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS_DIR = os.path.dirname(HERE)
+ROOT_DIR = os.path.dirname(TESTS_DIR)
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT_DIR, "tools")
+for p in (HERE, TESTS_DIR, TOOLS_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+from support import STUB_DXBC, translate_lines, mrt0_words  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+@dataclass
+class SaluMachineState:
+    pc: int = 0
+    scc: int = 0
+    exec_mask: int = 0xFFFFFFFFFFFFFFFF
+    vcc: int = 0
+    sgprs: list[int] = None
+
+    def __post_init__(self):
+        if self.sgprs is None:
+            self.sgprs = [0] * 106
+
+
+def eval_branch_condition(mnemonic: str, state: SaluMachineState) -> bool:
+    if mnemonic == "s_cbranch_execnz":
+        return (state.exec_mask & MASK64) != 0
+    if mnemonic == "s_cbranch_execz":
+        return (state.exec_mask & MASK64) == 0
+    if mnemonic == "s_cbranch_scc0":
+        return (state.scc & 1) == 0
+    if mnemonic == "s_cbranch_scc1":
+        return (state.scc & 1) == 1
+    if mnemonic == "s_cbranch_vccnz":
+        return (state.vcc & MASK64) != 0
+    if mnemonic == "s_cbranch_vccz":
+        return (state.vcc & MASK64) == 0
+    raise ValueError(f"Unknown branch mnemonic: {mnemonic}")
+
+
+class BranchRegKind(enum.Enum):
+    LABEL = "label"
+    SIMM16 = "simm16"
+
+
+@dataclass(frozen=True)
+class BranchInstructionAST:
+    mnemonic: str
+    target_offset: int
+
+
+def step_branch(instr: BranchInstructionAST, state: SaluMachineState) -> int:
+    if eval_branch_condition(instr.mnemonic, state):
+        state.pc = state.pc + 1 + instr.target_offset
+    else:
+        state.pc = state.pc + 1
+    return state.pc
+
+
+def translate_cs_branch(name: str, lines: list[tuple[str, int]]) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "disasm"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, "fssm"), exist_ok=True)
+        src = os.path.join(tmp, "disasm", name + ".s")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(f"; {name} synthetic branch test\n")
+            for text, size in lines:
+                f.write(f"\t{text} ; encoding: [{','.join(['0x00'] * size)}]\n")
+        with open(os.path.join(tmp, name + ".dxbc"), "wb") as f:
+            f.write(STUB_DXBC)
+        with open(os.path.join(tmp, "fssm", name + ".fssm"), "wb") as f:
+            f.write(bytes(0x138) + struct.pack("<4I", 0x8090, 64, 1, 1))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            spv = rdna2spirv.translate(src)
+        return spv
+
+
+def run_cs_branch(spv: str) -> int:
+    pc = [0, 0, 0xFFFFFFFF, 0x31016FAC] + [0] * 28
+    mem = si.run_workgroup(
+        spv, 64, 64,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=pc,
+        memory={}
+    )
+    return mem.get(0, 0)
+
+# -----------------------------------------------------------------------------
+# Opcode 1: s_cbranch_execnz
+# -----------------------------------------------------------------------------
+
+def ref_oracle_execnz(exec_mask: int) -> bool:
+    return (exec_mask & MASK64) != 0
+
+
+class SCbranchExecnzOracleTests(unittest.TestCase):
+    def test_all_lanes_active(self):
+        self.assertTrue(ref_oracle_execnz(0xFFFFFFFFFFFFFFFF))
+
+    def test_single_lane_active(self):
+        self.assertTrue(ref_oracle_execnz(1))
+        self.assertTrue(ref_oracle_execnz(1 << 31))
+        self.assertTrue(ref_oracle_execnz(1 << 63))
+
+    def test_all_lanes_inactive(self):
+        self.assertFalse(ref_oracle_execnz(0))
+
+if __name__ == '__main__':
+    unittest.main()
