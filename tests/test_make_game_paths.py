@@ -110,17 +110,38 @@ class BuildDestinationTest(unittest.TestCase):
         junction = os.path.join(root, "MountedContent")
         mounted_content = os.path.join(other_root, "Package")
 
+        real_lexists = os.path.lexists
+        real_isdir = os.path.isdir
+        other_root_norm = os.path.normcase(other_root)
+
         def realpath(path):
             if os.path.normcase(path) == os.path.normcase(junction):
                 return mounted_content
             return os.path.normpath(path)
+
+        def lexists(path):
+            norm = os.path.normcase(path)
+            if norm.startswith(other_root_norm):
+                return norm == other_root_norm
+            return real_lexists(path)
+
+        def isdir(path):
+            norm = os.path.normcase(path)
+            if norm.startswith(other_root_norm):
+                return norm == other_root_norm
+            return real_isdir(path)
 
         # A junction target on a different volume must not end the search before the matching entry.
         for entries, protected in (
             (["MountedContent", "Content"], os.path.join(root, "Content")),
             (["Content", "MountedContent"], mounted_content),
         ):
-            with patch("os.listdir", return_value=entries), patch("os.path.realpath", side_effect=realpath):
+            with (
+                patch("os.listdir", return_value=entries),
+                patch("os.path.realpath", side_effect=realpath),
+                patch("os.path.lexists", side_effect=lexists),
+                patch("os.path.isdir", side_effect=isdir),
+            ):
                 for option in ("out", "work"):
                     with self.subTest(protected=protected, option=option):
                         destinations = {name: os.path.join(self.root, name) for name in ("out", "work")}
