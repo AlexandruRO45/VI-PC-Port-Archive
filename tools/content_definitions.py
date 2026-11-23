@@ -3,6 +3,7 @@
 Accepts XML files or rpf9_carve directories. The CLI prints aggregate counts only.
 The Python API returns ordered records containing local game data: never publish
 those records. Archive offsets identify recovered spans, not named RPF entries.
+Usage: `python -I tools/content_definitions.py --help` lists the options.
 """
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ ROOTS = {
 
 class ContentError(ValueError):
     """Invalid content XML; messages never include input values or paths."""
+
+
+class _OtherRoot(ContentError):
+    """Well-formed XML outside the supported content schemas."""
 
 
 @dataclass(frozen=True)
@@ -134,7 +139,7 @@ def parse_content(chunks, *, max_bytes: int = 64 << 20) -> ContentDocument:
     except (ET.ParseError, LookupError, ValueError):
         raise ContentError("malformed or unsupported XML") from None
     if element.tag not in ROOTS:
-        raise ContentError("unsupported content root")
+        raise _OtherRoot("unsupported content root")
 
     def record(el):
         return Record(el.tag, tuple(el.attrib.items()), el.text or "", el.tail or "",
@@ -217,7 +222,11 @@ def main() -> int:
                     add(doc)
             else:
                 with open(path, "rb") as stream:
-                    add(parse_content(file_chunks(stream)))
+                    try:
+                        doc = parse_content(file_chunks(stream))
+                    except _OtherRoot:
+                        doc = None
+                    add(doc)
         except (OSError, ContentError, ValueError, KeyError, TypeError):
             counts["failed_inputs"] += 1
             status = max(status, 1)
