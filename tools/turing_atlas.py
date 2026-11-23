@@ -3,8 +3,9 @@ r"""Turing bring-up atlas for Leonida (stdlib only, run with python -I).
 Probes the host GPU (here: RTX 2060 SUPER, wave32) without game data:
   1. vulkaninfo feature matrix (subgroup size, mesh/task, barycentrics,
      maintenance8, subgroup_size_control, descriptor heap).
-  2. spirv-as/spirv-val validation of 4 synthetic cases at vulkan1.4:
-     compute-32, compute ballot-64 (wave64 marker), mesh-only, 16-bit I/O.
+  2. spirv-as/spirv-val validation of 5 synthetic cases at vulkan1.4:
+     compute-32, compute ballot-64 (wave64 marker), 16-bit I/O, the
+     maintenance8 Offset form, and a malformed control that must fail.
   3. Emits a JSON atlas to stdout (or --out FILE) for the PR body.
 
 Usage:
