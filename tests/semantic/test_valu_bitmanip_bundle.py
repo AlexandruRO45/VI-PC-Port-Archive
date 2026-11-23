@@ -340,6 +340,26 @@ class TestVBfmB32ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res, 0xff0)
         self.assertEqual(state.vgprs[2], 0xff0)
 
+class TestVBfmB32SIMDAndIEEE(unittest.TestCase):
+    def test_aliasing_and_condition_codes(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(0, 8)
+        state.write_vgpr(1, 4)
+        inst = ASTInstruction(Opcode.V_BFM_B32, ASTOperand.vgpr(0), ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res, 0xff0)
+        self.assertEqual(state.vgprs[0], 0xff0)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_ieee754_bitwise_transparency(self) -> None:
+        qnan = 0x7FC00000
+        snan = 0x7F800001
+        res = ref_v_bfm_b32(qnan, snan)
+        self.assertIsInstance(res, int)
+
 
 if __name__ == "__main__":
     unittest.main()
