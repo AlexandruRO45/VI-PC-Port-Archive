@@ -20,12 +20,14 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bink_names  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 
 CACHE_FIELDS = ("path", "offset", "width", "height", "frames")
 
@@ -60,6 +62,33 @@ def _read_cache(cache, key):
         return None
 
 
+def _write_cache(cache, key, rows):
+    fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
+    part = Path(name)
+    try:
+        try:
+            f = open(fd, "w", encoding="utf-8", newline="")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            f.write("# " + key + "\n")
+            w = csv.writer(f, lineterminator="\n")
+            w.writerow(CACHE_FIELDS)
+            for r in rows:
+                w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
+        os.chmod(part, published_mode(cache))
+        os.replace(part, cache)
+        part = None
+    finally:
+        if part is not None:
+            with suppress(OSError):
+                # The staging file may have inherited a read-only cache's mode; make it
+                # deletable first, or Windows strands it beside the cache when replace fails.
+                os.chmod(part, 0o600)
+                part.unlink(missing_ok=True)
+
+
 def load_names(archive, mount, use_cache=True):
     """[(path, offset, width, height, frames)] for the streams of ``archive``, named from ``mount``."""
     cache = cache_path()
@@ -83,14 +112,7 @@ def load_names(archive, mount, use_cache=True):
     finally:
         tmp.unlink(missing_ok=True)
     if use_cache:
-        fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
-        with open(fd, "w", encoding="utf-8", newline="") as f:
-            f.write("# " + key + "\n")
-            w = csv.writer(f, lineterminator="\n")
-            w.writerow(CACHE_FIELDS)
-            for r in rows:
-                w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
-        os.replace(name, cache)
+        _write_cache(cache, key, rows)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
 

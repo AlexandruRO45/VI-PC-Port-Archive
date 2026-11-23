@@ -1,4 +1,5 @@
 """tools/bink_play.py: name matching and the name-table cache. Synthetic names only, no game files."""
+import os
 import sys
 import tempfile
 import threading
@@ -167,6 +168,70 @@ class CacheTest(unittest.TestCase):
                     worker.join()
             self.assertEqual(got, {"first": "Stinger/first.bk2", "second": "Stinger/second.bk2"})
             self.assertEqual(sorted(p.name for p in (d / "cache").iterdir()), ["bink_names.csv"])
+
+    def test_cache_write_applies_published_mode_without_flipping_umask(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "bink_names.csv"
+            rows = [{"path": "Stinger/A.bk2", "offset": "4096", "width": "1920", "height": "1080", "frames": "60"}]
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def record_chmod(path, mode):
+                chmod_calls.append((Path(path), mode))
+                return real_chmod(path, mode)
+
+            with mock.patch.object(bink_play, "published_mode", wraps=bink_play.published_mode) as pub, \
+                    mock.patch.object(bink_play.os, "chmod", side_effect=record_chmod), \
+                    mock.patch("os.umask", side_effect=AssertionError("os.umask must not be called")):
+                bink_play._write_cache(cache, "key", rows)
+            self.assertEqual(pub.call_count, 1)
+            self.assertEqual(pub.call_args.args, (cache,))
+            self.assertEqual(len(chmod_calls), 1)
+            staged_path, staged_mode = chmod_calls[0]
+            self.assertNotEqual(staged_path, cache)
+            self.assertEqual(staged_mode, file_mode.published_mode(cache))
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["bink_names.csv"])
+
+    def test_failed_cache_replace_cleans_read_only_staging_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "bink_names.csv"
+            cache.write_text("# old\n", encoding="utf-8", newline="\n")
+            os.chmod(cache, 0o444)
+            self.addCleanup(lambda: cache.exists() and os.chmod(cache, 0o600))
+            rows = [{"path": "Stinger/A.bk2", "offset": "4096", "width": "1920", "height": "1080", "frames": "60"}]
+            with mock.patch.object(bink_play.os, "replace", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    bink_play._write_cache(cache, "key", rows)
+            self.assertEqual(cache.read_text(encoding="utf-8"), "# old\n")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["bink_names.csv"])
+
+    def test_failed_cache_write_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "bink_names.csv"
+            bad_rows = [{"path": "Stinger/A.bk2"}]
+            with self.assertRaises(KeyError):
+                bink_play._write_cache(cache, "key", bad_rows)
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_new_cache_gets_bits_of_a_plain_open(self):
+        import file_mode
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "bink_names.csv"
+            rows = [{"path": "Stinger/A.bk2", "offset": "4096", "width": "1920", "height": "1080", "frames": "60"}]
+            bink_play._write_cache(cache, "key", rows)
+            self.assertEqual(os.stat(cache).st_mode & 0o777, file_mode.new_file_mode(d))
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
+    def test_replaced_cache_keeps_its_bits(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "bink_names.csv"
+            cache.write_text("# old\n", encoding="utf-8", newline="\n")
+            os.chmod(cache, 0o640)
+            rows = [{"path": "Stinger/A.bk2", "offset": "4096", "width": "1920", "height": "1080", "frames": "60"}]
+            bink_play._write_cache(cache, "key", rows)
+            self.assertEqual(os.stat(cache).st_mode & 0o777, 0o640)
 
 
 if __name__ == "__main__":
