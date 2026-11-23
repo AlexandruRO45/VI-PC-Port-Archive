@@ -420,6 +420,18 @@ class BindingCliTest(unittest.TestCase):
             self.assertEqual(doc["files"][0]["bindings"]["records"], 1)
             self.assertEqual(doc["files"][0]["bindings"]["name"], "x")
 
+    def test_stage_index_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump([{"file": "ps_01.dxbc", "stage": "ps"}], f)
+            self.assertEqual(fssm_header.stage_index(tmp), {"ps_01": "ps"})
+
+    def test_stage_index_malformed_json_with_utf8_bom_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write("{not valid json")
+            self.assertEqual(fssm_header.stage_index(tmp), {})
+
 
 if __name__ == "__main__":
     unittest.main()

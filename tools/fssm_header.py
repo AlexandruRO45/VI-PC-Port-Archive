@@ -229,7 +229,7 @@ def stage_index(path):
     for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
         if os.path.isfile(candidate):
             try:
-                with open(candidate, encoding="utf-8") as f:
+                with open(candidate, encoding="utf-8-sig") as f:
                     rows = json.load(f)
             except (OSError, ValueError):
                 continue
