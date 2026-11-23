@@ -753,6 +753,18 @@ def cross_tool_suffix() -> "str | None":
     return None
 
 
+def partial_cross_suffix() -> str:
+    """The version suffix of the most complete set of CROSS_TOOLS on PATH ("" for the plain names), when none is
+    complete: the newest of the sets with the most tools, so the missing ones can be named in that set. On Ubuntu with
+    clang-19, lld-19 and llvm-19 that is "-19" (only clang-cl-19 is absent), not the five plain names."""
+    best, best_count = "", sum(bool(shutil.which(t)) for t in CROSS_TOOLS)
+    for suffix in CROSS_SUFFIXES[1:]:
+        count = sum(bool(shutil.which(t + suffix)) for t in CROSS_TOOLS)
+        if count > best_count:
+            best, best_count = suffix, count
+    return best
+
+
 def cross_build_dir() -> str:
     return os.path.join(ROOT, "runtime", "build", "windows")
 
@@ -794,13 +806,18 @@ def cross_build_missing() -> list:
                            "PATH, or delete runtime/build/windows to configure it with the tools on PATH now")
     elif cross_tool_suffix() is None:
         major = clang_cl_major() if all(shutil.which(t) for t in CROSS_TOOLS) else None
-        partial = next((s for s in CROSS_SUFFIXES[1:] if shutil.which("clang-cl" + s)), "")
+        partial = partial_cross_suffix()
         absent = [t + partial for t in CROSS_TOOLS if not shutil.which(t + partial)]
         if major is not None and not absent:
             missing.append(f"clang-cl 19 or newer (this one is {major}; the MSVC STL from xwin rejects older Clang)")
         else:
-            missing.append(f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), all five by their plain "
-                           "names or with one version suffix such as clang-cl-21")
+            item = (f"{', '.join(absent)}: LLVM 19 or newer (clang, lld and llvm), all five by their plain "
+                    "names or with one version suffix such as clang-cl-21")
+            if "clang-cl" + partial in absent and shutil.which("clang" + partial):
+                # Debian and Ubuntu ship clang-cl-<N> in clang-tools-<N>, not in clang-<N> (docs/testing.md).
+                item += (f"; clang{partial} is installed, and on Debian and Ubuntu clang-cl{partial} comes with the "
+                         f"clang-tools{partial} package (sudo apt-get install clang-tools{partial})")
+            missing.append(item)
     if not xwin_dir():
         missing.append("an xwin splat made with `xwin splat --use-winsysroot-style --preserve-ms-arch-notation` "
                        "(VC/Tools/MSVC and Windows Kits/10/Lib/<version>/um/x64) in XWIN_DIR or "

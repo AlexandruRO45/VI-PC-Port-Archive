@@ -153,6 +153,34 @@ class CrossBuildMissingTest(unittest.TestCase):
         (item,) = self.missing(have=("cmake",))
         self.assertTrue(item.startswith(", ".join(make_game.CROSS_TOOLS) + ":"))
 
+    def test_ubuntu_clang_without_clang_tools_names_the_package(self):
+        # Ubuntu 24.04 with `apt install clang-19 lld-19 llvm-19`: every versioned tool but clang-cl-19, which is in
+        # clang-tools-19. The missing one is named in that set (not all five plain names), with the package.
+        ubuntu = ("cmake", "clang-19", "lld-link-19", "llvm-lib-19", "llvm-rc-19", "llvm-mt-19")
+        (item,) = self.missing(have=ubuntu)
+        self.assertTrue(item.startswith("clang-cl-19: LLVM 19 or newer"), item)
+        self.assertIn("clang-tools-19 package (sudo apt-get install clang-tools-19)", item)
+        self.assertEqual(self.missing(have=(*ubuntu, "clang-cl-19")), [])
+
+    def test_the_package_hint_needs_clang_itself(self):
+        # Without clang-<N> there is nothing to say about clang-tools-<N>: LLVM is simply missing.
+        (item,) = self.missing(have=("cmake", "lld-link-19", "llvm-lib-19", "llvm-rc-19", "llvm-mt-19"))
+        self.assertTrue(item.startswith("clang-cl-19: LLVM 19 or newer"), item)
+        self.assertNotIn("clang-tools", item)
+        # The plain names follow the same rule.
+        (item,) = self.missing(have=("cmake", "clang", "lld-link", "llvm-lib", "llvm-rc", "llvm-mt"))
+        self.assertTrue(item.startswith("clang-cl: LLVM 19 or newer"), item)
+        self.assertIn("clang-tools package (sudo apt-get install clang-tools)", item)
+
+    def test_the_most_complete_set_is_named(self):
+        # A newer partial install doesn't hide the set that lacks only one tool, and a tie goes to the newer set.
+        have = ("cmake", "clang-cl-21", "lld-link-19", "llvm-lib-19", "llvm-rc-19", "llvm-mt-19", "clang-cl-20")
+        (item,) = self.missing(have=have)
+        self.assertTrue(item.startswith("clang-cl-19: LLVM 19 or newer"), item)
+        have = ("cmake", "clang-cl-21", "lld-link-21", "clang-cl-20", "lld-link-20")
+        (item,) = self.missing(have=have)
+        self.assertTrue(item.startswith("llvm-lib-21, llvm-rc-21, llvm-mt-21:"), item)
+
     def test_clang_older_than_19_is_refused(self):
         (item,) = self.missing(major=18)
         self.assertIn("this one is 18", item)
