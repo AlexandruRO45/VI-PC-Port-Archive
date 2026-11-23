@@ -320,5 +320,25 @@ class TestSTtraceDataImmRejection(unittest.TestCase):
         self.assertIn("s_ttracedata_imm32", str(cm.exception))
 
 
+class TestSSendMsgOrderedPsDoneReference(unittest.TestCase):
+    def test_sendmsg_ordered_ps_done_translation(self):
+        lines = [
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "v_mov_b32 v0, 0x12344321",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x12344321, 0x12344321, 0x12344321, 0x12344321])
+
+    def test_sendmsg_spirv_header_validity(self):
+        lines = [
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_sendmsg_valid", lines)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        self.assertIn("OpExecutionMode", spv)
+
+
 if __name__ == "__main__":
     unittest.main()
