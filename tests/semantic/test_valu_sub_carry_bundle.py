@@ -695,5 +695,37 @@ class VSubrevCoCiU32TranslatorIntegrationTests(unittest.TestCase):
             translate_lines("ps_neg_subrev_co_ci", prog)
 
 
+class VSubF16OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_sub_f16 with translator execution."""
+
+    def test_basic_subtraction(self):
+        # 5.0 (0x4500) - 2.0 (0x4000) = 3.0 (0x4200)
+        out = run_prog([
+            "v_mov_b32 v0, 0x4500",
+            "v_mov_b32 v1, 0x4000",
+            "v_sub_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x4200)
+
+    def test_negative_result(self):
+        # 1.0 (0x3C00) - 4.0 (0x4400) = -3.0 (0xC200)
+        out = run_prog([
+            "v_mov_b32 v0, 0x3C00",
+            "v_mov_b32 v1, 0x4400",
+            "v_sub_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0xC200)
+
+    def test_cancellation(self):
+        out = run_prog([
+            "v_mov_b32 v0, 0x4780",  # 7.5
+            "v_sub_f16 v1, v0, v0",
+            "v_mov_b32 v0, v1",
+        ])
+        self.assertEqual(out[0] & 0xFFFF, 0x0000)
+
+
 if __name__ == "__main__":
     unittest.main()
