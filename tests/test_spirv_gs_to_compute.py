@@ -380,3 +380,25 @@ def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, befo
 
     assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
     assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+
+
+def test_cli_uses_shared_same_report_path_for_folding_volume_case_alias(tmp_path: Path, monkeypatch, capsys) -> None:
+    import report_paths
+
+    assert gsc.same_report_path is report_paths.same_report_path
+    source = tmp_path / "gs.spv"
+    source.write_bytes(b"synthetic")
+    output = tmp_path / "cs.spv"
+    folded_layout = tmp_path / "CS.SPV"
+    calls = []
+    monkeypatch.setattr(report_paths.os.path, "realpath", os.path.abspath)
+    monkeypatch.setattr(report_paths, "_resolved_key", str)
+    monkeypatch.setattr(report_paths.os.path, "samefile", lambda *_a: (_ for _ in ()).throw(OSError("not same")))
+    monkeypatch.setattr(report_paths, "_same_resolved_name", lambda a, b: (calls.append((a, b)) or True))
+
+    rc = gsc.main(["spirv_gs_to_compute.py", str(source), str(output), "--layout", str(folded_layout)])
+    assert rc == 2
+    assert "refer to the same file" in capsys.readouterr().err
+    assert len(calls) >= 1
+    assert source.read_bytes() == b"synthetic"
+    assert not output.exists()

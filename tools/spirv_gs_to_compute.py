@@ -30,6 +30,9 @@ import sys
 from itertools import combinations
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 LOCAL_SIZE = 64
 IN_VERTS = {"InputPoints": 1, "InputLines": 2, "InputLinesAdjacency": 4, "Triangles": 3,
             "InputTrianglesAdjacency": 6}
@@ -372,10 +375,10 @@ def main(argv):
     if lay_path:
         paths.append(("--layout output", lay_path))
     try:
-        resolved = [(name, Path(path).resolve()) for name, path in paths]
-        for (left_name, left), (right_name, right) in combinations(resolved, 2):
-            if left == right or (left.exists() and right.exists() and left.samefile(right)):
-                print(f"{left_name} and {right_name} refer to the same file: {left}", file=sys.stderr)
+        for (left_name, left), (right_name, right) in combinations(paths, 2):
+            if same_report_path(left, right):
+                print(f"{left_name} and {right_name} refer to the same file: {os.path.realpath(left)}",
+                      file=sys.stderr)
                 return 2
     except (OSError, RuntimeError, ValueError) as e:
         print(f"cannot check input/output paths: {e}", file=sys.stderr)
