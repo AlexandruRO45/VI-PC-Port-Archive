@@ -229,6 +229,8 @@ class Gen:
         self.per_vertex = set()     # PS: attribute numbers read by a *_f16 interp: PerVertexKHR, decoded per half
         self.f16_halves = set()     # PS, --f16-interp-fallback: the same attributes, read from decoded-half inputs
         self.f16_half_locs = {}     # PS/VS/MS, --f16-interp-fallback: attr/param n -> (low_loc, high_loc)
+        self.pc_tail_ubo = PC_TAIL_UBO
+        self.f16_interp_fallback = F16_HALVES
         self.param_max = -1         # VS/MS: the highest exp paramN (--f16-interp-fallback keeps halves above it)
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
@@ -12689,6 +12691,10 @@ def mesh_compute_epilogue(gen):
 
 
 def assemble(gen):
+    # Metadata may be requested after callers restore their translation options.
+    # Retain the layout options actually used for this module's declarations.
+    gen.pc_tail_ubo = PC_TAIL_UBO
+    gen.f16_interp_fallback = F16_HALVES
     vs = gen.stage == "vs"
     cs = gen.stage == "cs"
     ms = gen.stage == "ms"
@@ -15558,7 +15564,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         lay["params"] = {str(k): v for k, v in lay["params"].items()}
         m["mesh_compute"] = lay
         m["push_constant_bytes"] = lay["push_constant_bytes"]
-    if PC_TAIL_UBO:
+    if g.pc_tail_ubo:
         # --pc-tail-ubo: s0..s31 alone in push constants; the tail, if the shader reads it, in a uniform block.
         m["push_constant_bytes"] = 4 * USER_SGPRS
         if g.uses_pc_tail:
@@ -15620,7 +15626,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --bary-fallback: the raw barycentrics are a perspective-interpolated vec3 at this location; the stage
         # before the PS must write (1,0,0), (0,1,0), (0,0,1) at the triangle's vertices (see BARY_FALLBACK).
         m["bary_fallback_input"] = {"location": g.bary_location}
-    if F16_HALVES and g.stage in ("vs", "ms", "ps"):
+    if g.f16_interp_fallback and g.stage in ("vs", "ms", "ps"):
         # --f16-interp-fallback: PS = the attributes whose f16 reads take decoded halves, VS/MS = the params that
         # export them; each as {n: [low-half location, high-half location]}. When a PS's canonical half slots would
         # collide with its raw attributes, assign_f16_half_locations packs them into free locations <= F16_HALF_TOP
