@@ -8,8 +8,11 @@ against `--main` (default `origin/main`), using one history scan for the whole b
 - `merges`: first-parent commits on main whose subject is "Merge pull request #PR" or ends with " (#PR)" (squash
   merges; "Revert ..." subjects are ignored), newest first. A number that is already there is the case the repeated
   merges come from: a rebased copy merged again keeps both copies of what it added.
-- `reverted`: earlier merges of the PR that a later commit on main reverted ("Revert #PR: ...", or git's
-  `Revert "<the merge's subject>"`), as [merge, revert] pairs, newest first. `merges` leaves those out.
+- `reverted`: earlier merges of the PR that a later commit on main reverted, as [merge, revert] pairs, newest
+  first; `merges` leaves them out. A revert that names the commit it undoes ("This reverts commit <sha>.", as
+  git writes it) undoes that one, and one that names none ("Revert #PR: why") the PR's newest merge still
+  standing. Reverting a revert (git's `Reapply "..."`) puts its merge back. With a revert in a PR's history,
+  `already-merged` needs the merged tree to match main, since its patches stay in main's history.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
   characters once stripped) that already stand in the same order in the same file on main. This is what a second
@@ -39,6 +42,10 @@ REVERT_SUBJECT = re.compile(r"^Revert\b", re.IGNORECASE)
 # What a revert commit on main undoes: the maintainer's "Revert #N: why", or git's own `Revert "<the merge's subject>"`.
 REVERTED_NUMBER = re.compile(r"^Revert #(\d+)\b")
 REVERTED_SUBJECT = re.compile(r'^Revert "(.*)"\s*$')
+# Reverting a revert puts the merge back: git says `Reapply "<subject>"`, older git `Revert "Revert "<subject>""`.
+REAPPLIED_SUBJECT = re.compile(r'^(?:Reapply "(.*)"|Revert "Revert "(.*)"")\s*$')
+# The commit a revert names in its message, as git writes it; the maintainer's "Revert #N: why" names none.
+REVERTS_COMMIT = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b", re.MULTILINE)
 # Where a doubled block is the repeated-merge damage. In code, three equal lines in two functions are ordinary, so a
 # block there is listed but does not change the verdict.
 TEXT_SUFFIXES = (".md", ".txt", ".rst")
@@ -77,21 +84,70 @@ def _reverted_pr_number(subject):
     return _merged_pr_number(m.group(1)) if m else None
 
 
+def _reapplied_pr_number(subject):
+    """The PR whose reverted merge a revert of the revert puts back, or None."""
+    m = REAPPLIED_SUBJECT.match(subject)
+    return _merged_pr_number(m.group(1) or m.group(2)) if m else None
+
+
+def _named_commit(prefix, *tables):
+    """The full sha, among the keys of `tables`, that a revert message's commit names; None for one not tracked."""
+    for table in tables:
+        for sha in table:
+            if sha.startswith(prefix):
+                return sha
+    return None
+
+
+def _latest(order, undone_by, number, standing):
+    """PR `number`'s newest merge that still stands (`standing`), or the revert of its newest undone one."""
+    for n, sha in reversed(order):
+        if n == number and (undone_by[sha] is None) == standing:
+            return sha if standing else undone_by[sha]
+    return None
+
+
 def prior_merges(repo, main, numbers, depth):
-    out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
+    out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x1f%s%x1f%b%x1e").stdout
     hits = {number: [] for number in numbers}
-    reverted = {number: [] for number in hits}
-    # Oldest first, so that a revert undoes the latest merge of its PR before it; a merge it undoes no longer counts.
-    for line in reversed(out.splitlines()):
-        sha, _, subject = line.partition("\t")
+    order = []  # merges of the PRs asked about, oldest first, as (number, sha)
+    undone_by = {}  # merge sha: the revert that undid it, or None while it stands
+    undid = {}  # revert sha: the merge it undid, until a later commit reverts the revert
+    # Oldest first. A revert that names the commit it undoes ("This reverts commit <sha>.", as git writes it) undoes
+    # exactly that one; one that names none (the maintainer's "Revert #N: why") the PR's newest merge still standing.
+    # Reverting a revert puts its merge back.
+    for record in reversed(out.split("\x1e")):
+        sha, _, rest = record.strip("\n").partition("\x1f")
+        subject, _, body = rest.partition("\x1f")
+        if not sha:
+            continue
         number = _merged_pr_number(subject)
         if number in hits:
-            hits[number].append(sha[:12])
+            order.append((number, sha))
+            undone_by[sha] = None
             continue
-        number = _reverted_pr_number(subject)
-        if number in hits and hits[number]:
-            reverted[number].append([hits[number].pop(), sha[:12]])
-    return {number: (hits[number][::-1], reverted[number][::-1]) for number in hits}
+        named = REVERTS_COMMIT.search(body)
+        target = _named_commit(named.group(1), undone_by, undid) if named else None
+        if named and target is None:
+            continue  # it undoes a commit of a PR this run does not ask about
+        reapplied = _reapplied_pr_number(subject)
+        if target in undid or (not named and reapplied in hits):
+            revert = target if named else _latest(order, undone_by, reapplied, standing=False)
+            if revert:
+                undone_by[undid.pop(revert)] = None
+            continue
+        if not named:
+            target = _latest(order, undone_by, _reverted_pr_number(subject), standing=True)
+        if target in undone_by and undone_by[target] is None:
+            undone_by[target] = sha
+            undid[sha] = target
+    reverted = {number: [] for number in hits}
+    for number, sha in reversed(order):
+        if undone_by[sha] is None:
+            hits[number].append(sha[:12])
+        else:
+            reverted[number].append([sha[:12], undone_by[sha][:12]])
+    return {number: (hits[number], reverted[number]) for number in hits}
 
 
 def cherry(repo, main, ref):
@@ -174,7 +230,9 @@ def check(repo, main, number, ref, min_length, merges, reverted=()):
     unchanged = not conflict and tree == rev_tree(repo, main)
     dups = {} if unchanged else duplicates(repo, main, tree, min_length)
     text_dups = {p: v for p, v in dups.items() if p.lower().endswith(TEXT_SUFFIXES)}
-    if merges and (total == on_main or unchanged):
+    # With a revert in the PR's history its patches can sit in main's history while its code is gone: then only
+    # a merged tree that matches main says it is merged.
+    if merges and (unchanged or (total == on_main and not reverted)):
         verdict = "already-merged"
     elif reverted and unchanged:
         # The branch is in main's history already, so git merges nothing: the reverted code stays out.

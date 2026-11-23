@@ -368,6 +368,50 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["merges"], [second])
         self.assertEqual(r["reverted"], [[first, revert]])
 
+    def test_a_revert_that_names_an_older_merge_of_the_same_pr_undoes_that_one(self):
+        # #313 squash-merged twice, then its first squash reverted by git, which names it. The first branch's file is
+        # off main again, so that branch is a merge to make, though its patch is still in main's history.
+        base = self.git("rev-parse", "main")
+        self.git("checkout", "-q", "-b", "original", base)
+        self.write("first.txt", "The first contribution adds this file.\n")
+        self.commit("add first.txt")
+        self.git("checkout", "-q", "main")
+        self.squash_merge(313, "original", "First contribution")
+        first = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "-b", "follow-up", first)
+        self.write("second.txt", "The follow-up adds this file.\n")
+        self.commit("add second.txt")
+        self.git("checkout", "-q", "main")
+        self.squash_merge(313, "follow-up", "Follow-up contribution")
+        second = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", first)
+        revert = self.git("rev-parse", "HEAD")[:12]
+        code, [r] = self.run_check("313=original")
+        self.assertEqual(r["merges"], [second])
+        self.assertEqual(r["reverted"], [[first[:12], revert]])
+        self.assertEqual(r["verdict"], "clean")
+        self.assertEqual(code, 0)
+
+    def test_a_reverted_merge_that_is_reapplied_stands_again(self):
+        # Merged, reverted, then the revert reverted: git writes `Reapply "..."` naming the revert, and the code is
+        # back, so the same branch is already merged. An older git's `Revert "Revert "..."` naming nothing counts the
+        # same by its subject.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("add-file", base, "\n" + PARAGRAPH)
+        self.merge(314, "add-file")
+        merge = self.git("rev-parse", "HEAD")[:12]
+        self.git("revert", "--no-edit", "-m", "1", "HEAD")
+        self.git("revert", "--no-edit", "HEAD")
+        code, [r] = self.run_check("314=add-file")
+        self.assertEqual(r["verdict"], "already-merged")
+        self.assertEqual(r["merges"], [merge])
+        self.assertEqual(r["reverted"], [])
+        self.git("commit", "-q", "--amend", "-m", 'Revert "Revert "Merge pull request #314 from someone/add-file""')
+        code, [r] = self.run_check("314=add-file")
+        self.assertEqual(r["verdict"], "already-merged")
+        self.assertEqual(r["merges"], [merge])
+        self.assertEqual(r["reverted"], [])
+
     def test_reverted_pr_number_subject_parsing(self):
         # Subjects as they stand on main.
         self.assertEqual(mc._reverted_pr_number("Revert #4247: its tail-scheduler tests need a mini scheduler"), 4247)
@@ -377,6 +421,9 @@ class MergeCheckTest(unittest.TestCase):
         self.assertIsNone(mc._reverted_pr_number("Revert 33 oracle-only semantic tests merged this round"))
         self.assertIsNone(mc._reverted_pr_number('Revert "Revert "docs: fix wording (#5523)""'))
         self.assertIsNone(mc._reverted_pr_number("Merge pull request #7 from someone/first"))
+        self.assertEqual(mc._reapplied_pr_number('Reapply "Merge pull request #314 from fixture/add-file"'), 314)
+        self.assertEqual(mc._reapplied_pr_number('Revert "Revert "docs: fix wording (#5523)""'), 5523)
+        self.assertIsNone(mc._reapplied_pr_number('Revert "docs: fix wording (#5523)"'))
 
     def test_merged_pr_number_subject_parsing(self):
         self.assertEqual(mc._merged_pr_number("Merge pull request #7 from someone/first"), 7)
