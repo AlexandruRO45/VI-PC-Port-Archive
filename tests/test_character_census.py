@@ -450,6 +450,39 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertEqual(data["summary"]["models"], 1)
         self.assertEqual(data["models"][0]["name"], "synthetic_static")
 
+    def test_named_file_that_is_not_json_is_one_error_line_not_a_model(self):
+        # A named input is a model.json or a manifest, both JSON. An empty or text file used to be counted as
+        # "1 model ... 1 model with issues" and exit 0, so a wrong path looked like a clean census.
+        for name, payload in (("empty.bin", b""), ("zeros.bin", bytes(64)),
+                              ("notes.txt", b"nothing here\n"), ("truncated.json", b'{"type": "dr"')):
+            with self.subTest(name=name):
+                path = pathlib.Path(self.temp.name) / name
+                path.write_bytes(payload)
+                result = self.run_tool(path)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                lines = result.stderr.splitlines()
+                self.assertEqual(len(lines), 1, result.stderr)
+                self.assertTrue(lines[0].startswith(f"ERROR: {path}: not a model.json or a manifest: "), lines[0])
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_named_json_and_folder_scans_still_follow_their_rules(self):
+        # Positive controls: a model.json, a bare models[] array and a folder holding one unreadable
+        # model.json all keep working; the folder's bad model is still an issue row, not a failed run.
+        single = self.run_tool(self.root / "static" / "model.json")
+        self.assertEqual(single.returncode, 0, single.stderr)
+        self.assertIn("1 model, 6 vertices", single.stdout)
+
+        listed = pathlib.Path(self.temp.name) / "models.json"
+        write_json(listed, [str(self.root / "static" / "model.json")])
+        array = self.run_tool(listed)
+        self.assertEqual(array.returncode, 0, array.stderr)
+        self.assertIn("1 model, 6 vertices", array.stdout)
+
+        folder = self.run_tool(self.root)
+        self.assertEqual(folder.returncode, 0, folder.stderr)
+        self.assertIn("broken/model.json: cannot read model.json", folder.stdout)
+
     def test_model_json_saved_with_a_utf8_bom_is_read(self):
         # A model.json saved by a Windows editor starts with a UTF-8 BOM. Read as plain utf-8, json.load refuses it
         # ("Unexpected UTF-8 BOM"), and the census counted the model as unknown with an issue instead of reading it.

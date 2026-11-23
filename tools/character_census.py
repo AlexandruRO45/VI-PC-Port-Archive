@@ -77,6 +77,10 @@ CSV_FIELDS = ["source", "name", "kind", "vertices", "triangles", "indices", "bon
               "shaders", "textures", "issues"]
 
 
+class InputError(Exception):
+    """A named file that is not JSON, so it cannot be a model.json or a manifest."""
+
+
 # --------------------------------------------------------------------- hashes
 def _hash(value, digits: int):
     """Canonical ``0x`` + uppercase hex hash, or None when the value is not hex."""
@@ -640,7 +644,8 @@ def _read_model(path: str, source: str) -> dict:
 
 
 def load_rows(target: str):
-    """Yield one row per model. Per-model failures become rows with an issue."""
+    """Yield one row per model. A directory's per-model failures become rows with an issue; a named file
+    that is not JSON at all is an InputError, not a model row with an issue."""
     if os.path.isdir(target):
         root = os.path.abspath(target)
         for path in model_json_files(target):
@@ -648,16 +653,13 @@ def load_rows(target: str):
             yield _read_model(path, source)
         return
 
-    source = os.path.basename(target)
     try:
         data = _read_json(target)
     except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
-        row = _blank_row(source, _fallback_name(target))
         detail = getattr(exc, "strerror", None) or str(exc)
-        row["issues"].append(f"cannot read manifest: {detail}")
-        yield row
-        return
+        raise InputError(f"{target}: not a model.json or a manifest: {detail}") from None
 
+    source = os.path.basename(target)
     if _looks_like_model(data):
         yield model_row(data, source)
         return
@@ -905,6 +907,9 @@ def main(argv=None) -> int:
         return 2
     try:
         rows = list(load_rows(args.target))
+    except InputError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"ERROR: cannot read {getattr(exc, 'filename', None) or args.target}: "
               f"{getattr(exc, 'strerror', None) or exc}",
