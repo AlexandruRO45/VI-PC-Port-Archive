@@ -225,6 +225,15 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
     return None
 
 
+def check_work_drive(work, given):
+    """Refuse a work folder on D:. `given` is False when it is the default one in the temp folder."""
+    if work.drive.upper() == "D:":
+        # XCL maps the console drive D: to the game folder, so a real D:\ path is not reachable inside it.
+        what = "--work" if given else "the temp folder (%TEMP%)"
+        raise SystemExit(f"{what} is on D:, which XCL maps to the game folder; "
+                         + ("use a folder on another drive" if given else "give --work a folder on another drive"))
+
+
 def run_all(args, events):
     xcl_dir = Path(args.xcl).resolve()
     bins = find_xcl_binaries(xcl_dir)
@@ -234,9 +243,7 @@ def run_all(args, events):
     if not gta6rt or not gta6rt.is_file():
         raise SystemExit("gta6rt.exe not found: build the runtime first (scripts/build_runtime.ps1)")
     work = Path(args.work).resolve() if args.work else Path(tempfile.gettempdir()) / "leonida_xcl_compare"
-    if work.drive.upper() == "D:":
-        # XCL maps the console drive D: to the game folder, so a real D:\ path is not reachable inside it.
-        raise SystemExit("--work is on D:, which XCL maps to the game folder; use a folder on another drive")
+    check_work_drive(work, bool(args.work))
     work.mkdir(parents=True, exist_ok=True)
     cdb = Path(args.cdb) if args.cdb else (CDB_DEFAULT if CDB_DEFAULT.is_file() else None)
 

@@ -7,7 +7,7 @@ prints the test title's line format in place of a title.
 """
 import argparse
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import sys
 import tempfile
 import unittest
@@ -185,6 +185,27 @@ class Restart(unittest.TestCase):
         self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
 
 
+class WorkDrive(unittest.TestCase):
+    """XCL maps D: to the game folder, so the work folder must be on another drive."""
+
+    def test_a_work_folder_on_d_is_refused(self):
+        for path in ("D:/work", "d:/work"):
+            with self.subTest(path=path), self.assertRaises(SystemExit) as e:
+                xc.check_work_drive(PureWindowsPath(path), True)
+            self.assertTrue(str(e.exception).startswith("--work is on D:"), e.exception)
+
+    def test_a_temp_folder_on_d_names_the_temp_folder_and_the_option(self):
+        with self.assertRaises(SystemExit) as e:
+            xc.check_work_drive(PureWindowsPath("D:/Temp/leonida_xcl_compare"), False)
+        self.assertIn("%TEMP%", str(e.exception))
+        self.assertIn("give --work a folder on another drive", str(e.exception))
+
+    def test_other_drives_are_accepted(self):
+        for path in ("C:/work", "E:/work", "//server/share/work"):
+            for given in (True, False):
+                xc.check_work_drive(PureWindowsPath(path), given)
+
+
 class RestartTraces(unittest.TestCase):
     """Hang restarts reset game/ and overlay/, while preserving earlier trace_N.jsonl files."""
 
@@ -247,7 +268,9 @@ class RestartTraces(unittest.TestCase):
                 cdb=None,
                 out=None,
             )
-            with mock.patch.object(xc, "run_title", side_effect=fake_run_title):
+            # The folders are in %TEMP%, which may be on D:; nothing is mapped here, so the drive does not matter.
+            with mock.patch.object(xc, "run_title", side_effect=fake_run_title), \
+                    mock.patch.object(xc, "check_work_drive"):
                 xc.run_all(args, Sink())
 
             self.assertEqual(len(seen), 2)
