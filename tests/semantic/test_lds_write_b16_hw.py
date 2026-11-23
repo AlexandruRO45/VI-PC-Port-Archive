@@ -202,5 +202,65 @@ class TestDSWriteB16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.lds.read_u32(0x100), 0xCAFE_0000)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDWave:
+    def __init__(self, wave_size: int = 64, lds: Optional[LDSMemory] = None):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+        self.lds: LDSMemory = lds if lds is not None else LDSMemory()
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool(self.exec_mask & (1 << lane_id))
+
+    def step(self, inst: DSWriteB16Instruction) -> None:
+        for lane in range(self.wave_size):
+            if not self.is_lane_active(lane):
+                continue
+            vaddr = self.vgprs[inst.vaddr.index][lane] & MASK32
+            vdata = self.vgprs[inst.vdata.index][lane] & MASK32
+            ref_ds_write_b16(self.lds, vaddr, vdata, inst.offset)
+
+
+class TestDSWriteB16SIMDDivergence(unittest.TestCase):
+    def test_wave32_alternating_exec_mask(self):
+        wave = SIMDWave(wave_size=32)
+        wave.exec_mask = 0x5555_5555  # Even lanes active
+        base = 0x200
+        for lane in range(32):
+            wave.lds.write_u16(base + lane * 2, 0xFFFF)
+            wave.vgprs[1][lane] = base + lane * 2
+            wave.vgprs[2][lane] = 0x1111
+
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=0)
+        wave.step(inst)
+
+        for lane in range(32):
+            expected = 0x1111 if (lane % 2 == 0) else 0xFFFF
+            self.assertEqual(wave.lds.read_u16(base + lane * 2), expected)
+
+    def test_wave64_divergence(self):
+        wave = SIMDWave(wave_size=64)
+        wave.exec_mask = 0xFFFF_FFFF_0000_0000  # Top 32 lanes active
+        base = 0x400
+        for lane in range(64):
+            wave.lds.write_u16(base + lane * 2, 0x0000)
+            wave.vgprs[1][lane] = base + lane * 2
+            wave.vgprs[2][lane] = 0x5555
+
+        inst = DSWriteB16Instruction(vaddr=VGPR(1), vdata=VGPR(2), offset=0)
+        wave.step(inst)
+
+        for lane in range(32):
+            self.assertEqual(wave.lds.read_u16(base + lane * 2), 0x0000)
+        for lane in range(32, 64):
+            self.assertEqual(wave.lds.read_u16(base + lane * 2), 0x5555)
+
+
 if __name__ == '__main__':
     unittest.main()
