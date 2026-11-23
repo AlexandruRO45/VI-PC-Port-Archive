@@ -158,5 +158,47 @@ class TestInterpP1F32ASTAndScalar(unittest.TestCase):
         self.assertEqual(machine.vgprs[2], f32_to_bits(4.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1_f32 SIMD & Barycentric Coordinates
+# ------------------------------------------------------------------------------
+
+class SIMDWaveInterpP1F32:
+    def __init__(self, wave_size: int = 64):
+        self.wave_size = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def step(self, insn: VInterpP1F32Instruction, p0: float, p1: float):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                i_coord = bits_to_f32(self.vgprs[insn.src0.index][lane])
+                self.vgprs[insn.dst.index][lane] = ref_interp_p1_f32(i_coord, p0, p1)
+
+
+class TestInterpP1F32SIMDAndBarycentrics(unittest.TestCase):
+    def test_simd_divergent_coordinates(self):
+        wave = SIMDWaveInterpP1F32(wave_size=32)
+        p0, p1 = 0.0, 100.0
+        for lane in range(32):
+            i_coord = float(lane) / 32.0
+            wave.vgprs[0][lane] = f32_to_bits(i_coord)
+            wave.vgprs[2][lane] = 0
+
+        insn = VInterpP1F32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 2),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+            attr=AttrOperand(0, "x"),
+        )
+        wave.step(insn, p0, p1)
+
+        for lane in range(32):
+            expected = ref_interp_p1_f32(float(lane) / 32.0, p0, p1)
+            self.assertEqual(wave.vgprs[2][lane], expected)
+
+    def test_negative_coordinates(self):
+        # Outside triangle boundary (extrapolation)
+        self.assertEqual(ref_interp_p1_f32(-0.5, 10.0, 20.0), f32_to_bits(5.0))
+
+
 if __name__ == '__main__':
     unittest.main()
