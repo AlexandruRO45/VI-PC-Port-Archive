@@ -86,6 +86,59 @@ class _Stream:
                 self.pos = end
                 return val
 
+    _STRUCT = re.compile(r'["\[\]{}]')
+    _IN_STRING = re.compile(r'["\\]')
+    _CLOSE = {"]": "[", "}": "{"}
+
+    def _skip_string(self, where):
+        """Move past the rest of a string whose opening quote was consumed."""
+        while True:
+            m = self._IN_STRING.search(self.buf, self.pos)
+            if not m:
+                self.pos = len(self.buf)
+                if not self.fill():
+                    raise ValueError(f"unterminated string {where}")
+                continue
+            self.pos = m.end()
+            if m.group() == '"':
+                return
+            if self.pos >= len(self.buf) and not self.fill():   # the escaped character
+                raise ValueError(f"unterminated string {where}")
+            self.pos += 1
+
+    def skip_value(self, where):
+        """Move past one JSON value without decoding it (only a top-level Count is needed, and a member such as
+        ModelDecodeFailures can be large). Brackets must match and strings end; scalars are decoded, they are small."""
+        first = self.peek()
+        if first is None:
+            raise ValueError(f"file ends {where}")
+        if first == '"':
+            self.pos += 1
+            self._skip_string(where)
+            return
+        if first not in "[{":
+            self.value(where)
+            return
+        stack = []
+        while True:
+            m = self._STRUCT.search(self.buf, self.pos)
+            if not m:
+                self.pos = len(self.buf)
+                if not self.fill():
+                    raise ValueError(f"truncated JSON value {where}")
+                continue
+            ch = m.group()
+            self.pos = m.end()
+            if ch == '"':
+                self._skip_string(where)
+            elif ch in "[{":
+                stack.append(ch)
+            else:
+                if not stack or stack.pop() != self._CLOSE[ch]:
+                    raise ValueError(f"mismatched {ch!r} {where}")
+                if not stack:
+                    return
+
 
 def _is_count(key, val):
     return key == "Count" and isinstance(val, int) and not isinstance(val, bool)
@@ -110,9 +163,12 @@ def iter_items(path, chunk=CHUNK):
                 raise ValueError("a top-level key is not a string")
             s.expect(":", f"after the top-level key {key!r}")
             if key != "Items":
-                val = s.value(f"for the top-level key {key!r}")
-                if _is_count(key, val):
-                    count = val
+                if key == "Count":
+                    val = s.value(f"for the top-level key {key!r}")
+                    if _is_count(key, val):
+                        count = val
+                else:
+                    s.skip_value(f"for the top-level key {key!r}")
                 s.expect(",", "between top-level members")
                 continue
             s.expect("[", "to open \"Items\"")
@@ -142,9 +198,12 @@ def iter_items(path, chunk=CHUNK):
                 if not isinstance(key, str):
                     raise ValueError("a top-level key is not a string")
                 s.expect(":", f"after the top-level key {key!r}")
-                val = s.value(f"for the top-level key {key!r}")
-                if _is_count(key, val):
-                    count = val
+                if key == "Count":
+                    val = s.value(f"for the top-level key {key!r}")
+                    if _is_count(key, val):
+                        count = val
+                else:
+                    s.skip_value(f"for the top-level key {key!r}")
             if s.peek() is not None:
                 raise ValueError("data after the top-level object")
             return count

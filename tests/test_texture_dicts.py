@@ -94,6 +94,42 @@ class CensusTests(unittest.TestCase):
             dump(os.path.join(exp, ".hidden", "textures", "manifest.json"), {"Count": 1, "Items": [dictionary(16, ["h"])]})
             self.assertIn(".hidden", td.census(exp)["dictionaries"])
 
+    def test_unrelated_values_are_skipped_not_built(self):
+        # review on #4946: a large member before a trailing Count is skipped, not decoded into Python objects
+        import tracemalloc
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            failures = ",".join(['{"Offset":1234,"Reason":"synthetic ] } [ \\" x"}'] * 40000)
+            peaks = {}
+            for last in (False, True):
+                fields = ['"Items":[{}]', '"ModelDecodeFailures":[' + failures + ']']
+                fields.insert(2 if last else 0, '"Count":1')
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("{" + ",".join(fields) + "}")
+                tracemalloc.start()
+                gen = td.iter_items(path)
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration as stop:
+                        self.assertEqual(stop.value, 1)
+                        break
+                peaks[last] = tracemalloc.get_traced_memory()[1]
+                tracemalloc.stop()
+            self.assertLess(peaks[True], 2 * peaks[False] + (1 << 20), peaks)
+
+    def test_skipped_values_must_be_well_formed(self):
+        bad = ['{"Items":[],"X":[1,2}', '{"Items":[],"X":{"a":"b]', '{"X":"unterminated,"Items":[]}',
+               '{"Items":[],"X":[[]]]}']
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.json")
+            for text in bad:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                for chunk in (1, 3, td.CHUNK):
+                    with self.assertRaises(ValueError, msg=(text, chunk)):
+                        list(td.iter_items(path, chunk))
+
     def test_invalid_json_is_rejected(self):
         # review on #4946: separators and the enclosing object are checked, at every read size
         bad = ['{ "Count":2,"Items":[{}{}]', '{"Items":[{},]}', '{"Items":[,{}]}', '{"Items":[{},,{}]}',
