@@ -395,5 +395,50 @@ class TestInterpMovF32Oracle(unittest.TestCase):
         self.assertEqual(ref_interp_mov_f32("p20", 10.0, 0.0, 30.0), f32_to_bits(20.0))
 
 
+# ------------------------------------------------------------------------------
+# v_interp_mov_f32 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VInterpMovF32Instruction:
+    dst: RegisterOperand
+    vsel: str
+    attr: AttrOperand
+
+    def __post_init__(self):
+        if self.dst.op_type != OperandType.VGPR:
+            raise TypeError("Destination must be a VGPR")
+        if self.vsel not in ("p0", "p10", "p20"):
+            raise ValueError(f"Invalid vsel: {self.vsel}")
+
+
+class ScalarMachineInterpMovF32:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.attrs: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * 32
+
+    def step(self, insn: VInterpMovF32Instruction):
+        p0, p1, p2 = self.attrs[insn.attr.index]
+        res = ref_interp_mov_f32(insn.vsel, p0, p1, p2)
+        self.vgprs[insn.dst.index] = res
+
+
+class TestInterpMovF32ASTAndScalar(unittest.TestCase):
+    def test_ast(self):
+        insn = VInterpMovF32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 3),
+            vsel="p0",
+            attr=AttrOperand(1, "z"),
+        )
+        self.assertEqual(insn.vsel, "p0")
+
+    def test_scalar_execution(self):
+        machine = ScalarMachineInterpMovF32()
+        machine.attrs[1] = (100.0, 150.0, 220.0)
+        insn = VInterpMovF32Instruction(dst=RegisterOperand(OperandType.VGPR, 3), vsel="p10", attr=AttrOperand(1, "x"))
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[3], f32_to_bits(50.0))
+
+
 if __name__ == '__main__':
     unittest.main()
