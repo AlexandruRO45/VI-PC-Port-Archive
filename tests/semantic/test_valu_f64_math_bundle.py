@@ -319,5 +319,22 @@ class VFmaF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 6, res)
         self.assertEqual(wave.get_f64(0, 6), f64_to_u64(17.0))
 
+class VFmaF64SimdIeeeTests(unittest.TestCase):
+    def test_fma_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x55555555
+        for i in range(32):
+            wave.set_f64(i, 6, 0x3333333344444444)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 6, oracle_fma_f64(f64_to_u64(i), f64_to_u64(2.0), f64_to_u64(1.0)))
+        for i in range(32):
+            if (0x55555555 >> i) & 1:
+                self.assertEqual(wave.get_f64(i, 6), f64_to_u64(i * 2.0 + 1.0))
+            else:
+                self.assertEqual(wave.get_f64(i, 6), 0x3333333344444444)
+
+    def test_fma_nan_propagation(self):
+        self.assertTrue(is_nan_u64(oracle_fma_f64(F64_QNAN, f64_to_u64(1.0), f64_to_u64(2.0))))
+
 if __name__ == "__main__":
     unittest.main()
