@@ -668,6 +668,53 @@ void test_query_state() {
         expect(c.word(dst.buffer, arena_offset + inner_statistics_offset + word_size * j) == c.word(dst.buffer,
                arena_offset + statistics_offset + word_size * j), "previous statistics sum inside a new scope");
     }
+
+    // ANV can count internal compute work for transfers inside pipeline-statistics queries. Keep the workaround
+    // opt-in, and split both ordinary and overlapping queries around a buffer copy (D3D-494).
+    QueryPool transfer_stat{handle<VkQueryPool>(14), d3d12_query_heap::pipeline_statistics, heap_count, false,
+        std::vector<bool>(heap_count), {}};
+    auto previous_query_pool = vk.query_pool;
+    vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
+        return id == 2 ? &transfer_stat : previous_query_pool(id);
+    };
+
+    CommandList ordinary_transfer, ordinary_control;
+    expect(ordinary_transfer.begin_query({2, d3d12_query::pipeline_statistics, 0}) &&
+           ordinary_transfer.copy_buffer({1, 16, 1, 0, 8}) &&
+           ordinary_transfer.end_query({2, d3d12_query::pipeline_statistics, 0}), "record transfer in statistics");
+    expect(ordinary_control.begin_query({2, d3d12_query::pipeline_statistics, 1}) &&
+           ordinary_control.copy_buffer({1, 16, 1, 0, 8}) &&
+           ordinary_control.end_query({2, d3d12_query::pipeline_statistics, 1}), "record control transfer");
+    PreparedList transfer_control, transfer_split;
+    vk.exclude_transfers_from_pipeline_statistics = false;
+    prep(ordinary_control, transfer_control);
+    expect(transfer_control.statistics_segment_count == 0,
+           "non-ANV driver keeps ordinary transfer inside the original query");
+    vk.exclude_transfers_from_pipeline_statistics = true;
+    prep(ordinary_transfer, transfer_split);
+    expect(transfer_split.statistics_segment_count == 2 && transfer_split.queries.size() == 2 &&
+           transfer_split.queries[1].statistics_count == 2,
+           "ANV transfer splits ordinary statistics into two summed segments");
+
+    CommandList overlapping_transfer;
+    expect(overlapping_transfer.begin_query({2, d3d12_query::pipeline_statistics, 2}) &&
+           overlapping_transfer.begin_query({2, d3d12_query::pipeline_statistics, 3}) &&
+           overlapping_transfer.copy_buffer({1, 16, 1, 0, 8}) &&
+           overlapping_transfer.end_query({2, d3d12_query::pipeline_statistics, 2}) &&
+           overlapping_transfer.end_query({2, d3d12_query::pipeline_statistics, 3}),
+           "record transfer in overlapping statistics");
+    PreparedList overlapping_split;
+    prep(overlapping_transfer, overlapping_split);
+    expect(overlapping_split.statistics_overlaps && overlapping_split.statistics_segment_count == 4,
+           "ANV transfer splits overlapping statistics segments");
+    std::array<unsigned, 2> overlap_counts{};
+    for (const auto& query : overlapping_split.queries) {
+        const auto* end = std::get_if<EndQuery>(&overlapping_transfer.commands()[query.command]);
+        if (end && end->type == d3d12_query::pipeline_statistics && end->index >= 2)
+            overlap_counts[end->index - 2] = query.statistics_count;
+    }
+    expect(overlap_counts[0] == 3 && overlap_counts[1] == 3,
+           "both overlapping statistics queries include both sides of the transfer");
 }
 
 void test_predicated_copies() {

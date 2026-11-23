@@ -4838,11 +4838,21 @@ public:
             }
         }
 
-        state_.context = std::make_unique<leonida::VulkanContext>(get_device, info.device,
-                                                                  info.separate_depth_stencil_layouts,
-                                                                  info.conditional_rendering, info.ray_tracing,
-                                                                  info.xdxr_acceleration_structures &&
-                                                                      info.buffer_device_address);
+        bool anv_counts_transfer_in_pipeline_statistics = false;
+        if (info.physical && info.get_instance_proc) {
+            const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"));
+            if (get_props2) {
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                get_props2(info.physical, &properties);
+                anv_counts_transfer_in_pipeline_statistics = driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+            }
+        }
+        state_.context = std::make_unique<leonida::VulkanContext>(
+            get_device, info.device, info.separate_depth_stencil_layouts, info.conditional_rendering,
+            info.ray_tracing, info.xdxr_acceleration_structures && info.buffer_device_address,
+            anv_counts_transfer_in_pipeline_statistics);
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {

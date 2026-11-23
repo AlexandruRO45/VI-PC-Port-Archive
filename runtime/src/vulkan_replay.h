@@ -804,6 +804,9 @@ struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
+    // ANV may implement transfer commands with compute shaders after a dispatch; keep those internal invocations
+    // outside D3D12 pipeline-statistics queries (D3D-494).
+    bool exclude_transfers_from_pipeline_statistics = false;
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
     PFN_vkCmdClearDepthStencilImage clear_depth_stencil_image = nullptr;
@@ -2323,16 +2326,27 @@ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
     return active.empty() ? ReplayResult::success : ReplayResult::invalid_query;
 }
 
+inline bool statistics_transfer_command(const Command& command) {
+    return std::holds_alternative<ClearRenderTarget>(command) ||
+           std::holds_alternative<ClearDepthStencil>(command) ||
+           std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
+           std::holds_alternative<CopyResource>(command) || std::holds_alternative<ResolveSubresource>(command) ||
+           std::holds_alternative<ClearUnorderedAccess>(command) || std::holds_alternative<WriteImmediate>(command) ||
+           std::holds_alternative<AtomicCopyBuffer>(command) || std::holds_alternative<CopyAccelerationStructure>(command) ||
+           std::holds_alternative<AccelerationStructurePostbuild>(command);
+}
+
 // Helper dispatches must not contribute to the application's CSInvocations (D3D-162). Query resolves and
 // ordinary helper commands share one sequence of physical statistics segments. Resolve dispatch requirements
-// depend on heap state at planning time, so every non-timestamp resolve splits conservatively.
+// depend on heap state at planning time, so every non-timestamp resolve splits conservatively. ANV may implement
+// transfer commands with compute shaders after a dispatch, so its opt-in path splits those out as well (D3D-494).
 // A mesh draw cannot run while a query with the input-assembly, vertex, geometry or tessellation counters is active
 // (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076), though D3D12 allows it and reads those fields as 0. A query
 // that holds a mesh draw is split as well (D3D-291): a segment's first draw decides whether it runs in the full pool
 // or in the mesh one (statistics_mesh), and a later draw of the other kind ends it and begins one of its own kind.
 // Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
 // has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
-inline void plan_statistics_segments(PreparedList& out) {
+inline void plan_statistics_segments(PreparedList& out, bool exclude_transfers) {
     detail::PreparedQuery* begin = nullptr;
     // A split point (a helper or a resolve), or a draw: kind 0 vertex, 1 mesh.
     struct Event { std::uint32_t* end; std::uint32_t* begin; int kind; };
@@ -2342,8 +2356,10 @@ inline void plan_statistics_segments(PreparedList& out) {
     const auto commands = out.list->commands();
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
+        const Command& command = commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect)) {
+                      p.counted_dispatch.indirect ||
+                      (exclude_transfers && statistics_transfer_command(command)))) {
             inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
             splits = true;
         }
@@ -2357,7 +2373,6 @@ inline void plan_statistics_segments(PreparedList& out) {
         }
         if (next_query == out.queries.size() || out.queries[next_query].command != i) continue;
         auto& query = out.queries[next_query++];
-        const Command& command = commands[i];
         const auto range = query_range(command);
         if (std::holds_alternative<ResolveQueries>(command)) {
             // A stream-output resolve only fills zeros (no dispatch), so it needs no split.
@@ -2409,7 +2424,7 @@ inline void plan_statistics_segments(PreparedList& out) {
 // while one runs, because its helper dispatch would be counted — closes the one open physical query and opens
 // a new one, so each logical query keeps a contiguous slot range and its result is the sum of that range
 // (statistics_sum.comp). A Begin or End of another query kind leaves the segments alone.
-inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
+inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out, bool exclude_transfers) {
     std::map<std::pair<QueryHeapId, std::uint32_t>, std::uint32_t> active;
     std::uint32_t current = detail::PreparedQuery::no_segment;
     std::size_t next_query = 0;
@@ -2429,8 +2444,10 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
         if (!query) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
+            const Command& command = out.list->commands()[i];
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+                                    p.counted_dispatch.indirect ||
+                                    (exclude_transfers && statistics_transfer_command(command)))) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
@@ -3089,10 +3106,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
     if (statistics_overlaps) {
-        const auto result = plan_overlapping_statistics_segments(out);
+        const auto result = plan_overlapping_statistics_segments(out, vk.exclude_transfers_from_pipeline_statistics);
         if (result != ReplayResult::success) return result;
     } else {
-        plan_statistics_segments(out);
+        plan_statistics_segments(out, vk.exclude_transfers_from_pipeline_statistics);
     }
     if (overlaps) {
         if (!vk.sum_occlusion || out.queries.size() >= detail::PreparedQuery::no_segment)
