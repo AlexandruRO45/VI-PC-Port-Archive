@@ -120,7 +120,7 @@ def psv0_stage(psv0: bytes) -> str | None:
     if len(psv0) < 29:
         return None
     info_size = u32(psv0, 0)
-    if info_size < 25 or 4 + 24 >= len(psv0):
+    if not 25 <= info_size <= len(psv0) - 4:
         return None
     return PSV0_STAGES.get(psv0[4 + 24])
 

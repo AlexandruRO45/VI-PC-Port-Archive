@@ -292,6 +292,13 @@ class Psv0StageTests(unittest.TestCase):
         self.assertIsNone(psc.psv0_stage(bytes(20)))
         self.assertIsNone(psc.psv0_stage(struct.pack("<I", 20) + bytes(28)))
 
+    def test_psv0_stage_rejects_truncated_runtime_info(self):
+        complete = psv0(1)
+        self.assertEqual(psc.psv0_stage(complete), "vs")
+        for truncated in (complete[:29], complete[:-1]):
+            with self.subTest(length=len(truncated)):
+                self.assertIsNone(psc.psv0_stage(truncated))
+
     def test_extract_writes_psv0_stage_to_index(self):
         # Match the unnamed XBCH containers embedded in game_scarlett_master.exe (no ILDN, PSV0 present),
         # plus a container without PSV0 to verify the "cs" fallback.
