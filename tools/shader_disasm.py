@@ -90,13 +90,17 @@ def probe(mcpu: str) -> None:
              f"  LLVM_MC=wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc")
 
 
-def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True):
+def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool | None = None):
     if backend == "python":
-        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
+        asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32 is not False)
         return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
+    args = ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"]
+    if wave32 is not None:
+        args.append("-mattr=+wavefrontsize32,-wavefrontsize64" if wave32 else
+                    "-mattr=+wavefrontsize64,-wavefrontsize32")
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+        p = subprocess.run(MC + args,
                            input=text, capture_output=True, text=True, errors="replace",
                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
@@ -152,7 +156,8 @@ def code_range(b: bytes):
 def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
-    wave32 = fssm_header.wave_size(b) != 64
+    size = fssm_header.wave_size(b)
+    wave32 = None if size is None else size == 32
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"

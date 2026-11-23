@@ -146,6 +146,19 @@ class ShaderStageResumeTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(os.path.join(self.spirv, make_game.SHARD_PLAN)))
                 self.assertEqual(self.run_stage(), [])
 
+    def test_listings_from_before_wave_size_selection_are_rebuilt_once(self):
+        with mock.patch.object(make_game, "llvm_mc_signature", self.real_llvm_mc_signature):
+            with mock.patch.dict(os.environ, {"LLVM_MC": f'"{sys.executable}"'}):
+                self.run_stage()
+                path = os.path.join(self.dxbc, "disasm.done")
+                with open(path, encoding="utf-8") as f:
+                    marker = json.load(f)
+                marker["llvm"] = json.dumps(json.loads(marker["llvm"])[:2])
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(marker, f)
+                self.assertEqual(self.run_stage(), ["shader_disasm.py", "translate"])
+                self.assertEqual(self.run_stage(), [])
+
     def test_llvm_change_leaves_no_completion_markers_if_disassembly_stops(self):
         self.run_stage()
         self.touch(self.spirv, make_game.SHARD_PLAN)

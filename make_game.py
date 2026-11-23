@@ -1107,7 +1107,7 @@ def llvm_mc_signature() -> str:
         fallback = f"exit code {result.returncode}" if result.returncode else "no version printed"
         detail = (result.stderr.strip().splitlines() or [fallback])[0]
         fail(f"Could not read the llvm-mc version. Check LLVM_MC: {detail}")
-    return json.dumps([command, version])
+    return json.dumps([command, version, "fssm-wave-size"])
 
 
 def unpacked_shader_stems(dxbc: str) -> set[str] | None:

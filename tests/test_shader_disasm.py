@@ -70,6 +70,26 @@ class DisasmFailureTest(unittest.TestCase):
                 with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
                     self.assertIn(f" {operand},", f.read())
 
+    def test_llvm_backend_selects_the_compiled_wave_size(self):
+        mc = self.fake("import sys\n"
+                       "print('s_endpgm'); print('mode', [v for v in sys.argv if v.startswith('-mattr=')])\n")
+        for flag, expected in ((0, ["-mattr=+wavefrontsize64,-wavefrontsize32"]),
+                               (0x20, ["-mattr=+wavefrontsize32,-wavefrontsize64"]),
+                               (None, [])):
+            with self.subTest(flag=flag):
+                blob = bytearray(fssm())
+                if flag is None:
+                    blob[:4] = bytes(4)
+                else:
+                    blob[0xD4] = flag
+                with open(self.fssm, "wb") as f:
+                    f.write(blob)
+                out = os.path.join(self.dir, str(flag))
+                result = self.run_tool(mc, out)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+                    self.assertIn(f"mode {expected}", f.read())
+
     def test_missing_tool(self):
         out = os.path.join(self.dir, "out")
         p = self.run_tool("definitely-not-an-llvm-mc", out)
