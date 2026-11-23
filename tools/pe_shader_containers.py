@@ -109,7 +109,8 @@ def module_name(ildn: bytes) -> str | None:
     length = struct.unpack_from("<H", ildn, 2)[0]
     path = ildn[4 : 4 + min(length, NAME_LIMIT)].split(b"\0", 1)[0]
     base = path.replace(b"\\", b"/").rsplit(b"/", 1)[-1].decode("latin-1")
-    return base[:-4] if base.lower().endswith(".pdb") else base or None
+    stem = base[:-4] if base.lower().endswith(".pdb") else base
+    return stem or None
 
 
 PSV0_STAGES = {0: "ps", 1: "vs", 2: "gs", 3: "hs", 4: "ds", 5: "cs", 13: "ms", 14: "as"}
@@ -203,9 +204,18 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
     return found, rejected
 
 
+_WINDOWS_RESERVED_DEVICES = frozenset({
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+})
+
+
 def safe_stem(name: str | None, index: int) -> str:
     stem = SAFE_NAME.sub("_", name or "").strip("._")
-    return stem or f"container_{index:02d}"
+    if not stem or stem.split(".", 1)[0].rstrip(" ").upper() in _WINDOWS_RESERVED_DEVICES:
+        return f"container_{index:02d}"
+    return stem
 
 
 def extract(data: bytes, records: list[dict], directory: str) -> list[dict]:

@@ -317,6 +317,18 @@ class Psv0StageTests(unittest.TestCase):
                 ],
             )
 
+    def test_module_name_returns_none_for_bare_pdb_suffix(self):
+        self.assertIsNone(psc.module_name(b"\x00\x00\x04\x00.pdb"))
+        self.assertIsNone(psc.module_name(b"\x00\x00\x0b\x00C:\\dir\\.PDB"))
+        self.assertEqual(psc.module_name(b"\x00\x00\x08\x00demo.pdb"), "demo")
+
+    def test_safe_stem_avoids_windows_reserved_device_names(self):
+        for bad in ("CON", "con", "NUL", "PRN", "AUX", "COM1", "LPT9", "con.extra"):
+            with self.subTest(bad=bad):
+                self.assertEqual(psc.safe_stem(bad, 3), "container_03")
+        self.assertEqual(psc.safe_stem("COM10", 3), "COM10")
+        self.assertEqual(psc.safe_stem("console", 3), "console")
+
 
 if __name__ == "__main__":
     unittest.main()
