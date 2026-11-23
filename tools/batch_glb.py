@@ -40,7 +40,8 @@ def _build_texture_index(texture_dir: str | None) -> dict[str, str]:
     if not texture_dir:
         return {}
     index: dict[str, str] = {}
-    for entry in os.scandir(texture_dir):
+    # Sorted by name: two files with the same lowercase stem and extension pick the same winner on every file system.
+    for entry in sorted(os.scandir(texture_dir), key=lambda e: e.name):
         if not entry.is_file():
             continue
         lower = entry.name.lower()
@@ -162,7 +163,7 @@ def batch_convert(
 
     os.makedirs(out_dir, exist_ok=True)
     obj_files = [
-        f for f in os.listdir(in_dir) if f.lower().endswith(".obj") and os.path.isfile(os.path.join(in_dir, f))
+        f for f in sorted(os.listdir(in_dir)) if f.lower().endswith(".obj") and os.path.isfile(os.path.join(in_dir, f))
     ]
 
     tex_index = _build_texture_index(texture_dir)

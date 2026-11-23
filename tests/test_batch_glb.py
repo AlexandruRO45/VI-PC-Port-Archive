@@ -421,6 +421,54 @@ class TestBatchGlb(unittest.TestCase):
             self.assertIn("not embedded", result.stdout)
             self.assertIn("(1 failed, 1 unembedded texture)", result.stdout)
 
+    def test_main_failure_lines_do_not_follow_listing_order(self) -> None:
+        import contextlib
+        import io
+        from unittest import mock
+
+        real_listdir = os.listdir
+
+        def run(reverse: bool) -> list[str]:
+            def listing(path):
+                names = list(real_listdir(path))
+                return names[::-1] if reverse else names
+
+            with tempfile.TemporaryDirectory() as in_dir, tempfile.TemporaryDirectory() as out_dir:
+                for name in ("a", "b", "c"):
+                    with open(os.path.join(in_dir, name + ".obj"), "w", encoding="utf-8", newline="\n") as f:
+                        f.write("o x\nf 1 2 3\n")             # faces with no vertices: parse_obj refuses
+                buf = io.StringIO()
+                with mock.patch.object(batch_glb.os, "listdir", listing), contextlib.redirect_stdout(buf):
+                    self.assertEqual(batch_glb.main([in_dir, out_dir, "--jobs", "1"]), 1)
+                return [ln.replace(in_dir, "<in>") for ln in buf.getvalue().splitlines() if "failed" not in ln]
+
+        forward = run(False)
+        backward = run(True)
+        self.assertEqual(len(forward), 3)
+        self.assertEqual(forward, backward)
+        for line, name in zip(forward, ("a", "b", "c")):
+            self.assertIn(name + ".obj", line)
+
+    def test_texture_index_winner_does_not_depend_on_listing_order(self) -> None:
+        from unittest import mock
+
+        # Fake entries: a case-insensitive file system cannot hold both A.png and a.png.
+        class Entry:
+            def __init__(self, name: str) -> None:
+                self.name = name
+                self.path = os.path.join("tex", name)
+
+            def is_file(self) -> bool:
+                return True
+
+        entries = [Entry("A.png"), Entry("a.png")]
+
+        def winner(listing: list) -> str:
+            with mock.patch.object(batch_glb.os, "scandir", lambda _path: iter(listing)):
+                return batch_glb._build_texture_index("tex")["a"]
+
+        self.assertEqual(winner(entries), winner(entries[::-1]))
+
 
 if __name__ == "__main__":
     unittest.main()
