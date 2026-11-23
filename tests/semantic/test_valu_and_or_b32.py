@@ -193,6 +193,110 @@ class TestValuAndOrB32AST(unittest.TestCase):
         self.assertIn("v_and_or_b32 v0", lines[0])
         self.assertIn("v_and_or_b32 v2", lines[1])
 
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarVALUInterpreter:
+    """Single-lane scalar interpreter for v_and_or_b32."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.sgprs: list[int] = [0] * 106
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.trace: list[str] = []
+
+    def read_reg_u32(self, kind: RegKind, idx: int) -> int:
+        if kind == RegKind.VGPR:
+            return self.vgprs[idx] & MASK32
+        return self.sgprs[idx] & MASK32
+
+    def write_reg_u32(self, kind: RegKind, idx: int, val: int) -> None:
+        val32 = val & MASK32
+        if kind == RegKind.VGPR:
+            self.vgprs[idx] = val32
+        else:
+            self.sgprs[idx] = val32
+
+    def resolve_operand(self, op: Register | int) -> int:
+        if isinstance(op, Register):
+            return self.read_reg_u32(op.kind, op.index)
+        return op & MASK32
+
+    def step(self, inst: Instruction) -> int:
+        s0 = self.resolve_operand(inst.src0)
+        s1 = self.resolve_operand(inst.src1)
+        s2 = self.resolve_operand(inst.src2)
+
+        res = ref_and_or_b32(s0, s1, s2)
+        self.write_reg_u32(inst.dst.kind, inst.dst.index, res)
+        self.trace.append(f"{inst.to_assembly()} => {res:#010x}")
+        return res
+
+    def run_program(self, prog: Program) -> list[int]:
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestValuAndOrB32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+
+    def test_scalar_execution_all_vgprs(self) -> None:
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0xFF00)
+        self.interp.write_reg_u32(RegKind.VGPR, 2, 0xF0F0)
+        self.interp.write_reg_u32(RegKind.VGPR, 3, 0x000F)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=Register(RegKind.VGPR, 2),
+            src2=Register(RegKind.VGPR, 3),
+        )
+        # (0xFF00 & 0xF0F0) | 0x000F = 0xF000 | 0x000F = 0xF00F
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0xF00F)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 0), 0xF00F)
+
+    def test_scalar_mixed_sgpr_and_immediate(self) -> None:
+        self.interp.write_reg_u32(RegKind.SGPR, 4, 0xAAAA0000)
+        self.interp.write_reg_u32(RegKind.VGPR, 5, 0xFFFF0000)
+
+        inst = Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 6),
+            src0=Register(RegKind.SGPR, 4),
+            src1=Register(RegKind.VGPR, 5),
+            src2=0x00005555,
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0xAAAA5555)
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 6), 0xAAAA5555)
+
+    def test_scalar_program_chaining(self) -> None:
+        prog = Program()
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0xFF)
+        prog.append(Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 0),
+            src0=Register(RegKind.VGPR, 1),
+            src1=0x0F,
+            src2=0x10,
+        ))
+        prog.append(Instruction(
+            opcode=Opcode.V_AND_OR_B32,
+            dst=Register(RegKind.VGPR, 2),
+            src0=Register(RegKind.VGPR, 0),
+            src1=0x1F,
+            src2=0xA0,
+        ))
+        results = self.interp.run_program(prog)
+        self.assertEqual(results, [0x1F, 0xBF])
+        self.assertEqual(self.interp.read_reg_u32(RegKind.VGPR, 2), 0xBF)
+
 class TestValuAndOrB32Oracle(unittest.TestCase):
     """Unit tests for reference mathematical oracle and bitwise truth tables."""
 
