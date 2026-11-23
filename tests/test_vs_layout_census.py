@@ -189,6 +189,31 @@ class TestSurvey(unittest.TestCase):
         # marker count for hw 2 stays empty and the run still succeeds.
         self.assertIn("vs|0|2", document["by_stage_hw"])
 
+    def test_limit_caps_containers(self):
+        r = V.survey(self.dx, disasm_fn=fake_disasm, limit=2)
+        self.assertEqual(r["containers"], 2)
+        self.assertEqual(r["payloads"], 3)  # a_vs (1) + b_vs (2)
+
+    def test_survey_rejects_non_positive_limit(self):
+        for bad in (0, -1, -5, False, True):
+            with self.subTest(limit=bad):
+                with self.assertRaises(ValueError):
+                    V.survey(self.dx, disasm_fn=fake_disasm, limit=bad)
+
+    def test_cli_rejects_non_positive_limit(self):
+        out = os.path.join(self._tmp.name, "should_not_exist.json")
+        for bad in ("0", "-1"):
+            with self.subTest(limit=bad):
+                result = subprocess.run(
+                    [sys.executable, "-I", os.path.join(ROOT, "scripts", "vs_layout_census.py"),
+                     self.dx, "--limit", bad, "--json", out],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("must be at least 1", result.stderr)
+                self.assertFalse(os.path.exists(out))
+
 
 if __name__ == "__main__":
     unittest.main()

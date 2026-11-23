@@ -103,6 +103,8 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
                 names.append(stem)
             stages[stem] = e.get("stage")
     if limit is not None:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise ValueError(f"limit must be at least 1, got {limit!r}")
         names = names[:limit]
 
     by_stage_hw = Counter()
@@ -179,11 +181,22 @@ def survey(dxbc_dir, disasm_fn=None, limit=None):
     }
 
 
+def _positive_int(text):
+    """--limit: a positive container count."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
-    ap.add_argument("--limit", type=int, help="stop after this many containers (index order)")
+    ap.add_argument("--limit", type=_positive_int, help="stop after this many containers (index order)")
     a = ap.parse_args(argv)
     index_path = os.path.join(a.dxbc, "index.json")
     if a.json and os.path.exists(a.json) and os.path.exists(index_path) and os.path.samefile(a.json, index_path):
