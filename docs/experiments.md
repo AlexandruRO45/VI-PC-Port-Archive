@@ -3773,11 +3773,11 @@ python -B tools/ttpf_batch_export.py $pool -o out/exported_dds --tools-path "$ru
 
 Add `--calibration path/to/profile.json` to retry strict decode failures using a local version-1 Leonida profile. This option requires NumPy and the calibration library. Use it by itself or with `--require-rust`. The separate legacy history mode uses `--allow-provisional --history`. Output produced by the local profile has `"mode": "fitted"` in the manifest.
 
-For Xbox 1.0.2.1, build the pinned standalone Leonida exporter and pass `--xbox-1.0.2.1` with `--rust-exporter`. The wrapper loads the bundled shared calibration and 161 asset-key recipes, and asks Rust to prefer fitted decoding. The verification covered all 51,156 textures in the BCPack catalog across 55 pools. Other inputs can use the strict default or an explicitly supplied version-1 calibration. Use the reference path above for Python history files.
+For Xbox 1.0.2.1, build the pinned standalone Leonida exporter and pass `--xbox-1.0.2.1` with `--rust-exporter`. The wrapper loads the bundled shared calibration and 163 asset-key recipes, and asks Rust to prefer fitted decoding. The verification covered all 51,156 textures in the BCPack catalog across 55 pools. Other inputs can use the strict default or an explicitly supplied version-1 calibration. Use the reference path above for Python history files.
 
 ```powershell
 $batchCheckout = "$out/Leonida-rust-batch"
-$batchCommit = 'b5d30a86f3abec47bf54da4f6f9f26aab6f52e82'
+$batchCommit = '86ca164c257f78ab5de586539d01dce214dc924f'
 git init "$batchCheckout"
 git -C "$batchCheckout" fetch --depth=1 https://github.com/wish131400/Leonida.git $batchCommit
 git -C "$batchCheckout" checkout --detach $batchCommit
