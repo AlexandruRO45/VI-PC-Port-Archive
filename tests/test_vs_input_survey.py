@@ -90,20 +90,33 @@ def test_vs_input_survey():
         pixel = {"stage": "ps", "file": "e_ps.dxbc"}
         report = os.path.join(tmp, "counts.json")
         verdicts = {}
-        for label, entries, total, absent in (("no VS", [pixel], 0, 0), ("all missing", [missing], 1, 1),
-                                              ("partial", [known, missing], 2, 1), ("complete", [known], 1, 0)):
+        for name, body in (("empty", ""), ("comment", "; v_mbcnt_lo_u32_b32 in a comment only\n"),
+                           ("ngg", "\texp prim v0, off, off, off done\n")):
+            with open(os.path.join(dx, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(body)
+        empty, comment, ngg = ({"stage": "vs", "file": name + ".dxbc"} for name in ("empty", "comment", "ngg"))
+        cases = (("no VS", [pixel], 0), ("all missing", [missing], 1), ("partial", [known, missing], 1),
+                 ("complete", [known], 0), ("empty", [empty], 0), ("comment", [comment], 0),
+                 ("mixed", [known, empty], 0), ("positive", [ngg, empty, missing], 1))
+        for label, entries, absent in cases:
             with open(os.path.join(dx, "index.json"), "w", encoding="utf-8", newline="\n") as f:
                 json.dump(entries, f)
             result = cli(dx, "--json", report)
             check(result.returncode == 0 and not result.stderr, f"{label}: survey succeeds")
             with open(report, encoding="utf-8") as f:
                 counts = json.load(f)
-            check((counts["vertex_shaders"], counts["missing_listings"]) == (total, absent),
+            check((counts["vertex_shaders"], counts["missing_listings"]) == (sum(e["stage"] == "vs" for e in entries), absent),
                   f"{label}: original coverage counts preserved")
+            if label == "comment":
+                check(counts["markers"]["v_mbcnt"] == 1, "JSON retains the textual marker count in comments")
             verdicts[label] = next(line for line in result.stdout.splitlines() if line.startswith("layout:"))
         check("legacy (non-NGG)" in verdicts["complete"], "complete marker-free survey identifies legacy layout")
         for label in ("no VS", "all missing", "partial"):
             check(verdicts[label] != verdicts["complete"], f"{label}: no unconditional legacy verdict")
+        for label in ("empty", "comment", "mixed"):
+            check(verdicts[label].startswith("layout: unknown (") and "instruction" in verdicts[label],
+                  f"{label}: layout explains the lack of decoded instructions")
+        check("NGG markers present" in verdicts["positive"], "decoded NGG marker wins with empty and missing listings")
         check(verdicts["no VS"] != verdicts["all missing"], "no indexed vertex shaders and absent listings are distinct")
 
     with tempfile.TemporaryDirectory() as tmp:
