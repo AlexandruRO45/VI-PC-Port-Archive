@@ -390,6 +390,7 @@ public:
         image,
         buffer,
         device_memory,
+        semaphore,
         acceleration_structure,
     };
 
@@ -469,6 +470,9 @@ public:
                 break;
             case Kind::device_memory:
                 vk.vkFreeMemory(device, reinterpret_cast<VkDeviceMemory>(item.handle), nullptr);
+                break;
+            case Kind::semaphore:
+                vk.vkDestroySemaphore(device, reinterpret_cast<VkSemaphore>(item.handle), nullptr);
                 break;
             case Kind::acceleration_structure:
                 if (vk.vkDestroyAccelerationStructureKHR)
@@ -1416,7 +1420,7 @@ public:
     ~VulkanFence() {
         if (!semaphore_) return;
         context_.holds().remove_fence(semaphore_);  // batches held on it can never run: dropped and reported
-        context_.vk.vkDestroySemaphore(context_.device(), semaphore_, nullptr);
+        context_.defer_destroy(DeferredDeletionQueue::Kind::semaphore, semaphore_);
     }
     VulkanFence(const VulkanFence&) = delete;
     VulkanFence& operator=(const VulkanFence&) = delete;
@@ -2137,6 +2141,14 @@ private:
     // Holder: the fence is released, so what waits on it can never run.
     void discard_waiting_on(VkSemaphore semaphore) override {
         std::lock_guard state(state_mutex_);
+        for (std::size_t i = 0; i < waits_.size();) {
+            if (waits_[i] != semaphore) {
+                ++i;
+                continue;
+            }
+            waits_.erase(waits_.begin() + i);
+            wait_values_.erase(wait_values_.begin() + i);
+        }
         for (auto it = held_.begin(); it != held_.end();) {
             if (std::find(it->waits.begin(), it->waits.end(), semaphore) == it->waits.end()) {
                 ++it;
