@@ -26,12 +26,18 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Local: reserve it with `VirtualAlloc2(MEM_RESERVE \| MEM_RESERVE_PLACEHOLDER)` |
 | 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Local: a physical reserve inside a known placeholder stays a placeholder (the page maps split it); other `MEM_REPLACE_PLACEHOLDER` calls split the range and allocate it in place |
 | 12 | Device slot 133 is called; the proxy table had 128 slots, so the call went through a null pointer | Local: a 192-slot table, and a slot 133 stand-in, §3.4 |
-| 13 | **Current stop**: right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9 (`GetCPUDescriptorHandleForHeapStart` on the PC), takes the handle from `rax` and asserts that it equals a value it already holds. Hypothesis: a console descriptor heap starts at an address the title chose or can predict, which the PC handle doesn't match | Open: a question for the descriptor model ([boot.md](boot.md) Q4) |
+| 13 | Right after the first `CreateDescriptorHeap`, the title calls the heap's slot 9 (`GetCPUDescriptorHandleForHeapStart` on the PC), takes the handle from `rax` and asserts that it equals a value it already holds | Local: the heap lives at the title's address, §3.5 |
+| 14 | Device slot 70 is forwarded to the PC slot 70 (`CreatePlacedResource1`), which writes through the title's arguments | Local stand-in that skips the descriptor write, §3.6 |
+| 15 | Device slot 127 is past the PC device vtable and gets `E_NOTIMPL`; the title asserts on the null resource | Local: forwarded to `ID3D12Device10::CreateCommittedResource3`, §3.7 |
+| 16 | Device slot 25 (`GetResourceAllocationInfo`, a struct return) passes Xbox descriptors to the PC unchanged | Local: the descriptors are cleaned like slot 76's before the PC call, §3.7 |
+| 17 | **Current stop**: a fatal assert right after the title creates its first full-screen render targets through slot 127. It checks a fixed memory budget against what the targets used and fires when more than 2 MiB is left over, so the PC sizes (from slot 25) come out smaller than the console's | Open: the console's allocation sizes for render targets |
 
 At stop 13 the D3D12 trace holds 1,185 calls: the device, 5 command queues, 5 fences, 7 command allocators,
 581 command lists created and closed, a shader cache session, `XboxIDXGIDevice::GetAdapter`, one failed
 `ID3D12Device10::CreateReservedResource2`, the first `CreateSampler2`, one committed resource (the slot 133
-stand-in) and the first descriptor heap.
+stand-in) and the first descriptor heap. At stop 17 it holds 1,641: four descriptor heaps (the first shader-visible
+one with over a million descriptors), the first shader resource, unordered access and render target views, and two
+committed resources from slot 127.
 
 Without a debugger, the unhandled `int3` of a fatal assert ends the process with `C0000374` (heap corruption) or
 `C0000005` during teardown, not `80000003`. An exit code of `C0000374` from `--run` can be such an assert, not a
@@ -95,6 +101,31 @@ mapper (#5378) or an imported host allocation.
 
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.
+
+### 3.5 Descriptor heaps at an address the title chose
+
+The Xbox `D3D12_DESCRIPTOR_HEAP_DESC` goes on past the 16 PC bytes: the word at `+0x10` is a CPU address and the
+one at `+0x18` its size. Only the first heap (shader visible) carries one. The title then asserts that
+`GetCPUDescriptorHandleForHeapStart` returns that address. In the Vulkan backend a CPU descriptor handle is a pointer
+into the heap's storage, so the local change gives the heap the title's memory as its CPU storage (the GPU arena
+copy stays where it was). The assert passes and the title goes on to write descriptors.
+
+### 3.6 Device slot 70 writes a view from raw descriptions
+
+Device slot 70 is `(texture words, view desc, destination handle)`. Its caller is the title's SRV writer, and the
+other path of that writer calls the PC-shaped `CreateShaderResourceView` with a resource. It makes a view from raw
+descriptions and a GPU address, with no resource object. The local stand-in leaves the destination descriptor as it
+is. A real version needs the descriptor layout for an SRV built from an address.
+
+### 3.7 Device slots 25 and 127: allocation info and committed resources
+
+Slot 127 has the argument list of `ID3D12Device10::CreateCommittedResource3`: heap properties, heap flags,
+`D3D12_RESOURCE_DESC1`, barrier layout, clear value, protected session, castable format count and list, riid, out.
+The console has more device slots than the PC, so forwarding by number can't reach it. Slot 25,
+`GetResourceAllocationInfo`, is a struct return called as `(ret, this, mask, count, descs)` (§3.1). In both, the
+descriptors carry Xbox layouts and Xbox bits above the PC `Flags`. Clearing them the way slot 76 already does lets
+the PC device create the resource and return a size. The first resources are full-screen render targets with
+render-target and unordered-access flags.
 
 ## 4. What this does not show
 
