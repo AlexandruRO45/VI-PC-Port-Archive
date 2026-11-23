@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace leonida::vk_test {
@@ -91,11 +92,13 @@ struct ShaderFma {
     }
 
     // True when the module can be used: it does not need FMAKHR, or the device enables shaderFmaFloat32.
-    // Otherwise says so and the caller returns 77.
-    bool accepts(const void* code, std::size_t bytes, const char* name) const {
+    // Otherwise says so (on stderr, or in *why when given) and the caller returns 77.
+    bool accepts(const void* code, std::size_t bytes, const char* name, std::string* why = nullptr) const {
         if (float32 || !spirv_declares_capability(code, bytes, 6030)) return true;  // FMAKHR
-        std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32) and the device "
-                             "lacks it; translate with --fma glsl\n", name);
+        const std::string message = std::string("unsupported: ") + name + " needs OpFmaKHR (VK_KHR_shader_fma, "
+                                    "shaderFmaFloat32) and the device lacks it; translate with --fma glsl\n";
+        if (why) *why = message;
+        else std::fputs(message.c_str(), stderr);
         return false;
     }
 };

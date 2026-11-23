@@ -23,14 +23,15 @@ inline constexpr std::uint32_t pc_tail_binding = 0;
 
 // LEONIDA_PC_TAIL_UBO=1: the shaders were translated with --pc-tail-ubo. The values run_gpu_tests.py accepts:
 // 1/true/yes/on, any case, with the trailing space cmd.exe's `set VAR=1 &` leaves.
-inline bool pc_tail_requested() {
-    const char* v = std::getenv("LEONIDA_PC_TAIL_UBO");
+inline bool pc_tail_value(const char* v) {
     std::string s = v ? v : "";
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
     for (char& c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
     return s == "1" || s == "true" || s == "yes" || s == "on";
 }
+
+inline bool pc_tail_requested() { return pc_tail_value(std::getenv("LEONIDA_PC_TAIL_UBO")); }
 
 // OpDecorate (71) <id> DescriptorSet (34) <set>: a --pc-tail-ubo module declares set 1 only when it reads the tail.
 inline bool spirv_declares_set(const void* data, std::size_t bytes, std::uint32_t set) {
@@ -57,6 +58,9 @@ struct PcTail {
     VkDeviceSize stride = 0;
     std::uint32_t slots = 0;
     std::uint8_t* map = nullptr;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory device_memory = VK_NULL_HANDLE;
 
     bool create(PFN_vkGetDeviceProcAddr gdpa, VkDevice dev, const VkPhysicalDeviceMemoryProperties& memory,
                 VkDeviceSize min_offset_alignment, VkShaderStageFlags stages, std::uint32_t slot_count) {
@@ -79,7 +83,6 @@ struct PcTail {
         VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1};
         VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pi.maxSets = 1; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
-        VkDescriptorPool pool;
         if (vkCreateDescriptorPool(dev, &pi, nullptr, &pool) != VK_SUCCESS) return false;
         VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
         ai.descriptorPool = pool; ai.descriptorSetCount = 1; ai.pSetLayouts = &set_layout;
@@ -87,7 +90,6 @@ struct PcTail {
 
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         bi.size = stride * slots; bi.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-        VkBuffer buffer;
         if (vkCreateBuffer(dev, &bi, nullptr, &buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, buffer, &mr);
         constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -97,11 +99,10 @@ struct PcTail {
         if (type == memory.memoryTypeCount) return false;
         VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         mi.allocationSize = mr.size; mi.memoryTypeIndex = type;
-        VkDeviceMemory mem;
-        if (vkAllocateMemory(dev, &mi, nullptr, &mem) != VK_SUCCESS) return false;
-        if (vkBindBufferMemory(dev, buffer, mem, 0) != VK_SUCCESS) return false;
+        if (vkAllocateMemory(dev, &mi, nullptr, &device_memory) != VK_SUCCESS) return false;
+        if (vkBindBufferMemory(dev, buffer, device_memory, 0) != VK_SUCCESS) return false;
         void* p;
-        if (vkMapMemory(dev, mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
+        if (vkMapMemory(dev, device_memory, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) return false;
         map = static_cast<std::uint8_t*>(p);
         std::memset(map, 0, std::size_t(stride * slots));
 
@@ -120,6 +121,23 @@ struct PcTail {
     }
 
     std::uint32_t offset(std::uint32_t slot) const { return std::uint32_t(stride * slot); }
+
+    // Frees what create() made (any part of it), for a program that runs many dispatches on one device
+    // (vk_compute_test --batch); the others leave it to the device's destruction.
+    void destroy(PFN_vkGetDeviceProcAddr gdpa, VkDevice dev) {
+        const auto destroy_pool = reinterpret_cast<PFN_vkDestroyDescriptorPool>(gdpa(dev, "vkDestroyDescriptorPool"));
+        const auto destroy_layout =
+            reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(gdpa(dev, "vkDestroyDescriptorSetLayout"));
+        const auto destroy_buffer = reinterpret_cast<PFN_vkDestroyBuffer>(gdpa(dev, "vkDestroyBuffer"));
+        const auto free_memory = reinterpret_cast<PFN_vkFreeMemory>(gdpa(dev, "vkFreeMemory"));
+        if (!destroy_pool || !destroy_layout || !destroy_buffer || !free_memory) return;
+        destroy_buffer(dev, buffer, nullptr);
+        free_memory(dev, device_memory, nullptr);
+        destroy_pool(dev, pool, nullptr);   // frees the set
+        destroy_layout(dev, set_layout, nullptr);
+        destroy_layout(dev, empty_layout, nullptr);
+        *this = PcTail{};
+    }
 };
 
 } // namespace leonida::vk_test

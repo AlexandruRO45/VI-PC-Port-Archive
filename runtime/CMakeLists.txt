@@ -1023,6 +1023,17 @@ if(TARGET Vulkan::Headers)
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_pipeline_cli.cmake")
     add_test(NAME depth24_convert COMMAND depth24_convert_test)
     set_tests_properties(depth24_convert PROPERTIES SKIP_RETURN_CODE 77)
+    # vk_compute_test --batch (tools/vk_compute_batch.py): three jobs on one device, one failing its expectation, each
+    # the same as its single run, and a dispatch past --job-timeout ending the batch. Needs the SDK's spirv-as.
+    find_program(LEONIDA_BATCH_SPIRV_AS spirv-as HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(LEONIDA_BATCH_SPIRV_AS AND Python3_FOUND)
+      add_test(NAME vk_compute_batch COMMAND "${Python3_EXECUTABLE}" -I
+               "${CMAKE_CURRENT_SOURCE_DIR}/test/check_vk_compute_batch.py" $<TARGET_FILE:vk_compute_test>
+               "${LEONIDA_BATCH_SPIRV_AS}" "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_batch"
+               "--runner=${CMAKE_CROSSCOMPILING_EMULATOR}")
+      set_tests_properties(vk_compute_batch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    endif()
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
     foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture)
       add_test(NAME ${test} COMMAND ${test}_test)
