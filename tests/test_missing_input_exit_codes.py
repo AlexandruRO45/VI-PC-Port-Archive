@@ -7,6 +7,7 @@ hardware-oracle startup cost back in.
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +51,23 @@ class MissingInputExitCodeTests(unittest.TestCase):
                 self.assertTrue(lines[0].strip())
                 self.assertTrue(lines[0].startswith("ERROR:"), p.stderr)
                 self.assertIn(missing, p.stderr)
+
+
+class NotAnArchiveExitCodeTests(unittest.TestCase):
+    """An input that exists but is not a readable RPF is the same usage error as a missing one."""
+
+    def test_plain_file_is_exit_2_with_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "not-an-archive.rpf")
+            with open(path, "wb") as f:
+                f.write(b"this file exists but is not an RPF7/8/9 archive")
+            p = run_tool("navmesh_index", path, "--out", os.path.join(tmp, "out.json"))
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertNotIn("Traceback", p.stderr)
+            lines = p.stderr.strip().splitlines()
+            self.assertEqual(len(lines), 1, p.stderr)
+            self.assertTrue(lines[0].startswith("ERROR:"), p.stderr)
+            self.assertIn(path, p.stderr)
 
 
 class ImageQueryProbeHelpTests(unittest.TestCase):
