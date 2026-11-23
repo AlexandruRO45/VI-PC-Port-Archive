@@ -503,6 +503,36 @@ class SIMDGWSInterpreter:
 # ============================================================================
 
 
+# ============================================================================
+# Commit 6: Condition codes, status flags, and carry/borrow generation
+# ============================================================================
+
+
+@dataclass(frozen=True)
+class GWSBranchReleaseStatusFlags:
+    """Architectural condition codes and status flags for GWS branch release."""
+    scc: int = 0
+    zero_flag: bool = False
+    negative_flag: bool = False
+    carry_flag: bool = False
+    waiters_awakened: int = 0
+    branch_taken: bool = False
+
+    @classmethod
+    def compute(cls, val: int, awakened: List[int], wrapped: bool = False) -> GWSBranchReleaseStatusFlags:
+        branch = len(awakened) > 0
+        scc = 1 if branch else 0
+        zero = (val == 0)
+        return cls(
+            scc=scc,
+            zero_flag=zero,
+            negative_flag=False,
+            carry_flag=wrapped,
+            waiters_awakened=len(awakened),
+            branch_taken=branch,
+        )
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_v."""
 
@@ -905,6 +935,62 @@ class TestRegisterAliasingAndInPlacePreservation(unittest.TestCase):
             self.assertEqual(state.m0, rid)
             self.assertEqual(state.get_sgpr(10), 0x11223344)
             self.assertEqual(state.get_vgpr(20), 0x55667788)
+
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation for ds_gws_sema_br_v."""
+
+    def setUp(self) -> None:
+        self.gws = GWSSubsystem()
+        self.interp = ScalarGWSInterpreter()
+
+    def test_scc_and_branch_taken_when_waiters_awakened(self) -> None:
+        rid = 2
+        self.gws.init_resource(rid, init_val=0)
+        self.gws.wait_p(rid, wave_id=42)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst, branch_pc=0x7000)
+        flags = GWSBranchReleaseStatusFlags.compute(val, awakened)
+
+        self.assertTrue(branch)
+        self.assertEqual(flags.scc, 1)
+        self.assertTrue(flags.branch_taken)
+        self.assertEqual(flags.waiters_awakened, 1)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.branch_target, 0x7000)
+        self.assertTrue(flags.zero_flag)
+
+    def test_scc_and_branch_not_taken_without_waiters(self) -> None:
+        rid = 3
+        self.gws.init_resource(rid, init_val=0)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst, branch_pc=0x7000)
+        flags = GWSBranchReleaseStatusFlags.compute(val, awakened)
+
+        self.assertFalse(branch)
+        self.assertEqual(flags.scc, 0)
+        self.assertFalse(flags.branch_taken)
+        self.assertEqual(flags.waiters_awakened, 0)
+        self.assertEqual(state.scc, 0)
+        self.assertIsNone(state.branch_target)
+        self.assertFalse(flags.zero_flag)
+
+    def test_carry_flag_on_32bit_overflow(self) -> None:
+        rid = 4
+        self.gws.init_resource(rid, init_val=0xFFFF_FFFF)
+        state = ScalarThreadState(wave_id=1, m0=rid, gws=self.gws)
+        inst = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+
+        val, awakened, branch = self.interp.execute(state, inst)
+        # 0xFFFFFFFF + 1 wraps to 0
+        self.assertEqual(val, 0)
+        flags = GWSBranchReleaseStatusFlags.compute(val, awakened, wrapped=True)
+        self.assertTrue(flags.carry_flag)
+        self.assertTrue(flags.zero_flag)
 
 
 if __name__ == "__main__":
