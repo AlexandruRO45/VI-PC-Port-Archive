@@ -118,6 +118,76 @@ class F64DiffTests(unittest.TestCase):
         self.assertTrue(observed)
         self.assertTrue(all(item is context for item in observed))
 
+    def test_prepare_gpu_assembles_inline_vs_without_glslc(self):
+        requested = []
+        commands = []
+        def fake_sdk_tool(name):
+            requested.append(name)
+            return "/fake/spirv-as" if name == "spirv-as" else None
+        def fake_run(cmd, **kw):
+            commands.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "vk_harness")
+            with open(exe, "wb") as f:
+                f.write(b"")
+            with mock.patch.object(fd, "sdk_tool", side_effect=fake_sdk_tool), \
+                    mock.patch.object(fd.subprocess, "run", side_effect=fake_run):
+                ctx = fd.prepare_gpu(exe, tmp)
+            self.assertEqual(requested, ["spirv-as"])
+            self.assertEqual(ctx["exe"], exe)
+            self.assertEqual(ctx["spirv_as"], "/fake/spirv-as")
+            self.assertEqual(ctx["vs_spv"], os.path.join(tmp, "f64_diff_vs.spv"))
+            self.assertNotIn("glslc", ctx)
+            vs_asm = os.path.join(tmp, "f64_diff_vs.spvasm")
+            self.assertTrue(os.path.isfile(vs_asm))
+            self.assertEqual(commands, [["/fake/spirv-as", "--target-env", "vulkan1.2", vs_asm, "-o", ctx["vs_spv"]]])
+
+    def test_prepare_gpu_unavailable_without_spirv_as(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "vk_harness")
+            with open(exe, "wb") as f:
+                f.write(b"")
+            with mock.patch.object(fd, "sdk_tool", return_value=None), \
+                    self.assertRaises(fd.GPUUnavailable) as ctx:
+                fd.prepare_gpu(exe, tmp)
+            self.assertIn("spirv-as", str(ctx.exception))
+
+    def test_prepare_gpu_reports_spirv_as_failure_and_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "vk_harness")
+            with open(exe, "wb") as f:
+                f.write(b"")
+            with mock.patch.object(fd, "sdk_tool", return_value="/fake/spirv-as"), \
+                    mock.patch.object(fd.subprocess, "run",
+                                      return_value=subprocess.CompletedProcess(["spirv-as"], 1, "", "bad op")), \
+                    self.assertRaises(fd.HarnessError) as fail_ctx:
+                fd.prepare_gpu(exe, tmp)
+            self.assertIn("spirv-as failed", str(fail_ctx.exception))
+            self.assertIn("bad op", str(fail_ctx.exception))
+
+            with mock.patch.object(fd, "sdk_tool", return_value="/fake/spirv-as"), \
+                    mock.patch.object(fd.subprocess, "run",
+                                      side_effect=subprocess.TimeoutExpired(["spirv-as"], 30)), \
+                    self.assertRaises(fd.HarnessError) as to_ctx:
+                fd.prepare_gpu(exe, tmp)
+            self.assertIn("timed out", str(to_ctx.exception))
+
+    def test_inline_fullscreen_vs_validates_under_vulkan12(self):
+        spirv_as = fd.sdk_tool("spirv-as")
+        spirv_val = fd.sdk_tool("spirv-val")
+        if not spirv_as or not spirv_val:
+            self.skipTest("spirv-as and spirv-val are not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "vk_harness")
+            with open(exe, "wb") as f:
+                f.write(b"")
+            ctx = fd.prepare_gpu(exe, tmp)
+            self.assertTrue(os.path.isfile(ctx["vs_spv"]))
+            r = subprocess.run([spirv_val, "--target-env", "vulkan1.2", ctx["vs_spv"]],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_known_divergences_only_reinserted_with_known(self):
         normal = self.command("--ops", "v_add_f64", "--programs", "0")
         known = self.command("--ops", "v_add_f64", "--programs", "0", "--no-sweep", "--known", "--all-failures")

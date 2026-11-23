@@ -173,13 +173,71 @@ def _extract_profile(doc):
     }
 
 
+_MOLTENVK_DRIVER_ID = 14
+
+
+def _vk_subgroup_fallback():
+    """Fallback GPU/subgroup probe via tools/vk_subgroup_info.py when vulkaninfo is absent."""
+    probe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vk_subgroup_info.py")
+    if not os.path.isfile(probe):
+        return None
+    try:
+        r = run([sys.executable, "-I", probe, "--stage-caps"], timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r is None or r.returncode != 0 or not isinstance(r.stdout, str):
+        return None
+    lines = [line for line in r.stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        doc = json.loads(lines[-1])
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or "error" in doc:
+        return None
+    name = doc.get("device")
+    if not isinstance(name, str) or not name:
+        return None
+    barycentric = doc.get("fragment_shader_barycentric")
+    if not isinstance(barycentric, bool):
+        per_vertex = doc.get("per_vertex_inputs")
+        barycentric = (per_vertex if isinstance(per_vertex, bool)
+                       and doc.get("driver_id") != _MOLTENVK_DRIVER_ID else None)
+    mesh = doc.get("mesh_shader")
+    maintenance8 = doc.get("maintenance8")
+    return {
+        "vulkaninfo": "fallback:vk_subgroup_info",
+        "device": {"name": name, "driver": None, "api": None},
+        "subgroup": {
+            "size": doc.get("subgroup_size"),
+            "stages": doc.get("supported_subgroup_stages"),
+            "min": doc.get("min_subgroup_size"),
+            "max": doc.get("max_subgroup_size"),
+        },
+        "subgroup_size_control": {
+            "subgroupSizeControl": doc.get("subgroup_size_control"),
+            "computeFullSubgroups": None,
+            "requiredSubgroupSizeStages": doc.get("required_subgroup_size_stages"),
+        },
+        "mesh": mesh if isinstance(mesh, bool) else None,
+        "barycentric": barycentric,
+        "maintenance8": maintenance8 if isinstance(maintenance8, bool) else None,
+        "descriptor_heap": None,
+        "storageInputOutput16": None,
+    }
+
+
 def vulkan_matrix():
-    """Device/feature matrix from vulkaninfo JSON (Vulkan Profiles schema)."""
+    """Device/feature matrix from vulkaninfo JSON (Vulkan Profiles schema), or vk_subgroup_info.py if absent."""
     m = {"vulkaninfo": None, "device": None, "subgroup": None,
          "subgroup_size_control": None, "mesh": None, "barycentric": None,
          "maintenance8": None, "descriptor_heap": None,
          "storageInputOutput16": None}
     if not shutil.which("vulkaninfo"):
+        fallback = _vk_subgroup_fallback()
+        if fallback is not None:
+            m.update(fallback)
         return m
     best_rank = -1
     best_profile = None

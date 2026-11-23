@@ -425,18 +425,62 @@ def sdk_tool(name):
     return candidate if candidate and os.path.isfile(candidate) else None
 
 
+VS_FULLSCREEN_SPVASM = """\
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %gl_VertexIndex %gl_Position
+               OpDecorate %gl_VertexIndex BuiltIn VertexIndex
+               OpDecorate %gl_Position BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+    %v4float = OpTypeVector %float 4
+   %ptr_in_i = OpTypePointer Input %int
+  %ptr_out_v = OpTypePointer Output %v4float
+     %uint_3 = OpConstant %uint 3
+     %arr_v4 = OpTypeArray %v4float %uint_3
+ %ptr_fn_arr = OpTypePointer Function %arr_v4
+  %ptr_fn_v4 = OpTypePointer Function %v4float
+        %fm1 = OpConstant %float -1
+         %f0 = OpConstant %float 0
+         %f1 = OpConstant %float 1
+         %f3 = OpConstant %float 3
+      %pos_0 = OpConstantComposite %v4float %fm1 %fm1 %f0 %f1
+      %pos_1 = OpConstantComposite %v4float %f3 %fm1 %f0 %f1
+      %pos_2 = OpConstantComposite %v4float %fm1 %f3 %f0 %f1
+    %pos_arr = OpConstantComposite %arr_v4 %pos_0 %pos_1 %pos_2
+%gl_VertexIndex = OpVariable %ptr_in_i Input
+%gl_Position = OpVariable %ptr_out_v Output
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %p_var = OpVariable %ptr_fn_arr Function
+               OpStore %p_var %pos_arr
+        %idx = OpLoad %int %gl_VertexIndex
+       %p_pt = OpAccessChain %ptr_fn_v4 %p_var %idx
+       %p_vl = OpLoad %v4float %p_pt
+               OpStore %gl_Position %p_vl
+               OpReturn
+               OpFunctionEnd
+"""
+
+
 def prepare_gpu(exe, tmpdir):
     if not os.path.isfile(exe): raise GPUUnavailable(f"vk_harness not found: {exe}")
-    glslc, spirv_as = sdk_tool("glslc"), sdk_tool("spirv-as")
-    if not glslc or not spirv_as: raise GPUUnavailable("Vulkan SDK glslc and spirv-as are required for --oracle gpu")
-    vertex = os.path.join(ROOT, "runtime", "test", "glsl", "vs_fullscreen.vert")
-    if not os.path.isfile(vertex): raise HarnessError(f"full-screen vertex shader is missing: {vertex}")
+    spirv_as = sdk_tool("spirv-as")
+    if not spirv_as: raise GPUUnavailable("spirv-as is required for --oracle gpu")
+    vs_asm = os.path.join(tmpdir, "f64_diff_vs.spvasm")
     vs_spv = os.path.join(tmpdir, "f64_diff_vs.spv")
+    with open(vs_asm, "w", encoding="utf-8", newline="\n") as f:
+        f.write(VS_FULLSCREEN_SPVASM)
     try:
-        r = subprocess.run([glslc, vertex, "-o", vs_spv], capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired: raise HarnessError("glslc timed out while compiling the full-screen vertex shader") from None
-    if r.returncode: raise HarnessError(f"glslc failed: {(r.stdout + r.stderr).strip()}")
-    return {"exe": exe, "glslc": glslc, "spirv_as": spirv_as, "vs_spv": vs_spv}
+        r = subprocess.run([spirv_as, "--target-env", "vulkan1.2", vs_asm, "-o", vs_spv],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise HarnessError("spirv-as timed out while assembling the full-screen vertex shader") from None
+    if r.returncode: raise HarnessError(f"spirv-as failed: {(r.stdout + r.stderr).strip()}")
+    return {"exe": exe, "spirv_as": spirv_as, "vs_spv": vs_spv}
 
 
 def run_gpu(lines, name, tmpdir, gpu):

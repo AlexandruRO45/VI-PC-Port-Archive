@@ -150,6 +150,97 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertEqual(matrix["device"]["name"], "Discrete GPU 1")
         self.assertEqual(calls, [("vulkaninfo", "-j"), ("vulkaninfo", "--summary"), ("vulkaninfo", "-j=1")])
 
+    def test_missing_vulkaninfo_falls_back_to_vk_subgroup_info(self):
+        payload = {
+            "device": "NVIDIA GeForce GTX 1070",
+            "subgroup_size": 32,
+            "min_subgroup_size": 32,
+            "max_subgroup_size": 32,
+            "subgroup_size_control": True,
+            "per_vertex_inputs": False,
+            "driver_id": 4,
+            "supported_subgroup_stages": 63,
+            "required_subgroup_size_stages": 32,
+        }
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(payload) + "\n", "")
+
+        with patch.object(turing_atlas.shutil, "which", return_value=None), \
+                patch.object(turing_atlas, "run", fake_run):
+            matrix = turing_atlas.vulkan_matrix()
+
+        self.assertEqual(tuple(matrix), MATRIX_KEYS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], [sys.executable, "-I"])
+        self.assertTrue(calls[0][2].endswith("vk_subgroup_info.py"))
+        self.assertEqual(calls[0][3:], ["--stage-caps"])
+        self.assertEqual(matrix["vulkaninfo"], "fallback:vk_subgroup_info")
+        self.assertEqual(matrix["device"], {"name": "NVIDIA GeForce GTX 1070", "driver": None, "api": None})
+        self.assertEqual(matrix["subgroup"], {"size": 32, "stages": 63, "min": 32, "max": 32})
+        self.assertEqual(matrix["subgroup_size_control"], {
+            "subgroupSizeControl": True,
+            "computeFullSubgroups": None,
+            "requiredSubgroupSizeStages": 32,
+        })
+        self.assertIs(matrix["barycentric"], False)
+        self.assertIsNone(matrix["mesh"])
+        self.assertIsNone(matrix["maintenance8"])
+        self.assertIsNone(matrix["descriptor_heap"])
+        self.assertIsNone(matrix["storageInputOutput16"])
+
+        out = io.StringIO()
+        with patch.object(sys, "argv", ["turing_atlas.py"]), \
+                patch.object(turing_atlas.shutil, "which", return_value=None), \
+                patch.object(turing_atlas, "run", fake_run), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = turing_atlas.main()
+        self.assertEqual(code, 0)
+        atlas = json.loads(out.getvalue())
+        self.assertEqual(atlas["gpu"], "NVIDIA GeForce GTX 1070")
+        self.assertEqual(atlas["features"]["vulkaninfo"], "fallback:vk_subgroup_info")
+
+    def test_fallback_uses_optional_feature_booleans_and_guards_moltenvk_barycentric(self):
+        moltenvk = {
+            "device": "Apple M2",
+            "subgroup_size": 32,
+            "min_subgroup_size": 32,
+            "max_subgroup_size": 32,
+            "subgroup_size_control": False,
+            "per_vertex_inputs": False,
+            "driver_id": 14,
+            "mesh_shader": False,
+            "maintenance8": True,
+        }
+        with patch.object(turing_atlas.shutil, "which", return_value=None), \
+                patch.object(turing_atlas, "run",
+                             return_value=subprocess.CompletedProcess(["python"], 0, json.dumps(moltenvk) + "\n", "")):
+            matrix = turing_atlas.vulkan_matrix()
+        self.assertEqual(matrix["device"]["name"], "Apple M2")
+        self.assertIsNone(matrix["barycentric"])
+        self.assertIs(matrix["mesh"], False)
+        self.assertIs(matrix["maintenance8"], True)
+
+    def test_fallback_failures_leave_the_matrix_unknown(self):
+        cases = [
+            subprocess.CompletedProcess(["python"], 1, json.dumps({"error": "no Vulkan loader"}), ""),
+            subprocess.CompletedProcess(["python"], 0, json.dumps({"error": "failed"}), ""),
+            subprocess.CompletedProcess(["python"], 0, "not-json\n", ""),
+            subprocess.CompletedProcess(["python"], 0, "", ""),
+            None,
+        ]
+        for result in cases:
+            with self.subTest(result=result), \
+                    patch.object(turing_atlas.shutil, "which", return_value=None), \
+                    patch.object(turing_atlas, "run", return_value=result):
+                self.assert_unknown(turing_atlas.vulkan_matrix())
+
+        with patch.object(turing_atlas.shutil, "which", return_value=None), \
+                patch.object(turing_atlas, "run", side_effect=subprocess.TimeoutExpired(["python"], 30)):
+            self.assert_unknown(turing_atlas.vulkan_matrix())
+
 
 
 
