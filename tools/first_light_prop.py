@@ -40,7 +40,7 @@ def stream_items(lines):
         line = line.rstrip("\r\n")
         if line.strip():
             seen_content = True
-        if line == '  "Items": []':
+        if line.rstrip(",") == '  "Items": []':
             seen_items = True   # a windowed export can legitimately hold no item: empty, not a format error
         if item is None:
             if line == "    {":

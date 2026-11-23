@@ -673,6 +673,10 @@ class PropRuleTests(unittest.TestCase):
     def test_a_manifest_with_no_items_is_empty_not_a_format_error(self):
         import first_light_prop as prop
 
+        # rpf9dump models writes ModelDecodeFailures after Items, so the Items line ends in a comma there
+        followed = json.dumps({"Count": 0, "Items": [], "ModelDecodeFailures": {}}, indent=2) + "\n"
+        self.assertIn('  "Items": [],\n', followed)
+        self.assertEqual(list(prop.stream_items(followed.splitlines(True))), [])
         empty = json.dumps({"Count": 0, "Items": []}, indent=2) + "\n"
         self.assertEqual(list(prop.stream_items(empty.splitlines(True))), [])
         with tempfile.TemporaryDirectory() as folder:
