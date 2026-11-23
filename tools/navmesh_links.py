@@ -161,7 +161,6 @@ def verify_tile(b, stats):
     gpi = 0
     max_poly_links = 0
     w20_hi9 = Counter()
-    by_li = {}
     if b98 is not None:
         for po, pcnt in b98:
             for pi in range(pcnt):
@@ -185,7 +184,6 @@ def verify_tile(b, stats):
                         if not ((p0 == gpi or p1 == gpi) and (s0 == c8 or s1 == c8)):
                             endpoints_ok = False
                             break
-                        by_li.setdefault(li, set()).add(gpi)
                 nxt += cnt
                 gpi += 1
             if not chain_ok:
@@ -193,15 +191,6 @@ def verify_tile(b, stats):
         if nxt != d8:
             chain_ok = False
             endpoints_ok = False
-
-    # Every link referenced in +0xB0 must be listed by all of its local-tile endpoints (p0 when s0 == c8,
-    # and p1 when s1 == c8).
-    if endpoints_ok and by_li:
-        for li, gpis in by_li.items():
-            p0, p1, s0, s1 = struct.unpack_from("<HHII", b, la + 32 * li + 12)
-            if (s0 == c8 and p0 not in gpis) or (s1 == c8 and p1 not in gpis):
-                endpoints_ok = False
-                break
 
     chk["poly_link_chain"] = chain_ok
     chk["link_indices_endpoints"] = endpoints_ok

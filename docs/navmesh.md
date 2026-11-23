@@ -232,7 +232,8 @@ The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` 
   - **`458,728,869`** (`93.04%`) are intra-tile neighbors with `adj_sector == u32@0xC8` and `adj_poly < u32@0xC4`
     (`0` out-of-bounds polygon indices);
   - **`34,295,319`** (`6.96%`) are open or tile-border edges with `adj_sector == 0xFFFFFFFF` and `adj_poly == 0xFFFF`
-    (cross-tile border stitching is performed at runtime rather than serialized in `+0x88`).
+    (cross-tile border stitching is performed at runtime rather than serialized in `+0x88`). Intra-tile edges are
+    not strictly symmetric per directed `(poly, adj_poly)` pair (directed one-way excess pairs exist across the corpus).
 - **Polygon `+0x20` special-link prefix-sum chain (`124,768,148` polygons across `27,644` tiles):**
   In every 44-byte polygon at `+0x98`, `u32@0x20` packs `link_count = w20 & 0x3F` (bits `0..5`, range `0..63`),
   `link_start = (w20 >> 6) & 0x1FFFF` (bits `6..22`, up to `17,459`), and a 9-bit polygon flag field `w20 >> 23`
@@ -257,11 +258,12 @@ The `24,480` unique static sector IDs form a complete, gap-free `136 Ã— 180` 
   - `+0x1E..+0x1F` (`u16 pad`): zero padding (`0` on `26,679,246 / 26,679,246`).
   - Across all `26,903,247 / 26,903,247` entries of `+0xB0`, every entry `li = u16@(b0 + 2*k)` in polygon `pi`'s slice
     `[link_start .. link_start + link_count)` indexes a 32-byte link at `+0xA8` satisfying
-    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)`, and every referenced link is
-    listed by all of its local-tile endpoints (`poly0` when `sector0 == u32@0xC8`, and `poly1` when
-    `sector1 == u32@0xC8`; on cross-tile links where the foreign endpoint polygon index is `< u32@0xC4`, the offline
-    builder also indexed the link under that polygon index because it matched `poly0/poly1 == pi` without filtering
-    by `sector0/sector1 == u32@0xC8`).
+    `(poly0 == pi or poly1 == pi) and (sector0 == u32@0xC8 or sector1 == u32@0xC8)` (`0` failures across all
+    `27,644 / 27,644` tiles). Referenced links are not always listed by both local endpoints: on `124` tiles (`12,430`
+    intra-tile links), only one endpoint (`poly0` in `12,410` cases, `poly1` in `20` cases) lists the link in `+0xB0`;
+    conversely, on cross-tile links across `7,759` tiles where the foreign endpoint polygon index is `< u32@0xC4`, the
+    offline builder also indexed the link under that local polygon index because it matched `poly0/poly1 == pi`
+    without filtering by `sector0/sector1 == u32@0xC8`.
 
 ### Split arrays and quadtree layout
 

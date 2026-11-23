@@ -247,19 +247,22 @@ class NavmeshLinksTest(unittest.TestCase):
         self.assertEqual(doc["special_links"]["cross_tile_s0"], 1)
         self.assertEqual(doc["special_links"]["cross_tile_s1"], 1)
 
-    def test_malformed_inputs_and_no_partial_counter_leak(self):
+    def test_one_way_intra_tile_link_accepted(self):
         sector = (260 << 9) | 250
-        # Counterexample where polygon 1 lists a cross-tile link whose index-1 endpoint is in sector+1
-        # while its local endpoint (poly 2 in sector) does not list it.
-        unlisted_local_end = build_tile(
+        # Real archive tiles (124 tiles, 12,430 intra-tile links) list one-way links on only one endpoint.
+        one_way = build_tile(
             sector=sector,
             links=[
                 (100, 200, 300, 400, 500, 600, 0, 2, sector, sector, 0x0200, 0x0050, 63, 0),
-                (110, 210, 310, 410, 510, 610, 1, 2, sector + 1, sector, 0x0400, 0x0040, 127, 0),
+                (110, 210, 310, 410, 510, 610, 1, 2, sector, sector, 0x0400, 0x0040, 127, 0),
             ],
-            link_indices=[0, 1, 0],
-            poly_link_counts=(1, 1, 1),
+            link_indices=[0, 1],
+            poly_link_counts=(1, 1, 0),
         )[0]
+        chk = nl.verify_tile(one_way, nl.new_stats())
+        self.assertTrue(chk["link_indices_endpoints"], chk)
+
+    def test_malformed_inputs_and_no_partial_counter_leak(self):
         cases = [
             ("edges_valid", build_tile(corrupt_edge_oob=True)[0]),
             ("edges_valid", build_tile(corrupt_edge_sector=True)[0]),
@@ -271,7 +274,6 @@ class NavmeshLinksTest(unittest.TestCase):
             ("poly_link_chain", build_tile(corrupt_chain_start=True)[0]),
             ("poly_link_chain", build_tile(corrupt_chain_total=True)[0]),
             ("link_indices_endpoints", build_tile(corrupt_b0_endpoint=True)[0]),
-            ("link_indices_endpoints", unlisted_local_end),
         ]
         for failed_check, blob in cases:
             with self.subTest(failed_check=failed_check):
