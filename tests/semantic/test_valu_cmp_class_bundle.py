@@ -892,3 +892,45 @@ class TestCmpxClassF64Oracle(unittest.TestCase):
 
         val_zero, _ = run_cmp_shader("f64", 0x7FF0000000000000, 0, is_cmpx=True, test_id="cmpx_id_zero")
         self.assertEqual(val_zero, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmpx_class_f64 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+@dataclass
+class VCmpxClassF64Instruction:
+    src0_lo: RegisterOperand
+    src0_hi: RegisterOperand
+    mask: Union[RegisterOperand, LiteralOperand]
+
+
+def step_cmpx_class_f64(machine: ScalarMachineClassLogic, insn: VCmpxClassF64Instruction):
+    lo = machine.read_operand(insn.src0_lo) & MASK32
+    hi = machine.read_operand(insn.src0_hi) & MASK32
+    val64 = (hi << 32) | lo
+    mask = machine.read_operand(insn.mask) & MASK32
+    cond = ref_cmp_class_f64(val64, mask)
+    if not cond:
+        machine.exec = 0
+
+
+class TestCmpxClassF64ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineClassLogic()
+        machine.vgprs[2] = 0
+        machine.vgprs[3] = 0x3FF00000
+        insn = VCmpxClassF64Instruction(
+            src0_lo=RegisterOperand(OperandType.VGPR, 2),
+            src0_hi=RegisterOperand(OperandType.VGPR, 3),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        step_cmpx_class_f64(machine, insn)
+
+        val_hw, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=True, test_id="ast_scalar_match")
+        self.assertEqual(machine.exec, MASK32)
+        self.assertEqual(val_hw, 1)
+
+    def test_scalar_predicated_execution_hardware(self):
+        val_hw, _ = run_cmp_shader("f64", 0x0000000000000000, CLASS_NEG_NORMAL, is_cmpx=True, test_id="ast_scalar_pred")
+        self.assertEqual(val_hw, 0)
