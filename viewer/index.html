@@ -188,8 +188,9 @@ renderer.setSize(innerWidth, innerHeight);
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9cc3e6);
-scene.fog = new THREE.Fog(0x9cc3e6, 900, 2600);
-const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 6000);
+const DEFAULT_CAMERA_FAR = 6000, DEFAULT_FOG_FAR = 2600;
+scene.fog = new THREE.Fog(0x9cc3e6, 900, DEFAULT_FOG_FAR);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, DEFAULT_CAMERA_FAR);
 scene.add(new THREE.HemisphereLight(0xdfefff, 0x4a4030, 1.1));
 const sun = new THREE.DirectionalLight(0xfff2dd, 1.6); sun.position.set(0.4, 1, 0.3); scene.add(sun);
 addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
@@ -402,6 +403,29 @@ function stream(now = performance.now()) {
 }
 
 // ---------- main loop ----------
+function updateViewRange() {
+  const { x, y, z } = camera.position;
+  let farthest = 0;
+  for (const { def, obj } of live.values()) {
+    if (def.lod === undefined || !obj?.visible) continue;
+    // Streaming uses horizontal cell distance. The farthest corner of the 3D bounds
+    // covers the chunk's depth in any view direction, including at high altitude.
+    const [minX, minY, minZ, maxX, maxY, maxZ] = def.bounds;
+    farthest = Math.max(farthest, Math.hypot(
+      Math.max(Math.abs(x - minX), Math.abs(x - maxX)),
+      Math.max(Math.abs(y - minY), Math.abs(y - maxY)),
+      Math.max(Math.abs(z - minZ), Math.abs(z - maxZ))));
+  }
+  const far = Math.max(DEFAULT_CAMERA_FAR, farthest + 1);
+  if (camera.far !== far) {
+    camera.far = far;
+    camera.updateProjectionMatrix();
+  }
+  // Leave part of the fog fade beyond the visible LOD bounds so their colours
+  // retain contrast against the background, even at the farthest corner.
+  scene.fog.far = Math.max(DEFAULT_FOG_FAR, farthest * 1.25);
+}
+
 camera.position.fromArray(world.spawn);
 const startCam = parseCamHash(location.hash);
 if (startCam) { camera.position.fromArray(startCam.pos); yaw = startCam.yaw; pitch = THREE.MathUtils.clamp(startCam.pitch, -1.55, 1.55); }
@@ -422,6 +446,7 @@ renderer.setAnimationLoop(() => {
   if (keys.has("KeyE")) v.y += 1; if (keys.has("KeyQ")) v.y -= 1;
   if (v.lengthSq()) camera.position.addScaledVector(v.normalize(), s * dt);
   stream();
+  updateViewRange();
   renderer.render(scene, camera);
   fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = fpsN / fpsT; fpsN = 0; fpsT = 0; }
   const p = camera.position, loaded = [...live.values()].filter(c => c.obj).length;

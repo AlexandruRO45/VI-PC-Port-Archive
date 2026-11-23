@@ -293,7 +293,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
     helpers.forEach((helper, i) => assert.equal(boundsGroup.children[i], helper));
 });
 
-test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+async function cameraFixture(manifest, search = '') {
     class Vector3 {
         constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
         set(x, y, z) { return Object.assign(this, { x, y, z }); }
@@ -307,7 +307,8 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     }
     const handlers = new Map();
     let frame;
-    const camera = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn camera; })()`, {
+    const requests = [];
+    const { camera, scene } = await vm.runInNewContext(`(async () => { ${viewerModule}\nreturn { camera, scene }; })()`, {
         THREE: {
             WebGLRenderer: class {
                 domElement = { addEventListener() {} };
@@ -315,24 +316,38 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
                 setPixelRatio() {} setSize() {} render() {}
                 setAnimationLoop(callback) { frame = callback; }
             },
-            Scene: class { add() {} },
+            Scene: class { add() {} remove() {} },
             PerspectiveCamera: class {
+                constructor(fov, aspect, near, far) { this.near = near; this.far = this.projectedFar = far; }
                 position = new Vector3();
                 quaternion = { setFromEuler() {} };
                 getWorldDirection(v) { return v.set(0, 0, -1); }
+                updateProjectionMatrix() { this.projectedFar = this.far; }
             },
             DirectionalLight: class { position = { set() {} }; },
             Clock: class { getDelta() { return 0.1; } },
-            Color: class {}, Fog: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
+            Fog: class { constructor(color, near, far) { Object.assign(this, { near, far }); } },
+            LoaderUtils: { extractUrlBase: () => './' },
+            Color: class {}, HemisphereLight: class {}, MeshStandardMaterial: class {}, Euler: class {},
             Group: class { add() {} },
             Vector3,
         },
-        document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
+        document: { body: { prepend() {} }, getElementById: () => ({ classList: { remove() {} } }), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
-        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
-        performance: { now: () => 0 },
-        fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
+        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search },
+        performance: { now: () => 0 }, AbortController, setTimeout, clearTimeout,
+        async fetch(url) {
+            if (url === 'world/world.json') return manifestResponse(manifest)();
+            requests.push(url);
+            return { ok: true, arrayBuffer: async () => new ArrayBuffer(0) };
+        },
+        GLTFLoader: class { async parseAsync() { return { scene: { visible: true, traverse() {} } }; } },
     });
+    return { camera, fog: scene.fog, handlers, frame, requests };
+}
+
+test('Shift speeds the camera up and Ctrl slows it down, on either side of the keyboard', async () => {
+    const { camera, handlers, frame } = await cameraFixture({ spawn: [0, 0, 0], chunks: [] });
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
     const climb = (...modifiers) => {
         for (const code of ['KeyE', ...modifiers]) handlers.get('keydown')({ code });
@@ -347,6 +362,55 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
     close(climb('ShiftRight'), 20);
     close(climb('ControlLeft'), 0.8);
     close(climb('ControlRight'), 0.8);
+});
+
+test('a loaded distant LOD fits the camera and stays distinguishable through fog', async t => {
+    const coarse = { id: 'coarse', url: 'coarse.glb', lod: 'slod4',
+        cell: [0, -8000, 256, -7200], bounds: [-150, 10, -9100, 300, 3200, -7200] };
+    const inactive = { ...coarse, id: 'inactive', url: 'inactive.glb',
+        cell: [0, -21000, 256, -20000], bounds: [0, 0, -21000, 256, 3200, -20000] };
+    const manifest = { spawn: [0, 0, 0], lod_bands: { slod4: [6500, 7800] }, chunks: [coarse, inactive] };
+    const { camera, fog, frame, requests } = await cameraFixture(manifest);
+    frame();
+    await settle();
+    frame();
+    assert.deepEqual(requests, ['coarse.glb']);
+    // The far corner is deeper than the band end, even before accounting for elevation.
+    const farCorner = Math.hypot(300, 3200, 9100);
+    await t.test('projection covers the chunk bounds', () => {
+        assert.ok(camera.projectedFar > farCorner, `projected far ${camera.projectedFar} clips the bound ${farCorner}`);
+        assert.ok(camera.projectedFar < 20000, 'the inactive chunk must not expand the projection');
+    });
+    await t.test('fog retains contrast at the far corner', () => {
+        const fogDepth = (farCorner - fog.near) / (fog.far - fog.near);
+        assert.ok(fogDepth <= 0.85, `fog end ${fog.far} leaves too little contrast at ${farCorner}`);
+        assert.equal(fog.near, 900);
+    });
+    camera.position.z = -710; // Still visible as a cached fallback within the LOD slack.
+    frame();
+    assert.ok(camera.projectedFar > 8390);
+    camera.position.z = -760; // Outside the slack, so the coarse chunk is evicted.
+    frame();
+    assert.deepEqual([camera.projectedFar, fog.far], [6000, 2600]);
+});
+
+test('ordinary maps, nearby LODs and test terrain keep the stock camera and fog ranges', async () => {
+    const spawn = [0, 0, 0];
+    const nearby = { ...worldChunk, lod: 'hd', cell: [-1, -3, 1, 3] };
+    const cases = [
+        [{ spawn, chunks: [worldChunk] }, ''],
+        [{ spawn, lod_bands: { hd: [0, 1000] }, chunks: [nearby] }, ''],
+        [null, '?test'],
+    ];
+    for (const [manifest, search] of cases) {
+        const { camera, fog, frame } = await cameraFixture(manifest, search);
+        if (manifest) {
+            frame();
+            await settle();
+            frame();
+        }
+        assert.deepEqual([camera.near, camera.projectedFar, fog.near, fog.far], [0.5, 6000, 900, 2600]);
+    }
 });
 
 const begin = html.indexOf('// ---------- chunk streaming ----------');
