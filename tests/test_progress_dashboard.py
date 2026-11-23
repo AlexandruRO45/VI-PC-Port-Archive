@@ -258,6 +258,25 @@ class Outputs(unittest.TestCase):
             with open(os.path.join(out, "history.json"), encoding="utf-8") as f:
                 self.assertEqual(len(json.load(f)), 1)
 
+    def test_distinct_snapshots_in_the_same_second_keep_each_payload(self):
+        with tempfile.TemporaryDirectory() as out:
+            stamp = "2026-11-23T12:00:00Z"
+            for content in ("a", "b", "c"):
+                snap = {"generated_at": stamp, "content_hash": content * 64,
+                        "git": {}, "metrics": []}
+                self.assertTrue(pd.write_outputs(snap, out))
+                self.assertFalse(pd.write_outputs(snap, out))
+
+            folder = os.path.join(out, "snapshots")
+            snapshots = [json.loads(pd.read_utf8(os.path.join(folder, name)))
+                         for name in os.listdir(folder)]
+            history = json.loads(pd.read_utf8(os.path.join(out, "history.json")))
+            self.assertEqual([row["content_hash"] for row in history],
+                             ["a" * 16, "b" * 16, "c" * 16])
+            self.assertCountEqual([snap["content_hash"] for snap in snapshots],
+                                  ["a" * 64, "b" * 64, "c" * 64])
+            self.assertTrue(os.path.isfile(os.path.join(folder, "progress_20261123T120000Z.json")))
+
     def test_missing_logo_leaves_no_image(self):
         old = pd.LOGO
         try:

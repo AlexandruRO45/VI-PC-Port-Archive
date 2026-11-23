@@ -5,7 +5,8 @@
 
 Writes, into --out only (a folder inside the repository is refused, so nothing here can be committed by accident):
     progress.html                 one self-contained page (no network, no packages; open it from disk)
-    snapshots/progress_<utc>.json the data behind it; a snapshot equal to the previous one is not written again
+    snapshots/progress_<utc>.json the data behind it (numbered suffix on a filename collision);
+                                a snapshot equal to the previous one is not written again
     history.json                  one summary line per snapshot, for the trend chart
     unit_results.json             the last --run-tests outcome, kept so a later run can show what changed since
 
@@ -901,13 +902,19 @@ def render_page(snap, history):
 
 
 def write_outputs(snap, out_dir):
-    os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
+    snapshots = os.path.join(out_dir, "snapshots")
+    os.makedirs(snapshots, exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
     history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
-        save_text(os.path.join(out_dir, "snapshots", f"progress_{stamp}.json"), dump_json(snap))
+        path = os.path.join(snapshots, f"progress_{stamp}.json")
+        suffix = 2
+        while os.path.lexists(path):
+            path = os.path.join(snapshots, f"progress_{stamp}_{suffix}.json")
+            suffix += 1
+        save_text(path, dump_json(snap))
         history.append(summary_line(snap))
         save_text(hist_path, dump_json(history))
     save_text(os.path.join(out_dir, "progress.html"), render_page(snap, history))
