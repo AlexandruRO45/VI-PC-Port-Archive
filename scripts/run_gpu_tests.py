@@ -869,10 +869,12 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
-                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
+                      "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8",
+                      "cs_thread_ids"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
-            # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
-            # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
+            # load reads 0, so thread 0's four output words are fixed. One thread (cs_thread_ids: eight), no
+            # wave64 requirement. cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup
+            # width either.
             # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
             want = {
@@ -896,6 +898,8 @@ def run_suite(a, work: str) -> int:
                 # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
                 "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
                 "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
+                # local thread id x, y, z from v0, v1, v2 in a 2x2x2 group (cs_thread_ids.asm)
+                "cs_thread_ids": [0, 1, 0x100, 0x101, 0x10000, 0x10001, 0x10100, 0x10101],
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
