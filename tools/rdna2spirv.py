@@ -535,6 +535,42 @@ class Gen:
             return self.sdwa_src(v, s) if "sdwa_sel" in s else v
         return self.src_u({**s, "neg": False, "abs": False})
 
+    def f16_widen(self, u, hi):
+        """One f16 half of the %uint ``u`` (bits 15:0, or 31:16 when ``hi``) widened to f32 exactly, with integer ops
+        and no GLSL.std.450 UnpackHalf2x16. The AMD Windows driver (26.10.1, RX 9060 XT / RDNA4, wave32) gives wrong
+        halves out of UnpackHalf2x16 when its input's high half was just written through op_sel and the register is
+        written again later: v_max_i16 v31.hi then v_pk_mul_f16 reading it gave 0xbcb64000 for 0xbcb02000, and the
+        same module with v31 widened by integer ops gave the right word (SHADER-777 follow-up). Normal halves move
+        their exponent and mantissa into place (+112 on the exponent), +-inf and NaN keep their payload with an
+        all-ones exponent, and a zero exponent field (+-0, denormals) is sign * mantissa * 2^-24, exact in f32."""
+        h = self.tmp()
+        if hi:
+            self.emit(f"{h} = OpShiftRightLogical %uint {u} {self.cu(16)}")
+        else:
+            self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
+        mag, mag13, norm, infnan, ex, top, body, sgn, sgn16, bits, f = (self.tmp() for _ in range(11))
+        self.emit(f"{mag} = OpBitwiseAnd %uint {h} {self.cu(0x7FFF)}")
+        self.emit(f"{mag13} = OpShiftLeftLogical %uint {mag} {self.cu(13)}")
+        self.emit(f"{norm} = OpIAdd %uint {mag13} {self.cu(0x38000000)}")
+        self.emit(f"{infnan} = OpBitwiseOr %uint {mag13} {self.cu(0x7F800000)}")
+        self.emit(f"{ex} = OpBitwiseAnd %uint {h} {self.cu(0x7C00)}")
+        self.emit(f"{top} = OpIEqual %bool {ex} {self.cu(0x7C00)}")
+        self.emit(f"{body} = OpSelect %uint {top} {infnan} {norm}")
+        self.emit(f"{sgn} = OpBitwiseAnd %uint {h} {self.cu(0x8000)}")
+        self.emit(f"{sgn16} = OpShiftLeftLogical %uint {sgn} {self.cu(16)}")
+        self.emit(f"{bits} = OpBitwiseOr %uint {body} {sgn16}")
+        self.emit(f"{f} = OpBitcast %float {bits}")
+        small, mant, mf, den, neg, isneg, sden, out = (self.tmp() for _ in range(8))
+        self.emit(f"{small} = OpIEqual %bool {ex} {self.cu(0)}")
+        self.emit(f"{mant} = OpBitwiseAnd %uint {h} {self.cu(0x3FF)}")
+        self.emit(f"{mf} = OpConvertUToF %float {mant}")
+        self.emit(f"{den} = OpFMul %float {mf} {self.fconst(2.0 ** -24)}")
+        self.emit(f"{neg} = OpFNegate %float {den}")
+        self.emit(f"{isneg} = OpINotEqual %bool {sgn} {self.cu(0)}")
+        self.emit(f"{sden} = OpSelect %float {isneg} {neg} {den}")
+        self.emit(f"{out} = OpSelect %float {small} {sden} {f}")
+        return out
+
     def mem_f16(self, f):
         """f32 ``f`` -> f16 bits as RDNA2's buffer unit narrows a float: toward zero, a finite value past the range
         -> +-65504, an f32 denormal -> +-0 (f16_bits(rtz=True)), and a NaN keeps its sign and the top 10 bits of its
@@ -7011,12 +7047,10 @@ class Gen:
             srcs = []
             for i in range(ns):
                 u = self.src_h(a[1 + i])
-                v2 = self.tmp()
-                self.emit(f"{v2} = OpExtInst %v2float %glsl UnpackHalf2x16 {u}")
                 comps = []
                 for half_sel, neg in ((sel[i], nlo[i]), (selhi[i], nhi[i])):
-                    c = self.tmp()
-                    self.emit(f"{c} = OpCompositeExtract %float {v2} {half_sel}")
+                    # integer widening, not UnpackHalf2x16: see f16_widen (AMD driver, wave32, SHADER-777 follow-up)
+                    c = self.f16_widen(u, half_sel)
                     if neg:
                         n2 = self.tmp()
                         self.emit(f"{n2} = OpFNegate %float {c}")
