@@ -73,6 +73,41 @@ class FrontFaceTests(unittest.TestCase):
         self.assertEqual(result["shaders_per_unresolved_reason"], {"possible lane-partial write": 1})
         self.assertEqual(result["resolved_without_read"], 0)
 
+    def test_quad_write_against_concrete_lane_values(self):
+        # Two quads suffice: sweep every combination of empty, partial and full.
+        # Each lane initially contains its lane id. After the write, activate
+        # all lanes and inspect which lanes still contain their initial value.
+        for narrow in (False, True):
+            retained_entry = retained_other = False
+            for entry in range(256):
+                active = [bool(entry & (1 << i)) for i in range(8)]
+                before_wqm = [on and (not narrow or i < 4) for i, on in enumerate(active)]
+                values = list(range(8))
+                for i in range(0, 8, 4):
+                    if any(before_wqm[i:i + 4]):
+                        values[i:i + 4] = [-1] * 4
+                retained_entry |= any(on and values[i] == i for i, on in enumerate(active))
+                retained_other |= any(not on and values[i] == i for i, on in enumerate(active))
+            self.assertTrue(retained_other)
+            self.assertEqual(retained_entry, narrow)
+            prefix = ["s_and_b64 exec, exec, 15"] if narrow else []
+            for later_mask in ("s[0:1]", "-1"):
+                lines = ["s_mov_b64 s[0:1], exec"] + prefix + [
+                    "s_wqm_b64 exec, exec", "v_mov_b32 v4, 1",
+                    f"s_mov_b64 exec, {later_mask}", "v_cmp_eq_u32_e32 vcc, v4, 0"]
+                result = self.run_cache(lines)
+                self.assertEqual(result["resolved_without_read"], int(not retained_entry))
+                self.assertEqual(result["unresolved"], int(retained_entry))
+
+    def test_unverified_coverage_at_write(self):
+        for prefix in (["s_wqm_b64 exec, vcc"], ["s_wqm_b32 exec_lo, exec_lo"],
+                       ["v_add_co_u32_e64 v6, exec, v0, v1", "s_wqm_b64 exec, exec"],
+                       ["s_and_saveexec_b64 s[0:1], vcc", "s_mov_b64 exec, s[0:1]"],
+                       ["s_cbranch_scc0 1", "s_mov_b64 exec, 1", "s_wqm_b64 exec, exec"]):
+            with self.subTest(prefix=prefix):
+                result = self.run_cache(prefix + ["v_mov_b32 v4, 1", "s_endpgm"])
+                self.assertEqual(result["shaders_per_unresolved_reason"], {"possible lane-partial write": 1})
+
     def test_unknown_edges_and_sidecar_mismatch(self):
         for lines, mismatch in [(["s_setpc_b64 s[0:1]"], False), (["s_branch -2"], False),
                                 (["s_endpgm"], True)]:

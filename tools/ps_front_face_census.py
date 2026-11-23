@@ -3,9 +3,11 @@
 Run python -I tools/ps_front_face_census.py <dxbc> [--disasm <listing directory>].
 Both direct successors are considered regardless of branch feasibility. A first
 syntactic read ends that path. The tracked lanes are those active at entry.
-After EXEC may have changed, a destination write ends analysis of that path
-with uncertainty. Read kinds and uncertainty reasons each count distinct stems
-and can overlap if different paths have different outcomes.
+An ordinary full-dword write kills those values when EXEC still includes every
+entry-active lane. Self-WQM can add helper lanes, leaving empty quads inactive.
+Later activation can expose initial contents in other lanes, outside this metric.
+Read kinds and uncertainty reasons each count distinct stems and can overlap
+if different paths have different outcomes.
 """
 import argparse
 from collections import Counter
@@ -40,6 +42,21 @@ def input_register(data):
     return 2 + sum(mask.bit_count() for mask in positions)
 
 
+def preserves_entry_coverage(ins):
+    """A self-WQM expands each nonempty quad of the current mask."""
+    args = ins["args"]
+    if ins["op"] == "s_wqm_b64" and len(args) == 2 and not ins["mods"]:
+        if all(a["k"] == "special" and a["t"] == "exec"
+               and not a.get("neg") and not a.get("abs") for a in args):
+            return True
+    # A vector ALU instruction can also have a scalar mask destination in
+    # operand 1 (carry out). Conservatively treat EXEC there as a write.
+    if ins["op"].startswith("v_") and len(args) > 1:
+        if args[1]["k"] == "special" and args[1]["t"].startswith("exec"):
+            return False
+    return not isa.writes_exec(ins)
+
+
 def first_uses(info, native, reg):
     pc = start = info["code_start"]
     end = info["code_end"]
@@ -55,25 +72,27 @@ def first_uses(info, native, reg):
         pc = nxt
 
     reads, unresolved, seen = set(), set(), set()
-    pending = [(start, False)]
+    pending = [(start, True)]
     while pending:
-        pc, masked = pending.pop()
-        if (pc, masked) in seen:
+        pc, covers_entry = pending.pop()
+        if (pc, covers_entry) in seen:
             continue
-        seen.add((pc, masked))
+        seen.add((pc, covers_entry))
         if pc not in instructions:
             unresolved.add("unverified instruction address")
             continue
         ins, nxt = instructions[pc]
         op, args = ins["op"], ins["args"]
         if op in isa.BRANCHES:
+            # Direct scalar branches leave EXEC intact. Explore both states
+            # at a join if either incoming path could have narrowed it.
             if len(args) == 1 and args[0]["k"] == "imm":
                 displacement = (args[0]["v"] + 32768) % 65536 - 32768
-                pending.append((nxt + 4 * displacement, masked))
+                pending.append((nxt + 4 * displacement, covers_entry))
             else:
                 unresolved.add("unknown branch target")
             if op != "s_branch":
-                pending.append((nxt, masked))
+                pending.append((nxt, covers_entry))
             continue
         if op == "s_endpgm":
             continue
@@ -97,12 +116,12 @@ def first_uses(info, native, reg):
             reads.add(kind)
             continue
         if reg in dest:
-            if masked or op.startswith("v_writelane") or op.endswith(("_sdwa", "_dpp")):
+            if not covers_entry or op.startswith("v_writelane") or op.endswith(("_sdwa", "_dpp")):
                 unresolved.add("possible lane-partial write")
             elif ins["mods"] or isa.base_op(op) not in FULL_WRITES:
                 unresolved.add("unclassified destination")
             continue
-        pending.append((nxt, masked or isa.writes_exec(ins)))
+        pending.append((nxt, covers_entry and preserves_entry_coverage(ins)))
     return reads, unresolved
 
 
