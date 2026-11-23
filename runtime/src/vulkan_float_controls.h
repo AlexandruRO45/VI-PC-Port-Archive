@@ -9,6 +9,7 @@ namespace leonida {
 inline const VkBool32* float_control_property(const VkPhysicalDeviceFloatControlsProperties& properties,
                                               std::string_view name) {
     if (name == "shaderSignedZeroInfNanPreserveFloat32") return &properties.shaderSignedZeroInfNanPreserveFloat32;
+    if (name == "shaderSignedZeroInfNanPreserveFloat64") return &properties.shaderSignedZeroInfNanPreserveFloat64;
     if (name == "shaderDenormPreserveFloat16") return &properties.shaderDenormPreserveFloat16;
     return nullptr;
 }
