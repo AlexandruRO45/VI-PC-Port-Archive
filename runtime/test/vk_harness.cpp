@@ -267,10 +267,13 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    if (props.apiVersion >= VK_API_VERSION_1_2) sgProps.pNext = &driver;
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
     props2.pNext = &sgProps;
     vkGetPhysicalDeviceProperties2(pd, &props2);
     std::fprintf(stderr, "device: %s (subgroup %u..%u)\n", props.deviceName, sgProps.minSubgroupSize, sgProps.maxSubgroupSize);
+    if (driver.driverName[0]) std::fprintf(stderr, "driver: %s\n", driver.driverName);
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
@@ -311,10 +314,13 @@ int main(int argc, char** argv) {
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
     }
-    // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; the fragment shader decides whether it is refused.
+    // OpFmaKHR (rdna2spirv.py --fma khr) needs VK_KHR_shader_fma; a module of ANY stage that needs it is refused
+    // (argv[1] is the vertex shader, or the mesh shader run as compute under VKH_MESH_COMPUTE).
     leonida::vk_test::ShaderFma fma;
     fma.query(gipa, inst, pd);
     if (!fma.accepts(fs_code.data(), fs_code.size() * 4, argv[2])) return 77;
+    if (!fma.accepts_file(argv[1])) return 77;
+    if (!fma.accepts_file(std::getenv("VKH_MESH_COMPUTE"))) return 77;
     std::vector<const char*> enable;
     void* chain = nullptr;
     if (fma.supported()) {
@@ -788,6 +794,11 @@ int main(int argc, char** argv) {
             f.write(reinterpret_cast<const char*>(key.key), VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR);
             f.write(reinterpret_cast<const char*>(&n64), 8);
             f.write(data.data(), std::streamsize(n));
+        }
+        f.close();
+        if (!f) {
+            std::fprintf(stderr, "failed to write pipeline binaries to %s\n", bin_out);
+            return 1;
         }
         std::fprintf(stderr, "wrote %u pipeline binaries to %s\n", count, bin_out);
     }
