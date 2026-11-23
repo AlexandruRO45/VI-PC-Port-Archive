@@ -40,4 +40,10 @@ int main() {
     CHECK(!fs::exists(output / "old.bin"));
     CHECK(fs::is_regular_file(output / "keep.txt"));
     CHECK(prepare_xdxr_build_output(output / "keep.txt", false));
+
+    const auto blocked_case = output / "blocked.bin";
+    CHECK(fs::create_directory(blocked_case));
+    CHECK(bool(std::ofstream(blocked_case / "keep.txt") << "prevents removal"));
+    CHECK(prepare_xdxr_build_output(output, false));
+    CHECK(fs::is_regular_file(blocked_case / "keep.txt"));
 }
