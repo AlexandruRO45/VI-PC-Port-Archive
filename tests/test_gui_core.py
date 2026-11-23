@@ -87,6 +87,7 @@ class GuiCoreTest(unittest.TestCase):
         by_key = {item.package_key: item for item in plan}
         self.assertFalse(by_key["python"].manual_only)
         self.assertIn("winget", by_key["python"].command)
+        self.assertTrue(any("install_vcredist.ps1" in part for part in by_key["msvc"].command))
         self.assertFalse(by_key["llvm_mc"].manual_only)
         self.assertTrue(any("install_llvm.ps1" in part for part in by_key["llvm_mc"].command))
 

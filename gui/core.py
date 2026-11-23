@@ -178,13 +178,9 @@ PREREQ_SPECS: dict[str, dict] = {
     },
     "msvc": {
         "package_key": "msvc",
-        "name": "Visual Studio 2022 C++ Build Tools",
-        "download_url": "https://visualstudio.microsoft.com/visual-cpp-build-tools/",
-        "win32": [
-            "winget", "install", "--id", "Microsoft.VisualStudio.2022.BuildTools", "-e",
-            "--accept-package-agreements", "--accept-source-agreements",
-            "--override", "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended",
-        ],
+        "name": "Visual C++ AIO Redistributable (x86/x64)",
+        "download_url": "https://github.com/abbodi1406/vcredist/releases/download/v0.107.0/VisualCppRedist_AIO_x86_x64.exe",
+        "win32": ["powershell", "-ExecutionPolicy", "Bypass", "-File", "{ROOT}/scripts/install_vcredist.ps1"],
         "darwin": None,
         "linux": None,
     },
