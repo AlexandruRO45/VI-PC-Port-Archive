@@ -524,5 +524,47 @@ class TestSNorSaveExecConditionCodes(unittest.TestCase):
         ScalarInterpreter32.step(instr, state)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestSNorSaveExecIEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying that IEEE 754 float32 bit patterns are treated as raw bitmasks."""
+
+    FLOAT32_PATTERNS = {
+        "pos_zero": 0x0000_0000,
+        "neg_zero": 0x8000_0000,
+        "pos_inf": 0x7F80_0000,
+        "neg_inf": 0xFF80_0000,
+        "qnan": 0x7FC0_0000,
+        "snan": 0x7F80_0001,
+        "min_subnormal": 0x0000_0001,
+        "max_subnormal": 0x007F_FFFF,
+        "min_normal": 0x0080_0000,
+        "max_normal": 0x7F7F_FFFF,
+        "one_point_zero": 0x3F80_0000,
+    }
+
+    def test_float32_bitwise_nor_inversion(self):
+        """Verify SALU bitwise NOR inverts float32 bit patterns bit-exact."""
+        for name, pattern in self.FLOAT32_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                # NOR(pattern, 0) = ~pattern & 0xFFFFFFFF
+                new_exec, d, scc = s_nor_saveexec_b32_oracle(pattern, 0)
+                expected_exec = (~pattern) & MASK32
+                self.assertEqual(new_exec, expected_exec)
+                self.assertEqual(d, 0)
+                expected_scc = 1 if expected_exec != 0 else 0
+                self.assertEqual(scc, expected_scc)
+
+    def test_float32_zeros_nor(self):
+        """Verify NOR of pos_zero and neg_zero."""
+        pos_zero = self.FLOAT32_PATTERNS["pos_zero"]
+        neg_zero = self.FLOAT32_PATTERNS["neg_zero"]
+        # NOR(0, 0x80000000) = ~0x80000000 = 0x7FFFFFFF
+        new_exec, _, scc = s_nor_saveexec_b32_oracle(pos_zero, neg_zero)
+        self.assertEqual(new_exec, 0x7FFF_FFFF)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
