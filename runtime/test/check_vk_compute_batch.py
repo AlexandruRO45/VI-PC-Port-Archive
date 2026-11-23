@@ -120,8 +120,18 @@ SHADER = """               OpCapability Shader
 """
 
 
+# Lines a Vulkan driver prints once per device creation. A single run creates its own device and so prints them;
+# a batch job reuses the device opened before the jobs and never does. They say nothing about the job.
+DRIVER_NOTICES = (
+    b"WARNING: radv is not a conformant Vulkan implementation",
+    b"WARNING: lavapipe is not a conformant vulkan implementation",
+    b"MESA-INTEL: warning:",
+)
+
+
 def plain(data):
-    return data.replace(b"\r\n", b"\n")
+    lines = data.replace(b"\r\n", b"\n").split(b"\n")
+    return b"\n".join(line for line in lines if not line.startswith(DRIVER_NOTICES))
 
 
 def records(stdout):
