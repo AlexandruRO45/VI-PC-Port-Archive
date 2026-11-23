@@ -35,16 +35,21 @@ resource identity from ``Id64`` or ``AssetKey``.
 
 ``--json`` writes the full per-material report and ``--csv`` one row per
 binding; neither may overwrite an input. Standard library only.
+``--json`` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import csv
 import json
 import ntpath
 import os
+import stat
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 
 SLOT_ROLES = {
@@ -341,12 +346,40 @@ def write_csv(path: str, rows: list) -> None:
 
 
 def write_json(path: str, report: dict, rows: list) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
     _make_parent(path)
     public = {"summary": report["summary"], "warnings": report["warnings"],
               "models": report["models"], "rows": rows}
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(public, f, indent=2)
-        f.write("\n")
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(public, f, indent=2)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".character_textures-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(public, staged, indent=2)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def check_report_path(parser: argparse.ArgumentParser, flag: str, path: str, sources: list) -> None:

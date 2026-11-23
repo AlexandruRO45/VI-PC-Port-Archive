@@ -5,12 +5,14 @@ bumptex), a garment material (speculartex only, must flag missing albedo), an un
 JSON/CSV reports and the report-path guard. Every fixture is hand-written; no game data is used.
 """
 import csv
+import importlib.util
 import json
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 TOOL = ROOT / "tools" / "character_textures.py"
@@ -287,6 +289,20 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertNotIn("Traceback", proc.stderr)
             self.assertIn("ERROR: cannot write", proc.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        spec = importlib.util.spec_from_file_location("ct_preserve_under_test", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as td:
+            previous = '{"previous": true}\n'
+            path = pathlib.Path(td) / "out.json"
+            path.write_text(previous, encoding="utf-8", newline="\n")
+            report = {"summary": {}, "warnings": [], "models": []}
+            with mock.patch.object(mod, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    mod.write_json(str(path), report, [])
+            self.assertEqual(path.read_text(encoding="utf-8"), previous)
 
 
 if __name__ == "__main__":
