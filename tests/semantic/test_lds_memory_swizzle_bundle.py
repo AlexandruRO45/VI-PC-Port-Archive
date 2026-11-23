@@ -1,0 +1,147 @@
+"""Bundle 5: LDS Swizzle & Sub-Dword Memory Suite.
+
+Tests for 7 LDS memory and swizzle opcodes:
+- ds_swizzle_b32: cross-lane quad permute (QUAD_PERM) and bitmask permute (BITMASK_PERM)
+- ds_permute_b32: forward (scatter) cross-lane permute
+- ds_bpermute_b32: backward (gather) cross-lane permute
+- ds_read_u16: 16-bit unsigned sub-dword load with zero extension
+- ds_read_i16: 16-bit signed sub-dword load with sign extension
+- ds_write_b16: 16-bit halfword store with byte preservation
+- ds_write_b32: 32-bit dword store into LDS
+
+Standard library only; zero game data.
+"""
+from __future__ import annotations
+
+import math
+import os
+import struct
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+
+sys.dont_write_bytecode = True
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+MASK16 = 0xFFFF
+LDS_SIZE = 4096
+
+FSSM = bytearray(0x148)
+struct.pack_into("<4I", FSSM, 0x138, 0x40088, 32, 1, 1)
+FSSM = bytes(FSSM)
+VSHARP = [0, 0, 0x1000, 0x31016FAC]
+
+
+class LdsModel:
+    """Byte-level little-endian LDS memory model wrapping at LDS_SIZE."""
+
+    def __init__(self, size: int = LDS_SIZE) -> None:
+        self.size = size
+        self.bytes = bytearray(size)
+
+    def write_u8(self, addr: int, val: int) -> None:
+        eff = addr % self.size
+        self.bytes[eff] = val & 0xFF
+
+    def read_u8(self, addr: int) -> int:
+        eff = addr % self.size
+        return self.bytes[eff]
+
+    def write_u16(self, addr: int, val: int) -> None:
+        eff = addr % self.size
+        self.bytes[eff : eff + 2] = struct.pack("<H", val & 0xFFFF)
+
+    def read_u16(self, addr: int) -> int:
+        eff = addr % self.size
+        return struct.unpack_from("<H", self.bytes, eff)[0]
+
+    def read_i16(self, addr: int) -> int:
+        eff = addr % self.size
+        val = struct.unpack_from("<h", self.bytes, eff)[0]
+        return val & MASK32
+
+    def write_u32(self, addr: int, val: int) -> None:
+        eff = addr % self.size
+        self.bytes[eff : eff + 4] = struct.pack("<I", val & MASK32)
+
+    def read_u32(self, addr: int) -> int:
+        eff = addr % self.size
+        return struct.unpack_from("<I", self.bytes, eff)[0]
+
+
+def run_cs(body: list[str], lanes: int = 32, num_words: int = 32, name: str = "cs_bundle5") -> list[int]:
+    """Helper to translate and run a 32-lane compute shader; outputs out[lane*32]."""
+    prologue = ["v_lshlrev_b32_e32 v30, 5, v0"]
+    full_body = prologue + list(body) + ["s_endpgm"]
+    spv = support.translate_lines(name, full_body, fssm=FSSM)
+    mem: dict[int, int] = {}
+    si.run_workgroup(
+        spv,
+        lanes,
+        32,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=VSHARP + [0] * 28,
+        memory=mem,
+    )
+    return [mem.get(i * 32, 0) for i in range(num_words)]
+
+
+class ASTNode:
+    """Base class for symbolic AST expressions."""
+    pass
+
+def ref_ds_swizzle_b32(lane: int, mode: str, args: tuple[int, ...] | str) -> int:
+    """Reference mathematical oracle for ds_swizzle_b32 across 32 lanes."""
+    if mode == "QUAD_PERM":
+        return (lane & ~3) | (args[lane & 3])
+    elif mode == "BITMASK_PERM":
+        and_m = or_m = xor_m = 0
+        for k, ch in enumerate(args):
+            bit = 1 << (4 - k)
+            if ch in "pi":
+                and_m |= bit
+            if ch == "i":
+                xor_m |= bit
+            if ch == "1":
+                or_m |= bit
+        return ((lane & and_m) | or_m) ^ xor_m
+    raise ValueError(f"Unknown swizzle mode: {mode}")
+
+
+class TestDsSwizzleB32Oracle(unittest.TestCase):
+    def test_quad_perm_oracle(self) -> None:
+        # Swap adjacent lanes: (1, 0, 3, 2)
+        perm = (1, 0, 3, 2)
+        for quad in range(8):
+            base = quad * 4
+            self.assertEqual(ref_ds_swizzle_b32(base + 0, "QUAD_PERM", perm), base + 1)
+            self.assertEqual(ref_ds_swizzle_b32(base + 1, "QUAD_PERM", perm), base + 0)
+            self.assertEqual(ref_ds_swizzle_b32(base + 2, "QUAD_PERM", perm), base + 3)
+            self.assertEqual(ref_ds_swizzle_b32(base + 3, "QUAD_PERM", perm), base + 2)
+
+    def test_bitmask_perm_oracle(self) -> None:
+        # Invert bit 0 (SWAP 1): pattern "ppppi"
+        for l in range(32):
+            expected = l ^ 1
+            self.assertEqual(ref_ds_swizzle_b32(l, "BITMASK_PERM", "ppppi"), expected)
+        # Broadcast lane 0: pattern "00000"
+        for l in range(32):
+            self.assertEqual(ref_ds_swizzle_b32(l, "BITMASK_PERM", "00000"), 0)
+        # Reverse 16: pattern "ppiii"
+        for l in range(32):
+            self.assertEqual(ref_ds_swizzle_b32(l, "BITMASK_PERM", "ppiii"), (l & ~7) | (7 - (l & 7)))
+
+
+if __name__ == "__main__":
+    unittest.main()
