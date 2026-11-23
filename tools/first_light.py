@@ -517,20 +517,31 @@ def harness_env(manifest: dict, out_dir: str, base_env: dict | None = None) -> d
         if not 0 <= ptr_sgpr <= 105:
             raise SystemExit("first-light manifest: texture.ptr_sgpr must be an SGPR index in 0..105")
         tsharp_va = _manifest_int(tex.get("tsharp_va"), "texture.tsharp_va")
+        # vk_harness writes a T# at this offset in its 64 KiB heap: parse_u32 takes no sign, the offset must be
+        # 4-byte aligned and at most heap-32 (0xffe0). A negative/unaligned/oversized value used to reach the
+        # harness as a status-2 exit after image.raw was already removed.
+        if not 0 <= tsharp_va <= 64 * 1024 - 32 or tsharp_va % 4:
+            raise SystemExit("first-light manifest: texture.tsharp_va must be a 4-byte aligned offset in 0..0xffe0")
         ssharp = tex.get("ssharp")
-        if not isinstance(ssharp, list):
-            raise SystemExit("first-light manifest: texture.ssharp must be a list of sampler words")
+        if not isinstance(ssharp, list) or len(ssharp) != 4:
+            raise SystemExit("first-light manifest: texture.ssharp must be a list of exactly 4 sampler words")
+        ssharp_words = []
+        for w in ssharp:
+            word = _manifest_int(w, "texture.ssharp")
+            if not 0 <= word <= 0xFFFFFFFF:
+                raise SystemExit("first-light manifest: texture.ssharp words must be unsigned 32-bit (0..0xffffffff)")
+            ssharp_words.append(word)
         sgprs = ["0"] * (ptr_sgpr + 1)
         sgprs[ptr_sgpr] = hex(tsharp_va)
         env["VKH_TEX_RGBA"] = os.path.join(out_dir, tex_file)
         env["VKH_TSHARP_VA"] = hex(tsharp_va)
-        env["VKH_SSHARP"] = ",".join(hex(_manifest_int(w, "texture.ssharp")) for w in ssharp)
+        env["VKH_SSHARP"] = ",".join(hex(w) for w in ssharp_words)
         env["VKH_SGPRS"] = ",".join(sgprs)
         ps_sg = manifest.get("ps", {}).get("subgroup_size")
         if ps_sg is not None:
             subgroup = _manifest_int(ps_sg, "ps.subgroup_size")
-            if subgroup <= 0:
-                raise SystemExit("first-light manifest: ps.subgroup_size must be a positive integer")
+            if subgroup not in (32, 64):
+                raise SystemExit("first-light manifest: ps.subgroup_size must be 32 or 64 (the harness-supported sizes)")
             env["VKH_SUBGROUP_SIZE"] = str(subgroup)
     return env
 

@@ -70,12 +70,26 @@ class HarnessEnvManifestTests(unittest.TestCase):
         self.assertEqual(env["VKH_TSHARP_VA"], "0x0")
         self.assertEqual(env["VKH_SGPRS"], "0,0,0,0,0x0")
 
+    def test_valid_tsharp_and_subgroup_sizes_build_the_env(self):
+        man = self._manifest()
+        man["texture"]["tsharp_va"] = 0x100
+        man["texture"]["ssharp"] = [0x92, 0xC00000, 0x14500000, 0]
+        for sg in (32, 64):
+            with self.subTest(subgroup_size=sg):
+                man["ps"] = {"subgroup_size": sg}
+                env = fl.harness_env(man, "/tmp/out", base_env={})
+                self.assertEqual(env["VKH_TSHARP_VA"], "0x100")
+                self.assertEqual(env["VKH_SSHARP"], "0x92,0xc00000,0x14500000,0x0")
+                self.assertEqual(env["VKH_SUBGROUP_SIZE"], str(sg))
+
     def test_bad_texture_field_is_one_systemexit_line(self):
         cases = (
             ("ptr_sgpr", 1e400), ("ptr_sgpr", -1e400), ("ptr_sgpr", [1]),
             ("ptr_sgpr", None), ("ptr_sgpr", True), ("ptr_sgpr", 1.5),
             ("ptr_sgpr", -1), ("ptr_sgpr", 1e100), ("ptr_sgpr", 106),
             ("tsharp_va", 1e400), ("tsharp_va", [1]), ("tsharp_va", None),
+            ("tsharp_va", -1), ("tsharp_va", 1), ("tsharp_va", 0x10000),
+            ("tsharp_va", 0xFFE4), ("tsharp_va", 0x100000000),
         )
         for field, bad in cases:
             with self.subTest(field=field, bad=bad):
@@ -86,11 +100,13 @@ class HarnessEnvManifestTests(unittest.TestCase):
                 self.assertIn(field, str(ctx.exception))
 
     def test_bad_ssharp_word_is_one_systemexit_line(self):
-        man = self._manifest()
-        man["texture"]["ssharp"] = [0, 1e400, 0, 0]
-        with self.assertRaises(SystemExit) as ctx:
-            fl.harness_env(man, "/tmp/out", base_env={})
-        self.assertIn("ssharp", str(ctx.exception))
+        for bad in (1e400, -1, 0x100000000, None, True, 1.5):
+            with self.subTest(bad=bad):
+                man = self._manifest()
+                man["texture"]["ssharp"] = [0, bad, 0, 0]
+                with self.assertRaises(SystemExit) as ctx:
+                    fl.harness_env(man, "/tmp/out", base_env={})
+                self.assertIn("ssharp", str(ctx.exception))
 
     def test_missing_texture_field_is_one_systemexit_line(self):
         man = self._manifest()
@@ -100,7 +116,7 @@ class HarnessEnvManifestTests(unittest.TestCase):
         self.assertIn("ptr_sgpr", str(ctx.exception))
 
     def test_bad_subgroup_size_is_one_systemexit_line(self):
-        for bad in (1e400, False, [], 0, True, 1.5):
+        for bad in (1e400, False, [], 0, True, 1.5, 3, 16, 128, -32):
             with self.subTest(bad=bad):
                 man = self._manifest()
                 man["ps"] = {"subgroup_size": bad}
@@ -114,7 +130,7 @@ class HarnessEnvManifestTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             fl.harness_env(man, "/tmp/out", base_env={})
         self.assertIn("ssharp", str(ctx.exception))
-        for bad in (None, 5, "0,0,0,0", {"a": 0}):
+        for bad in (None, 5, "0,0,0,0", {"a": 0}, [], [0], [0, 0, 0, 0, 0]):
             with self.subTest(bad=bad):
                 man = self._manifest()
                 man["texture"]["ssharp"] = bad
@@ -130,7 +146,10 @@ class HarnessEnvManifestTests(unittest.TestCase):
             with open(harness, "w") as f:
                 f.write("")  # dummy; never run because validation fails first
             args = SimpleNamespace(harness=harness)
-            for field, bad in (("ptr_sgpr", -1), ("ssharp", None), ("ptr_sgpr", 1e100)):
+            cases = (("ptr_sgpr", -1), ("ssharp", None), ("ptr_sgpr", 1e100),
+                     ("tsharp_va", -1), ("tsharp_va", 1), ("ssharp", [0]),
+                     ("ssharp", [-1, 0, 0, 0]), ("ssharp", [0x100000000, 0, 0, 0]))
+            for field, bad in cases:
                 with self.subTest(field=field, bad=bad):
                     with open(raw, "wb") as f:
                         f.write(b"sentinel")
@@ -140,6 +159,15 @@ class HarnessEnvManifestTests(unittest.TestCase):
                         fl.run_draw(args, man, out)
                     with open(raw, "rb") as f:
                         self.assertEqual(f.read(), b"sentinel")
+            # ps.subgroup_size of 3 is not a harness-supported size; it must preserve the image too
+            with open(raw, "wb") as f:
+                f.write(b"sentinel")
+            man = self._manifest()
+            man["ps"] = {"subgroup_size": 3}
+            with self.assertRaises(SystemExit):
+                fl.run_draw(args, man, out)
+            with open(raw, "rb") as f:
+                self.assertEqual(f.read(), b"sentinel")
 
 
 class MeshOutputTests(unittest.TestCase):
