@@ -2,7 +2,7 @@
 
 Usage:
     python -I scripts/run_wine_tests.py --tests ctest.json --windows-root D:/a/Leonida/Leonida
-        [--root DIR] [--wine CMD] [--require NAME ...] [--timeout SECONDS] [--summary FILE] [--label TEXT]
+        [--root DIR] [--wine CMD] [--require NAME ...] [--fail-on-failure] [--timeout SECONDS] [--summary FILE] [--label TEXT]
 
 --tests is the output of `ctest --show-only=json-v1` from the Windows build, and --windows-root the checkout it was
 made in (forward slashes, as `cygpath -m` prints it). Paths under it are mapped to --root, the Linux checkout (default:
@@ -13,7 +13,8 @@ runtime/build/generated). For those, the drive of --windows-root is pointed at -
 ($WINEPREFIX, else ~/.wine), unless that drive is already in use there.
 
 Every test is reported. The exit code is 1 if a test named by --require fails or is missing, else 0: the
-others show what does and doesn't work under Wine yet without failing the job.
+others show what does and doesn't work under Wine yet without failing the job. With --fail-on-failure, any failed test
+also gives exit code 1 (skips still don't), for a local run that should not pass with a regression in it.
 --timeout caps each process; a shorter positive CTest TIMEOUT takes precedence for that test.
 """
 import argparse
@@ -330,6 +331,8 @@ def main() -> int:
     ap.add_argument("--wine", type=wine_command, default=os.environ.get("WINE", "wine"),
                     help="Wine command (default: $WINE or wine)")
     ap.add_argument("--require", action="append", default=[], help="a test that must pass (repeatable)")
+    ap.add_argument("--fail-on-failure", action="store_true",
+                    help="exit 1 if any test fails, not only a --require one (skips are allowed)")
     ap.add_argument("--timeout", type=positive_seconds, default=120.0,
                     help="maximum seconds per test; a shorter CTest TIMEOUT applies (default 120)")
     ap.add_argument("--summary", help="append a Markdown table to this file (e.g. $GITHUB_STEP_SUMMARY)")
@@ -377,6 +380,10 @@ def main() -> int:
         print(f"required test not listed by the Windows build: {n}")
     if failed_required:
         print("required tests that did not pass: " + ", ".join(failed_required))
+    # By index: CTest can list two tests under one name.
+    any_failed = args.fail_on_failure and "fail" in results_by_index.values()
+    if any_failed:
+        print("--fail-on-failure: at least one test failed")
 
     if args.summary:
         try:
@@ -391,7 +398,7 @@ def main() -> int:
         except OSError as e:
             print(f"ERROR: cannot write the summary {args.summary}: {e.strerror or e}", file=sys.stderr)
             return 1
-    return 1 if failed_required else 0
+    return 1 if failed_required or any_failed else 0
 
 
 if __name__ == "__main__":

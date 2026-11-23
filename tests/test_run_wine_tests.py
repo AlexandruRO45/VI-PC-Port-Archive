@@ -527,6 +527,28 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("[FAIL] bad", out)
 
+    def test_fail_on_failure_reports_every_test_before_exiting_one(self):
+        entries = [
+            ctest_entry("repeat", self.command("bad.py")),
+            ctest_entry("repeat", self.command("ok.py")),
+        ]
+        code, out, _ = self.run_main(entries, "--fail-on-failure")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] repeat", out)
+        self.assertIn("[PASS] repeat", out)
+
+    def test_fail_on_failure_allows_skips_unless_required(self):
+        entries = [
+            ctest_entry("ok", self.command("ok.py")),
+            ctest_entry("skip", self.command("bad.py"), {"SKIP_RETURN_CODE": 1}),
+        ]
+        code, out, _ = self.run_main(entries, "--fail-on-failure")
+        self.assertEqual(code, 0)
+        self.assertIn("[SKIP] skip", out)
+        code, out, _ = self.run_main(entries, "--fail-on-failure", "--require", "skip")
+        self.assertEqual(code, 1)
+        self.assertIn("required tests that did not pass: skip", out)
+
     def test_malformed_skip_return_code_does_not_stop_later_tests(self):
         entries = [
             ctest_entry("bad_property", self.command("ok.py"), {"SKIP_RETURN_CODE": "invalid"}),
