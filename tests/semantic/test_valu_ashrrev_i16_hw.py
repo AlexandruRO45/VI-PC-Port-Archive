@@ -250,6 +250,63 @@ class TestVAshrrevI16ASTAndOpcodeDefinitions(unittest.TestCase):
         with self.assertRaises(ValueError):
             VAshrrevI16Instruction.parse("v_ashrrev_i16 0x1234, v1, v2")  # literal as dest
 
+class ScalarThreadState:
+    """Register file state for a single SIMD lane."""
+
+    def __init__(self) -> None:
+        self.vgprs: list[int] = [0] * 256
+
+    def get_vgpr(self, reg: VGPR) -> int:
+        return self.vgprs[reg.index]
+
+    def set_vgpr(self, reg: VGPR, val: int) -> None:
+        self.vgprs[reg.index] = val & MASK32
+
+
+class ScalarVALUInterpreter:
+    """Deterministic instruction interpreter for v_ashrrev_i16."""
+
+    def execute(self, state: ScalarThreadState, inst: VAshrrevI16Instruction) -> int:
+        val0 = state.get_vgpr(inst.src0) if isinstance(inst.src0, VGPR) else inst.src0
+        val1 = state.get_vgpr(inst.src1) if isinstance(inst.src1, VGPR) else inst.src1
+        old_dst = state.get_vgpr(inst.vdst)
+
+        res = ref_v_ashrrev_i16(val0, val1, old_dst=old_dst, e64=inst.e64, op_sel=inst.op_sel)
+        state.set_vgpr(inst.vdst, res)
+        return res
+
+
+class TestVAshrrevI16ScalarInterpreter(unittest.TestCase):
+    """Part 3: Deterministic scalar instruction interpreter tests."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarVALUInterpreter()
+        self.state = ScalarThreadState()
+
+    def test_vop2_execution(self) -> None:
+        self.state.set_vgpr(VGPR(1), 2)         # shift amount 2
+        self.state.set_vgpr(VGPR(2), 0xFFF0)    # -16 in 16-bit
+        self.state.set_vgpr(VGPR(0), 0xCAFEBABE)
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v0, v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        # -16 >> 2 = -4 (0xFFFC in 16-bit, high 16 bits zeroed in VOP2)
+        self.assertEqual(res, 0x0000FFFC)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0x0000FFFC)
+
+    def test_vop3_execution_preserve_high(self) -> None:
+        self.state.set_vgpr(VGPR(1), 3)
+        self.state.set_vgpr(VGPR(2), 80)
+        self.state.set_vgpr(VGPR(0), 0xABCD0000)
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16_e64 v0, v1, v2")
+        res = self.interp.execute(self.state, inst)
+
+        # 80 >> 3 = 10 (0x000A), high half 0xABCD preserved
+        self.assertEqual(res, 0xABCD000A)
+        self.assertEqual(self.state.get_vgpr(VGPR(0)), 0xABCD000A)
+
 
 if __name__ == '__main__':
     unittest.main()
