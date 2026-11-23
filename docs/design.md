@@ -604,8 +604,7 @@ the 195 GS pairs included) carry paired `0xDEADBEEFDEADBEEF` qwords, a lone 32-b
 occurs, and those 860 are the blobs whose 0x120/0x12C/0x130 directory words are `0xDEADBEEF`. The hardware
 ids 0/1 and the API ids 4/5 are not in the corpus; the rest of a record is not decoded.
 `tools/pal_stages.py` prints the records of an FSSM or a container (every tag-0x0D payload);
-`tests/test_pal_stages.py` covers the layout with synthetic blobs. The translator refuses a blob whose first record
-names a hardware stage other than its own (*Inputs and outputs*, `tests/test_pal_stage_guard.py`).
+`tests/test_pal_stages.py` covers the layout with synthetic blobs.
 
 ## Pixel-shader inputs
 
