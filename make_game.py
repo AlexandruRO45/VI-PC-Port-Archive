@@ -2001,7 +2001,12 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
                 # built before that: a build that fails leaves the old export in place.
                 get_exporter(work)
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
-                shutil.rmtree(folder)
+                if os.path.islink(folder):
+                    fail(f"assets: {folder} is a symlink (symbolic link)")
+                try:
+                    shutil.rmtree(folder)
+                except OSError as e:
+                    fail(f"assets: cannot remove {folder}: {e.strerror or e}")
             elif os.path.isfile(os.path.join(folder, "manifest.json")):
                 continue
             archive_todo.append((rel, mode, folder, record, src))
@@ -2043,7 +2048,12 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
-            shutil.rmtree(pool_dir)
+            if os.path.islink(pool_dir):
+                fail(f"assets: texture pool {os.path.relpath(p, game)}: {pool_dir} is a symlink (symbolic link)")
+            try:
+                shutil.rmtree(pool_dir)
+            except OSError as e:
+                fail(f"assets: texture pool {os.path.relpath(p, game)}: cannot remove {pool_dir}: {e.strerror or e}")
         pool_jobs.append((p, name, root, pool_dir, record))
 
     pool_todo = [(p, name, root, pool_dir, record) for p, name, root, pool_dir, record in pool_jobs
