@@ -1241,6 +1241,9 @@ if(TARGET Vulkan::Headers)
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
   target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
   add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
+  add_executable(vk_pc_tail_test test/vk_pc_tail_test.cpp)
+  target_link_libraries(vk_pc_tail_test PRIVATE Vulkan::Headers)
+  add_test(NAME vk_pc_tail COMMAND vk_pc_tail_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
