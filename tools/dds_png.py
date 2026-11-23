@@ -11,11 +11,11 @@ byte) decodes as transparent black. BC6H is not supported.
 DXT2, DXT4 and premultiplied DX10 images are converted to straight alpha for PNG.
 For tagged sRGB images, unpremultiplication and downscaling use linear light. The PNG stores sRGB bytes.
 
-DX10 R16_FLOAT (54), R32_FLOAT (41) and R16G16B16A16_FLOAT (10) are read as linear values and
-written like the UNORM formats, with no tone mapping or sRGB transfer: clamp to
+DX10 R16_FLOAT (54), R16G16_FLOAT (34), R32_FLOAT (41) and R16G16B16A16_FLOAT (10) are read as
+linear values and written like the UNORM formats, with no tone mapping or sRGB transfer: clamp to
 [0, 1], then round(v * 255) half up. +inf saturates to 255; -inf, negative values
 and NaN map to 0. The single-channel formats fill red, with green and blue 0 and alpha 255;
-R16G16B16A16_FLOAT keeps its own alpha.
+R16G16_FLOAT fills red and green, with blue 0 and alpha 255; R16G16B16A16_FLOAT keeps its own alpha.
 R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
 
 Usage:
@@ -108,11 +108,12 @@ _DXGI_MAP: dict[int, str] = {
     98: "BC7",
     99: "BC7",
     10: "RGBA16_FLOAT",
+    34: "RG16_FLOAT",
     54: "R16_FLOAT",
 }
 
 # Bytes per texel and channels per texel of the half-float formats.
-_HALF_FLOAT_LAYOUT = {"RGBA16_FLOAT": (8, 4), "R16_FLOAT": (2, 1)}
+_HALF_FLOAT_LAYOUT = {"RGBA16_FLOAT": (8, 4), "RG16_FLOAT": (4, 2), "R16_FLOAT": (2, 1)}
 _HALF_TO_U8: bytes | None = None
 
 _SRGB_DXGI_FORMATS = frozenset((29, 72, 75, 78, 91, 93, 99))
@@ -529,13 +530,16 @@ def _decode_half_float(payload: memoryview, width: int, height: int, fmt: str, p
     row_count = width * channels
     unpack_row = struct.Struct(f"<{row_count}H").unpack_from
     out = bytearray(width * height * 4)
-    if channels == 1:
+    if channels != 4:
         out[3::4] = b"\xff" * (width * height)
     for y in range(height):
         values = bytes(map(lut.__getitem__, unpack_row(payload, y * pitch)))
         start = y * width * 4
         if channels == 4:
             out[start : start + row_bytes // 2] = values
+        elif channels == 2:
+            out[start : start + width * 4 : 4] = values[0::2]
+            out[start + 1 : start + width * 4 : 4] = values[1::2]
         else:
             out[start : start + width * 4 : 4] = values
     return bytes(out)

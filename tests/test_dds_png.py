@@ -1181,10 +1181,10 @@ HALF_FLOAT = dict(flags=DDPF_FOURCC, fourcc=b"DX10")
 
 
 class HalfFloatTests(unittest.TestCase):
-    """DXGI 54 (R16_FLOAT) and 10 (R16G16B16A16_FLOAT): clamp to [0, 1], round(v * 255) half up."""
+    """DXGI 54 (R16_FLOAT), 34 (R16G16_FLOAT) and 10 (R16G16B16A16_FLOAT): clamp to [0, 1], round(v * 255) half up."""
 
     def test_header_names_the_half_float_formats(self):
-        for dxgi, name in ((54, "R16_FLOAT"), (10, "RGBA16_FLOAT")):
+        for dxgi, name in ((54, "R16_FLOAT"), (34, "RG16_FLOAT"), (10, "RGBA16_FLOAT")):
             with self.subTest(dxgi=dxgi):
                 info = dds.parse_dds_header(dds_buffer(1, 1, dxgi=dxgi, **HALF_FLOAT))
                 self.assertEqual((info["format"], info["dxgi_format"]), (name, dxgi))
@@ -1195,6 +1195,22 @@ class HalfFloatTests(unittest.TestCase):
         width, height, rgba = dds.decode_dds(dds_buffer(2, 2, payload, pitch=8, dxgi=54, **HALF_FLOAT))
         self.assertEqual((width, height), (2, 2))
         self.assertEqual(pixels(rgba), [(255, 0, 0, 255), (128, 0, 0, 255), (1, 0, 0, 255), (255, 0, 0, 255)])
+
+    def test_rg16_float_fills_red_and_green_and_skips_row_padding(self):
+        # (1.0, 0.5) (0.25, -1) | (NaN, 2^-8) (+inf, 0) with four padding bytes after each 8-byte row.
+        payload = (halves(0x3C00, 0x3800, 0x3400, 0xBC00) + b"\xcc" * 4
+                   + halves(0x7E00, 0x1C00, 0x7C00, 0x0000))
+        width, height, rgba = dds.decode_dds(dds_buffer(2, 2, payload, pitch=12, dxgi=34, **HALF_FLOAT))
+        self.assertEqual((width, height), (2, 2))
+        self.assertEqual(pixels(rgba), [(255, 128, 0, 255), (64, 0, 0, 255), (0, 1, 0, 255), (255, 0, 0, 255)])
+
+    def test_rg16_float_texel_reads_both_stored_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rg.dds")
+            with open(path, "wb") as f:
+                f.write(dds_buffer(2, 1, halves(0x3C00, 0x8000, 0x7E00, 0x3555), dxgi=34, **HALF_FLOAT))
+            self.assertEqual(dds.read_half_texel(path, x=0, y=0), {"R": "1.0", "G": "-0.0"})
+            self.assertEqual(dds.read_half_texel(path, x=1, y=0), {"R": "nan", "G": "0.333251953125"})
 
     def test_rgba16_float_keeps_alpha_and_skips_row_padding(self):
         payload = (halves(0x3C00, 0x3800, 0x0000, 0x3C00) + b"\xcc" * 4
