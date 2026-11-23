@@ -11,6 +11,7 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -35,7 +36,7 @@ def context(rip, rsp):
     return bytes(ctx)
 
 
-def build_dump(code=0xC0000005, params=(1, 0x10), pid=PID):
+def build_dump(code=0xC0000005, params=(1, 0x10), pid=PID, memory_list=True):
     """A minidump laid out as: header, directory, stream bodies, then the blobs they point at."""
     blobs = bytearray()
     base = 0x1000  # blobs start here, well past the header and the directory
@@ -65,7 +66,8 @@ def build_dump(code=0xC0000005, params=(1, 0x10), pid=PID):
     thread = struct.pack("<IIIIQQIIII", TID, 0, 0, 0, 0, STACK_BASE, STACK_SLOTS * 8, stack_rva,
                          ms.CONTEXT_SIZE, thread_ctx_rva)
     streams.append((ms.THREAD_LIST, struct.pack("<I", 1) + thread))
-    streams.append((ms.MEMORY_LIST, struct.pack("<IQII", 1, STACK_BASE, STACK_SLOTS * 8, stack_rva)))
+    if memory_list:  # the stack again through MemoryList, as most writers do; the ThreadList descriptor alone must do
+        streams.append((ms.MEMORY_LIST, struct.pack("<IQII", 1, STACK_BASE, STACK_SLOTS * 8, stack_rva)))
     info = list(params) + [0] * (15 - len(params))
     exc = struct.pack("<IIIIQQII", TID, 0, code, 0, 0, GAME_BASE + 0x1234, len(params), 0)
     exc += struct.pack("<15Q", *info) + struct.pack("<II", ms.CONTEXT_SIZE, fault_ctx_rva)
@@ -85,10 +87,10 @@ def build_dump(code=0xC0000005, params=(1, 0x10), pid=PID):
     return bytes(out + blobs)
 
 
-def trace_lines(pid=PID):
+def trace_lines(pid=PID, module="title.exe"):
     return [
         json.dumps({"seq": 1, "t": 0.0, "kind": "trace_open", "pid": pid}),
-        json.dumps({"seq": 2, "t": 0.1, "kind": "map", "module": "title.exe", "base": hex(GAME_BASE),
+        json.dumps({"seq": 2, "t": 0.1, "kind": "map", "module": module, "base": hex(GAME_BASE),
                     "size": hex(GAME_SIZE), "relocated": False}),
         '{"seq":3,"t":0.2,"kind":"exce',  # cut short by the crash
     ]
@@ -132,6 +134,25 @@ class MinidumpSummaryTest(unittest.TestCase):
         self.assertEqual(exc["access"], "write")
         self.assertEqual(exc["target"], "0x10")
         self.assertEqual(report["warnings"], [])
+
+    def test_stack_read_through_the_thread_descriptor_without_memory_list(self):
+        with_list = self.report()["threads"][0]["stack"]
+        without = self.report(dump=build_dump(memory_list=False))["threads"][0]["stack"]
+        self.assertEqual(len(with_list), 3)
+        self.assertEqual(without, with_list)
+
+    def test_redirected_strict_stdout_replaces_unencodable_names(self):
+        dump = self.write("a.dmp", build_dump())
+        trace = self.write("a.trace", trace_lines(module="title\ue9c3.exe"))
+        tool = os.path.join(ROOT, "tools", "minidump_summary.py")
+        # The tool's own __main__ guard must cope with a strict, non-UTF-8 stdout (Windows' ANSI code page under -I).
+        code = ("import io, runpy, sys; "
+                "sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='cp1252', errors='strict'); "
+                f"sys.argv = [{tool!r}, {dump!r}, '--trace', {trace!r}]; "
+                f"runpy.run_path({tool!r}, run_name='__main__')")
+        run = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True)
+        self.assertEqual(run.returncode, 0, run.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"title?.exe+0x1234", run.stdout)
 
     def test_faulting_thread_uses_exception_context_and_scans_stack(self):
         (thread,) = self.report()["threads"]

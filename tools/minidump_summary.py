@@ -237,6 +237,8 @@ def overlaps(mapped: list, own: list) -> list:
 def stack_scan(dump: Minidump, thread: dict, rsp: int, ranges: list, symbolize: Symbolizer, limit: int) -> list:
     """Stack slots at or above `rsp` that hold an address inside a known module."""
     start, size, _rva = thread["stack"]
+    # The thread's own stack descriptor first: a dump need not repeat the saved stack in MemoryList/Memory64List.
+    ranges = [thread["stack"]] + list(ranges)
     lo = max(start, rsp) if start <= rsp < start + size else start
     frames = []
     address = lo - (lo % 8)
@@ -366,4 +368,8 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
