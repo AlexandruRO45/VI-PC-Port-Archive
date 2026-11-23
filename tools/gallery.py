@@ -352,6 +352,19 @@ class GalleryListenError(OSError):
     """The gallery could not listen on a local port."""
 
 
+class GalleryServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """The gallery's server: a port another gallery is serving is an error on every OS.
+
+    `HTTPServer` sets SO_REUSEADDR so a restart can bind while old connections are still in TIME_WAIT.
+    On POSIX that is all it does: a second listener on the same address still fails. On Windows
+    SO_REUSEADDR lets a second socket bind a port that is already being listened on, bypassing both
+    --port conflict reporting and the default port+1 fallback while the browser keeps talking to the
+    first instance. Windows needs no option for a restart either, so leave it off there.
+    """
+    daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+
+
 def start_server(
     port: int = 8080,
     models_dir: str | None = None,
@@ -411,17 +424,14 @@ def start_server(
     StudioHandler.viewer_dir = viewer_dir
 
     addr = ("127.0.0.1", port)
-    class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-        daemon_threads = True
-
     try:
         try:
-            httpd = ThreadingServer(addr, StudioHandler)
+            httpd = GalleryServer(addr, StudioHandler)
         except OSError:
             if not retry_next_port or not 0 < port < 65535:
                 raise
             addr = ("127.0.0.1", port + 1)
-            httpd = ThreadingServer(addr, StudioHandler)
+            httpd = GalleryServer(addr, StudioHandler)
     except OSError as error:
         raise GalleryListenError(f"can't listen on port {addr[1]}: {error}") from error
 

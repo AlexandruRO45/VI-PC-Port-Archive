@@ -392,5 +392,63 @@ class TestGalleryCommandLine(unittest.TestCase):
             serve.assert_called_once_with()
 
 
+class TestGalleryPortBinding(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved_dirs = (
+            gallery.StudioHandler.models_dir,
+            gallery.StudioHandler.textures_dir,
+            gallery.StudioHandler.viewer_dir,
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        gallery.StudioHandler.models_dir = self.tmp.name
+        gallery.StudioHandler.textures_dir = self.tmp.name
+        gallery.StudioHandler.viewer_dir = self.tmp.name
+
+    def tearDown(self) -> None:
+        (
+            gallery.StudioHandler.models_dir,
+            gallery.StudioHandler.textures_dir,
+            gallery.StudioHandler.viewer_dir,
+        ) = self._saved_dirs
+        self.tmp.cleanup()
+
+    def test_allow_reuse_address_disabled_on_windows(self) -> None:
+        self.assertEqual(gallery.GalleryServer.allow_reuse_address, os.name != "nt")
+
+    def test_second_gallery_on_occupied_port_is_refused(self) -> None:
+        first = gallery.GalleryServer(("127.0.0.1", 0), gallery.StudioHandler)
+        port = first.server_address[1]
+        try:
+            with self.assertRaises(OSError):
+                second = gallery.GalleryServer(("127.0.0.1", port), gallery.StudioHandler)
+                second.server_close()
+            with self.assertRaises(gallery.GalleryListenError) as raised:
+                gallery.start_server(
+                    port=port,
+                    models_dir=self.tmp.name,
+                    textures_dir=self.tmp.name,
+                    open_browser=False,
+                    retry_next_port=False,
+                )
+            self.assertIn(f"can't listen on port {port}", str(raised.exception))
+        finally:
+            first.server_close()
+
+    def test_restart_binds_port_after_close(self) -> None:
+        port = 0
+        for _ in range(3):
+            server = gallery.GalleryServer(("127.0.0.1", port), gallery.StudioHandler)
+            port = server.server_address[1]
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, _, _ = _raw_get(port, "/api/models", host=f"127.0.0.1:{port}")
+                self.assertEqual(status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(10)
+
+
 if __name__ == "__main__":
     unittest.main()
