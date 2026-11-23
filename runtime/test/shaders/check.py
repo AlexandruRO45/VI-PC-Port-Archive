@@ -329,6 +329,9 @@ def heap_init_env():
 USER_SGPRS = [0x4F000000, 0xDEADBEEF, 7, 0xFFFFFFFF]
 USER_SGPRS_ENV = {"VKC_SGPRS": ",".join(hex(w) for w in USER_SGPRS)}
 USER_SGPRS_WORDS = USER_SGPRS + [0xEEEEEEEE] * 4
+# cs_f64_add.asm: binary64 (0.75 + 0.5) * 2 = 2.5 as its low and high words. Needs shaderFloat64: vk_compute_test exits
+# 77 with an "unsupported:" line without it, a skip.
+F64_ADD_WORDS = [0x00000000, 0x40040000]
 # cs_fma_fused.asm: single-rounded f32 multiply-adds (and one f16). The operands arrive in s4..s7 so no driver can fold
 # them; FMA_FUSED are the exact single-rounded words and FMA_SPLIT are the exact split-rounded words (derivations in
 # the .asm header; out[7] is f16 round-to-odd, never GLSL Fma, so it is always 0x7351). Under --fma khr
@@ -1778,6 +1781,7 @@ def main():
                                                   expected_words=USER_SGPRS_WORDS, env=USER_SGPRS_ENV)))
     results.append(("cs_heap_init", compute_test(tools, spirv, "cs_heap_init", "1", "dump",
                                                  expected_words=HEAP_INIT_EXPECTED, env=heap_init_env())))
+    results.append(("cs_f64_add", compute_test(tools, spirv, "cs_f64_add", "1", "dump", expected_words=F64_ADD_WORDS)))
     results.append(("cs_cvt_f32_sat", cvt_f32_sat_test(tools, spirv)))
     results.append(("cs_fma_fused", fma_fused_test(tools, spirv)))
     results.append(("cs_cvt_pk_u8", compute_test(tools, spirv, "cs_cvt_pk_u8", "1", "dump",
