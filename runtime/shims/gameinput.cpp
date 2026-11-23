@@ -1124,9 +1124,16 @@ void id_bytes(const std::string& identity, const SDL_GUID& guid, uint32_t twin, 
     id_bytes(twin ? "t:" + std::to_string(twin) + ":" + identity : identity, guid, out);
 }
 
+// Overwrites dst with src only when they differ. GetDeviceInfo hands the title a pointer into the device, which it
+// reads without the state lock, so a reconnect must never leave a field zeroed while it is rebuilt (RT-732): the new
+// value is built off to the side, and a pad that comes back unchanged writes nothing at all.
+template <class T>
+void publish(T& dst, const T& src) {
+    if (std::memcmp(&dst, &src, sizeof(T)) != 0) dst = src;
+}
+
 void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
-    GameInputDeviceInfo& i = d->info;
-    i = {};
+    GameInputDeviceInfo i{};
     i.infoSize = sizeof(GameInputDeviceInfo);
     i.vendorId = SDL_GetGamepadVendor(p);
     i.productId = SDL_GetGamepadProduct(p);
@@ -1149,7 +1156,7 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
         i.supportedInput |= GameInputKindMotion;
         // The maxima GetMotionState's fractions divide by. The magnetometer is not available: SDL's gamepad API has
         // no compass, and maxMagneticFieldStrength 0 says so (Microsoft's GameInputMotionInfo remarks).
-        d->motion_info = {kMaxAcceleration, kMaxAngularVelocity, 0.0f};
+        publish(d->motion_info, GameInputMotionInfo{kMaxAcceleration, kMaxAngularVelocity, 0.0f});
         i.motionInfo = &d->motion_info;
     }
     // The motors this pad can back. Force feedback is whatever SDL opened a haptic device for with effect kinds of its
@@ -1166,31 +1173,45 @@ void fill_info(Device* d, SDL_Gamepad* p, const AppLocalDeviceId& id) {
     i.controllerAxisCount = kAxisCount;
     i.controllerButtonCount = kButtonCount;
     for (uint32_t a = 0; a < kAxisCount; ++a) {
-        d->axis_info[a] = {};
-        d->axis_info[a].mappedInputKinds = GameInputKindGamepad;
-        d->axis_info[a].isContinuous = true;
-        d->axis_info[a].hasRestValue = true;
-        d->axis_info[a].restValue = a < 4 ? 0.5f : 0.0f;
-        d->axis_info[a].resolution = 65536;
-        d->axis_info[a].legacyHidIndex = static_cast<uint16_t>(a);
-        d->axis_info[a].legacyDInputIndex = static_cast<uint16_t>(a);
+        GameInputControllerAxisInfo ai{};
+        ai.mappedInputKinds = GameInputKindGamepad;
+        ai.isContinuous = true;
+        ai.hasRestValue = true;
+        ai.restValue = a < 4 ? 0.5f : 0.0f;
+        ai.resolution = 65536;
+        ai.legacyHidIndex = static_cast<uint16_t>(a);
+        ai.legacyDInputIndex = static_cast<uint16_t>(a);
+        publish(d->axis_info[a], ai);
     }
     for (uint32_t b = 0; b < kButtonCount; ++b) {
-        d->button_info[b] = {};
-        d->button_info[b].mappedInputKinds = GameInputKindGamepad;
-        d->button_info[b].legacyHidIndex = static_cast<uint16_t>(b);
-        d->button_info[b].legacyDInputIndex = static_cast<uint16_t>(b);
+        GameInputControllerButtonInfo bi{};
+        bi.mappedInputKinds = GameInputKindGamepad;
+        bi.legacyHidIndex = static_cast<uint16_t>(b);
+        bi.legacyDInputIndex = static_cast<uint16_t>(b);
+        publish(d->button_info[b], bi);
     }
     i.controllerAxisInfo = d->axis_info;
     i.controllerButtonInfo = d->button_info;
     i.gamepadInfo = &d->gamepad_info;
     i.uiNavigationInfo = &d->ui_info;
+    // The name is reassigned only when it changed: a new buffer would free the one displayName points at.
     const char* n = SDL_GetGamepadName(p);
-    d->name = n ? n : "Gamepad";
+    const char* name = n ? n : "Gamepad";
+    if (d->name != name) d->name = name;
     uint32_t points = 0;
     for (unsigned char c : d->name) points += (c & 0xC0) != 0x80;
-    d->display_name = {static_cast<uint32_t>(d->name.size()), points, d->name.c_str()};
+    publish(d->display_name, GameInputString{static_cast<uint32_t>(d->name.size()), points, d->name.c_str()});
     i.displayName = &d->display_name;
+    // The raw report fields are open_raw's, which runs next and corrects them; until then they keep what they had.
+    const GameInputDeviceInfo& old = d->info;
+    i.supportedInput |= old.supportedInput & GameInputKindRawDeviceReport;
+    i.inputReportCount = old.inputReportCount;
+    i.inputReportInfo = old.inputReportInfo;
+    i.outputReportCount = old.outputReportCount;
+    i.outputReportInfo = old.outputReportInfo;
+    i.featureReportCount = old.featureReportCount;
+    i.featureReportInfo = old.featureReportInfo;
+    publish(d->info, i);
 }
 
 // Makes snap the device's current reading. A reading leaves the history once the one after it is more than kHistoryUs
@@ -1211,6 +1232,20 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
 // Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
 // descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
 // I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Under g().mu.
+// The raw report fields of d->info, from the report tables (empty tables: no raw I/O). Under g().mu and hid_mu.
+void publish_raw_info(Device* d) {
+    GameInputDeviceInfo i = d->info;
+    i.supportedInput &= ~static_cast<uint32_t>(GameInputKindRawDeviceReport);
+    if (d->hid) i.supportedInput |= GameInputKindRawDeviceReport;
+    i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
+    i.inputReportInfo = d->raw_in.empty() ? nullptr : d->raw_in.data();
+    i.outputReportCount = static_cast<uint32_t>(d->raw_out.size());
+    i.outputReportInfo = d->raw_out.empty() ? nullptr : d->raw_out.data();
+    i.featureReportCount = static_cast<uint32_t>(d->raw_feature.size());
+    i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
+    publish(d->info, i);
+}
+
 void open_raw(Device* d, const char* path) {
     std::lock_guard lock(d->hid_mu);
     if (d->hid) d->hid_backend->close(d->hid);
@@ -1229,6 +1264,7 @@ void open_raw(Device* d, const char* path) {
                      xinput             ? "an XInput pad: SDL's hidapi does not open XInput HID interfaces"
                      : path && *path    ? "its HID device could not be opened"
                                         : "SDL reports no device path");
+        publish_raw_info(d);
         return;
     }
     std::vector<uint8_t> desc(4096);
@@ -1239,6 +1275,7 @@ void open_raw(Device* d, const char* path) {
         std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
                      n <= 0 ? "no report descriptor" : !parsed ? "malformed report descriptor" : "no reports declared");
         b->close(h);
+        publish_raw_info(d);
         return;
     }
     for (const rt::gameinput::RawReportSize& r : reports) {
@@ -1249,14 +1286,7 @@ void open_raw(Device* d, const char* path) {
     }
     d->hid = h;
     d->hid_backend = b;
-    GameInputDeviceInfo& i = d->info;
-    i.supportedInput |= GameInputKindRawDeviceReport;
-    i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
-    i.inputReportInfo = d->raw_in.empty() ? nullptr : d->raw_in.data();
-    i.outputReportCount = static_cast<uint32_t>(d->raw_out.size());
-    i.outputReportInfo = d->raw_out.empty() ? nullptr : d->raw_out.data();
-    i.featureReportCount = static_cast<uint32_t>(d->raw_feature.size());
-    i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
+    publish_raw_info(d);
 }
 
 void close_raw(Device* d) {
@@ -1321,7 +1351,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
         ++twins;
         if (!d && old->status == GameInputDeviceNoStatus) d = old;
     }
-    AppLocalDeviceId id = d ? d->info.deviceId : base;  // a copy: fill_info clears info before it writes the id
+    AppLocalDeviceId id = d ? d->info.deviceId : base;
     if (!d) {
         const auto taken = [&s](const AppLocalDeviceId& v) {
             for (Device* o : s.devices)
@@ -1354,12 +1384,11 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     // passed on: no haptic device, no motor, and an effect kind SDL does not list is not offered to a title.
     d->haptic = haptics().open_joystick(SDL_GetGamepadJoystick(p));
     d->ff_features = 0;
-    d->ff_motor_info = {};
     d->sent_gain = -1;
     if (d->haptic) {
         const uint32_t features = haptics().features(d->haptic);
         if (features) {
-            GameInputForceFeedbackMotorInfo& m = d->ff_motor_info;
+            GameInputForceFeedbackMotorInfo m{};  // published below: info.forceFeedbackMotorInfo points at it
             d->ff_features = features;
             m.supportedAxes = GameInputFeedbackAxisLinearX;  // the axis a wheel's or a stick's motor acts on
             m.location = GameInputLocationChassis;
@@ -1376,6 +1405,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
             m.isFrictionEffectSupported = (features & SDL_HAPTIC_FRICTION) != 0;
             m.isDamperEffectSupported = (features & SDL_HAPTIC_DAMPER) != 0;
             m.isInertiaEffectSupported = (features & SDL_HAPTIC_INERTIA) != 0;
+            publish(d->ff_motor_info, m);
         } else {
             haptics().close(d->haptic);
             d->haptic = nullptr;
@@ -1386,13 +1416,17 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->haptic_motors = 0;
     if (d->has_trigger_output) {
         for (uint32_t m = 0; m < kHapticMotors; ++m) {
-            d->haptic_waveform_info[m] = {{0x0F, 0x58}, true, true, true, false, 0};
-            d->haptic_motor_info[m] = {};
-            d->haptic_motor_info[m].mappedRumbleMotors = m ? GameInputRumbleRightTrigger : GameInputRumbleLeftTrigger;
-            d->haptic_motor_info[m].location = GameInputLocationChassis;
-            d->haptic_motor_info[m].locationId = m;
-            d->haptic_motor_info[m].waveformCount = 1;
-            d->haptic_motor_info[m].waveformInfo = &d->haptic_waveform_info[m];
+            GameInputHapticWaveformInfo w{};  // zeroed padding too, so publish's compare sees equal bytes
+            w.usage = {0x0F, 0x58};
+            w.isDurationSupported = w.isIntensitySupported = w.isRepeatSupported = true;
+            publish(d->haptic_waveform_info[m], w);
+            GameInputHapticFeedbackMotorInfo hm{};
+            hm.mappedRumbleMotors = m ? GameInputRumbleRightTrigger : GameInputRumbleLeftTrigger;
+            hm.location = GameInputLocationChassis;
+            hm.locationId = m;
+            hm.waveformCount = 1;
+            hm.waveformInfo = &d->haptic_waveform_info[m];
+            publish(d->haptic_motor_info[m], hm);
         }
         d->haptic_motors = kHapticMotors;
     }
@@ -1451,8 +1485,7 @@ void close_pad(Device* d, uint64_t ts) {
         d->haptic = nullptr;
     }
     d->retired.clear();
-    d->ff_features = 0;
-    d->ff_motor_info = {};
+    d->ff_features = 0;  // no new effects while it is away; ff_motor_info stays, info still points at it
     d->sent_gain = -1;
     d->haptic_motors = 0;
     for (ForceFeedbackEffect* e : d->effects) e->orphan();
@@ -2000,6 +2033,8 @@ void Device::SetRumbleState(const GameInputRumbleParams* params) {
 HRESULT Device::CreateForceFeedbackEffect(uint32_t motorIndex, const void* params, void** effect) {
     if (!effect) return E_POINTER;
     *effect = nullptr;
+    // info and ff_features are rebuilt by the poll thread when the pad reconnects (RT-732): read them under the lock.
+    std::lock_guard lock(g().mu);
     if (!params || motorIndex >= info.forceFeedbackMotorCount) return E_INVALIDARG;
     const auto* p = static_cast<const GameInputForceFeedbackParams*>(params);
     // Only what the motor reported. SDL is not asked here: this is a title call, so the cached feature mask decides,
@@ -2010,6 +2045,7 @@ HRESULT Device::CreateForceFeedbackEffect(uint32_t motorIndex, const void* param
 }
 
 bool Device::IsForceFeedbackMotorPoweredOn(uint32_t motorIndex) {
+    std::lock_guard lock(g().mu);
     return motorIndex < info.forceFeedbackMotorCount && haptic != nullptr && status.load() != GameInputDeviceNoStatus;
 }
 

@@ -1533,6 +1533,125 @@ void test_force_feedback(IGameInput* input) {
     rt::gameinput::set_haptic_source(nullptr);
 }
 
+// RT-732: a reconnect rebuilds the device's info on the poll thread while the title reads it. GetDeviceInfo hands out a
+// pointer the title reads with no lock, so nothing it points at may be zeroed and rebuilt in place; and
+// CreateForceFeedbackEffect, which checks the motor count and the feature mask, must not see them half rebuilt.
+// The fake haptic's feature query, which open_pad makes with the state lock held, pauses the reconnect on demand.
+HANDLE g_in_features = nullptr, g_release_features = nullptr;
+uint32_t pausing_features(void* h) {
+    if (g_in_features) {
+        SetEvent(g_in_features);
+        WaitForSingleObject(g_release_features, 5000);
+    }
+    return fake_features(h);
+}
+const rt::gameinput::HapticApi kPausingHaptic{fake_open,   fake_close, pausing_features, fake_max_effects, fake_create,
+                                              fake_update, fake_run,   fake_stop,        fake_destroy,     fake_gain};
+
+void test_info_during_reconnect(IGameInput*) {
+    rt::gameinput::set_haptic_source(&kPausingHaptic);
+    g_fake = {};
+    g_fake_open = true;
+    Pad wheel;
+    const char* const name = "Leonida virtual reconnect wheel";
+    attach(wheel, name, 0x046D, 0xC24F, false);
+    const size_t before = g_device_events.size();
+    rt::gameinput::poll();
+    IGameInputDevice* dev = g_device_events.size() > before ? g_device_events.back().device : nullptr;
+    check(dev != nullptr, "reconnect info: a force-feedback pad to reconnect");
+    if (!dev) {
+        detach(wheel);
+        rt::gameinput::poll();
+        rt::gameinput::set_haptic_source(nullptr);
+        g_fake_open = false;
+        return;
+    }
+    dev->AddRef();
+    const GameInputDeviceInfo* info = dev->GetDeviceInfo();
+    const GameInputDeviceInfo first = *info;
+    // What the shim named it: SDL keeps the mapping name of the first pad it saw with this GUID.
+    const std::string shown = info->displayName && info->displayName->data ? info->displayName->data : "";
+    detach(wheel);
+    rt::gameinput::poll();
+    check(dev->GetDeviceInfo() == info && info->forceFeedbackMotorCount == 1 &&
+              static_cast<const GameInputForceFeedbackMotorInfo*>(info->forceFeedbackMotorInfo)->isConstantEffectSupported,
+          "reconnect info: an unplugged pad keeps describing its force-feedback motor");
+
+    // Pause the reconnect inside open_pad, after the feature mask was reset and before it is filled again.
+    g_in_features = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_release_features = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HANDLE created_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    attach(wheel, name, 0x046D, 0xC24F, false);
+    std::thread poller([] { rt::gameinput::poll(); });
+    const bool paused = WaitForSingleObject(g_in_features, 5000) == WAIT_OBJECT_0;
+    const auto* motor = static_cast<const GameInputForceFeedbackMotorInfo*>(info->forceFeedbackMotorInfo);
+    check(paused && std::memcmp(&info->deviceId, &first.deviceId, sizeof first.deviceId) == 0 &&
+              info->forceFeedbackMotorCount == 1 && motor && motor->isConstantEffectSupported &&
+              motor->maxSimultaneousEffects == 8,
+          "reconnect info: mid-reconnect, the info a title holds still describes the motor");
+    GameInputForceFeedbackParams params{};
+    params.kind = GameInputForceFeedbackConstant;
+    params.data.constant.magnitude.linearX = 0.25f;
+    HRESULT hr = E_FAIL;
+    IGameInputForceFeedbackEffect* effect = nullptr;
+    std::thread creator([&] {
+        hr = dev->CreateForceFeedbackEffect(0, &params, reinterpret_cast<void**>(&effect));
+        SetEvent(created_done);
+    });
+    const bool waited = WaitForSingleObject(created_done, 200) == WAIT_TIMEOUT;
+    SetEvent(g_release_features);
+    poller.join();
+    const bool finished = WaitForSingleObject(created_done, 5000) == WAIT_OBJECT_0;
+    creator.join();
+    CloseHandle(g_in_features);
+    CloseHandle(g_release_features);
+    CloseHandle(created_done);
+    g_in_features = g_release_features = nullptr;
+    check(paused && waited, "reconnect info: CreateForceFeedbackEffect waits while the pad's motor is rebuilt");
+    check(finished && hr == S_OK && effect, "reconnect info: then it creates the effect on the reconnected motor");
+    if (effect) effect->Release();
+    check(dev->GetDeviceInfo() == info && std::memcmp(&info->deviceId, &first.deviceId, sizeof first.deviceId) == 0 &&
+              info->displayName == first.displayName && info->displayName->data == first.displayName->data &&
+              shown == info->displayName->data,
+          "reconnect info: the same pad back keeps its id and its name buffer");
+
+    // A title thread reading the info while the pad is unplugged and plugged back in, again and again. Every field it
+    // looks at must hold the one value it has for this pad: no zeroed id, no missing tables, no freed name.
+    std::atomic<bool> stop{false};
+    std::atomic<long> reads{0}, bad{0};
+    std::thread reader([&] {
+        while (!stop.load()) {
+            const GameInputDeviceInfo* i = dev->GetDeviceInfo();
+            const GameInputString* dn = i->displayName;
+            const bool ok = std::memcmp(&i->deviceId, &first.deviceId, sizeof first.deviceId) == 0 &&
+                            i->infoSize == first.infoSize && i->vendorId == 0x046D &&
+                            i->controllerAxisCount == first.controllerAxisCount && i->controllerAxisInfo &&
+                            i->controllerAxisInfo[0].mappedInputKinds == GameInputKindGamepad &&
+                            i->controllerButtonCount == first.controllerButtonCount && i->gamepadInfo &&
+                            i->forceFeedbackMotorCount == 1 && i->forceFeedbackMotorInfo && dn && dn->data &&
+                            dn->sizeInBytes == shown.size() && std::memcmp(dn->data, shown.data(), shown.size()) == 0;
+            bad += !ok;
+            ++reads;
+        }
+    });
+    for (int n = 0; n < 200; ++n) {
+        detach(wheel);
+        rt::gameinput::poll();
+        attach(wheel, name, 0x046D, 0xC24F, false);
+        rt::gameinput::poll();
+    }
+    stop = true;
+    reader.join();
+    std::printf("reconnect info: %ld reads over 200 reconnects, %ld inconsistent\n", reads.load(), bad.load());
+    check(reads.load() > 0 && bad.load() == 0, "reconnect info: a title reading the info across 200 reconnects sees it whole");
+
+    detach(wheel);
+    rt::gameinput::poll();
+    dev->Release();
+    g_fake_open = false;
+    rt::gameinput::set_haptic_source(nullptr);
+}
+
 // The trigger haptic motors of a pad that has them. Runs with no other pad.
 void test_haptic_motors(IGameInput* input) {
     set_env("LEONIDA_DS_TRIGGERS", nullptr);
@@ -2119,6 +2238,7 @@ int main() {
     test_motion(input);
     test_aggregate_device(input);
     test_force_feedback(input);
+    test_info_during_reconnect(input);
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
