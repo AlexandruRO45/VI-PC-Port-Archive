@@ -187,3 +187,44 @@ class TestQuadmaskB32ASTAndScalar(unittest.TestCase):
         ])
         # scc is 0 on zero -> s_cselect picks 2
         self.assertEqual(val_zero, 2)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b32 SIMD Divergence & Nibble Reduction
+# ------------------------------------------------------------------------------
+
+class TestQuadmaskB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        # Alternating nibble patterns
+        val_even, _ = run_shader_words("ps_qm32_even", [
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        val_odd, _ = run_shader_words("ps_qm32_odd", [
+            "s_mov_b32 s1, 0xF0F0F0F0",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(val_even, 0x55)
+        self.assertEqual(val_odd, 0xAA)
+        self.assertEqual(val_even | val_odd, 0xFF)
+
+    def test_algebraic_reduction_properties_hardware(self):
+        # Monotonicity: quadmask(a | b) == quadmask(a) | quadmask(b)
+        val_a, _ = run_shader_words("ps_qm32_prop_a", [
+            "s_mov_b32 s1, 0x0000000F",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        val_b, _ = run_shader_words("ps_qm32_prop_b", [
+            "s_mov_b32 s1, 0x000000F0",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        val_ab, _ = run_shader_words("ps_qm32_prop_ab", [
+            "s_mov_b32 s1, 0x000000FF",
+            "s_quadmask_b32 s0, s1",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(val_a | val_b, val_ab)
