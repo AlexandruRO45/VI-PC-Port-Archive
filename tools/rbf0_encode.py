@@ -245,7 +245,7 @@ def check(source, limit=None):
 def write_all(report, out_dir):
     """Encode every resource of an rbf0_tree JSON report into out_dir. Returns (written, refused)."""
     try:
-        with open(report, encoding="utf-8") as f:
+        with open(report, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:  # ValueError: bad JSON or non-UTF-8 bytes
         raise SystemExit(f"{report}: cannot read report: {e}") from None

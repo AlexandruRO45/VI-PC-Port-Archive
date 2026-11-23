@@ -421,6 +421,27 @@ class Cli(unittest.TestCase):
         self.assertIn("1 resource(s) written, 1 refused", out)
         self.assertTrue(os.path.isfile(os.path.join(out_dir, "00000000.rbf")))
 
+    def test_write_all_accepts_utf8_bom(self):
+        doc = rbf0_tree.parse_resource(every_record(True))
+        doc["offset"] = 0x100
+        report = os.path.join(self.tmp.name, "bom.json")
+        with open(report, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"tool": "rbf0_tree", "resources": [doc]}, f)
+        out_dir = os.path.join(self.tmp.name, "out-bom")
+        code, out = self.run_main(report, out_dir)
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 resource(s) written, 0 refused", out)
+
+    def test_write_all_malformed_json_with_utf8_bom_raises_system_exit(self):
+        report = os.path.join(self.tmp.name, "bad_bom.json")
+        with open(report, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        out_dir = os.path.join(self.tmp.name, "out-bad-bom")
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(report, out_dir)
+        self.assertIn("cannot read report", str(cm.exception))
+        self.assertFalse(os.path.exists(out_dir))
+
 
 if __name__ == "__main__":
     unittest.main()
