@@ -108,5 +108,63 @@ class MadU32U24AstValidationTests(unittest.TestCase):
         self.assertEqual(ast.src1.kind, RegKind.IMM)
         self.assertEqual(ast.src1.raw_val, 50)
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs: dict[int, int] = {}
+        self.sgprs: dict[int, int] = {}
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs.get(idx, 0) & MASK32
+
+    def set_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+    def get_operand_val(self, op: Operand) -> int:
+        if op.kind == RegKind.VGPR:
+            return self.get_vgpr(op.index)
+        elif op.kind == RegKind.SGPR:
+            return self.sgprs.get(op.index, 0) & MASK32
+        else:
+            return op.raw_val & MASK32
+
+
+def execute_scalar_mad_u32_u24(state: ScalarRegisterState, ast: InstructionAST) -> None:
+    s0 = state.get_operand_val(ast.src0)
+    s1 = state.get_operand_val(ast.src1)
+    s2 = state.get_operand_val(ast.src2)
+    res = oracle_mad_u32_u24(s0, s1, s2)
+    state.set_vgpr(ast.dst.index, res)
+
+
+class MadU32U24ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution_basic(self):
+        state = ScalarRegisterState()
+        state.set_vgpr(0, 15)
+        state.set_vgpr(1, 4)
+        state.set_vgpr(2, 7)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 3),
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+            Operand(RegKind.VGPR, 2),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(state.get_vgpr(3), (15 * 4) + 7)
+
+    def test_scalar_execution_with_sgpr_and_imm(self):
+        state = ScalarRegisterState()
+        state.sgprs[0] = 100
+        state.set_vgpr(1, 25)
+        ast = InstructionAST(
+            "v_mad_u32_u24",
+            Operand(RegKind.VGPR, 2),
+            Operand(RegKind.SGPR, 0),
+            Operand(RegKind.IMM, raw_val=3),
+            Operand(RegKind.VGPR, 1),
+        )
+        execute_scalar_mad_u32_u24(state, ast)
+        self.assertEqual(state.get_vgpr(2), (100 * 3) + 25)
+
 if __name__ == "__main__":
     unittest.main()
