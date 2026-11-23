@@ -443,5 +443,48 @@ class TestDSDecU32SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xDEADBEEF)
 
 
+class TestDSDecU32RegisterAliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+
+    def test_vdst_aliases_vaddr(self) -> None:
+        self.lds.write_dword(0x40, 5)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 5)
+
+        inst = DSDecInstruction(
+            opcode=DSOpcode.DS_DEC_RTN_U32,
+            vdst=VGPR(1),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 5)
+        self.assertEqual(new, 4)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(1)), 5)
+        self.assertEqual(self.lds.read_dword(0x40), 4)
+
+    def test_vdst_aliases_vdata(self) -> None:
+        self.lds.write_dword(0x60, 5)
+        self.state.rf.set_vgpr(VGPR(1), 0x60)
+        self.state.rf.set_vgpr(VGPR(2), 5)
+
+        inst = DSDecInstruction(
+            opcode=DSOpcode.DS_DEC_RTN_U32,
+            vdst=VGPR(2),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 5)
+        self.assertEqual(new, 4)
+        self.assertEqual(self.state.rf.get_vgpr(VGPR(2)), 5)
+        self.assertEqual(self.lds.read_dword(0x60), 4)
+
+
 if __name__ == "__main__":
     unittest.main()
