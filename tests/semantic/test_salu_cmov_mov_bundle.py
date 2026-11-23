@@ -394,6 +394,25 @@ class TestSMovB32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 777777)
 
+def ref_s_mov_b64(s0: int) -> int:
+    """Reference mathematical oracle for s_mov_b64."""
+    return s0 & MASK64
+
+
+class TestSMovB64Oracle(unittest.TestCase):
+    def test_identity(self) -> None:
+        self.assertEqual(ref_s_mov_b64(0x0123456789ABCDEF), 0x0123456789ABCDEF)
+
+    def test_translator_oracle_verification(self) -> None:
+        body = [
+            "s_mov_b64 s[4:5], 0x0123456789abcdef",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_mov_b64_oracle")
+        for l in range(32):
+            self.assertEqual(results[l], 0x89ABCDEF)
+
 
 if __name__ == "__main__":
     unittest.main()
