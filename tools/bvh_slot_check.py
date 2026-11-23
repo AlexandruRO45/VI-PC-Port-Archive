@@ -24,6 +24,7 @@ import bvh_geometry_check as C
 import bvh_index as I
 import bvh_match as M
 import bvh_rehydrate as R
+from file_mode import published_mode
 
 
 # Bump when signature ordering, source matching or matrix verdict semantics change.
@@ -228,6 +229,7 @@ def save_evidence(path, record):
     try:
         with f:
             json.dump(record, f)
+        os.chmod(temporary, published_mode(path))   # NamedTemporaryFile creates 0600
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
