@@ -160,6 +160,144 @@ def ref_ds_gws_sema_br_v(subsystem: GWSSubsystem, m0_val: int, offset: int, rele
     return subsystem.bulk_release_br_v(rid, release_count=release_count)
 
 
+# ============================================================================
+# Commit 2: Symbolic AST opcode definitions and typed expressions
+# ============================================================================
+
+
+class RegKind(enum.Enum):
+    """Register kinds in RDNA2 architecture."""
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    M0 = "m0"
+    EXEC = "exec"
+    VCC = "vcc"
+    SCC = "scc"
+    STATUS = "status"
+
+
+@dataclass(frozen=True)
+class Register:
+    """Represents an RDNA2 hardware register."""
+    index: int = 0
+    kind: RegKind = RegKind.VGPR
+
+    def __post_init__(self) -> None:
+        if self.kind in (RegKind.VGPR, RegKind.SGPR):
+            if not (0 <= self.index <= 255):
+                raise ValueError(f"Register index out of bounds [0, 255]: {self.index}")
+        elif self.kind in (RegKind.M0, RegKind.EXEC, RegKind.VCC, RegKind.SCC, RegKind.STATUS):
+            if self.index != 0:
+                raise ValueError(f"Special register {self.kind.value} index must be 0")
+
+    def __str__(self) -> str:
+        if self.kind == RegKind.VGPR:
+            return f"v{self.index}"
+        elif self.kind == RegKind.SGPR:
+            return f"s{self.index}"
+        return self.kind.value
+
+
+class Opcode(enum.Enum):
+    """Data Share / GWS Opcode definitions."""
+    DS_GWS_SEMA_BR_V = "ds_gws_sema_br_v"
+    DS_GWS_SEMA_BR_P = "ds_gws_sema_br_p"
+    DS_GWS_SEMA_BR = "ds_gws_sema_br"
+    DS_GWS_SEMA_P = "ds_gws_sema_p"
+    DS_GWS_SEMA_V = "ds_gws_sema_v"
+    DS_GWS_INIT = "ds_gws_init"
+    DS_GWS_BARRIER = "ds_gws_barrier"
+
+
+@dataclass(frozen=True)
+class Instruction:
+    """AST representation of RDNA2 ds_gws_sema_br_v instruction."""
+    opcode: Opcode = Opcode.DS_GWS_SEMA_BR_V
+    offset: int = 0
+    gds: bool = True
+    vdata: Optional[Register] = None
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"GWS immediate offset out of range [0, 65535]: {self.offset}")
+        if not self.gds:
+            raise ValueError("GWS instructions strictly require the gds keyword modifier")
+        if self.vdata is not None and self.vdata.kind != RegKind.VGPR:
+            raise TypeError(f"vdata must be a VGPR, got: {self.vdata.kind}")
+
+    def disasm(self) -> str:
+        parts = [self.opcode.value]
+        if self.vdata is not None:
+            parts.append(str(self.vdata))
+        parts.append(f"offset:{self.offset}")
+        if self.gds:
+            parts.append("gds")
+        return " ".join(parts)
+
+    @classmethod
+    def parse(cls, asm: str) -> Instruction:
+        """Parse assembly text into Instruction AST."""
+        tokens = asm.strip().split()
+        if not tokens:
+            raise ValueError("Empty assembly string")
+
+        op_str = tokens[0]
+        try:
+            opcode = Opcode(op_str)
+        except ValueError:
+            raise ValueError(f"Unrecognized opcode: {op_str}")
+
+        if tokens[-1] != "gds":
+            raise ValueError("Instruction must end with 'gds' modifier")
+        gds = True
+
+        offset = 0
+        vdata = None
+
+        for tok in tokens[1:-1]:
+            if tok.startswith("offset:"):
+                raw_off = tok.split(":", 1)[1]
+                offset = int(raw_off, 0)
+            elif tok.startswith("v") and tok[1:].isdigit():
+                vdata = Register(int(tok[1:]), RegKind.VGPR)
+            else:
+                raise ValueError(f"Unexpected token in instruction: {tok}")
+
+        return cls(opcode=opcode, offset=offset, gds=gds, vdata=vdata)
+
+
+@dataclass(frozen=True)
+class GWSResourceExpr:
+    """Symbolic expression for effective GWS resource identifier."""
+    base_reg: Register = field(default_factory=lambda: Register(0, RegKind.M0))
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.offset <= OFFSET16_MASK):
+            raise ValueError(f"Offset out of range [0, 65535]: {self.offset}")
+
+    def evaluate(self, m0_val: int) -> int:
+        return ref_gws_resource_id(m0_val, self.offset)
+
+
+@dataclass(frozen=True)
+class SemaphoreBranchReleaseExpr:
+    """Symbolic typed expression for semaphore branch release operation."""
+    resource_id: int
+
+    def calculate_new_value(self, current_val: int, release_count: int, num_waiters: int) -> int:
+        count = max(1, release_count & MASK32)
+        unconsumed = max(0, count - num_waiters)
+        return (current_val + unconsumed) & MASK32
+
+    def num_awakened(self, release_count: int, num_waiters: int) -> int:
+        count = max(1, release_count & MASK32)
+        return min(count, num_waiters)
+
+    def branch_taken(self, num_waiters: int) -> bool:
+        return num_waiters > 0
+
+
 class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model for ds_gws_sema_br_v."""
 
@@ -240,6 +378,77 @@ class TestReferenceOracleAndArchitecturalModel(unittest.TestCase):
         self.gws.init_resource(rid, init_val=0, res_type=GWSResourceType.BARRIER)
         with self.assertRaises(TypeError):
             ref_ds_gws_sema_br_v(self.gws, m0_val=rid, offset=0, release_count=1)
+
+
+class TestSymbolicASTAndTypedExpressions(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions for ds_gws_sema_br_v."""
+
+    def test_register_construction_and_formatting(self) -> None:
+        v0 = Register(0, RegKind.VGPR)
+        v255 = Register(255, RegKind.VGPR)
+        s15 = Register(15, RegKind.SGPR)
+        m0 = Register(0, RegKind.M0)
+        exec_reg = Register(0, RegKind.EXEC)
+
+        self.assertEqual(str(v0), "v0")
+        self.assertEqual(str(v255), "v255")
+        self.assertEqual(str(s15), "s15")
+        self.assertEqual(str(m0), "m0")
+        self.assertEqual(str(exec_reg), "exec")
+
+    def test_register_bounds_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            Register(-1, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(256, RegKind.VGPR)
+        with self.assertRaises(ValueError):
+            Register(1, RegKind.M0)
+
+    def test_instruction_disassembly(self) -> None:
+        i1 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=0, gds=True)
+        self.assertEqual(i1.disasm(), "ds_gws_sema_br_v offset:0 gds")
+
+        i2 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=12, gds=True)
+        self.assertEqual(i2.disasm(), "ds_gws_sema_br_v offset:12 gds")
+
+        i3 = Instruction(opcode=Opcode.DS_GWS_SEMA_BR_V, offset=4, gds=True, vdata=Register(3, RegKind.VGPR))
+        self.assertEqual(i3.disasm(), "ds_gws_sema_br_v v3 offset:4 gds")
+
+    def test_instruction_assembly_parser(self) -> None:
+        i1 = Instruction.parse("ds_gws_sema_br_v offset:0 gds")
+        self.assertEqual(i1.opcode, Opcode.DS_GWS_SEMA_BR_V)
+        self.assertEqual(i1.offset, 0)
+        self.assertTrue(i1.gds)
+
+        i2 = Instruction.parse("ds_gws_sema_br_v v2 offset:8 gds")
+        self.assertIsNotNone(i2.vdata)
+        self.assertEqual(i2.vdata.index, 2)
+        self.assertEqual(i2.offset, 8)
+
+    def test_instruction_parser_rejections(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction.parse("ds_gws_sema_br_v offset:0")
+        with self.assertRaises(ValueError):
+            Instruction.parse("ds_gws_sema_br_v gds offset:0")
+        with self.assertRaises(ValueError):
+            Instruction.parse("v_add_f32 v0, v1, v2")
+
+    def test_gws_resource_expr_evaluation(self) -> None:
+        expr = GWSResourceExpr(offset=10)
+        self.assertEqual(expr.evaluate(m0_val=2), 12)
+        self.assertEqual(expr.evaluate(m0_val=60), 6)
+
+    def test_semaphore_branch_release_expr(self) -> None:
+        expr = SemaphoreBranchReleaseExpr(resource_id=5)
+        # Release 4 permits when 2 waiters present: 2 awakened, 2 added to counter 10 -> 12
+        self.assertEqual(expr.calculate_new_value(current_val=10, release_count=4, num_waiters=2), 12)
+        self.assertEqual(expr.num_awakened(release_count=4, num_waiters=2), 2)
+        self.assertTrue(expr.branch_taken(num_waiters=2))
+
+        # Release 3 permits when 0 waiters present: 0 awakened, 3 added to counter 0 -> 3
+        self.assertEqual(expr.calculate_new_value(current_val=0, release_count=3, num_waiters=0), 3)
+        self.assertEqual(expr.num_awakened(release_count=3, num_waiters=0), 0)
+        self.assertFalse(expr.branch_taken(num_waiters=0))
 
 
 if __name__ == "__main__":
