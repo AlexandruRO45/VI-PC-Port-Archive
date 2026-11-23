@@ -14,6 +14,7 @@ Standard library only. No game data is written: the report holds RVAs and counts
 """
 import argparse
 import json
+import os
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -109,6 +110,16 @@ def rank(data, hashes, window=48, top=15):
     }
 
 
+def same_path(first, second):
+    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("exe")
@@ -118,6 +129,11 @@ def main(argv=None):
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("--json", help="also write the report here")
     a = ap.parse_args(argv)
+    if a.json:
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        if same_path(a.json, a.exe):
+            ap.error(f"--json {a.json} would overwrite the input {a.exe}")
     try:
         hashes = [(h, parse_hash(h)) for h in (a.hash or ["player_story000_00", "cs_mandy"])]
     except ValueError as e:
@@ -137,9 +153,14 @@ def main(argv=None):
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
-            f.write("\n")
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 0
 
 
