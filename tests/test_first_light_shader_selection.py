@@ -1,5 +1,5 @@
 """CPU-only first-light selection checks on a synthetic carve index."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -104,6 +104,28 @@ class ShaderSelectionTests(unittest.TestCase):
                 manifest = json.loads((self.work / "first_light/out/manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(manifest["ps"]["offset"], expected)
                 self.assertEqual("texture" in manifest, "--dds" in options)
+
+    def test_camera_requires_its_vertex_shader_when_selecting_by_offset(self):
+        self.entries[0]["name"] = fl.CAMERA_VS
+        self.entries[1]["name"] = fl.DEFAULT_PS
+        self.entries.append({"stage": "vs", "name": fl.DEFAULT_VS, "file": "other.dxbc", "offset": 64})
+        self.index.write_text(json.dumps(self.entries), encoding="utf-8", newline="\n")
+        obj = self.work / "triangle.obj"
+        obj.write_text("v -1 -1 0\nv 1 -1 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8", newline="\n")
+        args = ["--game", str(self.work), "--work", str(self.work), "--obj", str(obj), "--camera"]
+        for options in ([], ["--vs-offset", "0x8"]):
+            with self.subTest(options=options), patch.object(fl, "run", self.run_compiler_stage), redirect_stdout(io.StringIO()):
+                self.assertEqual(fl.main(args + options), 0)
+                manifest = json.loads((self.work / "first_light/camera/manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual((manifest["vs"]["name"], manifest["vs"]["offset"]), (fl.CAMERA_VS, 8))
+                self.assertTrue(manifest["camera"]["heap"])
+
+        error = io.StringIO()
+        with patch.object(fl, "translate") as translate, redirect_stderr(error), self.assertRaises(SystemExit) as exc:
+            fl.main(args + ["--vs-offset", "64"])
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn(fl.CAMERA_VS, error.getvalue())
+        translate.assert_not_called()
 
 
 if __name__ == "__main__":

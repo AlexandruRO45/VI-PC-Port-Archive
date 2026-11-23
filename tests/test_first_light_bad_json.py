@@ -92,6 +92,19 @@ class CliBadJsonTests(unittest.TestCase):
         path = self.bad_index('[{"stage": "vs", "name": "x"}, {"stage": "ps"}]')
         self.assert_one_clean_line(self.list_cli(), path)
 
+    def test_listing_and_selection_report_a_present_non_integer_offset(self):
+        for value in ("null", '"0x20"', "32.0", "true"):
+            path = self.bad_index('[{"stage":"vs","name":"v","offset":8},'
+                                  '{"stage":"ps","name":"p","offset":' + value + '}]')
+            for options in (("--list",), ("--no-fit", "--vs", "v", "--ps", "p"),
+                            ("--no-fit", "--vs-offset", "8", "--ps-offset", "32")):
+                with self.subTest(value=value, options=options):
+                    proc = self.run_cli("--game", self.game, "--work", self.work, *options)
+                    self.assert_one_clean_line(proc, path)
+                    self.assertIn("entry 1", proc.stderr)
+                    self.assertIn("offset", proc.stderr)
+                    self.assertEqual(proc.stdout, "")
+
     def test_list_prints_the_candidates_from_a_hand_written_index(self):
         self.bad_index(
             '[{"stage": "vs", "name": "a"}, {"stage": "ps", "name": "b"}, {"stage": "cs", "name": "c"}]'
