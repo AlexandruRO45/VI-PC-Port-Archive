@@ -588,6 +588,12 @@ When shrinking a DDS tagged sRGB, the converter averages RGB in linear light, we
 alpha, and encodes the result as sRGB again. An opaque black and white pair averages to 188 in sRGB
 and 128 in an untagged RGBA8 texture.
 
+Textured builds check each staged primitive against its resolved source material key before publishing. The check
+follows the primitive's base-color texture through to its embedded PNG bytes and checks the effective alpha mode
+and MASK cutoff (default 0.5). In each chunk record, `material_bindings.verified` counts stored primitives that
+passed. `material_bindings.unverifiable` counts primitives without a resolved, decodable texture binding,
+including geometry without UVs. Instanced meshes count once per stored primitive regardless of placement count.
+
 ### Shared geometry (`--instancing`)
 
 A city has 1.55 M HD placements of about 120 k models, and most models are placed many times. By default
