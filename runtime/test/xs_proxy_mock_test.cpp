@@ -70,7 +70,7 @@ namespace xs = rt::d3d12_xs;
 
 // ---- Mocks ----
 
-enum class Kind { device, queue, fence, resource, allocator, command_list };
+enum class Kind { device, queue, fence, resource, allocator, command_list, heap };
 
 constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
@@ -149,6 +149,7 @@ bool mock_has(const Mock* m, REFIID iid) {
         case Kind::allocator:
             return IsEqualIID(iid, __uuidof(ID3D12CommandAllocator)) ||
                    (m->allocator_tag && IsEqualIID(iid, xs::kLeonidaCommandAllocatorTag));
+        case Kind::heap: return IsEqualIID(iid, __uuidof(ID3D12DescriptorHeap));
         default: return false;
     }
 }
@@ -188,6 +189,7 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+            case 14: return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));    // CreateDescriptorHeap
             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
@@ -287,10 +289,12 @@ std::uint64_t word(const T* p) {
 const IID kQueueIid = __uuidof(ID3D12CommandQueue);
 const IID kFenceIid = __uuidof(ID3D12Fence);
 const IID kFence1Iid = __uuidof(ID3D12Fence1);
+const IID kHeapIid = __uuidof(ID3D12DescriptorHeap);
 const IID kUnknownIid = __uuidof(IUnknown);
 const IID kResourceIid = __uuidof(ID3D12Resource);
 const IID kDevice1Iid = __uuidof(ID3D12Device1);
 const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
+const D3D12_DESCRIPTOR_HEAP_DESC kHeapDesc{};
 
 // A device proxy over a new mock device. The proxy takes the mock's one reference.
 void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
@@ -313,6 +317,39 @@ void* make_queue(void* device) {
 void* make_fence(void* device, const IID& iid = kFenceIid) {
     void* fence = nullptr;
     return SUCCEEDED(hr_of(raw(device, 36, 0, 0, word(&iid), word(&fence)))) ? fence : nullptr;
+}
+
+void* make_heap(void* device, const IID& iid = kHeapIid) {
+    void* heap = nullptr;
+    return SUCCEEDED(hr_of(raw(device, 14, word(&kHeapDesc), word(&iid), word(&heap)))) ? heap : nullptr;
+}
+
+ULONG_PTR g_fault_address = 0;
+DWORD g_fault_code = 0;
+
+int record_fault(EXCEPTION_POINTERS* info) {
+    g_fault_code = info->ExceptionRecord->ExceptionCode;
+    g_fault_address = info->ExceptionRecord->NumberParameters >= 2 ? info->ExceptionRecord->ExceptionInformation[1] : 0;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// The read itself, in a function of its own: clang-cl's __try only catches a fault raised inside a call, not one
+// raised by a load in the __try body itself (MSVC catches both).
+__declspec(noinline) void* read_entry(void* const* vtable, unsigned slot) {
+    return *static_cast<void* const volatile*>(&vtable[slot]);
+}
+
+// Reads vtable[slot] the way a call through it does. Returns the exception code, or 0 when the read worked.
+DWORD read_slot_guarded(void* const* vtable, unsigned slot) {
+    g_fault_address = 0;
+    g_fault_code = 0;
+    __try {
+        void* volatile entry = read_entry(vtable, slot);
+        (void)entry;
+        return 0;
+    } __except (record_fault(GetExceptionInformation())) {
+        return g_fault_code;
+    }
 }
 
 unsigned long release(void* object) {
@@ -829,16 +866,63 @@ int check_tail(bool want_guarded) {
     EXPECT(device);
     void* queue = make_queue(device);
     void* fence = make_fence(device);
-    EXPECT(queue && fence);
+    void* heap = make_heap(device);
+    EXPECT(queue && fence && heap);
+    EXPECT(xs::is_heap_proxy(heap));
+    EXPECT(xs::device_proxy_table_size() == 128 && xs::heap_proxy_table_size() == 64);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
+    EXPECT(xs::device_and_heap_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
+    Mock* const heap_mock = reinterpret_cast<Mock*>(xs::heap_proxy_real_heap(heap));
+    EXPECT(heap_mock != nullptr);
+    xs::reset_device_proxy_stats();
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Heap public slot 6 (SetName) forwards to the real heap.
+    EXPECT(hr_of(raw(heap, 6, 0x1234)) == S_OK && heap_mock->calls[6] == 1 && heap_mock->args[6][0] == 0x1234);
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    for (unsigned slot = 11; slot < xs::heap_proxy_table_size(); ++slot) {
+        const std::uint64_t before = xs::heap_slot_hits(slot);
+        EXPECT(hr_of(raw(heap, slot, 0x11, 0x22, 0x33, 0x44)) == E_NOTIMPL && heap_mock->calls[slot] == 0);
+        EXPECT(xs::heap_slot_hits(slot) == before + 1 && xs::heap_slot_first_call_seen(slot));
+    }
+    // Second call on a refused heap tail slot still returns E_NOTIMPL and counts without hitting the mock.
+    {
+        const std::uint64_t before = xs::heap_slot_hits(11);
+        EXPECT(hr_of(raw(heap, 11, 0xaa, 0xbb, 0xcc, 0xdd)) == E_NOTIMPL && heap_mock->calls[11] == 0);
+        EXPECT(xs::heap_slot_hits(11) == before + 1);
+    }
+    // Heap still forwards public slots after refused tail calls.
+    EXPECT(hr_of(raw(heap, 6, 0x5678)) == S_OK && heap_mock->calls[6] == 2 && heap_mock->args[6][0] == 0x5678);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
+    EXPECT(xs::device_table_overruns() == 0 && xs::heap_table_overruns() == 0);
+    if (want_guarded) {
+        struct Probe {
+            void* object;
+            unsigned table;
+            std::uint64_t (*overruns)();
+        } probes[] = {
+            {device, xs::device_proxy_table_size(), &xs::device_table_overruns},
+            {heap, xs::heap_proxy_table_size(), &xs::heap_table_overruns},
+        };
+        for (const Probe& probe : probes) {
+            void* const* vtable = *reinterpret_cast<void* const* const*>(probe.object);
+            EXPECT(read_slot_guarded(vtable, probe.table - 1) == 0);  // last table slot is readable
+            for (unsigned slot : {probe.table, probe.table + 512, probe.table + 7000}) {
+                const std::uint64_t before = probe.overruns();
+                EXPECT(read_slot_guarded(vtable, slot) == EXCEPTION_ACCESS_VIOLATION);
+                EXPECT(g_fault_address == reinterpret_cast<ULONG_PTR>(&vtable[slot]));
+                EXPECT(probe.overruns() == before + 1);
+            }
+        }
+        EXPECT(xs::device_table_overruns() == 3 && xs::heap_table_overruns() == 3);
+        xs::reset_device_proxy_stats();
+        EXPECT(xs::device_table_overruns() == 0 && xs::heap_table_overruns() == 0);
+    }
+    EXPECT(release(heap) == 0 && heap_mock->refs == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;
 }

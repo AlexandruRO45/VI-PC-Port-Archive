@@ -71,7 +71,12 @@ struct DeviceProxy {
     std::atomic<std::uint64_t> frame_next_token{1};
 };
 
-constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
+constexpr unsigned kHeapPublicSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
+constexpr unsigned kHeapSlots = 64;        // the table: 11 public slots plus a refused tail
+constexpr SIZE_T kTableRegion = 64 * 1024;  // one allocation granule: the table page plus 15 never-committed pages
+static_assert(kHeapSlots > kHeapPublicSlots, "the heap table needs a tail");
+static_assert(kHeapSlots * sizeof(void*) <= 4096, "the heap table must fit in the first page of its reservation");
+static_assert(kMaxSlots * sizeof(void*) <= 4096, "the device table must fit in the first page of its reservation");
 
 struct HeapProxy {
     void** vtable;          // offset 0: the caller's ID3D12DescriptorHeap* points here
@@ -81,11 +86,68 @@ struct HeapProxy {
     std::atomic<unsigned long> refs;
 };
 
+struct GuardedTable {
+    SRWLOCK init_lock = SRWLOCK_INIT;
+    std::atomic<void**> vtable{nullptr};
+    std::atomic<std::uint64_t> overruns{0};
+    // Where the table and its reservation are: written once, before the table is handed out.
+    std::atomic<std::uintptr_t> table_begin{0}, table_end{0}, region_end{0};
+};
+
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
 std::atomic<bool> g_first[kMaxSlots];
 std::atomic<bool> g_beyond_warned[kMaxSlots];
 std::atomic<std::uint64_t> g_heap_hits[kHeapSlots];
 std::atomic<bool> g_heap_first[kHeapSlots];
+std::atomic<bool> g_heap_beyond_warned[kHeapSlots];
+GuardedTable g_device_table_guard;
+GuardedTable g_heap_table_guard;
+void* g_device_vtable_fallback[kMaxSlots];
+void* g_heap_vtable_fallback[kHeapSlots];
+
+bool install_table_overrun_handler();
+
+template <typename FillFn>
+void** init_guarded_vtable(GuardedTable& state, const char* kind, unsigned slot_count, void** fallback_storage,
+                           FillFn fill) {
+    if (void** ready = state.vtable.load(std::memory_order_acquire)) return ready;
+    AcquireSRWLockExclusive(&state.init_lock);
+    void** table = state.vtable.load(std::memory_order_relaxed);
+    if (!table) {
+        const std::size_t bytes = static_cast<std::size_t>(slot_count) * sizeof(void*);
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        const SIZE_T page = system.dwPageSize;
+        if (void* base = page >= bytes ? VirtualAlloc(nullptr, kTableRegion, MEM_RESERVE, PAGE_NOACCESS) : nullptr) {
+            if (VirtualAlloc(base, page, MEM_COMMIT, PAGE_READWRITE)) {
+                table = reinterpret_cast<void**>(static_cast<char*>(base) + page - bytes);
+                fill(table);
+                DWORD old = 0;
+                if (!VirtualProtect(base, page, PAGE_READONLY, &old))  // the table works, but stays writable
+                    std::fprintf(stderr, "[rt] d3d12_xs: %s proxy table stays writable (VirtualProtect error %lu)\n",
+                                 kind, GetLastError());
+                state.table_begin.store(reinterpret_cast<std::uintptr_t>(table), std::memory_order_release);
+                state.region_end.store(reinterpret_cast<std::uintptr_t>(base) + kTableRegion,
+                                       std::memory_order_release);
+                // table_end is what "guarded" means (device_and_heap_tables_guarded, the fault logger): set only when
+                // a fault past the table will be named. Without the logger the region still faults, unnamed.
+                if (install_table_overrun_handler())
+                    state.table_end.store(reinterpret_cast<std::uintptr_t>(base) + page, std::memory_order_release);
+            } else {
+                VirtualFree(base, 0, MEM_RELEASE);
+            }
+        }
+        if (!table) {
+            // No reservation: the table still works, but a slot past it is not caught.
+            std::fprintf(stderr, "[rt] d3d12_xs: %s proxy table without a guard region\n", kind);
+            fill(fallback_storage);
+            table = fallback_storage;
+        }
+        state.vtable.store(table, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&state.init_lock);
+    return table;
+}
 // The hit counters are for tests. They count from the first call of a *_slot_hits reader or of
 // reset_device_proxy_stats, so the calls of a title, which reads no counter, write no shared counter.
 std::atomic<bool> g_count_hits{false};
@@ -243,7 +305,7 @@ const char* heap_slot_name(unsigned slot) {
         case 8: return "GetDesc";
         case 9: return "GetCPUDescriptorHandleForHeapStart";
         case 10: return "GetGPUDescriptorHandleForHeapStart";
-        default: return "forwarded";
+        default: return slot < kHeapPublicSlots ? "forwarded" : "past the public chain";
     }
 }
 
@@ -563,6 +625,18 @@ std::uint64_t WINAPI heap_slot(HeapProxy* self, std::uint64_t a1, std::uint64_t 
         return static_cast<std::uint64_t>(heap_get_cpu_handle(self).ptr);
     } else if constexpr (Slot == 10) {
         return static_cast<std::uint64_t>(heap_get_gpu_handle(self).ptr);
+    } else if constexpr (Slot >= kHeapPublicSlots) {
+        note_heap_slot(Slot);
+        bool expected = false;
+        if (g_heap_beyond_warned[Slot].compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: heap slot %u is beyond the PC heap vtable (%u slots); returning E_NOTIMPL "
+                         "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                         Slot, kHeapPublicSlots, static_cast<unsigned long long>(a1),
+                         static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                         static_cast<unsigned long long>(a4));
+        }
+        return hr_to_u64(E_NOTIMPL);
     } else {
         note_heap_slot(Slot);
         using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
@@ -580,12 +654,9 @@ void fill_heap_vtable(void** vtable, std::index_sequence<I...>) {
 }
 
 void** get_heap_vtable() {
-    static void** vtable = [] {
-        static void* storage[kHeapSlots];
-        fill_heap_vtable(storage, std::make_index_sequence<kHeapSlots>{});
-        return storage;
-    }();
-    return vtable;
+    return init_guarded_vtable(g_heap_table_guard, "heap", kHeapSlots, g_heap_vtable_fallback, [](void** table) {
+        fill_heap_vtable(table, std::make_index_sequence<kHeapSlots>{});
+    });
 }
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out) {
@@ -666,7 +737,6 @@ constexpr unsigned kFencePublicSlots = 11;   // ID3D12Fence
 constexpr unsigned kFence1PublicSlots = 12;  // ID3D12Fence1
 constexpr unsigned kAllocatorSlots = 64;     // the table: 9 public slots plus a refused tail
 constexpr unsigned kAllocatorPublicSlots = 9;  // ID3D12CommandAllocator: the base chain and Reset (slot 8)
-constexpr SIZE_T kTableRegion = 64 * 1024;   // one allocation granule: the table page plus 15 never-committed pages
 static_assert(kQueueSlots > kQueuePublicSlots && kFenceSlots > kFence1PublicSlots &&
                   kAllocatorSlots > kAllocatorPublicSlots,
               "the tables need a tail");
@@ -930,14 +1000,16 @@ private:
 
 // The vtable read for a slot past a table faults in the reservation behind it; name the slot. Only reads the
 // exception record and writes with WriteFile, so it is safe whatever the faulting thread holds.
-template <ChildKind K>
-void report_table_overrun(std::uintptr_t address) {
-    using S = ChildStats<K>;
-    const std::uintptr_t begin = S::table_begin.load(std::memory_order_acquire);
-    const std::uintptr_t end = S::table_end.load(std::memory_order_acquire);
-    const std::uintptr_t limit = S::region_end.load(std::memory_order_acquire);
-    if (!end || address < end || address >= limit) return;
-    S::overruns.fetch_add(1, std::memory_order_relaxed);
+void report_guarded_table_overrun(const char* kind, const std::atomic<std::uintptr_t>& table_begin,
+                                  const std::atomic<std::uintptr_t>& table_end,
+                                  const std::atomic<std::uintptr_t>& region_end,
+                                  std::atomic<std::uint64_t>& overruns, std::uintptr_t address) {
+    const std::uintptr_t end = table_end.load(std::memory_order_acquire);
+    if (!end) return;
+    const std::uintptr_t begin = table_begin.load(std::memory_order_relaxed);
+    const std::uintptr_t limit = region_end.load(std::memory_order_relaxed);
+    if (address < end || address >= limit) return;
+    overruns.fetch_add(1, std::memory_order_relaxed);
     char line[160];
     unsigned long long slot = (address - begin) / sizeof(void*);
     char digits[24];
@@ -951,7 +1023,7 @@ void report_table_overrun(std::uintptr_t address) {
         while (*text && n < static_cast<int>(sizeof(line)) - 1) line[n++] = *text++;
     };
     put("[rt] d3d12_xs: ");
-    put(child_kind_name<K>());
+    put(kind);
     put(" slot ");
     while (d > 0 && n < static_cast<int>(sizeof(line)) - 1) line[n++] = digits[--d];
     put(" is past the proxy table; the vtable read faults\n");
@@ -959,10 +1031,21 @@ void report_table_overrun(std::uintptr_t address) {
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n), &written, nullptr);
 }
 
+template <ChildKind K>
+void report_table_overrun(std::uintptr_t address) {
+    using S = ChildStats<K>;
+    report_guarded_table_overrun(child_kind_name<K>(), S::table_begin, S::table_end, S::region_end, S::overruns,
+                                 address);
+}
+
 LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* record = info ? info->ExceptionRecord : nullptr;
     if (record && record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
         const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+        report_guarded_table_overrun("device", g_device_table_guard.table_begin, g_device_table_guard.table_end,
+                                     g_device_table_guard.region_end, g_device_table_guard.overruns, address);
+        report_guarded_table_overrun("heap", g_heap_table_guard.table_begin, g_heap_table_guard.table_end,
+                                     g_heap_table_guard.region_end, g_heap_table_guard.overruns, address);
         report_table_overrun<ChildKind::queue>(address);
         report_table_overrun<ChildKind::fence>(address);
         report_table_overrun<ChildKind::allocator>(address);
@@ -1026,8 +1109,8 @@ void fill_child_vtable(void** vtable, std::index_sequence<I...>) {
 bool install_table_overrun_handler() {
     static const bool installed = [] {
         if (AddVectoredExceptionHandler(0, &table_overrun_handler)) return true;
-        std::fprintf(stderr, "[rt] d3d12_xs: AddVectoredExceptionHandler failed (error %lu); a slot past a queue or "
-                     "fence proxy table faults without being named\n", GetLastError());
+        std::fprintf(stderr, "[rt] d3d12_xs: AddVectoredExceptionHandler failed (error %lu); a slot past a proxy "
+                     "table faults without being named\n", GetLastError());
         return false;
     }();
     return installed;
@@ -1577,12 +1660,9 @@ void fill_vtable(void** vtable, std::index_sequence<I...>) {
 }
 
 void** get_vtable() {
-    static void** vtable = [] {
-        static void* storage[kMaxSlots];
-        fill_vtable(storage, std::make_index_sequence<kMaxSlots>{});
-        return storage;
-    }();
-    return vtable;
+    return init_guarded_vtable(g_device_table_guard, "device", kMaxSlots, g_device_vtable_fallback, [](void** table) {
+        fill_vtable(table, std::make_index_sequence<kMaxSlots>{});
+    });
 }
 
 bool supports(ID3D12Device* real, REFIID iid) {
@@ -1693,9 +1773,28 @@ ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap) {
     return static_cast<const HeapProxy*>(heap)->real;
 }
 
+unsigned heap_proxy_table_size() { return kHeapSlots; }
+
+std::uint64_t heap_table_overruns() {
+    return g_heap_table_guard.overruns.load(std::memory_order_relaxed);
+}
+
 unsigned device_proxy_slot_count(const void* device) {
     if (!is_device_proxy(device)) return 0;
     return static_cast<const DeviceProxy*>(device)->slot_count;
+}
+
+unsigned device_proxy_table_size() { return kMaxSlots; }
+
+std::uint64_t device_table_overruns() {
+    return g_device_table_guard.overruns.load(std::memory_order_relaxed);
+}
+
+bool device_and_heap_tables_guarded() {
+    get_vtable();
+    get_heap_vtable();
+    return g_device_table_guard.table_end.load(std::memory_order_acquire) &&
+           g_heap_table_guard.table_end.load(std::memory_order_acquire);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {
@@ -1840,10 +1939,13 @@ void reset_device_proxy_stats() {
         g_first[slot].store(false, std::memory_order_relaxed);
         g_beyond_warned[slot].store(false, std::memory_order_relaxed);
     }
+    g_device_table_guard.overruns.store(0, std::memory_order_relaxed);
     for (unsigned slot = 0; slot < kHeapSlots; ++slot) {
         g_heap_hits[slot].store(0, std::memory_order_relaxed);
         g_heap_first[slot].store(false, std::memory_order_relaxed);
+        g_heap_beyond_warned[slot].store(false, std::memory_order_relaxed);
     }
+    g_heap_table_guard.overruns.store(0, std::memory_order_relaxed);
     reset_child_stats<ChildKind::queue>();
     reset_child_stats<ChildKind::fence>();
     reset_child_stats<ChildKind::allocator>();

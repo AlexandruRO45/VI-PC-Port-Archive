@@ -82,9 +82,19 @@ void* device_proxy_primary(void* device);
 // True when `heap` is a descriptor-heap proxy created by device slot 14.
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
+// Size of the heap proxy's vtable (11 public slots plus a refused tail up to 64).
+unsigned heap_proxy_table_size();
+// Vtable reads past the heap proxy table that faulted in its guard region (counted by the fault logger).
+std::uint64_t heap_table_overruns();
 
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
+// Size of the device proxy's vtable (kMaxSlots) and vtable reads past it that faulted in its guard region.
+unsigned device_proxy_table_size();
+std::uint64_t device_table_overruns();
+// True when both the device and heap tables sit in front of their guard regions (false only if a reservation
+// or the fault logger failed).
+bool device_and_heap_tables_guarded();
 
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
