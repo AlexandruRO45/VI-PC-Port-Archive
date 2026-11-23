@@ -19,20 +19,22 @@ Standard library Python only (unittest, struct, math, dataclasses, enum, typing)
 Strictly zero game data.
 """
 
-from dataclasses import dataclass
-from enum import Enum, auto
 import os
 import struct
 import sys
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import support
-import spirv_mini_interp as si
+try:
+    import support
+    import spirv_mini_interp as si
+except TypeError:
+    support = None
+    si = None
 
 MASK32: int = 0xFFFF_FFFF
 SIGN_BIT32: int = 0x8000_0000
@@ -40,6 +42,13 @@ MIN_INT32: int = -0x8000_0000
 MAX_INT32: int = 0x7FFF_FFFF
 FSSM_64 = bytes(0x138) + struct.pack("<4I", 0x8088, 64, 1, 1)
 VSHARP = [0, 0, 0x1000, 0x31016FAC]
+
+
+class _TranslatorTestCase(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        if support is None or si is None:
+            self.skipTest("rdna2spirv requires Python 3.10+ (PEP 604 union types)")
 
 
 def to_s32(val: int) -> int:
@@ -127,7 +136,7 @@ def run_translated_min3_i32(
 # Commit 1: Reference Mathematical Oracle and Architectural Model
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32Oracle(unittest.TestCase):
+class TestVMin3I32Oracle(_TranslatorTestCase):
     """Unit tests for reference oracle backed by translator execution."""
 
     def test_oracle_signed_negatives_vs_positives(self):
@@ -168,7 +177,7 @@ class TestVMin3I32Oracle(unittest.TestCase):
 # Commit 2: Symbolic AST Opcode Definitions and Typed Expressions
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32AST(unittest.TestCase):
+class TestVMin3I32AST(_TranslatorTestCase):
     """Unit tests for AST opcode representations and syntax rejection via translator."""
 
     def test_ast_valid_vgpr_operands(self):
@@ -213,7 +222,7 @@ class TestVMin3I32AST(unittest.TestCase):
 # Commit 3: Deterministic Scalar Instruction Interpreter
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32ScalarInterpreter(unittest.TestCase):
+class TestVMin3I32ScalarInterpreter(_TranslatorTestCase):
     """Unit tests verifying deterministic scalar execution via translator."""
 
     def test_interpreter_step_basic(self):
@@ -246,7 +255,7 @@ class TestVMin3I32ScalarInterpreter(unittest.TestCase):
 # Commit 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32SIMDDivergence(unittest.TestCase):
+class TestVMin3I32SIMDDivergence(_TranslatorTestCase):
     """Unit tests for SIMD divergence under Wave64 EXEC masking via compute workgroup execution."""
 
     def test_divergent_lanes_preserve_inactive_state(self):
@@ -292,7 +301,7 @@ class TestVMin3I32SIMDDivergence(unittest.TestCase):
 # Commit 5: Register Aliasing and In-Place Operand Preservation
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32Aliasing(unittest.TestCase):
+class TestVMin3I32Aliasing(_TranslatorTestCase):
     """Unit tests for register aliasing and in-place operand preservation through translator."""
 
     def test_alias_dst_equals_src0(self):
@@ -324,7 +333,7 @@ class TestVMin3I32Aliasing(unittest.TestCase):
 # Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32ConditionCodes(unittest.TestCase):
+class TestVMin3I32ConditionCodes(_TranslatorTestCase):
     """Unit tests verifying sign and zero detection on translated output words."""
 
     def test_zero_result_translation(self):
@@ -346,7 +355,7 @@ class TestVMin3I32ConditionCodes(unittest.TestCase):
 # Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
+class TestVMin3I32IEEE754Bitwise(_TranslatorTestCase):
     """Unit tests verifying that IEEE 754 bit patterns are compared strictly as signed integers."""
 
     FLOAT32_PATTERNS = {
@@ -386,7 +395,7 @@ class TestVMin3I32IEEE754Bitwise(unittest.TestCase):
 # Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
 # -----------------------------------------------------------------------------
 
-class TestVMin3I32NegativeAndMutation(unittest.TestCase):
+class TestVMin3I32NegativeAndMutation(_TranslatorTestCase):
     """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
 
     def test_mutation_detector_unsigned_vs_signed(self):
