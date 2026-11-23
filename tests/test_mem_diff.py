@@ -3,17 +3,21 @@ llvm-mc).
 
     python -I tests/test_mem_diff.py
 """
+import contextlib
+import io
 import os
 import random
 import sys
 import unittest
 from fractions import Fraction
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.dont_write_bytecode = True
 
 import mem_diff as md  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct  # noqa: E402
 
 
 def program(lines, memory):
@@ -60,6 +64,76 @@ class EverythingSkipped(unittest.TestCase):
             rc = md.main(["--programs", "2", "--seed", "1"])
         self.assertEqual(rc, 2, out.getvalue())
         self.assertIn("no program ran: every one was skipped", out.getvalue())
+
+
+class InterpreterErrors(unittest.TestCase):
+    """One passing case must not hide an invalid module or a broken interpreter."""
+
+    def run_cli(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = md.main(["--programs", "2", "--seed", "1", "--max-ops", "1", "--family", "s_load"])
+        return rc, out.getvalue()
+
+    def assert_harness_error(self, rc, output, reason):
+        self.assertEqual(rc, 2, output)
+        self.assertIn("1 pass, 0 mismatch, 0 skipped, 1 harness errors", output)
+        self.assertIn("ps_mem_00000: harness error " + reason, output)
+
+    def test_real_interpreter_rejects_invalid_translated_modules(self):
+        translate = md.rdna2spirv.translate
+        for instruction in ("OpSelectionMerge %invalid None", "%invalid = OpPhi %uint %uint_0 %entry"):
+            with self.subTest(instruction=instruction):
+                calls = 0
+
+                def corrupt_first(path):
+                    nonlocal calls
+                    calls += 1
+                    text = translate(path)
+                    if calls == 1:
+                        self.assertIn("OpFunctionEnd", text)
+                        text = text.replace("OpFunctionEnd", instruction + "\nOpFunctionEnd", 1)
+                    return text
+
+                with mock.patch.object(md.rdna2spirv, "translate", side_effect=corrupt_first):
+                    rc, output = self.run_cli()
+                self.assertEqual(calls, 2)
+                self.assert_harness_error(rc, output, "InvalidModule:")
+
+    def test_interpreter_crash_is_not_a_skip(self):
+        run_fragment = md.run_fragment
+        for error in (RuntimeError("interpreter failed"), KeyError("missing value"), ValueError("bad value")):
+            with self.subTest(error=type(error).__name__):
+                calls = 0
+
+                def fail_first(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise error
+                    return run_fragment(*args, **kwargs)
+
+                with mock.patch.object(md, "run_fragment", side_effect=fail_first):
+                    rc, output = self.run_cli()
+                self.assertEqual(calls, 2)
+                self.assert_harness_error(rc, output, type(error).__name__ + ":")
+
+    def test_explicit_unsupported_construct_remains_a_skip(self):
+        run_fragment = md.run_fragment
+        calls = 0
+
+        def unsupported_first(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise UnsupportedConstruct("unmodelled operation")
+            return run_fragment(*args, **kwargs)
+
+        with mock.patch.object(md, "run_fragment", side_effect=unsupported_first):
+            rc, output = self.run_cli()
+        self.assertEqual(rc, 0, output)
+        self.assertIn("1 pass, 0 mismatch, 1 skipped, 0 harness errors", output)
+        self.assertIn("mini_interp unsupported: UnsupportedConstruct: unmodelled operation", output)
 
 
 class Reference(unittest.TestCase):

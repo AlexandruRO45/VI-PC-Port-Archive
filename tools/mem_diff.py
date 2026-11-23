@@ -51,7 +51,7 @@ if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct, run_fragment  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = (1 << 64) - 1
@@ -729,7 +729,7 @@ def run_one(name, prog):
     memory = dict(prog.memory)
     try:
         out = run_fragment(spvasm, memory=memory)
-    except Exception as e:  # noqa: BLE001 - the interpreter is half of the comparison
+    except UnsupportedConstruct as e:
         return "skip", f"mini_interp unsupported: {type(e).__name__}: {e}"
     got = list(out.get("%out_mrt0", ()))
     if got != want:
