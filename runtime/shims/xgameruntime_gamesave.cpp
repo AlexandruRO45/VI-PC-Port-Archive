@@ -546,6 +546,9 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
         XAsyncComplete(data->async, hr, SUCCEEDED(hr) ? size : 0);
         return S_OK;
     }
+    case XAsyncOp::Cancel:
+        XAsyncComplete(data->async, E_ABORT, 0);
+        return S_OK;
     case XAsyncOp::GetResult:
         if (!data->buffer) return E_INVALIDARG;
         if (job->identity == &kInitIdentity) {

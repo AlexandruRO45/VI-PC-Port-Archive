@@ -154,6 +154,46 @@ int main() {
     check(at<Quota>(save, 7)(save, provider, &quota) == S_OK && quota == (int64_t{1} << 30),
           "GetRemainingQuota of an empty provider is the whole 1 GiB");
 
+    // A manual work queue keeps the job pending until explicitly dispatched.
+    XTaskQueueHandle cancel_queue = nullptr;
+    check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &cancel_queue) == S_OK,
+          "create manual queue for cancellation");
+    if (!cancel_queue) return 1;
+    XAsyncBlock normal{};
+    normal.queue = cancel_queue;
+    check(at<WithAsync>(save, 8)(save, provider, &normal) == S_OK &&
+              XAsyncGetStatus(&normal, false) == E_PENDING,
+          "uncancelled quota job waits on the manual queue");
+    XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Work, 0);
+    check(XAsyncGetStatus(&normal, true) == S_OK, "uncancelled quota job completes successfully");
+    XAsyncCancel(&normal);
+    check(XAsyncGetStatus(&normal, false) == S_OK, "cancelling a completed job preserves success");
+    int64_t normal_quota = 0;
+    check(at<QuotaResult>(save, 9)(save, &normal, &normal_quota) == S_OK && normal_quota == quota,
+          "completed quota result remains available");
+
+    XAsyncBlock cancelled{};
+    cancelled.queue = cancel_queue;
+    check(at<WithAsync>(save, 8)(save, provider, &cancelled) == S_OK &&
+              XAsyncGetStatus(&cancelled, false) == E_PENDING,
+          "quota job to cancel waits on the manual queue");
+    XAsyncCancel(&cancelled);
+    struct WaitStatus { XAsyncBlock* async; HRESULT result; } wait{&cancelled, E_PENDING};
+    HANDLE waiter = CreateThread(nullptr, 0, [](void* arg) -> DWORD {
+        auto* state = static_cast<WaitStatus*>(arg);
+        state->result = XAsyncGetStatus(state->async, true);
+        return 0;
+    }, &wait, 0, nullptr);
+    if (!waiter || WaitForSingleObject(waiter, 5000) != WAIT_OBJECT_0) {
+        std::printf("FAIL cancelled quota job did not complete within 5 seconds\n");
+        ExitProcess(1);
+    }
+    CloseHandle(waiter);
+    check(wait.result == E_ABORT, "cancelled quota job completes with E_ABORT");
+    while (XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Work, 0) ||
+           XTaskQueueDispatch(cancel_queue, XTaskQueuePort::Completion, 0)) {}
+    XTaskQueueCloseHandle(cancel_queue);
+
     // ---- containers and names ----
     Handle container = nullptr;
     check(at<Create>(save, 16)(save, provider, "bad name", &container) == E_GS_INVALID_CONTAINER_NAME && !container,
