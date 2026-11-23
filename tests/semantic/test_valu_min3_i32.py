@@ -586,3 +586,97 @@ class TestIEEE754EdgeCases(unittest.TestCase):
             expected = min(to_signed_i32(x) for x in triple) & MASK32
             for perm in itertools.permutations(triple):
                 self.assertEqual(oracle_min3_i32(*perm), expected)
+
+
+# ==============================================================================
+# SECTION 8: Translator-Backed Execution Tests and Negative Controls
+# ==============================================================================
+
+class TestTranslatorBackedExecutionAndNegativeControls(unittest.TestCase):
+    """Commit 8: Translator-backed execution tests and negative controls for v_min3_i32."""
+
+    def test_rejection_invalid_destination(self) -> None:
+        """Verify syntax rejection when destination is not a VGPR."""
+        with self.assertRaises(TypeError):
+            VMin3I32Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+
+    def test_rejection_out_of_range_registers(self) -> None:
+        """Verify rejection of register indices outside architectural bounds."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+
+    def test_spirv_opcode_generation(self) -> None:
+        """Verify that rdna2spirv emits OpExtInst SMin instructions."""
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mov_b32 v3, 30",
+            "v_min3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_spv_check", lines)
+        self.assertIn("OpExtInst %uint %glsl SMin", spv)
+
+    def test_mutation_detection_swap_smin_with_smax(self) -> None:
+        """Mutation detector: swapping SMin with SMax in SPIR-V alters results."""
+        lines = [
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 30",
+            "v_min3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_min3_test", lines)
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], 10)
+
+        self.assertIn("SMin", spv)
+        mutated_spv = spv.replace("SMin", "SMax")
+        mutated_words = support.mrt0_words(mutated_spv)
+        self.assertNotEqual(orig_words[0], mutated_words[0])
+        self.assertEqual(mutated_words[0], 50)
+
+    def test_mutation_detection_swap_smin_with_umin(self) -> None:
+        """Mutation detector: swapping SMin with UMin causes divergence on negative inputs."""
+        s_neg100 = from_signed_i32(-100)
+        lines = [
+            f"v_mov_b32 v1, {s_neg100:#x}",
+            "v_mov_b32 v2, 10",
+            "v_mov_b32 v3, 20",
+            "v_min3_i32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_umin_test", lines)
+        orig_words = support.mrt0_words(spv)
+        self.assertEqual(orig_words[0], s_neg100)
+
+        mutated_spv = spv.replace("SMin", "UMin")
+        mutated_words = support.mrt0_words(mutated_spv)
+        self.assertEqual(mutated_words[0], 10)
+        self.assertNotEqual(orig_words[0], mutated_words[0])
+
+    def test_mutation_detection_inactive_lane_overwritten(self) -> None:
+        """Mutation detector: faulty interpreter overwriting inactive lane is detected."""
+        state = SIMDState(num_lanes=32, exec_mask=0x1)
+        sentinel = 0x5555_5555
+        state.set_vgpr(1, 0, sentinel)
+
+        class FaultyInterpreter(SIMDInterpreter):
+            def step(self, instr: VMin3I32Instruction, s: SIMDState):
+                for l in range(s.num_lanes):
+                    s.set_vgpr(l, instr.dst.value, 0x1234)
+                return []
+
+        faulty = FaultyInterpreter()
+        instr = VMin3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        faulty.step(instr, state)
+        self.assertNotEqual(state.get_vgpr(1, 0), sentinel)
+
+
+if __name__ == "__main__":
+    unittest.main()
