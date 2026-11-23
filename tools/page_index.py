@@ -28,6 +28,7 @@ Usage:
     python -I page_index.py <carved-dir> <out.json|out.csv> [--quiet]
 
 --start and --limit apply to a single archive only; with a directory they are an error (exit 2).
+A JSON `--out` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 from collections import Counter
@@ -36,12 +37,16 @@ import json
 import mmap
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I omits the script directory from sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 # zlib stream start. Kept in step with rpf9_carve.py.
@@ -371,8 +376,37 @@ def summarise(pages, mode, source):
 
 
 def write_json(path, pages, summary):
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "pages": pages}, f, indent=1)
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    payload = {"summary": summary, "pages": pages}
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".page_index-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def write_csv(path, pages):
