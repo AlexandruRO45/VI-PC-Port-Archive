@@ -1,6 +1,7 @@
-; Vertex shader for ps_interp_f32_mods and ps_interp_mov_mods: the vs_ids full-screen triangle, with the same constant
+; Vertex shader for ps_interp_f32_mods, ps_interp_mov_mods and ps_interp_mods_edge: the vs_ids full-screen triangle, with the same constant
 ; in each param channel at all three vertices, so interpolation gives that constant at every pixel:
-; param0 = (1.5, -0.25, 0.375, 0.625), param1 = (1.5, -0.5, 0.25, 4.0), param2 = (0.25, 3.0, 0, 0).
+; param0 = (1.5, -0.25, 0.375, 0.625), param1 = (1.5, -0.5, 0.25, 4.0), param2 = (0.25, 3.0, 0, 0),
+; param3 = (2^126, 2^-125, 0, 0), param4 = (2^127, 2^-100, 0, 0).
 v_lshlrev_b32_e32 v1, 1, v0
 v_and_b32_e32 v1, 2, v1
 v_and_b32_e32 v2, 2, v0
@@ -23,4 +24,10 @@ exp param1 v7, v8, v9, v10
 v_mov_b32_e32 v7, 0.25
 v_mov_b32_e32 v8, 0x40400000
 exp param2 v7, v8, v5, v5
+v_mov_b32_e32 v7, 0x7e800000
+v_mov_b32_e32 v8, 0x01000000
+exp param3 v7, v8, v5, v5
+v_mov_b32_e32 v7, 0x7f000000
+v_mov_b32_e32 v8, 0x0d800000
+exp param4 v7, v8, v5, v5
 s_endpgm

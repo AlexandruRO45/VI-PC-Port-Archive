@@ -4,7 +4,7 @@ Each fixture in runtime/test/shaders writes four mrt0 words that its .asm header
 bits"). These tests keep the three places that state those words in step with the translator: the interpreter run of
 the translated fixture (tests/semantic/fixtures/disasm, made by regen_fixtures.py), check.py's PIXEL_BITS and
 scripts/run_gpu_tests.py's table. A GPU run of check.py or run_gpu_tests.py then compares the same words with what
-the device writes. The two interp fixtures are drawn with vs_interp_consts, whose params are constant over the
+the device writes. The three interp fixtures are drawn with vs_interp_consts, whose params are constant over the
 triangle; the interpreter gets those constants, read back from that vertex shader's source.
 """
 import os
@@ -23,7 +23,7 @@ import support  # noqa: E402
 import check    # noqa: E402  (runtime/test/shaders/check.py; importing it runs nothing)
 
 FIXTURES = ("ps_cmp_nlg", "ps_cvt_off", "ps_fmac_f16_mods", "ps_vop3_const_mods", "ps_interp_f32_mods",
-            "ps_interp_mov_mods")
+            "ps_interp_mov_mods", "ps_interp_mods_edge")
 INTERP_VERTEX = "vs_interp_consts"
 INLINE_F32 = {"0.5": 0x3F000000, "-0.5": 0xBF000000, "1.0": 0x3F800000, "-1.0": 0xBF800000, "2.0": 0x40000000,
               "-2.0": 0xC0000000, "4.0": 0x40800000, "-4.0": 0xC0800000, "0.25": 0x3E800000, "-0.25": 0xBE800000}
@@ -98,7 +98,9 @@ class RuleFixtureTests(unittest.TestCase):
         self.assertEqual(params[0], (1.5, -0.25, 0.375, 0.625))
         self.assertEqual(params[1], (1.5, -0.5, 0.25, 4.0))
         self.assertEqual(params[2], (0.25, 3.0, 0.0, 0.0))
-        for name in ("ps_interp_f32_mods", "ps_interp_mov_mods"):
+        self.assertEqual(params[3], (2.0 ** 126, 2.0 ** -125, 0.0, 0.0))
+        self.assertEqual(params[4], (2.0 ** 127, 2.0 ** -100, 0.0, 0.0))
+        for name in ("ps_interp_f32_mods", "ps_interp_mov_mods", "ps_interp_mods_edge"):
             self.assertEqual(check.PIXEL_VERTEX[name], INTERP_VERTEX)
             self.assertIn(f"vk_harness {INTERP_VERTEX}.spv {name}.spv", read(name))
 
