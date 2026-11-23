@@ -267,7 +267,8 @@ class LocalDecoder:
         )
         if expected > ttpf.MAX_OUTPUT:
             raise ValueError("DDS exceeds output limit")
-        grids = [
+        # DDS carries only the visible block grid of each mip; the source grid below can be larger.
+        visible = [
             ((max(1, width >> i) + 3) // 4, (max(1, height >> i) + 3) // 4)
             for i in range(levels)
         ]
@@ -275,6 +276,7 @@ class LocalDecoder:
             # Mode-1 arrays group source slices by mip. DDS groups mips by slice.
             layout = ttpf.array_surface_layout(width, height, faces, levels, bs, 4, tile)
             bw, bh = layout["block_w"], layout["block_h"]
+            grids = [(m["blocks_w"], m["blocks_h"]) for m in layout["mips"]]
             offsets = {
                 mip["index"]: (mip["offset"], mip["tile_x"], mip["tile_y"], mip["slice_stride"])
                 for mip in layout["mips"]
@@ -301,6 +303,12 @@ class LocalDecoder:
                     + face * slice_stride
                     + offset
                 )
+                vw, vh = visible[i]
+                if (vw, vh) != (w, h):
+                    if vw > w or vh > h:
+                        raise ValueError("Source grid cannot hold the visible mip")
+                    # Addresses keep the storage pitch; only visible blocks are read and decoded.
+                    at = at.reshape(h, w)[:vh, :vw].ravel()
                 if at.max() + bs > d["base"] + span:
                     raise ValueError("Texture crosses its allocation boundary")
                 payload.extend(self.surface(at, bs, profile))

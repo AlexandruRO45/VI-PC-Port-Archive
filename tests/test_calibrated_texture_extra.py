@@ -1999,6 +1999,81 @@ class TestLocalDecoder(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "DDS exceeds output limit"):
             dec.dds(4)
 
+    def test_dds_crops_storage_grid_to_visible_blocks(self):
+        # Synthetic, spatially distinct blocks. Storage grids wider/taller than the visible grid
+        # (17x13 BC1 stores its 8x6 child as 3x2 blocks) must be cropped like ttpf_mips' exporter.
+        def distinct(layout, face):
+            eb = layout["element_bytes"]
+            return {
+                m["index"]: b"".join(
+                    hashlib.sha256(struct.pack("<4H", face, m["index"], x, y)).digest()[:eb]
+                    for y in range(m["blocks_h"])
+                    for x in range(m["blocks_w"])
+                )
+                for m in layout["mips"]
+            }
+
+        for fmt, w, h, mips, faces, mode, count in (
+            (71, 17, 13, 5, 1, 4, None),   # BC1 NPOT chain, 4K tile
+            (71, 17, 13, 5, 1, 4, 3),      # prefix of the same chain
+            (98, 65, 65, 7, 1, 4, None),   # BC7 NPOT chain
+            (71, 17, 13, 1, 1, 4, None),   # single mip
+            (71, 64, 64, 6, 1, 4, None),   # aligned: bytes unchanged
+            (71, 17, 13, 5, 2, 1, None),   # mode-1 array
+            (98, 17, 13, 5, 2, 1, 4),      # mode-1 BC7 array, prefix
+            # mip 1 stores 129 blocks (2 tile columns) but shows 128: source pitch follows storage
+            (71, 1025, 9, 2, 2, 1, None),
+        ):
+            with self.subTest(fmt=fmt, dims=(w, h, mips, faces, mode, count)):
+                tile = ttpf.tile_bytes(mode)
+                bs = 8 if fmt == 71 else 16
+                if faces > 1:
+                    lay = ttpf.array_surface_layout(w, h, faces, mips, bs, 4, tile)
+                else:
+                    lay = ttpf.surface_layout(w, h, fmt, mips, tile)
+                size = (lay["size"] + 4095) // 4096 * 4096
+                tiled = bytearray(size)
+                lins = []
+                for f in range(faces):
+                    lin = distinct(lay, f)
+                    lins.append(lin)
+                    for m in lay["mips"]:
+                        step = m.get("slice_stride", 0) if faces > 1 else 0
+                        ttm.retile_to(lay, m, lin[m["index"]], tiled, f * step)
+                pool, _ = self._open_pool(
+                    f"crop_{fmt}_{w}_{h}_{faces}_{mips}_{count}.ttpf",
+                    [ttm.pack_etpf_record(w, h, mips, 0, fmt, faces, 1, mode, 4096)],
+                    [(0, bytes(tiled), size)],
+                )
+                dec = ct.LocalDecoder(pool, {"version": 1})
+                requested = []
+                original = dec.surface
+                dec.surface = lambda at, bs_, profile, _o=original: (
+                    requested.append(len(at)) or _o(at, bs_, profile)
+                )
+                dds = dec.dds(0, count)
+                used = mips if count is None else count
+                expected = b"".join(
+                    ttpf._visible_rows(lay, lay["mips"][i], lins[f][i])
+                    for f in range(faces)
+                    for i in range(used)
+                )
+                visible = sum(
+                    ((max(1, w >> i) + 3) // 4) * ((max(1, h >> i) + 3) // 4) * bs
+                    for i in range(used)
+                )
+                self.assertEqual(len(expected), faces * visible)
+                self.assertEqual(dds[148:], expected)
+                # Stored padding coordinates are never requested from the pool.
+                self.assertEqual(
+                    requested,
+                    [
+                        ((max(1, w >> i) + 3) // 4) * ((max(1, h >> i) + 3) // 4)
+                        for _ in range(faces)
+                        for i in range(used)
+                    ],
+                )
+
     def test_dds_no_tail_64k_tile_layout(self):
         # 512x256 BC7 (fmt 98, bs=16, 64K tile -> bw=64, bh=64) with 2 mips:
         # mip 0 is 128x64 blocks (2 tiles), mip 1 is 64x32 blocks (> bw//2=32 -> 1 tile), so tail == 2 == levels.
