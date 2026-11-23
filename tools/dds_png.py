@@ -19,17 +19,20 @@ R16G16B16A16_FLOAT keeps its own alpha.
 R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alpha.
 
 Usage:
-    python -I tools/dds_png.py <in.dds> <out.png> [--max-size N]
+    python -I tools/dds_png.py <in.dds> --info
+    python -I tools/dds_png.py <in.dds> <out.png> [--mip N] [--layer N] [--face px] [--z N] [--max-size N]
 """
 from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
 from functools import cache
+import json
 import math
 import os
 import struct
 import sys
+from typing import BinaryIO, NamedTuple, TypedDict
 import zlib
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,6 +44,10 @@ DDS_MAGIC = b"DDS "
 DDS_HEADER_SIZE = 128
 DDS_DX10_HEADER_SIZE = 148
 DDSD_PITCH = 0x8
+DDSD_DEPTH = 0x800000
+DDSCAPS2_CUBEMAP = 0x200
+DDSCAPS2_VOLUME = 0x200000
+_CUBE_FACES = ("px", "nx", "py", "ny", "pz", "nz")
 DDS_ALPHA_MODE_MASK = 0x7
 DDS_ALPHA_MODE_PREMULTIPLIED = 2
 DDS_ALPHA_MODE_OPAQUE = 3
@@ -209,9 +216,23 @@ def _validate_mask(mask: int) -> tuple[int, int]:
     return shift, max_val
 
 
+class _DdsHeader(TypedDict):
+    width: int
+    height: int
+    depth: int
+    dimension: str
+    array_size: int
+    faces: tuple[str, ...]
+    format: str
+    dxgi_format: int | None
+    mip_count: int
+    pitch: int
+    data_offset: int
+
+
 def _parse_header_internal(
     data: bytes | bytearray | memoryview,
-) -> tuple[dict[str, int | str | None], tuple[int, int, int, int] | None, int]:
+) -> tuple[_DdsHeader, tuple[int, int, int, int] | None, int]:
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise DdsError(f"Expected bytes-like object, got {type(data).__name__}")
     if len(data) < DDS_HEADER_SIZE:
@@ -219,11 +240,10 @@ def _parse_header_internal(
     if bytes(data[:4]) != DDS_MAGIC:
         raise DdsError(f"Invalid DDS magic: {bytes(data[:4])!r}")
 
-    height, width = struct.unpack_from("<II", data, 12)
+    flags, height, width, pitch, raw_depth, raw_mips = struct.unpack_from("<6I", data, 8)
     if width <= 0 or height <= 0:
         raise DdsError(f"Invalid DDS dimensions: {width}x{height}")
 
-    raw_mips = struct.unpack_from("<I", data, 28)[0]
     mip_count = raw_mips if raw_mips > 0 else 1
 
     pf_flags, fourcc, rgb_bit_count, r_mask, g_mask, b_mask, a_mask = struct.unpack_from(
@@ -283,21 +303,119 @@ def _parse_header_internal(
     else:
         raise DdsError(f"Unsupported DDS pixel format flags: 0x{pf_flags:08X}")
 
-    info: dict[str, int | str | None] = {
+    caps2 = struct.unpack_from("<I", data, 112)[0]
+    if dxgi_format is not None:
+        dim, misc, array_size = struct.unpack_from("<III", data, 132)
+        if dim not in (2, 3, 4) or not array_size:
+            raise DdsError(f"Invalid DX10 texture dimension {dim} or array size {array_size}")
+        dimension = {2: "1d", 3: "2d", 4: "3d"}[dim]
+        faces = _CUBE_FACES if misc & 0x4 else ()
+    else:
+        dimension = "3d" if flags & DDSD_DEPTH or caps2 & DDSCAPS2_VOLUME else "2d"
+        array_size = 1
+        faces = ()
+        if caps2 & DDSCAPS2_CUBEMAP:
+            faces = tuple(face for index, face in enumerate(_CUBE_FACES)
+                          if caps2 & (0x400 << index))
+            if not faces:
+                raise DdsError("Legacy DDS cubemap has no faces")
+
+    if dimension == "1d" and height != 1:
+        raise DdsError("A 1D DDS must have height 1")
+    if faces and (dimension != "2d" or width != height):
+        raise DdsError("DDS cubemap faces must be square 2D textures")
+    depth = 1
+    if dimension == "3d":
+        if array_size != 1 or not flags & DDSD_DEPTH or not raw_depth:
+            raise DdsError("A DDS volume must specify depth with a single array element")
+        depth = raw_depth
+    if mip_count > max(width, height, depth).bit_length():
+        raise DdsError(f"Too many DDS mip levels ({mip_count}) for {width}x{height}x{depth}")
+
+    info: _DdsHeader = {
         "width": width,
         "height": height,
+        "depth": depth,
+        "dimension": dimension,
+        "array_size": array_size,
+        "faces": faces,
         "format": fmt,
         "dxgi_format": dxgi_format,
         "mip_count": mip_count,
         "data_offset": data_offset,
+        "pitch": pitch if flags & DDSD_PITCH else 0,
     }
     return info, masks, alpha_mode
 
 
-def parse_dds_header(data: bytes) -> dict:
-    """Parse a legacy or DX10 DDS header and return format metadata."""
+def parse_dds_header(data: bytes) -> _DdsHeader:
+    """Return format and shape metadata from a legacy or DX10 DDS header."""
     info, _, _ = _parse_header_internal(data)
     return info
+
+
+class _Plane(NamedTuple):
+    offset: int
+    width: int
+    height: int
+    row_pitch: int
+    byte_length: int
+
+
+_TEXEL_BYTES = {
+    "RGBA8": 4, "BGRA8": 4, "BGRX8": 4, "RGBX8": 4, "R11G11B10_FLOAT": 4,
+    "BGR8": 3, "RGB8": 3, "R16_UNORM": 2, "A8_UNORM": 1,
+    **{fmt: layout[0] for fmt, layout in _HALF_FLOAT_LAYOUT.items()},
+}
+
+
+def _locate_plane(info: _DdsHeader, *, mip: int = 0, layer: int = 0,
+                  face: str | None = None, z: int = 0) -> _Plane:
+    """Locate one stored 2D plane without walking individual layers or depth slices."""
+    for name, value, count in (("mip", mip, info["mip_count"]), ("layer", layer, info["array_size"])):
+        if type(value) is not int or not 0 <= value < count:
+            raise DdsError(f"DDS {name} must be in 0..{count - 1}, got {value!r}")
+    mip_depth = max(1, info["depth"] >> mip)
+    if type(z) is not int or not 0 <= z < mip_depth:
+        raise DdsError(f"DDS z must be in 0..{mip_depth - 1} at mip {mip}, got {z!r}")
+
+    faces = info["faces"]
+    if face is not None and face not in faces:
+        raise DdsError(f"DDS does not contain face {face!r}")
+    image_index = layer
+    if faces:
+        image_index = layer * len(faces) + (faces.index(face) if face is not None else 0)
+
+    fmt = info["format"]
+    if fmt.startswith("BC"):
+        block = 4
+        unit_bytes = 8 if fmt in ("BC1", "BC4", "BC4_SNORM") else 16
+    else:
+        block = 1
+        unit_bytes = _TEXEL_BYTES[fmt]
+
+    # Arrays and cubemaps store one complete mip chain per image. A volume
+    # instead stores all depth slices of each mip together. A header has at
+    # most 32 mip levels, irrespective of its declared array size or depth.
+    chain_bytes = 0
+    for level in range(info["mip_count"]):
+        width = max(1, info["width"] >> level)
+        height = max(1, info["height"] >> level)
+        rows = (height + block - 1) // block
+        row_bytes = (width + block - 1) // block * unit_bytes
+        row_pitch = row_bytes
+        if level == 0 and block == 1 and info["pitch"]:
+            row_pitch = info["pitch"]
+            if row_pitch < row_bytes:
+                raise DdsError(f"Invalid {fmt} row pitch: {row_pitch} bytes (need at least {row_bytes})")
+        slice_bytes = rows * row_pitch
+        if level == mip:
+            # The next plane starts after full rows including padding. Decoding
+            # this plane only needs the visible bytes of its last row.
+            plane = _Plane(chain_bytes + z * slice_bytes, width, height, row_pitch,
+                           slice_bytes - row_pitch + row_bytes)
+        chain_bytes += slice_bytes * max(1, info["depth"] >> level)
+    return plane._replace(offset=info["data_offset"] + image_index * chain_bytes + plane.offset)
 
 
 def _decode_uncompressed_32(
@@ -1109,51 +1227,41 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
     return bytes(out)
 
 
-def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
-    info, masks, alpha_mode = _parse_header_internal(data)
+def _decode_plane(data: bytes | bytearray | memoryview, plane: _Plane, info: _DdsHeader,
+                  masks: tuple[int, int, int, int] | None, alpha_mode: int) -> tuple[int, int, bytes, bool]:
+    """Decode data starting at the selected plane, in its source color space."""
+    payload = memoryview(data)
     srgb = info["dxgi_format"] in _SRGB_DXGI_FORMATS
-    width = int(info["width"])  # type: ignore[arg-type]
-    height = int(info["height"])  # type: ignore[arg-type]
-    fmt = str(info["format"])
-    offset = int(info["data_offset"])  # type: ignore[arg-type]
+    width, height, pitch = plane.width, plane.height, plane.row_pitch
+    fmt = info["format"]
 
     if fmt in ("RGBA8", "BGRA8", "BGRX8", "RGBX8"):
-        flags = struct.unpack_from("<I", data, 8)[0]
-        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_32(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        rgba = _decode_uncompressed_32(payload, width, height, fmt, masks, pitch)
     elif fmt in _HALF_FLOAT_LAYOUT:
-        flags = struct.unpack_from("<I", data, 8)[0]
-        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_half_float(memoryview(data)[offset:], width, height, fmt, pitch)
+        rgba = _decode_half_float(payload, width, height, fmt, pitch)
     elif fmt in _RGB24_LAYOUTS.values():
         assert masks is not None
-        flags = struct.unpack_from("<I", data, 8)[0]
-        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_uncompressed_24(memoryview(data)[offset:], width, height, fmt, masks, pitch)
+        rgba = _decode_uncompressed_24(payload, width, height, fmt, masks, pitch)
     elif fmt == "BC1":
-        rgba = _decode_bc1(data, offset, width, height)
+        rgba = _decode_bc1(payload, 0, width, height)
     elif fmt == "BC2":
-        rgba = _decode_bc2(data, offset, width, height)
+        rgba = _decode_bc2(payload, 0, width, height)
     elif fmt == "BC3":
-        rgba = _decode_bc3(data, offset, width, height)
+        rgba = _decode_bc3(payload, 0, width, height)
     elif fmt == "BC4":
-        rgba = _decode_bc4(data, offset, width, height, signed=False)
+        rgba = _decode_bc4(payload, 0, width, height, signed=False)
     elif fmt == "BC4_SNORM":
-        rgba = _decode_bc4(data, offset, width, height, signed=True)
+        rgba = _decode_bc4(payload, 0, width, height, signed=True)
     elif fmt == "BC5":
-        rgba = _decode_bc5(data, offset, width, height, signed=False)
+        rgba = _decode_bc5(payload, 0, width, height, signed=False)
     elif fmt == "BC5_SNORM":
-        rgba = _decode_bc5(data, offset, width, height, signed=True)
+        rgba = _decode_bc5(payload, 0, width, height, signed=True)
     elif fmt == "R11G11B10_FLOAT":
-        flags = struct.unpack_from("<I", data, 8)[0]
-        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_r11g11b10(memoryview(data)[offset:], width, height, pitch)
+        rgba = _decode_r11g11b10(payload, width, height, pitch)
     elif fmt in ("R16_UNORM", "A8_UNORM"):
-        flags = struct.unpack_from("<I", data, 8)[0]
-        pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
-        rgba = _decode_single_channel(memoryview(data)[offset:], width, height, pitch, fmt)
+        rgba = _decode_single_channel(payload, width, height, pitch, fmt)
     elif fmt == "BC7":
-        rgba = _decode_bc7(data, offset, width, height)
+        rgba = _decode_bc7(payload, 0, width, height)
     else:
         raise DdsError(f"Unsupported DDS format: {fmt}")
 
@@ -1167,9 +1275,18 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     return width, height, rgba, srgb
 
 
-def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data)
+def _decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
+                z: int = 0) -> tuple[int, int, bytes, bool]:
+    info, masks, alpha_mode = _parse_header_internal(data)
+    plane = _locate_plane(info, mip=mip, layer=layer, face=face, z=z)
+    payload = memoryview(data)[plane.offset:plane.offset + plane.byte_length]
+    return _decode_plane(payload, plane, info, masks, alpha_mode)
+
+
+def decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
+               z: int = 0) -> tuple[int, int, bytes]:
+    """Decode one DDS image plane into top-down row-major RGBA8 with straight alpha."""
+    width, height, rgba, _ = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
     return width, height, rgba
 
 
@@ -1298,45 +1415,86 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
     return PNG_SIGNATURE + ihdr + idat + iend
 
 
-def dds_to_png_bytes(data: bytes, max_size: int = 0) -> bytes:
-    """Decode a DDS buffer (optionally downscaling) and encode as PNG bytes."""
-    if max_size < 0:
-        raise DdsError(f"Invalid max_size: {max_size}")
-    w, h, rgba, srgb = _decode_dds(data)
+def _preview_png(image: tuple[int, int, bytes, bool], max_size: int) -> bytes:
+    w, h, rgba, srgb = image
     if max_size > 0:
         w, h, rgba = downscale_rgba(w, h, rgba, max_size, srgb=srgb)
     return encode_png(w, h, rgba)
 
 
-def dds_file_to_png_bytes(path: str, max_size: int = 0) -> bytes:
-    """Read a DDS file from disk and convert it to PNG bytes."""
+def _read_header(source: BinaryIO) -> bytes:
+    header = source.read(DDS_HEADER_SIZE)
+    if header[84:88] == b"DX10":
+        header += source.read(DDS_DX10_HEADER_SIZE - DDS_HEADER_SIZE)
+    return header
+
+
+def dds_to_png_bytes(
+    data: bytes, max_size: int = 0, *, mip: int = 0, layer: int = 0, face: str | None = None, z: int = 0,
+) -> bytes:
+    """Encode one DDS plane as PNG, optionally downscaling the selected mip."""
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
+    return _preview_png(_decode_dds(data, mip=mip, layer=layer, face=face, z=z), max_size)
+
+
+def dds_file_to_png_bytes(
+    path: str, max_size: int = 0, *, mip: int = 0, layer: int = 0, face: str | None = None, z: int = 0,
+) -> bytes:
+    """Seek directly to a mip, array layer, cube face or volume slice and encode it as PNG."""
+    if max_size < 0:
+        raise DdsError(f"Invalid max_size: {max_size}")
     with open(path, "rb") as f:
-        data = f.read()
-    return dds_to_png_bytes(data, max_size=max_size)
+        if not f.seekable():
+            return dds_to_png_bytes(f.read(), max_size, mip=mip, layer=layer, face=face, z=z)
+        info, masks, alpha_mode = _parse_header_internal(_read_header(f))
+        plane = _locate_plane(info, mip=mip, layer=layer, face=face, z=z)
+        # Check before seek/read: an invalid header may describe an offset larger than off_t.
+        if plane.offset + plane.byte_length > f.seek(0, os.SEEK_END):
+            raise DdsError(f"Truncated {info['format']} payload for the selected plane")
+        f.seek(plane.offset)
+        payload = f.read(plane.byte_length)
+    return _preview_png(_decode_plane(payload, plane, info, masks, alpha_mode), max_size)
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Decode a DDS texture to PNG (pure Python stdlib).")
     ap.add_argument("input", help="Input .dds file path")
-    ap.add_argument("output", help="Output .png file path")
+    ap.add_argument("output", nargs="?", help="Output .png file path")
+    ap.add_argument("--info", action="store_true", help="Print DDS header metadata as JSON")
+    ap.add_argument("--mip", type=int, help="Mip level (0 is full resolution)")
+    ap.add_argument("--layer", type=int, help="Zero-based array element or cube index")
+    ap.add_argument("--face", choices=_CUBE_FACES, help="Cubemap face (default: first face present)")
+    ap.add_argument("--z", type=int, help="Zero-based volume slice within the selected mip")
     ap.add_argument(
         "--max-size",
         type=int,
-        default=0,
-        help="Downscale via repeated 2x box filter until max(width, height) <= N (0 = disabled)",
+        help="Downscale the selected plane to a maximum side length of N (0 = disabled)",
     )
     args = ap.parse_args(argv)
-    if args.max_size < 0:
+    if args.max_size is not None and args.max_size < 0:
         ap.error("--max-size must be 0 or more")
+    export_options = (args.output, args.mip, args.layer, args.face, args.z, args.max_size)
+    if args.info and any(value is not None for value in export_options):
+        ap.error("--info takes only an input DDS")
+    if not args.info and args.output is None:
+        ap.error("an output PNG is required unless --info is used")
 
     try:
+        if args.info:
+            with open(args.input, "rb") as f:
+                print(json.dumps(parse_dds_header(_read_header(f)), indent=2))
+            return 0
         try:
             overwrites_input = os.path.samefile(args.input, args.output)
         except FileNotFoundError:
             overwrites_input = False
         if overwrites_input:
             raise DdsError("output must not overwrite the input DDS")
-        png = dds_file_to_png_bytes(args.input, max_size=args.max_size)
+        png = dds_file_to_png_bytes(
+            args.input, args.max_size or 0, mip=args.mip or 0, layer=args.layer or 0,
+            face=args.face, z=args.z or 0,
+        )
         parent = os.path.dirname(os.path.abspath(args.output))
         if parent:
             os.makedirs(parent, exist_ok=True)
