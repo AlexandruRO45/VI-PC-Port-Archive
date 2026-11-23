@@ -1594,11 +1594,19 @@ def group_lod_chains(rows: list[dict]) -> list[list[dict]]:
     return assets
 
 
+def _walk_error(error: OSError) -> None:
+    raise error
+
+
 def _collect_census_targets(paths: Iterable[str]) -> list[str]:
+    """Every archive, carved .smh file and directory target, expanded.
+
+    A folder the walk cannot list stops the census: os.walk skips it silently by default, which would leave its
+    archives out of the totals and report a smaller corpus as if it were the whole one."""
     targets: list[str] = []
     for raw in paths:
         if os.path.isdir(raw):
-            for root, dirs, files in os.walk(raw):
+            for root, dirs, files in os.walk(raw, onerror=_walk_error):
                 dirs.sort()
                 for name in sorted(files):
                     low = name.lower()

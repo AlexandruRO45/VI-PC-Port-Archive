@@ -1029,6 +1029,29 @@ class CliTests(unittest.TestCase):
             self.assertIn("must not overwrite", err_buf.getvalue())
 
 
+    @unittest.skipIf(os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0,
+                     "needs a POSIX folder that a non-root user cannot list")
+    def test_cli_census_refuses_an_unlistable_sub_folder(self):
+        """A sub-folder the walk cannot list used to be skipped, so the census reported a smaller corpus and exited 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hidden = os.path.join(tmp, "hidden")
+            os.makedirs(hidden)
+            with open(os.path.join(hidden, "sample.smh"), "wb") as f:
+                f.write(b"")
+            os.chmod(hidden, 0)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"), "census", tmp, "--json"],
+                    capture_output=True, text=True,
+                )
+            finally:
+                os.chmod(hidden, 0o700)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ERROR:", proc.stderr)
+        self.assertIn("hidden", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
     def test_cli_census_limit_below_one_is_refused(self):
         """--limit 0 used to stop at the first target and report an empty corpus with exit 0."""
         with tempfile.TemporaryDirectory() as tmp:
