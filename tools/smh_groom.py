@@ -1594,11 +1594,17 @@ def group_lod_chains(rows: list[dict]) -> list[list[dict]]:
     return assets
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a census must not report an
+    # incomplete folder scan as complete. main() turns the OSError into one ERROR line and exit 1.
+    raise exc
+
+
 def _collect_census_targets(paths: Iterable[str]) -> list[str]:
     targets: list[str] = []
     for raw in paths:
         if os.path.isdir(raw):
-            for root, dirs, files in os.walk(raw):
+            for root, dirs, files in os.walk(raw, onerror=_walk_error):
                 dirs.sort()
                 for name in sorted(files):
                     low = name.lower()

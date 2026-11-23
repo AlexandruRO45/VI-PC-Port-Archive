@@ -5,7 +5,9 @@ Run with:
 """
 from __future__ import annotations
 
+import contextlib
 import gc
+import io
 import json
 import math
 import os
@@ -943,6 +945,52 @@ class ErrorHandlingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_unlistable_subfolder_is_an_error_not_a_silent_undercount(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the census used to report
+        # the remaining banks and exit 0, hiding the incomplete scan.
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "static")
+            os.mkdir(sub)
+            try:
+                os.chmod(sub, 0o000)
+                try:
+                    os.listdir(sub)
+                    self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+                except OSError:
+                    pass
+                proc = subprocess.run(
+                    [sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"), "census", tmp],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("ERROR", proc.stderr)
+                self.assertIn("static", proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+            finally:
+                os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_an_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root; forcing os.scandir to raise for one
+        # folder gives the same PermissionError os.walk hits for real, on every platform.
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "static")
+            os.mkdir(sub)
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(sub))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(smh_groom.os, "scandir", scandir), contextlib.redirect_stderr(err):
+                rc = smh_groom.main(["census", tmp])
+            self.assertEqual(rc, 1, err.getvalue())
+            self.assertIn("ERROR", err.getvalue())
+            self.assertIn("Access is denied", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
     def test_cli_inspect_census_and_export_glb(self):
         sysd, gpu = build_synthetic_groom_buffers(
             unset_rig_floats=True,
