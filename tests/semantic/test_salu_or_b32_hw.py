@@ -661,5 +661,56 @@ class SaluOrB32ConditionCodeTests(unittest.TestCase):
                 out = mrt0_words(spv)
                 self.assertEqual(out[1], expected_sel)
 
+
+class SaluOrB32FloatBitPatternTests(unittest.TestCase):
+    """IEEE 754 boundary extremes, subnormals, and NaN handling for s_or_b32."""
+
+    def test_ieee754_sign_bit_manipulation(self):
+        """Inject sign bit (0x80000000) into positive floats to produce negative equivalents."""
+        state = ScalarRegisterState()
+        pos_zero = 0x00000000
+        neg_zero = 0x80000000
+        res = state.execute_s_or_b32("s0", pos_zero, 0x80000000)
+        self.assertEqual(res, neg_zero)
+
+        pos_one_bits = struct.unpack("<I", struct.pack("<f", 1.0))[0]
+        neg_one_bits = struct.unpack("<I", struct.pack("<f", -1.0))[0]
+        res_neg_one = state.execute_s_or_b32("s1", pos_one_bits, 0x80000000)
+        self.assertEqual(res_neg_one, neg_one_bits)
+
+    def test_nan_quieting_and_payload_synthesis(self):
+        """Set quiet bit (bit 22, 0x00400000) to convert signaling NaN to quiet NaN."""
+        state = ScalarRegisterState()
+        snan_bits = 0x7F800001
+        qnan_expected = 0x7FC00001
+        res = state.execute_s_or_b32("s0", snan_bits, 0x00400000)
+        self.assertEqual(res, qnan_expected)
+
+    def test_subnormal_to_infinity_promotion(self):
+        """Promote subnormal float mantissa to infinity exponent using bitwise OR."""
+        state = ScalarRegisterState()
+        subnorm = 0x000000FF
+        inf_exp = 0x7F800000
+        res = state.execute_s_or_b32("s0", subnorm, inf_exp)
+        self.assertEqual(res, inf_exp | subnorm)
+        self.assertTrue(math.isnan(struct.unpack("<f", struct.pack("<I", res))[0]))
+
+    def test_translated_float_bitwise_shader(self):
+        """Verify shader synthesizing float NaN and sign bit manipulation translates."""
+        lines = [
+            "s_mov_b32 s0, 0x3F800000",   # +1.0f
+            "s_or_b32 s1, s0, 0x80000000", # -1.0f
+            "v_mov_b32 v0, s1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_float_or_shader", lines)
+        out = mrt0_words(spv)
+        expected_neg_one = struct.unpack("<I", struct.pack("<f", -1.0))[0]
+        self.assertEqual(out[0], expected_neg_one)
+
 if __name__ == "__main__":
     unittest.main()
