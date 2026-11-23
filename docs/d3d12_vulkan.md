@@ -2364,10 +2364,14 @@ The trace will enumerate them.
     read parts of the tiled texture as if the DIRECT queue's mappings had not happened, despite the fence handoff:
     every texel 0xffffffff on the 610M (24 of 25 runs, one matched), every texel 0 on the RX 9070 XT (3 of 40 runs),
     75 to 97 percent of the texels 0 on an RX 9060 XT (AMD 26.10.44, 8 of 8 runs). The RX 7800 XT matched. The test
-    checks the layer against the texels themselves in every case. A native run is reported and left out of the
-    comparison when every row-major texel matches the rounded-down offset, or when every COPY-queue texel is either
-    the expected one or one unmapped value (0 or 0xffffffff) while every DIRECT-queue read is right. Any other native
-    mismatch still fails.
+    checks the layer against the texels themselves in every case. Intel's D3D12 (Arc B580, Intel 101.9150, Windows)
+    does the opposite at an unaligned offset: the upload takes the offset as given (the row-major copy is exact), but
+    the tile-order readbacks into the linear buffer are written from the offset rounded down, so each texel read back
+    at the offset is the expected one's top bytes followed by the next texel's low bytes (every judged texel of the
+    offset 1 and offset 3 cases, 3 of 3 runs). A native run is reported and left out of the comparison when every
+    row-major texel matches the rounded-down offset, when the row-major copy is exact and every judged tile-order
+    texel was written from the rounded-down offset, or when every COPY-queue texel is either the expected one or one
+    unmapped value (0 or 0xffffffff) while every DIRECT-queue read is right. Any other native mismatch still fails.
 - `D3D12_RESOURCE_DESC::Layout`: the public `ROW_MAJOR` and `64KB_STANDARD_SWIZZLE` values plus the Xbox `0x101`
   tiled value from slot 76. Row-major textures need `VK_IMAGE_TILING_LINEAR` (not usable for RT/DS) or a staging
   copy; `64KB_STANDARD_SWIZZLE` and `0x101` have no direct Vulkan equivalent. If the game uploads console-tiled data,
