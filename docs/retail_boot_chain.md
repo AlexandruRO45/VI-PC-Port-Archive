@@ -18,7 +18,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
 | 2 | The 2 MiB reserve+commit calls carry attribute words the shim refuses, and `PAGE_GRAPHICS_*` bits (0x800..0x40000) on top of `PAGE_READWRITE` | Local: accept the attribute word, drop the graphics bits and keep the CPU protection. All seven startup allocations then succeed. #6843 measures the attribute words; no PR changes the check yet |
 | 3 | `xgameruntime.lib`'s thunk treats a missing `XErrorReport` as fatal | #6582 |
 | 4 | Access violation in the title's allocator: its `/GA` code reads its TLS from module index 0 | #4313 |
-| 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
+| 5 | Fatal assert when `DStorageGetFactory` returns null | `XCRDAPI.dll!DStorageGetFactory` (`runtime/shims/xcrdapi.cpp`, #4348) |
 | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
 | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
 | 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local, §3.2 |

@@ -165,7 +165,7 @@ Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.d
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
 
-The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+The seven `xmem.dll` imports, `d3d12_xs.dll!D3D12ConfigureVirtualMemoryX` and `XCRDAPI.dll!DStorageGetFactory` (`runtime/shims/xcrdapi.cpp`) are served now, so the same dry run lists 21.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
