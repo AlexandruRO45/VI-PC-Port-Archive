@@ -135,11 +135,135 @@ def _block_shape(bpe, block_bytes):
     return bw, elems // bw
 
 
+# --- Optional native kernels (tools/amd_swizzle_native) ---------------------
+# `tools/amd_swizzle_native` (built with Cargo, see its README.md) computes the offset grid of `offsets` and the
+# element gather of `detile` with the same integer steps, so the arrays are identical. Any call it refuses (an
+# unusual argument type, an offset that would not fit in an int64) runs the numpy code below, as does everything
+# when the library is missing or fails its first-use self-check. `LEONIDA_AMD_SWIZZLE_NATIVE=0` keeps numpy.
+
+_NATIVE = []  # [ctypes library or None], filled on first use
+_REFUSED = object()
+
+
+def _native():
+    """The loaded `tools/amd_swizzle_native` library, or None (not built, disabled, unloadable or mismatching)."""
+    if not _NATIVE:
+        _NATIVE.append(None)  # the self-check below runs the numpy code through the public functions
+        if os.environ.get("LEONIDA_AMD_SWIZZLE_NATIVE", "1") != "0":
+            lib = _native_load()
+            if lib is not None and _native_self_check(lib):
+                _NATIVE[0] = lib
+    return _NATIVE[0]
+
+
+def _native_load():
+    import ctypes
+    name = {"win32": "amd_swizzle_native.dll",
+            "darwin": "libamd_swizzle_native.dylib"}.get(sys.platform, "libamd_swizzle_native.so")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amd_swizzle_native", "target", "release", name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        lib = ctypes.CDLL(path)
+        if lib.amd_swizzle_native_abi() != 1:
+            return None
+        n, u64, p = ctypes.c_size_t, ctypes.c_uint64, ctypes.c_void_p
+        lib.amd_swizzle_offsets.argtypes = [p, p, n, n, n, u64, u64, u64, p]
+        lib.amd_swizzle_detile.argtypes = [p, n, n, p, p, n, n, n, u64, u64, u64, p]
+        lib.amd_swizzle_offsets.restype = lib.amd_swizzle_detile.restype = ctypes.c_int32
+    except (OSError, AttributeError):
+        return None
+    return lib
+
+
+def _native_args(eq, bpe, wb, hb, block_bytes):
+    """(x masks, y masks, count, bw, bh) as ctypes arguments, or None when the numpy code should run."""
+    if type(eq) not in (list, tuple) or len(eq) > 63:
+        return None
+    if not all(type(v) is int for v in (bpe, wb, hb, block_bytes)) or bpe <= 0 or wb < 0 or hb < 0 \
+            or block_bytes <= 0 or wb >= 1 << 40 or hb >= 1 << 40:
+        return None
+    xm, ym = [], []
+    for masks in eq:
+        if type(masks) not in (list, tuple) or len(masks) < 2:
+            return None
+        mx, my = masks[0], masks[1]
+        if type(mx) is not int or type(my) is not int or not (0 <= mx < 1 << 63 and 0 <= my < 1 << 63):
+            return None
+        xm.append(mx)
+        ym.append(my)
+    bw, bh = _block_shape(bpe, block_bytes)
+    if bw <= 0 or bh <= 0:
+        return None
+    import ctypes
+    arr = ctypes.c_uint64 * max(1, len(xm))
+    return arr(*xm), arr(*ym), len(xm), bw, bh
+
+
+def _native_offsets(lib, eq, bpe, wb, hb, block_bytes):
+    """The (hb, wb) int64 offset grid, or _REFUSED."""
+    args = _native_args(eq, bpe, wb, hb, block_bytes)
+    if args is None:
+        return _REFUSED
+    xm, ym, nbits, bw, bh = args
+    out = np.empty((hb, wb), np.int64)
+    status = lib.amd_swizzle_offsets(xm, ym, nbits, wb, hb, bw, bh, block_bytes, out.ctypes.data)
+    return out if status == 0 else _REFUSED
+
+
+def _native_detile(lib, data, eq, bpe, wb, hb, block_bytes):
+    """`detile`'s result (None when an element lies past the data), or _REFUSED."""
+    args = _native_args(eq, bpe, wb, hb, block_bytes)
+    if args is None:
+        return _REFUSED
+    xm, ym, nbits, bw, bh = args
+    raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)  # as detile, same errors
+    if not raw.flags.c_contiguous:
+        return _REFUSED
+    out = np.empty((wb * hb, bpe), np.uint8)
+    status = lib.amd_swizzle_detile(raw.ctypes.data if raw.size else None, raw.size, bpe, xm, ym, nbits,
+                                    wb, hb, bw, bh, block_bytes, out.ctypes.data)
+    if status == 1:
+        return None
+    return out if status == 0 else _REFUSED
+
+
+def _native_self_check(lib):
+    """Compare both kernels with the numpy code on a few seeded random layouts; False on any difference."""
+    import random
+    rng = random.Random(0x5EED)
+    for case in range(24):
+        bpe = (1, 2, 3, 4, 8, 16)[case % 6]
+        bits = (8, 12, 16)[case % 3]
+        eq = [(rng.getrandbits(16) if rng.random() < 0.8 else 0, rng.getrandbits(16) if rng.random() < 0.8 else 0)
+              for _ in range(bits)]
+        wb, hb = rng.randint(0, 90), rng.randint(0, 90)
+        want = offsets(eq, bpe, wb, hb, 1 << bits)[0]
+        got = _native_offsets(lib, eq, bpe, wb, hb, 1 << bits)
+        if got is _REFUSED or got.shape != want.shape or not np.array_equal(got, want):
+            return False
+        size = (int(want.max()) // bpe + 1) * bpe if want.size else 0
+        size = max(0, size + rng.choice((-1, 0, 0, 3)))
+        data = bytes(rng.getrandbits(8) for _ in range(size))
+        want = detile(data, eq, bpe, wb, hb, 1 << bits)
+        got = _native_detile(lib, data, eq, bpe, wb, hb, 1 << bits)
+        if got is _REFUSED or (want is None) != (got is None):
+            return False
+        if want is not None and (got.shape != want.shape or not np.array_equal(got, want)):
+            return False
+    return True
+
+
 def offsets(eq, bpe, wb, hb, block_bytes=65536):
     """Byte offset of every element (row-major y, x) for a wb x hb element grid."""
     xb = max((mx.bit_length() for mx, _ in eq if mx), default=0)
     yb = max((my.bit_length() for _, my in eq if my), default=0)
     bw, bh = _block_shape(bpe, block_bytes)
+    lib = _native()
+    if lib is not None:
+        grid = _native_offsets(lib, eq, bpe, wb, hb, block_bytes)
+        if grid is not _REFUSED:
+            return grid, (bw, bh, xb, yb)
     return _grid(eq, wb, hb, bw, bh, block_bytes, 0), (bw, bh, xb, yb)
 
 
@@ -157,7 +281,12 @@ def feature(linear, bpe):
 
 
 def detile(data, eq, bpe, wb, hb, block_bytes=65536):
-    raw = np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
+    lib = _native()
+    if lib is not None:
+        lin = _native_detile(lib, data, eq, bpe, wb, hb, block_bytes)
+        if lin is not _REFUSED:
+            return lin
+    raw =np.frombuffer(data[: len(data) // bpe * bpe], np.uint8).reshape(-1, bpe)
     bw, bh = _block_shape(bpe, block_bytes)
     shift = bpe.bit_length() - 1
     if bpe & (bpe - 1) == 0 and block_bytes % bpe == 0:
