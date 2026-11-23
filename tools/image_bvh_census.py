@@ -213,25 +213,28 @@ def vgpr_access(ins):
     """(read operands as [(argument index, registers)], written registers, partial write?) by the conventions of
     rdna2spirv.reg_reads_writes, plus atomics and LDS ops that return nothing and the partial writes."""
     op, a, mods = ins["op"], ins["args"], ins.get("mods", [])
-    if not a:
+    if not a or op.startswith("s_"):
         return [], [], False
     bop = rdna2spirv.base_op(op)
     no_dst = op.startswith(NO_VGPR_DST) or op.startswith("v_cmpx")
-    if bop.startswith(("global_atomic_", "flat_atomic_", "buffer_atomic_", "image_atomic_")) and "glc" not in mods:
-        no_dst = True
-    if bop.startswith("ds_") and not (bop.startswith(LDS_RETURNING) or "_rtn_" in bop):
-        no_dst = True
-    if op.startswith("s_"):
-        return [], [], False
-    sources = [n for n in range(len(a)) if no_dst or n > 0]
-    reads = [(n, vregs(a[n])) for n in sources if vregs(a[n])]
+    if not no_dst:
+        if bop.startswith(("global_atomic_", "flat_atomic_", "buffer_atomic_", "image_atomic_")) and "glc" not in mods:
+            no_dst = True
+        elif bop.startswith("ds_") and not (bop.startswith(LDS_RETURNING) or "_rtn_" in bop):
+            no_dst = True
+    reads = []
+    for n in range(0 if no_dst else 1, len(a)):
+        vr = vregs(a[n])
+        if vr:
+            reads.append((n, vr))
+    dst_vr = [] if no_dst else vregs(a[0])
     partial = rdna2spirv.sdwa_reads_dst(op, mods) or bop == "v_writelane_b32" or \
         ("_d16" in bop and bop.startswith(MEMORY))
-    if (partial or bop in ACC_DST) and not no_dst and vregs(a[0]):
-        reads.append((0, vregs(a[0])))
-    writes = [] if no_dst else vregs(a[0])
+    if (partial or bop in ACC_DST) and dst_vr:
+        reads.append((0, dst_vr))
+    writes = dst_vr
     if bop == "v_swap_b32" and len(a) > 1:
-        writes = vregs(a[0]) + vregs(a[1])
+        writes = dst_vr + vregs(a[1])
     return reads, writes, partial
 
 
@@ -301,15 +304,23 @@ def imm32(a):
 
 def sgpr_step(sg, ins):
     """Update the SGPR literal map for one instruction (written SGPRs lose their value unless set from a literal)."""
-    op, a = ins["op"], ins["args"]
+    a = ins["args"]
+    if not a:
+        return
+    a0k = a[0]["k"]
+    if a0k != "sgpr" and (len(a) <= 1 or a[1]["k"] != "sgpr"):
+        return
+    op = ins["op"]
     bop = rdna2spirv.base_op(op)
     written = []
-    if a and not op.startswith(SALU_NO_DST):
+    if a0k == "sgpr" and not op.startswith(SALU_NO_DST):
         written += sregs(a[0])              # SALU destinations, v_cmp_*_e64 / v_readlane_b32 SGPR destinations
-    if len(a) > 1 and ("_co_" in bop or bop.startswith("v_div_scale")):
+    if len(a) > 1 and a[1]["k"] == "sgpr" and ("_co_" in bop or bop.startswith("v_div_scale")):
         written += sregs(a[1])              # the carry / scale SGPR of a VOP3b op
+    if not written:
+        return
     value = {}
-    if bop in ("s_mov_b32", "s_movk_i32", "s_brev_b32") and len(a) == 2 and len(sregs(a[0])) == 1:
+    if bop in ("s_mov_b32", "s_movk_i32", "s_brev_b32") and len(a) == 2 and len(written) == 1:
         v = imm32(a[1])
         if v is not None:
             if bop == "s_movk_i32":
@@ -319,7 +330,7 @@ def sgpr_step(sg, ins):
             value[a[0]["r"]] = v
         elif bop == "s_mov_b32" and len(sregs(a[1])) == 1 and a[1]["r"] in sg and plain(a[1]):
             value[a[0]["r"]] = sg[a[1]["r"]]
-    elif bop == "s_mov_b64" and len(a) == 2 and len(sregs(a[0])) == 2:
+    elif bop == "s_mov_b64" and len(a) == 2 and len(written) == 2:
         r = a[0]["r"]
         if a[1]["k"] == "imm" and -16 <= a[1]["v"] <= 64:              # inline constant, sign-extended
             v = a[1]["v"] & 0xFFFFFFFFFFFFFFFF
@@ -328,7 +339,8 @@ def sgpr_step(sg, ins):
             value = {r + i: sg[a[1]["r"] + i] for i in (0, 1) if a[1]["r"] + i in sg}
     for r in written:
         sg.pop(r, None)
-    sg.update(value)
+    if value:
+        sg.update(value)
 
 
 def decode_descriptor(words):
@@ -525,15 +537,19 @@ class SiteState:
 
     def write(self, r, new, partial=False):
         """new: definitions [(label, guard)] the active lanes now hold."""
+        old = self.vg.get(r)
+        if old is None:
+            if all(lab == OTHER for lab, _ in new):
+                return
+            old = OTHER_ENTRIES
         node = self.exec
-        old = self.vg.get(r, OTHER_ENTRIES)
         if node == ROOT and not partial:
             out = frozenset(new)
         else:
             mine = frozenset((lab, guard | {("in", node)}) for lab, guard in new)
             rest = old if partial else frozenset((lab, guard | {("out", node)}) for lab, guard in old)
             out = entries_union(frozenset(e for e in mine if live(e[1])), frozenset(e for e in rest if live(e[1])))
-        if out == OTHER_ENTRIES:
+        if out == OTHER_ENTRIES or all(lab == OTHER for lab, _ in out):
             self.vg.pop(r, None)
         else:
             self.vg[r] = out
@@ -657,45 +673,81 @@ def classify(st, ins, n, words):
     return kind_of(ins, n), "all"
 
 
-def site_transfer(call_pc, events, product_reads):
+_OTHER_NEW = ((OTHER, frozenset()),)
+
+
+def _insn_meta(ins):
+    """Precompute static per-instruction analysis metadata for site_transfer."""
+    op, a, pc = ins["op"], ins["args"], ins["pc"]
+    bop = rdna2spirv.base_op(op)
+    reads, writes, partial = vgpr_access(ins)
+    copy = is_copy(ins)
+    hh_op = 1 if (writes and high_half_operand(ins, 1)) else (2 if (writes and high_half_operand(ins, 2)) else 0)
+    rcp_src = a[1]["r"] if (bop == "v_rcp_f32" and writes and len(a) > 1 and len(vregs(a[1])) == 1) else -1
+    m_writes = mask_writes(ins)
+    touches_exec = (
+        bop.startswith(("v_cmpx", "s_andn2_wrexec"))
+        or "saveexec" in bop
+        or rdna2spirv.writes_exec(ins)
+        or (bop in ("s_mov_b32", "s_mov_b64") and len(a) == 2 and is_exec(a[1]) and not is_exec(a[0]))
+    )
+    return (pc, bop, reads, writes, partial, copy, hh_op, rcp_src, m_writes, touches_exec)
+
+
+def site_transfer(call_pc, events, product_reads, meta_by_id=None):
     """The transfer function of one call's walk: record the reads of its words, then apply the writes."""
     def transfer(st, ins):
-        a = ins["args"]
-        bop = rdna2spirv.base_op(ins["op"])
-        pc = ins["pc"]
-        reads, writes, partial = vgpr_access(ins)
-        copy = is_copy(ins)
+        meta = meta_by_id.get(id(ins)) if meta_by_id is not None else None
+        if meta is None:
+            meta = _insn_meta(ins)
+        pc, bop, reads, writes, partial, copy, hh_op, rcp_src, m_writes, touches_exec = meta
+        vg = st.vg
         ev, pr = [], []
-        for n, regs in reads if not copy else ():
-            for r in regs:
-                s = st.read(r)
-                if H in s:
-                    pr.append((product_reader(ins, n), "all" if s == {H} else "some"))
-                words = sorted(x for x in s if x[0] == "w")
-                if not words:
-                    continue
-                cat, reach = classify(st, ins, n, words)
-                if len(words) != len(s):
-                    reach = "some"
-                ev += [(w[1], cat, reach, bop) for w in words]
-        events[pc] = ev
-        product_reads[pc] = pr
+        if vg and not copy:
+            for n, regs in reads:
+                for r in regs:
+                    if r not in vg:
+                        continue
+                    s = st.read(r)
+                    if H in s:
+                        pr.append((product_reader(ins, n), "all" if s == {H} else "some"))
+                    words = sorted(x for x in s if x[0] == "w")
+                    if not words:
+                        continue
+                    cat, reach = classify(st, ins, n, words)
+                    if len(words) != len(s):
+                        reach = "some"
+                    ev += [(w[1], cat, reach, bop) for w in words]
+        if ev or pc in events:
+            events[pc] = ev
+        if pr or pc in product_reads:
+            product_reads[pc] = pr
         if pc == call_pc:
-            new = {r: {("w", k)} for k, r in enumerate(writes[:4])}
+            for k, r in enumerate(writes[:4]):
+                st.write(r, ((("w", k), frozenset()),), partial)
         elif copy:
+            a = ins["args"]
             new = {r: st.read(a[1]["r"]) for r in writes[:1]}
             if bop == "v_swap_b32":
                 new[a[1]["r"]] = st.read(a[0]["r"])
-        elif bop == "v_rcp_f32" and writes and len(a) > 1 and len(vregs(a[1])) == 1:
-            new = {writes[0]: derived(st.read(a[1]["r"]), R1)}
-        elif writes and any(high_half_operand(ins, n) for n in (1, 2)):
-            n = 1 if high_half_operand(ins, 1) else 2
-            new = {writes[0]: derived(st.read(a[n]["r"]), H)}
-        else:
-            new = {r: {OTHER} for r in writes}
-        for r, labs in new.items():
-            st.write(r, [(lab, frozenset()) for lab in labs], partial)
-        exec_step(st, ins)
+            for r, labs in new.items():
+                st.write(r, [(lab, frozenset()) for lab in labs], partial)
+        elif rcp_src >= 0:
+            labs = derived(st.read(rcp_src), R1) if rcp_src in vg else {OTHER}
+            st.write(writes[0], [(lab, frozenset()) for lab in labs], partial)
+        elif hh_op:
+            src_r = ins["args"][hh_op]["r"]
+            labs = derived(st.read(src_r), H) if src_r in vg else {OTHER}
+            st.write(writes[0], [(lab, frozenset()) for lab in labs], partial)
+        elif vg:
+            for r in writes:
+                if r in vg:
+                    st.write(r, _OTHER_NEW, partial)
+        if touches_exec:
+            exec_step(st, ins)
+        elif st.masks and m_writes:
+            for r in m_writes:
+                st.masks.pop(r, None)
     return transfer
 
 
@@ -726,15 +778,18 @@ def analyse(insns):
     where = {i["pc"]: (b, n) for b, blk in enumerate(blocks) for n, i in enumerate(blk)}
     calls = [i for i in insns if rdna2spirv.base_op(i["op"]) in FORMS]
     desc = descriptor_words(blocks, succ, {c["pc"] for c in calls})
+    meta_by_id = {id(i): _insn_meta(i) for blk in blocks for i in blk} if calls else {}
+    call_pcs = [x["pc"] for x in calls]
     sites = []
     for c in calls:
+        c_pc = c["pc"]
         events, product_reads = {}, {}
-        at_cut = flow(blocks, succ, where[c["pc"]], site_transfer(c["pc"], events, product_reads), join_site,
-                      SiteState(), copy=SiteState.copy, cut=c["pc"], on_back=strip, idle=SiteState.idle)
-        sites.append({"form": rdna2spirv.base_op(c["op"]), "pc": c["pc"], "reached": c["pc"] in desc,
+        at_cut = flow(blocks, succ, where[c_pc], site_transfer(c_pc, events, product_reads, meta_by_id), join_site,
+                      SiteState(), copy=SiteState.copy, cut=c_pc, on_back=strip, idle=SiteState.idle)
+        sites.append({"form": rdna2spirv.base_op(c["op"]), "pc": c_pc, "reached": c_pc in desc,
                       "loop_carried": any(lab[0] == "w" for st in at_cut for s in st.vg.values() for lab, _ in s),
-                      "desc": desc.get(c["pc"], [None] * 4),
-                      "reads": [(pc,) + e + (any(c["pc"] < x["pc"] < pc for x in calls),)
+                      "desc": desc.get(c_pc, [None] * 4),
+                      "reads": [(pc,) + e + (any(c_pc < x_pc < pc for x_pc in call_pcs),)
                                 for pc in sorted(events) for e in events[pc]],
                       "product_reads": [(pc,) + e for pc in sorted(product_reads) for e in product_reads[pc]]})
     return sites
