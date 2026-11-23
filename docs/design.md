@@ -603,6 +603,20 @@ Two pairs skipped a mesh export and one used consecutive exports. The original p
 DXIL signatures and native parameter exports corroborated these joins. These fields describe
 the compiled stages; the active pipeline for a particular draw is separate.
 
+On Xbox 1.0.2.1, both SGD5 databases together contain 12,101 pixel programs in group 1.
+Of these, 10,307 have a complete table of 1–32 kind-6 inputs at `0x138`. In all 10,307,
+byte 3 equals the zero-based row position throughout the table. Group 0 contains 9,282
+mesh programs. Of these, 7,543 have a count of 1–32 at `0x29c`; 5,637 of those consist
+entirely of kind-6 export rows. All 5,637 have distinct byte-1 keys within the table.
+
+For the paired check, resolve the group-0 and group-1 program selectors of each stored
+technique pass with `sgd5_effects.py`, retaining passes whose selected programs have DXIL
+stages MS and PS respectively. Count each pair of ordinals once per database and read the
+default (last) FSSM payload for each program. The 17,145 pass occurrences select **12,221
+distinct pairs**. Running `fssm_header.mesh_pixel_slots` on those pairs gave 5,385 identity
+mappings, 1,423 sparse mappings and 5,413 rejections. This counts native header matches;
+translated SPIR-V declarations and direct Location decorations are checked separately.
+
 `python -I tools/shader_link_check.py link-mesh --ms mesh.spv --ms-fssm mesh.fssm
 --ps pixel.spv --ps-fssm pixel.fssm --out paired-pixel.spv` writes a separate fragment
 module for that pair. Supply the original dense fragment translation and the native sidecar

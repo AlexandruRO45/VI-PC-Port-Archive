@@ -6,7 +6,7 @@ table of 8-byte input records starts at offset 0x138.  A record is present while
     byte 0      record kind (6 for an input)
     byte 1      semantic id
     byte 2      component mask (bit 0 = x, bit 3 = w)
-    byte 3      running index (same semantic id, next index)
+    byte 3      row index (equals the zero-based table position in the measured 1-32-row pixel tables)
     bytes 4-5   unused here
     byte 6      parameter slot
     byte 7      flags, the read method: bit 0 (0x01) read through v_interp_mov_f32 (flat),

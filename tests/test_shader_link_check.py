@@ -159,6 +159,32 @@ class NativeMeshLinkTest(unittest.TestCase):
         ms, pixel, producer, consumer = self.fixture(slots=(0, 1, 2))
         self.assertEqual(link.link_mesh_fragment(ms, pixel, producer, consumer), (pixel, [0, 1, 2]))
 
+    def test_vec3_and_component_packed_fragment_inputs_are_rejected(self):
+        ms, _, producer, consumer = self.fixture(slots=(2,))
+        for component in (None, 1):
+            with self.subTest(component=component):
+                pixel = input(location=0, components=3, component=component)
+                with self.assertRaisesRegex(ValueError, "one float vec4 per parameter location"):
+                    link.link_mesh_fragment(ms, pixel.binary(), producer, consumer)
+
+    def test_translated_mesh_with_an_extra_export_is_rejected(self):
+        _, pixel, producer, consumer = self.fixture()
+        extra_mesh, _, _, _ = self.fixture(exports=4)
+        with self.assertRaisesRegex(ValueError, "native tables do not match the mesh exports"):
+            link.link_mesh_fragment(extra_mesh, pixel, producer, consumer)
+
+    def test_relocated_fragment_input_requires_a_direct_location(self):
+        ms, _, producer, consumer = self.fixture(slots=(2,))
+        pixel = ModuleFixture("ps")
+        param = pixel.variable(spv.STORAGE_INPUT, pixel.numeric(32, 4))
+        group = pixel.allocate()
+        pixel.emit(spv.OP_DECORATION_GROUP, group)
+        pixel.decorate(group, spv.DEC_LOCATION, 0)
+        pixel.emit(spv.OP_GROUP_DECORATE, group, param)
+        self.assertEqual(pixel.reflect().inputs[0].varyings[0].address.location, 0)
+        with self.assertRaisesRegex(ValueError, "expected direct Location decorations"):
+            link.link_mesh_fragment(ms, pixel.binary(), producer, consumer)
+
     def test_command_bounds_sidecar_reads_and_detects_a_33rd_record(self):
         ms, ps, producer, consumer = self.fixture(slots=range(32), exports=32)
         with tempfile.TemporaryDirectory() as directory:
