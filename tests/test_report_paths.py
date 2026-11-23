@@ -86,6 +86,28 @@ class SamePathTests(unittest.TestCase):
         self.assertEqual(got, insensitive or os.path.normcase("A") == os.path.normcase("a"))
 
 
+class WindowsTrailingNameTests(unittest.TestCase):
+    """Windows ends a name at its last non-dot, non-space character: `index.json.` writes `index.json`.
+
+    `realpath` folds that only for a file that is already there, and the shared guard runs before the first write,
+    so the name key has to fold the rest. `sys` is patched so the Windows branch runs on every platform.
+    """
+
+    def windows(self):
+        return mock.patch.object(report_paths, "sys", mock.Mock(platform="win32"))
+
+    def test_a_trailing_dot_or_space_is_the_same_report(self):
+        with self.windows():
+            for second in (r"C:\world\index.json.", r"C:\world\index.json ", r"C:\world\index.json. ."):
+                with self.subTest(name=second):
+                    self.assertTrue(report_paths.same_report_path(r"C:\world\index.json", second))
+
+    def test_every_folder_component_is_folded(self):
+        with self.windows():
+            self.assertTrue(report_paths.same_report_path(r"C:\carve\world\out.json",
+                                                          r"C:\carve\world.\out.json "))
+
+
 class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
 
