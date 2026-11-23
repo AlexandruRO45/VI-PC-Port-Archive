@@ -18,6 +18,7 @@
 #include <XTaskQueue.h>
 
 #include "shims.h"
+#include "test_temp_dir.h"
 
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
@@ -122,7 +123,7 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // a crash still shows the checks before it
     std::printf("xgameruntime_gamesave_test: XGameSaveImpl through QueryApiImpl\n");
-    const std::filesystem::path root = std::filesystem::temp_directory_path() / L"leonida_gamesave_test";
+    const std::filesystem::path root = testfiles::process_temp_dir("leonida_gamesave_test");  // this process's own
     std::error_code ec;
     std::filesystem::remove_all(root, ec);
     SetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", root.c_str());

@@ -111,7 +111,8 @@ int main() {
     const auto vs_program = fssm_program({0x56530002, 0xbf810000});
     const auto ms_container = shader_container(ms_program), ps_container = shader_container(ps_program);
     const auto vs_container = shader_container(vs_program);
-    const auto library = testfiles::process_temp_dir("leonida_mesh_test");
+    const testfiles::ScratchDir scratch("leonida_mesh_test");  // this process's own, removed on return
+    const auto& library = scratch.path();
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
@@ -185,7 +186,6 @@ int main() {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
     if (!d.mesh_shader) {
-        std::filesystem::remove_all(library);
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
         return 77;
     }
@@ -493,7 +493,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {

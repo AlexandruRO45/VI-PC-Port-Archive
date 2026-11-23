@@ -1059,6 +1059,9 @@ if(BUILD_TESTING)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
     add_test(NAME xgameruntime_user COMMAND xgameruntime_user_test)
     add_test(NAME xgameruntime_gamesave COMMAND xgameruntime_gamesave_test)
+    # Two copies at once: each uses a temp folder of its own process (test/test_temp_dir.h).
+    add_test(NAME xgameruntime_gamesave_two_copies COMMAND ${CMAKE_COMMAND} -DTEST=$<TARGET_FILE:xgameruntime_gamesave_test>
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_two_copies.cmake)
     add_test(NAME xgameruntime_store COMMAND xgameruntime_store_test)
     add_test(NAME xgameruntime_offline COMMAND xgameruntime_offline_test)
     add_test(NAME xgameruntime_offline_hdr COMMAND xgameruntime_offline_test)
@@ -1790,6 +1793,10 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_shader_cache_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_shader_cache COMMAND d3d12_shader_cache_test)
     set_tests_properties(d3d12_shader_cache PROPERTIES SKIP_RETURN_CODE 77)
+    # Two copies at once: each uses a temp folder of its own process (test/test_temp_dir.h).
+    add_test(NAME d3d12_shader_cache_two_copies COMMAND ${CMAKE_COMMAND} -DTEST=$<TARGET_FILE:d3d12_shader_cache_test>
+             -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_two_copies.cmake)
+    set_tests_properties(d3d12_shader_cache_two_copies PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: both copies skipped")
     set_tests_properties(d3d12_method_variants PROPERTIES SKIP_RETURN_CODE 77)
     # ID3D12Object private data (GetPrivateData, SetPrivateData, SetPrivateDataInterface, SetName) compared with
     # the host runtime's answers on the device and four child objects.
@@ -2551,6 +2558,10 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_geometry_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_geometry COMMAND d3d12_geometry_test)
       set_tests_properties(d3d12_geometry PROPERTIES SKIP_RETURN_CODE 77)
+      # Two copies at once: each uses a temp folder of its own process (test/test_temp_dir.h).
+      add_test(NAME d3d12_geometry_two_copies COMMAND ${CMAKE_COMMAND} -DTEST=$<TARGET_FILE:d3d12_geometry_test>
+               -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_two_copies.cmake)
+      set_tests_properties(d3d12_geometry_two_copies PROPERTIES SKIP_REGULAR_EXPRESSION "SKIP: both copies skipped")
       # D3D-309: D24 depth bias and 24-bit depth in draws, with and without a pixel shader and with a geometry shader
       # (src/depth24_fragment.h).
       set(LEONIDA_TEST_VS_DEPTH ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_depth.spv)

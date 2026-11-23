@@ -6,6 +6,7 @@
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
 #include "../shims/d3d12_com.h"
+#include "test_temp_dir.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -286,7 +287,7 @@ int main() {
     // D3D12_SHADER_CACHE_MODE_DISK persistence across session + device teardown and cleanup on SetDeleteOnDestroy.
     {
         const auto prev_cwd = std::filesystem::current_path();
-        const auto temp_dir = std::filesystem::temp_directory_path() / L"leonida_shader_cache_disk_test";
+        const auto temp_dir = testfiles::process_temp_dir("leonida_shader_cache_disk_test");  // this process's own
         std::error_code ec;
         std::filesystem::remove_all(temp_dir, ec);
         std::filesystem::create_directories(temp_dir);

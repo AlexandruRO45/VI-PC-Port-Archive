@@ -54,7 +54,8 @@ int main() {
     const auto ps_program = fssm_program({0x50530001, 0xbf810000});
     const auto vs_container = shader_container(vs_program), gs_container = shader_container(gs_program),
                ps_container = shader_container(ps_program);
-    const auto library = testfiles::process_temp_dir("leonida_geometry_test");
+    const testfiles::ScratchDir scratch("leonida_geometry_test");  // this process's own, removed on return
+    const auto& library = scratch.path();
     std::filesystem::create_directories(library);
     std::filesystem::copy_file(LEONIDA_TEST_VS_SPV, library / "vs_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_GS_SPV, library / "gs_double.spv",
@@ -242,7 +243,6 @@ int main() {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {

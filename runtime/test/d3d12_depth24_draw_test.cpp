@@ -229,7 +229,8 @@ int main() {
     const auto ps_empty_program = fssm_program({0x50530309, 0xbf810000});
     const auto ps_write_program = fssm_program({0x50530310, 0xbf810000});
     const auto gs_program = fssm_program({0x47530309, 0xbf810000});
-    const auto library = testfiles::process_temp_dir("leonida_depth24_draw_test");
+    const testfiles::ScratchDir scratch("leonida_depth24_draw_test");  // this process's own, removed on return
+    const auto& library = scratch.path();
     std::filesystem::create_directories(library);
     const auto copy = std::filesystem::copy_options::overwrite_existing;
     std::filesystem::copy_file(LEONIDA_TEST_VS_DEPTH_SPV, library / "vs_depth.spv", copy);
@@ -459,7 +460,6 @@ int main() {
                                   std::to_string(r.depth[0]) + ")");
         }
     }
-    std::filesystem::remove_all(library);
     std::printf("%d failure(s)\n", g_failures);
     return g_failures ? 1 : 0;
 }
