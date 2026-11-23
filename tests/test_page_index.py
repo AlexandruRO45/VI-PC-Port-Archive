@@ -163,6 +163,7 @@ class PageIndexTest(unittest.TestCase):
         page = header(0x100, q28=0x100, q38=0xC0, counts=(2, 0, 1, 0))
         put_q38(page, 0xC0, [(0x5678, 0x20, 0x60)])
         second = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        struct.pack_into("<Q", second, 8, BASE + 0x60)   # a full directory header, not the magic alone
         put_q38(second, 0xC0, [(0x9abc, 0x10, 0x60)])
         for name, streams in (("archive end", [page]), ("next directory", [page, second])):
             with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
@@ -214,6 +215,21 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["q28_tables_unread"], 0)
         self.assertEqual(doc["summary"]["q28_continuation_pages"], 1)
         self.assertEqual(doc["summary"]["q28_records"], 2)
+
+    def test_directory_magic_in_a_q28_stream_does_not_end_the_read(self):
+        # The stream after the resource carries `0DRP` at +0x10 inside its payload but no directory header
+        # (no zero prefix, no 0x50000000 pointer at +0x08): it is still read for the q28 table.
+        page = header(0x100, q28=0x120, q38=0xC0, counts=(1, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x5678, 0x20, 0x60)])
+        cont = bytearray(b"\xbb" * 0x80)
+        cont[0x10:0x14] = b"0DRP"
+        struct.pack_into("<IIQQII", cont, 0x20, 0x5678, 0x1, 0x0, BASE + 0x60, 0x10, 0x10000)
+        pages, seen = page_index.index_streams([(100, None, bytes(page)), (200, None, bytes(cont))])
+        self.assertEqual(seen, 2)
+        (page_doc,) = pages
+        self.assertEqual(page_doc["q28_error"], "")
+        self.assertEqual([c["offset"] for c in page_doc["q28_continuations"]], [200])
+        self.assertEqual([(r["hash_a"], r["target"]) for r in page_doc["q28_records"]], [(0x5678, 0x60)])
 
     def test_q28_table_after_a_q38_continuation(self):
         # q38's record needs the first continuation; the q28 table starts in the second one and straddles

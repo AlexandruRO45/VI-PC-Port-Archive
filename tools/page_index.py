@@ -82,6 +82,12 @@ def is_page(data):
     return len(data) >= HEADER_SIZE and data[0x10:0x14] == b"0DRP"
 
 
+def has_directory_header(data):
+    """Recognize a directory at a stream boundary using more than the magic alone."""
+    return (is_page(data) and data[:8] == b"\0" * 8
+            and offset_of(_u64(data, 8)) is not None and _u32(data, 0x14) == 122)
+
+
 def scan_rpf(path, start=None, limit=None):
     """Yield (archive_offset, stored_bytes, inflated_bytes) for each zlib stream."""
     with open(path, "rb") as fh:
@@ -321,7 +327,7 @@ def index_streams(streams, progress=None):
             progress(streams_seen, len(pages))
         if q28_waiting is not None:
             page, base, cont, extra = q28_waiting
-            if is_page(data):
+            if has_directory_header(data):
                 add(page)   # the q28 table stays unread; this stream is the next directory
                 q28_waiting = None
             else:
