@@ -133,6 +133,19 @@ class TestSCmovB32SCCGating(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 88)
 
+class TestSCmovB32Translator(unittest.TestCase):
+    def test_translator_s_cmov_b32_execution(self) -> None:
+        body = [
+            "s_cmp_eq_u32 0, 0",
+            "s_mov_b32 s4, 0x1234",
+            "s_cmov_b32 s4, 0x5678",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmov_b32_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0x5678)
+
 
 if __name__ == "__main__":
     unittest.main()
