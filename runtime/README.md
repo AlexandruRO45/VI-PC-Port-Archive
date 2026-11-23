@@ -113,9 +113,10 @@ basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, 
 module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
 compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
-The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
+The game's code is built for the console's AMD Zen 2 and contains a few of its instructions: SSE4a
 `insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
-([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
+([docs/cpu_features.md](../docs/cpu_features.md)). Boots on Intel hosts reach `clzero` and `clwb`, so no CPUID check
+keeps those from an Intel CPU; for the others that is not measured. A host without one raises `#UD` there, so `gta6rt` installs a
 vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
 address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
 line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
