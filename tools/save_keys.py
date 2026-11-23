@@ -166,9 +166,11 @@ INPUT_EXTENSIONS = (".jsav", ".asav", ".json", ".bin")
 
 def input_files(paths):
     """Every save file (.jsav, .asav, .bin or no extension) or .json under the given paths, in reading order."""
+    def abort(error):
+        raise error
     for p in paths:
         if os.path.isdir(p):
-            for dp, _, fs in os.walk(p):
+            for dp, _, fs in os.walk(p, onerror=abort):
                 for f in sorted(fs):
                     if f.lower().endswith(INPUT_EXTENSIONS) or "." not in f:
                         yield os.path.join(dp, f)

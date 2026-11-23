@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -261,6 +262,39 @@ class MissingFilesTest(unittest.TestCase):
         r = self.cli("resolve", self.save, "--dict", self.missing, "--out", out)
         self.assert_one_error_line(r, self.missing)
         self.assertFalse(os.path.exists(out))
+
+    def locked_dir(self):
+        # A directory whose listing fails: os.walk would quietly drop it without an onerror callback.
+        bad = os.path.join(self.tmp.name, "locked")
+        os.makedirs(bad)
+        real = os.scandir
+
+        def scandir(path):
+            if os.fspath(path) == bad:
+                raise PermissionError(13, "Permission denied", bad)
+            return real(path)
+
+        return bad, unittest.mock.patch("os.scandir", side_effect=scandir)
+
+    def test_an_unreadable_directory_is_not_skipped_in_silence(self):
+        bad, patch = self.locked_dir()
+        with patch:
+            with self.assertRaises(PermissionError):
+                sk.collect_keys([bad])
+
+    def test_an_unreadable_directory_is_one_error_line(self):
+        bad, patch = self.locked_dir()
+        for args in (["collect", bad], ["resolve", bad, "--dict", self.words]):
+            with self.subTest(cmd=args[0]):
+                err = io.StringIO()
+                with patch:
+                    with contextlib.redirect_stderr(err):
+                        rc = sk.main(args)
+                self.assertEqual(rc, 1)
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, err.getvalue())
+                self.assertTrue(lines[0].startswith("error: "), err.getvalue())
+                self.assertIn(bad, lines[0])
 
     def test_readable_files_still_resolve(self):
         r = self.cli("resolve", self.save, "--dict", self.words)
