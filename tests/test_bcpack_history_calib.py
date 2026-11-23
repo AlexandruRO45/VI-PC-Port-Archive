@@ -471,6 +471,34 @@ class PrefixDecoderAndCliTest(unittest.TestCase):
                 self.assertIn("ERROR:", msg)
                 self.assertNotIn("Traceback", msg)
 
+    def test_cli_ref_pairs_wrong_typed_fields_are_clean_errors(self):
+        # A list/dict/null index or out_size, a missing index, or a list chunk_hex/ref_hex used to
+        # raise TypeError/KeyError past main's (CliError, ValueError, OSError, ...) handler.
+        bad_pairs = [
+            ({"pool": "p.bin", "dds": "d.dds", "index": [1]}, "index"),
+            ({"pool": "p.bin", "dds": "d.dds", "index": {"x": 1}}, "index"),
+            ({"pool": "p.bin", "dds": "d.dds"}, "index"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": "00" * 16, "out_size": [16]}, "out_size"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": "00" * 16, "out_size": None}, "out_size"),
+            ({"codec": "bc1", "chunk_hex": [0], "ref_hex": "00" * 16}, "chunk_hex"),
+            ({"codec": "bc1", "chunk_hex": "00" * 8, "ref_hex": [0]}, "ref_hex"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for i, (pair, field) in enumerate(bad_pairs):
+                with self.subTest(field=field, pair=pair):
+                    pairs_json = os.path.join(tmp, f"pairs_{i}.json")
+                    with open(pairs_json, "w", encoding="utf-8") as fh:
+                        json.dump({"pairs": [pair]}, fh)
+                    err = io.StringIO()
+                    with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                        rc = calib.main(["--ref-pairs", pairs_json, "--codec", "bc1",
+                                         "--out", os.path.join(tmp, f"out_{i}")])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    msg = err.getvalue()
+                    self.assertIn("ERROR:", msg)
+                    self.assertNotIn("Traceback", msg)
+                    self.assertIn(field, msg)
+
 
 class ReferenceInversionTest(unittest.TestCase):
     def test_ref_pairs_inverts_all_six_codecs_for_strict_decode(self):

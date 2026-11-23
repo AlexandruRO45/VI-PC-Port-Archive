@@ -2156,6 +2156,22 @@ def apply_ref_dds(pool_path, index, dds_path, calibrators):
         pool.close()
 
 
+def _pair_int(value, pairs_path, idx, field):
+    """int() for one --ref-pairs field; a null, list, object or non-numeric string is a CliError."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise CliError(f"{pairs_path}: pair {idx} {field} must be an integer") from None
+
+
+def _pair_hex(value, pairs_path, idx, field):
+    """bytes.fromhex() for one --ref-pairs field; a non-string or non-hex value is a CliError."""
+    try:
+        return bytes.fromhex(value)
+    except (TypeError, ValueError):
+        raise CliError(f"{pairs_path}: pair {idx} {field} must be a hex string") from None
+
+
 def apply_ref_pairs_file(pairs_path, calibrators):
     """Apply a JSON file of raw `(codec, chunk, reference)` block pairs or DDS pairs."""
     if not os.path.isfile(pairs_path):
@@ -2179,7 +2195,8 @@ def apply_ref_pairs_file(pairs_path, calibrators):
                 p_path = os.path.join(base_dir, p_path)
             if not os.path.isabs(d_path):
                 d_path = os.path.join(base_dir, d_path)
-            apply_ref_dds(p_path, int(item["index"]), d_path, calibrators)
+            apply_ref_dds(p_path, _pair_int(item.get("index"), pairs_path, idx, "index"),
+                          d_path, calibrators)
             continue
         cspec = str(item.get("codec", "")).strip().lower()
         codec = CODEC_ALIASES.get(cspec)
@@ -2188,7 +2205,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
         if codec not in calibrators:
             continue
         if "chunk_hex" in item:
-            raw = bytes.fromhex(item["chunk_hex"])
+            raw = _pair_hex(item["chunk_hex"], pairs_path, idx, "chunk_hex")
         elif "chunk_file" in item:
             cp = item["chunk_file"]
             if not os.path.isabs(cp):
@@ -2198,7 +2215,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
         else:
             raise CliError(f"{pairs_path}: pair {idx} missing chunk_hex or chunk_file")
         if "ref_hex" in item:
-            ref_bytes = bytes.fromhex(item["ref_hex"])
+            ref_bytes = _pair_hex(item["ref_hex"], pairs_path, idx, "ref_hex")
         elif "ref_file" in item:
             rp = item["ref_file"]
             if not os.path.isabs(rp):
@@ -2208,7 +2225,7 @@ def apply_ref_pairs_file(pairs_path, calibrators):
         else:
             raise CliError(f"{pairs_path}: pair {idx} missing ref_hex or ref_file")
         eb = bcpack.BLOCK_BYTES[codec]
-        out_size = int(item.get("out_size", len(ref_bytes)))
+        out_size = _pair_int(item.get("out_size", len(ref_bytes)), pairs_path, idx, "out_size")
         if out_size <= 0 or out_size % eb != 0 or len(ref_bytes) < out_size:
             raise CliError(f"{pairs_path}: pair {idx} out_size/ref length mismatch")
         nblocks = out_size // eb
