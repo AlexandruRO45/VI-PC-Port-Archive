@@ -570,6 +570,15 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(reflect.call_count, 2)
 
+    def test_windows_reserved_device_names_and_trailing_dots_are_rejected_as_stems(self):
+        for bad in ("CON", "PRN", "AUX", "NUL", "COM1", "LPT9", "con.extra", "NUL .spv",
+                    "COM\u00b9", "LPT\u00b2.x", "CONIN$", "CONOUT$", "foo.", "..."):
+            with self.subTest(bad=bad):
+                self.assertFalse(link.is_shader_stem(bad))
+        for good in (".leadingdot", "~foo!&(1)", "COM10", "LPT10", "console", "my.CON"):
+            with self.subTest(good=good):
+                self.assertTrue(link.is_shader_stem(good))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

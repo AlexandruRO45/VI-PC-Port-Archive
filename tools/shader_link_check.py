@@ -26,11 +26,20 @@ CHAINS = {("vs", "ps"), ("vs", "gs", "ps"), ("ms", "ps"), ("vs", "gs")}
 # folder: no separators or drive colon, not "." or "..", and no character a Windows file name can't hold. Anything
 # else is allowed: make_game's corpus names use "~", "!", "&", "(" and a leading ".".
 BAD_STEM = re.compile(r'[\\/:<>"|?*\x00-\x1f]')
+_WINDOWS_RESERVED_DEVICES = frozenset({
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+    *(f"LPT{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+})
 
 
 def is_shader_stem(reference):
-    return isinstance(reference, str) and reference not in ("", ".", "..") \
-        and not BAD_STEM.search(reference) and reference == reference.strip()
+    if not isinstance(reference, str) or reference in ("", ".", ".."):
+        return False
+    if BAD_STEM.search(reference) or reference != reference.strip() or reference.endswith("."):
+        return False
+    stem = reference.split(".", 1)[0].rstrip(" ").upper()
+    return stem not in _WINDOWS_RESERVED_DEVICES
 
 
 @dataclass(frozen=True)
