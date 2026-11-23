@@ -10,6 +10,7 @@ import os
 import struct
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -172,6 +173,55 @@ class CompareCommand(unittest.TestCase):
                 ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
+
+
+class PartialResults(unittest.TestCase):
+    """A run killed mid-write leaves a partly written last line; resuming and comparing must survive it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = self.tmp.name
+        self.dir = os.path.join(self.out, "a_z")
+        os.makedirs(self.dir)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, text):
+        with open(os.path.join(self.dir, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+
+    @staticmethod
+    def row(i):
+        return json.dumps({"i": i, "code": 0, "reason": "", "targets": 1}) + "\n"
+
+    def test_a_partly_written_last_line_is_ignored(self):
+        self.write(self.row(0) + '{"i": 1, "co')
+        a = types.SimpleNamespace(out=self.out, variant="z", suffix="")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            recs = ps_sweep.load_results(a, "a")
+        self.assertEqual(sorted(recs), [0])
+        self.assertIn("partly written last line", err.getvalue())
+
+    def test_a_broken_line_in_the_middle_is_still_an_error(self):
+        self.write('{"i": 0, "co\n' + self.row(1))
+        with self.assertRaises(ValueError):
+            ps_sweep.read_rows(os.path.join(self.dir, "results_0.jsonl"))
+
+    def test_run_resumes_past_a_partly_written_line(self):
+        spirv = os.path.join(self.out, "spirv")
+        os.makedirs(spirv)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"x": meta()}, f)
+        with open(os.path.join(self.out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"name": "x", "stratum": [False, "none", "structured"]}], f)
+        self.write(self.row(0) + '{"i": 1, "co')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            ps_sweep.main(["run", "--spirv", spirv, "--out", self.out, "--tag", "a", "--exe", "unused"])
+        # shader 0 is in the log, so nothing ran and the harness was never started
+        self.assertIn("done a z 0", buf.getvalue())
 
 
 if __name__ == "__main__":
