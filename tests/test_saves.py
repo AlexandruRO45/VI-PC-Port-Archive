@@ -1123,7 +1123,7 @@ class ChivesShapeTest(ChivesFolderTestCase):
                            (b"true", "a boolean")):
             with self.subTest(body=body):
                 write(self.chives, body)
-                self.assert_one_error_line(f"must hold a JSON object, not {kind}")
+                self.assert_one_error_line(f"chives.json must be an object, not {kind}")
 
     def test_save_directory_that_is_not_a_string_is_one_error_line(self):
         for value, kind in ((b"5", "a number"), (b'["a"]', "an array"), (b"{}", "an object"),

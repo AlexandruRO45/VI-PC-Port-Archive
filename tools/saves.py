@@ -97,7 +97,7 @@ def read_chives(path):
     nor null, is a ValueError naming the file: info and import read save_directory as the folder's label."""
     meta = read_json(path)
     if not isinstance(meta, dict):
-        raise ValueError(f'{path}: chives.json must hold a JSON object, not {json_kind(meta)}')
+        raise ValueError(f'{path}: chives.json must be an object, not {json_kind(meta)}')
     label = meta.get('save_directory')
     if label is not None and not isinstance(label, str):
         raise ValueError(f'{path}: save_directory must be a string, not {json_kind(label)}')
