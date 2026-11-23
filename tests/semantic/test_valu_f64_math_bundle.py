@@ -554,5 +554,22 @@ class VLdexpF64AstInterpreterTests(unittest.TestCase):
         wave.set_f64(0, 0, res)
         self.assertEqual(wave.get_f64(0, 0), f64_to_u64(12.0))
 
+class VLdexpF64SimdIeeeTests(unittest.TestCase):
+    def test_ldexp_simd_exec_masking(self):
+        wave = SimdWaveState64(lane_count=32)
+        wave.exec_mask = 0x000000FF
+        for i in range(32):
+            wave.set_f64(i, 4, 0x99999999AAAAAAAA)
+            if (wave.exec_mask >> i) & 1:
+                wave.set_f64(i, 4, oracle_ldexp_f64(F64_POS_ONE, i))
+        for i in range(8):
+            self.assertEqual(wave.get_f64(i, 4), f64_to_u64(2.0**i))
+        for i in range(8, 32):
+            self.assertEqual(wave.get_f64(i, 4), 0x99999999AAAAAAAA)
+
+    def test_ldexp_overflow(self):
+        # 1.0 * 2^2000 -> overflow to inf
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 2000), F64_POS_INF)
+
 if __name__ == "__main__":
     unittest.main()
