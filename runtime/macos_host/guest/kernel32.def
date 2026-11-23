@@ -1,0 +1,21 @@
+LIBRARY kernel32.dll
+EXPORTS
+GetStdHandle
+WriteFile
+ExitProcess
+GetLastError
+GetProcessHeap
+HeapAlloc
+HeapFree
+VirtualAlloc
+VirtualFree
+TlsAlloc
+TlsGetValue
+TlsSetValue
+CreateThread
+WaitForSingleObject
+CloseHandle
+Sleep
+QueryPerformanceCounter
+CreateFileW
+ReadFile
