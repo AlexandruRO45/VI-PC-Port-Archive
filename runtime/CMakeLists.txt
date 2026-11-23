@@ -420,7 +420,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   endif()
 
 elseif(NOT WIN32)
-  message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux")
+  message(STATUS "gta6rt requires Windows; only Vulkan tools are available on Linux and macOS")
 endif()
 
 include(CTest)
