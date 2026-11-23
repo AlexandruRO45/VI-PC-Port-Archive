@@ -192,7 +192,7 @@ def translate(work: str, picked: list[dict]) -> dict:
             spirv,
         ]
     )
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:
         meta = json.load(f)
     result = {}
     for entry in picked:
