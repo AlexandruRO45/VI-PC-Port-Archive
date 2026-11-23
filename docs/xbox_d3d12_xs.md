@@ -681,6 +681,38 @@ HRESULT D3D12GetInterface(
 their GUID words and maps each to an interface. It creates no device.
 Source: <https://docs.xbox.com/reference/graphics/d3d12/functions/d3d12getinterface_public.md>
 
+The retail 1.0.2.1 title's only call site (static read, not run) passes a null adapter,
+`IID_ID3D12Device11`, and a parameter block whose first `0x50` bytes it initializes. The field
+names and offsets below are the public `D3D12XBOX_CREATE_DEVICE_PARAMETERS` layout
+([d3d12_xs_surface.md §7.1](d3d12_xs_surface.md)); the values are the title's.
+
+| Field | Offset | Value |
+|---|---|---:|
+| `Version` | `+0x00` | `0x20004` |
+| `ProcessDebugFlags` | `+0x04` | 0 |
+| `GraphicsCommandQueueRingSizeBytes` | `+0x08` | `0x100000` (1 MiB) |
+| `pOffchipTessellationBuffer` | `+0x10` | 0 |
+| `GraphicsScratchMemorySizeBytes` | `+0x18` | 0 (default) |
+| `ComputeScratchMemorySizeBytes` | `+0x1C` | 0 (default) |
+| `DisableGeometryShaderAllocations` | `+0x20` | 0 |
+| `DisableTessellationShaderAllocations` | `+0x24` | 0 |
+| `DisableDXR` | `+0x28` | 1 |
+| `DisableAutomaticDPBBBreakBatchEvents` | `+0x2C` | 0 |
+| `pDXRStackBuffer` | `+0x30` | 0 |
+| `DXRStackBufferOverrideSizeBytes` | `+0x38` | 0 |
+| `CreateDeviceFlags` | `+0x3C` | `0x20` |
+| `AutoHDRPaperWhiteLevelNits` | `+0x40` | 0 |
+| `DisableAutomaticCommandSegmentChaining` | `+0x44` | 0 |
+
+The dword at `+0x0C` is the x64 alignment pad. The last two dwords of the initialized range,
+`+0x48` and `+0x4C`, are zero; the public samples name two amplification-shader sizes without
+offsets. The runtime logs 24 words (96 bytes), so words 20 to 23 are past the part this call site
+writes. The `+0x20` and `+0x24` values come from two startup-config bytes, 0 in the image.
+
+The 1 at `DisableDXR` is the one surprise: the title later builds acceleration structures with
+`XboxBvhBuilder`, so either it disables console DXR for this configuration or the console struct
+names or inverts that field differently. The call site alone does not settle it.
+
 ### 5.2 Command queue
 
 ```cpp
