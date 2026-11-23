@@ -332,3 +332,21 @@ class TestValuPkMaxI16ConditionCodes(unittest.TestCase):
         self.assertEqual(res, 0x7FFF7FFF)
         self.assertEqual(scc, 0)
         self.assertEqual(vcc, 0)
+
+
+class TestValuPkMaxI16BitwiseEdgeCases(unittest.TestCase):
+    """Test suite for 16-bit float bit representations and signed int boundaries."""
+
+    def test_float16_patterns_interpreted_as_signed_int16(self):
+        # 0x8000 is -0.0 in float16, but -32768 in int16
+        # 0x0000 is +0.0 in float16, but 0 in int16
+        # In signed int: max(-32768, 0) = 0 (0x0000)
+        res = ref_pk_max_i16(0x80008000, 0x00000000)
+        self.assertEqual(res, 0x00000000)
+
+    def test_boundary_checkerboard_bitmasks(self):
+        checkerboards = [0x55555555, 0xAAAAAAAA, 0x33333333, 0xCCCCCCCC, 0x0F0F0F0F, 0xF0F0F0F0]
+        for cb0 in checkerboards:
+            for cb1 in checkerboards:
+                res = ref_pk_max_i16(cb0, cb1)
+                self.assertEqual(res, ref_pk_max_i16(cb1, cb0))
