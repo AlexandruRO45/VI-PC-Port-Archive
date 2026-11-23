@@ -6,8 +6,9 @@ The test programs are vk_compute_test, vk_store_test, vk_harness, vk_texture_tes
 (runtime/build by default). With
 the Visual Studio generator they are in runtime/build/RelWithDebInfo, Release and so on: that subfolder is found by
 itself (the newest complete one if there are several) and its name is printed.
-Each line is one shader: ok, or what came back instead. The wave32 test ps_bitmask_perm checks every pixel, including
-the second 32-lane half when a GPU runs fragment shaders in 64-wide subgroups.
+Each line is one shader: ok, SKIP (why) when this device can't run it, or what came back instead. The last line counts
+the passes and the skips, and the exit status is 1 when a shader failed. The wave32 test ps_bitmask_perm checks every
+pixel, including the second 32-lane half when a GPU runs fragment shaders in 64-wide subgroups.
 The two whole-wave mask checks are skipped when the device cannot provide a full 64-wide compute subgroup.
 The cs_w64x_* / ms_w64x_* cross-half tests (lanes 32-63 against lanes 0-31, see their .asm headers) are skipped there
 too. With LEONIDA_W64_EMULATE=1 they run without that requirement, on a device whose subgroups are narrower (NVIDIA),
