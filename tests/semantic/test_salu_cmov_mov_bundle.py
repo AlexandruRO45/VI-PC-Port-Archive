@@ -322,6 +322,26 @@ class TestSCmovkI32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 1234)
 
+def ref_s_mov_b32(s0: int) -> int:
+    """Reference mathematical oracle for s_mov_b32."""
+    return s0 & MASK32
+
+
+class TestSMovB32Oracle(unittest.TestCase):
+    def test_identity(self) -> None:
+        self.assertEqual(ref_s_mov_b32(0x12345678), 0x12345678)
+        self.assertEqual(ref_s_mov_b32(0), 0)
+
+    def test_translator_oracle_verification(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0xCAFEBABE",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_mov_b32_oracle")
+        for l in range(32):
+            self.assertEqual(results[l], 0xCAFEBABE)
+
 
 if __name__ == "__main__":
     unittest.main()
