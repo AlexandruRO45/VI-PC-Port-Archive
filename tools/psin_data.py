@@ -39,6 +39,10 @@ Member types (LSCH member +8), with the layouts this tool reads:
     0x73  {u32 capacity, u32 count, u64 pointer}: open addressing over `capacity` (key, value) slots; key 0 = empty
     0x75  {u32 groups, u32 count, u64 pointer}: groups of 16 control bytes + 16 (key, value) slots; a control
           byte with bit 7 set is an empty slot
+    0x76, 0x77  {u32 slots, u32 entries, u64 pointer}: a hash set stored in `slots` records of the block's own
+          element type (a u32 hash block for 0x76, a bucket struct for 0x77)
+    0x5a  {u64 pointer, u16 rows, u16 cols, u32 count}: a rows * cols grid of f32 values (count == rows * cols)
+          in a type-0x21 block
 
 An array's element is the member at its element index (+10); a map's key and value elements are the members at
 `ref & 0xffff` and `ref >> 16`. In a (key, value) slot the value starts at the key size rounded up to the value's
@@ -51,7 +55,8 @@ Usage:
 
 The default output is counts only: containers, block tables, bytes reached from the root, pointers, arrays and maps,
 with every check. `--dump` prints the decoded tree of one container on stdout, hashes as hex, for local inspection;
-it writes no file. Unknown member types (0x5a, 0x76, 0x77, ...) are counted and skipped, never guessed.
+it writes no file. Every member type measured so far is decoded; a type this file has not seen is counted and
+skipped, never guessed.
 """
 import argparse
 import collections
@@ -155,6 +160,13 @@ class Container:
         if t == 0x40:
             return m["ref"]
         return None
+
+    def block_element_size(self, btype):
+        """Bytes of one record of a block whose type is a struct name or a member type code."""
+        s = self.structs.get(btype)
+        if s is not None:
+            return s["size"]
+        return self.size_of({"type": btype, "ref": 0})
 
     def align_of(self, m):
         t = m["type"]
@@ -308,6 +320,10 @@ class Walker:
             return self.array(m, members, at, depth)
         if t in (0x71, 0x73, 0x75):
             return self.map(m, members, at, depth)
+        if t in (0x76, 0x77):
+            return self.hash_set(m, at, depth)
+        if t == 0x5A:
+            return self.grid(m, at, depth)
         st[f"type {t:02x} not decoded"] += 1
         return None
 
@@ -369,6 +385,64 @@ class Walker:
         st[f"{kind} block type matches element" if btype == want else f"{kind} block type differs"] += 1
         self.mark(number, absolute, size * count)
         return self.elements(el, members, absolute, count, depth)
+
+    def grid(self, m, at, depth):
+        """0x5a: {u64 pointer, u16 rows, u16 cols, u32 count}, a rows * cols grid of f32 values.
+
+        `count` equals `rows * cols` on every measured member, and the pointer names a type-0x21 block whose
+        `rows * cols * 4` bytes are the grid.
+        """
+        c, st, blob = self.c, self.stats, self.c.blob
+        rows, cols, count = struct.unpack_from("<HHI", blob, at + 8)
+        st["grid 5a count == rows * cols" if count == rows * cols else "grid 5a count != rows * cols"] += 1
+        n = rows * cols
+        if not n:
+            st["grid 5a empty"] += 1
+            return [] if self.keep else None
+        r = c.resolve(at, 4 * n, st, "grid 5a")
+        if r is None:
+            return None
+        btype, absolute, number = r
+        st["grid 5a block is f32" if btype == 0x21 else "grid 5a block is not f32"] += 1
+        self.mark(number, absolute, 4 * n)
+        return list(struct.unpack_from(f"<{n}f", blob, absolute)) if self.keep else None
+
+    def hash_set(self, m, at, depth):
+        """0x76 / 0x77: {u32 slots, u32 entries, u64 pointer}, a hash set held in `slots` records.
+
+        The pointed block holds `slots` records of its own element type: a type-0x4a block gives 4-byte u32
+        hashes (0x76, `entries` <= `slots`, the unused records are 0), an anonymous 0x100 block gives struct
+        buckets (0x77, where `entries` counts what the buckets hold and may exceed `slots`).
+        """
+        c, st, blob = self.c, self.stats, self.c.blob
+        kind = f"set {m['type']:02x}"
+        slots, entries = struct.unpack_from("<II", blob, at)
+        if slots == 0:
+            st[f"{kind} empty"] += 1
+            return [] if self.keep else None
+        r = c.resolve(at + 8, 1, st, kind)
+        if r is None:
+            return None
+        btype, absolute, number = r
+        elem = c.block_element_size(btype)
+        if not elem:
+            st[f"{kind} of undecoded block type {btype:02x}"] += 1
+            return None
+        _, base, size = c.blocks[number - 1]
+        if absolute - base + slots * elem > size:
+            st[f"{kind} past block end"] += 1
+            return None
+        st[f"{kind} slots"] += slots
+        st[f"{kind} entries"] += entries
+        self.mark(number, absolute, slots * elem)
+        if not self.keep:
+            return None
+        if btype in c.structs:
+            return [self.struct(btype, absolute + i * elem, depth + 1, number) for i in range(slots)]
+        if elem != 4:
+            return [f"{elem} byte records"] * slots
+        values = [struct.unpack_from("<I", blob, absolute + 4 * i)[0] for i in range(slots)]
+        return [f"{v:08x}" for v in values if v]
 
     def map(self, m, members, at, depth):
         c, st, blob = self.c, self.stats, self.c.blob

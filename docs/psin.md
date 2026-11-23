@@ -151,7 +151,7 @@ hypothesis until a struct is matched against its instance data.
 | 0x68 | 98 | an enum | 8 | 64-bit enum (medium) |
 | 0x50, 0x53 | 20,777, 367 | the element count in the low 16 bits | varies | fixed array in place (high) |
 | 0x71, 0x73, 0x75 | 114,700, 111, 12,888 | the key and value element indices (`ref & 0xffff`, `ref >> 16`) | 24, 16, 16 | maps (high), see *Instance data* |
-| 0x76, 0x77, 0x54, 0x5a | 4, 2, 1, 3 | varies | varies | 0x54: inline array; the others are not decoded |
+| 0x76, 0x77, 0x54, 0x5a | 4, 2, 1, 3 | varies | varies | 0x54: inline array; 0x76/0x77: hash sets; 0x5a: f32 grid (see below) |
 | 0x01, 0x11 | 93,811, 14,761 | - | 1 | 1-byte scalars (medium) |
 | 0x13, 0x20 | 7,372, 7,356 | - | 2 | 2-byte scalars (medium) |
 | 0x14, 0x15, 0x21, 0x4a | 35,088, 41,144, 110,948, 194,191 | - | 4 | 4-byte scalars (medium) |
@@ -302,11 +302,40 @@ index, as in `LSCH`. Maps name a key element at `ref & 0xffff` and a value eleme
 | 0x75 | 16 | `{u32 groups, u32 count, u64 pointer}`: `groups` groups of 16 control bytes followed by 16 (key, value) slots. A control byte with bit 7 set marks an empty slot. |
 | 0x73 | 16 | `{u32 capacity, u32 count, u64 pointer}`: `capacity` (key, value) slots, where key 0 marks an empty slot |
 | 0x60, 0x63 / 0x64 / 0x62, 0x65 / 0x68 | 1 / 2 / 4 / 8 | enum value or enum bit set |
+| 0x5a | 16 | `{u64 pointer, u16 rows, u16 cols, u32 count}`: `rows × cols` f32 in a type-`0x21` block, `count == rows × cols` |
+| 0x76, 0x77 | 16 | `{u32 slots, u32 entries, u64 pointer}`: a hash set in `slots` records of the block's element type |
 
 **Alignment.** In a (key, value) slot the value starts at the key size rounded up to the value's alignment, and the
 slot size is rounded up to the larger of the two alignments. A struct aligns to 2^(+9 of its header). The 16-byte
 vectors (0x0c, 0x0d, 0x31, 0x33, 0x34, 0x35) and 0x36 align to 16, and 0x32 aligns to 4. Every other type aligns to
 its size, capped at 8. With these rules the 24-byte 0x71 value sits at +8 after a u32 key, in a 32-byte pair.
+
+### Hash sets (`0x76` / `0x77`)
+
+Two member types are hash sets rather than maps: 16 bytes of `{u32 slots, u32 entries, u64 pointer}`. The pointer
+names a block that holds `slots` records of the **block's own element type**, so no other field has to say how wide
+a record is:
+
+| Type | Element block | Record |
+|---:|---|---|
+| `0x76` | a type-`0x4a` block | one `u32` hash; `entries <= slots` and the unused records are `0` |
+| `0x77` | an anonymous `0x100` block | the block's struct, a bucket of 16 `u64` hashes behind a 16-byte bit set; `entries` counts the hashes in the buckets and may exceed `slots` |
+
+Measured on the two `data.rpf` containers these types left partly reached: `2 * 32 slots * 4 bytes = 256` and
+`1 * 4 slots * 144 bytes = 576` are exactly the bytes each had unreached, and both then hold `bytes == bytes
+reached`. In the `0x76` windows exactly `entries` of the `slots` u32s are non-zero (`1` and `2`), and the four
+`0x77` buckets hold exactly the declared `35` hashes (`12 + 10 + 10 + 3`). Reading `slots` as the *second* word
+would overrun both blocks, so its position is measured, not assumed. Whole-corpus figures are not claimed yet: the
+other `0x76`/`0x77` members sit in archives whose carve this change was not checked against.
+
+### f32 grids (`0x5a`)
+
+`0x5a` is 16 bytes of `{u64 pointer, u16 rows, u16 cols, u32 count}`: a `rows × cols` grid of f32 values in a
+type-`0x21` block. Measured on the three `anim.rpf` containers that hold all `81` corpus-wide occurrences: `count ==
+rows * cols` on `81 / 81`, the pointer names a type-`0x21` block on `81 / 81`, and `rows * cols * 4` bytes fit in
+the block on `81 / 81`. The three containers go from `5,884`, `9,244` and `11,356` reached bytes to `9,076`,
+`10,588` and `22,516` (`bytes == bytes reached`), and the sums of `rows * cols * 4` are `3,192`, `1,344` and
+`11,160` - exactly the bytes each had unreached.
 
 ### Measured coverage
 
@@ -317,16 +346,16 @@ and marks each byte it reads.
 |---|---:|---:|---:|---:|---:|---:|
 | `levels` | 6,982 | 6,650 | 6,650 | 6,650 | 43,591,021 | 43,591,021 |
 | `story000` | 5,348 | 5,075 | 5,075 | 5,075 | 36,404,701 | 36,404,701 |
-| `data` | 2,281 | 2,081 | 2,081 | 2,079 | 14,773,021 | 14,772,189 |
+| `data` | 2,281 | 2,081 | 2,081 | 2,081 | 14,773,021 | 14,773,021 |
 | `story000_script` | 2,309 | 2,118 | 2,118 | 2,118 | 30,677,748 | 30,677,748 |
 | `script` | 1,012 | 1,009 | 1,009 | 1,009 | 1,323,348 | 1,323,348 |
 | `packs` | 586 | 487 | 487 | 486 | 1,924,622 | 1,923,342 |
 | `shared_minigame000` | 73 | 70 | 70 | 70 | 227,855 | 227,855 |
 | `navmeshes` | 22 | 1 | 1 | 1 | 28,688 | 28,688 |
-| `anim` | 18 | 9 | 9 | 6 | 102,040 | 86,344 |
+| `anim` | 18 | 9 | 9 | 9 | 102,040 | 102,040 |
 | `core_restofworld` | 6 | 5 | 5 | 5 | 59,136 | 59,136 |
 | `story000_restofworld` | 3 | 2 | 2 | 2 | 5,632 | 5,632 |
-| **all** | **18,640** | **17,507** | **17,507** | **17,501** | **129,117,812** | **129,100,004** (99.986%) |
+| **all** | **18,640** | **17,507** | **17,507** | **17,506** | **129,117,812** | **129,116,532** (99.999%) |
 
 The other 1,133 streams are not counted. 1,076 are cut off (see *Corpus*), and 57 use the `PMAP`/`PSCH` form, which
 has no `LSCH`.
@@ -350,9 +379,8 @@ Checks over the 17,507 containers:
   are listed only as negative numbers and 30,797 only as values of 2^31 or more, so a value counts as listed under either
   reading. Reading it only as `s32`, as the first version of this tool did, leaves 31,624 unlisted. 235,486 of 235,489 bit sets (0x65) use only bits their enum defines. 1,431
   values name an enum that is not in their file's `LENM`.
-- **Not decoded.** 0x5a (81 members), 0x76 (12) and 0x77 (1) are counted and skipped. They are the only reason the
-  6 partly reached containers are partial: the 0x5a and 0x76 members point at `f32` and u32-hash blocks that
-  nothing else reaches.
+- **Undecoded.** None on the two carves re-measured here (`data` and `anim`): every member type has a layout
+  above or below. A type the tool has not seen is still counted and skipped, never guessed.
 
 These numbers cover layout only. What each struct means is not decoded here. The engine names behind the schema
 hashes are covered under *Hashes*, and the resource names behind hash values under *Name hashes in the data*.

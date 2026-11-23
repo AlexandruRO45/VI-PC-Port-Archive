@@ -38,9 +38,10 @@ def make_container(blocks, structs, enums=(), root=1, end_row=True, fill=b"\xaa"
 
 
 ROOT_T, ITEM_T, STR_T = joaat("RootThing"), joaat("ItemThing"), 0x10
+BUCKET_T = joaat("BucketThing")
 KIND = joaat("KindEnum")
 
-# RootThing (0x90 bytes): every container shape the decoder reads.
+# RootThing (0xC8 bytes): every container shape the decoder reads.
 ROOT_MEMBERS = [
     (0x100, 0, 0x05, 0, 0, ITEM_T),                  # 0: element descriptor, ItemThing
     (0x100, 0, 0x15, 0, 0, 0),                       # 1: element descriptor, u32
@@ -55,21 +56,25 @@ ROOT_MEMBERS = [
     (joaat("short"), 0x68, 0x44, 0, 0, 0),           # 16-byte string, stored in place
     (joaat("kind"), 0x78, 0x62, 0, 0, KIND),         # 32-bit enum
     (joaat("fixed"), 0x7C, 0x50, 0, 1, 3),           # u32[3] in place
-    (joaat("odd"), 0x88, 0x77, 0, 0, 0),             # a type this tool does not decode
+    (joaat("odd"), 0x88, 0x77, 0, 0, 0),             # an all-zero 0x77: an empty set
+    (joaat("hashes"), 0x98, 0x76, 0, 0, 0),          # hash set: 4 slots of a u32 hash
+    (joaat("grid"), 0xA8, 0x5A, 0, 0, 0),            # 2x3 f32 grid, count 6
+    (joaat("buckets"), 0xB8, 0x77, 0, 0, 0),         # hash set: 2 bucket records
 ]
 SCHEMA = [
-    (ROOT_T, 0x1, 0x90, 3, ROOT_MEMBERS),
+    (ROOT_T, 0x1, 0xC8, 3, ROOT_MEMBERS),
     (ITEM_T, 0x2, 0x8, 2, [(joaat("x"), 0, 0x21, 0, 0, 0), (joaat("n"), 4, 0x15, 0, 0, 0)]),
+    (BUCKET_T, 0x4, 0x8, 3, [(joaat("h"), 0, 0x4F, 0, 0, 0)]),
 ]
 ENUMS = [(KIND, 0x3, [(0, joaat("KIND_A")), (1, joaat("KIND_B"))])]
 
 
 def sample(kind=1):
     """Blocks: 1 root, 2 ItemThing[2], 3 u32[3], 4 map pairs, 5 SwissTable group, 6 open slots, 7 one ItemThing,
-    8 strings."""
+    8 strings, 9 four u32 hash slots, 10 a 2x3 f32 grid, 11 two bucket records."""
     k1, k2 = joaat("alpha"), joaat("beta")
     lo, hi = sorted((k1, k2))
-    root = bytearray(0x90)
+    root = bytearray(0xC8)
     struct.pack_into("<IIQ", root, 0x00, 2, 2, ptr(2))
     struct.pack_into("<QHH", root, 0x10, ptr(3), 3, 3)
     struct.pack_into("<QQHH", root, 0x20, 1, ptr(4), 2, 2)
@@ -81,6 +86,9 @@ def sample(kind=1):
     root[0x68 + 15] = 0x80 | 3
     struct.pack_into("<i", root, 0x78, kind)
     struct.pack_into("<3I", root, 0x7C, 7, 8, 9)
+    struct.pack_into("<IIQ", root, 0x98, 4, 2, ptr(9))       # 0x76: 4 slots, 2 entries
+    struct.pack_into("<QHHI", root, 0xA8, ptr(10), 2, 3, 6)  # 0x5A: 2x3 f32 grid
+    struct.pack_into("<IIQ", root, 0xB8, 2, 3, ptr(11))      # 0x77: 2 buckets, 3 entries
     items = struct.pack("<fIfI", 1.5, 10, 2.5, 20)
     values = struct.pack("<3I", 1, 2, 3)
     pairs = struct.pack("<II", lo, 100) + struct.pack("<II", hi, 200)
@@ -93,8 +101,11 @@ def sample(kind=1):
     struct.pack_into("<II", open_slots, (k1 % 4) * 8, k1, 33)
     item = struct.pack("<fI", 3.5, 30)
     strings = b"hello\0"
+    buckets = struct.pack("<QQ", joaat("first"), joaat("second"))
     blocks = [(ROOT_T, bytes(root)), (ITEM_T, items), (0x15, values), (0x100, pairs), (0x101, bytes(ctrl) + slots),
-              (0x102, bytes(open_slots)), (ITEM_T, item), (STR_T, strings)]
+              (0x102, bytes(open_slots)), (ITEM_T, item), (STR_T, strings),
+              (0x4A, struct.pack("<4I", 0xDEADBEEF, 0, 0x12345678, 0)), (0x21, struct.pack("<6f", 1.0, 2.0, 3.0, 4.0, 5.0, 6.0)),
+              (BUCKET_T, buckets)]
     return make_container(blocks, SCHEMA, ENUMS)
 
 
@@ -142,7 +153,7 @@ class TestWalk(unittest.TestCase):
 
     def test_every_byte_is_reached(self):
         self.assertEqual(self.stats["bytes reached"], self.stats["bytes"])
-        self.assertEqual(self.stats["blocks reached"], 8)
+        self.assertEqual(self.stats["blocks reached"], 11)
 
     def test_arrays(self):
         self.assertEqual(self.tree[f"{joaat('items'):08x}"],
@@ -171,8 +182,8 @@ class TestWalk(unittest.TestCase):
     def test_enum_and_undecoded_type(self):
         self.assertEqual(self.tree[f"{joaat('kind'):08x}"], 1)
         self.assertEqual(self.stats["enum value listed"], 1)
-        self.assertEqual(self.stats["type 77 not decoded"], 1)
-        self.assertIsNone(self.tree[f"{joaat('odd'):08x}"])
+        self.assertEqual(self.stats["set 77 empty"], 1)
+        self.assertEqual(self.tree[f"{joaat('odd'):08x}"], [])
 
     def test_enum_value_not_listed(self):
         stats = __import__("collections").Counter()
