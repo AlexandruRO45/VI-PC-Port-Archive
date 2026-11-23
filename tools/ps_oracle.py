@@ -788,6 +788,7 @@ def main(argv=None):
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"device": o.device, "wave": 64 if o.wave64 else 32, "size": list(a.size), "pixels": px},
                           f, indent=1)
+                f.write("\n")
         return 0
     finally:
         o.close()
