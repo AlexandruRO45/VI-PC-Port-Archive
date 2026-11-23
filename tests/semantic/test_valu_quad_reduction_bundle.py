@@ -419,3 +419,66 @@ class TestQuadmaskB64NegativeAndTranslator(unittest.TestCase):
             "v_mov_b32 v0, s0",
         ])
         self.assertIn("OpBitwiseOr", spv)
+
+
+# ------------------------------------------------------------------------------
+# v_perm_b32 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_perm_b32(s0: int, s1: int, sel: int) -> int:
+    s0 = s0 & MASK32
+    s1 = s1 & MASK32
+    sel = sel & MASK32
+    combined = (s0 << 32) | s1
+    out = 0
+    for i in range(4):
+        sb = (sel >> (8 * i)) & 0xFF
+        if sb < 8:
+            b = (combined >> (8 * sb)) & 0xFF
+        elif 8 <= sb <= 11:
+            half = sb & 3
+            bit = 15 if half == 0 else 31 if half == 1 else 47 if half == 2 else 63
+            b = 0xFF if ((combined >> bit) & 1) else 0x00
+        elif sb == 12:
+            b = 0x00
+        else:
+            b = 0xFF
+        out |= (b << (8 * i))
+    return out
+
+
+class TestPermB32Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        # s0 = high dword (bytes 4..7), s1 = low dword (bytes 0..3)
+        s0 = 0x11223344
+        s1 = 0x55667788
+        vectors = [
+            0x03020100,  # identity select s1 -> 0x55667788
+            0x07060504,  # identity select s0 -> 0x11223344
+            0x00010203,  # byte reversal of s1 -> 0x88776655
+            0x04050607,  # byte reversal of s0 -> 0x44332211
+            0x0C0C0C0C,  # zero constant (12) -> 0x00000000
+            0x0D0D0D0D,  # 0xFF constant (13) -> 0xFFFFFFFF
+        ]
+        for idx, sel in enumerate(vectors):
+            val_hw, _ = run_shader_words(f"ps_perm_oracle_{idx}", [
+                f"v_mov_b32 v1, {hex(s0)}",
+                f"v_mov_b32 v2, {hex(s1)}",
+                f"v_mov_b32 v3, {hex(sel)}",
+                "v_perm_b32 v0, v1, v2, v3",
+            ])
+            self.assertEqual(val_hw, ref_perm_b32(s0, s1, sel))
+
+    def test_oracle_sign_extension_hardware(self):
+        # s1 high half is 0x8000 (negative f16 / sign bit 31 set)
+        s0 = 0x00000000
+        s1 = 0x80000000
+        # selector 9 picks sign bit of half 1 (bit 31 of s1) -> should replicate 0xFF
+        sel = 0x0C0C0C09
+        val_hw, _ = run_shader_words("ps_perm_sign", [
+            f"v_mov_b32 v1, {hex(s0)}",
+            f"v_mov_b32 v2, {hex(s1)}",
+            f"v_mov_b32 v3, {hex(sel)}",
+            "v_perm_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(val_hw, 0x000000FF)
