@@ -128,7 +128,9 @@ IMAGE_TLS_DIRECTORY64* tls_directory(Module& m) {
 // module TLS index for each simultaneous module (up to kMaxMappedTlsModules).
 constexpr DWORD kMaxModuleTlsSlots = 64;
 constexpr size_t kMaxMappedTlsModules = 16;
-void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(0x58)); }
+constexpr uintptr_t kTebTlsVectorOffset = 0x58;    // TEB->ThreadLocalStoragePointer
+constexpr uintptr_t kTebTlsSlotsOffset = 0x1480;   // TEB->TlsSlots; the /GA rewrite (patch_ga_tls_reads) indexes it
+void** module_tls_slots() { return reinterpret_cast<void**>(__readgsqword(kTebTlsVectorOffset)); }
 
 void __cdecl on_host_thread_event(DWORD reason);
 
@@ -397,6 +399,9 @@ struct ExistingThreadBlock {
     void*** vector = nullptr;  // that thread's TEB->ThreadLocalStoragePointer field; the array itself can be replaced
     void* saved = nullptr;     // what the block replaced
     void* block = nullptr;
+    uint32_t ga_slot = kNoTlsIndex;  // its TEB->TlsSlots slot for a /GA image, kNoTlsIndex when not patched
+    void** ga_view = nullptr;        // the view written there, freed with the block
+    void* ga_saved = nullptr;        // what that slot held before
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -491,7 +496,7 @@ size_t patch_ga_tls_reads(Module& m, uint32_t slot) {
     const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
     const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
-    const uint32_t disp = 0x1480u + 8u * slot;
+    const uint32_t disp = static_cast<uint32_t>(kTebTlsSlotsOffset) + 8u * slot;
     size_t sites = 0;
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
         if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
@@ -607,7 +612,7 @@ void*** running_thread_tls_vector(HANDLE thread) {
     const QueryThreadFn query = query_thread_fn();
     if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof info, nullptr) < 0) return nullptr;
     if (info.exit_status != STILL_ACTIVE || !info.teb) return nullptr;
-    return reinterpret_cast<void***>(static_cast<uint8_t*>(info.teb) + 0x58);
+    return reinterpret_cast<void***>(static_cast<uint8_t*>(info.teb) + kTebTlsVectorOffset);
 }
 
 // Another thread's TLS array and one entry of it, read through its TEB. False when the memory is not there any more
@@ -633,6 +638,29 @@ bool write_thread_slot(void** slots, uint32_t index, void* value) noexcept {
     }
 }
 
+// Another thread's TEB->TlsSlots entry: the value its rewritten /GA reads see. `vector` is that thread's TEB->
+// ThreadLocalStoragePointer field (running_thread_tls_vector). False when the TEB is gone (the thread was terminated).
+bool read_thread_tls_value(void*** vector, uint32_t slot, void*& value) noexcept {
+    __try {
+        value = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(vector) - kTebTlsVectorOffset +
+                                         kTebTlsSlotsOffset)[slot];
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        value = nullptr;
+        return false;
+    }
+}
+
+bool write_thread_tls_value(void*** vector, uint32_t slot, void* value) noexcept {
+    __try {
+        reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(vector) - kTebTlsVectorOffset +
+                                 kTebTlsSlotsOffset)[slot] = value;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Puts `saved` back where `block` is, if it is still there.
 void restore_thread_slot(void*** vector, uint32_t index, void* block, void* saved) noexcept {
     __try {
@@ -646,6 +674,13 @@ void restore_thread_slot(void*** vector, uint32_t index, void* block, void* save
 // is gone.
 void remove_existing_block(const ExistingThreadBlock& b) {
     if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
+    if (b.ga_view) {
+        void* now = nullptr;
+        if (b.ga_slot != kNoTlsIndex && b.vector && read_thread_tls_value(b.vector, b.ga_slot, now) &&
+            now == b.ga_view)
+            write_thread_tls_value(b.vector, b.ga_slot, b.ga_saved);
+        VirtualFree(b.ga_view, 0, MEM_RELEASE);
+    }
     VirtualFree(b.block, 0, MEM_RELEASE);
 }
 
@@ -740,7 +775,32 @@ void install_on_existing_threads(Module& m) {
                                  m.name.c_str());
                 continue;
             }
-            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block});
+            void** view = nullptr;
+            void* ga_saved = nullptr;
+            if (m.tls_ga_slot != kNoTlsIndex) {
+                // The view that install_thread_block gives the loading thread and every thread started after
+                // load(): the rewritten gs:[58h] reads index it, and the TLS array entry written above is not one.
+                // The task queue runs a title's callbacks on pool workers that predate the load.
+                view = static_cast<void**>(
+                    VirtualAlloc(nullptr, kMaxModuleTlsSlots * sizeof(void*), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (view) {
+                    view[0] = block;
+                    view[m.tls_index] = block;
+                }
+                if (!view || !read_thread_tls_value(vector, m.tls_ga_slot, ga_saved) ||
+                    !write_thread_tls_value(vector, m.tls_ga_slot, view)) {
+                    if (view) VirtualFree(view, 0, MEM_RELEASE);
+                    restore_thread_slot(vector, m.tls_index, block, saved);
+                    VirtualFree(block, 0, MEM_RELEASE);
+                    static std::atomic<bool> logged_ga{false};
+                    if (!logged_ga.exchange(true))
+                        std::fprintf(stderr, "[rt] loader: %s: a running thread did not take its index-0 (/GA) TLS "
+                                             "view; its gs:[58h] reads are not valid on it\n", m.name.c_str());
+                    continue;
+                }
+            }
+            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block,
+                                    m.tls_ga_slot, view, ga_saved});
         }
     }
 }
@@ -775,6 +835,7 @@ void forget_ended_thread_id() {
             ++it;
             continue;
         }
+        VirtualFree(it->ga_view, 0, MEM_RELEASE);
         VirtualFree(it->block, 0, MEM_RELEASE);
         it = state.blocks.erase(it);
     }

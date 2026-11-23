@@ -739,6 +739,18 @@ if(BUILD_TESTING)
       ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
     )
 
+    # A /GA EXE: the retail title's form of __declspec(thread), reading TEB->ThreadLocalStoragePointer[0]
+    # directly. loader_tls_test checks the loader's rewrite of those reads on the loading thread, a thread that
+    # existed before load() (the task queue runs a title's callbacks on pool workers that predate it) and a new one.
+    add_executable(tiny_ga test/fixtures/tiny_ga.cpp)
+    target_compile_definitions(tiny_ga PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_ga PRIVATE /W4 /permissive- /utf-8 /GA /GS-)
+    target_link_options(tiny_ga PRIVATE /OPT:NOREF)
+    set_target_properties(tiny_ga PROPERTIES
+      OUTPUT_NAME tiny_ga
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+    )
+
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The fixtures import only host
     # DLLs, so no shim tables are linked.
     add_executable(loader_tls_test
@@ -751,9 +763,9 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
+    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only tiny_ga gta6rt_tls_host)
     add_test(NAME loader_tls
-      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
+      COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>" "$<TARGET_FILE:tiny_ga>"
     )
 
     # DisableThreadLibraryCalls from a mapped DllMain (shims/library_loader.cpp). The fixture is built without the CRT, so

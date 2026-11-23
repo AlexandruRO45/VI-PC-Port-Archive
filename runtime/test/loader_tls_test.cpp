@@ -757,6 +757,87 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     fs::remove(live_file, ec);
 }
 
+// A /GA executable reads its own TLS as ThreadLocalStoragePointer[0] (gs:[58h], no _tls_index). load() rewrites
+// those reads to a TlsAlloc slot whose value in each thread is a view with that thread's block at [0] and at
+// [tls_index]. Threads started after load() get the view from the helper DLL's DLL_THREAD_ATTACH; threads that
+// already existed must get it from install_on_existing_threads(), which is where the task queue runs a title's
+// callbacks (process thread-pool workers predate most loads).
+void test_ga_tls(const fs::path& exe) {
+    std::printf("\n-- /GA index-0 TLS: %s --\n", exe.string().c_str());
+    HANDLE started = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE go = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    uint32_t index = rt::kNoTlsIndex;
+    uintptr_t(__cdecl* vector_fn)() = nullptr;
+    uintptr_t(__cdecl* address_fn)() = nullptr;
+    // Read inside the thread: its view and block are freed when it ends.
+    uintptr_t early_vector = 0, early_address = 0;
+    void* early_view_block = nullptr;
+    void* early_block = nullptr;
+    std::thread early([&] {
+        SetEvent(started);
+        WaitForSingleObject(go, INFINITE);
+        early_block = module_tls_slots()[index];
+        early_vector = vector_fn();
+        if (early_vector) {
+            early_view_block = reinterpret_cast<void**>(early_vector)[0];
+            early_address = address_fn();
+        }
+        SetEvent(done);
+    });
+    WaitForSingleObject(started, INFINITE);
+    {
+        rt::Loader loader(exe.parent_path());
+        rt::Module& m = loader.load(exe);
+        check(m.tls_ga_sites > 0 && m.tls_ga_slot != rt::kNoTlsIndex,
+              "load() rewrites the /GA fixture's gs:[58h] reads to a TlsAlloc view");
+        index = m.tls_index;
+        vector_fn = find_export<uintptr_t(__cdecl*)()>(m, "tiny_ga_tls_vector");
+        address_fn = find_export<uintptr_t(__cdecl*)()>(m, "tiny_ga_tls_address");
+
+        const uintptr_t main_vector = vector_fn();
+        const uintptr_t main_address = address_fn();
+        check(main_vector != 0 && reinterpret_cast<void**>(main_vector)[0] == m.tls_block,
+              "the loading thread's /GA view points at its own TLS block");
+        check(main_address >= reinterpret_cast<uintptr_t>(m.tls_block) &&
+                  main_address < reinterpret_cast<uintptr_t>(m.tls_block) + m.tls_block_size,
+              "a /GA access on the loading thread reads its own block");
+
+        SetEvent(go);
+        WaitForSingleObject(done, INFINITE);
+        check(early_block != nullptr && early_block != m.tls_block,
+              "a thread that existed before load() got a TLS block of its own");
+        check(early_vector != 0, "it also has the /GA view the patched reads need (not null)");
+        check(early_view_block == early_block, "its /GA view points at its own block");
+        check(early_address >= reinterpret_cast<uintptr_t>(early_block) &&
+                  early_address < reinterpret_cast<uintptr_t>(early_block) + m.tls_block_size,
+              "a /GA access on that thread reads its own block");
+
+        uintptr_t late_vector = 0, late_address = 0;
+        void* late_view_block = nullptr;
+        void* late_block = nullptr;
+        std::thread late([&] {
+            late_block = module_tls_slots()[index];
+            late_vector = vector_fn();
+            if (late_vector) {
+                late_view_block = reinterpret_cast<void**>(late_vector)[0];
+                late_address = address_fn();
+            }
+        });
+        late.join();
+        check(late_vector != 0 && late_view_block == late_block,
+              "a thread started after load() gets the same /GA view");
+        check(late_address >= reinterpret_cast<uintptr_t>(late_block) &&
+                  late_address < reinterpret_cast<uintptr_t>(late_block) + m.tls_block_size,
+              "a /GA access on a new thread reads its own block");
+    }
+    early.join();
+    CloseHandle(started);
+    CloseHandle(go);
+    CloseHandle(done);
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\nloader_tls_test: OK (%d checks)\n", g_checks);
@@ -770,15 +851,17 @@ void print_result() {
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("loader_tls_test: static TLS against locally built fixtures\n");
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: loader_tls_test <tiny_tls.dll>\n");
+    if (argc != 3) {
+        std::fprintf(stderr, "usage: loader_tls_test <tiny_tls.dll> <tiny_ga.exe>\n");
         return 2;
     }
     const fs::path tls_dll = argv[1];
+    const fs::path ga_exe = argv[2];
 
     try {
         check(fs::exists(tls_dll), "tiny_tls fixture exists");
-        if (!fs::exists(tls_dll)) {
+        check(fs::exists(ga_exe), "tiny_ga fixture exists");
+        if (!fs::exists(tls_dll) || !fs::exists(ga_exe)) {
             print_result();
             return 1;
         }
@@ -787,6 +870,7 @@ int main(int argc, char** argv) {
         test_purge_ownership_scoping(tls_dll, temp.path);  // first: the sweep fires once per process
         test_existing_threads(tls_dll);
         test_terminated_thread(tls_dll);
+        test_ga_tls(ga_exe);
         test_tls(tls_dll);
         test_thread_events(tls_dll);
         test_thread_outlives_loader(tls_dll);
