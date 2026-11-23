@@ -121,6 +121,30 @@ STRONG_EXTRA = '''
 '''
 
 
+class CliValidation(unittest.TestCase):
+    def test_timeout_below_one_is_usage_error(self):
+        for bad in ("0", "-1"):
+            with self.subTest(timeout=bad):
+                p = subprocess.run(
+                    [sys.executable, "-I", TOOL, "tests/semantic/test_x.py", "--function", "swizzle",
+                     "--timeout", bad, "--list"],
+                    cwd=ROOT, capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(p.returncode, 2)
+                self.assertIn("--timeout must be at least 1", p.stderr)
+
+    def test_docstring_examples_parse_with_list(self):
+        prefix = "python -I tools/semantic_mutants.py "
+        examples = [line.strip()[len(prefix):].split()
+                    for line in sm.__doc__.splitlines() if line.strip().startswith(prefix)]
+        self.assertGreaterEqual(len(examples), 3)
+        for argv in examples:
+            with self.subTest(argv=argv):
+                p = subprocess.run([sys.executable, "-I", TOOL, *argv, "--list"],
+                                   cwd=ROOT, capture_output=True, text=True, timeout=30)
+                self.assertEqual(p.returncode, 0, p.stderr)
+
+
 class EndToEnd(unittest.TestCase):
     """v_sad_u8's UMax line: replacing UMax(xa, ya) by UMax(xa, xa) is only right when every byte of S0 >= S1's."""
 

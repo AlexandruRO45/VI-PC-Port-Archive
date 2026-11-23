@@ -1,7 +1,7 @@
 """Op-scoped mutation testing for a tests/semantic file: which one-line translator bugs would it miss?
 
     python -I tools/semantic_mutants.py tests/semantic/test_valu_sad_u8_hw.py --op v_sad_u8
-    python -I tools/semantic_mutants.py tests/semantic/test_x.py --op ds_swizzle_b32 --function swizzle
+    python -I tools/semantic_mutants.py tests/semantic/test_x.py --function swizzle
     python -I tools/semantic_mutants.py tests/semantic/test_x.py --lines 8375-8414
 
 The tool finds the code in tools/rdna2spirv.py that translates the op: the `if op == "..."` / `elif op in (...)`
@@ -205,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=int, default=300, help="seconds per test run (default 300)")
     ap.add_argument("--list", action="store_true", help="only list the mutants")
     args = ap.parse_args(argv)
+    if args.timeout < 1:
+        ap.error("--timeout must be at least 1")
 
     src_path = os.path.join(ROOT, "tools", TRANSLATOR)
     with open(src_path, encoding="utf-8", newline="") as f:
