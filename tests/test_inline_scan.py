@@ -171,6 +171,36 @@ class InlineScanTests(unittest.TestCase):
         text = inline_scan.summarize(sites(GUARDED))
         self.assertNotIn("outside the scanned window", text)
 
+    def test_a_guarded_store_without_a_list_field_is_not_called_a_command_list(self):
+        # The retail executable's common shape: guarded, but the object has no D3D12.X-only field near it.
+        rows = (
+            "mov rsi,qword ptr [rbx+18h]",
+            "cmp rsi,qword ptr [rbx+8]",
+            "jae 0000000140002000",
+            "mov dword ptr [rsi],1",
+            "add rsi,4",
+            "mov qword ptr [rbx+18h],rsi",
+        )
+        (site,) = sites(rows)
+        self.assertTrue(site["checked"])
+        self.assertFalse(site["fields"])
+        text = inline_scan.summarize([site])
+        self.assertIn("with a D3D12.X list field in the window: 0, without one: 1", text)
+
+    def test_a_site_that_touches_a_list_field_keeps_it_out_of_that_line(self):
+        rows = (
+            "mov rax,qword ptr [rbx+18h]",
+            "cmp rax,qword ptr [rbx+30h]",
+            "jae 0000000140002000",
+            "mov edx,dword ptr [rbx+0000000000000344h]",
+            "mov dword ptr [rax],edx",
+            "add rax,4",
+            "mov qword ptr [rbx+18h],rax",
+        )
+        (site,) = sites(rows)
+        self.assertTrue(site["fields"])
+        self.assertNotIn("a D3D12.X list field in the window", inline_scan.summarize([site]))
+
     def test_scan_counts_the_instructions_it_read(self):
         stats = {}
         sites = list(inline_scan.scan(listing(*GUARDED), stats))

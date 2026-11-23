@@ -594,8 +594,8 @@ pipeline, and copies 32 bytes of the pipeline object (from its `+0x10`) to `+0x5
 section 3.4 measured in the BVH builder's helper without a meaning (`+0x18`, `+0x30`, `+0x140`, `+0x344`, `+0x544`).
 **With the cursor at the limit, every command goes through the vtable**: that is how `fsr_dispatch_test` records
 them, and it is the simplest contract for a layer that does not want to decode these packets. The retail
-executable makes the same check before every one of its inline writes (section 3.3, measured on 1.0.2.1); it is
-compiled against the same console headers.
+executable makes the same check before each of its 12 inline command writes (section 3.3, measured on 1.0.2.1); it
+is compiled against the same console headers.
 
 **Every inline write in the package's DLLs checks first.** `tools/inline_scan.py` finds each cursor store-back
 (`mov [list+18h],reg` after stores through the cursor) and looks for the compare in front of it. On the 1.0.2.1
@@ -615,16 +615,25 @@ result as an upper bound of about one site per image. Removing the compare and b
 
 On the executable, `python -I tools/inline_scan.py <exe> --sites` answers the question in one pass (see the day-one
 list in `docs/design.md`). It was run on the retail 1.0.2.1 `game_scarlett_master.exe` (120,181,760 bytes, dumpbin
-14.39): **26,674,075 instructions, 110 list sites, 110 guarded, none unchecked**, and the 2,720 further cursor-like
-stores touch no list field, so they are not lists. A cursor-at-limit layer therefore sees every inline command write
-the executable makes, on the same evidence as the DLLs.
+14.39): 26,674,075 instructions, **110 guarded cursor store-backs, none unchecked**, and 2,720 further cursor-like
+stores with neither a guard nor a list field.
 
-Two things that run turned up, both now in the tool's output. The exe's limits are mostly not the DLLs': `+0x8` ×51,
-`+0x20` ×33, `+0x30` ×12, `+0x10` ×9, `+0x28` ×2, `+0x40` ×2, `+0xd0` ×1, so the offsets other than `+0x28`/`+0x30`
-are command kinds the DLLs never write and are worth reading by hand. And only 31 of the 110 load the cursor from
-`[list+18h]` inside the window (all 31 checked); the other 79 are guarded stores to `+0x18` whose cursor load is in
-another block or a shared prologue, so the tool no longer folds them into "checked": the summary prints the split
-and `--sites` prints `cursor loaded` / `cursor outside`.
+**Only 12 of those 110 are command-list writes.** They are the whole `+0x28` (2) and `+0x30` (10) families, and each
+touches one of the fields only a D3D12.X list has (`+0x140`..`+0x143`, `+0x344`, `+0x544`) inside the window. So the
+executable's inline command writes are 12, not 110, and at those 12 it checks first: a cursor-at-limit layer sees
+every one, on the same evidence as the DLLs. The other 98 are guarded stores to `+0x18` of some other bump
+allocator — limits at `+0x8` (51), `+0x20` (33), `+0x10` (9), `+0x40` (2), `+0xd0` (1), and 2 at `+0x30` whose field is
+outside the window — with nothing from this page in them. A compare alone does not make a command list, so the tool
+keeps the split (`checked with a D3D12.X list field in the window: 12, without one: 98`) and `--sites` prints
+`fields` / `no-fields` per site.
+
+Cursor loads are separate again: 31 of the 110 load `[list+18h]` inside the window, and the other 79 are guarded with
+the load in another block or a shared prologue (`cursor loaded` / `cursor outside`). 12 sites touch a list field
+without a guard at all; they are not cursor writes and the summary's last count excludes them.
+
+The builder shows both splits in miniature — 187 of its 196 guarded sites load the cursor in the window and 194 touch
+a list field — so the new summary lines are not executable-specific, and the FSR DLL's 9 sites have both on all 9.
+The table above is unchanged by either line.
 
 One `+0x28` site, `0x56b78`, is the four-word dispatch this page measured in the DLLs: 16 bytes, cursor `+0x18`
 advanced by 16, `+0x140` cleared, header `0x4002c400` when either of the flag bytes `+0x140`/`+0x143` is set and

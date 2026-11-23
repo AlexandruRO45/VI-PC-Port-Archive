@@ -137,7 +137,8 @@ def classify(window, base, stored):
     checked = limit is not None
     # A guard-free list write must load the cursor from the list nearby; without that it is some other structure.
     is_list = checked or (evidence and load is not None and not broken)
-    return {"load": load, "base": base, "checked": checked, "list": is_list, "limit": limit, "size": size,
+    return {"fields": evidence, "load": load, "base": base, "checked": checked, "list": is_list,
+            "limit": limit, "size": size,
             "stores": stores, "header": header, "target": target, "fallback_slot": None,
             "bases": bases, "load_traced": load is not None and not broken}
 
@@ -200,6 +201,10 @@ def summarize(sites, instructions=None):
     if len(traced) != len(checked):
         out.append(f"checked with the cursor loaded from the list: {len(traced)}, checked with the cursor load "
                    f"outside the scanned window: {len(checked) - len(traced)}")
+    fielded = [s for s in checked if s["fields"]]
+    if len(fielded) != len(checked):
+        out.append(f"checked with a D3D12.X list field in the window: {len(fielded)}, without one: "
+                   f"{len(checked) - len(fielded)} (a compare alone does not make a command list)")
     for title, key, group, fmt in (("limit offsets (checked)", "limit", checked, limit_text),
                                    ("fallback vtable slots (checked)", "fallback_slot", checked, plain),
                                    ("packet sizes, checked", "size", checked, plain),
@@ -234,8 +239,9 @@ def main() -> int:
             state = f"checked {limit_text(s['limit'])}" if s["checked"] else "UNCHECKED" if s["list"] else "unrelated"
             header = "-" if s["header"] is None else f"0x{s['header']:08x}"
             cursor = "loaded" if s["load_traced"] else "outside"
+            fields = "fields" if s["fields"] else "no-fields"
             print(f"  load {rva(s['load'])} store {rva(s['store_back'])} [{s['base']}] {state} size {s['size']} "
-                  f"stores {s['stores']} header {header} fallback {s['fallback_slot']} cursor {cursor}")
+                  f"stores {s['stores']} header {header} fallback {s['fallback_slot']} cursor {cursor} {fields}")
     return 0
 
 
