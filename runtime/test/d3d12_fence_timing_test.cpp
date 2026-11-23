@@ -9,6 +9,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_console_call.h"
 
 #include <dxgi1_4.h>
 
@@ -51,7 +52,9 @@ UINT64 qpc() {
 }
 
 // GetClockCalibration twice, 50 ms apart: the CPU stamps bracket the call, and both clocks advance at the same rate.
-int check_calibration(ID3D12CommandQueue* queue, double gpu_frequency, const char* path) {
+int check_calibration(ID3D12CommandQueue* queue_or_proxy, double gpu_frequency, const char* path) {
+    // Not a console queue method: the layer's own queue answers it (d3d12_xs_console_slots.h).
+    ID3D12CommandQueue* const queue = xs_test::pc_queue(queue_or_proxy);
     LARGE_INTEGER qpf{};
     QueryPerformanceFrequency(&qpf);
     UINT64 gpu0 = 0, cpu0 = 0, gpu1 = 0, cpu1 = 0;
@@ -86,12 +89,19 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&b.p))));
     ID3D12Fence* both[] = {a.p, b.p};
     constexpr auto ALL = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, ANY = D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
+    // On the proxy SetEventOnMultipleFenceCompletion is at its console slot (84), which unwraps the fence proxies.
+    const bool proxy = rt::d3d12_xs::device_proxy_real_device(device) != nullptr;
+    const auto set_event = [&](ID3D12Fence* const* fences, const UINT64* values, UINT count,
+                               D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
+        if (!proxy) return device1->SetEventOnMultipleFenceCompletion(fences, values, count, flags, event);
+        return xs_test::console_call(device1.p, xs_test::device_slot(45), fences, values, count, flags, event);
+    };
 
     // ALL with an event: one fence is not enough.
     {
         const UINT64 values[] = {1, 1};
         Event event;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, event.h)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ALL, event.h)));
         EXPECT(SUCCEEDED(a->Signal(1)));
         EXPECT(!event.set_within(50));
         EXPECT(SUCCEEDED(queue->Signal(b.p, 1)));  // from the GPU
@@ -101,7 +111,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     {
         const UINT64 values[] = {2, 100};
         Event event;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, event.h)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ANY, event.h)));
         EXPECT(!event.set_within(50));
         EXPECT(SUCCEEDED(queue->Signal(a.p, 2)));
         EXPECT(event.set_within(5000));
@@ -111,9 +121,9 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     {
         const UINT64 values[] = {2, 1};
         Event all, any;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, all.h)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ALL, all.h)));
         EXPECT(all.set_within(0));
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, any.h)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ANY, any.h)));
         EXPECT(any.set_within(0));
     }
     // A null event blocks: ALL until both fences are signalled from another thread, ANY until one is.
@@ -125,7 +135,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             b->Signal(3);
         });
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ALL, nullptr)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ALL, nullptr)));
         const bool reached = a->GetCompletedValue() >= 3 && b->GetCompletedValue() >= 3;
         signaller.join();
         EXPECT(reached);
@@ -136,7 +146,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
             std::this_thread::sleep_for(std::chrono::milliseconds(30));
             b->Signal(4);
         });
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(both, values, 2, ANY, nullptr)));
+        EXPECT(SUCCEEDED(set_event(both, values, 2, ANY, nullptr)));
         const bool reached = b->GetCompletedValue() >= 4;
         signaller.join();
         EXPECT(reached && a->GetCompletedValue() == 3);
@@ -148,7 +158,7 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
         ID3D12Fence* one[] = {c.p};
         const UINT64 values[] = {1};
         Event event;
-        EXPECT(SUCCEEDED(device1->SetEventOnMultipleFenceCompletion(one, values, 1, ALL, event.h)));
+        EXPECT(SUCCEEDED(set_event(one, values, 1, ALL, event.h)));
         c.reset();
         EXPECT(event.set_within(2000));
     }
@@ -156,12 +166,12 @@ int check_multiple_fences(ID3D12Device* device, ID3D12CommandQueue* queue) {
     {
         const UINT64 values[] = {1, 1};
         ID3D12Fence* with_null[] = {a.p, nullptr};
-        EXPECT(device1->SetEventOnMultipleFenceCompletion(both, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAGS(2),
+        EXPECT(set_event(both, values, 2, D3D12_MULTIPLE_FENCE_WAIT_FLAGS(2),
                                                            nullptr) == E_INVALIDARG);
-        EXPECT(device1->SetEventOnMultipleFenceCompletion(with_null, values, 2, ALL, nullptr) == E_INVALIDARG);
-        EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, values, 2, ALL, nullptr) == E_INVALIDARG);
+        EXPECT(set_event(with_null, values, 2, ALL, nullptr) == E_INVALIDARG);
+        EXPECT(set_event(nullptr, values, 2, ALL, nullptr) == E_INVALIDARG);
         Event event;  // no fences: refused and the event left alone, as on the host PC runtime
-        EXPECT(device1->SetEventOnMultipleFenceCompletion(nullptr, nullptr, 0, ALL, event.h) == E_INVALIDARG);
+        EXPECT(set_event(nullptr, nullptr, 0, ALL, event.h) == E_INVALIDARG);
         EXPECT(!event.set_within(0));
     }
     return 0;
@@ -244,7 +254,9 @@ int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
 }
 
 int check_luid(ID3D12Device* device) {
-    const LUID luid = device->GetAdapterLuid();
+    // On the proxy GetAdapterLuid is console slot 43, which returns the LUID in RAX.
+    const LUID luid = rt::d3d12_xs::device_proxy_real_device(device) ? xs_test::console_call<LUID>(device, 43)
+                                                                      : device->GetAdapterLuid();
     EXPECT(luid.LowPart || luid.HighPart);
     Ref<IDXGIFactory4> factory;
     EXPECT(SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))));

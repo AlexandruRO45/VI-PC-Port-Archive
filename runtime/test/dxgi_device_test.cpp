@@ -18,6 +18,7 @@
 #include "window_station.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_console_call.h"
 
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -97,7 +98,8 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
     EXPECT(dxgi->AddRef() == device_refs + 2 && dxgi->Release() == device_refs + 1);
 
     // GetAdapter: the adapter of the device behind the proxy.
-    const LUID device_luid = device->GetAdapterLuid();
+    // Console slot 43: the LUID comes back in RAX, not through the PC header's hidden return pointer.
+    const LUID device_luid = xs_test::console_call<LUID>(device, 43);
     EXPECT(same_luid(device_luid, real->GetAdapterLuid()));
     Ref<IDXGIAdapter> adapter;
     EXPECT(dxgi->GetAdapter(&adapter.p) == S_OK && adapter.p);

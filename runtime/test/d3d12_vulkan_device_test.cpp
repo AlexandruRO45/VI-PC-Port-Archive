@@ -13,6 +13,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_feature_compat.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_console_call.h"
 #include "d3d12_copy_compare.h"  // D3D-46: copies compared with the host runtime
 #include "d3d12_depth24_compare.h"  // D24 clears compared with the host runtime
 #include "../src/vulkan_memory.h"  // D3D-96: resizable_bar
@@ -5564,7 +5565,7 @@ int main() {
             Ref<ID3D12CommandQueue> granted_q;
             EXPECT(SUCCEEDED(device->CreateCommandQueue(&rt_desc, IID_PPV_ARGS(&granted_q.p))) && granted_q.p);
             if (granted_q.p) {
-                EXPECT(granted_q->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
+                EXPECT(xs_test::pc_queue(granted_q.p)->GetDesc().Priority == D3D12_COMMAND_QUEUE_PRIORITY_GLOBAL_REALTIME);
             }
             granted_q.reset();
             rt::d3d12::set_global_realtime_privilege_override_for_test(-1);
@@ -5686,31 +5687,38 @@ int main() {
             EXPECT(device->SetStablePowerState(TRUE) == S_OK);
             EXPECT(device->SetStablePowerState(FALSE) == S_OK);
 
+            // The ID3D12Device1+ methods are at their console slots on the proxy (d3d12_xs_console_slots.h).
             Ref<ID3D12Device1> device1;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device1.p))));
             const D3D12_RESIDENCY_PRIORITY priorities[] = {D3D12_RESIDENCY_PRIORITY_MAXIMUM,
                                                            D3D12_RESIDENCY_PRIORITY(D3D12_RESIDENCY_PRIORITY_LOW + 5)};
+            const auto set_priority = [&](UINT count, ID3D12Pageable* const* objects,
+                                          const D3D12_RESIDENCY_PRIORITY* values) {
+                return xs_test::console_call(device1.p, xs_test::device_slot(46), count, objects, values);
+            };
             // Only committed resources and heaps take a priority, as on the host runtime (d3d12_residency_test): a
             // fence and an allocator don't.
-            EXPECT(device1->SetResidencyPriority(2, pageables, priorities) == E_INVALIDARG);
-            EXPECT(device1->SetResidencyPriority(0, nullptr, nullptr) == S_OK);
-            EXPECT(device1->SetResidencyPriority(1, pageables, nullptr) == E_INVALIDARG);
-            EXPECT(device1->SetResidencyPriority(1, nullptr, priorities) == E_INVALIDARG);
+            EXPECT(set_priority(2, pageables, priorities) == E_INVALIDARG);
+            EXPECT(set_priority(0, nullptr, nullptr) == S_OK);
+            EXPECT(set_priority(1, pageables, nullptr) == E_INVALIDARG);
+            EXPECT(set_priority(1, nullptr, priorities) == E_INVALIDARG);
 
             Ref<ID3D12Device3> device3;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device3.p))));
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
+            const auto enqueue = [&](D3D12_RESIDENCY_FLAGS flags, UINT count, ID3D12Pageable* const* objects,
+                                     ID3D12Fence* fence_to_signal, UINT64 value) {
+                return xs_test::console_call(device3.p, xs_test::device_slot(50), flags, count, objects,
+                                             fence_to_signal, value);
+            };
+            EXPECT(enqueue(D3D12_RESIDENCY_FLAG_NONE, 2, pageables, residency.p, 7) == S_OK);
             EXPECT(residency->GetCompletedValue() == 7);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) ==
-                   S_OK);
+            EXPECT(enqueue(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 0, nullptr, residency.p, 9) == S_OK);
             EXPECT(residency->GetCompletedValue() == 9);
             // A null fence is accepted (the host runtime's answer) and signals nothing; refused calls leave the fence
             // alone.
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) ==
-                   E_INVALIDARG);
-            EXPECT(device3->EnqueueMakeResident(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) ==
-                   E_INVALIDARG);
+            EXPECT(enqueue(D3D12_RESIDENCY_FLAG_NONE, 1, pageables, nullptr, 11) == S_OK);
+            EXPECT(enqueue(D3D12_RESIDENCY_FLAG_NONE, 1, nullptr, residency.p, 11) == E_INVALIDARG);
+            EXPECT(enqueue(D3D12_RESIDENCY_FLAGS(0x2), 1, pageables, residency.p, 11) == E_INVALIDARG);
             EXPECT(residency->GetCompletedValue() == 9);
             // The GPU sees the signal: a queue waits on it, then signals past it.
             EXPECT(SUCCEEDED(queue->Wait(residency.p, 9)));
@@ -5719,50 +5727,60 @@ int main() {
 
             Ref<ID3D12Device6> device6;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device6.p))));
+            const auto background_mode = [&](D3D12_BACKGROUND_PROCESSING_MODE mode, D3D12_MEASUREMENTS_ACTION action,
+                                             HANDLE event, BOOL* more) {
+                return xs_test::console_call(device6.p, xs_test::device_slot(65), mode, action, event, more);
+            };
             const HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
             EXPECT(done);
             BOOL further = TRUE;
-            const HRESULT background = device6->SetBackgroundProcessingMode(
-                D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK, D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS,
-                done, &further);
+            const HRESULT background = background_mode(D3D12_BACKGROUND_PROCESSING_MODE_DISABLE_BACKGROUND_WORK,
+                                                       D3D12_MEASUREMENTS_ACTION_COMMIT_RESULTS, done, &further);
             const DWORD signalled = WaitForSingleObject(done, 0);
             CloseHandle(done);
             EXPECT(background == S_OK && signalled == WAIT_OBJECT_0 && further == FALSE);
-            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
-                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) == S_OK);
-            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE(4),
-                                                        D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr) ==
-                   E_INVALIDARG);
-            EXPECT(device6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED,
-                                                        D3D12_MEASUREMENTS_ACTION(4), nullptr, nullptr) ==
-                   E_INVALIDARG);
+            EXPECT(background_mode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED, D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr,
+                                   nullptr) == S_OK);
+            EXPECT(background_mode(D3D12_BACKGROUND_PROCESSING_MODE(4), D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr,
+                                   nullptr) == E_INVALIDARG);
+            EXPECT(background_mode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED, D3D12_MEASUREMENTS_ACTION(4), nullptr,
+                                   nullptr) == E_INVALIDARG);
         }
         {
             Ref<ID3D12Device5> device5;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device5.p))));
+            using xs_test::console_call;
+            using xs_test::device_slot;
             UINT meta_count = 7;
-            EXPECT(device5->EnumerateMetaCommands(&meta_count, nullptr) == S_OK && meta_count == 0);
-            EXPECT(device5->EnumerateMetaCommands(nullptr, nullptr) == E_INVALIDARG);
+            D3D12_META_COMMAND_DESC* const no_descs = nullptr;
+            EXPECT(console_call(device5.p, device_slot(59), &meta_count, no_descs) == S_OK && meta_count == 0);
+            EXPECT(console_call(device5.p, device_slot(59), static_cast<UINT*>(nullptr), no_descs) == E_INVALIDARG);
             const GUID unknown_command{0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
             UINT total_size = 0, param_count = 0;
-            EXPECT(device5->EnumerateMetaCommandParameters(unknown_command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
-                                                           &total_size, &param_count, nullptr) == E_INVALIDARG);
+            EXPECT(console_call(device5.p, device_slot(60), &unknown_command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
+                                &total_size, &param_count, static_cast<D3D12_META_COMMAND_PARAMETER_DESC*>(nullptr)) ==
+                   E_INVALIDARG);
             void* meta = reinterpret_cast<void*>(1);
-            EXPECT(device5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
-                       E_INVALIDARG &&
+            EXPECT(console_call(device5.p, device_slot(61), &unknown_command, 0u, static_cast<const void*>(nullptr),
+                                SIZE_T{0}, &IID_ID3D12MetaCommand, &meta) == E_INVALIDARG &&
                    meta == nullptr);
             D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER identifier{};
-            EXPECT(device5->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
-                                                          &identifier) == D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED);
-            EXPECT(device5->CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE(1), &identifier) ==
+            using Status = D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS;
+            EXPECT(console_call<Status>(device5.p, device_slot(64),
+                                        D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE,
+                                        static_cast<const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*>(&identifier)) ==
+                   D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED);
+            EXPECT(console_call<Status>(device5.p, device_slot(64), D3D12_SERIALIZED_DATA_TYPE(1),
+                                        static_cast<const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER*>(&identifier)) ==
                    D3D12_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE);
         }
         {
             Ref<ID3D12Device4> device4;
             Ref<ID3D12GraphicsCommandList> closed;
             EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-            EXPECT(SUCCEEDED(device4->CreateCommandList1(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                         D3D12_COMMAND_LIST_FLAG_NONE, IID_PPV_ARGS(&closed.p))));
+            EXPECT(SUCCEEDED(xs_test::console_call(device4.p, xs_test::device_slot(51), 0u, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                   D3D12_COMMAND_LIST_FLAG_NONE, &__uuidof(ID3D12GraphicsCommandList),
+                                                   reinterpret_cast<void**>(&closed.p))));
             EXPECT(closed->Close() == E_FAIL);  // CreateCommandList1 returns a closed list
         }
 
@@ -6554,9 +6572,12 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
-                EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                                  nullptr, IID_PPV_ARGS(&one.p))));
+                // ID3D12Device10 has no console slot: CreateReservedResource2 is the layer's own, behind the proxy.
+                EXPECT(SUCCEEDED(xs_test::pc_device(device.p)->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                EXPECT(SUCCEEDED(xs_test::console_call(
+                    device4.p, xs_test::device_slot(55), &tiled_desc, D3D12_RESOURCE_STATE_COMMON,
+                    static_cast<const D3D12_CLEAR_VALUE*>(nullptr), static_cast<ID3D12ProtectedResourceSession*>(nullptr),
+                    &__uuidof(ID3D12Resource), reinterpret_cast<void**>(&one.p)))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
                 UINT tiles = 0;
@@ -6694,8 +6715,9 @@ int main() {
         // instead of stalling the GPU, and that the D3D12 rules for the calls are kept.
         {
             UINT64 frequency = 0;
-            EXPECT(SUCCEEDED(queue->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
-            EXPECT(queue->GetTimestampFrequency(nullptr) == E_INVALIDARG);
+            // Not a console queue method (d3d12_xs_console_slots.h): the layer's own queue answers it.
+            EXPECT(SUCCEEDED(xs_test::pc_queue(queue.p)->GetTimestampFrequency(&frequency)) && frequency >= 1'000'000);
+            EXPECT(xs_test::pc_queue(queue.p)->GetTimestampFrequency(nullptr) == E_INVALIDARG);
             Ref<ID3D12QueryHeap> occlusion, timestamps, statistics, so, refused;
             D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 4, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&occlusion.p))));

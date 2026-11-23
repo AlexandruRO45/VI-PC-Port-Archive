@@ -8,6 +8,7 @@
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "xs_console_call.h"
 
 #include <cstdint>
 #include <cstring>
@@ -150,13 +151,16 @@ int run_markers(ID3D12Device* device) {
 
     const wchar_t queue_frame[] = L"queue frame";
     const char after[] = "after";
-    queue->BeginEvent(0, queue_frame, sizeof(queue_frame));
+    // Queue slots 11-13 are markers only once the proxy knows the console layout; this checks the layer's labels, so
+    // the markers go to the layer's queue (the proxy's own routing: xs_console_slots_test).
+    ID3D12CommandQueue* const markers = xs_test::pc_queue(queue.p);
+    markers->BeginEvent(0, queue_frame, sizeof(queue_frame));
     ID3D12CommandList* lists[] = {first.p, second.p};
     queue->ExecuteCommandLists(2, lists);
     EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
-    queue->SetMarker(1, after, sizeof(after));
-    queue->EndEvent();
-    queue->EndEvent();  // nothing open: dropped
+    markers->SetMarker(1, after, sizeof(after));
+    markers->EndEvent();
+    markers->EndEvent();  // nothing open: dropped
     EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)));
     EXPECT(SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
 
