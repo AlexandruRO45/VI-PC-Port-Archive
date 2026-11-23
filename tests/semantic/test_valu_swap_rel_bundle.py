@@ -274,6 +274,19 @@ class TestMovRelS32Translator(unittest.TestCase):
         self.assertIn("OpIAdd", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestMovRelS64Oracle(unittest.TestCase):
+    def test_oracle_pair(self):
+        sgprs = {10: 100, 11: 200}
+        lo, hi = model_movrels_b64(10, 0, sgprs)
+        self.assertEqual(lo, 100)
+        self.assertEqual(hi, 200)
+
+    def test_translator_movrels64_oracle(self):
+        prog = ["s_mov_b32 m0, 0", "s_mov_b32 s4, 100", "s_mov_b32 s5, 200", "s_movrels_b64 s[0:1], s[4:5]", "s_endpgm"]
+        spv = support.translate_lines("cs_movrels64_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpAccessChain", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
