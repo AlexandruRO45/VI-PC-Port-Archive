@@ -138,6 +138,7 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.mesh_shader_queries = mesh && d.mesh_shader_queries;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };

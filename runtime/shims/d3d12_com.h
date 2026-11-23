@@ -173,6 +173,9 @@ struct VulkanDeviceInfo {
     // shaders have no amplification stage). Mesh-shader PSOs and DispatchMesh work, and CheckFeatureSupport reports
     // D3D12_MESH_SHADER_TIER_1; without it mesh PSOs are refused and the tier is NOT_SUPPORTED.
     bool mesh_shader = false;
+    // VK_EXT_mesh_shader's meshShaderQueries is enabled too: a pipeline-statistics query split around mesh draws
+    // takes their CInvocations/CPrimitives from a VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT query (D3D-291).
+    bool mesh_shader_queries = false;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};

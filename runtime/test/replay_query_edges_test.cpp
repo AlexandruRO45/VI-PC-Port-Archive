@@ -239,7 +239,8 @@ struct MockReplay {
             VkDeviceSize off) {
             helper(false, false, p, f, n, b, off);
         };
-        v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, const std::uint8_t*, unsigned f,
+        v.sum_statistics = [helper](VkCommandBuffer, VkQueryPool p, VkQueryPool, VkQueryPool, const std::uint8_t*,
+                                    unsigned f,
             unsigned n, VkBuffer b, VkDeviceSize off) {
             helper(true, false, p, f, n, b, off);
         };
@@ -348,7 +349,7 @@ void test_helper_chunks() {
                 }
             } else {
                 if (mode == MockReplay::statistics) {
-                    helper.sum_statistics({}, qp, VK_NULL_HANDLE, nullptr, first, n, dst, output_offset);
+                    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first, n, dst, output_offset);
                 } else {
                     helper.sum({}, qp, first, n, dst, output_offset);
                 }
@@ -388,7 +389,7 @@ void test_helper_chunks() {
     expect(c.word(dst, output_offset) == reset_sum, "sum accumulator reset between calls");
     c.mode = MockReplay::statistics;
     c.values[qp][first_query].fill(reset_counter);
-    helper.sum_statistics({}, qp, VK_NULL_HANDLE, nullptr, first_query, 1, dst, output_offset);
+    helper.sum_statistics({}, qp, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, first_query, 1, dst, output_offset);
     for (unsigned j = 0; j < statistics_counters; ++j) {
         expect(c.word(dst, output_offset + word_size * j) == reset_counter, "statistics accumulator reset");
     }

@@ -3218,11 +3218,15 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   while a query with those counters is active (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's
   pool has all eleven. So a statistics query that holds a mesh draw is split as above, and a split before a draw stays
   outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
-  with only clipping invocations and primitives, fragment and compute invocations. A later draw of the other kind ends
-  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
-  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
-  its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
-  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  with only fragment and compute invocations. The same VUID lists the two clipping counters too (the validation layer
+  of SDK 1.4.363 reports them, three times per `d3d12_mesh_test` run, when the second pool counted them), so a mesh
+  segment's `CInvocations` and `CPrimitives` come from a `VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT` query begun and
+  ended with it, where the device has `meshShaderQueries` (enabled with `meshShader`); without that feature they are
+  0, logged once. A later draw of the other kind ends the segment and begins one of its own kind; dispatches and
+  segments without draws use the full pool, and `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh
+  segment's two counters into fields 7 and 8 of its record and its primitive count (or 0) into fields 5 and 6, and
+  `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and `CSInvocations`, so the other
+  fields get nothing from it. A query that holds only mesh draws is one mesh segment,
   resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
   (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
   `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their

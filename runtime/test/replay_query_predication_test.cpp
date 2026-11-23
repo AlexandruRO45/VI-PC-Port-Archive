@@ -127,7 +127,8 @@ int main() {
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, VkQueryPool, const std::uint8_t*,
+                           std::uint32_t first,
                            std::uint32_t count, VkBuffer, VkDeviceSize) {
         g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
     };

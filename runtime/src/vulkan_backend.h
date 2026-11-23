@@ -235,12 +235,16 @@ public:
 
     // Adds `count` pipeline-statistics results into one D3D12_QUERY_DATA_PIPELINE_STATISTICS at dst + offset: the
     // segments of a statistics query that was split around helper dispatches (D3D-162) or mesh draws (D3D-291).
-    // Segment i is in `mesh_queries` when mesh[i] is set (four counters: clipping, fragment and compute; see
-    // statistics_sum.comp), otherwise in `queries` (all eleven).
-    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries, const std::uint8_t* mesh,
-                        std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
+    // Segment i is in `mesh_queries` when mesh[i] is set (two counters: fragment and compute, which land on
+    // PSInvocations and on the word statistics_sum.comp reads CSInvocations from), otherwise in `queries` (all eleven).
+    // A mesh segment's CInvocations and CPrimitives are both the mesh-primitives count of `mesh_primitives` at the
+    // same index, or 0 when there is none (no meshShaderQueries).
+    void sum_statistics(VkCommandBuffer cb, VkQueryPool queries, VkQueryPool mesh_queries,
+                        VkQueryPool mesh_primitives, const std::uint8_t* mesh, std::uint32_t first,
+                        std::uint32_t count, VkBuffer dst, VkDeviceSize offset) const {
         constexpr VkDeviceSize result = statistics_counters * word_size;
-        constexpr VkDeviceSize mesh_slot = 5 * word_size;  // CInvocations, where the mesh pool's first counter goes
+        constexpr VkDeviceSize clip_slot = 5 * word_size;  // CInvocations; CPrimitives follows it
+        constexpr VkDeviceSize mesh_slot = 7 * word_size;  // PSInvocations, where the mesh pool's first counter goes
         begin_scratch_write(cb);
         vk_.vkCmdFillBuffer(cb, scratch_, 0, result, 0);
         bind(cb, statistics_pipeline_);
@@ -249,9 +253,18 @@ public:
             std::uint32_t chunk = 1;
             while (chunk < std::min(count, statistics_capacity) && bool(mesh && mesh[first + chunk]) == in_mesh)
                 ++chunk;
+            if (in_mesh && !mesh_primitives) {  // the clipping words the sum reads stay 0
+                vk_.vkCmdFillBuffer(cb, scratch_, result, VkDeviceSize(chunk) * result, 0);
+                barrier(cb, transfer, transfer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            }
             vk_.vkCmdCopyQueryPoolResults(cb, in_mesh ? mesh_queries : queries, first, chunk, scratch_,
                                           result + (in_mesh ? mesh_slot : 0), result,
                                           VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (in_mesh && mesh_primitives) {
+                for (const VkDeviceSize slot : {clip_slot, clip_slot + word_size})
+                    vk_.vkCmdCopyQueryPoolResults(cb, mesh_primitives, first, chunk, scratch_, result + slot, result,
+                                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            }
             barrier(cb, transfer | compute, compute, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                     shader_access);
             dispatch(cb, chunk, 1, in_mesh);
@@ -1248,6 +1261,10 @@ public:
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
+    // VK_EXT_mesh_shader's meshShaderQueries is enabled on the device: the clipping counts of mesh draws inside a
+    // pipeline-statistics query come from a mesh-primitives query (D3D-291). Set once, before the first submission.
+    void set_mesh_shader_queries(bool enabled) { mesh_shader_queries_ = enabled; }
+
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
         replay_.color_attachment_format = std::move(check);
@@ -1630,6 +1647,7 @@ private:
     VkDevice device_;
     bool loaded_ = false;
     bool ray_tracing_ = false;
+    bool mesh_shader_queries_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
@@ -2288,9 +2306,11 @@ private:
                 occlusion_resolve_->normalize(cb, pool, first, count, dst, offset);
             };
             replay.sum_statistics = [this](VkCommandBuffer cb, VkQueryPool pool, VkQueryPool mesh_pool,
+                                           VkQueryPool mesh_primitives_pool,
                                            const std::uint8_t* mesh, std::uint32_t first, std::uint32_t count,
                                            VkBuffer dst, VkDeviceSize offset) {
-                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh, first, count, dst, offset);
+                occlusion_resolve_->sum_statistics(cb, pool, mesh_pool, mesh_primitives_pool, mesh, first, count,
+                                                   dst, offset);
             };
             replay.sum_binary_occlusion = [this](VkCommandBuffer cb, VkQueryPool pool, std::uint32_t first,
                                                  std::uint32_t count, VkBuffer dst, VkDeviceSize offset) {
@@ -2337,18 +2357,31 @@ private:
             if (std::find(statistics->mesh.begin(), statistics->mesh.end(), 1) == statistics->mesh.end()) {
                 statistics->mesh.clear();
             } else {
-                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): clipping
-                // invocations and primitives, fragment and compute invocations (D3D-291).
+                // The counters a mesh draw allows (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076): fragment and
+                // compute invocations. The clipping counters are on that VUID's list too, so a mesh segment's
+                // CInvocations and CPrimitives come from a mesh-primitives query over the same segment, where the
+                // device has meshShaderQueries, and are 0 without it (D3D-291).
                 VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
                 info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
                 info.queryCount = statistics_segments;
-                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
-                                          VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
+                info.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT |
                                           VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
                 if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
                     VK_SUCCESS)
                     return ReplayResult::unsupported;
+                if (context_.mesh_shader_queries_) {
+                    VkQueryPoolCreateInfo primitives{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+                    primitives.queryType = VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT;
+                    primitives.queryCount = statistics_segments;
+                    if (context_.vk.vkCreateQueryPool(statistics->device, &primitives, nullptr,
+                                                      &statistics->mesh_primitives_pool) != VK_SUCCESS)
+                        return ReplayResult::unsupported;
+                } else {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr, "[rt] d3d12: no meshShaderQueries: CInvocations/CPrimitives of mesh draws "
+                                             "in pipeline-statistics queries are 0 (logged once)\n");
+                }
             }
         }
         // QueryReplay::plan() reads QueryPool::ended / occlusion and QueryReplay::commit() writes them after
