@@ -1007,6 +1007,26 @@ class CliTests(unittest.TestCase):
             self.assertIn("would overwrite the input", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_zero_meshlet_group_is_rejected_without_hanging(self):
+        raw = bytes.fromhex("00000080000000000000000001000000")
+        self.assertFalse(mp.is_mesh_page(raw))
+        with self.assertRaises(mp.PageError):
+            mp.parse_group(raw, 0)
+        with self.assertRaises(mp.PageError):
+            mp.parse_page(raw)
+
+        trailing = page(block(4), raw)
+        with self.assertRaises(mp.PageError):
+            mp.parse_page(trailing)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "hang.bin")
+            with open(bad, "wb") as fh:
+                fh.write(raw)
+            r = subprocess.run([sys.executable, "-I", TOOL, bad], capture_output=True, text=True, timeout=5)
+            self.assertEqual(r.returncode, 1, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

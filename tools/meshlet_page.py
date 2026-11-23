@@ -485,6 +485,8 @@ def parse_group(data, at):
     if not head & 0x80000000:
         raise PageError(f"no group header at +0x{at:x}")
     meshlets = head & 0x7FFFFFFF
+    if not meshlets:
+        raise PageError(f"empty group at +0x{at:x}")
     triangles, refs = _u32(data, at + 4), _u32(data, at + 8)
     rec_at = at + 12
     tri_at = rec_at + 16 * meshlets
@@ -552,6 +554,7 @@ def parse_page(data):
         raise PageError("page starts with neither a vertex block nor a meshlet group")
     chunks = []
     pos = 0
+    prev_pos = -1
     while True:
         while pos < len(data) and data[pos] == 0:
             pos += 1
@@ -562,6 +565,9 @@ def parse_page(data):
             pos += 4
         if pos % 16:
             raise PageError(f"chunk at +0x{pos:x} is not 16-byte aligned")
+        if pos <= prev_pos:
+            raise PageError(f"chunk at +0x{pos:x} did not advance")
+        prev_pos = pos
         word = _u32(data, pos)
         if word == BLOCK_MAGIC:
             record, pos = parse_block(data, pos)
