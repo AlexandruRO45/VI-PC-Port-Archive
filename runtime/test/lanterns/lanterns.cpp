@@ -345,9 +345,10 @@ int stage5(const std::filesystem::path& shader_dir, const std::filesystem::path&
     if (!final_check.pass())
         report("the final frame", final_check);
     const unsigned control = lanterns::certain_differences(skipped, post);
+    const unsigned misplaced = lanterns::misplaced_differences(skipped, post);
     const unsigned race = lanterns::certain_differences(no_barrier, post);
-    std::printf("lanterns: control, the blur skipped: %u certain pixels differ (the reference predicts %u)\n", control,
-                post.bloom_pixels);
+    std::printf("lanterns: control, the blur skipped: %u certain pixels differ (the reference predicts %u), %u of them "
+                "or of the predicted ones in the wrong place\n", control, post.bloom_pixels, misplaced);
     std::printf("lanterns: measured, the row pass without s_barrier: %u certain pixels differ\n", race);
     if (!dump(out_dir, "stage5-scene", scene_pixels, half) ||
         !dump(out_dir, "stage5-final", final_pixels, as_reference(post)) ||
@@ -355,7 +356,7 @@ int stage5(const std::filesystem::path& shader_dir, const std::filesystem::path&
         !dump(out_dir, "stage5-nobarrier", no_barrier, as_reference(post)))
         return 1;
     if (!particles_ok || !scene_check.pass() || !final_check.pass() || post.inexact ||
-        post.bloom_pixels < 1000 || control != post.bloom_pixels) {
+        post.bloom_pixels < 1000 || control != post.bloom_pixels || misplaced != 0) {
         std::fprintf(stderr, "lanterns: stage 5 FAILED\n");
         return 1;
     }
