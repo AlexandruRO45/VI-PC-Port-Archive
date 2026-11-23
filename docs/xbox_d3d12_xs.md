@@ -681,9 +681,9 @@ HRESULT D3D12GetInterface(
 their GUID words and maps each to an interface. It creates no device.
 Source: <https://docs.xbox.com/reference/graphics/d3d12/functions/d3d12getinterface_public.md>
 
-The retail 1.0.2.1 title's only call site (static read, not run) passes a null adapter,
-`IID_ID3D12Device11`, and a parameter block whose first `0x50` bytes it initializes. The field
-names and offsets below are the public `D3D12XBOX_CREATE_DEVICE_PARAMETERS` layout
+The retail 1.0.2.1 title's only direct call site found (static read, not run) passes a null
+adapter, `IID_ID3D12Device11`, and a parameter block whose first `0x50` bytes it initializes. The
+field names and offsets below are the public `D3D12XBOX_CREATE_DEVICE_PARAMETERS` layout
 ([d3d12_xs_surface.md §7.1](d3d12_xs_surface.md)); the values are the title's.
 
 | Field | Offset | Value |
@@ -706,12 +706,14 @@ names and offsets below are the public `D3D12XBOX_CREATE_DEVICE_PARAMETERS` layo
 
 The dword at `+0x0C` is the x64 alignment pad. The last two dwords of the initialized range,
 `+0x48` and `+0x4C`, are zero; the public samples name two amplification-shader sizes without
-offsets. The runtime logs 24 words (96 bytes), so words 20 to 23 are past the part this call site
-writes. The `+0x20` and `+0x24` values come from two startup-config bytes, 0 in the image.
+offsets. The shim logs 24 words (96 bytes); this call site writes 20 (`0x50` bytes), so words 20 to
+23 are past the part it initializes. The `+0x20` and `+0x24` values come from two startup-config
+bytes, 0 in the image; their run-time values are not measured.
 
-The 1 at `DisableDXR` is the one surprise: the title later builds acceleration structures with
-`XboxBvhBuilder`, so either it disables console DXR for this configuration or the console struct
-names or inverts that field differently. The call site alone does not settle it.
+The 1 at `DisableDXR` is the one surprise: the executable contains calls to an `XboxBvhBuilder`
+build export, so either it disables console DXR for this configuration or the console struct
+names or inverts that field differently. Whether those calls run with this device, and the effect
+of the 1, are not measured here.
 
 ### 5.2 Command queue
 
@@ -857,7 +859,7 @@ means the code is absent, not that the API is undocumented.
 | Draws and dispatch | `DrawInstanced`, `DrawIndexedInstanced`, `Dispatch`, root-argument setters (interfaces index) | Present and GPU-tested ([first_light.md](first_light.md)) | Nothing to change from the documentation side |
 | Shader cache | Session desc with its three documented defaults, `StoreValue`/`FindValue` two-call pattern, `ShaderCacheControl` in developer mode, library gate (§4) | Implemented with `ID3D12Device9::CreateShaderCacheSession`, the session object and `ShaderCacheControl` (D3D-34, `runtime/test/d3d12_shader_cache_test.cpp`) | The defaults (1 KB / 128 entries / 128 MB) are the numbers the layer must reproduce for a host-parity answer |
 | Present | No page (§5.5) | `runtime/shims/xbox_present.cpp` plus a DXGI swapchain fallback | The layer's presenter is built on measurement; there is no document to check it against |
-| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice` with an unmeasured 24-word params block | Params and flags stay open; nothing in the public reference narrows them |
+| Device creation | No `D3D12CreateDevice` page; `D3D12GetInterface` only (§5.1) | `D3D12XboxCreateDevice` with a 20-word (`0x50`-byte) block measured at the retail call; the shim logs 24 words | Params and flags stay open; nothing in the public reference narrows them |
 
 Two consequences follow for how this documentation is used. First, the parts a replay layer needs most precisely
 (the enum values) are the parts this reference publishes worst: three enums in this page print colliding or all-zero
