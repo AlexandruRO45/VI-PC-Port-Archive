@@ -961,6 +961,16 @@ class PackIndexValidationTest(unittest.TestCase):
                 self.assertNotIn("invalid JSON", str(error.exception))
                 self.assertEqual(rd(target), before, "the source file changed")
 
+    def test_cli_pack_refuses_an_out_that_names_the_index(self):
+        before = rd(self.index_path)
+        result = subprocess.run([sys.executable, "-I", TOOL, "pack", self.extracted, self.index_path],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("ERROR:", result.stderr)
+        self.assertIn("would replace it", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(rd(self.index_path), before)
+
     def test_valid_editable_metadata_still_round_trips(self):
         self.index["header"]["note"] = "extra metadata is ignored"
         self.index["entries"][0]["hash"] = "0X" + self.index["entries"][0]["hash"]
