@@ -7,6 +7,7 @@ Counts each mnemonic (number of shaders using it and total occurrences), groups 
 classifies instructions (ALU vs memory vs branch), computes operation ratios, and summarises register pressure
 per stage (VGPR/SGPR counts from `profile_shader`; `--per-shader` also lists every shader).
 In the JSON report, ratios.alu_to_memory is null when the corpus has ALU instructions and no memory instructions.
+`categories_by_stage` breaks those instruction counts down by stage, using `?` when the stage is unknown.
 
 `undecoded` counts the llvm-mc 'invalid instruction encoding' warnings shader_disasm.py copies into each .s file.
 by_word lists the four bytes at each warning position, their total occurrences and how many shaders contain them.
@@ -327,7 +328,7 @@ def main():
     occ, users = Counter(), Counter()
     word_occ, word_users = Counter(), Counter()    # warned-at word -> warnings, shaders
     unresolved = 0
-    per_stage = defaultdict(Counter)
+    categories_by_stage = defaultdict(Counter)
     reg_stage = defaultdict(list)    # stage -> [(vgpr_count, sgpr_count)]
     shaders = []
     stages = stage_map(a.src)
@@ -350,7 +351,7 @@ def main():
                             "vgpr_count": regs["vgpr_count"], "sgpr_count": regs["sgpr_count"]})
         occ.update(prof["mnemonics"])
         users.update(prof["mnemonics"].keys())
-        per_stage[stage].update(prof["mnemonics"].keys())
+        categories_by_stage[stage].update(prof["categories"])
         words, bad = warning_words(text)
         word_occ.update(words)
         word_users.update(set(words))
@@ -367,6 +368,7 @@ def main():
     out = {"shaders": n, "mnemonics": len(occ),
            "families": {k: {"mnemonics": v[0], "occurrences": v[1]} for k, v in sorted(fam.items())},
            "categories": cats,
+           "categories_by_stage": dict(sorted(categories_by_stage.items())),
            "ratios": ratios,
            "by_mnemonic": [{"m": m, "shaders": shader_count, "count": occ[m]}
                            for m, shader_count in ranked_users],
