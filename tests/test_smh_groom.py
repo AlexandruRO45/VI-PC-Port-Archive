@@ -1028,6 +1028,18 @@ class CliTests(unittest.TestCase):
             self.assertEqual(bad_rc, 1)
             self.assertIn("must not overwrite", err_buf.getvalue())
 
+            # Alias spelling that resolves to the same path (dot segment) must also refuse.
+            alias = os.path.join(os.path.dirname(smh_path), ".", os.path.basename(smh_path))
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                self.assertEqual(smh_groom.main(["export-glb", smh_path, alias]), 1)
+            self.assertIn("must not overwrite", err_buf.getvalue())
+
+
+    def test_export_glb_uses_shared_same_report_path(self):
+        import report_paths
+        self.assertIs(smh_groom.same_report_path, report_paths.same_report_path)
+
 
     def test_cli_census_limit_below_one_is_refused(self):
         """--limit 0 used to stop at the first target and report an empty corpus with exit 0."""
