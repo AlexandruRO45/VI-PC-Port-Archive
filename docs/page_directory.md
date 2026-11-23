@@ -132,7 +132,7 @@ sample; the meaning column separates decoded fields from unresolved ones.
 | +0x10 | 4 | `30 44 52 50` | `0DRP` |
 | +0x14 | 4 | 122 in all 29,298 | version |
 | +0x18 | 8 | zero in all pages | unused |
-| +0x20 | 4 | 1-89 in `data.rpf`, 2-3 in navmesh, 1-38 in anim (whole archives: 1-6, 1-41; 1-44 in `levels.rpf`) | presumed page count; **unit unresolved** |
+| +0x20 | 4 | 1-89 in `data.rpf`, 2-3 in navmesh, 1-38 in anim (whole archives: 1-6, 1-41; 1-44 in `levels.rpf`) | 1-based index into the page's `q38` block table naming the root object block, not a count (`docs/navmesh.md` root-object-block rule, `docs/ped_catalogues.md` `root_block`); the count readings are measured and rejected below |
 | +0x24 | 4 | zero in all pages | high half of the +0x20 qword |
 | +0x28 | 8 | `0x5000xxxx`, 8-byte aligned | pointer to the `q28` table |
 | +0x30 | 8 | zero or `0x5000xxxx` | pointer to the `q30` table |
@@ -156,7 +156,7 @@ The header read for the worked example below (`data.rpf`, archive offset `0x11f4
 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 ```
 
-That is: `0DRP`, version 122, page count 2, `q28=0x18740`, `q30=0`, `q38=0x186d0`, `q40=0x18860`, counts
+That is: `0DRP`, version 122, root-block index 2 (`+0x20`), `q28=0x18740`, `q30=0`, `q38=0x186d0`, `q40=0x18860`, counts
 `4,0,4,0`, then 16 zero bytes. The first payload starts at +0x60.
 
 ### The +0x60 "key" is payload
@@ -399,7 +399,7 @@ data pages, but only the directory page carries the offset/size table. The typed
 magic; 0 of 60,880 `data.rpf` records and 0 of the 6,645 navmesh and 269,320 animation records in their sampled
 windows started with `0x00010015` at +0x14.
 
-## Distribution of the +0x20 count
+## Distribution of the +0x20 root-block index
 
 | Value | `data.rpf` | `navmeshes.rpf` (64 MiB) | `anim.rpf` (256 MiB) |
 |---:|---:|---:|---:|
@@ -411,17 +411,22 @@ windows started with `0x00010015` at +0x14.
 | 18-38 | 0 | 0 | 82 |
 | 89 | 1 | 0 | 0 |
 
-The count does not equal the `q38` record count or the stream count. A `data.rpf` page with count 2 can have four
-records; a navmesh page with count 3 has six; an animation page with count 3 can have 22. The unit is **unresolved**.
-The earlier label "presumed page count" is kept only as a name for `u32@0x20`.
+The value does not equal the `q38` record count or the stream count. A `data.rpf` page with value 2 can have four
+records; a navmesh page with value 3 has six; an animation page with value 3 can have 22 — as an index it names one
+of the page's `q38` records, so it need not equal any count. `docs/navmesh.md` resolves it as the **1-based index
+into the page's `q38` block table naming the root object block** (`1 <= u20 <= n_blocks` and `blocks[u20-1].hash` is
+in `q28`, 9,603/9,603), and `docs/ped_catalogues.md` names the same field `root_block` (1-based index into the block
+directory). The earlier "presumed page count" label survives only as the field name `page_count` in
+`tools/page_index.py`'s output.
 
-### The `+0x20` count does not mark stream boundaries
+### The +0x20 root-block index does not mark stream boundaries
 
-`story000.rpf` was measured to decide whether the field can group a resource's streams. In a 256 MiB carve
+`story000.rpf` was measured to decide whether the field could still group a resource's streams as a count. In a
+256 MiB carve
 (33,315 streams, 16,977 `0DRP` directories) a directory is followed by **exactly one** non-directory stream in
 16,128 cases, and that is the same for counts 2, 3 and 4 (9,616 / 5,663 / 633), so the field is not a stream count.
 Compared against the 64 KiB units the resource group actually occupies (directory plus the continuations needed to
-reach the `q38` table and its last record), the declared count matches on **9,010 of 16,977 pages (53.1%)**. Growing
+reach the `q38` table and its last record), the declared value matches on **9,010 of 16,977 pages (53.1%)**. Growing
 the group until the `q28`/`q30`/`q38`/`q40` tables also fit raises that only to 9,622 (56.7%). Against
 the directory stream alone the best unit is 32 KiB, at 7,660 pages (45.1%). Against counts derived from the `q28`
 table (`n28`, `sum(flags >> 16)`, `max(flags >> 16)`, `sum(field_08)`) the match is **0%** on all 16,977 pages, and
@@ -431,26 +436,27 @@ pages either.
 The boundary is therefore taken from the tables, not from `+0x20`: a resource is the directory stream plus the
 following streams needed to reach the `q38` table and its last record. `tools/page_index.py` reports that group per
 page as `resource` (`streams`, `bytes`, `page_units`, `declared_pages`, `declared_matches_units`), and the summary
-counts how often the declared count agrees, so the disagreement is recorded rather than used.
+counts how often the declared value agrees, so the disagreement is recorded rather than used.
 
 ## Readable versus opaque
 
 **Readable from bytes:** the `0DRP` magic, version 122, header length and pointers, the four `u16` counts, the
-`q38` hash/size/target table, the raw `q28` fields, the first payload offset, continuation stream boundaries, and
-the payload's coarse class (zero-prefix or other).
+root-block index at `+0x20` (the header table above), the `q38` hash/size/target table, the raw `q28` fields, the
+first payload offset, continuation stream boundaries, and the payload's coarse class (zero-prefix or other).
 
 **Opaque:** the hash-to-name mapping (TOC or executable), the meaning of each type hash, `q28` `hash_b`,
-`field_08` and `count_or_size`, the `q30` and `q40` layouts, `u16@0x4e`, and the unit of `u32@0x20`. No name,
+`field_08` and `count_or_size`, `u16@0x4e`, and the `q30` and `q40` layouts. No name,
 path or resource type is present in a `0DRP` page.
 
 ## Remaining unknowns
 
 1. **Names and types.** Join a `q38` hash to the TOC or the executable's resource registry. Do not guess from a
    four-byte value.
-2. **`+0x20` unit.** Tested and rejected as a boundary on `story000.rpf`: no page-size reading fits (best 56.7% at
-   64 KiB, 45.1% at 32 KiB over the directory stream, 0% against the `q28`-derived counts). The measured `data.rpf`
-   page `0x11f4010` has span 195,211 bytes and count 2 (1.49 x 128 KiB), while a navmesh page with span below 8 KiB
-   has count 3. A loader or a decoded dictionary is needed before the field itself is named.
+2. **`+0x20` as a boundary.** Tested and rejected on `story000.rpf`: no page-size reading fits (best 56.7% at
+   64 KiB, 45.1% at 32 KiB over the directory stream, 0% against the `q28`-derived counts). The field itself is no
+   longer unknown: it is the root object block index (`docs/navmesh.md`, `docs/ped_catalogues.md`), not a page or
+   stream count, so the boundary readings above reject the field's old name rather than its meaning. A loader or a
+   decoded dictionary is still needed for the `q28` and `q30`/`q40` fields.
 3. **`q28` fields.** `hash_b`, `field_08` and `count_or_size` need a loader or a decoded dictionary. The hash
    tables it points at look like `{hash, 0, index, 0}` records, but the index semantics are not proven.
 4. **`q30`/`q40`.** Both contain hash-like tables and are not needed for boundaries. Decode them only with a
@@ -483,7 +489,8 @@ that does not end in `.json` or `.csv`, or a `--start` past the end of the archi
 error and exit code 2, before anything is scanned or written. An empty archive, or one shorter than its 8-byte
 header, gives an index with no pages.
 
-JSON has a `summary` and one object per page: offset, stored/inflated size, version, `page_count` (`u32@0x20`),
+JSON has a `summary` and one object per page: offset, stored/inflated size, version, `page_count` (`u32@0x20`, the
+root-block index — the name predates its resolution),
 the four counts, table offsets, `q38_records`, raw `q28_records` (`target` is null for a null pointer; `q28_error`
 names a table that was cut short or not read), continuation streams, `span`,
 `payload_at_0x60`, `complete`, and a `resource` group (its `streams` with offsets and inflated sizes, `bytes`,
