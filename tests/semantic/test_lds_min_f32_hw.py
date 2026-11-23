@@ -680,6 +680,77 @@ class TestDSMinF32BoundaryExtremes(unittest.TestCase):
         idx2 = self.lds.resolve_dword_index(4096)
         self.assertEqual(idx2, 0)
 
+class TestDSMinF32NegativeAndTranslator(unittest.TestCase):
+    """Part 8: Negative controls, syntax rejection, mutation detection, and translator execution."""
 
-if __name__ == '__main__':
+    def test_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "ds_min_f32",
+            "ds_min_f32 v1",
+            "ds_min_f32 v1, v2, v3",
+            "ds_min_rtn_f32 v1, v2",
+            "ds_min_f32 s1, v2",
+            "ds_min_rtn_f32 s0, v1, v2",
+            "ds_min_f32 v1, v2 offset:-1",
+            "ds_min_f32 v1, v2 offset:70000",
+            "ds_min_f32 v1, v2 bad_mod",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises(ValueError):
+                    DSMinF32Instruction.parse(asm)
+
+    def test_mutation_detection_max_instead_of_min(self) -> None:
+        def mutant_max_f32(a: int, b: int) -> int:
+            fa = bits_to_f32(a)
+            fb = bits_to_f32(b)
+            return a if fa > fb else b
+
+        oracle_res = ref_ds_min_f32(ONE_F32, TWO_F32)
+        mutant_res = mutant_max_f32(ONE_F32, TWO_F32)
+        self.assertEqual(oracle_res, ONE_F32)
+        self.assertEqual(mutant_res, TWO_F32)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_translator_emits_cas_loop_with_nmin(self) -> None:
+        """Verifies tools/rdna2spirv.py emits OpAtomicCompareExchange CAS loop and GLSL NMin."""
+        lines = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 0x3F800000",
+            "ds_min_f32 v1, v2",
+            "ds_min_rtn_f32 v5, v1, v2 offset:16",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spv = L.translate(lines)
+        self.assertIn("OpAtomicCompareExchange", spv)
+        self.assertIn("NMin", spv)
+
+    def test_translator_backed_execution_via_lds_run(self) -> None:
+        """Executes translated ds_min_f32 and ds_min_rtn_f32 in spirv_mini_interp."""
+        # Test 1: Memory has 10.0 (0x41200000), atomic min with 2.0 (0x40000000) -> returns 10.0, memory becomes 2.0
+        init = {0x40: TEN_F32}
+        ops = [("ds_min_rtn_f32", 0x40, 0, (TWO_F32,))]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [TEN_F32])
+        self.assertEqual(fin, {0x40: TWO_F32})
+
+        # Test 2: Memory has -1.0 (0xBF800000), atomic min with +2.0 (0x40000000) -> min remains -1.0
+        init2 = {0x44: NEG_ONE_F32}
+        ops2 = [("ds_min_rtn_f32", 0x44, 0, (TWO_F32,))]
+        rtns2, fin2 = L.run_chain(ops2, init2)
+        self.assertEqual(rtns2, [NEG_ONE_F32])
+        self.assertEqual(fin2, {0x44: NEG_ONE_F32})
+
+        # Test 3: Non-returning ds_min_f32 with offset
+        init3 = {0x48: TEN_F32, 0x4C: TWO_F32}
+        ops3 = [
+            ("ds_min_f32", 0x48, 4, (ONE_F32,)),       # 0x48 + 4 = 0x4C: min(2.0, 1.0) = 1.0
+            ("ds_min_rtn_f32", 0x48, 0, (HALF_F32,)),   # 0x48: min(10.0, 0.5) = 0.5
+        ]
+        rtns3, fin3 = L.run_chain(ops3, init3)
+        self.assertEqual(rtns3, [0xDEAD, TEN_F32])
+        self.assertEqual(fin3, {0x48: HALF_F32, 0x4C: ONE_F32})
+
+
+if __name__ == "__main__":
     unittest.main()
