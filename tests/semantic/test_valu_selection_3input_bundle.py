@@ -89,5 +89,30 @@ class VMin3F32OracleTests(unittest.TestCase):
         self.assertEqual(ref_min3_f32_bits(v1, qnan, v2), v1)
         self.assertEqual(ref_min3_f32_bits(v2, v1, qnan), v1)
 
+@dataclasses.dataclass
+class Valu3AstNode:
+    opcode: str
+    dst: str
+    src0: str
+    src1: str
+    src2: str
+
+    def emit_asm(self) -> str:
+        return f"{self.opcode} {self.dst}, {self.src0}, {self.src1}, {self.src2}"
+
+
+class VMin3F32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_min3_f32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_min3_f32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_min3_f32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": f32_to_bits(5.0), "v2": f32_to_bits(1.5), "v3": f32_to_bits(7.2)}
+        res = ref_min3_f32_bits(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertAlmostEqual(bits_to_f32(regs["v0"]), 1.5)
+
 if __name__ == "__main__":
     unittest.main()
