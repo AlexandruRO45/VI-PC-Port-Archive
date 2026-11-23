@@ -1953,23 +1953,41 @@ class Gen:
         """s_bitcmp0/1_b32/b64: test if bit (a[1]) of scalar a[0] is 0 or 1, result in SCC."""
         is_64 = op.endswith("b64")
         test_one = op.startswith("s_bitcmp1")
-        if self.holds_lane_mask(a[0]):
-            lo, hi = self.wave_mask(a[0])
-            if not is_64 and self.wave64:
-                half = self.mask_half(a[0])
-                if half == "hi":
-                    lo = hi
-        elif is_64 and a[0]["k"] == "sgpr" and a[0].get("n") == 2:
-            lo, hi = self.load_reg("sgpr", a[0]["r"]), self.load_reg("sgpr", a[0]["r"] + 1)
-        elif is_64 and a[0]["k"] == "imm":
-            v = a[0]["v"] & 0xFFFFFFFFFFFFFFFF
-            lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
-        elif is_64:
-            lo, hi = self.mask_src(a[0]), self.cu(0)
+        src = a[0]
+        if is_64:
+            if src["k"] == "sgpr" and src.get("n") == 2:
+                r = src["r"]
+                if (self.wave64 and self.cur_masks.get(r) == lane_masks.MASK_LO
+                        and self.cur_masks.get(r + 1) == lane_masks.MASK_HI):
+                    lo, hi = self.wave_mask(src)
+                else:
+                    words = []
+                    for i in range(2):
+                        reg = r + i
+                        if reg in self.cur_masks:
+                            words.append(self.lane_mask_word({"k": "sgpr", "r": reg, "n": 1}))
+                        else:
+                            words.append(self.load_reg("sgpr", reg))
+                    lo, hi = words[0], words[1]
+            elif self.holds_lane_mask(src):
+                lo, hi = self.wave_mask(src)
+            elif src["k"] == "imm":
+                v = src["v"] & 0xFFFFFFFFFFFFFFFF
+                lo, hi = self.cu(v & 0xFFFFFFFF), self.cu(v >> 32)
+            elif src["k"] == "special" and src.get("t") == "null":
+                lo, hi = self.cu(0), self.cu(0)
+            elif src["k"] == "special" and src.get("t") == "vcc":
+                lo, hi = self.tmp(), self.tmp()
+                self.emit(f"{lo} = OpLoad %uint %vcc")
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+            else:
+                lo, hi = self.mask_src(src), self.cu(0)
+        elif self.holds_lane_mask(src):
+            lo = self.lane_mask_word(src)
         else:
-            lo = self.src_u(a[0])
+            lo = self.src_u(src)
 
-        sh = self.src_u(a[1])
+        sh = self.lane_mask_word(a[1]) if self.holds_lane_mask(a[1]) else self.src_u(a[1])
         mask_bits = 63 if is_64 else 31
         m = self.tmp()
         self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(mask_bits)}")
