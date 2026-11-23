@@ -391,6 +391,14 @@ class TestPermLaneX16Routing(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestPermLaneX16Translator(unittest.TestCase):
+    def test_translator_mutation_guard(self):
+        prog = ["s_mov_b32 s5, 0x76543210", "s_mov_b32 s6, 0xFEDCBA98", "v_permlanex16_b32 v4, v5, s5, s6", "s_endpgm"]
+        spv = support.translate_lines("cs_px16_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
