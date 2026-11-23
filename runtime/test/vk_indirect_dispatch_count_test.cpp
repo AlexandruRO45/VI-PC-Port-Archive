@@ -432,7 +432,9 @@ int main() {
 
     vktest::Device d;
     d.request_buffer_device_address = true;
-    if (!d.create(false) || !d.buffer_device_address) {
+    const vktest::DeviceStatus status = d.initialize(false);
+    if (status == vktest::DeviceStatus::failed) return 1;
+    if (status == vktest::DeviceStatus::unavailable || !d.buffer_device_address) {
         std::printf("SKIP: no suitable Vulkan 1.3 BDA device\n");
         return 77;
     }
