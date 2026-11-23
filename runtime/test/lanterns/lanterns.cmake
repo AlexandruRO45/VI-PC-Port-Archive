@@ -74,7 +74,7 @@ elseif(LEONIDA_TEST_LANTERNS)
     add_dependencies(lanterns lanterns_shaders)
     if(CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING)
       # One test per stage (the runner gives each its own output folder under --out).
-      foreach(_stage 1 3 5 6 8 9 10)
+      foreach(_stage 1 3 5 6 8 9 10 11)
         add_test(NAME lanterns_stage${_stage}
                  COMMAND $<TARGET_FILE:Python3::Interpreter> -I ${_lanterns_src}/run_lanterns.py
                          --gta6rt $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:lanterns>
