@@ -704,8 +704,8 @@ def assets_exported(work: str) -> bool:
     """Whether an earlier run finished the assets stage's exports, so its space is already in use. xma.done is the
     last marker assets() writes, after every model, texture and audio export before it succeeded; ogg.done is read
     too. A marker counts only when it holds what mark() writes, not because a file of that name exists.
-    xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
-    ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again.
+    xma.done is written with or without ffmpeg. Once ffmpeg is on PATH, every run decodes XMA2 streams whose PCM
+    output is missing or empty, so the stage may still write after the marker exists.
     Models, textures and pools made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
     such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
@@ -2127,17 +2127,24 @@ def mark(path: str, what: str) -> None:
 
 
 def pending_xma(xma_dir: str) -> list:
-    """The XMA2 streams (.xma.wav) under xma_dir that have no decoded .wav next to them yet."""
+    """The XMA2 streams (.xma.wav) with no nonempty regular PCM .wav next to them."""
     todo = []
     for root, _, files in os.walk(xma_dir):
         for f in files:
-            if f.endswith(".xma.wav") and not os.path.isfile(os.path.join(root, f[:-8] + ".wav")):
-                todo.append(os.path.join(root, f))
+            if not f.endswith(".xma.wav"):
+                continue
+            try:
+                output = os.stat(os.path.join(root, f[:-8] + ".wav"))
+                if stat.S_ISREG(output.st_mode) and output.st_size > 0:
+                    continue
+            except OSError:
+                pass
+            todo.append(os.path.join(root, f))
     return todo
 
 
 def decode_xma(ff: str, xma_dir: str, jobs: int = 1) -> None:
-    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for each stream that has no .wav yet. ffmpeg writes to a
+    """XMA2 (.xma.wav) -> 16-bit PCM .wav with ffmpeg, for streams with missing or empty outputs. ffmpeg writes to a
     temporary name that is renamed when it succeeds, so a stopped or failed decode never leaves a short .wav."""
     todo = pending_xma(xma_dir)
     if not todo:

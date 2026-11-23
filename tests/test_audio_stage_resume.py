@@ -144,7 +144,8 @@ class AudioStageResumeTest(unittest.TestCase):
     def fake_subprocess(self, cmd, *a, **k):
         self.ran.append("ffmpeg")
         if self.ffmpeg_ok:
-            open(cmd[-1], "w").close()
+            with open(cmd[-1], "wb") as f:
+                f.write(b"decoded WAV")
             return subprocess.CompletedProcess(cmd, 0)
         open(cmd[-1], "w").close()        # a failed ffmpeg can still leave part of its output
         return subprocess.CompletedProcess(cmd, 1)
@@ -184,6 +185,30 @@ class AudioStageResumeTest(unittest.TestCase):
         self.ffmpeg_ok = True
         self.assertEqual(self.run_stage(), ["ffmpeg", "ffmpeg"])
         self.assertEqual(self.wavs(), ["s1.wav", "s1.xma.wav", "s2.wav", "s2.xma.wav"])
+
+    def test_resume_retries_an_empty_wav_and_preserves_the_valid_sibling(self):
+        self.run_stage()
+        bank = os.path.join(self.audio, "xma", "bank")
+        source = os.path.join(bank, "s1.xma.wav")
+        with open(source, "wb") as f:
+            f.write(b"synthetic XMA")
+        empty = self.touch(bank, "s1.wav")
+        sibling = os.path.join(bank, "s2.wav")
+        os.utime(sibling, (1_000_000_000, 1_000_000_000))
+        sibling_mtime = os.stat(sibling).st_mtime_ns
+
+        self.ffmpeg_ok = False
+        self.assertEqual(self.run_stage(), ["ffmpeg"])
+        self.assertEqual(os.path.getsize(empty), 0)
+        self.assertFalse(os.path.exists(empty + ".part"))
+
+        self.ffmpeg_ok = True
+        self.assertEqual(self.run_stage(), ["ffmpeg"])
+        for path, expected in ((empty, b"decoded WAV"), (sibling, b"decoded WAV"), (source, b"synthetic XMA")):
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), expected)
+        self.assertEqual(os.stat(sibling).st_mtime_ns, sibling_mtime)
+        self.assertEqual(self.run_stage(), [])
 
     def test_ffmpeg_installed_later_decodes_on_the_next_run(self):
         self.assertNotIn("ffmpeg", self.run_stage(ffmpeg=None))
