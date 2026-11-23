@@ -663,6 +663,8 @@ public:
     // is recorded once, at the end. A full barrier (flags 0) is recorded where it is issued.
     bool transition(const TransitionBarrier& barrier, std::uint32_t flags = 0) {
         if (closed_ || !barrier.resource) return false;
+        if (barrier.before == barrier.after) return false;
+        if (!valid_resource_state(barrier.before) || !valid_resource_state(barrier.after)) return false;
         if (flags & ~(barrier_begin_only | barrier_end_only)) return false;
         if (flags == (barrier_begin_only | barrier_end_only)) return false;
         if (flags & barrier_begin_only) return true;
@@ -677,18 +679,28 @@ public:
     // sync_before == split is replayed as a full barrier.
     bool barrier(const GlobalBarrier& barrier) {
         if (!valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (!valid_access(barrier.sync_before, barrier.access_before) ||
+            !valid_access(barrier.sync_after, barrier.access_after))
+            return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;
         return append(barrier);
     }
 
     bool barrier(const BufferBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (!valid_access(barrier.sync_before, barrier.access_before) ||
+            !valid_access(barrier.sync_after, barrier.access_after))
+            return false;
         if (barrier.sync_after == d3d12_sync::split) return !closed_;
         return append(barrier);
     }
 
     bool barrier(const TextureBarrier& barrier) {
         if (!barrier.resource || !valid_sync(barrier.sync_before, barrier.sync_after)) return false;
+        if (!valid_access(barrier.sync_before, barrier.access_before) ||
+            !valid_access(barrier.sync_after, barrier.access_after))
+            return false;
+        if (!valid_layout(barrier.layout_before) || !valid_layout(barrier.layout_after)) return false;
         if (barrier.layout_after == d3d12_layout::undefined && barrier.layout_before != d3d12_layout::undefined)
             return false;
         if (barrier.flags & ~texture_barrier_discard) return false;
@@ -919,9 +931,100 @@ private:
                location.row_pitch % texture_data_pitch_alignment == 0;
     }
 
-    // A split begin and end cannot be the same barrier.
+    // Legacy D3D12 resource states: known bits only, and write states cannot be combined with any other bit.
+    static bool valid_resource_state(std::uint32_t state) {
+        constexpr std::uint32_t read_states =
+            d3d12_state::vertex_and_constant_buffer | d3d12_state::index_buffer | d3d12_state::depth_read |
+            d3d12_state::non_pixel_shader_resource | d3d12_state::pixel_shader_resource |
+            d3d12_state::indirect_argument | d3d12_state::copy_source | d3d12_state::resolve_source |
+            d3d12_state::raytracing_acceleration_structure | d3d12_state::shading_rate_source |
+            0x10000u | 0x40000u | 0x200000u;  // VIDEO_DECODE_READ, VIDEO_PROCESS_READ, VIDEO_ENCODE_READ
+        constexpr std::uint32_t write_states =
+            d3d12_state::render_target | d3d12_state::unordered_access | d3d12_state::depth_write |
+            d3d12_state::stream_out | d3d12_state::copy_dest | d3d12_state::resolve_dest |
+            0x20000u | 0x80000u | 0x800000u;  // VIDEO_DECODE_WRITE, VIDEO_PROCESS_WRITE, VIDEO_ENCODE_WRITE
+        if (state & ~(read_states | write_states)) return false;
+        if ((state & write_states) && (state & (state - 1))) return false;
+        return true;
+    }
+
+    // Known sync bits only; a split begin and end cannot be the same barrier.
     static bool valid_sync(std::uint32_t before, std::uint32_t after) {
+        constexpr std::uint32_t known_sync =
+            d3d12_sync::all | d3d12_sync::draw | d3d12_sync::index_input | d3d12_sync::vertex_shading |
+            d3d12_sync::pixel_shading | d3d12_sync::depth_stencil | d3d12_sync::render_target |
+            d3d12_sync::compute_shading | d3d12_sync::raytracing | d3d12_sync::copy | d3d12_sync::resolve |
+            d3d12_sync::execute_indirect | d3d12_sync::all_shading | d3d12_sync::non_pixel_shading |
+            d3d12_sync::emit_raytracing_acceleration_structure_postbuild_info |
+            d3d12_sync::clear_unordered_access_view | d3d12_sync::video_decode | d3d12_sync::video_process |
+            d3d12_sync::video_encode | d3d12_sync::build_raytracing_acceleration_structure |
+            d3d12_sync::copy_raytracing_acceleration_structure | d3d12_sync::split;
+        if ((before & ~known_sync) || (after & ~known_sync)) return false;
         return !(before == d3d12_sync::split && after == d3d12_sync::split);
+    }
+
+    static bool valid_access(std::uint32_t sync, std::uint32_t access) {
+        namespace a = d3d12_access;
+        namespace y = d3d12_sync;
+        constexpr std::uint32_t known_access =
+            a::vertex_buffer | a::constant_buffer | a::index_buffer | a::render_target | a::unordered_access |
+            a::depth_stencil_write | a::depth_stencil_read | a::shader_resource | a::stream_output |
+            a::indirect_argument | a::copy_dest | a::copy_source | a::resolve_dest | a::resolve_source |
+            a::raytracing_acceleration_structure_read | a::raytracing_acceleration_structure_write |
+            a::shading_rate_source | a::video_decode_read | a::video_decode_write | a::video_process_read |
+            a::video_process_write | a::video_encode_read | a::video_encode_write | a::no_access;
+        if (access & ~known_access) return false;
+        if ((access & a::no_access) && access != a::no_access) return false;
+        if (sync == y::none) return access == a::no_access;
+        if (access == a::common || access == a::no_access) return true;
+        if ((sync & y::all) || (sync & y::split)) return true;
+
+        std::uint32_t allowed = 0;
+        if (sync & y::draw)
+            allowed |= a::vertex_buffer | a::constant_buffer | a::index_buffer | a::render_target |
+                       a::unordered_access | a::depth_stencil_write | a::depth_stencil_read | a::shader_resource |
+                       a::stream_output | a::indirect_argument | a::shading_rate_source |
+                       a::raytracing_acceleration_structure_read;
+        if (sync & y::index_input) allowed |= a::index_buffer;
+        if (sync & y::vertex_shading)
+            allowed |= a::vertex_buffer | a::constant_buffer | a::unordered_access | a::shader_resource |
+                       a::stream_output | a::raytracing_acceleration_structure_read;
+        if (sync & y::pixel_shading)
+            allowed |= a::constant_buffer | a::unordered_access | a::shader_resource | a::shading_rate_source |
+                       a::raytracing_acceleration_structure_read;
+        if (sync & y::depth_stencil) allowed |= a::depth_stencil_write | a::depth_stencil_read;
+        if (sync & y::render_target) allowed |= a::render_target;
+        if (sync & y::compute_shading)
+            allowed |= a::constant_buffer | a::unordered_access | a::shader_resource |
+                       a::raytracing_acceleration_structure_read;
+        if (sync & y::raytracing)
+            allowed |= a::constant_buffer | a::unordered_access | a::shader_resource |
+                       a::raytracing_acceleration_structure_read;
+        if (sync & y::copy) allowed |= a::copy_dest | a::copy_source;
+        if (sync & y::resolve) allowed |= a::resolve_dest | a::resolve_source;
+        if (sync & y::execute_indirect) allowed |= a::indirect_argument;
+        if (sync & y::all_shading)
+            allowed |= a::vertex_buffer | a::constant_buffer | a::unordered_access | a::shader_resource |
+                       a::stream_output | a::shading_rate_source | a::raytracing_acceleration_structure_read;
+        if (sync & y::non_pixel_shading)
+            allowed |= a::vertex_buffer | a::constant_buffer | a::unordered_access | a::shader_resource |
+                       a::stream_output | a::raytracing_acceleration_structure_read;
+        if (sync & y::emit_raytracing_acceleration_structure_postbuild_info)
+            allowed |= a::unordered_access | a::raytracing_acceleration_structure_read;
+        if (sync & y::clear_unordered_access_view) allowed |= a::unordered_access;
+        if (sync & y::video_decode) allowed |= a::video_decode_read | a::video_decode_write;
+        if (sync & y::video_process) allowed |= a::video_process_read | a::video_process_write;
+        if (sync & y::video_encode) allowed |= a::video_encode_read | a::video_encode_write;
+        if (sync & y::build_raytracing_acceleration_structure)
+            allowed |= a::constant_buffer | a::shader_resource | a::unordered_access |
+                       a::raytracing_acceleration_structure_read | a::raytracing_acceleration_structure_write;
+        if (sync & y::copy_raytracing_acceleration_structure)
+            allowed |= a::raytracing_acceleration_structure_read | a::raytracing_acceleration_structure_write;
+        return (access & ~allowed) == 0;
+    }
+
+    static bool valid_layout(std::uint32_t layout) {
+        return layout == d3d12_layout::undefined || layout <= d3d12_layout::video_queue_common;
     }
 
     bool append(const Command& command) {

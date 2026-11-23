@@ -450,7 +450,9 @@ public:
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResourceBarrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || list_.closed()) return check(false);
+        if (count == 0) return;
+        if (!barriers) return check(false);
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
@@ -475,24 +477,39 @@ public:
 
     void STDMETHODCALLTYPE Barrier(UINT32 groups, const D3D12_BARRIER_GROUP* group) override {
         d3d12_trace::record("ID3D12GraphicsCommandList7::Barrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || list_.closed()) return check(false);
+        if (groups == 0) return;
+        if (!group) return check(false);
         for (UINT32 g = 0; g < groups; ++g) {
-            for (UINT32 i = 0; i < group[g].NumBarriers; ++i) {
-                switch (group[g].Type) {
-                case D3D12_BARRIER_TYPE_GLOBAL: {
-                    const auto& b = group[g].pGlobalBarriers[i];
+            const auto& grp = group[g];
+            switch (grp.Type) {
+            case D3D12_BARRIER_TYPE_GLOBAL:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pGlobalBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pGlobalBarriers[i];
                     check(list_.barrier(leonida::GlobalBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
                                                                u(b.AccessAfter)}));
-                    break;
                 }
-                case D3D12_BARRIER_TYPE_BUFFER: {
-                    const auto& b = group[g].pBufferBarriers[i];
+                break;
+            case D3D12_BARRIER_TYPE_BUFFER:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pBufferBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pBufferBarriers[i];
+                    if (b.Offset != 0) {
+                        check(false);
+                        continue;
+                    }
                     check(list_.barrier(leonida::BufferBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
                                                                u(b.AccessAfter), resource_id(b.pResource)}));
-                    break;
                 }
-                case D3D12_BARRIER_TYPE_TEXTURE: {
-                    const auto& b = group[g].pTextureBarriers[i];
+                break;
+            case D3D12_BARRIER_TYPE_TEXTURE:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pTextureBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pTextureBarriers[i];
                     const auto& r = b.Subresources;
                     check(list_.barrier(leonida::TextureBarrier{
                         u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
@@ -500,11 +517,10 @@ public:
                         {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices, r.FirstPlane,
                          r.NumPlanes},
                         u(b.Flags)}));
-                    break;
                 }
-                default:
-                    check(false);
-                }
+                break;
+            default:
+                check(false);
             }
         }
     }
