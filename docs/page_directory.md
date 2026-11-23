@@ -92,8 +92,10 @@ What the samples did not show:
 - **The navmesh type hashes are not on every page.** `0xde5f1345` is in 8,412 of the 9,603 pages (every page of the
   first 64 MiB has it); the most common hash, `0x0bcb00e4`, is in 9,585 records.
 
-The per-archive tables further down (common sizes, common hashes, payload classes) are still the 64 MiB and 256 MiB
-slices where they say navmesh or animation; the `data.rpf` columns were complete from the start.
+The per-archive tables further down (tiling, spans, common sizes, common hashes, payload classes, `q30` prefix,
+`+0x20` distribution) are counted over the whole archives too: `tools/page_index.py` reports for `pages`, and for
+the byte classes a second pass over the same archive that joins each page with its directory and continuation
+streams (counts only). The class rule reproduces the earlier `data.rpf` numbers exactly.
 
 ## Fixed header (0x60 bytes)
 
@@ -234,13 +236,13 @@ continuation starts with printable ASCII, so that segment is text, not a model, 
 | Archive | Pages | `q38` records | First target +0x60 | Overlap pages | Gap runs | Gap bytes |
 |---|---:|---:|---:|---:|---:|---:|
 | `data.rpf` | 15,768 | 60,880 | 15,767 | 0 | 27,377 | 8,411,848 |
-| `navmeshes.rpf` (64 MiB) | 1,132 | 6,645 | 1,132 | 0 | 1,318 | 270,520 |
-| `anim.rpf` (256 MiB) | 12,398 | 269,320 | 12,398 | 0 | 64,356 | 5,088,441 |
+| `navmeshes.rpf` | 9,603 | 54,898 | 9,603 | 0 | 11,461 | 5,058,136 |
+| `anim.rpf` | 22,823 | 527,439 | 22,823 | 0 | 136,013 | 10,259,744 |
 
 "Gap runs" count individual gaps between sorted records, not pages. The gaps are the metadata tables and padding.
 Classifying the gap bytes: most fall inside the `q38` table or the `q28`/`q30`/`q40` ranges; the rest are
-`0x00`/`0x80` fill and short 16-40 byte alignment runs. No record overlaps another record in any sampled page.
-On 2 `data.rpf`, 32 navmesh and 6,978 animation pages the `q38` table itself is in the continuation stream; each
+`0x00`/`0x80` fill and short 16-40 byte alignment runs. No record overlaps another record on any page.
+On 2 `data.rpf`, 270 navmesh and 10,218 animation pages the `q38` table itself is in the continuation stream; each
 was parsed after concatenation.
 
 Largest/smallest declared span (target + size):
@@ -248,21 +250,21 @@ Largest/smallest declared span (target + size):
 | Archive | Minimum | Median | Maximum |
 |---|---:|---:|---:|
 | `data.rpf` | 296 | 21,768 | 14,848,448 |
-| `navmeshes.rpf` | 5,186 | 144,960 | 2,422,688 |
-| `anim.rpf` | 2,732 | 206,064 | 2,319,504 |
+| `navmeshes.rpf` | 360 | 186,208 | 2,985,724 |
+| `anim.rpf` | 2,732 | 189,072 | 5,634,144 |
 
 ### Most common `q38` sizes
 
 | `data.rpf` | Count | `navmeshes.rpf` | Count | `anim.rpf` | Count |
 |---:|---:|---:|---:|---:|---:|
-| `0x10` | 15,320 | `0x130` | 1,148 | `0x10` | 11,750 |
-| `0x2200` | 5,616 | `0x1000` | 1,136 | `0x2e00` | 9,522 |
-| `0x220` | 4,658 | `0x20` | 125 | `0x120` | 5,436 |
-| `0x4400` | 2,172 | `0x40` | 111 | `0x140` | 4,444 |
-| `0x28` | 1,270 | `0x80` | 82 | `0x240` | 4,251 |
-| `0x440` | 858 | `0x60` | 76 | `0x40` | 3,567 |
-| `0x880` | 768 | `0xc0` | 66 | `0x80` | 3,459 |
-| `0x20` | 552 | `0x100` | 65 | `0xc0` | 3,458 |
+| `0x10` | 15,320 | `0x130` | 8,535 | `0x10` | 22,737 |
+| `0x2200` | 5,616 | `0x1000` | 8,449 | `0x40` | 14,315 |
+| `0x220` | 4,658 | `0x90` | 1,381 | `0x120` | 13,428 |
+| `0x4400` | 2,172 | `0x30` | 1,303 | `0x2e00` | 13,395 |
+| `0x28` | 1,270 | `0x18` | 1,208 | `0x8` | 10,295 |
+| `0x440` | 858 | `0x40` | 626 | `0x20` | 10,039 |
+| `0x880` | 768 | `0x80` | 571 | `0x70` | 9,757 |
+| `0x20` | 552 | `0x20` | 556 | `0x80` | 9,663 |
 
 ### Most common `q38` hashes
 
@@ -270,14 +272,18 @@ These are 32-bit hashes; whether they are type ids is open. Repeated values are 
 
 | `data.rpf` hash | Count | `navmeshes.rpf` hash | Count | `anim.rpf` hash | Count |
 |---:|---:|---:|---:|---:|---:|
-| `0x00000010` | 14,520 | `0xde5f1345` | 1,132 | `0x00000007` | 12,398 |
-| `0xa8478889` | 14,482 | `0x2283b2cb` | 1,132 | `0xa90b7f7e` | 12,398 |
-| `0x99331089` | 14,482 | `0x00000013` | 1,132 | `0x0000004a` | 12,398 |
-| `0x00000101` | 14,482 | `0xbb5a70d8` | 1,132 | `0x64e8ac67` | 12,398 |
-| `0xc90d1c34` | 1,247 | `0x0bcb00e4` | 1,132 | `0xad5dfe3c` | 12,366 |
-| `0xfc3dbc38` | 1,247 | `0x00000100` | 985 | `0x64d97283` | 11,686 |
-| `0xd7e9c53b` | 38 | | | `0x00000100` | 11,686 |
-| `0x8731ec16` | 38 | | | `0x29f72aea` | 11,670 |
+| `0x00000010` | 14,520 | `0x0bcb00e4` | 9,585 | `0xa90b7f7e` | 22,823 |
+| `0xa8478889` | 14,482 | `0x00000100` | 8,825 | `0x0000004a` | 22,823 |
+| `0x99331089` | 14,482 | `0xde5f1345` | 8,412 | `0x64e8ac67` | 22,823 |
+| `0x00000101` | 14,482 | `0x2283b2cb` | 8,412 | `0x00000007` | 22,808 |
+| `0xc90d1c34` | 1,247 | `0x00000013` | 8,412 | `0xad5dfe3c` | 22,773 |
+| `0xfc3dbc38` | 1,247 | `0xbb5a70d8` | 8,412 | `0x64d97283` | 22,089 |
+| `0x956a9df5` | 62 | `0x57ad0b12` | 1,187 | `0xe19e0658` | 18,002 |
+| `0x10075946` | 62 | `0x4712787b` | 1,187 | `0x00000100` | 17,031 |
+
+Earlier versions of this table listed `0xd7e9c53b` and `0x8731ec16` (38 records each) as the seventh and eighth
+`data.rpf` hashes; two hashes with 62 records each rank above them. Over the whole archives the first three
+`anim.rpf` hashes are on every page, and `0x00000007` on 22,808 of 22,823.
 
 No name or type string is present in the page; these hashes remain opaque until the TOC or the executable supplies a mapping.
 
@@ -344,8 +350,10 @@ pages where both tables were present.
 
 ## `q30`, `q40` and `+0x4e`
 
-- `q30` is present when `u16@0x4a` is nonzero. Its target begins with a 16-byte hash-like header; in 980 of 1,132
-  navmesh pages the first eight bytes are `01 2e 3b 5c 3e b2 ee 6e`. The internal layout is not decoded.
+- `q30` is present when `u16@0x4a` is nonzero. Its target begins with a 16-byte hash-like header. Over the whole
+  `navmeshes.rpf`, 9,600 of the 9,603 pages have a `q30` table; on 8,386 its first eight bytes are
+  `01 2e 3b 5c 3e b2 ee 6e` (980 of the 1,132 pages in the first 64 MiB), on 1,187 they differ, and on 27 the
+  table lies past the streams read for `q38` and `q28`, so it was not classed. The internal layout is not decoded.
 - `q40` points at a table whose common prefix is `01 00 00 00 01 01 00 00 20 00 00 00 ...` (1, 0x101, 32, then
   hash words). The 89-count page starts `05 00 00 00 01 01 00 00 40 46 4e 00 0f 01 ...`. It is not used for
   resource boundaries and its fields are unresolved.
@@ -357,10 +365,13 @@ A `0DRP` stream starts a **logical resource**. The fixed header is followed by p
 `q38`; the first segment normally starts at +0x60. The page does not map to a zlib block (the zlib framing is
 outside it), to another page, or to a named RBF0/PSIN/model/texture resource:
 
-- Every `q38` target's first 0x18 bytes were classed. In `data.rpf`: 46,184 "other" and 14,696 zero-prefix; in
-  navmesh: 6,194 "other" and 451 zero-prefix; in anim: 80,697 "other", 188,617 zero-prefix and 6 too short.
-  None started with `PSIN`, `RBF0`, `0DRP`, `RSC7` or `RSC8`.
-- Continuation streams were classed as zero-prefix or other payload in every case; none was a `0DRP` page. A
+- Every `q38` target's first 0x18 bytes were classed (zero-prefix: the first eight bytes are zero). In
+  `data.rpf`: 46,184 "other" and 14,696 zero-prefix; in navmesh (whole archive): 52,171 "other" and 2,727
+  zero-prefix; in anim (whole archive): 175,220 "other", 352,213 zero-prefix and 6 too short. None started with
+  `PSIN`, `RBF0`, `0DRP`, `RSC7` or `RSC8`. (The 64 MiB and 256 MiB slices gave 6,194 / 451 and 80,697 /
+  188,617 / 6.)
+- Continuation streams were classed as zero-prefix or other payload in every case (`data.rpf` 87 / 71,
+  navmesh 116 / 2,054, anim 8,827 / 2,933); none was a `0DRP` page. A
   resource therefore extends forward by payload, not by nesting another directory.
 - `PSIN` (2,281) and `RBF0` (1,263) are separate top-level stream classes in `data.rpf`, not `q38` payloads.
 
@@ -374,23 +385,28 @@ boundaries by itself.
 
 This is the cross-check the navmesh report asked for: the `0x50000000` base is shared by directory pages and typed
 data pages, but only the directory page carries the offset/size table. The typed prefix is not a `q38` payload
-magic; 0 of 60,880 `data.rpf` records, 0 of 6,645 navmesh records and 0 of 269,320 animation records started with
+magic; 0 of 60,880 `data.rpf` records, 0 of 54,898 navmesh records and 0 of 527,439 animation records started with
 `0x00010015` at +0x14.
 
 ## Distribution of the +0x20 count
 
 | Value | `data.rpf` | `navmeshes.rpf` | `anim.rpf` |
 |---:|---:|---:|---:|
-| 1 | 1,247 | 0 | 480 |
-| 2 | 14,485 | 147 | 5,240 |
-| 3 | 35 | 985 | 5,144 |
-| 4 | 0 | 0 | 1,407 |
-| 5 | 0 | 0 | 45 |
-| 18-38 | 0 | 0 | 82 |
+| 1 | 1,247 | 1 | 1,883 |
+| 2 | 14,485 | 779 | 7,571 |
+| 3 | 35 | 7,650 | 9,241 |
+| 4 | 0 | 932 | 2,022 |
+| 5 | 0 | 22 | 70 |
+| 6 | 0 | 219 | 0 |
+| 13-41 | 0 | 0 | 2,036 |
 | 89 | 1 | 0 | 0 |
 
+The navmesh and animation columns are the whole archives (the first 64 MiB and 256 MiB had 147 / 985 navmesh
+pages at 2 / 3, and 480 / 5,240 / 5,144 / 1,407 / 45 / 82 animation pages at 1 / 2 / 3 / 4 / 5 / 18-38).
+
 The count does not equal the `q38` record count or the stream count. A `data.rpf` page with count 2 can have four
-records; a navmesh page with count 3 has six; an animation page with count 3 can have 22. The unit is **unresolved**.
+records; a navmesh page with count 3 has six (7,635 of 7,650; the other 15 have three); an animation page with
+count 3 can have 28. The unit is **unresolved**.
 The earlier label "presumed page count" is kept only as a name for `u32@0x20`.
 
 ### The `+0x20` count does not mark stream boundaries
