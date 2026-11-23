@@ -309,6 +309,21 @@ int main() {
     CHECK(!JsonReader("[-]").parse(json));
     CHECK(!JsonReader("[1e999]").parse(json));
     CHECK(!JsonReader("[1.2.3]").parse(json));
+    // strtod accepts a broader grammar than JSON. Check complete values and container members.
+    for (const char* token : {"+1", "01", "-01", ".5", "-.5", "1.", "1.e2", "1e", "1e+", "1e-"}) {
+        for (const std::string& document : {std::string(token), "[" + std::string(token) + "]",
+                                           "{\"n\":" + std::string(token) + "}"}) {
+            Json number;
+            CHECK(!JsonReader(document).parse(number));
+        }
+    }
+    for (const char* token : {"0", "-0", "10", "-10", "0.5", "-0.5", "1e2", "1E+2", "1e-2", "1.25e+2"}) {
+        for (const std::string& document : {std::string(token), "[" + std::string(token) + "]",
+                                           "{\"n\":" + std::string(token) + "}"}) {
+            Json number;
+            CHECK(JsonReader(document).parse(number));
+        }
+    }
     CHECK(!JsonReader("\"\\uzzzz\"").parse(json));
     CHECK(!JsonReader("\"\\u0x41\"").parse(json));
     CHECK(!JsonReader("\"\\u00").parse(json));

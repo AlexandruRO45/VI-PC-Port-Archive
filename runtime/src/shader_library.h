@@ -401,11 +401,30 @@ private:
         if (literal("true")) return out.kind = Json::Kind::boolean, out.boolean = true, true;
         if (literal("false")) return out.kind = Json::Kind::boolean, out.boolean = false, true;
         if (literal("null")) return out.kind = Json::Kind::null, true;
-        // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload. The
-        // token is already limited to JSON number characters, and the end check requires all of it to be consumed.
+        // Numbers through strtod: Apple's libc++ does not provide the floating-point from_chars overload.
+        // Validate JSON's grammar first: strtod also accepts leading plus signs, leading zeroes and missing
+        // digits on either side of a decimal point. Conversion and range handling stay separate from syntax.
         const std::size_t start = pos_;
-        while (pos_ < text_.size() && std::strchr("+-0123456789.eE", text_[pos_])) ++pos_;
-        if (pos_ == start) return false;
+        const auto digit = [&] { return pos_ < text_.size() && text_[pos_] >= '0' && text_[pos_] <= '9'; };
+        if (text_[pos_] == '-') ++pos_;
+        if (!digit()) return false;
+        if (text_[pos_] == '0') {
+            ++pos_;
+            if (digit()) return false;
+        } else {
+            while (digit()) ++pos_;
+        }
+        if (pos_ < text_.size() && text_[pos_] == '.') {
+            ++pos_;
+            if (!digit()) return false;
+            while (digit()) ++pos_;
+        }
+        if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+            if (!digit()) return false;
+            while (digit()) ++pos_;
+        }
         out.kind = Json::Kind::number;
         const std::string token(text_.substr(start, pos_ - start));
         char* end = nullptr;
