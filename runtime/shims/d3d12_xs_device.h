@@ -41,6 +41,8 @@
 //             ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68), accepting the console C-ABI struct return
 //             (return buffer in RCX, device in RDX) as well as the PC C++ order, with Xbox layout words and flag bits
 //             normalized on a copy of the descriptors.
+//   slot 127  CreateCommittedResource3 with Xbox layout/flags -> the PC device's ID3D12Device10 method; the
+//             caller's heap, layout, clear value, session and castable formats are kept.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
