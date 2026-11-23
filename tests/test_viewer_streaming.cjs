@@ -930,3 +930,35 @@ test('camera hash round-trips and malformed hashes are ignored', () => {
         assert.equal(camHelpers.parseCamHash(bad), null, String(bad));
     }
 });
+
+test('resize handler ignores zero-dimension viewports and updates on valid dimensions', () => {
+    const match = html.match(/addEventListener\("resize",\s*\(\)\s*=>\s*\{[^\n]*\}\);/);
+    assert.ok(match, 'resize listener must exist in viewer/index.html');
+    let onResize = null;
+    let updates = 0;
+    const sizes = [];
+    const ctx = {
+        innerWidth: 1600,
+        innerHeight: 900,
+        camera: { aspect: 1600 / 900, updateProjectionMatrix() { updates++; } },
+        renderer: { setSize(w, h) { sizes.push([w, h]); } },
+        addEventListener(type, fn) { if (type === 'resize') onResize = fn; },
+    };
+    vm.runInNewContext(match[0], ctx);
+    assert.equal(typeof onResize, 'function');
+    for (const [w, h] of [[0, 0], [800, 0], [0, 600], [-10, 400]]) {
+        ctx.innerWidth = w;
+        ctx.innerHeight = h;
+        onResize();
+        assert.equal(ctx.camera.aspect, 1600 / 900);
+        assert.ok(Number.isFinite(ctx.camera.aspect));
+        assert.equal(updates, 0);
+        assert.equal(sizes.length, 0);
+    }
+    ctx.innerWidth = 1280;
+    ctx.innerHeight = 720;
+    onResize();
+    assert.equal(ctx.camera.aspect, 1280 / 720);
+    assert.equal(updates, 1);
+    assert.deepEqual(sizes, [[1280, 720]]);
+});

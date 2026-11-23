@@ -194,7 +194,7 @@ scene.fog = new THREE.Fog(0x9cc3e6, 900, 2600);
 const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 6000);
 scene.add(new THREE.HemisphereLight(0xdfefff, 0x4a4030, 1.1));
 const sun = new THREE.DirectionalLight(0xfff2dd, 1.6); sun.position.set(0.4, 1, 0.3); scene.add(sun);
-addEventListener("resize", () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+addEventListener("resize", () => { if (innerWidth <= 0 || innerHeight <= 0) return; camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
 
 // ---------- freecam ----------
 const keys = new Set(); let yaw = 0, pitch = -0.25, speed = 40, locked = false;
