@@ -210,6 +210,35 @@ bool host_renames_case(const std::filesystem::path& folder) {
 
 void run_checks(const std::filesystem::path& root);
 
+// ReplaceFile with overlay copies of both files and a marker that can't be written (from illusionart453-max's review
+// of #4965): the call fails before the host replaces anything, with or without a backup.
+void check_replace_marker_failure(const std::filesystem::path& root) {
+    const auto replace = resolve<ReplaceFileWFn>("kernel32.dll", "ReplaceFileW");
+    check(replace != nullptr, "ReplaceFileW resolves for the marker-failure cases");
+    if (!replace) return;
+    for (bool backup : {false, true}) {
+        const auto scratch = root / (backup ? "replace-marker-backup" : "replace-marker-plain");
+        const auto package = scratch / "package", overlay = scratch / "overlay";
+        write_path(package / "target.txt", "package target");
+        write_path(package / "source.txt", "package source");
+        write_path(overlay / "target.txt", "overlay target");
+        write_path(overlay / "source.txt", "overlay replacement");
+        write_path(overlay / ".gta6rt-deleted", "marker obstruction");
+        rt::fs::configure(package, overlay);
+        SetLastError(0);
+        const BOOL result = replace(L"GAME:\\target.txt", L"GAME:\\source.txt",
+                                    backup ? L"GAME:\\backup.txt" : nullptr, 0, nullptr, nullptr);
+        const char* with = backup ? " (with a backup)" : "";
+        check(result == FALSE, (std::string("an obstructed marker fails ReplaceFileW") + with).c_str());
+        check(read_path(overlay / "target.txt") == "overlay target", "the failed replace keeps the destination");
+        check(read_path(overlay / "source.txt") == "overlay replacement", "the failed replace keeps the replacement");
+        check(!std::filesystem::exists(overlay / "backup.txt"), "the failed replace writes no backup");
+        check(read_path(package / "target.txt") == "package target" &&
+                  read_path(package / "source.txt") == "package source", "the package files are untouched");
+    }
+    rt::fs::configure({}, {});
+}
+
 }  // namespace
 
 int main() {
@@ -1635,6 +1664,7 @@ void run_checks(const std::filesystem::path& root) {
               "a ReplaceFileW the host refuses removes the marker it wrote");
         rt::fs::configure(package, overlay);
     }
+    check_replace_marker_failure(root);
 }
 
 }  // namespace
