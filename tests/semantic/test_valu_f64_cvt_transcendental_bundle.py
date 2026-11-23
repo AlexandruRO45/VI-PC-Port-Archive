@@ -380,6 +380,25 @@ class VCvtF64U32SimdIeeeTests(unittest.TestCase):
         self.assertEqual(res, F64_POS_ZERO)
         self.assertNotEqual(res, F64_NEG_ZERO)
 
+class VCvtF64U32TranslatorTests(unittest.TestCase):
+    def test_cvt_f64_u32_translation_and_interp(self):
+        lines = [
+            "v_mov_b32 v2, 100",
+            "v_cvt_f64_u32 v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_cvt_f64_u32_test", lines)
+        self.assertIn("OpCapability Float64", spv)
+        self.assertIn("OpConvertUToF %double", spv)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[0] & MASK32) | ((res.vgpr[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(100.0))
+
+    def test_cvt_f64_u32_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_cvt_f64_u32", ["v_cvt_f64_u32"])
+
 
 if __name__ == "__main__":
     unittest.main()
