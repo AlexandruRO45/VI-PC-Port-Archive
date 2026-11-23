@@ -90,6 +90,12 @@ def main():
         ap.error(f"cannot read texture index {a.index}: {error}")
     if not isinstance(index, list):
         ap.error(f"{a.index}: texture index must contain a list")
+    # A row that is not a descriptor (a non-dict, or missing fmt_name/w/h) used to raise KeyError,
+    # AttributeError or TypeError in the filter below. Refuse it like the non-list check above.
+    for i, t in enumerate(index):
+        if not isinstance(t, dict) or not isinstance(t.get("fmt_name"), str) \
+                or not isinstance(t.get("w"), int) or not isinstance(t.get("h"), int):
+            ap.error(f"{a.index}: texture row {i} needs fmt_name (string) and w, h (integers)")
     nib, tab = load()
     texs = [t for t in index if t["fmt_name"].startswith(a.fmt)
             and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]

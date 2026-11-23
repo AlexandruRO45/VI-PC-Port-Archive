@@ -294,6 +294,32 @@ class TestArgumentValidation(unittest.TestCase):
                 self.assertIn(diagnostic, stderr.getvalue())
                 self.assertIn(index, stderr.getvalue())
 
+    def test_probe_refuses_rows_missing_descriptor_keys(self):
+        # Before: a list row that was not a descriptor raised KeyError ('fmt_name'/'w'/'h'),
+        # AttributeError (fmt_name=null) or TypeError (non-dict) in the filter, exit 1 with a
+        # traceback. The wrong-schema case is plausible: tex_headers emits format_name/width/height.
+        rows = (
+            [{"w": 256, "h": 256}],                                   # missing fmt_name
+            [{"fmt_name": None, "w": 256, "h": 256}],                 # null fmt_name
+            [{"fmt_name": "BC1_UNORM", "h": 256}],                    # missing w
+            ["BC1_UNORM"],                                            # non-dict row
+            [{"format_name": "BC1_UNORM", "width": 256, "height": 256}],  # tex_headers schema
+        )
+        for bad in rows:
+            with self.subTest(row=bad), tempfile.TemporaryDirectory() as directory:
+                index = os.path.join(directory, "index.json")
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(bad, f)
+                stderr = io.StringIO()
+                with mock.patch.object(tex_mode_probe, "load", return_value=({}, {})) as load, \
+                        mock.patch.object(sys, "argv", ["tex_mode_probe.py", index, directory]), \
+                        mock.patch.object(sys, "stderr", stderr), self.assertRaises(SystemExit) as exc:
+                    tex_mode_probe.main()
+                load.assert_not_called()
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("texture row 0 needs fmt_name", stderr.getvalue())
+                self.assertIn(index, stderr.getvalue())
+
     def test_probe_refuses_a_count_below_one_cli(self):
         for val in ["0", "-1", "x"]:
             with self.subTest(value=val):
