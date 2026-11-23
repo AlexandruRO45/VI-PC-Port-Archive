@@ -210,11 +210,14 @@ def _fold_scalar_alu(op, x, y):
     if op == "s_bfm_b32":
         # A mask of (x & 31) ones, shifted left by (y & 31).
         return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
-    if op == "s_bfe_u32":
+    if op in ("s_bfe_u32", "s_bfe_i32"):
         # y packs the offset in bits [4:0] and the width in bits [22:16]; the field stops at bit 31.
         offset = y & 31
         width = min((y >> 16) & 0x7F, 32 - offset)
-        return ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+        field = (x >> offset) & ((1 << width) - 1)
+        if op == "s_bfe_i32" and width and field & (1 << (width - 1)):
+            field -= 1 << width
+        return field & 0xFFFFFFFF
     if op == "s_min_u32":
         return min(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
     if op == "s_max_u32":
@@ -426,7 +429,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
                 "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
-                "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+                "s_bfm_b32", "s_bfe_u32", "s_bfe_i32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:

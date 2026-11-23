@@ -657,6 +657,23 @@ class OperandClassificationTests(unittest.TestCase):
             with self.subTest(build=build):
                 self.assertEqual(self._literal_samplers_with(build), [])
 
+    def test_signed_bitfield_extract_folds_into_literal_sampler(self):
+        cases = [
+            # Offset 28 and width 127 leave a four-bit field of 0xd, which sign-extends to 0xfffffffd.
+            (["s_mov_b32 s13, 0xd2f90159", "s_bfe_i32 s13, s13, 0xfffffffc",
+              "s_and_b32 s13, s13, 0xc00000"], 0xC00000),
+            (["s_mov_b32 s13, 0x40004", "s_bfe_i32 s13, 0x70, s13"], 7),  # Positive field; dst aliases control.
+            (["s_bfe_i32 s13, s8, 31"], 0),  # A zero-width extract gives zero even when bit 31 is set.
+        ]
+        for build, word in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, word, 0, 0]])
+
+    def test_signed_bitfield_extract_with_unknown_operand_clears_sampler_constant(self):
+        for extract in ("s_bfe_i32 s13, s3, 0x40004", "s_bfe_i32 s13, s8, s3"):
+            with self.subTest(extract=extract):
+                self.assertEqual(self._literal_samplers_with(["s_mov_b32 s13, 0xc00000", extract]), [])
+
     def test_inverted_scalar_logic_of_unknown_source_is_not_a_literal(self):
         # A source that is not a known constant (the user SGPR s3) must not give a literal sampler, also when the
         # destination held a known constant before the operation.
