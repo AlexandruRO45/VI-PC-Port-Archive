@@ -1099,6 +1099,50 @@ class SkinnedJointRemappingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out-of-range"):
             pa.build_assembled_glb([oob_raw_part], skeleton=master_skel, apply_standing=False)
 
+    def test_cli_missing_input_malformed_json_and_output_guards(self):
+        script = os.path.join(TOOLS, "ped_assemble.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            part_path = os.path.join(tmp, "part.json")
+            part_text = json.dumps({
+                "name": "hand_fr1_000_nude_cull",
+                "positions": [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.1, 0.0]],
+                "triangles": [[0, 1, 2]],
+            })
+            with open(part_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(part_text)
+
+            bad_json = os.path.join(tmp, "bad.json")
+            with open(bad_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{not valid json")
+
+            out_dir = os.path.join(tmp, "dir_out")
+            os.mkdir(out_dir)
+
+            cases = [
+                (["inspect-seams", os.path.join(tmp, "missing.json")], "missing input"),
+                (["inspect-seams", bad_json], "malformed json"),
+                (["inspect-seams", part_path, "--json", out_dir], "json is a directory"),
+                (["inspect-seams", part_path, "--json", part_path], "json overwrites input"),
+                (["assemble", part_path, "-o", out_dir], "out is a directory"),
+                (["assemble", part_path, "-o", part_path], "out overwrites input"),
+                (["assemble", part_path, "-o", os.path.join(tmp, "same.glb"),
+                  "--json", os.path.join(tmp, "same.glb")], "out and json collide"),
+                (["cull-overlap", "--target", part_path, "--ref", part_path,
+                  "-o", part_path], "cull-overlap out overwrites input"),
+            ]
+            for argv, label in cases:
+                with self.subTest(label=label):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", script, *argv],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("ERROR:", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+
+            with open(part_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), part_text)
+
 
 if __name__ == "__main__":
     unittest.main()

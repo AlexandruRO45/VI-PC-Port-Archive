@@ -53,6 +53,7 @@ if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import glb_writer  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -2126,12 +2127,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_cli_outputs(args: argparse.Namespace) -> None:
+    if args.command == "cull-overlap":
+        input_paths = [args.target, *args.ref]
+    else:
+        input_paths = ([args.manifest] if args.manifest else []) + list(args.inputs)
+    outputs: list[tuple[str, str]] = []
+    if getattr(args, "out", None):
+        outputs.append(("-o/--out", args.out))
+    if getattr(args, "json", None):
+        outputs.append(("--json", args.json))
+    for flag, out_path in outputs:
+        if os.path.isdir(out_path):
+            raise PedAssembleError(f"{flag} is a directory: {out_path}")
+        for in_path in input_paths:
+            if same_report_path(out_path, in_path):
+                raise PedAssembleError(f"{flag} would overwrite input: {out_path}")
+    if len(outputs) == 2 and same_report_path(outputs[0][1], outputs[1][1]):
+        raise PedAssembleError(f"--json and -o/--out name the same file: {outputs[1][1]}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _validate_cli_outputs(args)
         return int(args.func(args))
-    except PedAssembleError as exc:
+    except (PedAssembleError, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
