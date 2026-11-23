@@ -89,6 +89,24 @@ class GlobalFcmpswapFixture(unittest.TestCase):
             with self.subTest(word=k):
                 self.assertEqual(mem[4 * k], want)
 
+    def test_the_seed_is_an_atomic_and_a_workgroup_barrier_precedes_the_swaps(self):
+        # Review: lane 0 seeded P+16 with a plain store, and the 32 lanes swapped at it with nothing in between.
+        # Translated, a lane is an invocation, so a swap could run before the seed landed: a data race. The seed is
+        # the module's one OpAtomicExchange now, and its one OpControlBarrier (workgroup scope, which every lane
+        # reaches: the interpreter above checks that) stands between it and the swaps' OpAtomicLoad.
+        text = support.translate_fixture("cs_w32_global_fcmpswap", fssm=FSSM)
+        consts = {int(v): i for i, v in re.findall(r"^(\S+) = OpConstant %uint (\d+)$", text, re.MULTILINE)}
+        lines = [ln.split() for ln in text.splitlines()]
+        seed = [i for i, ln in enumerate(lines) if "OpAtomicExchange" in ln]
+        barrier = [i for i, ln in enumerate(lines) if "OpControlBarrier" in ln]
+        loads = [i for i, ln in enumerate(lines) if "OpAtomicLoad" in ln]    # one per float compare-and-swap
+        self.assertEqual(len(seed), 1)
+        self.assertEqual(len(barrier), 1)
+        self.assertEqual(lines[barrier[0]][1:3], [consts[2]] * 2)            # execution and memory scope: Workgroup
+        self.assertLess(seed[0], barrier[0])
+        # the first three swaps are lane 0's own (P+0, P+4, P+8); the fourth is the 32 lanes at P+16
+        self.assertEqual([i > barrier[0] for i in loads], [False, False, False, True])
+
     def test_gpu_runners_expect_the_same_words(self):
         for rel in (("runtime", "test", "shaders", "check.py"), ("scripts", "run_gpu_tests.py")):
             with open(os.path.join(ROOT, *rel), encoding="utf-8") as f:

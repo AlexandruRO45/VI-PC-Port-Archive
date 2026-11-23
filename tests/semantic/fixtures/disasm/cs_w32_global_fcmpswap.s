@@ -12,7 +12,7 @@
 	buffer_store_dword v1, v2, s[0:3], 0 offen
 	v_mov_b32_e32 v1, 0
 	v_mov_b32_e32 v2, 0x90
-	buffer_store_dword v1, v2, s[0:3], 0 offen
+	buffer_atomic_swap v1, v2, s[0:3], 0 offen
 	s_waitcnt_vscnt null, 0
 	s_mov_b32 s20, 0x80
 	s_mov_b32 s21, 0
@@ -32,6 +32,7 @@
 	global_load_dword v17, v30, s[20:21] offset:8 glc
 	s_waitcnt vmcnt(0)
 	s_mov_b32 exec_lo, s10
+	s_barrier
 	v_mov_b32_e32 v30, 0
 	v_add_nc_u32_e32 v8, 0x3f800000, v0
 	v_mov_b32_e32 v9, 0x80000000

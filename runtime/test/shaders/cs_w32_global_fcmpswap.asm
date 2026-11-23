@@ -1,17 +1,21 @@
 ; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; global_atomic_fcmpswap (#3153, Gen.float_cmpswap_loop): vdata is {DATA, CMP}, the compare is a float compare (-0
 ; matches +0, a NaN never matches, not even its own bits), and the CAS loop stays exact when lanes contend.
-; Global addresses are heap offsets (s[20:21] = P = 0x80, v30 = 0). Seeds (MUBUF stores through the V# in s[0:3]):
+; Global addresses are heap offsets (s[20:21] = P = 0x80, v30 = 0). Seeds, by lane 0 through the V# in s[0:3]:
 ;   P+0 0x80000000 (-0)   P+4 0x7FC00000 (NaN)   P+8 0x3F800000 (1.0)   P+16 0x00000000 (+0)
+; P+0, P+4 and P+8 are buffer_store_dword: lane 0 alone touches them. P+16, which all 32 lanes then swap at, is
+; seeded by buffer_atomic_swap, and an s_barrier follows before their swaps. Translated, a lane is an invocation, and
+; a plain store by invocation 0 is not ordered before another invocation's atomic without the barrier (a data race):
+; a lane's swap could read the heap's 0xEEEEEEEE fill before the seed landed.
 ; Lane 0 alone:
 ;   out[0] global_atomic_fcmpswap glc at P+0 {DATA 2.0, CMP +0}: old value                    = 0x80000000
 ;   out[1] the dword at P+0 after it: -0 == +0, so DATA is stored                            = 0x40000000
 ;   out[2] global_atomic_fcmpswap glc at P+4 {DATA 1.0, CMP the same NaN}: old value         = 0x7FC00000
 ;   out[3] the dword at P+4 after it: NaN != NaN, unchanged (a bit compare would store 1.0)  = 0x7FC00000
 ;   out[4] the dword at P+8 after global_atomic_fcmpswap (no glc) {DATA 3.0, CMP 0x3F800001} = 0x3F800000
-; All 32 lanes at P+16 (+0), glc, lane i: DATA 0x3F800000 + i, CMP -0. One lane matches and stores its DATA; every
-; later compare sees a nonzero DATA and fails, returning the stored word. Which lane wins is up to the hardware, so
-; the counts are stored:
+; All 32 lanes at P+16 (+0) after the barrier, glc, lane i: DATA 0x3F800000 + i, CMP -0. One lane matches and stores
+; its DATA; every later compare sees a nonzero DATA and fails, returning the stored word. Which lane wins is up to the
+; hardware, so the counts are stored:
 ;   out[5] lanes whose old value is 0                                         = 1
 ;   out[6] lanes whose old value is the final word at P+16                    = 31
 ;   out[7] lanes whose old value is 0 and whose DATA is the final word        = 1
@@ -32,7 +36,7 @@ v_mov_b32_e32 v2, 0x88
 buffer_store_dword v1, v2, s[0:3], 0 offen
 v_mov_b32_e32 v1, 0
 v_mov_b32_e32 v2, 0x90
-buffer_store_dword v1, v2, s[0:3], 0 offen
+buffer_atomic_swap v1, v2, s[0:3], 0 offen
 s_waitcnt_vscnt null, 0
 s_mov_b32 s20, 0x80
 s_mov_b32 s21, 0
@@ -52,6 +56,7 @@ global_load_dword v16, v30, s[20:21] offset:4 glc
 global_load_dword v17, v30, s[20:21] offset:8 glc
 s_waitcnt vmcnt(0)
 s_mov_b32 exec_lo, s10
+s_barrier
 v_mov_b32_e32 v30, 0
 v_add_nc_u32_e32 v8, 0x3f800000, v0
 v_mov_b32_e32 v9, 0x80000000
