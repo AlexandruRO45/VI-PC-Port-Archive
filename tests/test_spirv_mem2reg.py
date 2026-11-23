@@ -138,10 +138,22 @@ def _assert_valid_spirv(spvasm: str) -> None:
                 rpreds[s].add(b)
 
         for b in rpo:
+            # SPIR-V 2.16.1: every dominating block must appear earlier in block text order.
+            if b != 0 and idom.get(b, 0) > b:
+                raise AssertionError(
+                    f"dominating block {blabels[idom[b]]} appears after dominated block {blabels[b]}"
+                )
             for order, idx in enumerate(blocks[b]):
                 res, op, args, raw = insts[idx]
                 if op is None or not args or op == "OpLabel":
                     continue
+                if op == "OpLoopMerge":
+                    # SPIR-V 2.16.1: a loop header must have at most one back-edge from inside the loop.
+                    back_edges = [p for p in rpreds[b] if spirv_mem2reg._dominates(b, p, idom, depth)]
+                    if len(back_edges) > 1:
+                        raise AssertionError(
+                            f"loop header {blabels[b]} has {len(back_edges)} back-edges (must be <= 1)"
+                        )
                 if op == "OpPhi":
                     pairs = [(args[k], args[k + 1]) for k in range(1, len(args), 2)]
                     pred_lbls = [p for _, p in pairs]
@@ -343,20 +355,24 @@ class SpirvMem2RegTests(unittest.TestCase):
         # %vgpr must remain because of v_movrels_b32, while %sgpr / %active / %m0 / %scc / %pc promote away.
         self.assertEqual(opt_fvars, ["%vgpr"])
 
-    def test_nested_access_chain_out_of_block_order(self):
-        # Valid SPIR-V where dominated block %b2 defining %p2 = OpAccessChain %p1 %u0 appears before %b1.
+    def test_nested_access_chain_across_blocks_promotes_cleanly(self):
+        # Valid SPIR-V (dominance-ordered blocks) with nested OpAccessChain across blocks + diamond merge.
         spvasm = """               OpCapability Shader
                OpMemoryModel Logical GLSL450
-               OpEntryPoint Fragment %main "main" %out0
+               OpEntryPoint Fragment %main "main" %in0 %out0
                OpExecutionMode %main OriginUpperLeft
+               OpDecorate %in0 Location 0
+               OpDecorate %in0 Flat
                OpDecorate %out0 Location 0
        %void = OpTypeVoid
          %fn = OpTypeFunction %void
+       %bool = OpTypeBool
        %uint = OpTypeInt 32 0
          %c2 = OpConstant %uint 2
        %arr1 = OpTypeArray %uint %c2
        %arr2 = OpTypeArray %arr1 %c2
      %v4uint = OpTypeVector %uint 4
+    %_ptr_In = OpTypePointer Input %uint
     %_ptr_F2 = OpTypePointer Function %arr2
     %_ptr_F1 = OpTypePointer Function %arr1
     %_ptr_Fu = OpTypePointer Function %uint
@@ -364,28 +380,41 @@ class SpirvMem2RegTests(unittest.TestCase):
          %u0 = OpConstant %uint 0
          %u1 = OpConstant %uint 1
          %u7 = OpConstant %uint 7
+         %u9 = OpConstant %uint 9
        %null = OpConstantNull %arr2
+        %in0 = OpVariable %_ptr_In Input
        %out0 = OpVariable %_ptr_Out Output
        %main = OpFunction %void None %fn
       %entry = OpLabel
           %a = OpVariable %_ptr_F2 Function %null
+         %iv = OpLoad %uint %in0
+       %cond = OpINotEqual %bool %iv %u0
                OpBranch %b1
-         %b2 = OpLabel
+         %b1 = OpLabel
+         %p1 = OpAccessChain %_ptr_F1 %a %u1
+               OpSelectionMerge %merge None
+               OpBranchConditional %cond %then %else
+       %then = OpLabel
          %p2 = OpAccessChain %_ptr_Fu %p1 %u0
                OpStore %p2 %u7
-          %r = OpLoad %uint %p2
+               OpBranch %merge
+       %else = OpLabel
+         %p3 = OpAccessChain %_ptr_Fu %p1 %u0
+               OpStore %p3 %u9
+               OpBranch %merge
+      %merge = OpLabel
+         %p4 = OpAccessChain %_ptr_Fu %p1 %u0
+          %r = OpLoad %uint %p4
         %vec = OpCompositeConstruct %v4uint %r %u0 %u0 %u0
                OpStore %out0 %vec
                OpReturn
-         %b1 = OpLabel
-         %p1 = OpAccessChain %_ptr_F1 %a %u1
-               OpBranch %b2
                OpFunctionEnd
 """
         _assert_valid_spirv(spvasm)
         opt = spirv_opt.optimize(spvasm)
         _assert_valid_spirv(opt)
-        self.assertEqual(list(run_fragment(opt)["%out0"]), [7, 0, 0, 0])
+        self.assertEqual(list(run_fragment(opt, inputs={"%in0": 1})["%out0"]), [7, 0, 0, 0])
+        self.assertEqual(list(run_fragment(opt, inputs={"%in0": 0})["%out0"]), [9, 0, 0, 0])
         self.assertNotIn("%a = OpVariable", opt)
 
     def test_uninitialized_live_in_slot_does_not_synthesize_undef(self):
@@ -499,7 +528,7 @@ class SpirvMem2RegTests(unittest.TestCase):
         self.assertEqual(list(run_fragment(opt, inputs={"%in0": 0})["%out0"]), [2, 0, 0, 0])
 
     def test_wide_switch_phi_cap_promotes_readonly_and_bounds_mutable(self):
-        # 40-case OpSwitch looping back to %head (41 preds > max_phi_preds=32):
+        # 40-case OpSwitch converging at %sw_merge (41 preds > max_phi_preds=32) inside a structured loop:
         # %ro is written only in %entry (0 phis -> must promote), %mut is modified in cases (kept in memory).
         n_cases = 40
         consts = "\n".join(f"        %k{i} = OpConstant %uint {i}" for i in range(n_cases))
@@ -511,7 +540,7 @@ class SpirvMem2RegTests(unittest.TestCase):
       %m{i} = OpLoad %uint %mut
       %a{i} = OpIAdd %uint %r{i} %m{i}
               OpStore %mut %a{i}
-              OpBranch %head""")
+              OpBranch %sw_merge""")
         spvasm = f"""               OpCapability Shader
                OpMemoryModel Logical GLSL450
                OpEntryPoint Fragment %main "main" %in0 %out0
@@ -546,9 +575,11 @@ class SpirvMem2RegTests(unittest.TestCase):
                OpLoopMerge %exit %cont None
                OpBranchConditional %done %exit %body
        %body = OpLabel
-               OpSelectionMerge %cont None
-               OpSwitch %mv %cont {sw_pairs}
+               OpSelectionMerge %sw_merge None
+               OpSwitch %mv %sw_merge {sw_pairs}
 {chr(10).join(cases)}
+   %sw_merge = OpLabel
+               OpBranch %cont
        %cont = OpLabel
                OpBranch %head
        %exit = OpLabel
