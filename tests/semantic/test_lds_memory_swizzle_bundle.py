@@ -603,6 +603,22 @@ class TestDsWriteB16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xABCD5678)
 
+def ref_ds_write_b32(lds: LdsModel, addr: int, val: int, offset: int = 0) -> None:
+    """Reference mathematical oracle for ds_write_b32."""
+    lds.write_u32(addr + offset, val)
+
+
+class TestDsWriteB32Oracle(unittest.TestCase):
+    def test_write_b32_oracle(self) -> None:
+        lds = LdsModel()
+        ref_ds_write_b32(lds, 0x100, 0xDEADBEEF, offset=0x20)
+        self.assertEqual(lds.read_u32(0x120), 0xDEADBEEF)
+
+    def test_write_b32_wrapping(self) -> None:
+        lds = LdsModel()
+        ref_ds_write_b32(lds, LDS_SIZE + 8, 0x12345678)
+        self.assertEqual(lds.read_u32(8), 0x12345678)
+
 
 if __name__ == "__main__":
     unittest.main()
