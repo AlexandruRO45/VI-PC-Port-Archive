@@ -12,8 +12,10 @@ Subsystem Feature Bundle 10 covers 7 double-precision (IEEE 754 binary64) VALU i
 Architecture & Hardware Model:
   - Vector registers (VGPRs) are 32-bit words; 64-bit double operands occupy aligned pairs v[k:k+1].
   - Standard IEEE 754 binary64 representation: 1 sign bit, 11 exponent bits (bias 1023), 52 fraction bits.
-  - Multi-lane SIMD execution follows Wave32 (32-bit EXEC) and Wave64 (64-bit EXEC) masking rules.
-  - End-to-end translation exercises tools/rdna2spirv.py and validates SPIR-V bytecode.
+  - Implemented instructions (v_add_f64, v_ldexp_f64, v_frexp_exp_i32_f64) execute directly through
+    tools/rdna2spirv.py via support.translate_lines, support.mrt0_words, and spirv_interp.
+  - Unimplemented instructions (v_mul_f64, v_fma_f64, v_min_f64, v_max_f64) validate mathematical reference
+    models and verify explicit translator refusal (rdna2spirv.Unsupported) per maintainer review feedback.
 
 Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
 """
@@ -29,13 +31,14 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS_DIR = os.path.dirname(HERE)
-for p in (HERE, TESTS_DIR):
+ROOT = os.path.dirname(TESTS_DIR)
+for p in (HERE, TESTS_DIR, os.path.join(ROOT, "tools")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from support import translate_lines, mrt0_words  # noqa: E402
 import rdna2spirv  # noqa: E402
 import spirv_interp  # noqa: E402
+import support  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
@@ -70,6 +73,7 @@ def is_nan_u64(bits: int) -> bool:
     bits &= MASK64
     return (bits & 0x7FF0000000000000) == 0x7FF0000000000000 and (bits & 0x000FFFFFFFFFFFFF) != 0
 
+
 # -----------------------------------------------------------------------------
 # Opcode 1: v_add_f64
 # -----------------------------------------------------------------------------
@@ -92,90 +96,118 @@ def oracle_add_f64(a_bits: int, b_bits: int) -> int:
 
 class VAddF64OracleTests(unittest.TestCase):
     def test_add_basic(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(1.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(1.0) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(2.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(2.0) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_basic", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(3.0))
         self.assertEqual(oracle_add_f64(f64_to_u64(1.0), f64_to_u64(2.0)), f64_to_u64(3.0))
 
     def test_add_cancellation(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(100.5) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(100.5) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(-100.5) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(-100.5) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_cancel", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, F64_POS_ZERO)
         self.assertEqual(oracle_add_f64(f64_to_u64(100.5), f64_to_u64(-100.5)), F64_POS_ZERO)
 
     def test_add_precision_beyond_f32(self):
         # 2^50 + 1.0 exact in binary64
         v = float(2**50)
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(v) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(v) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(1.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(1.0) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_prec", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(v + 1.0))
         self.assertEqual(oracle_add_f64(f64_to_u64(v), f64_to_u64(1.0)), f64_to_u64(v + 1.0))
 
-class RegKind(enum.Enum):
-    VGPR_PAIR = "vgpr_pair"
-    VGPR_SINGLE = "vgpr_single"
-    SGPR_PAIR = "sgpr_pair"
-    IMM_F64 = "imm_f64"
-    IMM_I32 = "imm_i32"
-
-
-@dataclass(frozen=True)
-class Operand64:
-    kind: RegKind
-    index: int = 0
-    imm_val: int = 0
-
-
-@dataclass(frozen=True)
-class Instruction64AST:
-    mnemonic: str
-    dst: Operand64
-    src0: Operand64
-    src1: Operand64 | None = None
-    src2: Operand64 | None = None
-
-
-class SimdWaveState64:
-    def __init__(self, lane_count: int = 32):
-        self.lane_count = lane_count
-        self.exec_mask: int = (1 << lane_count) - 1
-        # Each lane has 256 32-bit vgprs
-        self.vgprs = [[0] * 256 for _ in range(lane_count)]
-
-    def get_f64(self, lane: int, reg_idx: int) -> int:
-        lo = self.vgprs[lane][reg_idx] & MASK32
-        hi = self.vgprs[lane][reg_idx + 1] & MASK32
-        return (hi << 32) | lo
-
-    def set_f64(self, lane: int, reg_idx: int, val: int):
-        val &= MASK64
-        self.vgprs[lane][reg_idx] = val & MASK32
-        self.vgprs[lane][reg_idx + 1] = (val >> 32) & MASK32
 
 class VAddF64AstInterpreterTests(unittest.TestCase):
     def test_add_ast_construction(self):
-        ast = Instruction64AST("v_add_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
-        self.assertEqual(ast.mnemonic, "v_add_f64")
-        self.assertEqual(ast.dst.index, 4)
+        lines = [
+            "v_mov_b32 v0, 0", "v_mov_b32 v1, 0x3FF00000",
+            "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x40000000",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_ast", lines)
+        self.assertIn("OpFAdd", spv)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(3.0))
 
     def test_add_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(10.0))
-        wave.set_f64(0, 2, f64_to_u64(20.0))
-        ast = Instruction64AST("v_add_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
-        wave.set_f64(0, 4, oracle_add_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
-        self.assertEqual(wave.get_f64(0, 4), f64_to_u64(30.0))
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(10.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(10.0) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(20.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(20.0) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_scalar", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(30.0))
+
 
 class VAddF64SimdIeeeTests(unittest.TestCase):
     def test_add_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0xAAAAAAAA  # Odd lanes active
-        for i in range(32):
-            wave.set_f64(i, 4, 0xDEADBEEFCAFEBABE)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 4, oracle_add_f64(f64_to_u64(i), f64_to_u64(1.0)))
-        for i in range(32):
-            if (0xAAAAAAAA >> i) & 1:
-                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(i + 1.0))
-            else:
-                self.assertEqual(wave.get_f64(i, 4), 0xDEADBEEFCAFEBABE)
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(5.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(5.0) >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(7.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(7.0) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_simd", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(12.0))
 
     def test_add_ieee_boundary_extremes(self):
-        # Infinity + number = Infinity
-        self.assertEqual(oracle_add_f64(F64_POS_INF, f64_to_u64(1.0)), F64_POS_INF)
-        # NaN propagation
-        self.assertTrue(is_nan_u64(oracle_add_f64(F64_QNAN, f64_to_u64(1.0))))
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_INF & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_INF >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {f64_to_u64(1.0) & MASK32:#010x}",
+            f"v_mov_b32 v3, {(f64_to_u64(1.0) >> 32) & MASK32:#010x}",
+            "v_add_f64 v[4:5], v[0:1], v[2:3]",
+            "exp mrt0 v4, v5, v4, v5 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_add_inf", lines)
+        res = spirv_interp.run(spv)
+        got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
+        self.assertEqual(got, F64_POS_INF)
+
 
 class VAddF64TranslatorTests(unittest.TestCase):
     def test_add_f64_translation_and_interp(self):
@@ -188,17 +220,19 @@ class VAddF64TranslatorTests(unittest.TestCase):
             "exp mrt0 v4, v5, v4, v5 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_add_f64_test", lines)
+        spv = support.translate_lines("ps_add_f64_test", lines)
+        self.assertIn("OpFAdd", spv)
         res = spirv_interp.run(spv)
         got = (res.vgpr[4] & MASK32) | ((res.vgpr[5] & MASK32) << 32)
         self.assertEqual(got, f64_to_u64(4.0))
 
     def test_add_f64_syntax_rejection(self):
         with self.assertRaises(Exception):
-            translate_lines("ps_bad_add_f64", ["v_add_f64"])
+            support.translate_lines("ps_bad_add_f64", ["v_add_f64"])
+
 
 # -----------------------------------------------------------------------------
-# Opcode 2: v_mul_f64
+# Opcode 2: v_mul_f64 (Refusal / Python model per maintainer feedback)
 # -----------------------------------------------------------------------------
 def oracle_mul_f64(a_bits: int, b_bits: int) -> int:
     """Reference mathematical oracle for v_mul_f64."""
@@ -222,40 +256,52 @@ def oracle_mul_f64(a_bits: int, b_bits: int) -> int:
 class VMulF64OracleTests(unittest.TestCase):
     def test_mul_basic(self):
         self.assertEqual(oracle_mul_f64(f64_to_u64(3.0), f64_to_u64(4.0)), f64_to_u64(12.0))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            support.translate_lines("ps_mul_basic_refuse", lines)
+        self.assertIn("v_mul_f64", str(ctx.exception))
 
     def test_mul_identity(self):
         self.assertEqual(oracle_mul_f64(f64_to_u64(42.5), F64_POS_ONE), f64_to_u64(42.5))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_id_refuse", lines)
 
     def test_mul_sign_rules(self):
         self.assertEqual(oracle_mul_f64(F64_NEG_ONE, f64_to_u64(5.0)), f64_to_u64(-5.0))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_sign_refuse", lines)
+
 
 class VMulF64AstInterpreterTests(unittest.TestCase):
     def test_mul_ast_construction(self):
-        ast = Instruction64AST("v_mul_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
-        self.assertEqual(ast.mnemonic, "v_mul_f64")
+        self.assertEqual(oracle_mul_f64(f64_to_u64(2.0), f64_to_u64(5.0)), f64_to_u64(10.0))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_ast_refuse", lines)
 
     def test_mul_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(6.0))
-        wave.set_f64(0, 2, f64_to_u64(7.0))
-        wave.set_f64(0, 4, oracle_mul_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
-        self.assertEqual(wave.get_f64(0, 4), f64_to_u64(42.0))
+        self.assertEqual(oracle_mul_f64(f64_to_u64(6.0), f64_to_u64(7.0)), f64_to_u64(42.0))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_scal_refuse", lines)
+
 
 class VMulF64SimdIeeeTests(unittest.TestCase):
     def test_mul_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0x0000FFFF
-        for i in range(32):
-            wave.set_f64(i, 4, 0x1111111122222222)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 4, oracle_mul_f64(f64_to_u64(i), f64_to_u64(2.0)))
-        for i in range(16):
-            self.assertEqual(wave.get_f64(i, 4), f64_to_u64(i * 2.0))
-        for i in range(16, 32):
-            self.assertEqual(wave.get_f64(i, 4), 0x1111111122222222)
+        for i in range(4):
+            self.assertEqual(oracle_mul_f64(f64_to_u64(float(i)), f64_to_u64(2.0)), f64_to_u64(float(i * 2)))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_simd_refuse", lines)
 
     def test_mul_zero_times_inf_is_nan(self):
         self.assertTrue(is_nan_u64(oracle_mul_f64(F64_POS_ZERO, F64_POS_INF)))
+        lines = ["v_mul_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_mul_nan_refuse", lines)
+
 
 class VMulF64TranslatorTests(unittest.TestCase):
     def test_mul_f64_translation_or_refusal(self):
@@ -266,14 +312,13 @@ class VMulF64TranslatorTests(unittest.TestCase):
             "exp mrt0 v4, v5, v4, v5 done vm",
             "s_endpgm",
         ]
-        try:
-            spv = translate_lines("ps_mul_f64_test", lines)
-            self.assertIn("OpCapability", spv)
-        except rdna2spirv.Unsupported as caught:
-            self.assertIn("v_mul_f64", str(caught))
+        with self.assertRaises(rdna2spirv.Unsupported) as caught:
+            support.translate_lines("ps_mul_f64_test", lines)
+        self.assertIn("v_mul_f64", str(caught.exception))
+
 
 # -----------------------------------------------------------------------------
-# Opcode 3: v_fma_f64
+# Opcode 3: v_fma_f64 (Refusal / Python model per maintainer feedback)
 # -----------------------------------------------------------------------------
 def oracle_fma_f64(a_bits: int, b_bits: int, c_bits: int) -> int:
     """Reference mathematical oracle for v_fma_f64: computes S0 * S1 + S2."""
@@ -298,43 +343,47 @@ def oracle_fma_f64(a_bits: int, b_bits: int, c_bits: int) -> int:
 
 class VFmaF64OracleTests(unittest.TestCase):
     def test_fma_basic(self):
-        # 2.0 * 3.0 + 4.0 = 10.0
         self.assertEqual(oracle_fma_f64(f64_to_u64(2.0), f64_to_u64(3.0), f64_to_u64(4.0)), f64_to_u64(10.0))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            support.translate_lines("ps_fma_basic_refuse", lines)
+        self.assertIn("v_fma_f64", str(ctx.exception))
 
     def test_fma_with_zero_addend(self):
-        # 5.0 * 5.0 + 0.0 = 25.0
         self.assertEqual(oracle_fma_f64(f64_to_u64(5.0), f64_to_u64(5.0), F64_POS_ZERO), f64_to_u64(25.0))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_fma_zero_refuse", lines)
+
 
 class VFmaF64AstInterpreterTests(unittest.TestCase):
     def test_fma_ast_construction(self):
-        ast = Instruction64AST("v_fma_f64", Operand64(RegKind.VGPR_PAIR, 6), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2), Operand64(RegKind.VGPR_PAIR, 4))
-        self.assertEqual(ast.mnemonic, "v_fma_f64")
+        self.assertEqual(oracle_fma_f64(f64_to_u64(1.0), f64_to_u64(2.0), f64_to_u64(3.0)), f64_to_u64(5.0))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_fma_ast_refuse", lines)
 
     def test_fma_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(3.0))
-        wave.set_f64(0, 2, f64_to_u64(4.0))
-        wave.set_f64(0, 4, f64_to_u64(5.0))
-        res = oracle_fma_f64(wave.get_f64(0, 0), wave.get_f64(0, 2), wave.get_f64(0, 4))
-        wave.set_f64(0, 6, res)
-        self.assertEqual(wave.get_f64(0, 6), f64_to_u64(17.0))
+        self.assertEqual(oracle_fma_f64(f64_to_u64(3.0), f64_to_u64(4.0), f64_to_u64(5.0)), f64_to_u64(17.0))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_fma_scal_refuse", lines)
+
 
 class VFmaF64SimdIeeeTests(unittest.TestCase):
     def test_fma_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0x55555555
-        for i in range(32):
-            wave.set_f64(i, 6, 0x3333333344444444)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 6, oracle_fma_f64(f64_to_u64(i), f64_to_u64(2.0), f64_to_u64(1.0)))
-        for i in range(32):
-            if (0x55555555 >> i) & 1:
-                self.assertEqual(wave.get_f64(i, 6), f64_to_u64(i * 2.0 + 1.0))
-            else:
-                self.assertEqual(wave.get_f64(i, 6), 0x3333333344444444)
+        for i in range(4):
+            self.assertEqual(oracle_fma_f64(f64_to_u64(float(i)), f64_to_u64(2.0), f64_to_u64(1.0)), f64_to_u64(float(i * 2 + 1)))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_fma_simd_refuse", lines)
 
     def test_fma_nan_propagation(self):
         self.assertTrue(is_nan_u64(oracle_fma_f64(F64_QNAN, f64_to_u64(1.0), f64_to_u64(2.0))))
+        lines = ["v_fma_f64 v[6:7], v[0:1], v[2:3], v[4:5]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_fma_nan_refuse", lines)
+
 
 class VFmaF64TranslatorTests(unittest.TestCase):
     def test_fma_f64_translation_or_refusal(self):
@@ -346,14 +395,13 @@ class VFmaF64TranslatorTests(unittest.TestCase):
             "exp mrt0 v6, v7, v6, v7 done vm",
             "s_endpgm",
         ]
-        try:
-            spv = translate_lines("ps_fma_f64_test", lines)
-            self.assertIn("OpCapability", spv)
-        except rdna2spirv.Unsupported as caught:
-            self.assertIn("v_fma_f64", str(caught))
+        with self.assertRaises(rdna2spirv.Unsupported) as caught:
+            support.translate_lines("ps_fma_f64_test", lines)
+        self.assertIn("v_fma_f64", str(caught.exception))
+
 
 # -----------------------------------------------------------------------------
-# Opcode 4: v_min_f64
+# Opcode 4: v_min_f64 (Refusal / Python model per maintainer feedback)
 # -----------------------------------------------------------------------------
 def oracle_min_f64(a_bits: int, b_bits: int) -> int:
     """Reference mathematical oracle for v_min_f64 (IEEE 754 minNum NaN suppression)."""
@@ -365,7 +413,6 @@ def oracle_min_f64(a_bits: int, b_bits: int) -> int:
         return b_bits
     if b_nan:
         return a_bits
-    # Handle signed zeros: -0.0 < +0.0
     if a_bits == F64_NEG_ZERO and b_bits == F64_POS_ZERO:
         return F64_NEG_ZERO
     if a_bits == F64_POS_ZERO and b_bits == F64_NEG_ZERO:
@@ -378,42 +425,52 @@ def oracle_min_f64(a_bits: int, b_bits: int) -> int:
 class VMinF64OracleTests(unittest.TestCase):
     def test_min_basic(self):
         self.assertEqual(oracle_min_f64(f64_to_u64(10.0), f64_to_u64(20.0)), f64_to_u64(10.0))
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            support.translate_lines("ps_min_basic_refuse", lines)
+        self.assertIn("v_min_f64", str(ctx.exception))
 
     def test_min_signed_zeros(self):
         self.assertEqual(oracle_min_f64(F64_NEG_ZERO, F64_POS_ZERO), F64_NEG_ZERO)
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_zero_refuse", lines)
 
     def test_min_nan_suppression(self):
-        # min(NaN, x) == x
         self.assertEqual(oracle_min_f64(F64_QNAN, f64_to_u64(5.0)), f64_to_u64(5.0))
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_nan_refuse", lines)
+
 
 class VMinF64AstInterpreterTests(unittest.TestCase):
     def test_min_ast_construction(self):
-        ast = Instruction64AST("v_min_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
-        self.assertEqual(ast.mnemonic, "v_min_f64")
+        self.assertEqual(oracle_min_f64(f64_to_u64(1.0), f64_to_u64(2.0)), f64_to_u64(1.0))
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_ast_refuse", lines)
 
     def test_min_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(100.0))
-        wave.set_f64(0, 2, f64_to_u64(50.0))
-        wave.set_f64(0, 4, oracle_min_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
-        self.assertEqual(wave.get_f64(0, 4), f64_to_u64(50.0))
+        self.assertEqual(oracle_min_f64(f64_to_u64(100.0), f64_to_u64(50.0)), f64_to_u64(50.0))
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_scal_refuse", lines)
+
 
 class VMinF64SimdIeeeTests(unittest.TestCase):
     def test_min_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0x00FF00FF
-        for i in range(32):
-            wave.set_f64(i, 4, 0x5555555566666666)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 4, oracle_min_f64(f64_to_u64(i), f64_to_u64(10.0)))
-        for i in range(32):
-            if (0x00FF00FF >> i) & 1:
-                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(min(float(i), 10.0)))
-            else:
-                self.assertEqual(wave.get_f64(i, 4), 0x5555555566666666)
+        for i in range(4):
+            self.assertEqual(oracle_min_f64(f64_to_u64(float(i)), f64_to_u64(10.0)), f64_to_u64(min(float(i), 10.0)))
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_simd_refuse", lines)
 
     def test_min_infinities(self):
         self.assertEqual(oracle_min_f64(F64_NEG_INF, f64_to_u64(0.0)), F64_NEG_INF)
+        lines = ["v_min_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_min_inf_refuse", lines)
+
 
 class VMinF64TranslatorTests(unittest.TestCase):
     def test_min_f64_translation_or_refusal(self):
@@ -424,14 +481,13 @@ class VMinF64TranslatorTests(unittest.TestCase):
             "exp mrt0 v4, v5, v4, v5 done vm",
             "s_endpgm",
         ]
-        try:
-            spv = translate_lines("ps_min_f64_test", lines)
-            self.assertIn("OpCapability", spv)
-        except rdna2spirv.Unsupported as caught:
-            self.assertIn("v_min_f64", str(caught))
+        with self.assertRaises(rdna2spirv.Unsupported) as caught:
+            support.translate_lines("ps_min_f64_test", lines)
+        self.assertIn("v_min_f64", str(caught.exception))
+
 
 # -----------------------------------------------------------------------------
-# Opcode 5: v_max_f64
+# Opcode 5: v_max_f64 (Refusal / Python model per maintainer feedback)
 # -----------------------------------------------------------------------------
 def oracle_max_f64(a_bits: int, b_bits: int) -> int:
     """Reference mathematical oracle for v_max_f64 (IEEE 754 maxNum NaN suppression)."""
@@ -443,7 +499,6 @@ def oracle_max_f64(a_bits: int, b_bits: int) -> int:
         return b_bits
     if b_nan:
         return a_bits
-    # Handle signed zeros: +0.0 > -0.0
     if a_bits == F64_NEG_ZERO and b_bits == F64_POS_ZERO:
         return F64_POS_ZERO
     if a_bits == F64_POS_ZERO and b_bits == F64_NEG_ZERO:
@@ -456,42 +511,52 @@ def oracle_max_f64(a_bits: int, b_bits: int) -> int:
 class VMaxF64OracleTests(unittest.TestCase):
     def test_max_basic(self):
         self.assertEqual(oracle_max_f64(f64_to_u64(10.0), f64_to_u64(20.0)), f64_to_u64(20.0))
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+            support.translate_lines("ps_max_basic_refuse", lines)
+        self.assertIn("v_max_f64", str(ctx.exception))
 
     def test_max_signed_zeros(self):
         self.assertEqual(oracle_max_f64(F64_NEG_ZERO, F64_POS_ZERO), F64_POS_ZERO)
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_zero_refuse", lines)
 
     def test_max_nan_suppression(self):
-        # max(NaN, x) == x
         self.assertEqual(oracle_max_f64(F64_QNAN, f64_to_u64(5.0)), f64_to_u64(5.0))
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_nan_refuse", lines)
+
 
 class VMaxF64AstInterpreterTests(unittest.TestCase):
     def test_max_ast_construction(self):
-        ast = Instruction64AST("v_max_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
-        self.assertEqual(ast.mnemonic, "v_max_f64")
+        self.assertEqual(oracle_max_f64(f64_to_u64(5.0), f64_to_u64(2.0)), f64_to_u64(5.0))
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_ast_refuse", lines)
 
     def test_max_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(100.0))
-        wave.set_f64(0, 2, f64_to_u64(50.0))
-        wave.set_f64(0, 4, oracle_max_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
-        self.assertEqual(wave.get_f64(0, 4), f64_to_u64(100.0))
+        self.assertEqual(oracle_max_f64(f64_to_u64(100.0), f64_to_u64(50.0)), f64_to_u64(100.0))
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_scal_refuse", lines)
+
 
 class VMaxF64SimdIeeeTests(unittest.TestCase):
     def test_max_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0xF0F0F0F0
-        for i in range(32):
-            wave.set_f64(i, 4, 0x7777777788888888)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 4, oracle_max_f64(f64_to_u64(i), f64_to_u64(15.0)))
-        for i in range(32):
-            if (0xF0F0F0F0 >> i) & 1:
-                self.assertEqual(wave.get_f64(i, 4), f64_to_u64(max(float(i), 15.0)))
-            else:
-                self.assertEqual(wave.get_f64(i, 4), 0x7777777788888888)
+        for i in range(4):
+            self.assertEqual(oracle_max_f64(f64_to_u64(float(i)), f64_to_u64(15.0)), f64_to_u64(max(float(i), 15.0)))
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_simd_refuse", lines)
 
     def test_max_infinities(self):
         self.assertEqual(oracle_max_f64(F64_POS_INF, f64_to_u64(1000.0)), F64_POS_INF)
+        lines = ["v_max_f64 v[4:5], v[0:1], v[2:3]", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("ps_max_inf_refuse", lines)
+
 
 class VMaxF64TranslatorTests(unittest.TestCase):
     def test_max_f64_translation_or_refusal(self):
@@ -502,11 +567,10 @@ class VMaxF64TranslatorTests(unittest.TestCase):
             "exp mrt0 v4, v5, v4, v5 done vm",
             "s_endpgm",
         ]
-        try:
-            spv = translate_lines("ps_max_f64_test", lines)
-            self.assertIn("OpCapability", spv)
-        except rdna2spirv.Unsupported as caught:
-            self.assertIn("v_max_f64", str(caught))
+        with self.assertRaises(rdna2spirv.Unsupported) as caught:
+            support.translate_lines("ps_max_f64_test", lines)
+        self.assertIn("v_max_f64", str(caught.exception))
+
 
 # -----------------------------------------------------------------------------
 # Opcode 6: v_ldexp_f64
@@ -518,7 +582,6 @@ def oracle_ldexp_f64(x_bits: int, exp_i32: int) -> int:
     fx = u64_to_f64(x_bits)
     if math.isinf(fx) or fx == 0.0:
         return x_bits
-    # Clamp exp to avoid Python float overflow / underflow crash
     signed_exp = exp_i32 if exp_i32 < 0x80000000 else exp_i32 - 0x100000000
     try:
         res = math.ldexp(fx, signed_exp)
@@ -532,57 +595,131 @@ def oracle_ldexp_f64(x_bits: int, exp_i32: int) -> int:
 class VLdexpF64OracleTests(unittest.TestCase):
     def test_ldexp_basic(self):
         # 1.0 * 2^3 = 8.0
-        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 3), f64_to_u64(8.0))
-
-    def test_ldexp_negative_scale(self):
-        # 1.0 * 2^-2 = 0.25
-        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, -2 & MASK32), f64_to_u64(0.25))
-
-    def test_ldexp_zero_preservation(self):
-        self.assertEqual(oracle_ldexp_f64(F64_POS_ZERO, 100), F64_POS_ZERO)
-
-class VLdexpF64AstInterpreterTests(unittest.TestCase):
-    def test_ldexp_ast_construction(self):
-        ast = Instruction64AST("v_ldexp_f64", Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_SINGLE, 2))
-        self.assertEqual(ast.mnemonic, "v_ldexp_f64")
-
-    def test_ldexp_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(3.0))
-        wave.vgprs[0][2] = 2  # 3.0 * 2^2 = 12.0
-        res = oracle_ldexp_f64(wave.get_f64(0, 0), wave.vgprs[0][2])
-        wave.set_f64(0, 0, res)
-        self.assertEqual(wave.get_f64(0, 0), f64_to_u64(12.0))
-
-class VLdexpF64SimdIeeeTests(unittest.TestCase):
-    def test_ldexp_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0x000000FF
-        for i in range(32):
-            wave.set_f64(i, 4, 0x99999999AAAAAAAA)
-            if (wave.exec_mask >> i) & 1:
-                wave.set_f64(i, 4, oracle_ldexp_f64(F64_POS_ONE, i))
-        for i in range(8):
-            self.assertEqual(wave.get_f64(i, 4), f64_to_u64(2.0**i))
-        for i in range(8, 32):
-            self.assertEqual(wave.get_f64(i, 4), 0x99999999AAAAAAAA)
-
-    def test_ldexp_overflow(self):
-        # 1.0 * 2^2000 -> overflow to inf
-        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 2000), F64_POS_INF)
-
-class VLdexpF64TranslatorTests(unittest.TestCase):
-    def test_ldexp_f64_translation(self):
         lines = [
             f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
             f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
-            "v_mov_b32 v2, 4",
+            "v_mov_b32 v2, 3",
             "v_ldexp_f64 v[0:1], v[0:1], v2",
             "exp mrt0 v0, v1, v0, v1 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_ldexp_f64_test", lines)
-        self.assertIn("OpCapability", spv)
+        spv = support.translate_lines("ps_ldexp_basic", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(8.0))
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, 3), f64_to_u64(8.0))
+
+    def test_ldexp_negative_scale(self):
+        # 1.0 * 2^-2 = 0.25
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+            f"v_mov_b32 v2, {(-2) & MASK32:#010x}",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_neg", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(0.25))
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ONE, -2 & MASK32), f64_to_u64(0.25))
+
+    def test_ldexp_zero_preservation(self):
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ZERO & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ZERO >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 100",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_zero", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, F64_POS_ZERO)
+        self.assertEqual(oracle_ldexp_f64(F64_POS_ZERO, 100), F64_POS_ZERO)
+
+
+class VLdexpF64AstInterpreterTests(unittest.TestCase):
+    def test_ldexp_ast_construction(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(3.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(3.0) >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 2",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_ast", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(12.0))
+
+    def test_ldexp_scalar_execution(self):
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(3.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(3.0) >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 2",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_scalar", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(12.0))
+
+
+class VLdexpF64SimdIeeeTests(unittest.TestCase):
+    def test_ldexp_simd_exec_masking(self):
+        for i in range(4):
+            lines = [
+                f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+                f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+                f"v_mov_b32 v2, {i}",
+                "v_ldexp_f64 v[0:1], v[0:1], v2",
+                "exp mrt0 v0, v1, v0, v1 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_ldexp_simd_{i}", lines)
+            words = support.mrt0_words(spv)
+            got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+            self.assertEqual(got, f64_to_u64(2.0**i))
+
+    def test_ldexp_overflow(self):
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 2000",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_overflow", lines)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, F64_POS_INF)
+
+
+class VLdexpF64TranslatorTests(unittest.TestCase):
+    def test_ldexp_f64_translation(self):
+        # 1.5 * 2^3 = 12.0. Pins exponent addition lowering, catching 'exponent not added' mutation.
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(1.5) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(1.5) >> 32) & MASK32:#010x}",
+            "v_mov_b32 v2, 3",
+            "v_ldexp_f64 v[0:1], v[0:1], v2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ldexp_f64_test", lines)
+        self.assertIn("OpBitFieldUExtract", spv)
+        words = support.mrt0_words(spv)
+        got = (words[0] & MASK32) | ((words[1] & MASK32) << 32)
+        self.assertEqual(got, f64_to_u64(12.0))
+        self.assertNotEqual(got, f64_to_u64(1.5))  # Explicitly catches exponent not added mutation
+
 
 # -----------------------------------------------------------------------------
 # Opcode 7: v_frexp_exp_i32_f64
@@ -601,47 +738,121 @@ def oracle_frexp_exp_i32_f64(x_bits: int) -> int:
 class VFrexpExpI32F64OracleTests(unittest.TestCase):
     def test_frexp_exp_basic(self):
         # 1.0 = 0.5 * 2^1 -> exp is 1
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ONE & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ONE >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_basic", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 1)
         self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_ONE), 1)
 
     def test_frexp_exp_powers_of_two(self):
         # 8.0 = 0.5 * 2^4 -> exp is 4
-        self.assertEqual(oracle_frexp_exp_i32_f64(f64_to_u64(8.0)), 4)
+        lines8 = [
+            f"v_mov_b32 v0, {f64_to_u64(8.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(8.0) >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv8 = support.translate_lines("ps_frexp_p8", lines8)
+        words8 = support.mrt0_words(spv8)
+        self.assertEqual(words8[0], 4)
+
         # 0.25 = 0.5 * 2^-1 -> exp is -1 (0xFFFFFFFF)
-        self.assertEqual(oracle_frexp_exp_i32_f64(f64_to_u64(0.25)), (-1) & MASK32)
+        lines_q = [
+            f"v_mov_b32 v0, {f64_to_u64(0.25) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(0.25) >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv_q = support.translate_lines("ps_frexp_pq", lines_q)
+        words_q = support.mrt0_words(spv_q)
+        self.assertEqual(words_q[0], (-1) & MASK32)
 
     def test_frexp_exp_zero(self):
+        lines = [
+            f"v_mov_b32 v0, {F64_POS_ZERO & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_ZERO >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_zero", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0)
         self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_ZERO), 0)
+
 
 class VFrexpExpI32F64AstInterpreterTests(unittest.TestCase):
     def test_frexp_exp_ast_construction(self):
-        ast = Instruction64AST("v_frexp_exp_i32_f64", Operand64(RegKind.VGPR_SINGLE, 2), Operand64(RegKind.VGPR_PAIR, 0))
-        self.assertEqual(ast.mnemonic, "v_frexp_exp_i32_f64")
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(4.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(4.0) >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_ast", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 3)
 
     def test_frexp_exp_scalar_execution(self):
-        wave = SimdWaveState64(lane_count=1)
-        wave.set_f64(0, 0, f64_to_u64(16.0))
-        res = oracle_frexp_exp_i32_f64(wave.get_f64(0, 0))
-        wave.vgprs[0][2] = res
-        self.assertEqual(wave.vgprs[0][2], 5)  # 16.0 = 0.5 * 2^5
+        lines = [
+            f"v_mov_b32 v0, {f64_to_u64(16.0) & MASK32:#010x}",
+            f"v_mov_b32 v1, {(f64_to_u64(16.0) >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_scalar", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 5)  # 16.0 = 0.5 * 2^5
+
 
 class VFrexpExpI32F64SimdIeeeTests(unittest.TestCase):
     def test_frexp_exp_simd_exec_masking(self):
-        wave = SimdWaveState64(lane_count=32)
-        wave.exec_mask = 0x0F0F0F0F
-        for i in range(32):
-            wave.vgprs[i][2] = 0xEE
-            if (wave.exec_mask >> i) & 1:
-                wave.vgprs[i][2] = oracle_frexp_exp_i32_f64(f64_to_u64(2.0**i))
-        for i in range(32):
-            if (0x0F0F0F0F >> i) & 1:
-                self.assertEqual(wave.vgprs[i][2], i + 1)
-            else:
-                self.assertEqual(wave.vgprs[i][2], 0xEE)
+        for i in range(4):
+            lines = [
+                f"v_mov_b32 v0, {f64_to_u64(2.0**i) & MASK32:#010x}",
+                f"v_mov_b32 v1, {(f64_to_u64(2.0**i) >> 32) & MASK32:#010x}",
+                "v_frexp_exp_i32_f64 v2, v[0:1]",
+                "exp mrt0 v2, v2, v2, v2 done vm",
+                "s_endpgm",
+            ]
+            spv = support.translate_lines(f"ps_frexp_simd_{i}", lines)
+            words = support.mrt0_words(spv)
+            self.assertEqual(words[0], i + 1)
 
     def test_frexp_exp_specials(self):
         # NaN and Inf return 0
-        self.assertEqual(oracle_frexp_exp_i32_f64(F64_QNAN), 0)
-        self.assertEqual(oracle_frexp_exp_i32_f64(F64_POS_INF), 0)
+        lines_nan = [
+            f"v_mov_b32 v0, {F64_QNAN & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_QNAN >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv_nan = support.translate_lines("ps_frexp_nan", lines_nan)
+        words_nan = support.mrt0_words(spv_nan)
+        self.assertEqual(words_nan[0], 0)
+
+        lines_inf = [
+            f"v_mov_b32 v0, {F64_POS_INF & MASK32:#010x}",
+            f"v_mov_b32 v1, {(F64_POS_INF >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv_inf = support.translate_lines("ps_frexp_inf", lines_inf)
+        words_inf = support.mrt0_words(spv_inf)
+        self.assertEqual(words_inf[0], 0)
+
 
 class VFrexpExpI32F64TranslatorTests(unittest.TestCase):
     def test_frexp_exp_translation(self):
@@ -652,8 +863,10 @@ class VFrexpExpI32F64TranslatorTests(unittest.TestCase):
             "exp mrt0 v2, v2, v2, v2 done vm",
             "s_endpgm",
         ]
-        spv = translate_lines("ps_frexp_exp_f64_test", lines)
-        self.assertIn("OpCapability", spv)
+        spv = support.translate_lines("ps_frexp_exp_f64_test", lines)
+        self.assertIn("OpBitFieldUExtract", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 1)
 
 
 if __name__ == "__main__":
