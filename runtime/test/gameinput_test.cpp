@@ -47,6 +47,7 @@ struct Pad {
     SDL_JoystickID id = 0;
     SDL_Joystick* js = nullptr;
     int rumble_calls = 0, trigger_calls = 0, effect_calls = 0, led_calls = 0;
+    bool reject_body = false, reject_triggers = false;
     uint16_t low = 0, high = 0, left = 0, right = 0;
     uint8_t effect[64] = {};
     int effect_size = 0;
@@ -57,6 +58,7 @@ struct Pad {
 bool SDLCALL on_rumble(void* u, Uint16 lo, Uint16 hi) {
     auto* p = static_cast<Pad*>(u);
     ++p->rumble_calls;
+    if (p->reject_body) return false;
     p->low = lo;
     p->high = hi;
     return true;
@@ -64,6 +66,7 @@ bool SDLCALL on_rumble(void* u, Uint16 lo, Uint16 hi) {
 bool SDLCALL on_triggers(void* u, Uint16 l, Uint16 r) {
     auto* p = static_cast<Pad*>(u);
     ++p->trigger_calls;
+    if (p->reject_triggers) return false;
     p->left = l;
     p->right = r;
     return true;
@@ -1765,6 +1768,31 @@ int main() {
     dev->SetRumbleState(nullptr);
     rt::gameinput::poll();
     check(xbox.low == 0 && xbox.high == 0 && xbox.left == 0 && xbox.right == 0, "SetRumbleState(nullptr) stops rumble");
+
+    // Lose a trigger start while the body motors succeed. Change the trigger level before retrying.
+    xbox.reject_triggers = true;
+    dev->SetRumbleState(&rumble);
+    rt::gameinput::poll();
+    rt::gameinput::OutputState delivered{};
+    check(rt::gameinput::output_state(0, &delivered) && delivered.low == 32768 && delivered.left == 0 &&
+              xbox.low == 32768 && xbox.left == 0, "a rejected trigger write leaves only the body motors delivered");
+    rumble.leftTrigger = 0.5f;
+    dev->SetRumbleState(&rumble);
+    xbox.reject_triggers = false;
+    Sleep(150);
+    rt::gameinput::poll();
+    check(xbox.left == 32768 && xbox.right == 49151, "trigger retry sends the latest request");
+
+    // Lose a body stop. No additional SetRumbleState call should be necessary to turn the motors off.
+    xbox.reject_body = true;
+    dev->SetRumbleState(nullptr);
+    rt::gameinput::poll();
+    check(rt::gameinput::output_state(0, &delivered) && delivered.low == 32768 && delivered.left == 0 &&
+              xbox.low == 32768 && xbox.left == 0, "a rejected body stop preserves its delivered state");
+    xbox.reject_body = false;
+    Sleep(150);
+    rt::gameinput::poll();
+    check(xbox.low == 0 && xbox.high == 0, "the body stop is retried without another title call");
 
     set_env("LEONIDA_RUMBLE", "0");
     rt::gameinput::reload_config();

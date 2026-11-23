@@ -65,6 +65,7 @@ constexpr uint32_t kButtonCount = SDL_GAMEPAD_BUTTON_COUNT;
 constexpr uint32_t kConnectedStatus = GameInputDeviceConnected | GameInputDeviceInputEnabled | GameInputDeviceOutputEnabled;
 constexpr Uint32 kRumbleDurationMs = 0xFFFF;  // SDL's maximum; refreshed well before it runs out
 constexpr uint64_t kRumbleRefreshUs = 20'000'000;
+constexpr uint64_t kRumbleRetryUs = 100'000;  // don't call a failing driver on every 2 ms poll
 constexpr uint64_t kBatteryRefreshUs = 1'000'000;
 constexpr int kDsEffectSize = 47;  // the DualSense effects block SDL_SendGamepadEffect forwards (SDL's DS5EffectsState_t)
 constexpr uint32_t kForceFeedbackMotors = 1;  // one per SDL haptic device: the wheel or stick it belongs to
@@ -299,6 +300,25 @@ struct Rumble {
     float low = 0, high = 0, left = 0, right = 0;
 };
 
+// Each SDL motor pair accepts or rejects a command independently. Only acknowledged levels count as sent.
+struct RumbleTiming {
+    uint64_t refresh_at = 0, retry_at = 0;
+
+    void apply(SDL_Gamepad* pad, decltype(&SDL_RumbleGamepad) send, uint64_t now, uint16_t a, uint16_t b,
+               uint16_t& sent_a, uint16_t& sent_b) {
+        if (now < retry_at) return;
+        if (a == sent_a && b == sent_b && (!(a || b) || now < refresh_at)) return;
+        if (!send(pad, a, b, kRumbleDurationMs)) {
+            retry_at = now + kRumbleRetryUs;
+            return;
+        }
+        sent_a = a;
+        sent_b = b;
+        retry_at = 0;
+        refresh_at = now + kRumbleRefreshUs;
+    }
+};
+
 // GameInput -1..1 magnitudes and 0..1 saturations against SDL's levels and saturations.
 Sint16 hlevel(float v) { return static_cast<Sint16>(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767.0f)); }
 Uint16 hsat(float v) { return static_cast<Uint16>(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f)); }
@@ -526,7 +546,8 @@ public:
     leonida::InputFamily family = leonida::InputFamily::Xbox;  // what kind of device it really is (active_input)
     Snapshot last_snap{};  // what the latest reading holds
     uint64_t last_reading_us = 0;  // for the motion cadence: readings stream at ~125 Hz on pads with sensors
-    uint64_t motors_sent_at = 0, triggers_sent_at = 0, battery_at = 0;
+    RumbleTiming body_rumble, trigger_rumble;
+    uint64_t battery_at = 0;
     bool ds_sent_once = false;
 
     // Raw HID (RT-175). hid is the backend's handle, null when the pad has no HID device the backend could open;
@@ -1402,7 +1423,9 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->sent.force_feedback = d->haptic != nullptr;
     d->sent.haptic_motors = d->haptic_motors;
     d->ds_sent_once = false;
-    d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
+    d->body_rumble = {};
+    d->trigger_rumble = {};
+    d->battery_at = 0;
     d->wanted = {};
     fill_info(d, p, id);
     open_raw(d, path);
@@ -1536,14 +1559,7 @@ void apply_output(Device* d, uint64_t now) {
     rt::gameinput::OutputState& o = d->sent;
 
     if (d->has_rumble) {
-        const uint16_t lo = to_u16(want.low), hi = to_u16(want.high);
-        const bool stale = (lo || hi) && now - d->motors_sent_at > kRumbleRefreshUs;
-        if (lo != o.low || hi != o.high || stale) {
-            SDL_RumbleGamepad(d->pad, lo, hi, kRumbleDurationMs);
-            o.low = lo;
-            o.high = hi;
-            d->motors_sent_at = now;
-        }
+        d->body_rumble.apply(d->pad, SDL_RumbleGamepad, now, to_u16(want.low), to_u16(want.high), o.low, o.high);
     }
     if (d->is_dualsense) {
         // LEONIDA_DS_TRIGGERS=off leaves the triggers alone.
@@ -1564,14 +1580,8 @@ void apply_output(Device* d, uint64_t now) {
             }
         }
     } else if (d->has_trigger_rumble) {
-        const uint16_t l = to_u16(want.left), r = to_u16(want.right);
-        const bool stale = (l || r) && now - d->triggers_sent_at > kRumbleRefreshUs;
-        if (l != o.left || r != o.right || stale) {
-            SDL_RumbleGamepadTriggers(d->pad, l, r, kRumbleDurationMs);
-            o.left = l;
-            o.right = r;
-            d->triggers_sent_at = now;
-        }
+        d->trigger_rumble.apply(d->pad, SDL_RumbleGamepadTriggers, now, to_u16(want.left), to_u16(want.right),
+                                o.left, o.right);
     }
     apply_effects(d, now);
 }
