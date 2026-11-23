@@ -240,15 +240,20 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
                 if future.result() != digest:
                     problems[rel] = "CHANGED"
 
+    def print_result(kind: str, rel: str) -> None:
+        # Keep literal backslashes distinct from escapes added by stdout.
+        display_path = rel.replace("\\", "\\\\")
+        print(f"{kind:<10}{display_path}")
+
     # Print in manifest order, not completion order, so the report is identical for any --jobs.
     bad = 0
     for rel in want:
         kind = problems.get(rel)
         if kind:
-            print(f"{kind:<10}{rel}")
+            print_result(kind, rel)
             bad += 1
     for rel in sorted(set(have) - set(want)):
-        print(f"{'NEW':<10}{rel}")
+        print_result("NEW", rel)
     print("OK" if not bad else f"{bad} problem(s)")
     return 1 if bad else 0
 

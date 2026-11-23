@@ -394,6 +394,13 @@ class ManifestCliTest(unittest.TestCase):
         for name in names:
             os.unlink(os.path.join(self.pkg, name))
 
+        # A POSIX manifest can also name a file containing a literal backslash.
+        with open(self.out_manifest, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["files"][r"caf\xe9.bin"] = doc["files"][names[-1]]
+        with open(self.out_manifest, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f)
+
         launcher = (
             "import runpy, sys; sys.stdout.reconfigure(encoding='ascii'); "
             "runpy.run_path(sys.argv.pop(1), run_name='__main__')"
@@ -408,7 +415,8 @@ class ManifestCliTest(unittest.TestCase):
         self.assertEqual(verified.stdout.splitlines(), [
             r"MISSING   caf\xe8.bin",
             r"MISSING   caf\xe9.bin",
-            "2 problem(s)",
+            r"MISSING   caf\\xe9.bin",
+            "3 problem(s)",
         ])
 
     def test_cli_rejects_invalid_game_directories(self):
