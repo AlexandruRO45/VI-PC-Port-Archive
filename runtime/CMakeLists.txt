@@ -395,6 +395,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       FetchContent_MakeAvailable(SDL3)
     endif()
   endif()
+  if(NOT (LEONIDA_SDL3 AND TARGET SDL3::SDL3-static))
+    # Nothing served gameinput.dll in a build without SDL3, so the loader fell through to the host's gameinput.dll and
+    # that one answers GameInputCreate with a null interface the title dereferences. Keep the object identity honest.
+    target_sources(gta6rt PRIVATE shims/gameinput_no_sdl.cpp)
+    add_executable(gameinput_no_sdl_test
+      test/gameinput_no_sdl_test.cpp
+      shims/gameinput_no_sdl.cpp
+      shims/registry.cpp
+    )
+    target_include_directories(gameinput_no_sdl_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+    target_compile_definitions(gameinput_no_sdl_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(gameinput_no_sdl_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(gameinput_no_sdl_test PRIVATE /OPT:NOREF)
+  endif()
   if(LEONIDA_SDL3 AND TARGET SDL3::SDL3-static)
     target_sources(gta6rt PRIVATE shims/gameinput.cpp)
     target_link_libraries(gta6rt PRIVATE SDL3::SDL3-static)
@@ -1076,6 +1090,9 @@ if(BUILD_TESTING)
     target_compile_options(active_input_test PRIVATE /W4 /permissive- /utf-8)
   endif()
   add_test(NAME active_input COMMAND active_input_test)
+  if(WIN32 AND TARGET gameinput_no_sdl_test)
+    add_test(NAME gameinput_no_sdl COMMAND gameinput_no_sdl_test)
+  endif()
   if(WIN32 AND TARGET gameinput_test)
     add_test(NAME gameinput COMMAND gameinput_test)
   elseif(TARGET gta6rt)

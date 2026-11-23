@@ -2669,5 +2669,7 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
 
 SHIM_TABLE(gameinput,
     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+    // The retail executable imports this by ordinal 1, so the registry key is "#1" (docs/runtime_imports.md).
+    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
 );
