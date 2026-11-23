@@ -2208,6 +2208,17 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_swapchain_count_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_swapchain_count COMMAND dxgi_swapchain_count_test)
 
+    # The present sequences a first frame takes through the DXGI shim and the shipped tests do not: a window
+    # resize between creation and Present (no ResizeBuffers), a minimised/restored window, a swapchain created
+    # on a 0x0 window, ResizeBuffers while minimised, the waitable object and a buffer-count change. Host DXGI
+    # is compared live where it is safe to do so (a plain/minimised present, ResizeBuffers while minimised).
+    add_executable(present_risk_test test/present_risk_test.cpp)
+    target_link_libraries(present_risk_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(present_risk_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(present_risk_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME present_risk COMMAND present_risk_test)
+    set_tests_properties(present_risk PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
     # ExecuteIndirect with CountBuffer (vkCmdDrawIndirectCount) + optional BLAS/TLAS/RayQueryKHR GPU test.
     add_executable(d3d12_indirect_rt_test test/d3d12_indirect_rt_test.cpp)
     target_link_libraries(d3d12_indirect_rt_test PRIVATE gta6rt_d3d12_com)
