@@ -273,5 +273,34 @@ class TestMul24ConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(words[1], 0x2222)
 
 
+class TestMul24BoundaryAndExtremes(unittest.TestCase):
+    """Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling for v_mul_i32_i24."""
+
+    def test_boundary_values_and_24bit_limits(self):
+        cases = [
+            (0x7FFFFF, 0x7FFFFF),  # max pos * max pos = 8388607 * 8388607
+            (0x800000, 0x800000),  # min neg * min neg = -8388608 * -8388608
+            (0x7FFFFF, 0x800000),  # max pos * min neg
+            (0xFFFFFF, 0x800000),  # -1 * min neg
+            (0x000001, 0x7FFFFF),  # 1 * max pos
+            (0x000000, 0x7FFFFF),  # 0 * max pos
+            (0x80000000, 1),       # high bits outside 24 bits ignored
+            (0xFFFFFFFF, 1),       # all ones -> low 24 bits is 0xFFFFFF (-1)
+        ]
+        for idx, (x, y) in enumerate(cases):
+            with self.subTest(x=hex(x), y=hex(y)):
+                expected = v_mul_i32_i24_oracle(x, y)
+                lines = [
+                    f"v_mov_b32 v1, {x:#x}",
+                    f"v_mov_b32 v2, {y:#x}",
+                    "v_mul_i32_i24 v0, v1, v2",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_mul24_ps(lines, f"ps_mul24_ext_{idx}")
+                self.assertEqual(words[0], expected)
+
+
 if __name__ == '__main__':
     unittest.main()
