@@ -18,11 +18,14 @@ namespace lanterns {
 using Color = std::array<float, 4>;
 using d3d12test::Ref;
 
+constexpr DXGI_FORMAT kGbufferNormalFormat = DXGI_FORMAT_R10G10B10A2_UNORM, kGbufferDepthFormat = DXGI_FORMAT_R32_FLOAT;
+
 // The containers the guest hands to the pipelines, read from the folder fssm_pack.py wrote.
 struct Shaders {
     std::vector<std::uint8_t> vs, ps_lit, ps_floor, unknown_vs, rebuilt_vs, vs_w64, ps_lit_w64, cs_rise;
     std::vector<std::uint8_t> ps_tex_floor, ps_tex_solid;   // stage 6: they replace ps_floor and ps_lit
     std::vector<std::uint8_t> ps_shadow;                    // stage 8: replaces both
+    std::vector<std::uint8_t> vs_gbuf, ps_gbuf;             // stage 9: replace vs and both pixel shaders
 };
 // stage 1: graphics only; 3 and 5: plus cs_lanterns_rise; 6: plus the textured pixel shaders; 8: plus the shadow
 // pixel shader.
@@ -73,6 +76,10 @@ public:
     ID3D12Device* device() const { return device_.p; }
     ID3D12CommandQueue* queue() const { return queue_.p; }
     ID3D12Resource* target() const { return target_.p; }
+    // Stage 9 (create with R8G8B8A8_UNORM): the target is the G-buffer's albedo; these are its normal and view depth,
+    // left in NON_PIXEL_SHADER_RESOURCE after each frame.
+    ID3D12Resource* gbuffer_normal() const { return gbuffer_normal_.p; }
+    ID3D12Resource* gbuffer_depth() const { return gbuffer_depth_.p; }
 
 private:
     bool create_pipelines(const Shaders& shaders);
@@ -90,7 +97,8 @@ private:
     Ref<ID3D12PipelineState> pso_[2][2];   // [floor][depth test]
     Ref<ID3D12PipelineState> pso_w64_[2];  // [depth test]: the wave64 pair, for the draws marked wave64
     Ref<ID3D12PipelineState> compute_pso_;
-    Ref<ID3D12Resource> shadow_map_;
+    Ref<ID3D12Resource> shadow_map_, gbuffer_normal_, gbuffer_depth_;
+    bool gbuffer_ = false, gbuffer_written_ = false;
     std::vector<std::uint8_t> vs_;
     Ref<ID3D12PipelineState> shadow_pso_;
     D3D12_CPU_DESCRIPTOR_HANDLE shadow_dsv_{};

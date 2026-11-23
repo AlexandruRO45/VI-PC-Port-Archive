@@ -56,6 +56,11 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     out.ps_lit_w64 = read_file(dir / "ps_lanterns_lit_w64.dxbc");
     CHECK(out.vs.size() > 64 && out.ps_lit.size() > 64 && out.ps_floor.size() > 64);
     CHECK(out.vs_w64.size() > 64 && out.ps_lit_w64.size() > 64);
+    if (stage == 9) {
+        out.vs_gbuf = read_file(dir / "vs_lanterns_gbuf.dxbc");
+        out.ps_gbuf = read_file(dir / "ps_lanterns_gbuf.dxbc");
+        CHECK(out.vs_gbuf.size() > 64 && out.ps_gbuf.size() > 64);
+    }
     if (stage == 8) {
         out.ps_shadow = read_file(dir / "ps_lanterns_shadow.dxbc");
         CHECK(out.ps_shadow.size() > 64);
@@ -86,7 +91,8 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
 }
 
 bool Gpu::create(const Scene& scene, const Shaders& shaders, DXGI_FORMAT target_format) {
-    CHECK(target_format == DXGI_FORMAT_R32G32B32A32_FLOAT || target_format == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    CHECK(target_format == DXGI_FORMAT_R32G32B32A32_FLOAT || target_format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+          (target_format == DXGI_FORMAT_R8G8B8A8_UNORM && !shaders.ps_gbuf.empty()));
     target_format_ = target_format;
     const std::uint32_t device_params[24] = {};
     const IID device_iid = __uuidof(ID3D12Device);
@@ -98,6 +104,7 @@ bool Gpu::create(const Scene& scene, const Shaders& shaders, DXGI_FORMAT target_
     compute_ = !shaders.cs_rise.empty();
     textured_ = !shaders.ps_tex_floor.empty() && !shaders.ps_tex_solid.empty();
     shadow_ = !shaders.ps_shadow.empty();
+    gbuffer_ = !shaders.ps_gbuf.empty();
     if (shadow_) vs_ = shaders.vs;   // the depth pass's pipeline (create_shadow) uses it too
     geometry_ = flatten(scene);
     CHECK(create_pipelines(shaders));
@@ -148,8 +155,9 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root_.p;
-    desc.VS = {shaders.vs.data(), shaders.vs.size()};
-    desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.VS = gbuffer_ ? D3D12_SHADER_BYTECODE{shaders.vs_gbuf.data(), shaders.vs_gbuf.size()}
+                       : D3D12_SHADER_BYTECODE{shaders.vs.data(), shaders.vs.size()};
+    for (auto& target : desc.BlendState.RenderTarget) target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = 0xffffffff;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
@@ -157,26 +165,30 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1;
+    desc.NumRenderTargets = gbuffer_ ? 3 : 1;
     desc.RTVFormats[0] = target_format_;
+    desc.RTVFormats[1] = kGbufferNormalFormat;   // stage 9's G-buffer: albedo (the target), normal, view depth
+    desc.RTVFormats[2] = kGbufferDepthFormat;
+    if (!gbuffer_) desc.RTVFormats[1] = desc.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     desc.SampleDesc.Count = 1;
     for (int floor = 0; floor < 2; ++floor)
         for (int depth = 0; depth < 2; ++depth) {
-            const auto& ps = shadow_     ? shaders.ps_shadow
+            const auto& ps = gbuffer_    ? shaders.ps_gbuf
+                             : shadow_     ? shaders.ps_shadow
                              : textured_ ? (floor ? shaders.ps_tex_floor : shaders.ps_tex_solid)
                                          : (floor ? shaders.ps_floor : shaders.ps_lit);
             desc.PS = {ps.data(), ps.size()};
             desc.DepthStencilState.DepthEnable = depth ? TRUE : FALSE;
             CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_[floor][depth].p))));
-            if (floor) continue;
+            if (floor || gbuffer_) continue;   // the G-buffer pass has its own VS and PS for every draw
             // The wave64 pair, for the draws marked wave64: vs_lanterns_w64, and ps_lanterns_lit_w64 where the solids
             // use ps_lanterns_lit (another stage's pixel shader stays as it is).
             const auto& ps64 = &ps == &shaders.ps_lit ? shaders.ps_lit_w64 : ps;
             desc.VS = {shaders.vs_w64.data(), shaders.vs_w64.size()};
             desc.PS = {ps64.data(), ps64.size()};
             CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso_w64_[depth].p))));
-            desc.VS = {shaders.vs.data(), shaders.vs.size()};
+            desc.VS = {shaders.vs.data(), shaders.vs.size()};   // not the G-buffer pass: it skipped the pair
         }
     // The lookup control: the guest's own container of the VS program must give a pipeline, and the same writer's
     // container with one name byte changed must be refused, so the refusal can only come from the lookup.
@@ -257,6 +269,16 @@ bool Gpu::create_resources(const Scene& scene) {
     tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     CHECK(SUCCEEDED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
                                                      D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&target_.p))));
+    if (gbuffer_) {
+        tex.Format = kGbufferNormalFormat;
+        CHECK(SUCCEEDED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&gbuffer_normal_.p))));
+        tex.Format = kGbufferDepthFormat;
+        CHECK(SUCCEEDED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
+                                                         D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                         IID_PPV_ARGS(&gbuffer_depth_.p))));
+    }
     tex.Format = DXGI_FORMAT_D32_FLOAT;
     tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE depth_clear{};
@@ -270,13 +292,18 @@ bool Gpu::create_resources(const Scene& scene) {
                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv_heap_.p))));
     CHECK(scene.meshes.size() + scene.draws.size() + kComputeSlots + 2 <= 32);
-    const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv_heap_.p))));
     const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&dsv_desc, IID_PPV_ARGS(&dsv_heap_.p))));
     rtv_ = {SIZE_T(heap_cpu(rtv_heap_.p))};
     dsv_ = {SIZE_T(heap_cpu(dsv_heap_.p))};
     device_->CreateRenderTargetView(target_.p, nullptr, rtv_);
+    if (gbuffer_) {
+        const UINT step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        device_->CreateRenderTargetView(gbuffer_normal_.p, nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{rtv_.ptr + step});
+        device_->CreateRenderTargetView(gbuffer_depth_.p, nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{rtv_.ptr + 2 * step});
+    }
     device_->CreateDepthStencilView(depth_.p, nullptr, dsv_);
 
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -382,9 +409,22 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     if (compute_)
         before.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_COMMON,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+    if (gbuffer_) {   // the compute pass leaves them as shader resources; they start in COMMON
+        const auto from = gbuffer_written_ ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COMMON;
+        before.push_back(transition(gbuffer_normal_.p, from, D3D12_RESOURCE_STATE_RENDER_TARGET));
+        before.push_back(transition(gbuffer_depth_.p, from, D3D12_RESOURCE_STATE_RENDER_TARGET));
+        gbuffer_written_ = true;
+    }
     list_->ResourceBarrier(UINT(before.size()), before.data());
     if (shadow_) record_shadow_pass(scene);
-    list_->ClearRenderTargetView(rtv_, kClear.data(), 0, nullptr);
+    if (gbuffer_) {   // albedo 0, normal 0, view depth 0 (no geometry: the compute pass writes the background)
+        const float zero[4] = {0, 0, 0, 0};
+        const UINT step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        for (UINT k = 0; k < 3; ++k)
+            list_->ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE{rtv_.ptr + k * step}, zero, 0, nullptr);
+    } else {
+        list_->ClearRenderTargetView(rtv_, kClear.data(), 0, nullptr);
+    }
     list_->ClearDepthStencilView(dsv_, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
     list_->SetGraphicsRootSignature(root_.p);
     ID3D12DescriptorHeap* heaps[] = {srv_heap_.p, sampler_heap_.p};
@@ -403,12 +443,12 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     const D3D12_RECT scissor{0, 0, LONG(kWidth), LONG(kHeight)};
     list_->RSSetViewports(1, &viewport);
     list_->RSSetScissorRects(1, &scissor);
-    list_->OMSetRenderTargets(1, &rtv_, FALSE, &dsv_);
+    list_->OMSetRenderTargets(gbuffer_ ? 3 : 1, &rtv_, TRUE, &dsv_);   // one contiguous range of RTVs
     list_->SetGraphicsRootConstantBufferView(3, upload_->GetGPUVirtualAddress() + upload_cbv_);
     for (std::size_t d = 0; d < scene.draws.size(); ++d) {
         const Draw& draw = scene.draws[d];
         if (draw.hidden) continue;
-        list_->SetPipelineState(draw.wave64 && !draw.floor ? pso_w64_[depth_test ? 1 : 0].p
+        list_->SetPipelineState(draw.wave64 && !draw.floor && !gbuffer_ ? pso_w64_[depth_test ? 1 : 0].p
                                                           : pso_[draw.floor ? 1 : 0][depth_test ? 1 : 0].p);
         bind_draw(scene, d);
         list_->DrawIndexedInstanced(geometry_.index_count[draw.mesh], UINT(draw.instances.size()),
@@ -416,6 +456,10 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
     }
     std::vector<D3D12_RESOURCE_BARRIER> to_copy = {
         transition(target_.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    if (gbuffer_)
+        for (ID3D12Resource* r : {gbuffer_normal_.p, gbuffer_depth_.p})
+            to_copy.push_back(transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
     if (compute_) {
         to_copy.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      D3D12_RESOURCE_STATE_COPY_SOURCE));
@@ -453,7 +497,12 @@ bool Gpu::finish_frame(std::vector<Color>& pixels, Readback* readback) {
     CHECK(SUCCEEDED(readback_->Map(0, nullptr, &mapped)));
     const auto* bytes = static_cast<const std::uint8_t*>(mapped);
     pixels.resize(std::size_t(kWidth) * kHeight);
-    if (target_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+    if (target_format_ == DXGI_FORMAT_R8G8B8A8_UNORM) {   // stage 9's albedo: code / 255
+        for (unsigned y = 0; y < kHeight; ++y)
+            for (unsigned x = 0; x < kWidth; ++x)
+                for (unsigned c = 0; c < 4; ++c)
+                    pixels[std::size_t(y) * kWidth + x][c] = float(bytes[y * kPitch + x * 4 + c]) / 255.0f;
+    } else if (target_format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) {
         for (unsigned y = 0; y < kHeight; ++y)
             for (unsigned x = 0; x < kWidth; ++x)
                 for (unsigned c = 0; c < 4; ++c) {

@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -45,6 +45,11 @@
 // and scales the face colour by the lit fraction (lanterns_shadow.h). Control: the map left cleared to 1 must change
 // exactly the pixels the reference says are shadowed.
 //
+// Stage 9: deferred lighting. A G-buffer pass writes three render targets (RGBA8 albedo, RGB10A2 normal, R32F view
+// depth); a compute pass, one 16x16 workgroup per tile, builds each tile's light list in LDS with atomics and shades
+// with 256 point lights in integers (lanterns_deferred.h). Controls: culling off must give the same image bit for bit;
+// one light moved must change exactly the pixels the reference predicts.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -56,6 +61,7 @@
 #include "lanterns_sampling.h"
 #include "lanterns_scene.h"
 #include "lanterns_shadow.h"
+#include "lanterns_deferred_gpu.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -487,6 +493,174 @@ int stage8(const std::filesystem::path& shader_dir, const std::filesystem::path&
     return 0;
 }
 
+// Stage 9: deferred lighting with tiled light culling (see the top of this file).
+int stage9(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    std::vector<std::uint8_t> tiled;
+    if (!lanterns::load_shaders(shader_dir, 9, shaders) || !lanterns::load_tiled_shader(shader_dir, tiled)) return 1;
+    const lanterns::Scene scene = lanterns::stage9();
+    const std::vector<lanterns::PointLight> lights = lanterns::make_lights();
+    // The control light: the one nearest (0, 0.5) on the floor, moved 0.875 to the right.
+    std::size_t moved_index = 0;
+    for (std::size_t i = 1; i < lights.size(); ++i)
+        if (std::hypot(lights[i].pos[0], lights[i].pos[2] - 0.5f) < std::hypot(lights[moved_index].pos[0], lights[moved_index].pos[2] - 0.5f))
+            moved_index = i;
+    std::vector<lanterns::PointLight> moved = lights;
+    moved[moved_index].pos[0] += 0.875f;
+    std::vector<Color> albedo;
+    std::vector<std::uint32_t> culled, all, shifted, counts, counts_all, counts_shifted, lists, lists_all, lists_shifted;
+    std::vector<std::uint32_t> normal_words;
+    std::vector<float> depth;
+    {
+        lanterns::Gpu gpu;
+        lanterns::Deferred deferred;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R8G8B8A8_UNORM) || !gpu.submit_frame(scene, true, 0) ||
+            !gpu.finish_frame(albedo) || !deferred.create(gpu, tiled) || !deferred.read_gbuffer(normal_words, depth))
+            return 1;
+        if (!deferred.run(lights, lanterns::deferred_constants(scene, 0), culled, counts, lists) ||
+            !deferred.run(lights, lanterns::deferred_constants(scene, 1), all, counts_all, lists_all) ||
+            !deferred.run(moved, lanterns::deferred_constants(scene, 0), shifted, counts_shifted, lists_shifted) ||
+            !gpu.idle())
+            return 1;
+    }
+    // Poison: every pixel word and tile count of every run, and every list entry below its tile's count, was written.
+    unsigned poisoned = 0;
+    for (const auto* v : {&culled, &all, &shifted, &counts, &counts_all, &counts_shifted})
+        for (std::uint32_t w : *v) poisoned += w == lanterns::kDeferredPoison;
+    // The exact light sets: each tile's list holds every light the CPU says it must keep, none it must not, none twice;
+    // with culling off, all 256.
+    const auto check_lists = [&](const std::vector<std::uint32_t>& cnt, const std::vector<std::uint32_t>& lst,
+                                 const std::vector<std::uint8_t>* states, unsigned& tiles_ok, unsigned& either) {
+        tiles_ok = either = 0;
+        for (std::size_t t = 0; t < cnt.size(); ++t) {
+            std::vector<std::uint8_t> seen(lanterns::kLights, 0);
+            bool ok = cnt[t] <= lanterns::kLights;
+            for (std::uint32_t j = 0; ok && j < cnt[t]; ++j) {
+                const std::uint32_t id = lst[t * lanterns::kLights + j];
+                ok = id < lanterns::kLights && !seen[id];
+                if (ok) seen[id] = 1;
+            }
+            for (unsigned l = 0; ok && l < lanterns::kLights; ++l) {
+                const std::uint8_t want = states ? (*states)[t * lanterns::kLights + l] : 1;
+                either += want == 2;
+                if (want != 2 && seen[l] != want) ok = false;
+            }
+            tiles_ok += ok;
+        }
+    };
+    const auto light_states = lanterns::tile_light_states(depth, lanterns::deferred_constants(scene, 0), lights);
+    const auto states_moved = lanterns::tile_light_states(depth, lanterns::deferred_constants(scene, 0), moved);
+    unsigned sets_ok = 0, sets_either = 0, sets_all_ok = 0, sets_moved_ok = 0, unused = 0;
+    check_lists(counts, lists, &light_states, sets_ok, sets_either);
+    check_lists(counts_all, lists_all, nullptr, sets_all_ok, unused);
+    check_lists(counts_shifted, lists_shifted, &states_moved, sets_moved_ok, unused);
+    // G-buffer probes: every certain pixel whose depth bounds are tight (no other surface may be in front), its three
+    // normal codes and its view depth within the bounds.
+    const auto gref = lanterns::gbuffer_reference(scene);
+    unsigned probes = 0, probes_ok = 0, beyond_fixed = 0;
+    double worst = 0;
+    for (std::size_t i = 0; i < depth.size(); ++i) {
+        const auto& b = gref.bounds[i];
+        if (!gref.certain[i] || !(b.lo[3] > 0) || b.hi[3] - b.lo[3] > 0.01 * b.lo[3]) continue;
+        ++probes;
+        bool ok = depth[i] >= b.lo[3] && depth[i] <= b.hi[3];
+        // The old fixed slack: a depth error above kPosSlack moves the rebuilt point by more than kPosSlack (the view
+        // ray's clip-w-1 direction is at least 1 long).
+        const double mid = (double(b.lo[3]) + b.hi[3]) / 2, half = (double(b.hi[3]) - b.lo[3]) / 2;
+        beyond_fixed += std::fabs(depth[i] - mid) > lanterns::kPosSlack;
+        worst = std::max(worst, std::fabs(depth[i] - mid) / half);
+        for (int k = 0; k < 3; ++k) {
+            const unsigned code = (normal_words[i] >> (10 * k)) & 1023u;
+            ok = ok && code >= unsigned(b.lo[k]) && code <= unsigned(b.hi[k]);
+        }
+        probes_ok += ok;
+        if (!ok && probes - probes_ok <= 5)
+            std::printf("lanterns: probe (%zu, %zu): depth %.7g want %.7g..%.7g; codes %u %u %u want [%g..%g] [%g..%g] [%g..%g]\n",
+                        i % lanterns::kWidth, i / lanterns::kWidth, double(depth[i]), double(b.lo[3]), double(b.hi[3]),
+                        normal_words[i] & 1023u, (normal_words[i] >> 10) & 1023u, (normal_words[i] >> 20) & 1023u,
+                        double(b.lo[0]), double(b.hi[0]), double(b.lo[1]), double(b.hi[1]), double(b.lo[2]), double(b.hi[2]));
+    }
+    const auto albedo_ref = lanterns::albedo_reference(scene);
+    const auto ref = lanterns::deferred_reference(scene, lights), ref_moved = lanterns::deferred_reference(scene, moved);
+    const std::vector<Color> frame = lanterns::unpack_rgba8(culled), frame_moved = lanterns::unpack_rgba8(shifted);
+    const lanterns::Comparison ca = lanterns::compare_textured(albedo, albedo_ref);
+    const lanterns::Comparison c = lanterns::compare_textured(frame, ref), cm = lanterns::compare_textured(frame_moved, ref_moved);
+    const auto single = [](const lanterns::TexturedReference& r, std::size_t i) {
+        return r.certain[i] && lanterns::detail::same(r.bounds[i].lo, r.bounds[i].hi);
+    };
+    unsigned exact = 0, singles = 0, expected = 0, changed = 0, kept_still = 0, still = 0, same_as_all = 0;
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        same_as_all += culled[i] == all[i];
+        if (!single(ref, i)) continue;
+        ++singles;
+        exact += lanterns::detail::same(frame[i], ref.bounds[i].lo);
+        if (!single(ref_moved, i)) continue;
+        if (!lanterns::detail::same(ref.bounds[i].lo, ref_moved.bounds[i].lo)) {
+            ++expected;
+            changed += culled[i] != shifted[i];
+        } else {
+            ++still;
+            kept_still += culled[i] == shifted[i];
+        }
+    }
+    std::uint64_t kept_total = 0;
+    unsigned kept_max = 0, empty_tiles = 0, all_full = 0;
+    for (std::size_t t = 0; t < counts.size(); ++t) {
+        kept_total += counts[t];
+        kept_max = std::max(kept_max, counts[t]);
+        empty_tiles += counts[t] == 0;
+        all_full += counts_all[t] == lanterns::kLights;
+    }
+    std::printf("lanterns: G-buffer albedo (RGBA8 MRT0): %u of %u certain pixels exact, %u of %u uncertain within bounds\n",
+                ca.certain_exact, ca.certain, ca.uncertain_plausible, ca.uncertain);
+    if (!ca.pass()) report("G-buffer albedo", ca);
+    std::printf("lanterns: lit frame: %u of %u single-colour pixels exact, %u of %u certain pixels within bounds, %u of "
+                "%u uncertain within bounds\n", exact, singles, c.certain_exact, c.certain, c.uncertain_plausible,
+                c.uncertain);
+    if (!c.pass()) report("lit frame", c);
+    std::printf("lanterns: tiled culling kept %.1f lights per tile on average (max %u of %u, %u empty tiles); culling "
+                "off: %u of %zu tiles listed every light, %u of %zu pixels identical to the culled frame\n",
+                double(kept_total) / double(counts.size()), kept_max, lanterns::kLights, empty_tiles, all_full,
+                counts.size(), same_as_all, frame.size());
+    std::printf("lanterns: depth slack: %u probes are off by more than the old fixed kPosSlack (%.0e), the largest error "
+                "is %.2f of its gradient slack, which the lighting and ray references now use\n", beyond_fixed,
+                lanterns::kPosSlack, worst);
+    std::printf("lanterns: G-buffer probes: %u of %u certain pixels with the expected 10-bit normal codes and view depth "
+                "(within the edge slack); exact light sets: %u of %zu tiles (%u light-tile pairs within 2e-3 of the box test either way), "
+                "culling off %u of %zu tiles with all 256 once, moved light %u of %zu; %u poisoned words left\n",
+                probes_ok, probes, sets_ok, counts.size(), sets_either, sets_all_ok, counts.size(), sets_moved_ok,
+                counts.size(), poisoned);
+    std::printf("lanterns: control, light %zu moved 0.875 right: %u of %u predicted pixels changed, %u of %u pixels "
+                "predicted unchanged kept; moved frame %u of %u certain pixels within its bounds\n", moved_index,
+                changed, expected, kept_still, still, cm.certain_exact, cm.certain);
+    if (!cm.pass()) report("moved-light frame", cm);
+    lanterns::Reference shown;
+    shown.color.resize(frame.size());
+    shown.candidates.resize(frame.size());
+    std::vector<std::uint8_t> states(frame.size());
+    for (std::size_t i = 0; i < frame.size(); ++i) {
+        for (int k = 0; k < 4; ++k) shown.color[i][k] = (ref.bounds[i].lo[k] + ref.bounds[i].hi[k]) / 2;
+        states[i] = !lanterns::within(frame[i], ref.bounds[i]) ? 2 : single(ref, i) ? 3 : 1;
+    }
+    if (!dump(out_dir, "stage9-frame", frame, shown, &states) || !dump(out_dir, "stage9-moved", frame_moved, shown, &states) ||
+        !dump(out_dir, "stage9-albedo", albedo, shown))
+        return 1;
+    if (!ca.pass() || !c.pass() || !cm.pass() || exact != singles || same_as_all != frame.size() ||
+        all_full != counts.size() || poisoned || probes < 50000 || worst > 0.5 || probes_ok != probes || sets_ok != counts.size() ||
+        sets_all_ok != counts.size() || sets_moved_ok != counts.size() || expected < 500 || changed != expected || kept_still != still ||
+        kept_total >= std::uint64_t(lanterns::kLights) * counts.size() / 2) {
+        std::fprintf(stderr, "lanterns: stage 9 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo %u of %u exact, RGB10A2 normal and R32F depth "
+                "%u of %u probes), %u of %u single-colour pixels exact through tiled culling with LDS atomics (%.1f of "
+                "256 lights per tile, the exact set in %u of %zu tiles), culling off gave the same image bit for bit "
+                "from poisoned buffers, one light moved changed %u of %u predicted pixels\n",
+                ca.certain_exact, ca.certain, probes_ok, probes, exact, singles,
+                double(kept_total) / double(counts.size()), sets_ok, counts.size(), changed, expected);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -508,8 +682,9 @@ int main(int argc, char** argv) {
     case 5: return stage5(shader_dir, out_dir);
     case 6: return stage6(shader_dir, out_dir);
     case 8: return stage8(shader_dir, out_dir);
+    case 9: return stage9(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

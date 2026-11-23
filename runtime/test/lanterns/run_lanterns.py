@@ -36,6 +36,7 @@ folder:
            down) | where the control left the frame's bounds (red, as predicted)
   stage 8: the shadowed frame; sheet: frame | the middle of its reference bounds / the control (map cleared to far) |
            the control's mask against its own all-lit reference (grey exact, yellow bounded, red outside)
+  stage 9: the lit frame; sheet: frame | reference / the G-buffer albedo | mask / one light moved | frame
 """
 import argparse
 import array
@@ -60,6 +61,7 @@ FACTORY = re.compile(r"^\[rt\] d3d12_xs: D3D12XboxCreateDevice -> proxy (0[xX])?
 # Each stage's PASS line, whole, and what its numbers must satisfy. A line that only starts right ("Lanterns stage 1:
 # PASS, nonsense") or whose counts do not fit together does not count.
 N = r"(\d+)"
+F = r"(\d+\.\d+)"   # a count printed with decimals
 PASS_LINES = {
     1: (rf"Lanterns stage 1: PASS, {N} of 98304 pixels exact, {N} edge pixels plausible, depth-off control changed "
         rf"{N} pixels; shared edges through a wave64 VS/PS with the title's s8 table: {N} of 98304 pixels exact, {N} "
@@ -77,6 +79,12 @@ PASS_LINES = {
     8: (rf"Lanterns stage 8: PASS, {N} of {N} single-colour pixels exact and {N} of {N} certain pixels within bounds "
         rf"\(D32 shadow map, PSO depth bias, 2x2 PCF with comparison samples\), the map cleared to far changed {N} "
         rf"pixels as predicted", lambda a, b, c, d, moved: a == b and c == d and moved >= 1000),
+    9: (rf"Lanterns stage 9: PASS, G-buffer of 3 MRTs \(RGBA8 albedo {N} of {N} exact, RGB10A2 normal and R32F depth "
+        rf"{N} of {N} probes\), {N} of {N} single-colour pixels exact through tiled culling with LDS atomics \({F} of "
+        rf"256 lights per tile, the exact set in {N} of {N} tiles\), culling off gave the same image bit for bit "
+        rf"from poisoned buffers, one light moved changed {N} of {N} predicted pixels",
+        lambda a, b, p, q, s, t, per_tile, sets, tiles, moved, predicted: a == b and p == q and q >= 50000
+        and s == t and per_tile < 128 and sets == tiles and moved == predicted and predicted >= 500),
 }
 
 
@@ -96,7 +104,7 @@ def check_transcript(stage, exit_code, stdout, stderr):
     else:
         pattern, fits = PASS_LINES[stage]
         whole = re.fullmatch(pattern, found[0])
-        if not whole or not fits(*map(int, whole.groups())):
+        if not whole or not fits(*(float(g) if "." in g else int(g) for g in whole.groups())):
             failures.append(f"the PASS line is not stage {stage}'s line with numbers that fit: {found[0]!r}")
     if not FACTORY.search(stderr) and not FACTORY.search(stdout):
         failures.append("no line shows D3D12XboxCreateDevice returning the shim's Vulkan device")
@@ -312,6 +320,9 @@ PANELS = {
         "sheet": [["stage6-frame.gpu", "stage6-frame.ref"], ["stage6-control.gpu", "stage6-control:mask"]]},
     8: {"main": [["stage8-frame.gpu"]],
         "sheet": [["stage8-frame.gpu", "stage8-frame.ref"], ["stage8-control.gpu", "stage8-control:mask"]]},
+    9: {"main": [["stage9-frame.gpu"]],
+        "sheet": [["stage9-frame.gpu", "stage9-frame.ref"], ["stage9-albedo.gpu", "stage9-frame:mask"],
+                  ["stage9-moved.gpu", "stage9-frame.gpu"]]},
 }
 
 

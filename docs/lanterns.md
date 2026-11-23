@@ -45,6 +45,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [5](#stage-5-an-fp16-target-and-a-bloom-post-process) | An fp16 target, then a bloom whose waves share LDS across an `s_barrier` | Skipping the blur changes the predicted pixels |
 | [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
 | [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
+| [9](#stage-9-deferred-lighting-with-tiled-light-culling) | A G-buffer of three render targets, then 256 point lights culled per 16x16 tile in LDS | One light moved changes the predicted pixels; culling off gives the same image |
 
 ## Stage 1
 
@@ -238,6 +239,33 @@ casters leaves the map cleared to 1, and that must change exactly the pixels the
 
 ```
 Lanterns stage 8: PASS, 95699 of 95699 single-colour pixels exact and 98144 of 98144 certain pixels within bounds (D32 shadow map, PSO depth bias, 2x2 PCF with comparison samples), the map cleared to far changed 9539 pixels as predicted
+```
+
+## Stage 9: deferred lighting with tiled light culling
+
+The stage-1 scene drawn into a G-buffer of three render targets in one pass: `R8G8B8A8_UNORM` albedo, `R10G10B10A2_UNORM`
+normal and `R32_FLOAT` view depth. `vs_lanterns_gbuf` exports each face's normal, packed into its vertices' shade word
+as an exact integer float, and `ps_lanterns_gbuf` unpacks it with `v_bfe`. Then `cs_lanterns_tiled` runs one 256-lane
+workgroup (eight wave32 waves) per 16x16 tile:
+
+- each lane rebuilds its pixel's world position from the view depth and folds it into the tile's box in LDS with
+  `ds_min_i32`/`ds_max_i32` on order-preserving float keys;
+- lane i tests light i's sphere against the box, and a kept light takes a list slot with `ds_add_rtn_u32`;
+- every lane loops over the list and adds each light's contribution in integers.
+
+How the check works. `lanterns_deferred.h` holds the lights, the root constants and the CPU reference. Each light's
+contribution is an interval, because the rebuilt position is known only within the depth's snapping slack.
+
+- The albedo target must be exact on every certain pixel; probes of the normal codes and the view depth must be within
+  their bounds (D3D12 lets a float-to-UNORM conversion be off by 0.6 ULP).
+- Every single-colour pixel of the lit frame must be exact, every other certain pixel within its bounds.
+- Each tile's list must be exactly the set of lights whose sphere meets its box.
+- The output and list buffers start poisoned, and with culling off (every light in every tile) the image must be the
+  same bit for bit.
+- Control: one light moved must change exactly the pixels the reference predicts and keep every other pixel.
+
+```
+Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo 98144 of 98144 exact, RGB10A2 normal and R32F depth 52643 of 52643 probes), 75462 of 75462 single-colour pixels exact through tiled culling with LDS atomics (10.4 of 256 lights per tile, the exact set in 384 of 384 tiles), culling off gave the same image bit for bit from poisoned buffers, one light moved changed 1231 of 1231 predicted pixels
 ```
 
 ## Build and run

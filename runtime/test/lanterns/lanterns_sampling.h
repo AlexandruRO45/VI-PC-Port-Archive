@@ -144,12 +144,12 @@ struct TexturedReference {
 // Per pixel: the bounds of the nearest certainly covering fragment, widened by every fragment that may be nearer
 // (within its depth tolerance) or may cover instead; the clear colour where nothing certainly covers. Each fragment's
 // colors[0] and colors[1] are its lower and upper bounds.
-inline TexturedReference resolve_bounds(const std::vector<std::vector<detail::Fragment>>& frags) {
+inline TexturedReference resolve_bounds(const std::vector<std::vector<detail::Fragment>>& frags,
+                                        const Color& clear = Color{kClear[0], kClear[1], kClear[2], kClear[3]}) {
     TexturedReference ref;
     ref.bounds.resize(frags.size());
     ref.certain.resize(frags.size());
     ref.others.resize(frags.size());
-    const Color clear{kClear[0], kClear[1], kClear[2], kClear[3]};
     for (std::size_t i = 0; i < frags.size(); ++i) {
         // The nearest cover (detail::covers): a certain fragment, or two faces of one solid sharing the edge the
         // centre is near. The clear colour only where nothing covers.

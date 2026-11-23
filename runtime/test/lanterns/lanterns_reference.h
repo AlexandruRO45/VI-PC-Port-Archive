@@ -132,6 +132,7 @@ struct PixelSite {
     Color lit;            // the face colour vs_lanterns.asm exports (flat)
     double px, py;        // the pixel centre
     std::function<void(double, double, double[3])> world;
+    float shade = 0;      // the face's vertex shade word (stage 9: its packed normal)
 };
 
 namespace detail {
@@ -223,7 +224,7 @@ std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, un
                             f.edge = {p.x, p.y, q.x, q.y};
                             f.side = cross(q.x - p.x, q.y - p.y, cx - p.x, cy - p.y) > 0 ? 1 : -1;
                         }
-                        shade(PixelSite{&draw, &inst, lit, px, py, world_at}, f);
+                        shade(PixelSite{&draw, &inst, lit, px, py, world_at, mesh.vertices[face.v[0]].shade}, f);
                         frags[std::size_t(y) * width + x].push_back(f);
                     }
             }
