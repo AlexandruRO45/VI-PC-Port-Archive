@@ -129,6 +129,16 @@ class Api(unittest.TestCase):
         self.assertEqual(weak.weak_parts, ["CPU", "GPU", "RAM"])
         self.assertEqual(c.check("Mystery", *self.GOOD[1:]).verdict, pc.UNKNOWN)
 
+    def test_ram_type_display_in_check(self):
+        c = pc.SpecChecker(XBOX)
+        rep = c.check("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32, ram_type="DDR5")
+        ram_check = [ch for ch in rep.checks if ch.component == "RAM"][0]
+        self.assertEqual(ram_check.detected, "32 GB DDR5")
+
+    def test_detect_ram_type_smbios(self):
+        self.assertEqual(pc.SMBIOS_MEMORY_TYPES[26], "DDR4")
+        self.assertEqual(pc.SMBIOS_MEMORY_TYPES[34], "DDR5")
+
     def test_as_dict_is_json(self):
         import json
         d = pc.SpecChecker().check(*self.WEAK).as_dict()

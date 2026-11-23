@@ -361,19 +361,20 @@ def _join(items):
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
-def evaluate(profile_name: str, cpu: str, gpu: str, ram):
+def evaluate(profile_name: str, cpu: str, gpu: str, ram, ram_type: str | None = None):
     """Compare the hardware with a profile. Returns (headline, subtitle, rows)."""
     p = PROFILES[profile_name]
     cs = [cpu_score(n) for n in p["cpu_ref"]]
     gs = [gpu_score(n) for n in p["gpu_ref"]]
     cpu_s, cpu_exact = cpu_lookup(cpu)
     gpu_s, gpu_exact = gpu_lookup(gpu)
+    ram_display = f"{ram} GB {ram_type}" if (ram and ram_type) else (f"{ram} GB" if ram else "")
     rows = [
         ("CPU", _judge(cpu_s, min(cs), max(cs), CPU_TOL), p["cpu_text"], cpu.strip(),
          cpu_s is not None and not cpu_exact),
         ("GPU", _judge(gpu_s, min(gs), max(gs), GPU_TOL), p["gpu_text"], gpu.strip(),
          gpu_s is not None and not gpu_exact),
-        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], f"{ram} GB" if ram else "", False),
+        ("RAM", _judge_ram(ram, p["ram"]), p["ram_text"], ram_display, False),
     ]
     weak = [r[0] for r in rows if r[1] == BELOW]
     unknown = [r[3] or r[0] for r in rows if r[1] == UNKNOWN]
@@ -547,6 +548,39 @@ def _total_ram_bytes():
         return None
 
 
+# DMTF SMBIOS 3.1+ specification memory types (Type 17)
+SMBIOS_MEMORY_TYPES = {
+    24: "DDR3",
+    26: "DDR4",
+    29: "LPDDR3",
+    30: "LPDDR4",
+    34: "DDR5",
+    35: "LPDDR5",
+}
+
+
+def detect_ram_type() -> str | None:
+    """Detect the system RAM generation (e.g. 'DDR4', 'DDR5')."""
+    if sys.platform == "win32":
+        out = _run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_PhysicalMemory | Select-Object -ExpandProperty SMBIOSMemoryType"])
+        if not out:
+            out = _run(["wmic", "memorychip", "get", "SMBIOSMemoryType"])
+        types = set()
+        for tok in out.split():
+            try:
+                code = int(tok)
+                if code in SMBIOS_MEMORY_TYPES:
+                    types.add(SMBIOS_MEMORY_TYPES[code])
+            except ValueError:
+                pass
+        if len(types) == 1:
+            return next(iter(types))
+        if len(types) > 1:
+            return "/".join(sorted(types))
+    return None
+
+
 def detect_ram_gb():
     total = _total_ram_bytes()
     if not total:
@@ -571,7 +605,7 @@ def detect_all() -> dict:
         gpu = clean_name(best[1])
         if best[2]:
             gpu += f" ({best[2]} GB VRAM)"
-    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb()}
+    return {"cpu": detect_cpu(), "gpu": gpu, "ram": detect_ram_gb(), "ram_type": detect_ram_type()}
 
 
 # ----------------------------------------------------------------------------
@@ -632,14 +666,16 @@ class SpecChecker:
         if self.profile not in PROFILES:
             raise ValueError(f"unknown profile {self.profile!r}; use one of {list(PROFILES)}")
 
-    def check(self, cpu=None, gpu=None, ram=None) -> Report:
+    def check(self, cpu=None, gpu=None, ram=None, ram_type=None) -> Report:
         """Anything left as None is detected from this PC."""
         if cpu is None or gpu is None or ram is None:
             info = detect_all()
             cpu = info["cpu"] if cpu is None else cpu
             gpu = info["gpu"] if gpu is None else gpu
             ram = info["ram"] if ram is None else ram
-        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram)
+            if ram_type is None:
+                ram_type = info.get("ram_type")
+        headline, summary, rows = evaluate(self.profile, cpu, gpu, ram, ram_type)
         return Report(self.profile, headline, summary, [Check(*r) for r in rows])
 
     def warn_if_weak(self, report=None) -> bool:
@@ -931,7 +967,7 @@ def _pick_profile(n: int) -> str:
 def run_check(args) -> int:
     """No window. Exit code: 0 good, 1 weak, 2 unknown, 3 player declined (--warn)."""
     checker = SpecChecker(_pick_profile(args.profile))
-    report = checker.check(args.cpu, args.gpu, args.ram)
+    report = checker.check(args.cpu, args.gpu, args.ram, getattr(args, "ram_type", None))
     print(json.dumps(report.as_dict(), indent=2) if args.json else report.as_text())
     if args.warn and not checker.warn_if_weak(report):
         return 3
@@ -944,8 +980,10 @@ def run_cli(args):
     cpu = args.cpu or info.get("cpu", "")
     gpu = args.gpu or info.get("gpu", "")
     ram = args.ram or info.get("ram")
-    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram or '?'} GB\n")
-    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram)))
+    ram_type = getattr(args, "ram_type", None) or info.get("ram_type")
+    ram_str = f"{ram or '?'} GB{' ' + ram_type if ram_type else ''}"
+    print(f"PC -> CPU: {cpu or '?'} | GPU: {gpu or '?'} | RAM: {ram_str}\n")
+    print(result_as_text(profile, *evaluate(profile, cpu, gpu, ram, ram_type)))
 
 
 def main():
@@ -956,6 +994,7 @@ def main():
     ap.add_argument("--cpu", help="override the detected CPU")
     ap.add_argument("--gpu", help="override the detected GPU")
     ap.add_argument("--ram", type=int, help="override the detected RAM, in GB")
+    ap.add_argument("--ram-type", help="override detected RAM generation (e.g. DDR4, DDR5)")
     ap.add_argument("--check", action="store_true",
                     help="no window; exit code 0 good, 1 weak, 2 unknown (3 with --warn if declined)")
     ap.add_argument("--json", action="store_true", help="with --check: print JSON")
