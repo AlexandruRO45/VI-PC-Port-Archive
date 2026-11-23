@@ -7,6 +7,7 @@
 Each run renders offscreen in a fresh process and write overlay. Without --out the runs go to a temporary folder that is removed
 afterwards. The summary is printed first, and on failure the last run's log tails are printed too. Audio stays offline
 unless --play-audio sets LEONIDA_SCENE_AUDIO=winmm. The guest then plays the pulse synchronously with PlaySoundW.
+Its audio record distinguishes successful playback, unavailable WinMM and a failed PlaySoundW call.
 --negative-controls also runs a corrupted scene.bin and a corrupted checkpoint.bin, and each one must exit with 1.
 Exit code 0 means every check passed, 1 means a check failed and 2 means bad arguments.
 """
@@ -170,6 +171,9 @@ def check_audio(mode_dir: Path, has_event: bool, play_audio: bool) -> dict:
     check(playback in PLAYBACK, f"{name}: invalid playback result {playback}")
     if play_audio:
         check(playback in (1, 3), f"{name}: WinMM playback was not attempted")
+        # play() leaves mm at 0 for success or an unavailable DLL/export; PlaySoundW failure sets MMSYSERR_ERROR.
+        check(mmresult == 0 or (playback == 3 and mmresult == 1),
+              f"{name}: inconsistent playback {playback}, MMRESULT {mmresult}")
     else:
         check(playback == 0 and mmresult == 0, f"{name}: offline run reports playback {playback}, MMRESULT {mmresult}")
     return {"event": "event.wav", "frame": words[3], "peak": peak, "pcm_fnv32": f"{words[6]:08x}",

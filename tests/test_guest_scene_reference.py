@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import wave
 
 
 path = Path(__file__).resolve().parents[1] / "scripts" / "run_guest_scene.py"
@@ -40,6 +41,26 @@ class GuestSceneReferenceTest(unittest.TestCase):
         self.assertEqual(samples[550:600], (-9000,) * 50)
         self.assertEqual(samples[-1], 0)
 
+
+    def test_audio_record_matches_winmm_outcome(self):
+        pcm = runner.expected_pcm(9000)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with wave.open(str(root / "event.wav"), "wb") as wav:
+                wav.setparams((1, 2, runner.AUDIO_RATE, 0, "NONE", "not compressed"))
+                wav.writeframes(pcm)
+            for playback, error, valid in ((1, 0, True), (3, 0, True), (3, 1, True),
+                                           (1, 1, False), (3, 2, False)):
+                with self.subTest(playback=playback, error=error):
+                    record = struct.pack("<4s8I", b"LSAU", runner.VERSION, 10, runner.A_FRAMES[0],
+                                         runner.AUDIO_RATE, runner.AUDIO_SAMPLES, runner.fnv1a(pcm, 32), playback, error)
+                    (root / "audio.bin").write_bytes(record + struct.pack("<I", runner.fnv1a(record, 32)))
+                    if valid:
+                        result = runner.check_audio(root, has_event=True, play_audio=True)
+                        self.assertEqual((result["playback"], result["mmresult"]), (runner.PLAYBACK[playback], error))
+                    else:
+                        with self.assertRaisesRegex(runner.Fail, "MMRESULT"):
+                            runner.check_audio(root, has_event=True, play_audio=True)
 
     def test_redirected_cli_preserves_unicode_paths_and_guest_diagnostic(self):
         # Force strict redirected text streams even on UTF-8 hosts. Invoke the real CLI with a
