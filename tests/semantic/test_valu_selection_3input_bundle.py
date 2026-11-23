@@ -274,5 +274,18 @@ class VMed3F32OracleTests(unittest.TestCase):
         self.assertEqual(ref_med3_f32_bits(v1, v2, qnan), v1)
         self.assertEqual(ref_med3_f32_bits(qnan, v2, v1), v1)
 
+class VMed3F32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_med3_f32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_med3_f32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_med3_f32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": f32_to_bits(15.0), "v2": f32_to_bits(3.0), "v3": f32_to_bits(9.0)}
+        res = ref_med3_f32_bits(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertAlmostEqual(bits_to_f32(regs["v0"]), 9.0)
+
 if __name__ == "__main__":
     unittest.main()
