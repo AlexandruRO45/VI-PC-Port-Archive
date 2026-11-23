@@ -359,3 +359,35 @@ class TestQuadmaskB64ASTAndScalar(unittest.TestCase):
             "v_mov_b32 v0, s4",
         ])
         self.assertEqual(val_zero, 20)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b64 SIMD Divergence & 16-Quad Reduction
+# ------------------------------------------------------------------------------
+
+class TestQuadmaskB64SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        val_even, _ = run_shader_words("ps_qm64_even", [
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_mov_b32 s3, 0x0F0F0F0F",
+            "s_quadmask_b64 s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+        ])
+        val_odd, _ = run_shader_words("ps_qm64_odd", [
+            "s_mov_b32 s2, 0xF0F0F0F0",
+            "s_mov_b32 s3, 0xF0F0F0F0",
+            "s_quadmask_b64 s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(val_even, 0x5555)
+        self.assertEqual(val_odd, 0xAAAA)
+        self.assertEqual(val_even | val_odd, 0xFFFF)
+
+    def test_algebraic_reduction_properties_hardware(self):
+        val_hi_quad, _ = run_shader_words("ps_qm64_hi_quad", [
+            "s_mov_b32 s2, 0",
+            "s_mov_b32 s3, 0xF0000000",
+            "s_quadmask_b64 s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+        ])
+        self.assertEqual(val_hi_quad, 0x8000)
