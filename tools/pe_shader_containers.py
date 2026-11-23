@@ -21,6 +21,7 @@ next step can be `fssm_unpack.py <DIR>`: nothing is extracted unless asked for, 
 data that must stay in the user's work folder, never in the repository. Nothing here prints shader bytes.
 
 Standard library only; reads files, never runs them.
+Extract paths that alias an input image, the report, or a planned container are refused (exit 2).
 """
 
 from __future__ import annotations
