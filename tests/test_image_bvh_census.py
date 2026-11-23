@@ -12,9 +12,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import image_bvh_census as census  # noqa: E402
+import report_paths  # noqa: E402
 
 ENC = " ; encoding: [0x00,0x00,0x00,0x00]"      # only the length matters: every instruction is 4 bytes here
 
@@ -277,10 +279,55 @@ class SummaryTests(unittest.TestCase):
     def test_output_must_not_overwrite_a_listing(self):
         with tempfile.TemporaryDirectory() as src:
             self.directory(src, {"cs_tri": listing(CALL32, "s_endpgm")})
-            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-                census.main([src, "--out", os.path.join(src, "cs_tri.s")])
-            with open(os.path.join(src, "cs_tri.s"), encoding="utf-8") as f:
+            target = os.path.join(src, "cs_tri.s")
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                census.main([src, "--out", target])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input it scans", err.getvalue())
+            with open(target, encoding="utf-8") as f:
                 self.assertIn("image_bvh", f.read())
+
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(census.same_report_path, report_paths.same_report_path)
+
+    def test_out_same_as_source_rejected(self):
+        with tempfile.TemporaryDirectory() as src:
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    census.main([src, "--out", src])
+            self.assertNotEqual(cm.exception.code, 0)
+
+    def test_out_overwriting_carve_index_rejected(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            disasm = root / "dxbc" / "disasm"
+            disasm.mkdir(parents=True)
+            index = root / "dxbc" / "index.json"
+            index.write_text(json.dumps([{"file": "cs_tri.dxbc", "stage": "cs"}]), encoding="utf-8")
+            self.directory(str(disasm), {"cs_tri": listing(CALL32, "s_endpgm")})
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                census.main([str(disasm), "--out", str(index)])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite an input it scans", err.getvalue())
+
+    def test_uses_shared_same_report_path_and_catches_folding_volume_case_alias(self):
+        with tempfile.TemporaryDirectory() as work:
+            disasm = os.path.join(work, "dxbc", "disasm")
+            os.makedirs(disasm)
+            index = os.path.join(work, "dxbc", "index.json")
+            with open(index, "w", encoding="utf-8") as f:
+                json.dump([{"file": "cs_tri.dxbc", "stage": "cs"}], f)
+            self.directory(disasm, {"cs_tri": listing(CALL32, "s_endpgm")})
+            folded_index = os.path.join(work, "dxbc", "INDEX.JSON")
+            with (mock.patch.object(report_paths.os.path, "realpath", side_effect=os.path.abspath),
+                  mock.patch.object(report_paths, "_resolved_key", side_effect=str),
+                  mock.patch.object(report_paths.os.path, "samefile", side_effect=OSError("not same")),
+                  mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe,
+                  contextlib.redirect_stderr(io.StringIO())):
+                with self.assertRaises(SystemExit) as cm:
+                    census.main([disasm, "--out", folded_index])
+                self.assertEqual(cm.exception.code, 2)
+            self.assertGreaterEqual(probe.call_count, 1)
 
 
 if __name__ == "__main__":

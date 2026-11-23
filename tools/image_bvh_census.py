@@ -73,8 +73,9 @@ from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import rdna2spirv  # noqa: E402  (base_op, BRANCHES, fold_far_branches, reachable_code, native_blob, stage_of)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
-from wave64_graphics_scan import scanned_paths  # noqa: E402
+from wave64_graphics_scan import metadata_paths, scanned_paths  # noqa: E402
 
 FORMS = ("image_bvh_intersect_ray", "image_bvh64_intersect_ray")
 CATEGORIES = ("ratio", "high_half", "raw_integer", "raw_float", "raw_other", "select")
@@ -926,10 +927,15 @@ def main(argv=None) -> int:
     if args.out:
         if os.path.isdir(args.out):
             ap.error(f"{args.out} is a directory, not a JSON file")
-        if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
-            ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
-            ap.error("output must not overwrite a listing it scans")
+        out_dir = os.path.dirname(os.path.abspath(args.out))
+        if not os.path.isdir(out_dir):
+            ap.error(f"output directory does not exist: {out_dir}")
+        if same_report_path(args.src, args.out):
+            ap.error("output must not overwrite the source directory")
+        listings = scanned_paths(args.src)
+        for path in [*listings, *metadata_paths(listings)]:
+            if same_report_path(path, args.out):
+                ap.error(f"output must not overwrite an input it scans: {path}")
     summary = summarise(*scan_directory(args.src))
     print_summary(summary)
     if args.out:
