@@ -77,6 +77,17 @@ class Sampling(unittest.TestCase):
             with open(os.path.join(out, "sample.json"), encoding="utf-8") as f:
                 self.assertEqual(len(json.load(f)), int(buf.getvalue().split("sampled ")[1].split()[0]))
 
+    def test_sample_command_accepts_utf8_bom_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv, out = os.path.join(tmp, "spirv"), os.path.join(tmp, "out")
+            os.makedirs(spirv)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump(synthetic_index(), f)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ps_sweep.main(["sample", "--spirv", spirv, "--out", out, "--n", "40"])
+            self.assertIn("population 133", buf.getvalue())
+
 
 class VertexShader(unittest.TestCase):
     def test_outputs_match_inputs_and_flat_locations(self):
@@ -172,6 +183,27 @@ class CompareCommand(unittest.TestCase):
                 ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
             self.assertIn("OK on both: 2", buf.getvalue())
             self.assertNotIn("timeout", buf.getvalue())
+
+    def test_run_and_compare_accept_utf8_bom_sample(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            spirv, out = os.path.join(tmp, "spirv"), os.path.join(tmp, "out")
+            os.makedirs(spirv)
+            os.makedirs(out)
+            with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump({"x": meta()}, f)
+            with open(os.path.join(out, "sample.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump([{"name": "x", "stratum": [False, "none", "structured"]}], f)
+            for tag in ("a", "b"):
+                d = os.path.join(out, f"{tag}_z")
+                os.makedirs(d)
+                with open(os.path.join(d, "results_0.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(json.dumps({"i": 0, "code": 0, "reason": "", "targets": 1}) + "\n")
+                write_raw(os.path.join(d, "0.raw"), [0.25] * 8)
+            ps_sweep.main(["run", "--spirv", spirv, "--out", out, "--tag", "a", "--exe", "unused"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ps_sweep.main(["compare", "--out", out, "--tags", "a", "b"])
+            self.assertIn("OK on both: 1", buf.getvalue())
 
 
 if __name__ == "__main__":

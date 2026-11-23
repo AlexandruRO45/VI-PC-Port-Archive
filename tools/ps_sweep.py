@@ -32,7 +32,7 @@ TOLERANCE = 1e-3
 
 
 def load_ps(spirv):
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     return {k: v for k, v in index.items() if v.get("stage") == "ps"}
 
@@ -114,7 +114,7 @@ def run_dir(a, tag):
 
 def cmd_run(a):
     ps = load_ps(a.spirv)
-    with open(os.path.join(a.out, "sample.json"), encoding="utf-8") as f:
+    with open(os.path.join(a.out, "sample.json"), encoding="utf-8-sig") as f:
         sample = json.load(f)
     out_dir = run_dir(a, a.tag)
     os.makedirs(out_dir, exist_ok=True)
@@ -231,7 +231,7 @@ def load_results(a, tag):
 
 
 def cmd_compare(a):
-    with open(os.path.join(a.out, "sample.json"), encoding="utf-8") as f:
+    with open(os.path.join(a.out, "sample.json"), encoding="utf-8-sig") as f:
         sample = json.load(f)
     ta, tb = a.tags
     ra, rb = load_results(a, ta), load_results(a, tb)
