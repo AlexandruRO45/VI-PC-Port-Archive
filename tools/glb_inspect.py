@@ -232,6 +232,21 @@ def _accessor_type(gltf: dict, index: object) -> str | None:
     return _text(accessor.get("type")) if accessor is not None else None
 
 
+def _morph_target_count(gltf: dict, node: dict | None) -> int | None:
+    mesh = _entry(gltf, "meshes", node.get("mesh")) if node is not None else None
+    primitives = _array(mesh.get("primitives")) if mesh is not None else []
+    count = None
+    for primitive in primitives:
+        targets = primitive.get("targets") if isinstance(primitive, dict) else None
+        if (not isinstance(targets, list) or not targets
+                or any(not isinstance(target, dict) for target in targets)):
+            return None
+        if count is not None and count != len(targets):
+            return None
+        count = len(targets)
+    return count
+
+
 def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
     """Summarize an animation and flag references that cannot be resolved."""
     issues: list[str] = []
@@ -274,13 +289,6 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
         if output_accessor is None:
             issues.append(f"sampler[{sampler_index}] output accessor is missing")
-        if input_count is not None and output_count is not None:
-            expected = input_count * 3 if interpolation == "CUBICSPLINE" else input_count
-            if output_count != expected:
-                issues.append(
-                    f"sampler[{sampler_index}] has {output_count} output values for {input_count} "
-                    f"keys with {interpolation} interpolation"
-                )
         if interpolation is not None and interpolation not in ("LINEAR", "STEP", "CUBICSPLINE"):
             issues.append(f"sampler[{sampler_index}] has unknown interpolation {interpolation!r}")
         samplers.append({
@@ -332,6 +340,22 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
                     f"channel[{channel_index}] path {path!r} expects {expected_type} output, "
                     f"got {output_type}"
                 )
+            # glTF 2.0 section 3.11: weight keys flatten one scalar per morph target.
+            # A sampler may serve several channels, so validate against each target.
+            width = _morph_target_count(gltf, node) if path == "weights" else 1
+            if width is None:
+                issues.append(f"channel[{channel_index}] weights target has no consistent morph target count")
+            if sampler is not None and width is not None:
+                input_count, output_count = sampler["input_count"], sampler["output_count"]
+                interpolation = sampler["interpolation"]
+                if (input_count is not None and output_count is not None
+                        and interpolation in ("LINEAR", "STEP", "CUBICSPLINE")):
+                    expected = input_count * width * (3 if interpolation == "CUBICSPLINE" else 1)
+                    if output_count != expected:
+                        issues.append(
+                            f"channel[{channel_index}] sampler[{sampler_index}] has {output_count} output values "
+                            f"for {input_count} keys with {interpolation} interpolation (expected {expected})"
+                        )
         channels.append({
             "index": channel_index,
             "sampler": sampler_index,

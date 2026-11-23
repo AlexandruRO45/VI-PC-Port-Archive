@@ -684,5 +684,122 @@ class GlbInspectTests(unittest.TestCase):
                                 for issue in issues))
 
 
+class MorphAnimationTests(unittest.TestCase):
+    @staticmethod
+    def fixture(interpolation=None, *, targets=2, output_count=None, path="weights"):
+        multiplier = 3 if interpolation == "CUBICSPLINE" else 1
+        if output_count is None:
+            output_count = 2 * multiplier * (targets if path == "weights" else 1)
+        components = 1 if path == "weights" else 3
+        blocks = [struct.pack("<9f", 0, 0, 0, 1, 0, 0, 0, 1, 0), bytes(36),
+                  struct.pack("<2f", 0.0, 1.0), bytes(4 * components * output_count)]
+        views, offset = [], 0
+        for block in blocks:
+            views.append({"buffer": 0, "byteOffset": offset, "byteLength": len(block)})
+            offset += len(block)
+        sampler = {"input": 2, "output": 3}
+        if interpolation is not None:
+            sampler["interpolation"] = interpolation
+        gltf = {
+            "asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0},
+                                         "targets": [{"POSITION": 1} for _ in range(targets)]}]}],
+            "buffers": [{"byteLength": offset}], "bufferViews": views,
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                 "min": [0, 0, 0], "max": [1, 1, 0]},
+                {"bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3",
+                 "min": [0, 0, 0], "max": [0, 0, 0]},
+                {"bufferView": 2, "componentType": 5126, "count": 2, "type": "SCALAR",
+                 "min": [0.0], "max": [1.0]},
+                {"bufferView": 3, "componentType": 5126, "count": output_count,
+                 "type": "SCALAR" if path == "weights" else "VEC3"},
+            ],
+            "animations": [{"samplers": [sampler],
+                            "channels": [{"sampler": 0, "target": {"node": 0, "path": path}}]}],
+        }
+        return gltf, b"".join(blocks)
+
+    def inspect_animation(self, gltf, binary):
+        with tempfile.TemporaryDirectory() as folder:
+            source, output = (os.path.join(folder, name) for name in ("morph.glb", "report.json"))
+            with open(source, "wb") as handle:
+                handle.write(glb(gltf, binary))
+            result = subprocess.run([sys.executable, "-I", TOOL, source, "--json", output],
+                                    capture_output=True, text=True, timeout=60, errors="replace")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            with open(output, encoding="utf-8") as handle:
+                return json.load(handle)["animations"][0]
+
+    def test_two_morph_targets_scale_the_output_count_for_each_interpolation(self):
+        for interpolation in (None, "LINEAR", "STEP", "CUBICSPLINE"):
+            with self.subTest(interpolation=interpolation):
+                gltf, binary = self.fixture(interpolation)
+                # Optional default weights are absent: the primitive's targets determine the width.
+                self.assertNotIn("weights", gltf["nodes"][0])
+                self.assertNotIn("weights", gltf["meshes"][0])
+                report = self.inspect_animation(gltf, binary)
+                self.assertEqual(report["issues"], [])
+                self.assertEqual(report["samplers"][0]["output_count"],
+                                 12 if interpolation == "CUBICSPLINE" else 4)
+                self.assertEqual(report["interpolations"], [interpolation or "LINEAR"])
+
+    def test_wrong_morph_weight_counts_are_reported(self):
+        for interpolation, count in ((None, 2), ("LINEAR", 5), ("STEP", 3),
+                                     ("CUBICSPLINE", 4), ("CUBICSPLINE", 11), ("CUBICSPLINE", 13)):
+            with self.subTest(interpolation=interpolation, count=count):
+                report = self.inspect_animation(*self.fixture(interpolation, output_count=count))
+                expected = 12 if interpolation == "CUBICSPLINE" else 4
+                self.assertTrue(any("channel[0]" in issue and f"has {count} output values" in issue
+                                    and f"expected {expected}" in issue for issue in report["issues"]),
+                                report["issues"])
+
+    def test_shared_sampler_is_checked_against_each_channels_mesh(self):
+        gltf, binary = self.fixture()
+        gltf["nodes"].append({"mesh": 1})
+        gltf["scenes"][0]["nodes"].append(1)
+        gltf["meshes"].append({"primitives": [{"attributes": {"POSITION": 0},
+                                               "targets": [{"POSITION": 1} for _ in range(3)]}]})
+        gltf["animations"][0]["channels"].append({"sampler": 0, "target": {"node": 1, "path": "weights"}})
+        issues = self.inspect_animation(gltf, binary)["issues"]
+        self.assertEqual(len(issues), 1, issues)
+        self.assertIn("channel[1]", issues[0])
+        self.assertIn("has 4 output values", issues[0])
+        self.assertIn("expected 6", issues[0])
+
+    def test_transform_sampler_counts_remain_per_key(self):
+        for interpolation, expected in (("LINEAR", 2), ("CUBICSPLINE", 6)):
+            for count in (expected, expected + 1):
+                with self.subTest(interpolation=interpolation, count=count):
+                    report = self.inspect_animation(*self.fixture(interpolation, output_count=count,
+                                                                 path="translation"))
+                    if count == expected:
+                        self.assertEqual(report["issues"], [])
+                    else:
+                        self.assertTrue(any(f"has {count} output values for 2 keys" in issue
+                                            for issue in report["issues"]), report["issues"])
+
+    def test_unusable_morph_target_arrays_are_reported_without_guessing(self):
+        for variant in ("missing", "non-array", "empty", "non-object", "inconsistent"):
+            with self.subTest(variant=variant):
+                gltf, binary = self.fixture()
+                primitive = gltf["meshes"][0]["primitives"][0]
+                if variant == "missing":
+                    del primitive["targets"]
+                elif variant == "inconsistent":
+                    gltf["meshes"][0]["primitives"].append({"attributes": {"POSITION": 0},
+                                                           "targets": [{"POSITION": 1}]})
+                else:
+                    primitive["targets"] = {"non-array": {}, "empty": [], "non-object": [7, {}]}[variant]
+                # A default-weight array must not hide missing or malformed actual target definitions.
+                gltf["nodes"][0]["weights"] = [0.0, 0.0]
+                gltf["meshes"][0]["weights"] = [0.0, 0.0]
+                issues = self.inspect_animation(gltf, binary)["issues"]
+                self.assertTrue(any("channel[0] weights target has no consistent morph target count" in issue
+                                    for issue in issues), issues)
+
+
 if __name__ == "__main__":
     unittest.main()
