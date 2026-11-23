@@ -304,5 +304,102 @@ class TestSAddI32AST(unittest.TestCase):
                 ssrc1=Imm(0x2000, is_inline=False),
             )
 
+@dataclasses.dataclass
+class ScalarState:
+    sgprs: list[int] = dataclasses.field(default_factory=lambda: [0] * 106)
+    scc: int = 0
+
+    def read_operand(self, op: Reg | Imm) -> int:
+        if isinstance(op, Imm):
+            return to_u32(op.value)
+        return self.sgprs[op.index]
+
+    def write_sgpr(self, reg: Reg, val: int) -> None:
+        self.sgprs[reg.index] = to_u32(val)
+
+
+class ScalarInterpreter:
+    def __init__(self, state: Optional[ScalarState] = None) -> None:
+        self.state = state or ScalarState()
+
+    def step(self, inst: SOP2Inst) -> tuple[int, int]:
+        v0 = self.state.read_operand(inst.ssrc0)
+        v1 = self.state.read_operand(inst.ssrc1)
+        if inst.opcode == Opcode.S_ADD_I32:
+            dst, scc = ref_s_add_i32(v0, v1)
+        elif inst.opcode == Opcode.S_ADD_U32:
+            dst, scc = ref_s_add_u32(v0, v1)
+        else:
+            raise NotImplementedError(f"Opcode {inst.opcode} not implemented in scalar interpreter")
+        self.state.write_sgpr(inst.sdst, dst)
+        self.state.scc = scc
+        return dst, scc
+
+
+class TestSAddI32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar instruction execution."""
+
+    def setUp(self) -> None:
+        self.state = ScalarState()
+        self.interp = ScalarInterpreter(self.state)
+
+    def test_reg_to_reg_addition(self) -> None:
+        self.state.sgprs[1] = 1234
+        self.state.sgprs[2] = 5678
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 0),
+            ssrc0=Reg(OperandKind.SGPR, 1),
+            ssrc1=Reg(OperandKind.SGPR, 2),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, 6912)
+        self.assertEqual(scc, 0)
+        self.assertEqual(self.state.sgprs[0], 6912)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_reg_to_literal_overflow(self) -> None:
+        self.state.sgprs[4] = INT32_MAX
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 3),
+            ssrc0=Reg(OperandKind.SGPR, 4),
+            ssrc1=Imm(1, is_inline=True),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, UINT32_INT_MIN)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.sgprs[3], UINT32_INT_MIN)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_reg_to_inline_negative_overflow(self) -> None:
+        self.state.sgprs[10] = UINT32_INT_MIN
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 11),
+            ssrc0=Reg(OperandKind.SGPR, 10),
+            ssrc1=Imm(-1, is_inline=True),
+        )
+        dst, scc = self.interp.step(inst)
+        self.assertEqual(dst, INT32_MAX)
+        self.assertEqual(scc, 1)
+        self.assertEqual(self.state.sgprs[11], INT32_MAX)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_unrelated_sgpr_preservation(self) -> None:
+        for i in range(106):
+            self.state.sgprs[i] = (i * 0x01010101) & MASK32
+        inst = SOP2Inst(
+            opcode=Opcode.S_ADD_I32,
+            sdst=Reg(OperandKind.SGPR, 50),
+            ssrc0=Reg(OperandKind.SGPR, 10),
+            ssrc1=Reg(OperandKind.SGPR, 20),
+        )
+        self.interp.step(inst)
+        for i in range(106):
+            if i == 50:
+                continue
+            self.assertEqual(self.state.sgprs[i], (i * 0x01010101) & MASK32)
+
 if __name__ == "__main__":
     unittest.main()
