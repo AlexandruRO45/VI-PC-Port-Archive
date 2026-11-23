@@ -74,7 +74,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
                     self.assertEqual(summary["error"], "full: exit code 7")
                     self.assertEqual(summary["runs"]["full"]["outcome"], "exited")
                     self.assertEqual(summary["runs"]["full"]["returncode"], 7)
-                    self.assertIn(str(report).encode(encoding, "backslashreplace"), result.stdout)
+                    # The CLI resolves --out before writing, so a symlinked or junctioned
+                    # temporary directory prints the target path, not the link's.
+                    self.assertIn(str(report.resolve()).encode(encoding, "backslashreplace"), result.stdout)
                     self.assertIn(diagnostic.encode(encoding, "backslashreplace"), result.stderr)
                     self.assertNotIn(b"UnicodeEncodeError", result.stderr)
 
