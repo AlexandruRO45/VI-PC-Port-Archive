@@ -2,7 +2,9 @@
 No game files."""
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import navmesh_cell_fit as cf  # noqa: E402
@@ -44,6 +46,18 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("wagon01"), h)
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
+
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(cf, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    cf.write_json_report(path, '{"new": true}\n')
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":

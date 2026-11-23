@@ -23,13 +23,17 @@ import glob
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import navmesh_decode as nd  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
@@ -209,9 +213,41 @@ def main():
     text = json.dumps(report, indent=1)
     print(text)
     if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        write_json_report(a.out, text + "\n")
     return 0
+
+
+def write_json_report(path, text):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".navmesh_cell_fit-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
