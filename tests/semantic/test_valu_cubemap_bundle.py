@@ -225,5 +225,27 @@ class VCubeIdTranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_cubeid", ["v_cubeid_f32"])
 
+# -----------------------------------------------------------------------------
+# Opcode 2: v_cubesc_f32
+# -----------------------------------------------------------------------------
+def oracle_cubesc_f32(x: float, y: float, z: float) -> float:
+    return select_cube_face(x, y, z)[1]
+
+
+class VCubeScOracleTests(unittest.TestCase):
+    def test_cubesc_cardinal_coordinates(self):
+        # +X (face 0): sc = -z
+        self.assertEqual(oracle_cubesc_f32(2.0, 0.0, 0.5), -0.5)
+        # -X (face 1): sc = +z
+        self.assertEqual(oracle_cubesc_f32(-2.0, 0.0, 0.5), 0.5)
+        # +Y (face 2): sc = +x
+        self.assertEqual(oracle_cubesc_f32(0.3, 2.0, 0.0), 0.3)
+        # -Y (face 3): sc = +x
+        self.assertEqual(oracle_cubesc_f32(0.4, -2.0, 0.0), 0.4)
+        # +Z (face 4): sc = +x
+        self.assertEqual(oracle_cubesc_f32(0.5, 0.0, 2.0), 0.5)
+        # -Z (face 5): sc = -x
+        self.assertEqual(oracle_cubesc_f32(0.5, 0.0, -2.0), -0.5)
+
 if __name__ == "__main__":
     unittest.main()
