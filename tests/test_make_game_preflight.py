@@ -862,7 +862,7 @@ SUBMODULE_READY = make_game.submodule_ready   # the real one, before a test patc
 class PreflightExportedAssetsSpaceTest(PreflightTestBase):
     """A rerun over finished asset exports doesn't need room for a second copy of them."""
 
-    OGG = "awc_opus.py finished\n"
+    OGG = make_game.ogg_marker() + " finished\n"
     XMA = "rpf9dump xma finished\n"
     DECODER = "current-decoder"
 
@@ -922,7 +922,7 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
         with tempfile.TemporaryDirectory() as work:
             audio = os.path.join(work, "assets", "audio")
             os.makedirs(audio)
-            make_game.mark(os.path.join(audio, "ogg.done"), "awc_opus.py")
+            make_game.mark(os.path.join(audio, "ogg.done"), make_game.ogg_marker())
             make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
             self.assertTrue(make_game.assets_exported(work))
 
@@ -976,7 +976,8 @@ class PreflightExportedAssetsSpaceTest(PreflightTestBase):
                 self.assert_fails(self.run_preflight, work, free_gb=60, match="about 250 GB is needed")
 
     def test_marker_with_other_contents_does_not_count(self):
-        for ogg, xma in (("", self.XMA), (self.OGG, "something else\n"), (self.XMA, self.OGG)):
+        for ogg, xma in (("", self.XMA), ("awc_opus.py finished\n", self.XMA), (self.OGG, "something else\n"),
+                         (self.XMA, self.OGG)):
             with self.subTest(ogg=ogg, xma=xma), tempfile.TemporaryDirectory() as work:
                 self.write_markers(work, ogg=ogg, xma=xma)
                 self.assertFalse(make_game.assets_exported(work))

@@ -491,6 +491,7 @@ class WavValidationTest(unittest.TestCase):
             for name in ("audio_manifest.json", "ogg.done", "xma.done"):
                 with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
                     f.write("{}")
+            make_game.mark(os.path.join(manifest_dir, "ogg.done"), make_game.ogg_marker())
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):
                 with patch("make_game.log"):
@@ -545,6 +546,7 @@ class WavValidationTest(unittest.TestCase):
             for name in ("audio_manifest.json", "ogg.done", "xma.done"):
                 with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
                     f.write("{}")
+            make_game.mark(os.path.join(manifest_dir, "ogg.done"), make_game.ogg_marker())
             os.makedirs(os.path.join(manifest_dir, "ogg"), exist_ok=True)
             os.makedirs(os.path.join(manifest_dir, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)

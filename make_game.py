@@ -484,7 +484,7 @@ def assets_exported(work: str) -> bool:
     Models, textures and pools made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
     such folder before it exports it again, so the new export goes into the space the old one held."""
     audio = os.path.join(work, "assets", "audio")
-    for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
+    for name, what in (("ogg.done", ogg_marker()), ("xma.done", "rpf9dump xma")):
         try:
             with open(os.path.join(audio, name), encoding="utf-8") as f:
                 if f.read().strip() != f"{what} finished":
@@ -1537,6 +1537,13 @@ def compute_decoder_digest() -> str:
 decoder_digest = functools.cache(compute_decoder_digest)
 
 
+AWC_OPUS_SOURCES = ("awc_opus.py", "file_mode.py", "pool_workers.py")
+
+
+def ogg_marker() -> str:
+    return f"awc_opus.py {sources_digest(TOOLS, AWC_OPUS_SOURCES)}"
+
+
 def rpf9dump(work: str) -> str:
     exe = os.path.join(work, "tools", "rpf9dump", "rpf9dump.exe" if os.name == "nt" else "rpf9dump")
     core = os.path.join(ROOT, "third_party", "rpf9-explorer", "Core")
@@ -1660,11 +1667,18 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
     # created first and exist after a stopped run too.
     ogg = os.path.join(out, "audio", "ogg")
     ogg_done = os.path.join(out, "audio", "ogg.done")
-    if not os.path.isfile(ogg_done):
+    ogg_what = ogg_marker()
+    if read_shader_setting(ogg_done) != f"{ogg_what} finished":
+        if os.path.isfile(ogg_done):
+            # awc_opus.py leaves the files it no longer writes, and audio_wav.py keeps every WAV it finds.
+            log("assets: no matching awc_opus.py fingerprint for the audio streams: exporting again")
+            for folder in (ogg, os.path.join(out, "audio", "wav")):
+                if os.path.isdir(folder):
+                    shutil.rmtree(folder)
         # Lossless: the banks' Opus packets repackaged as standard Ogg Opus files (PCM streams as .wav)
         log("assets: audio streams -> Ogg Opus")
         py("awc_opus.py", os.path.join(out, "audio", "awc"), ogg, "--jobs", str(jobs))
-        mark(ogg_done, "awc_opus.py")
+        mark(ogg_done, ogg_what)
     if wav:
         if not os.path.isdir(ogg):
             fail("assets: no Ogg Opus output to decode. The audio bank step must finish first (run the assets stage).")

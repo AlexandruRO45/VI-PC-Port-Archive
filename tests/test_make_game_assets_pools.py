@@ -32,7 +32,7 @@ class AssetsPoolsTest(unittest.TestCase):
                 with open(os.path.join(self.out, stem, mode, make_game.DECODER_RECORD), "w") as f:
                     f.write(make_game.decoder_digest())
         self.stub(os.path.join(self.out, "audio", "audio_manifest.json"))
-        self.stub(os.path.join(self.out, "audio", "ogg.done"))
+        make_game.mark(os.path.join(self.out, "audio", "ogg.done"), make_game.ogg_marker())
         self.stub(os.path.join(self.out, "audio", "xma.done"))
 
     def stub(self, path):

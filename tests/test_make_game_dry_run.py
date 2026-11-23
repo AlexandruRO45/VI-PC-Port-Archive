@@ -471,8 +471,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
 
         with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
             f.write("{}")
-        with open(os.path.join(audio_dir, "ogg.done"), "w", encoding="utf-8") as f:
-            f.write("done\n")
+        make_game.mark(os.path.join(audio_dir, "ogg.done"), make_game.ogg_marker())
         with open(os.path.join(audio_dir, "xma.done"), "w", encoding="utf-8") as f:
             f.write("done\n")
 
@@ -492,6 +491,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         audio.mkdir(parents=True)
         for marker in ("audio_manifest.json", "ogg.done", "xma.done"):
             (audio / marker).touch()
+        make_game.mark(str(audio / "ogg.done"), make_game.ogg_marker())
 
         # Identically named pools in the base game and a pack have distinct completion markers.
         game = Path(self.game_dir)

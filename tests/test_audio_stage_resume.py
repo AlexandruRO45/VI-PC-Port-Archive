@@ -2,9 +2,11 @@
 
 Standard library only; no game data: the tools are mocked or fed hand-made inputs.
 """
+import ast
 import contextlib
 import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -188,6 +190,62 @@ class AudioStageResumeTest(unittest.TestCase):
     def test_ffmpeg_installed_later_decodes_on_the_next_run(self):
         self.assertNotIn("ffmpeg", self.run_stage(ffmpeg=None))
         self.assertEqual(self.run_stage(), ["ffmpeg", "ffmpeg"])
+
+    def write_ogg_marker(self, text):
+        os.makedirs(os.path.join(self.audio, "ogg"), exist_ok=True)
+        with open(os.path.join(self.audio, "ogg.done"), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def test_matching_awc_opus_fingerprint_skips_the_ogg_step(self):
+        self.run_stage()
+        self.write_ogg_marker(make_game.ogg_marker() + " finished\n")
+        self.assertNotIn("awc_opus.py", self.run_stage())
+
+    def test_old_or_other_awc_opus_marker_exports_again(self):
+        for text in ("awc_opus.py finished\n", f"awc_opus.py {'0' * 64} finished\n"):
+            with self.subTest(text=text):
+                self.run_stage()
+                self.write_ogg_marker(text)
+                for folder in ("ogg", "wav"):
+                    self.touch(self.audio, folder, "bank", "stale.wav")
+                self.assertEqual(self.run_stage(), ["awc_opus.py"])
+                self.assertEqual(os.listdir(os.path.join(self.audio, "ogg")), [])
+                self.assertFalse(os.path.exists(os.path.join(self.audio, "wav")))
+                with open(os.path.join(self.audio, "ogg.done"), encoding="utf-8") as f:
+                    self.assertEqual(f.read(), make_game.ogg_marker() + " finished\n")
+                self.assertEqual(self.run_stage(), [])
+
+    def test_editing_awc_opus_or_its_imports_exports_again(self):
+        tools = os.path.join(self.work, "tools")
+        os.makedirs(tools)
+        for name in make_game.AWC_OPUS_SOURCES:
+            shutil.copy(os.path.join(make_game.TOOLS, name), tools)
+        with mock.patch.object(make_game, "TOOLS", tools):
+            self.run_stage()
+            for name in make_game.AWC_OPUS_SOURCES:
+                with open(os.path.join(tools, name), "ab") as f:
+                    f.write(b"\n")
+                self.assertEqual(self.run_stage(), ["awc_opus.py"], name)
+                self.assertEqual(self.run_stage(), [], name)
+
+    def test_the_list_covers_every_local_module_awc_opus_imports(self):
+        seen, todo = set(), ["awc_opus"]
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            with open(os.path.join(make_game.TOOLS, name + ".py"), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    mods = [a.name.split(".")[0] for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    mods = [node.module.split(".")[0]]
+                else:
+                    continue
+                todo += [m for m in mods if os.path.isfile(os.path.join(make_game.TOOLS, m + ".py"))]
+        self.assertEqual({n + ".py" for n in seen}, set(make_game.AWC_OPUS_SOURCES))
 
     def test_failed_ogg_step_leaves_no_marker(self):
         def failing_py(tool, *args):
