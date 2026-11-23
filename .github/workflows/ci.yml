@@ -110,6 +110,9 @@ jobs:
           CARGO_HOME="$(mktemp -d)" cargo build --release --locked --offline --manifest-path tools/bcpack_calibration/Cargo.toml
           python -I -c "import sys; sys.path.insert(0, 'tools'); import calibrated_texture; calibrated_texture.native()"
           python -I tests/test_calibrated_texture.py
+          cargo build --release --locked --manifest-path tools/bcpack_dds/Cargo.toml
+          export LEONIDA_BCPACK_DDS="$PWD/tools/bcpack_dds/target/release/bcpack_dds"
+          python -I tests/test_bcpack_dds.py
           python -I tests/test_ttpf_assets.py
       - name: Test rpf9dump diagnostics
         run: dotnet run --project tests/Rpf9DumpDiagnostics/Rpf9DumpDiagnostics.csproj -c Release

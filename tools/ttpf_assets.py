@@ -74,7 +74,7 @@ def candidate(row, profile):
 def complete_pool(source, directory, manifest, settings, rust_exporter=None, jobs=1):
     """Publish full chains next to ordinary DDS files, then switch the catalog to them."""
     stamp, profile = settings
-    pass_stamp = stamp if rust_exporter is None else f"{stamp}-rust-batch-v1"
+    pass_stamp = stamp if rust_exporter is None else f"{stamp}-rust-batch-v2"
     if manifest.get("BCPackPass") == pass_stamp:
         return 0, 0
     rows = [row for row in manifest["Textures"] if candidate(row, profile)]

@@ -176,19 +176,15 @@ pub fn rebuild(
             let selectors = [(0, 8), (4, 12), (16, 24), (20, 28)].map(|(low, high)| {
                 BC1_QUADRANT.map(|q| (u32::from(q) & 15) << low | (u32::from(q) >> 4) << high)
             });
-            let success = bc1::blocks(
+            bc1::blocks(
                 count,
                 |index, lane| symbols[lane * count + index],
                 &seeds,
                 &selectors,
                 &mut out,
                 true,
-            );
-            if !success {
-                return Err(
-                    "BC1 references an absent predictor or has a nonzero reserved lane".into(),
-                );
-            }
+            )
+            .map_err(|error| error.to_string())?;
         }
         Codec::Bc6h => bc6h::rebuild(symbols, &mut out, profile)?,
         Codec::Bc7 => {
@@ -276,8 +272,8 @@ pub fn decode_fitted_bc1(
         )
     };
     success
-        .then_some(out)
-        .ok_or_else(|| "Missing BC1 endpoint history".into())
+        .map(|()| out)
+        .map_err(|_| "Missing BC1 endpoint history".into())
 }
 
 /// Symbols and reconstruction state for a fitted BC7 chunk.

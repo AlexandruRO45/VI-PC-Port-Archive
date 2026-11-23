@@ -1520,7 +1520,8 @@ def prepare_bcpack() -> None:
     vendor = crate.parent.parent / "third_party" / "bcpack-rs"
     sources.extend([vendor / "Cargo.toml", *vendor.glob("src/**/*.rs")])
     if not os.environ.get("LEONIDA_BCPACK_DDS"):
-        batch_sources = [*sources, batch / "Cargo.toml", batch / "Cargo.lock", *batch.glob("src/**/*.rs")]
+        batch_sources = [*sources, batch / "Cargo.toml", batch / "Cargo.lock",
+                         batch.parent / "bcpack_bc1_history.json", *batch.glob("src/**/*.rs")]
         executable = "bcpack_dds.exe" if os.name == "nt" else "bcpack_dds"
         build_bcpack(cargo, batch, batch / "target" / "release" / executable, batch_sources)
     build_bcpack(cargo, crate, bcpack_native.library_path(), sources)

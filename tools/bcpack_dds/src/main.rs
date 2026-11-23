@@ -730,7 +730,10 @@ fn run() -> Result<()> {
             _ => return Err(USAGE.into()),
         }
     }
-    let mut profile = Profile::default();
+    let mut profile = Profile {
+        bc1: serde_json::from_str(include_str!("../../bcpack_bc1_history.json"))?,
+        ..Profile::default()
+    };
     profile.bc7.add_signature([20, 0, 6, 0, 0, 0])?;
     let start_time = Instant::now();
     let pool = Pool::open(&input)?;

@@ -1,8 +1,29 @@
 //! BC1 block reconstruction with predictor and selector tables supplied by the caller.
 use crate::{entropy, zig};
-use std::slice;
+use std::{fmt, slice};
 
 const WIDTHS: [u8; 12] = [8, 8, 5, 6, 5, 5, 6, 5, 8, 8, 8, 8];
+
+pub(crate) enum DecodeError {
+    ReservedLane { block: usize },
+    MissingPredictor { block: usize, slot: usize },
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::ReservedLane { block } => {
+                write!(f, "BC1 block {block} has a nonzero reserved lane")
+            }
+            Self::MissingPredictor { block, slot } => {
+                write!(
+                    f,
+                    "BC1 block {block} requires missing predictor slot {slot}"
+                )
+            }
+        }
+    }
+}
 
 pub(crate) fn blocks(
     count: usize,
@@ -11,11 +32,11 @@ pub(crate) fn blocks(
     selectors: &[[u32; 256]],
     output: &mut [u8],
     strict: bool,
-) -> bool {
+) -> Result<(), DecodeError> {
     let mut history = [[0u8; 6]; 256];
     for (i, block) in output.chunks_exact_mut(8).take(count).enumerate() {
         if strict && symbol(i, 1) != 0 {
-            return false;
+            return Err(DecodeError::ReservedLane { block: i });
         }
         let distance = zig(symbol(i, 0)) as u8 as usize;
         let mut color = if distance == 0 {
@@ -25,9 +46,10 @@ pub(crate) fn blocks(
         } else {
             let age = distance - i;
             // The strict table uses ring slots. Calibrated profiles index by age.
-            let seed = endpoints[if strict { 256 - age } else { age }];
+            let slot = if strict { 256 - age } else { age };
+            let seed = endpoints[slot];
             if seed.iter().any(|&value| value < 0) {
-                return false;
+                return Err(DecodeError::MissingPredictor { block: i, slot });
             }
             seed.map(|value| value as u8)
         };
@@ -48,7 +70,7 @@ pub(crate) fn blocks(
         block[2..4].copy_from_slice(&rgb(3).to_le_bytes());
         block[4..].copy_from_slice(&indices.to_le_bytes());
     }
-    true
+    Ok(())
 }
 
 // Caller supplies 256 endpoint rows, four selector rows and count * 8 writable bytes.
@@ -83,6 +105,7 @@ pub unsafe extern "C" fn decode_strict_bc1(
         slice::from_raw_parts_mut(output, count * 8),
         true,
     )
+    .is_ok()
 }
 
 // The calibrated reader supplies count interleaved records of twelve symbols each.
@@ -106,4 +129,5 @@ pub unsafe extern "C" fn rebuild_calibrated_bc1(
         slice::from_raw_parts_mut(output, count * 8),
         false,
     )
+    .is_ok()
 }

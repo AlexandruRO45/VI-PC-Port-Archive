@@ -15,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tools")]
 
+from bcpack_tables import BC1_HISTORY_CONFIRMED
 import ttpf_mips as ttpf
 import test_ttpf_mips as fixtures
 from test_bcpack import encode_bc7_mode6_blocks, encode_lanes
@@ -44,6 +45,16 @@ class RustBatchExport(unittest.TestCase):
         self.assertEqual((self.out / row["file"]).read_bytes(), expected)
         self.assertEqual(row["sha256"], hashlib.sha256(expected).hexdigest())
 
+    def test_strict_bc1_with_confirmed_initial_history(self):
+        # Exercise every confirmed slot before the chunk has enough blocks
+        # to satisfy the corresponding predictor from its own history.
+        slots = sorted(BC1_HISTORY_CONFIRMED)
+        distances = [256 + i - slot for i, slot in enumerate(slots)]
+        fixtures.build_bc1_bcpack_pool(
+            self.source, ref_dists=distances + [0] * (1024 - len(distances)),
+        )
+        self.check_reference()
+
     def test_strict_multimip_and_fitted_retry(self):
         fixtures.build_bc1_bcpack_pool(self.source)
         self.check_reference()
@@ -51,6 +62,7 @@ class RustBatchExport(unittest.TestCase):
         fixtures.build_bc1_bcpack_pool(self.source, ref_dists=[250] + [0] * 1023)
         (failed,) = self.export()
         self.assertEqual(failed["status"], "failed")
+        self.assertIn("missing predictor slot 6", failed["reason"])
         self.assertNotIn("file", failed)
         self.assertNotIn("sha256", failed)
         self.assertEqual((self.out / "tex_00000.dds").read_bytes(), old)
@@ -73,6 +85,15 @@ class RustBatchExport(unittest.TestCase):
             decoder = LocalDecoder(pool, config)
             self.addCleanup(decoder.read_chunk.cache_clear)
             self.assertEqual(data, decoder.dds(0))
+
+    def test_strict_bc1_rejects_nonzero_reserved_lane(self):
+        lanes = [bytes(512) for _ in range(12)]
+        lanes[1] = bytes([1]) + bytes(511)
+        self.write_compressed_tile(71, 1, encode_lanes(lanes, 1))
+        (row,) = self.export()
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "BC1 block 0 has a nonzero reserved lane")
+        self.assertFalse((self.out / "tex_00000.dds").exists())
 
     def test_fitted_bc7_signature(self):
         block = bytes.fromhex("40317204a56819be023456789abcdef0")
