@@ -352,5 +352,30 @@ class TestVCosF32SIMDAndIEEE(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 55.0)
 
 
+def run_hw_cos_f32(src_val: float) -> float:
+    bits = f32_to_bits(src_val)
+    lines = [
+        f"v_mov_b32 v0, {bits:#x}",
+        "v_cos_f32 v0, v0",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_cos_f32_hw", lines)
+    out_bits = support.mrt0_words(spv)[0]
+    return bits_to_f32(out_bits)
+
+
+class TestVCosF32HardwareTranslator(unittest.TestCase):
+    """Translator integration and hardware execution tests for v_cos_f32."""
+
+    def test_translator_cos_values(self):
+        self.assertAlmostEqual(run_hw_cos_f32(0.0), 1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(0.25), 0.0)
+        self.assertAlmostEqual(run_hw_cos_f32(0.5), -1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(0.75), 0.0)
+        self.assertAlmostEqual(run_hw_cos_f32(1.0), 1.0, places=6)
+        self.assertEqual(run_hw_cos_f32(-0.25), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
