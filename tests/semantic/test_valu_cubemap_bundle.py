@@ -198,5 +198,14 @@ class VCubeIdSimdDivergenceTests(unittest.TestCase):
             else:
                 self.assertEqual(wave.get_vgpr(i, 3), -999.0)
 
+class VCubeIdEdgeCasesTests(unittest.TestCase):
+    def test_cubeid_tie_breaking(self):
+        # Tie between X, Y, Z: Z takes priority -> face 4.0 (+Z)
+        self.assertEqual(oracle_cubeid_f32(1.0, 1.0, 1.0), 4.0)
+        # Tie between X and Y: Y takes priority -> face 2.0 (+Y)
+        self.assertEqual(oracle_cubeid_f32(1.0, 1.0, 0.5), 2.0)
+        # Negative tie (-1, -1, -1): -Z takes priority -> face 5.0 (-Z)
+        self.assertEqual(oracle_cubeid_f32(-1.0, -1.0, -1.0), 5.0)
+
 if __name__ == "__main__":
     unittest.main()
