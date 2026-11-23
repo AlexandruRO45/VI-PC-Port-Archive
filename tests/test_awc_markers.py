@@ -60,15 +60,18 @@ def music_bank(channel_id, samples, toc, marker_chunk):
     return build_bank([(0, [(0x48, bytes(desc)), (0x55, bytes(data))]), (channel_id, markers)])
 
 
-def later_block_music_bank(channel_id, samples, toc, marker_chunk):
-    """A one-channel streamed-music bank in two 4096-byte blocks whose channel has no subblock in block 0, so its
-    first packet is in block 1 (each block has its own channel table, docs/audio.md)."""
+def later_block_music_bank(channel_id, samples, toc, marker_chunk, empty_subblock=False):
+    """A one-channel streamed-music bank in two 4096-byte blocks whose first packet is in block 1 (each block has
+    its own channel table, docs/audio.md). Block 0 has no subblock for the channel, or with empty_subblock one
+    allocated, zero-filled subblock that holds no packet."""
     desc = bytearray(28)
     struct.pack_into("<III", desc, 0, 2, 4096, 1)             # blocks, chunk size, channels
     struct.pack_into("<II", desc, 12, channel_id, samples)    # interleaved sample count
     struct.pack_into("<H", desc, 22, 48000)
     desc[24] = 0x0B
     data = bytearray(8192)                                    # block 0: a table with 0 subblocks for the channel
+    if empty_subblock:
+        struct.pack_into("<I", data, 4, 1)                    # ... or 1, at 2048, whose first u16 is 0
     struct.pack_into("<I", data, 4096 + 4, 1)                 # block 1: one subblock
     struct.pack_into("<H", data, 4096 + 2048, 1)              # its first packet: 1 byte, the TOC
     data[4096 + 2050] = toc
@@ -174,6 +177,12 @@ class ScanTest(unittest.TestCase):
         bank = later_block_music_bank(0x1234, 192000, 0xF8, event(TRACK, 1.0, 150000))
         m = awc_markers.scan(self.write("mono_later.awc", bank))["streamed_music"]
         self.assertEqual((m["chunks_with_length"], m["chunks_past_end"]), (1, 0))
+
+    def test_an_empty_allocated_subblock_is_not_the_first_packet(self):
+        # Block 0 allocates a zero-filled subblock: the TOC is still the one in block 1 (awc_opus agrees).
+        bank = later_block_music_bank(0x1234, 192000, 0xFC, event(TRACK, 1.0, 150000), empty_subblock=True)
+        m = awc_markers.scan(self.write("stereo_empty.awc", bank))["streamed_music"]
+        self.assertEqual((m["chunks_with_length"], m["chunks_past_end"]), (1, 1))
 
     def test_a_bank_magic_across_the_search_window(self):
         bank = speech_bank(0x55, 48000, event(TICK, 1.0, 0))

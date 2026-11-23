@@ -78,7 +78,8 @@ def music_frames(fh, base: int, mus, data) -> dict:
 
     Each block of the 0x55 data (the descriptor's chunk size apart) has its own channel table (docs/audio.md), and
     a channel can have no subblock in the first blocks, so the blocks are walked until every channel's first
-    packet is found, as awc_opus.music_channels does."""
+    packet is found, as awc_opus.music_channels does. A subblock whose first u16 is 0 has no packet and is
+    skipped."""
     desc = _read(fh, base + mus[0], mus[1])
     if len(desc) < 12:
         return {}
@@ -99,8 +100,11 @@ def music_frames(fh, base: int, mus, data) -> dict:
         first = (24 * channels + 4 * sum(counts) + 2047) & ~2047      # the first channel's first 2048-byte subblock
         before = 0
         for c in range(channels):
-            if counts[c] and c not in packets:
-                packets[c] = _read(fh, base + data[0] + offset + first + before * 2048, 3)
+            for sub in range(counts[c] if c not in packets else 0):     # an allocated subblock can hold no packet
+                head = _read(fh, base + data[0] + offset + first + (before + sub) * 2048, 3)
+                if len(head) == 3 and head[:2] != b"\0\0":
+                    packets[c] = head
+                    break
             before += counts[c]
         if len(packets) == channels:
             break
