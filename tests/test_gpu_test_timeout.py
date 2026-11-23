@@ -99,9 +99,12 @@ class HungProgram(unittest.TestCase):
                 self.assertIn("0/1 passed", out.getvalue())
 
     def test_quick_program_is_unaffected(self):
-        self.assertEqual(run_gpu_tests.run_cmd(QUICK), (0, "ok"))
-        rc, out = check.run(*QUICK)
-        self.assertEqual((rc, out.strip()), (0, "ok"))
+        # This case is about a program that finishes, not about the limit: a CPU busy with the rest of the suite can
+        # delay a Python start past the 0.5 s the hang cases above use, so it gets a limit only a hang would reach.
+        with patch.dict(os.environ, {"LEONIDA_GPU_TEST_TIMEOUT": "10"}):
+            self.assertEqual(run_gpu_tests.run_cmd(QUICK), (0, "ok"))
+            rc, out = check.run(*QUICK)
+            self.assertEqual((rc, out.strip()), (0, "ok"))
 
     def test_translator_step_has_no_limit(self):
         seen = {}
