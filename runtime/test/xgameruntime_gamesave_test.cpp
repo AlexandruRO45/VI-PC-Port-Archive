@@ -271,6 +271,195 @@ int main() {
               aquota == (int64_t{1} << 30) - static_cast<int64_t>(story.size()),
           "GetRemainingQuotaAsync subtracts what the saves hold");
 
+    // ---- long container and blob names (Windows MAX_PATH + >255-char NTFS component) ----
+    {
+        const std::string c256(256, 'a');
+        const std::string c_slash = std::string(120, 'p') + "/" + std::string(100, 'f');   // >200 once %2F-encoded
+        const std::string c150(150, 'c');
+        const std::string b100(100, 'b');
+        const std::string b256(256, 'z');
+        const std::string payload = "long-name-payload";
+
+        for (const std::string& cname : {c256, c_slash}) {
+            Handle lc = nullptr;
+            check(at<Create>(save, 16)(save, provider, cname.c_str(), &lc) == S_OK && lc,
+                  "CreateContainer accepts a 256-char / long encoded container name");
+            Handle lu = nullptr;
+            check(at<Create>(save, 23)(save, lc, "Long Container", &lu) == S_OK && lu, "CreateUpdate on long container");
+            check(at<Write>(save, 25)(save, lu, "blob", reinterpret_cast<const uint8_t*>(payload.data()),
+                                      payload.size()) == S_OK,
+                  "SubmitBlobWrite on long container");
+            check(at<Submit>(save, 27)(save, lu) == S_OK, "SubmitUpdate commits long container");
+            at<Close>(save, 24)(save, lu);
+
+            Seen lseen;
+            check(at<GetInfo>(save, 13)(save, provider, cname.c_str(), &lseen, on_container) == S_OK &&
+                      lseen.names.size() == 1 && lseen.names[0] == cname,
+                  "GetContainerInfo returns the exact long container name");
+            Seen lenum;
+            check(at<EnumContainers>(save, 14)(save, provider, &lenum, on_container) == S_OK &&
+                      std::find(lenum.names.begin(), lenum.names.end(), cname) != lenum.names.end(),
+                  "EnumerateContainerInfo decodes the hashed container name");
+
+            const char* bnames[] = {"blob"};
+            uint32_t bcnt = 1;
+            std::vector<uint64_t> lbuf(256);
+            auto* lout = reinterpret_cast<Blob*>(lbuf.data());
+            check(at<Read>(save, 20)(save, lc, bnames, &bcnt, lbuf.size() * 8, lout) == S_OK && bcnt == 1 &&
+                      lout[0].info.size == payload.size() &&
+                      std::memcmp(lout[0].data, payload.data(), payload.size()) == 0,
+                  "ReadBlobData reads from a long/hashed container");
+            check(at<ByName>(save, 10)(save, provider, cname.c_str()) == S_OK,
+                  "DeleteContainer removes a long/hashed container");
+            at<Close>(save, 17)(save, lc);
+        }
+
+        // 150-char container + 100-char blob (combined path > MAX_PATH 260) and 256-char blob (hashed blob name).
+        Handle lc = nullptr;
+        check(at<Create>(save, 16)(save, provider, c150.c_str(), &lc) == S_OK && lc,
+              "CreateContainer accepts a 150-char container name");
+        Handle lu = nullptr;
+        check(at<Create>(save, 23)(save, lc, nullptr, &lu) == S_OK && lu, "CreateUpdate on 150-char container");
+        check(at<Write>(save, 25)(save, lu, b100.c_str(), reinterpret_cast<const uint8_t*>(payload.data()),
+                                  payload.size()) == S_OK,
+              "SubmitBlobWrite accepts a 100-char blob inside a 150-char container");
+        check(at<Write>(save, 25)(save, lu, b256.c_str(), reinterpret_cast<const uint8_t*>(payload.data()),
+                                  payload.size()) == S_OK,
+              "SubmitBlobWrite accepts a 256-char blob");
+        check(at<Submit>(save, 27)(save, lu) == S_OK, "SubmitUpdate commits long-path and hashed blobs");
+        at<Close>(save, 24)(save, lu);
+
+        Seen bseen;
+        check(at<EnumBlobs>(save, 18)(save, lc, &bseen, on_blob) == S_OK && bseen.names.size() == 2 &&
+                  bseen.names[0] == b100 && bseen.names[1] == b256,
+              "EnumerateBlobInfo returns exact 100-char and 256-char blob names");
+
+        const char* bnames[] = {b100.c_str(), b256.c_str()};
+        uint32_t bcnt = 2;
+        std::vector<uint64_t> lbuf(512);
+        auto* lout = reinterpret_cast<Blob*>(lbuf.data());
+        check(at<Read>(save, 20)(save, lc, bnames, &bcnt, lbuf.size() * 8, lout) == S_OK && bcnt == 2 &&
+                  std::strcmp(lout[0].info.name, b100.c_str()) == 0 &&
+                  std::strcmp(lout[1].info.name, b256.c_str()) == 0,
+              "ReadBlobData reads both long-path and hashed blobs");
+
+        Handle lu2 = nullptr;
+        check(at<Create>(save, 23)(save, lc, nullptr, &lu2) == S_OK && lu2, "CreateUpdate for hashed blob delete");
+        check(at<ByName>(save, 26)(save, lu2, b256.c_str()) == S_OK, "SubmitBlobDelete on 256-char blob");
+        check(at<Submit>(save, 27)(save, lu2) == S_OK, "SubmitUpdate commits hashed blob delete");
+        at<Close>(save, 24)(save, lu2);
+        Seen bafter;
+        check(at<EnumBlobs>(save, 18)(save, lc, &bafter, on_blob) == S_OK && bafter.names.size() == 1 &&
+                  bafter.names[0] == b100,
+              "deleted 256-char blob and its metadata are gone");
+        check(at<ByName>(save, 10)(save, provider, c150.c_str()) == S_OK, "DeleteContainer removes 150-char container");
+        at<Close>(save, 17)(save, lc);
+
+        // Write-old / read-new compatibility:
+        // 1) A 200-char CON.-prefixed container and NUL.-prefixed blob stay at the 200-char verbatim boundary.
+        // 2) An old hashed container (<200 chars, e.g. if an earlier build hashed it) is still enumerable and readable.
+        const std::string c_con200 = "CON." + std::string(196, 'x');
+        const std::string b_nul200 = "NUL." + std::string(196, 'y');
+        Handle lc200 = nullptr;
+        check(at<Create>(save, 16)(save, provider, c_con200.c_str(), &lc200) == S_OK && lc200,
+              "CreateContainer accepts a 200-char CON.-prefixed container");
+        Handle lu200 = nullptr;
+        check(at<Create>(save, 23)(save, lc200, nullptr, &lu200) == S_OK && lu200, "CreateUpdate on 200-char CON. container");
+        check(at<Write>(save, 25)(save, lu200, b_nul200.c_str(), reinterpret_cast<const uint8_t*>(payload.data()),
+                                  payload.size()) == S_OK,
+              "SubmitBlobWrite accepts a 200-char NUL.-prefixed blob");
+        check(at<Submit>(save, 27)(save, lu200) == S_OK, "SubmitUpdate commits 200-char CON./NUL. save");
+        at<Close>(save, 24)(save, lu200);
+        auto test_long = [](const std::filesystem::path& p) {
+            return std::filesystem::path(L"\\\\?\\" + p.lexically_normal().wstring());
+        };
+        check(std::filesystem::is_directory(
+                  test_long(root / L"local-user" / std::wstring(c_con200.begin(), c_con200.end()))),
+              "200-char CON.-prefixed container stays verbatim at the 200-byte boundary");
+        Seen c200_info;
+        check(at<GetInfo>(save, 13)(save, provider, c_con200.c_str(), &c200_info, on_container) == S_OK &&
+                  c200_info.names.size() == 1 && c200_info.names[0] == c_con200,
+              "GetContainerInfo reads 200-char CON.-prefixed container");
+        const char* nul_names[] = {b_nul200.c_str()};
+        uint32_t nul_cnt = 1;
+        std::vector<uint64_t> nul_buf(256);
+        auto* nul_out = reinterpret_cast<Blob*>(nul_buf.data());
+        check(at<Read>(save, 20)(save, lc200, nul_names, &nul_cnt, nul_buf.size() * 8, nul_out) == S_OK &&
+                  nul_cnt == 1 && nul_out[0].info.size == payload.size() &&
+                  std::memcmp(nul_out[0].data, payload.data(), payload.size()) == 0,
+              "ReadBlobData reads 200-char NUL.-prefixed blob");
+        check(at<ByName>(save, 10)(save, provider, c_con200.c_str()) == S_OK, "DeleteContainer removes 200-char CON. container");
+        at<Close>(save, 17)(save, lc200);
+
+        // Pre-existing hashed short container (simulating an old layout where a <200-char name was hashed).
+        const std::string legacy_name = "legacy_hashed_container";
+        const std::string legacy_blob = "legacy_hashed_blob";
+        // SHA-256("legacy_hashed_container") = 63a9... computed dynamically via a 256+ container or known digest:
+        // Create via direct directory placement using known SHA-256 of "legacy_c" and "legacy_b":
+        // sha256("legacy_c") = 0c8a8c76f05c8369f2f2b741f7932971b6511c72f4cfcf2f6e59588f8f53f4b5 -> verify in C++?
+        // Instead, use std::filesystem on an old verbatim-layout folder for a 201-char name (which new code hashes):
+        const std::string c201(201, 'v');
+        const std::string b201(201, 'w');
+        const std::filesystem::path old_dir = test_long(root / L"local-user" / std::wstring(c201.begin(), c201.end()));
+        std::filesystem::create_directories(old_dir, ec);
+        {
+            std::ofstream bf(old_dir / std::wstring(b201.begin(), b201.end()), std::ios::binary);
+            bf.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+        }
+        Handle lc201 = nullptr;
+        check(at<Create>(save, 16)(save, provider, c201.c_str(), &lc201) == S_OK && lc201,
+              "CreateContainer opens a 201-char container for write-old/read-new");
+        Seen old_cinfo;
+        check(at<GetInfo>(save, 13)(save, provider, c201.c_str(), &old_cinfo, on_container) == S_OK &&
+                  old_cinfo.names.size() == 1 && old_cinfo.names[0] == c201,
+              "GetContainerInfo finds a pre-existing verbatim 201-char container");
+        const char* b201_names[] = {b201.c_str()};
+        uint32_t b201_cnt = 1;
+        std::vector<uint64_t> b201_buf(256);
+        auto* b201_out = reinterpret_cast<Blob*>(b201_buf.data());
+        check(at<Read>(save, 20)(save, lc201, b201_names, &b201_cnt, b201_buf.size() * 8, b201_out) == S_OK &&
+                  b201_cnt == 1 && b201_out[0].info.size == payload.size() &&
+                  std::memcmp(b201_out[0].data, payload.data(), payload.size()) == 0,
+              "ReadBlobData reads a pre-existing verbatim 201-char blob");
+        // Overwrite the pre-existing verbatim 201-char blob: must leave one canonical entry, not two.
+        const std::string updated_payload = "updated-201-char-blob";
+        Handle lu201 = nullptr;
+        check(at<Create>(save, 23)(save, lc201, nullptr, &lu201) == S_OK && lu201,
+              "CreateUpdate for overwrite of pre-existing verbatim 201-char blob");
+        check(at<Write>(save, 25)(save, lu201, b201.c_str(),
+                                  reinterpret_cast<const uint8_t*>(updated_payload.data()),
+                                  updated_payload.size()) == S_OK,
+              "SubmitBlobWrite overwrites pre-existing verbatim 201-char blob");
+        check(at<Submit>(save, 27)(save, lu201) == S_OK, "SubmitUpdate commits overwrite of 201-char blob");
+        at<Close>(save, 24)(save, lu201);
+        Seen b201_enum;
+        b201_cnt = 1;
+        check(at<EnumBlobs>(save, 18)(save, lc201, &b201_enum, on_blob) == S_OK && b201_enum.names.size() == 1 &&
+                  b201_enum.names[0] == b201 &&
+                  at<Read>(save, 20)(save, lc201, b201_names, &b201_cnt, b201_buf.size() * 8, b201_out) == S_OK &&
+                  b201_cnt == 1 && b201_out[0].info.size == updated_payload.size() &&
+                  std::memcmp(b201_out[0].data, updated_payload.data(), updated_payload.size()) == 0 &&
+                  !std::filesystem::exists(old_dir / std::wstring(b201.begin(), b201.end())),
+              "overwriting pre-existing verbatim 201-char blob removes old copy and leaves one entry");
+        // Delete the 201-char blob: must remove both canonical and any legacy copy so ReadBlobData fails.
+        Handle lu201_del = nullptr;
+        check(at<Create>(save, 23)(save, lc201, nullptr, &lu201_del) == S_OK && lu201_del,
+              "CreateUpdate for delete of 201-char blob");
+        check(at<ByName>(save, 26)(save, lu201_del, b201.c_str()) == S_OK, "SubmitBlobDelete on 201-char blob");
+        check(at<Submit>(save, 27)(save, lu201_del) == S_OK, "SubmitUpdate commits delete of 201-char blob");
+        at<Close>(save, 24)(save, lu201_del);
+        Seen b201_after_del;
+        b201_cnt = 1;
+        check(at<EnumBlobs>(save, 18)(save, lc201, &b201_after_del, on_blob) == S_OK &&
+                  b201_after_del.names.empty() &&
+                  at<Read>(save, 20)(save, lc201, b201_names, &b201_cnt, b201_buf.size() * 8, b201_out) ==
+                      E_GS_BLOB_NOT_FOUND,
+              "deleting 201-char blob leaves 0 blobs and E_GS_BLOB_NOT_FOUND");
+        check(at<ByName>(save, 10)(save, provider, c201.c_str()) == S_OK && !std::filesystem::exists(old_dir),
+              "DeleteContainer removes pre-existing verbatim 201-char container");
+        at<Close>(save, 17)(save, lc201);
+    }
+
     // ---- delete the container ----
     async = XAsyncBlock{};
     check(at<ByNameAsync>(save, 11)(save, provider, "slots/SAVE_00.sav-1", &async) == S_OK && finished(&async) &&

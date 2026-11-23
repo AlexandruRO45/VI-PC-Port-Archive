@@ -10,9 +10,11 @@
 // Offline the saves are files, in the layout tools/saves.py imports into (docs/saves.md):
 //   <root>\local-user\<container>\<blob>      root = LEONIDA_SAVE_DIR, else %LOCALAPPDATA%\Leonida\saves
 // Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first character) stay, every other
-// UTF-8 byte becomes %XX. A container's display name is kept in "<container>\.display", which no encoded blob name
-// can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
-// progress; an encoded name never ends in '~' either.
+// UTF-8 byte becomes %XX. When an encoded component exceeds 200 bytes (below NTFS's 255-char limit, leaving room for
+// temp/metadata suffixes), it is stored as "#<sha256>" with the raw UTF-8 name kept in ".name" (container) or
+// ".blob.<sha256>" (blob). All filesystem calls use Windows \\?\ long paths. A container's display name is kept in
+// "<container>\.display", which no encoded or hashed blob name can collide with. Names ending in '~' are temporary
+// files of an update in progress; an encoded or hashed name never ends in '~' either.
 //
 // An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
 // its blob and removes the deleted ones, so a failed write leaves the container as it was.
@@ -91,6 +93,7 @@ constexpr uint64_t kMaxUpdateBytes = 16ull * 1024 * 1024;   // GS_MAX_BLOB_SIZE,
 constexpr uint64_t kQuotaBytes = 1ull << 30;                 // ASSUMPTION, see the header
 constexpr size_t kMaxContainerName = 256;
 constexpr size_t kMaxBlobName = 256;                         // ASSUMPTION, see the header
+constexpr size_t kMaxEncodedComponent = 200;
 
 // ---- Names ----
 
@@ -111,6 +114,78 @@ std::string encode_name(std::string_view name) {
     }
     return out;
 }
+
+std::string sha256_hex(std::string_view data) {
+    static constexpr uint32_t k[64] = {
+        0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+        0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+        0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+        0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+        0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+        0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+        0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+        0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u,
+    };
+    auto rotr = [](uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); };
+    uint32_t h[8] = {0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+                     0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u};
+    const uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
+    std::vector<uint8_t> msg(data.begin(), data.end());
+    msg.push_back(0x80);
+    while ((msg.size() % 64) != 56) msg.push_back(0);
+    for (int i = 7; i >= 0; --i) msg.push_back(static_cast<uint8_t>((bit_len >> (i * 8)) & 0xff));
+    for (size_t off = 0; off < msg.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            const size_t p = off + static_cast<size_t>(i) * 4;
+            w[i] = (static_cast<uint32_t>(msg[p]) << 24) | (static_cast<uint32_t>(msg[p + 1]) << 16) |
+                   (static_cast<uint32_t>(msg[p + 2]) << 8) | static_cast<uint32_t>(msg[p + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t t1 = hh + S1 + ch + k[i] + w[i];
+            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+    static const char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(64);
+    for (uint32_t v : h)
+        for (int i = 7; i >= 0; --i) out += hex[(v >> (i * 4)) & 0xf];
+    return out;
+}
+
+// Decided on the base %-encoding (<= 200 bytes) and hashed from the raw UTF-8 name, so verbatim-only escaping of
+// trailing dots / reserved device names (#5190) never pushes a 200-byte name across the hash threshold.
+std::string storage_name(std::string_view name) {
+    std::string enc = encode_name(name);
+    if (enc.size() <= kMaxEncodedComponent) return enc;
+    return "#" + sha256_hex(name);
+}
+
+bool is_hashed_component(std::string_view s) {
+    if (s.size() != 65 || s[0] != '#') return false;
+    for (size_t i = 1; i < s.size(); ++i) {
+        const char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
+std::string blob_meta_name(std::string_view hashed) { return ".blob." + std::string(hashed.substr(1)); }
 
 // The inverse; false for a file name encode_name could not have produced (temporary files, .display, strays).
 bool decode_name(std::string_view encoded, std::string& out) {
@@ -166,12 +241,30 @@ std::string narrow(const std::wstring& w) {
     return s;
 }
 
+fs::path long_path(const fs::path& p) {
+    const std::wstring& s = p.native();
+    if (s.empty() || s.rfind(L"\\\\?\\", 0) == 0) return p;
+    std::error_code ec;
+    fs::path abs = fs::absolute(p, ec);
+    std::wstring w = (ec ? p : abs).lexically_normal().native();
+    if (w.rfind(L"\\\\?\\", 0) == 0) return fs::path(std::move(w));
+    if (w.rfind(L"\\\\", 0) == 0) return fs::path(L"\\\\?\\UNC\\" + w.substr(2));
+    return fs::path(L"\\\\?\\" + w);
+}
+
+fs::path env_path(const wchar_t* name) {
+    const DWORD n = GetEnvironmentVariableW(name, nullptr, 0);
+    if (n == 0) return {};
+    std::wstring buf(n, L'\0');
+    const DWORD got = GetEnvironmentVariableW(name, buf.data(), n);
+    if (got == 0 || got >= n) return {};
+    buf.resize(got);
+    return fs::path(std::move(buf));
+}
+
 fs::path save_root() {
-    wchar_t buffer[MAX_PATH * 2];
-    DWORD n = GetEnvironmentVariableW(L"LEONIDA_SAVE_DIR", buffer, static_cast<DWORD>(std::size(buffer)));
-    if (n > 0 && n < std::size(buffer)) return fs::path(buffer);
-    n = GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, static_cast<DWORD>(std::size(buffer)));
-    if (n > 0 && n < std::size(buffer)) return fs::path(buffer) / L"Leonida" / L"saves";
+    if (fs::path p = env_path(L"LEONIDA_SAVE_DIR"); !p.empty()) return p;
+    if (fs::path p = env_path(L"LOCALAPPDATA"); !p.empty()) return p / L"Leonida" / L"saves";
     return {};
 }
 
@@ -185,11 +278,47 @@ struct XGameSaveProvider {
     std::string config_id;
     uint64_t serial = 0;
 };
+fs::path resolve_container_dir(const fs::path& user_dir, std::string_view name) {
+    const std::string stored = storage_name(name);
+    const fs::path primary = user_dir / widen(stored);
+    std::error_code ec;
+    if (fs::is_directory(long_path(primary), ec)) return primary;
+    if (is_hashed_component(stored)) {
+        const std::string enc = encode_name(name);
+        if (enc.size() <= 255) {
+            const fs::path alt = user_dir / widen(enc);
+            if (fs::is_directory(long_path(alt), ec)) return alt;
+        }
+    } else {
+        const fs::path alt = user_dir / widen("#" + sha256_hex(name));
+        if (fs::is_directory(long_path(alt), ec)) return alt;
+    }
+    return primary;
+}
+
+fs::path resolve_blob_path(const fs::path& dir, std::string_view name) {
+    const std::string stored = storage_name(name);
+    const fs::path primary = dir / widen(stored);
+    std::error_code ec;
+    if (fs::is_regular_file(long_path(primary), ec)) return primary;
+    if (is_hashed_component(stored)) {
+        const std::string enc = encode_name(name);
+        if (enc.size() <= 255) {
+            const fs::path alt = dir / widen(enc);
+            if (fs::is_regular_file(long_path(alt), ec)) return alt;
+        }
+    } else {
+        const fs::path alt = dir / widen("#" + sha256_hex(name));
+        if (fs::is_regular_file(long_path(alt), ec)) return alt;
+    }
+    return primary;
+}
+
 struct XGameSaveContainer {
     fs::path user_dir;   // the provider's, copied: a container outlives a closed provider safely
     std::string name;
     uint64_t serial = 0;
-    fs::path dir() const { return user_dir / widen(encode_name(name)); }
+    fs::path dir() const { return resolve_container_dir(user_dir, name); }
 };
 struct Op {
     bool write;
@@ -233,13 +362,23 @@ struct BlobFile {
     fs::path path;
 };
 
+std::string read_text(const fs::path& p) {
+    std::ifstream f(long_path(p), std::ios::binary);
+    return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : std::string{};
+}
+
 std::vector<BlobFile> list_blobs(const fs::path& dir) {
     std::vector<BlobFile> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
+    for (const auto& e : fs::directory_iterator(long_path(dir), ec)) {
         if (!e.is_regular_file(ec)) continue;
+        const std::string fname = narrow(e.path().filename().wstring());
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(fname, name)) {
+            if (!is_hashed_component(fname)) continue;
+            name = read_text(dir / widen(blob_meta_name(fname)));
+            if (name.empty() || sha256_hex(name) != fname.substr(1)) continue;
+        }
         out.push_back({name, static_cast<uint64_t>(e.file_size(ec)), e.path()});
     }
     std::sort(out.begin(), out.end(), [](const BlobFile& a, const BlobFile& b) { return a.name < b.name; });
@@ -248,18 +387,13 @@ std::vector<BlobFile> list_blobs(const fs::path& dir) {
 
 time_t modified_time(const fs::path& p) {
     WIN32_FILE_ATTRIBUTE_DATA data{};
-    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &data)) return 0;
+    if (!GetFileAttributesExW(long_path(p).c_str(), GetFileExInfoStandard, &data)) return 0;
     const uint64_t t = (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
     return t < 116444736000000000ull ? 0 : static_cast<time_t>((t - 116444736000000000ull) / 10000000ull);
 }
 
-std::string read_text(const fs::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    return f ? std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>()) : std::string{};
-}
-
 bool write_file(const fs::path& p, const void* data, size_t size) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    std::ofstream f(long_path(p), std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
     f.close();
@@ -289,10 +423,15 @@ ContainerRecord describe(const std::string& name, const fs::path& dir) {
 std::vector<ContainerRecord> list_containers(const fs::path& user_dir, std::string_view prefix) {
     std::vector<ContainerRecord> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(user_dir, ec)) {
+    for (const auto& e : fs::directory_iterator(long_path(user_dir), ec)) {
         if (!e.is_directory(ec)) continue;
+        const std::string fname = narrow(e.path().filename().wstring());
         std::string name;
-        if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
+        if (!decode_name(fname, name)) {
+            if (!is_hashed_component(fname)) continue;
+            name = read_text(e.path() / L".name");
+            if (name.empty() || sha256_hex(name) != fname.substr(1)) continue;
+        }
         if (name.compare(0, prefix.size(), prefix) != 0) continue;
         out.push_back(describe(name, e.path()));
     }
@@ -363,7 +502,7 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
         for (const BlobFile& b : list_blobs(dir)) wanted.push_back(b.name);
     }
     for (const std::string& name : wanted) {
-        std::ifstream f(dir / widen(encode_name(name)), std::ios::binary);
+        std::ifstream f(long_path(resolve_blob_path(dir, name)), std::ios::binary);
         if (!f) return E_GS_BLOB_NOT_FOUND;
         out.push_back({name, std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>())});
     }
@@ -379,33 +518,63 @@ HRESULT commit(XGameSaveUpdate* u) {
     uint64_t after = used_bytes(c->user_dir);
     for (const auto& [name, op] : u->ops) {
         std::error_code ec;
-        const fs::path p = dir / widen(encode_name(name));
+        const fs::path p = long_path(resolve_blob_path(dir, name));
         const uint64_t old = fs::is_regular_file(p, ec) ? static_cast<uint64_t>(fs::file_size(p, ec)) : 0;
         after = after - old + (op.write ? op.data.size() : 0);
     }
     if (after > kQuotaBytes) return E_GS_QUOTA_EXCEEDED;
 
     std::error_code ec;
-    fs::create_directories(dir, ec);
+    fs::create_directories(long_path(dir), ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
     std::vector<std::pair<fs::path, fs::path>> renames;   // temporary -> final
-    for (const auto& [name, op] : u->ops) {
-        if (!op.write) continue;
-        const fs::path final_path = dir / widen(encode_name(name));
+    auto stage_file = [&](const fs::path& final_path, const void* data, size_t size) {
         fs::path temp = final_path;
         temp += L"~";
-        if (!write_file(temp, op.data.data(), op.data.size())) {
-            for (const auto& r : renames) fs::remove(r.first, ec);
-            fs::remove(temp, ec);
-            return E_GS_OUT_OF_LOCAL_STORAGE;
+        if (!write_file(temp, data, size)) {
+            for (const auto& r : renames) fs::remove(long_path(r.first), ec);
+            fs::remove(long_path(temp), ec);
+            return false;
         }
         renames.emplace_back(temp, final_path);
+        return true;
+    };
+    if (is_hashed_component(storage_name(c->name))) {
+        if (!stage_file(dir / L".name", c->name.data(), c->name.size())) return E_GS_OUT_OF_LOCAL_STORAGE;
+    }
+    for (const auto& [name, op] : u->ops) {
+        if (!op.write) continue;
+        const std::string stored = storage_name(name);
+        if (!stage_file(dir / widen(stored), op.data.data(), op.data.size())) return E_GS_OUT_OF_LOCAL_STORAGE;
+        if (is_hashed_component(stored) &&
+            !stage_file(dir / widen(blob_meta_name(stored)), name.data(), name.size()))
+            return E_GS_OUT_OF_LOCAL_STORAGE;
     }
     for (const auto& [temp, final_path] : renames)
-        if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (!MoveFileExW(long_path(temp).c_str(), long_path(final_path).c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             return E_GS_OUT_OF_LOCAL_STORAGE;
-    for (const auto& [name, op] : u->ops)
-        if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
+    auto remove_alternate = [&](std::string_view name) {
+        const std::string stored = storage_name(name);
+        if (is_hashed_component(stored)) {
+            const std::string enc = encode_name(name);
+            if (enc.size() <= 255) fs::remove(long_path(dir / widen(enc)), ec);
+        } else {
+            const std::string hashed = "#" + sha256_hex(name);
+            fs::remove(long_path(dir / widen(hashed)), ec);
+            fs::remove(long_path(dir / widen(blob_meta_name(hashed))), ec);
+        }
+    };
+    for (const auto& [name, op] : u->ops) {
+        if (op.write) {
+            remove_alternate(name);
+            continue;
+        }
+        const std::string stored = storage_name(name);
+        fs::remove(long_path(dir / widen(stored)), ec);
+        if (is_hashed_component(stored)) fs::remove(long_path(dir / widen(blob_meta_name(stored))), ec);
+        remove_alternate(name);
+    }
     if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }
@@ -421,7 +590,7 @@ HRESULT open_provider(XUserHandle user, const char* config_id, XGameSaveProvider
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     const fs::path user_dir = root / L"local-user";
     std::error_code ec;
-    fs::create_directories(user_dir, ec);
+    fs::create_directories(long_path(user_dir), ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
     auto* p = new XGameSaveProvider{user_dir, config_id};
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
@@ -448,8 +617,15 @@ HRESULT delete_container(XGameSaveProviderHandle p, const char* name) {
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
     std::error_code ec;
-    fs::remove_all(p->user_dir / widen(encode_name(name)), ec);
-    return ec ? E_FAIL : S_OK;
+    const fs::path primary = p->user_dir / widen(storage_name(name));
+    const fs::path resolved = resolve_container_dir(p->user_dir, name);
+    fs::remove_all(long_path(primary), ec);
+    if (ec) return E_FAIL;
+    if (resolved != primary) {
+        fs::remove_all(long_path(resolved), ec);
+        if (ec) return E_FAIL;
+    }
+    return S_OK;
 }
 
 HRESULT submit_update(XGameSaveUpdateHandle u) {
@@ -490,7 +666,8 @@ HRESULT do_work(Job& job, size_t& size) {
         if (!job.user) return E_INVALIDARG;
         const fs::path root = save_root();
         std::error_code ec;
-        if (root.empty() || (fs::create_directories(root / L"local-user", ec), ec)) return E_GS_OUT_OF_LOCAL_STORAGE;
+        if (root.empty() || (fs::create_directories(long_path(root / L"local-user"), ec), ec))
+            return E_GS_OUT_OF_LOCAL_STORAGE;
         size = sizeof(XGameSaveProviderHandle);
         return S_OK;
     }
@@ -524,9 +701,9 @@ HRESULT do_work(Job& job, size_t& size) {
     if (job.identity == &kFolderIdentity) {
         const fs::path root = save_root();
         if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
-        const fs::path dir = root / L"files" / widen(encode_name(job.text));
+        const fs::path dir = root / L"files" / widen(storage_name(job.text));
         std::error_code ec;
-        fs::create_directories(dir, ec);
+        fs::create_directories(long_path(dir), ec);
         if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
         job.folder = narrow(dir.wstring());
         size = job.folder.size() + 1;
@@ -667,9 +844,9 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
     if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
-    const fs::path dir = p->user_dir / widen(encode_name(name));
+    const fs::path dir = resolve_container_dir(p->user_dir, name);
     std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return S_OK;
+    if (!fs::is_directory(long_path(dir), ec)) return S_OK;
     const ContainerRecord c = describe(name, dir);
     const XGameSaveContainerInfo info{c.name.c_str(), c.display_name.c_str(), c.blob_count, c.total_size, c.modified,
                                       false};
@@ -883,7 +1060,8 @@ HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* confi
     if (root.empty()) return E_GS_OUT_OF_LOCAL_STORAGE;
     uint64_t used = 0;
     std::error_code ec;
-    for (const auto& e : fs::recursive_directory_iterator(root / L"files" / widen(encode_name(config_id)), ec))
+    for (const auto& e : fs::recursive_directory_iterator(
+             long_path(root / L"files" / widen(storage_name(config_id))), ec))
         if (e.is_regular_file(ec)) used += static_cast<uint64_t>(e.file_size(ec));
     *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
     return S_OK;

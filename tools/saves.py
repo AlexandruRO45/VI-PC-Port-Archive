@@ -513,6 +513,9 @@ def diff(pa, pb):
 
 
 # ---------------------------------------------------------------------------------------------- import
+XGS_MAX_COMPONENT = 200
+
+
 def xgs_encode(name):
     """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
     [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
@@ -524,6 +527,28 @@ def xgs_encode(name):
         else:
             out.append('%%%02X' % c)
     return ''.join(out)
+
+
+def xgs_storage_name(name):
+    """Same rule as storage_name() in runtime/shims/xgameruntime_gamesave.cpp: xgs_encode(name) when the base
+    %-encoding fits in XGS_MAX_COMPONENT bytes, otherwise '#<sha256>' of the raw UTF-8 name (with the raw name in
+    .name / .blob.<sha256>). Decided on the base encoding so verbatim-only escaping does not shift 200-byte names."""
+    import hashlib
+    enc = xgs_encode(name)
+    if len(enc) <= XGS_MAX_COMPONENT:
+        return enc
+    return '#' + hashlib.sha256(name.encode('utf-8')).hexdigest()
+
+
+def _win_long_path(path):
+    if os.name != 'nt' or path.startswith('\\\\?\\'):
+        return path
+    ap = os.path.abspath(path)
+    if ap.startswith('\\\\?\\'):
+        return ap
+    if ap.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + ap[2:]
+    return '\\\\?\\' + ap
 
 
 def save_slot(folder):
@@ -628,8 +653,10 @@ def import_saves(args):
             files.append(('chives.dat', 'chives.dat'))
         for src_name, blob_name in files:
             src = os.path.join(folder, src_name)
-            dst = os.path.join(root, xgs_encode(container), xgs_encode(blob_name))
-            plan.append((src, dst))
+            c_dir = os.path.join(root, xgs_storage_name(container))
+            b_stored = xgs_storage_name(blob_name)
+            dst = os.path.join(c_dir, b_stored)
+            plan.append((src, dst, container, blob_name, b_stored))
             data = read(src)
             manifest['entries'].append({'folder': sd, 'source': src_name, 'title': title, 'container': container,
                                         'blob': blob_name, 'size': len(data),
@@ -639,23 +666,32 @@ def import_saves(args):
             if not valid_container_name(container):
                 print(f'warning: container {container!r} breaks XGameSaveCreateContainer\'s naming rule, so the game '
                       f'cannot open it by that name; give it another with --map {sd}=NAME', file=sys.stderr)
-    dsts = [d.lower() for _, d in plan]
+    dsts = [d.lower() for _, d, _, _, _ in plan]
     if len(set(dsts)) != len(dsts):
         raise SystemExit('import: two payloads map to the same container/blob (names are case-insensitive on '
                          'Windows); use --map to separate them')
     if dry:
         print('dry run: nothing written')
         return
-    for src, dst in plan:
-        if os.path.exists(dst) and not force:
+    for _, dst, _, _, _ in plan:
+        if os.path.exists(_win_long_path(dst)) and not force:
             raise SystemExit(f'{dst} exists; pass --force to overwrite')
-    for src, dst in plan:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        tmp = os.path.join(os.path.dirname(dst), '~' + os.path.basename(dst))   # the shim's temp-file convention
-        with open(tmp, 'wb') as f:
-            f.write(read(src))
-        os.replace(tmp, dst)
-    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8', newline="\n") as f:
+    for src, dst, c_name, b_name, b_stored in plan:
+        c_dir = os.path.dirname(dst)
+        os.makedirs(_win_long_path(c_dir), exist_ok=True)
+        def write_atomic(target_path, raw_bytes):
+            tmp_p = _win_long_path(os.path.join(c_dir, os.path.basename(target_path) + '~'))
+            with open(tmp_p, 'wb') as f:
+                f.write(raw_bytes)
+            os.replace(tmp_p, _win_long_path(target_path))
+        write_atomic(dst, read(src))
+        c_stored = os.path.basename(c_dir)
+        if c_stored.startswith('#'):
+            write_atomic(os.path.join(c_dir, '.name'), c_name.encode('utf-8'))
+        if b_stored.startswith('#'):
+            write_atomic(os.path.join(c_dir, '.blob.' + b_stored[1:]), b_name.encode('utf-8'))
+    os.makedirs(_win_long_path(out), exist_ok=True)
+    with open(_win_long_path(os.path.join(out, 'import-manifest.json')), 'w', encoding='utf-8', newline="\n") as f:
         json.dump(manifest, f, indent=1)
     print(f'wrote {len(plan)} blobs under {root}')
 

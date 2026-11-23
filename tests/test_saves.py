@@ -610,12 +610,32 @@ class MalformedSlayerTest(unittest.TestCase):
 
 class ImportTest(unittest.TestCase):
     def test_encoding_matches_the_shim(self):
-        # Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp.
+        # Same rule as encode_name() / storage_name() in runtime/shims/xgameruntime_gamesave.cpp.
         self.assertEqual(saves.xgs_encode("slot 1/main"), "slot%201%2Fmain")
         self.assertEqual(saves.xgs_encode("world.dat"), "world.dat")
         self.assertEqual(saves.xgs_encode(".hidden"), "%2Ehidden")
         self.assertEqual(saves.xgs_encode("~tmp"), "%7Etmp")
         self.assertEqual(saves.xgs_encode("é"), "%C3%A9")
+        self.assertEqual(saves.xgs_storage_name("a" * 200), "a" * 200)
+        self.assertEqual(saves.xgs_storage_name("CON." + "a" * 196), "CON." + "a" * 196)
+        self.assertEqual(saves.xgs_storage_name("NUL." + "a" * 196), "NUL." + "a" * 196)
+        hashed = saves.xgs_storage_name("a" * 201)
+        self.assertTrue(hashed.startswith("#") and len(hashed) == 65, hashed)
+
+    def test_import_long_container_and_blob_names(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            story, _, jsav = self._folders(tmp)
+            out = os.path.join(tmp, "saves")
+            cname = "a" * 256
+            bname = "b" * 256
+            quiet(saves.import_saves, [story, "--out", out, "--map", f"SLOT3={cname}/{bname}"])
+            c_hash = hashlib.sha256(cname.encode("utf-8")).hexdigest()
+            b_hash = hashlib.sha256(bname.encode("utf-8")).hexdigest()
+            c_dir = os.path.join(out, "local-user", "#" + c_hash)
+            self.assertEqual(rd(os.path.join(c_dir, "#" + b_hash)), jsav)
+            self.assertEqual(rd(os.path.join(c_dir, ".name")).decode("utf-8"), cname)
+            self.assertEqual(rd(os.path.join(c_dir, ".blob." + b_hash)).decode("utf-8"), bname)
 
     def _folders(self, tmp):
         jsav, _, _ = make_jsav()
