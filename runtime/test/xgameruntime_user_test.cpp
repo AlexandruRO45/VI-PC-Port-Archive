@@ -205,8 +205,17 @@ int main(int argc, char** argv) {
           "Modern: the classic gamertag when none is set");
     check(tag(tag_face, h, 2, sizeof(buf), buf, &used) == S_OK && buf[0] == 0 && used == 1,
           "ModernSuffix: empty (just the terminator)");
-    check(tag(tag_face, h, 0, want - 1, buf, &used) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
-          "a buffer one byte short is E_INSUFFICIENT_BUFFER");
+    constexpr HRESULT insufficient = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    check(tag(tag_face, h, 0, 0, nullptr, &used) == insufficient && used == want,
+          "Classic size query reports the required bytes including the terminator");
+    check(tag(tag_face, h, 2, 0, nullptr, &used) == insufficient && used == 1,
+          "ModernSuffix size query reports one byte for the terminator");
+    char sentinel[sizeof(buf)];
+    std::memset(sentinel, '!', sizeof(sentinel));
+    std::memcpy(buf, sentinel, sizeof(buf));
+    check(tag(tag_face, h, 0, want - 1, buf, &used) == insufficient && used == want &&
+              std::memcmp(buf, sentinel, sizeof(buf)) == 0,
+          "a buffer one byte short reports the required size without truncating");
     check(tag(tag_face, h, 7, sizeof(buf), buf, &used) == E_INVALIDARG, "an unknown component is E_INVALIDARG");
 
     // ---- handles: duplicate, close, all accounted for (3, 4) ----

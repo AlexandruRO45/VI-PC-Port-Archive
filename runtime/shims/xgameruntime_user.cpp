@@ -382,7 +382,7 @@ bool STDMETHODCALLTYPE user_is_store_user(void*, XUserHandle) { return true; }
 // HRESULT XUserGetGamertag(XUserHandle user, XUserGamertagComponent component, size_t gamertagSize, char* gamertag,
 //                          size_t* gamertagUsed). The offline user has a classic gamertag: Modern and UniqueModern are
 // the same text (a classic tag has no '#' and no suffix) and ModernSuffix is empty. gamertagUsed counts the
-// terminator.
+// terminator, including when the caller needs a larger buffer.
 HRESULT STDMETHODCALLTYPE user_get_gamertag(void*, XUserHandle user, XUserGamertagComponent component, size_t size,
                                             char* out, size_t* used) {
     if (used) *used = 0;
@@ -401,9 +401,9 @@ HRESULT STDMETHODCALLTYPE user_get_gamertag(void*, XUserHandle user, XUserGamert
         return E_INVALIDARG;
     }
     const size_t need = std::strlen(text) + 1;
+    if (used) *used = need;
     if (!out || size < need) return kInsufficientBuffer;
     std::memcpy(out, text, need);
-    if (used) *used = need;
     return S_OK;
 }
 
