@@ -749,7 +749,7 @@ The compute path, end to end:
     standalone device enables where the GPU has it and reports in `VulkanDeviceInfo::features`; without it such a
     PSO is `E_NOTIMPL`. The PSO's topology type must be `TRIANGLE`, the GS's input (`E_INVALIDARG` otherwise). The
     push-constant range names the geometry stage only on such a device (`d3d12_geometry_test`).
-  - **Refused with a log:** hull and domain stages, stream output, MSAA, set-0 bindings, and two stages
+  - **Refused with a log:** hull and domain stages, stream output, set-0 bindings on a device without the bindless set 0, and two stages
     that both read their code base (question 14, section 5.2). More than eight render targets is `E_INVALIDARG`.
   - **Push constants:** both PSO paths declare the 144-byte block as one range. Its stage flags are the whole
     stage table the graphics path accepts, and the replay pushes with the same flags. A device whose
