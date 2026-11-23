@@ -234,11 +234,15 @@ def _accessor_type(gltf: dict, index: object) -> str | None:
 
 def _morph_target_count(gltf: dict, node: dict | None) -> int | None:
     mesh = _entry(gltf, "meshes", _object(node).get("mesh"))
-    counts = {len(_array(_object(primitive).get("targets")))
-              for primitive in _array(_object(mesh).get("primitives"))}
-    # A valid glTF mesh has the same number of morph targets on every primitive.
+    counts = set()
+    for primitive in _array(_object(mesh).get("primitives")):
+        targets = _array(_object(primitive).get("targets"))
+        counts.add(len(targets) if all(isinstance(t, dict) for t in targets) else -1)
+    # A valid glTF mesh has the same number of morph targets on every primitive,
+    # and every target entry is an object mapping attributes to accessors.
     if len(counts) == 1:
-        return counts.pop() or None
+        count = counts.pop()
+        return count if count > 0 else None
     return None
 
 

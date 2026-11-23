@@ -727,6 +727,9 @@ class GlbInspectTests(unittest.TestCase):
                      targets=[{"POSITION": 0}, {"POSITION": 0}]),
                      g["meshes"][0]["primitives"].append(
                          {"attributes": {"POSITION": 0}, "targets": [{"POSITION": 0}]}))),
+                ("a non-object target entry",
+                 lambda g: g["meshes"][0]["primitives"][0].update(
+                     targets=[7, {"POSITION": 0}])),
             )
             for name, mutate in cases:
                 with self.subTest(case=name):
