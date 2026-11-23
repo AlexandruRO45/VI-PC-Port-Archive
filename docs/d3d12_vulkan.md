@@ -795,10 +795,6 @@ The compute path, end to end:
     and offset alignment checks (`4 MiB` vs `64 KiB`, `D3D-222`). `CreatePlacedResource2`'s castable-format list
     reaches the placed texture's image as the committed path's does (D3D-90).
 
-Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
-therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
-multisampled pipelines, several viewports, primitive restart; `requiredSubgroupSize = 64` for wave64 compute;
-the game's present entry point (`PresentX`; the DXGI factory/swapchain and the presenter above are what it
 - **Subgroup size (compute and graphics PSOs).** A translated shader assumes one subgroup size, and a GPU whose
   default differs runs it inexact: a wave64 shader reads lanes 32-63 of a 32-wide subgroup, and a wave32 pixel
   shader on a 64-wide default reads the other half's lanes (AnyPS5 #487 on RDNA4). `runtime/src/subgroup_size.h`
