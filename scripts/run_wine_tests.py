@@ -82,12 +82,20 @@ class DriveMap:
         if os.path.lexists(link):
             self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
             return self
-        self.scratch = tempfile.mkdtemp(prefix="wine-drive-")
-        parent = os.path.join(self.scratch, *rest[:-1])
-        os.makedirs(parent, exist_ok=True)
-        os.symlink(self.root, os.path.join(parent, rest[-1]))
-        os.symlink(self.scratch, link)
-        self.link = link
+        scratch = tempfile.mkdtemp(prefix="wine-drive-")
+        try:
+            parent = os.path.join(scratch, *rest[:-1])
+            os.makedirs(parent, exist_ok=True)
+            os.symlink(self.root, os.path.join(parent, rest[-1]))
+            try:
+                os.symlink(scratch, link)
+            except FileExistsError:
+                self.note = f"drive {drive}: is already set in {dosdevices}: left as it is"
+                return self
+            self.link, self.scratch = link, scratch
+        finally:
+            if self.scratch != scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
         self.note = f"drive {drive}: maps {self.windows_root} to {self.root} for this run"
         return self
 

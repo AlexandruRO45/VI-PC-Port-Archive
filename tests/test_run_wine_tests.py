@@ -338,6 +338,37 @@ class DriveMapTest(unittest.TestCase):
             self.assertIn("already set", drive.note)
         self.assertEqual(os.readlink(self.link), str(other))
 
+    def test_setup_failure_removes_the_temporary_directory(self):
+        scratch = Path(self._tmp.name) / "scratch"
+        scratch.mkdir()
+        drive = rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix))
+        with mock.patch.object(rwt.tempfile, "mkdtemp", return_value=str(scratch)), \
+                mock.patch.object(rwt.os, "symlink", side_effect=PermissionError("symlink denied")), \
+                self.assertRaisesRegex(PermissionError, "symlink denied"):
+            with drive:
+                self.fail("the drive was not mapped")
+        self.assertFalse(scratch.exists())
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_a_drive_created_during_setup_is_left_alone(self):
+        other = self.prefix / "elsewhere"
+        other.mkdir()
+        scratch = Path(self._tmp.name) / "scratch"
+        scratch.mkdir()
+        symlink = os.symlink
+
+        def create_link(src, dst):
+            if Path(dst) == self.link:
+                symlink(other, dst)
+            symlink(src, dst)
+
+        with mock.patch.object(rwt.tempfile, "mkdtemp", return_value=str(scratch)), \
+                mock.patch.object(rwt.os, "symlink", side_effect=create_link):
+            with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix)) as drive:
+                self.assertIn("already set", drive.note)
+        self.assertEqual(os.readlink(self.link), str(other))
+        self.assertFalse(scratch.exists())
+
     def test_no_prefix_or_no_drive_letter_maps_nothing(self):
         with rwt.DriveMap("D:/a/b", str(self.root), str(self.prefix / "absent")) as drive:
             self.assertIn("no Wine prefix", drive.note)
