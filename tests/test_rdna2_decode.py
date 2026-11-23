@@ -105,6 +105,20 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         info64 = rdna2_decode.decode_bytes(words(w_cmp), wave32=False)
         self.assertEqual(info64["insns"][0]["args"][0]["t"], "vcc")
 
+    def test_gfx1013_vop3_140_decodes_as_mad_legacy(self):
+        # Hand-encoded VOP3 0x140: v_mad_legacy_f32 v8, v1, v2, v3 on gfx1013.
+        # The same opcode is v_fma_legacy_f32 on gfx103x (docs/design.md opcode differences).
+        code = words(0xD5400008, 0x040E0501)
+        info = rdna2_decode.decode_bytes(code)
+        self.assertEqual(info["invalid"], 0)
+        ins = info["insns"][0]
+        self.assertEqual(ins["op"], "v_mad_legacy_f32")
+        self.assertEqual([a["r"] for a in ins["args"]], [8, 1, 2, 3])
+        self.assertIn("v_mad_legacy_f32 v8, v1, v2, v3", rdna2_decode.format_insn(ins))
+        text, bad, err = shader_disasm.disasm(code, "gfx1013", backend="python")
+        self.assertEqual((bad, err), (0, ""))
+        self.assertIn("v_mad_legacy_f32 v8, v1, v2, v3", text)
+
     def test_vop3p_dot4_i8_with_opsel_that_llvm_mc_rejects(self):
         # Raw RDNA2 hardware-measured word from docs/fspx.md & tests/semantic/test_alu_dot4_i8.py:
         # 0xCC165008 0x0C0E0501 = v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,1,0] op_sel_hi:[1,0,1]
