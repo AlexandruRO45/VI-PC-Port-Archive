@@ -601,5 +601,84 @@ class TestSIMDMultiLaneDivergence(unittest.TestCase):
                 self.assertEqual(state.get_lane_vgpr(lane, r), expected)
 
 
+
+
+class TestRegisterAliasingAndOperandPreservation(unittest.TestCase):
+    """Phase 5: Unit tests for register aliasing and in-place operand preservation."""
+
+    def test_scalar_operand_preservation_boundary_registers(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        state.set_vgpr(0, 0x12345678)
+        state.set_vgpr(255, 0x87654321)
+        state.set_m0(5)
+
+        v0 = RegisterOperand(0, RegType.VGPR)
+        instr_v0 = DSGWSBarrierVInstruction(vdata0=v0, offset=1)
+        interp.execute(instr_v0, state)
+        self.assertEqual(state.get_vgpr(0), 0x12345678)
+        self.assertEqual(state.get_m0(), 5)
+
+        v255 = RegisterOperand(255, RegType.VGPR)
+        instr_v255 = DSGWSBarrierVInstruction(vdata0=v255, offset=2)
+        interp.execute(instr_v255, state)
+        self.assertEqual(state.get_vgpr(255), 0x87654321)
+        self.assertEqual(state.get_m0(), 5)
+
+    def test_scalar_full_register_file_undisturbed(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            state.set_vgpr(i, 0xC0000000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            state.set_sgpr(i, 0xD0000000 | i)
+        state.set_m0(0x19)
+
+        instr = DSGWSBarrierVInstruction(offset=8)
+        interp.execute(instr, state)
+
+        for i in range(DEFAULT_NUM_VGPRS):
+            self.assertEqual(state.get_vgpr(i), 0xC0000000 | i)
+        for i in range(DEFAULT_NUM_SGPRS):
+            self.assertEqual(state.get_sgpr(i), 0xD0000000 | i)
+        self.assertEqual(state.get_m0(), 0x19)
+
+    def test_scalar_repeated_operand_use_across_barriers(self) -> None:
+        state = ScalarState()
+        interp = ScalarInterpreter()
+
+        common_val = 0xFEEDFACE
+        state.set_vgpr(5, common_val)
+        v5 = RegisterOperand(5, RegType.VGPR)
+
+        for i in range(6):
+            instr = DSGWSBarrierVInstruction(vdata0=v5, offset=i)
+            interp.execute(instr, state)
+            self.assertEqual(state.get_vgpr(5), common_val)
+
+        for i in range(6):
+            self.assertEqual(state.gws.read_releases(i), 1)
+
+    def test_simd_multi_lane_preservation_under_divergence(self) -> None:
+        mask = 0x3333333333333333
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        interp = SIMDInterpreter()
+
+        for lane in range(64):
+            for r in range(16):
+                state.set_lane_vgpr(lane, r, ((lane + 1) * 200) + r)
+
+        instr = DSGWSBarrierVInstruction(offset=14)
+        res = interp.execute(instr, state)
+        self.assertIsNotNone(res)
+
+        for lane in range(64):
+            for r in range(16):
+                expected = ((lane + 1) * 200) + r
+                self.assertEqual(state.get_lane_vgpr(lane, r), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
