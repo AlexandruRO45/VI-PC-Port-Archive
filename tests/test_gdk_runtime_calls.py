@@ -551,5 +551,16 @@ class GeneratorTest(unittest.TestCase):
             self.assertEqual(gen.main([os.path.join(self.root, "missing"), "--out", out]), 1)
 
 
+class CliTest(unittest.TestCase):
+    def test_a_directory_input_is_reported_as_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = grc.main([tmp])
+        self.assertEqual(rc, 2)
+        self.assertIn("is a directory", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
