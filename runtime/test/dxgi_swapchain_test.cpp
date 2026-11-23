@@ -1788,6 +1788,36 @@ int main() {
                 return fail("CreateSwapChainForCoreWindow should reject invalid sample descriptions");
             }
         }
+        for (DXGI_SWAP_EFFECT effect : {DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_SEQUENTIAL}) {
+            DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+            invalid.SwapEffect = effect;
+            IDXGISwapChain1* rejected = nullptr;
+            const HRESULT hr = factory->CreateSwapChainForCoreWindow(queue, mock_cw, &invalid, nullptr, &rejected);
+            if (rejected) rejected->Release();
+            if (hr != DXGI_ERROR_INVALID_CALL || rejected) {
+                mock_cw->Release();
+                DestroyWindow(hwnd4);
+                return fail("CreateSwapChainForCoreWindow should reject invalid swap effects");
+            }
+        }
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT device_hr = factory->CreateSwapChainForCoreWindow(dev, mock_cw, &scd, nullptr, &rejected);
+        if (rejected) rejected->Release();
+        if (device_hr != DXGI_ERROR_INVALID_CALL || rejected) {
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("CreateSwapChainForCoreWindow should reject a device instead of a queue");
+        }
+        DXGI_SWAP_CHAIN_DESC1 sequential = scd;
+        sequential.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        IDXGISwapChain1* sequential_sc = nullptr;
+        const HRESULT sequential_hr = factory->CreateSwapChainForCoreWindow(queue, mock_cw, &sequential, nullptr, &sequential_sc);
+        if (sequential_sc) sequential_sc->Release();
+        if (FAILED(sequential_hr) || !sequential_sc) {
+            mock_cw->Release();
+            DestroyWindow(hwnd4);
+            return fail("CreateSwapChainForCoreWindow with FLIP_SEQUENTIAL failed");
+        }
         IDXGISwapChain1* cw_sc1 = nullptr;
         if (FAILED(factory->CreateSwapChainForCoreWindow(queue, mock_cw, &scd, nullptr, &cw_sc1)) || !cw_sc1) {
             mock_cw->Release();

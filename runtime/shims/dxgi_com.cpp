@@ -1460,12 +1460,8 @@ public:
     // only when nothing else is wrong.
     static HRESULT check_hwnd_swap_chain(IUnknown* device, HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc,
                                          IDXGISwapChain1** out) {
-        if (!device || !hwnd || !desc || !out) return DXGI_ERROR_INVALID_CALL;
-        ID3D12CommandQueue* queue = nullptr;
-        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return DXGI_ERROR_INVALID_CALL;
-        queue->Release();
-        if (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
-            return DXGI_ERROR_INVALID_CALL;
+        if (!hwnd) return DXGI_ERROR_INVALID_CALL;
+        if (const HRESULT hr = check_swap_chain_common(device, desc, out); FAILED(hr)) return hr;
         if (desc->Scaling != DXGI_SCALING_STRETCH && desc->Scaling != DXGI_SCALING_NONE) return DXGI_ERROR_INVALID_CALL;
         if (desc->AlphaMode != DXGI_ALPHA_MODE_UNSPECIFIED && desc->AlphaMode != DXGI_ALPHA_MODE_IGNORE)
             return DXGI_ERROR_INVALID_CALL;
@@ -1476,12 +1472,22 @@ public:
         constexpr DXGI_USAGE kRefusedUsage =
             DXGI_USAGE_SHARED | DXGI_USAGE_READ_ONLY | DXGI_USAGE_DISCARD_ON_PRESENT | DXGI_USAGE_UNORDERED_ACCESS;
         if (desc->BufferUsage & kRefusedUsage) return DXGI_ERROR_INVALID_CALL;
-        // The host checks these before the size: MSAA 4 or one buffer at width 16385 is still INVALID_CALL.
-        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         if (dxgi_to_vk_format(desc->Format) == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
         if (desc->Width > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || desc->Height > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION)
             return E_INVALIDARG;
+        return S_OK;
+    }
+
+    static HRESULT check_swap_chain_common(IUnknown* device, const DXGI_SWAP_CHAIN_DESC1* desc,
+                                           IDXGISwapChain1** out) {
+        if (!device || !desc || !out) return DXGI_ERROR_INVALID_CALL;
+        ID3D12CommandQueue* queue = nullptr;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return DXGI_ERROR_INVALID_CALL;
+        queue->Release();
+        if (desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL && desc->SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD)
+            return DXGI_ERROR_INVALID_CALL;
+        if (desc->SampleDesc.Count != 1 || desc->SampleDesc.Quality != 0) return DXGI_ERROR_INVALID_CALL;
         return S_OK;
     }
 
@@ -1512,6 +1518,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (!device || !window || !desc) return E_INVALIDARG;
+        if (const HRESULT hr = check_swap_chain_common(device, desc, out); FAILED(hr)) return hr;
         // UWP / Game Core Scarlett titles present to an ICoreWindow. Extract the underlying
         // Win32 HWND via ICoreWindowInterop.
         static constexpr GUID kIID_ICoreWindowInterop = {
