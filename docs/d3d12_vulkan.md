@@ -1057,10 +1057,11 @@ and any validation error fails them.
     result was identical, checked on both GPUs). Both devices enable `shaderDrawParameters` where supported, which
     #436's shaders need. A non-zero base would differ (hardware: zero-based, the base in an SGPR), so the test avoids one.
 - `d3d12_method_variants_test`: each variant against the method it wraps, on the device directly (the proxy's
-  slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 12 creation cases (buffers on the
-  three heap types, textures, a volume, a multisampled target, and three shapes the base refuses) through every
-  `CreateCommittedResource` variant, which must give the same result, description, heap properties and `Map`
-  answer. It runs the edge cases in the table above and compares them with the host's PC runtime when there is
+  slot 76 is the Xbox texture method, not `CreateCommittedResource3`). It runs 14 creation cases (buffers on the
+  three heap types, textures, a volume, a multisampled target, three shapes the base refuses and a `D32_FLOAT`
+  render target the Vulkan drivers measured refuse) through every `CreateCommittedResource` variant, which must give
+  the same result, description, heap properties and `Map` answer, and without an output `S_FALSE` where creation
+  succeeds and its refusal where it fails. It runs the edge cases in the table above and compares them with the host's PC runtime when there is
   one; protected sessions are checked on the layer alone, and castable lists have their own success/refusal
   checks. `GetCopyableFootprints1` must match `GetCopyableFootprints` field by field, including the failure
   answer. A texture from `CreateCommittedResource3`
@@ -1893,7 +1894,14 @@ The trace will enumerate them.
   buffer and a format of the resource's family; descriptor heaps may have zero descriptors; non-monitored fences are
   refused; a null output is `S_FALSE` (a capability check) except for `CreateCommandQueue`, which answers
   `E_UNEXPECTED`, and `CreateDescriptorHeap` answers it before its flag, type and node rules (`S_FALSE` even for a
-  shader-visible RTV heap) where committed resources and fences check their arguments first; a `GPU_UPLOAD` heap is
+  shader-visible RTV heap) where committed resources and fences check their arguments first; a committed resource's
+  check makes every argument check its creation makes (the Vulkan device's answer for a texture's image included)
+  and creates nothing, so it is `S_FALSE` whatever the interface and however little room there is: the RX 5700 host
+  answers `S_FALSE` up to a `UINT64_MAX`-byte buffer (`E_OUTOFMEMORY` with an output, where the layer's creation
+  refuses a buffer within 64 KiB of that size as `E_INVALIDARG`) and an 8 TiB texture, and the layer answers it where
+  creation fails with `E_OUTOFMEMORY`: a buffer larger than the GPU address arena, and a texture larger than any
+  memory heap on a device with the arena and one without it (`check_no_room` in `d3d12_method_variants_test`, whose
+  `compare_creation` also asks every creation case without an output); a `GPU_UPLOAD` heap is
   refused, since `CheckFeatureSupport` reports `OPTIONS16.GPUUploadHeapSupported` FALSE (a host with GPU upload
   heaps, which needs Resizable BAR, accepts it, so that case is compared only on a host without them); a
   global-realtime queue is `DXGI_ERROR_ACCESS_DENIED` without the privilege; `Map` refuses a
@@ -1915,18 +1923,20 @@ The trace will enumerate them.
   resource (but any initial state for a buffer in an upload or readback heap, and no UAVs there); a buffer at a
   64 KiB-aligned offset; a texture at a multiple of its `GetResourceAllocationInfo` alignment (4 KiB for a small
   texture), in a heap aligned at least as much, and whole inside the heap; the heap's `DENY` flags against the
-  resource; then a null output is `E_UNEXPECTED` and nothing is made.
+  resource; `CreatePlacedResource2`'s castable-format list (a format of another texel size, or one without a mapping,
+  is `E_INVALIDARG` without an output too, RX 5700); then a null output is `E_UNEXPECTED` and nothing is made.
 - `CreateReservedResource` **implemented** (`d3d12_vulkan_device.cpp`, `src/resource_tiling.h`, checked by
   `d3d12_vulkan_device_test` and `resource_tiling_test`):
   - `CreateReservedResource`, `CreateReservedResource1` (no protected sessions) and `CreateReservedResource2`
-    (castable formats ignored) create sparse buffers when the device can bind and alias 64 KiB tiles and guarantees
-    zero reads from unbound pages. Reserved textures and buffers on other devices use a fully backed resource.
-    D3D12's description rules are kept, as measured on the PC
+    (its castable formats reach the backing texture) create sparse buffers when the device can bind and alias
+    64 KiB tiles and guarantees zero reads from unbound pages. Reserved textures and buffers on other devices use a
+    fully backed resource. D3D12's description rules are kept, as measured on the PC
     runtime: buffers are `ROW_MAJOR`, textures `64KB_UNDEFINED_SWIZZLE` (anything else, or a format without a tile
     shape, is `E_INVALIDARG`; `64KB_STANDARD_SWIZZLE` too, since `CheckFeatureSupport` reports
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
     The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
-    output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
+    output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88) and after
+    `CreateReservedResource2`'s castable-format list, which the RX 5700 host refuses without an output too.
     `GetHeapProperties` answers as the host runtime's (`d3d12_heap_properties_test`: 561 values for committed
     resources in every heap type, custom ones and SHARED / ALLOW_DISPLAY / CREATE_NOT_ZEROED / CREATE_NOT_RESIDENT
     included, placed resources in heaps of each kind, reserved ones, and null arguments; RTX 3060, driver 610.88).

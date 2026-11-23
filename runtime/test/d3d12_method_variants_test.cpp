@@ -123,12 +123,16 @@ std::vector<Case> cases() {
         {"multisampled with mips", D3D12_HEAP_TYPE_DEFAULT, ms_mips},
         {"unknown format", D3D12_HEAP_TYPE_DEFAULT,
          texture_desc(4, 4, DXGI_FORMAT_R1_UNORM, D3D12_RESOURCE_FLAG_NONE)},
+        // Valid by D3D12's rules, but no Vulkan driver measured can render to D32_SFLOAT as a colour attachment, so
+        // the device refuses the image; without an output the capability check gives that answer too.
+        {"D32_FLOAT render target", D3D12_HEAP_TYPE_DEFAULT,
+         texture_desc(8, 8, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)},
     };
 }
 
 enum class Via { base, v1, v2, v3 };
 
-HRESULT create(ID3D12Device11* device, Via via, const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc,
+HRESULT create(ID3D12Device10* device, Via via, const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC& desc,
                void** out, ID3D12ProtectedResourceSession* session = nullptr) {
     const D3D12_RESOURCE_DESC1 d1 = desc1(desc);
     const IID& iid = __uuidof(ID3D12Resource);
@@ -153,7 +157,9 @@ HRESULT create(ID3D12Device11* device, Via via, const D3D12_HEAP_PROPERTIES& hea
 }
 
 // Each variant against CreateCommittedResource on every case: the same result, and on success the same
-// description, heap properties, image-or-buffer and Map answer. Returns the number of differences.
+// description, heap properties, image-or-buffer and Map answer. Without an output each answers the capability check:
+// S_FALSE where creation succeeds and creation's refusal where it fails (none of these fails for room). Returns the
+// number of differences.
 int compare_creation(ID3D12Device11* device) {
     int differences = 0;
     for (const Case& c : cases()) {
@@ -161,6 +167,10 @@ int compare_creation(ID3D12Device11* device) {
         Ref<ID3D12Resource> base;
         const HRESULT base_hr = create(device, Via::base, heap, c.desc, reinterpret_cast<void**>(&base.p));
         const HRESULT base_check = create(device, Via::base, heap, c.desc, nullptr);  // null output: a check
+        const HRESULT want_check = SUCCEEDED(base_hr) ? S_FALSE : base_hr;
+        if (base_check != want_check && differences++ < 24)
+            std::fprintf(stderr, "%s, CreateCommittedResource: null-output result %08lx, want %08lx (%08lx with an "
+                         "output)\n", c.name, base_check, want_check, base_hr);
         for (const Via via : {Via::v1, Via::v2, Via::v3}) {
             Ref<ID3D12Resource> variant;
             const HRESULT hr = create(device, via, heap, c.desc, reinterpret_cast<void**>(&variant.p));
@@ -208,6 +218,50 @@ bool same_footprints(ID3D12Device11* device, const D3D12_RESOURCE_DESC* desc, UI
     return total_a == total_b && rows_a == rows_b && size_a == size_b;
 }
 
+// A null output is a capability check: every CreateCommittedResource variant answers S_FALSE with nothing made, so
+// also where creation fails for room (E_OUTOFMEMORY, nothing handed out). `no_arena` has no GPU address arena, so its
+// default-heap buffers get memory of their own; there, a texture larger than any memory heap. `arena` has one; there,
+// that texture and a default-heap buffer larger than any arena (at most 4095 MiB). `host` is the PC runtime when the
+// host has a D3D12 device, which answers S_FALSE to both without an output (RX 5700) and is never asked with one: it
+// would try to make them. Returns the number of answers that differ.
+int check_no_room(ID3D12Device10* no_arena, ID3D12Device10* arena, ID3D12Device10* host) {
+    // 2048 layers of 16384x16384 RGBA32F, 8 TiB: inside D3D12's limits and the RX 5700's Vulkan limits (16384 texels,
+    // 2048 layers, as desktop drivers commonly report), and larger than any memory heap.
+    const D3D12_RESOURCE_DESC texture =
+        texture_desc(16384, 16384, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_NONE, 1, 2048);
+    const D3D12_RESOURCE_DESC buffer = buffer_desc(UINT64(4) << 30);
+    const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
+    struct Room {
+        const char* name;
+        ID3D12Device10* device;
+        const D3D12_RESOURCE_DESC* desc;
+    };
+    const Room rooms[] = {
+        {"8 TiB texture without the arena", no_arena, &texture},
+        {"8 TiB texture with the arena", arena, &texture},
+        {"4 GiB default-heap buffer, larger than the arena", arena, &buffer},
+    };
+    int differences = 0;
+    for (const Room& room : rooms) {
+        for (const Via via : {Via::base, Via::v1, Via::v2, Via::v3}) {
+            void* out = reinterpret_cast<void*>(1);
+            const HRESULT made = create(room.device, via, default_heap, *room.desc, &out);
+            const bool handed_out = out != nullptr;
+            if (SUCCEEDED(made) && out) static_cast<IUnknown*>(out)->Release();
+            const HRESULT check = create(room.device, via, default_heap, *room.desc, nullptr);
+            const HRESULT host_check = host ? create(host, via, default_heap, *room.desc, nullptr) : S_FALSE;
+            if (made == E_OUTOFMEMORY && !handed_out && check == S_FALSE && host_check == S_FALSE) continue;
+            ++differences;
+            std::fprintf(stderr,
+                         "%s, CreateCommittedResource%d: %08lx with an output (want E_OUTOFMEMORY, nothing handed "
+                         "out), %08lx without (want S_FALSE; host runtime %08lx)\n",
+                         room.name, int(via), made, check, host_check);
+        }
+    }
+    if (!host) std::printf("no host D3D12 device: the checks where nothing fits ran on the layer alone\n");
+    return differences;
+}
+
 struct Edge {
     const char* name;
     HRESULT got, want;  // `want` is the PC runtime's answer, measured on an RTX 4090 (driver 621.14)
@@ -252,6 +306,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     uav_buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     D3D12_RESOURCE_DESC1 tall_buffer = desc1(buffer_desc(256));
     tall_buffer.Height = 2;
+    D3D12_RESOURCE_DESC tall_base = buffer_desc(256);
+    tall_base.Height = 2;
 
     D3D12_RESOURCE_DESC1 texture_region = texture, buffer_region = buffer;
     texture_region.SamplerFeedbackMipRegion = buffer_region.SamplerFeedbackMipRegion = {4, 4, 1};
@@ -336,6 +392,38 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         return device->CreateReservedResource2(&desc, layout, clear, nullptr, cast_count, cast, IID_PPV_ARGS(&r.p));
     };
 
+    // Without an output, a capability check for `riid`: nothing is made, and nothing is handed out.
+    const auto v1_check = [&](const D3D12_RESOURCE_DESC& desc, const IID& riid = __uuidof(ID3D12Resource)) {
+        return device->CreateCommittedResource1(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, nullptr, riid, nullptr);
+    };
+    const auto v2_check = [&](const D3D12_RESOURCE_DESC1& desc) {
+        return device->CreateCommittedResource2(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, nullptr, __uuidof(ID3D12Resource), nullptr);
+    };
+    const auto v3_check = [&](const D3D12_RESOURCE_DESC1& desc, D3D12_BARRIER_LAYOUT layout, UINT32 cast_count = 0,
+                              const DXGI_FORMAT* cast = nullptr, const IID& riid = __uuidof(ID3D12Resource)) {
+        return device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &desc, layout, nullptr, nullptr,
+                                                cast_count, cast, riid, nullptr);
+    };
+    const auto p1_check = [&](const D3D12_RESOURCE_DESC1& desc) {
+        return placed_device->CreatePlacedResource1(placed_heap.p, 0, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                    __uuidof(ID3D12Resource), nullptr);
+    };
+    const auto p2_check = [&](const D3D12_RESOURCE_DESC1& desc, D3D12_BARRIER_LAYOUT layout, UINT32 cast_count = 0,
+                              const DXGI_FORMAT* cast = nullptr, const IID& riid = __uuidof(ID3D12Resource)) {
+        return placed_device->CreatePlacedResource2(placed_heap.p, 0, &desc, layout, nullptr, cast_count, cast, riid,
+                                                    nullptr);
+    };
+    const auto r1_check = [&](const D3D12_RESOURCE_DESC& desc) {
+        return device->CreateReservedResource1(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr, nullptr,
+                                               __uuidof(ID3D12Resource), nullptr);
+    };
+    const auto r2_check = [&](const D3D12_RESOURCE_DESC& desc, D3D12_BARRIER_LAYOUT layout, UINT32 cast_count = 0,
+                              const DXGI_FORMAT* cast = nullptr, const IID& riid = __uuidof(ID3D12Resource)) {
+        return device->CreateReservedResource2(&desc, layout, nullptr, nullptr, cast_count, cast, riid, nullptr);
+    };
+
     return {
         {"CreateCommittedResource2, texture with a mip region", v2(default_heap, texture_region), E_INVALIDARG},
         {"CreateCommittedResource2, buffer with a mip region", v2(upload_heap, buffer_region), S_OK},
@@ -361,6 +449,26 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 2), S_OK},
         {"CreateCommittedResource3, null output",
          v3(default_heap, texture, D3D12_BARRIER_LAYOUT_COMMON, 0, false), S_FALSE},
+        // Without an output the committed variants answer S_FALSE whatever the interface, and refuse what creation
+        // refuses, castable-format list included (these null-output answers measured on an RX 5700, Windows driver
+        // 32.0.21045.29003; a list the host accepts is checked on the layer alone, below, as a host without relaxed
+        // format casting refuses every list).
+        {"CreateCommittedResource1, buffer, null output", v1_check(buffer_desc(300)), S_FALSE},
+        {"CreateCommittedResource1, buffer with Height=2, null output", v1_check(tall_base), E_INVALIDARG},
+        {"CreateCommittedResource1, wrong interface, null output",
+         v1_check(buffer_desc(300), __uuidof(ID3D12Fence)), S_FALSE},
+        {"CreateCommittedResource2, texture, null output", v2_check(texture), S_FALSE},
+        {"CreateCommittedResource2, texture with a mip region, null output", v2_check(texture_region), E_INVALIDARG},
+        {"CreateCommittedResource3, castable format of another texel size, null output",
+         v3_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 1, wide_cast), E_INVALIDARG},
+        {"CreateCommittedResource3, unknown castable format, null output",
+         v3_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 1, unknown_cast), E_INVALIDARG},
+        {"CreateCommittedResource3, castable format on a buffer, null output",
+         v3_check(buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, 1, srgb_cast), E_INVALIDARG},
+        {"CreateCommittedResource3, non-RT texture in RENDER_TARGET, null output",
+         v3_check(texture, D3D12_BARRIER_LAYOUT_RENDER_TARGET), E_INVALIDARG},
+        {"CreateCommittedResource3, wrong interface, null output",
+         v3_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 0, nullptr, __uuidof(ID3D12Fence)), S_FALSE},
         {"CreateCommittedResource3, bad heap type",
          v3(bad_heap, texture, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
         {"CreateCommittedResource3, DENY_BUFFERS heap flag",
@@ -443,6 +551,18 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
         {"CreatePlacedResource2, DS+DENY_SR in DIRECT_QUEUE_SHADER_RESOURCE",
          p2(placed_heap.p, 0, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+        // Without an output a placed or reserved resource is E_UNEXPECTED (not a capability check), whatever the
+        // interface, once creation's checks pass: the castable-format list's too (RX 5700, as above).
+        {"CreatePlacedResource1, texture, null output", p1_check(texture), E_UNEXPECTED},
+        {"CreatePlacedResource1, texture with a mip region, null output", p1_check(texture_region), E_INVALIDARG},
+        {"CreatePlacedResource2, castable format of another texel size, null output",
+         p2_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 1, wide_cast), E_INVALIDARG},
+        {"CreatePlacedResource2, unknown castable format, null output",
+         p2_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 1, unknown_cast), E_INVALIDARG},
+        {"CreatePlacedResource2, castable format on a buffer, null output",
+         p2_check(buffer, D3D12_BARRIER_LAYOUT_UNDEFINED, 1, srgb_cast), E_INVALIDARG},
+        {"CreatePlacedResource2, wrong interface, null output",
+         p2_check(texture, D3D12_BARRIER_LAYOUT_COMMON, 0, nullptr, __uuidof(ID3D12Fence)), E_UNEXPECTED},
         {"CreateReservedResource1, clear value on plain texture",
          r1(res_tex, D3D12_RESOURCE_STATE_COMMON, &cv_rt), E_INVALIDARG},
         {"CreateReservedResource2, buffer in COMMON",
@@ -467,6 +587,15 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          r2(res_tex, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
         {"CreateReservedResource2, DS+DENY_SR in SHADER_RESOURCE",
          r2(res_ds_deny, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreateReservedResource1, texture, null output", r1_check(res_tex), E_UNEXPECTED},
+        {"CreateReservedResource2, castable format of another texel size, null output",
+         r2_check(res_tex, D3D12_BARRIER_LAYOUT_COMMON, 1, wide_cast), E_INVALIDARG},
+        {"CreateReservedResource2, unknown castable format, null output",
+         r2_check(res_tex, D3D12_BARRIER_LAYOUT_COMMON, 1, unknown_cast), E_INVALIDARG},
+        {"CreateReservedResource2, castable format on a buffer, null output",
+         r2_check(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, 1, srgb_cast), E_INVALIDARG},
+        {"CreateReservedResource2, wrong interface, null output",
+         r2_check(res_tex, D3D12_BARRIER_LAYOUT_COMMON, 0, nullptr, __uuidof(ID3D12Fence)), E_UNEXPECTED},
         {"CreateReservedResource2, castable format on buffer",
          r2(res_buf, D3D12_BARRIER_LAYOUT_UNDEFINED, nullptr, 1, srgb_cast), E_INVALIDARG},
         {"CreateReservedResource2, unknown castable format on texture",
@@ -513,6 +642,8 @@ int main() {
             void* out = reinterpret_cast<void*>(1);
             EXPECT(create(device.p, via, upload_heap, buffer_desc(256), &out, fake_session()) == E_INVALIDARG);
             EXPECT(out == nullptr);
+            // Before the capability check too: refused without an output.
+            EXPECT(create(device.p, via, upload_heap, buffer_desc(256), nullptr, fake_session()) == E_INVALIDARG);
         }
         {
             D3D12_RESOURCE_DESC tiled_buf = buffer_desc(65536);
@@ -557,6 +688,10 @@ int main() {
             std::printf("no host D3D12 device: edge cases checked against their recorded answers only\n");
         }
 
+        // The capability check where nothing fits: S_FALSE from every CreateCommittedResource variant on the device
+        // above, which has no GPU address arena, and on the standalone device, which has one, while creation fails.
+        EXPECT(check_no_room(device.p, standalone_device.p, have_host ? host.p : nullptr) == 0);
+
         // Castable formats: the layer reports relaxed format casting and passes a real list to
         // VkImageFormatListCreateInfo. A count with a null list is still no list; a buffer cannot have one.
         {
@@ -583,6 +718,22 @@ int main() {
             EXPECT(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
                                                     D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 1, unknown,
                                                     IID_PPV_ARGS(&r.p)) == E_INVALIDARG && !r.p);
+            // Without an output the list is checked as with one: a list the layer takes passes the capability check
+            // (S_FALSE; E_UNEXPECTED for a placed or reserved resource, which have none). The ones refused are in
+            // the edge cases above.
+            const IID& iid = __uuidof(ID3D12Resource);
+            EXPECT(device->CreateCommittedResource3(&default_heap, D3D12_HEAP_FLAG_NONE, &texture,
+                                                    D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, own, iid,
+                                                    nullptr) == S_FALSE);
+            D3D12_RESOURCE_DESC reserved = texture_desc(64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+            reserved.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
+            EXPECT(device->CreateReservedResource2(&reserved, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 2, own,
+                                                   iid, nullptr) == E_UNEXPECTED);
+            const D3D12_HEAP_DESC heap_desc{65536, default_heap, 0, D3D12_HEAP_FLAG_NONE};
+            Ref<ID3D12Heap> heap;
+            EXPECT(SUCCEEDED(standalone_device->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+            EXPECT(standalone_device->CreatePlacedResource2(heap.p, 0, &texture, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
+                                                            2, own, iid, nullptr) == E_UNEXPECTED);
         }
 
         // The creation-time castable list is also the view allow-list. An unlisted SRGB view leaves the slot null;

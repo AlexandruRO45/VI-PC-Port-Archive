@@ -2838,10 +2838,11 @@ HRESULT released(HRESULT hr, void* const* object) {
 
 HRESULT committed(ID3D12Device* device, D3D12_HEAP_PROPERTIES heap, D3D12_RESOURCE_DESC desc,
                   D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON,
-                  D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE, const D3D12_CLEAR_VALUE* clear = nullptr) {
+                  D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE, const D3D12_CLEAR_VALUE* clear = nullptr,
+                  bool output = true) {
     void* out = nullptr;
-    const HRESULT hr =
-        device->CreateCommittedResource(&heap, flags, &desc, state, clear, __uuidof(ID3D12Resource), &out);
+    const HRESULT hr = device->CreateCommittedResource(&heap, flags, &desc, state, clear, __uuidof(ID3D12Resource),
+                                                       output ? &out : nullptr);
     return released(hr, &out);
 }
 
@@ -3731,6 +3732,40 @@ int compare_invalid_arguments(ID3D12Device* ours) {
              return d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                nullptr, __uuidof(ID3D12Resource), nullptr);
          }},
+        // The check is every check creation makes, with nothing made: S_FALSE whatever the interface, the refusal
+        // for what creation refuses (RX 5700). A UINT64_MAX-byte buffer is S_FALSE too: the host refuses it only
+        // with an output, for room (E_OUTOFMEMORY). The checks where nothing fits are check_no_room's
+        // (d3d12_method_variants_test).
+        {"committed: wrong interface, null output", [](ID3D12Device* d) {
+             const H heap{D3D12_HEAP_TYPE_DEFAULT};
+             const D3D12_RESOURCE_DESC desc = rgba8();
+             return d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                                               nullptr, __uuidof(ID3D12Fence), nullptr);
+         }},
+        {"committed: render target with a clear value, null output", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                              D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_HEAP_FLAG_NONE, &clear, false);
+         }},
+        {"committed: plain texture with a clear value, null output", [](ID3D12Device* d) {
+             static const D3D12_CLEAR_VALUE clear{DXGI_FORMAT_R8G8B8A8_UNORM, {0.f, 0.f, 0.f, 1.f}};
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, rgba8(), D3D12_RESOURCE_STATE_COMMON,
+                              D3D12_HEAP_FLAG_NONE, &clear, false);
+         }},
+        {"committed: texture on an upload heap, null output", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_UPLOAD}, rgba8(), D3D12_RESOURCE_STATE_GENERIC_READ,
+                              D3D12_HEAP_FLAG_NONE, nullptr, false);
+         }},
+        {"committed: 4x MSAA texture without RT or DS, null output", [](ID3D12Device* d) {
+             auto desc = rgba8();
+             desc.SampleDesc.Count = 4;
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, desc, D3D12_RESOURCE_STATE_COMMON, D3D12_HEAP_FLAG_NONE,
+                              nullptr, false);
+         }},
+        {"committed: UINT64_MAX-byte buffer, null output", [](ID3D12Device* d) {
+             return committed(d, {D3D12_HEAP_TYPE_DEFAULT}, buffer_desc(UINT64_MAX), D3D12_RESOURCE_STATE_COMMON,
+                              D3D12_HEAP_FLAG_NONE, nullptr, false);
+         }},
         // CreateHeap (D3D-238): the four descriptions the host refused on an RX 5700 and WARP, and the heap-property
         // rules CreateCommittedResource shares. A refusal needs no arena; the valid neighbours do, so
         // compare_heap_neighbours compares them on the standalone device.
@@ -4375,6 +4410,12 @@ int compare_placed_reserved(ID3D12Device* ours) {
              a.offset = 1024 * 1024 - 64 * 1024;
              return placed(d, texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
          }},
+        {"placed: null output, wrong interface", [](ID3D12Device* d) {
+             PlacedArgs a;
+             a.output = false;
+             a.riid = &__uuidof(ID3D12Fence);
+             return placed(d, texture_desc(16, 16, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE), a);
+         }},
         {"placed: wrong interface", [](ID3D12Device* d) {
              PlacedArgs a;
              a.riid = &__uuidof(ID3D12Fence);
@@ -4628,6 +4669,10 @@ int compare_placed_reserved(ID3D12Device* ours) {
              const auto desc =
                  tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
              return reserved(d, &desc, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, false);
+         }},
+        {"reserved: null output, wrong interface", [](ID3D12Device* d) {
+             const auto desc = tiled(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+             return reserved(d, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, false, __uuidof(ID3D12Fence));
          }},
         {"reserved: wrong interface", [](ID3D12Device* d) {
              const auto desc = buffer_desc(64 * 1024);

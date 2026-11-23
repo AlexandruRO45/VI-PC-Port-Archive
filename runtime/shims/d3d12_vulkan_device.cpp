@@ -1794,38 +1794,10 @@ public:
         if (desc_.MipLevels == 0) desc_.MipLevels = full_mips(desc_.Width, desc_.Height, depth);
         TextureCreateInfo create(desc_, format, device_.color_attachment_usable(format.format));
         VkImageCreateInfo& info = create.info;
-        if (!castable.empty()) {
-            // D3D12 always allows a view in the resource's own format, whether or not the castable list names
-            // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
-            view_formats_ = castable;
-            if (std::find(view_formats_.begin(), view_formats_.end(), format.format) == view_formats_.end())
-                view_formats_.push_back(format.format);
-            if (format.r9g9b9e5_as_r32_uint) {
-                // The R9G9B9E5 emulation needs its E5B9G9R9 views whatever the list names (TextureCreateInfo).
-                for (VkFormat pair : {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32})
-                    if (std::find(view_formats_.begin(), view_formats_.end(), pair) == view_formats_.end())
-                        view_formats_.push_back(pair);
-            }
-            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-            create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
-            create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
-        }
+        const HRESULT support =
+            prepare_image(device_, format, castable, cpu_visible(), create, view_formats_, host_transfer_);
         const std::uint32_t samples = info.samples;
-        // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
-        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert. Nor would it
-        // repack a 96-bit texture's 12-byte texels.)
-        host_transfer_ = cpu_visible() && samples == 1 && !format.d24_as_float && !format.rgb96 &&
-                         device_.host_transfer_format(format.format);
         rgb96_ = format.rgb96;
-        if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-        HRESULT support = device_.check_image_support(info);
-        if (support == E_INVALIDARG && host_transfer_) {
-            host_transfer_ = false;  // staging copies do not require host-transfer usage
-            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-            support = device_.check_image_support(info);
-        }
         if (FAILED(support)) return support;
         device_.share(info);
         const VkResult created = vk.vkCreateImage(device_.info.device, &info, nullptr, &image_);
@@ -1882,6 +1854,19 @@ public:
         // state that command expects (vulkan_replay.h, initialize), so no submission is needed here.
         device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
         return S_OK;
+    }
+
+    // What create_texture answers for `desc` in `heap` before it makes anything, with nothing made: the device's
+    // answer for the same image, for a capability check (a null output).
+    static HRESULT texture_supported(const DeviceState& device, D3D12_RESOURCE_DESC desc,
+                                     const D3D12_HEAP_PROPERTIES& heap, const Format& format,
+                                     const std::vector<VkFormat>& castable) {
+        const UINT depth = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? desc.DepthOrArraySize : 1;
+        if (desc.MipLevels == 0) desc.MipLevels = full_mips(desc.Width, desc.Height, depth);
+        TextureCreateInfo create(desc, format, device.color_attachment_usable(format.format));
+        std::vector<VkFormat> view_formats;
+        bool host_transfer = false;
+        return prepare_image(device, format, castable, cpu_visible(heap), create, view_formats, host_transfer);
     }
 
     // D3D12 reports the placement alignment of a description that left it 0: 64 KiB, or 4 MiB for a multisampled
@@ -2182,10 +2167,52 @@ private:
         return release(S_OK);
     }
 
-    bool cpu_visible() const {
-        if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD || heap_.Type == D3D12_HEAP_TYPE_READBACK) return true;
-        return heap_.Type == D3D12_HEAP_TYPE_CUSTOM && heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
-               heap_.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    bool cpu_visible() const { return cpu_visible(heap_); }
+    static bool cpu_visible(const D3D12_HEAP_PROPERTIES& heap) {
+        if (heap.Type == D3D12_HEAP_TYPE_UPLOAD || heap.Type == D3D12_HEAP_TYPE_READBACK) return true;
+        return heap.Type == D3D12_HEAP_TYPE_CUSTOM && heap.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE &&
+               heap.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    }
+
+    // The image create_texture makes, asked of the device before anything is made: `create` (a description with its
+    // mip count resolved) gets the castable list as its view formats, kept in `view_formats`, which must outlive
+    // `create`, and host-transfer usage where a texture in a `host_visible` heap can take it (`host_transfer`).
+    // E_INVALIDARG for an image the device cannot make. texture_supported asks the same with nothing made.
+    static HRESULT prepare_image(const DeviceState& device, const Format& format,
+                                 const std::vector<VkFormat>& castable, bool host_visible, TextureCreateInfo& create,
+                                 std::vector<VkFormat>& view_formats, bool& host_transfer) {
+        VkImageCreateInfo& info = create.info;
+        if (!castable.empty()) {
+            // D3D12 always allows a view in the resource's own format, whether or not the castable list names
+            // it. Vulkan requires every view format to be in the image's format list, so add it when missing.
+            view_formats = castable;
+            if (std::find(view_formats.begin(), view_formats.end(), format.format) == view_formats.end())
+                view_formats.push_back(format.format);
+            if (format.r9g9b9e5_as_r32_uint) {
+                // The R9G9B9E5 emulation needs its E5B9G9R9 views whatever the list names (TextureCreateInfo).
+                for (VkFormat pair : {VK_FORMAT_R32_UINT, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32})
+                    if (std::find(view_formats.begin(), view_formats.end(), pair) == view_formats.end())
+                        view_formats.push_back(pair);
+            }
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+            create.format_list.viewFormatCount = std::uint32_t(view_formats.size());
+            create.format_list.pViewFormats = view_formats.data();
+            create.format_list.pNext = info.pNext;
+            info.pNext = &create.format_list;
+        }
+        // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
+        // (A D24 texture stored as D32 goes through the staged copy: the host copy would not convert. Nor would it
+        // repack a 96-bit texture's 12-byte texels.)
+        host_transfer = host_visible && info.samples == 1 && !format.d24_as_float && !format.rgb96 &&
+                        device.host_transfer_format(format.format);
+        if (host_transfer) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+        HRESULT support = device.check_image_support(info);
+        if (support == E_INVALIDARG && host_transfer) {
+            host_transfer = false;  // staging copies do not require host-transfer usage
+            info.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+            support = device.check_image_support(info);
+        }
+        return support;
     }
 
     DeviceState& device_;
@@ -6102,7 +6129,8 @@ public:
     // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules
     // CreateCommittedResource has, then the placement: a buffer at a 64 KiB-aligned offset, a texture at a
     // multiple of its GetResourceAllocationInfo alignment (4 KiB for a small texture), in a heap aligned at least
-    // as much, and the whole resource inside the heap. Only then is a null output E_UNEXPECTED, with nothing made.
+    // as much, and the whole resource inside the heap, and a texture's castable-format list (refused without an
+    // output too, RX 5700). Only then is a null output E_UNEXPECTED, with nothing made.
     HRESULT create_placed(const char* method, ID3D12Heap* heap_interface, UINT64 heap_offset,
                           const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear,
                           UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
@@ -6130,6 +6158,8 @@ public:
         }
         const bool tiled = is_tiled_layout(desc->Layout);
         const bool msaa = desc->SampleDesc.Count > 1;
+        Format format{};
+        std::vector<VkFormat> cast_formats;
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (heap->flags() & D3D12_HEAP_FLAG_DENY_BUFFERS) return d3d12_trace::result(method, E_INVALIDARG);
             if (heap_offset % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
@@ -6178,6 +6208,9 @@ public:
                 log_once("placed resource with the Xbox tiled layout, as 64KB_UNDEFINED_SWIZZLE; dimension",
                          int(desc->Dimension));
             }
+            format = state_.texture_format(*desc);
+            if (FAILED(castable_view_formats(format, castable_count, castable, cast_formats)))
+                return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && !heap->use_as_placed_buffer(true)) {
@@ -6193,16 +6226,8 @@ public:
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             hr = resource->create_placed_buffer();
         } else {
-            hr = S_OK;
-            const Format format = state_.texture_format(*desc);
-            if (format.format == VK_FORMAT_UNDEFINED) {
-                hr = E_INVALIDARG;
-            } else {
-                std::vector<VkFormat> cast_formats;
-                hr = castable_view_formats(format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
-                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
-            }
+            hr = format.format == VK_FORMAT_UNDEFINED ? E_INVALIDARG : resource->create_texture(format, cast_formats);
+            if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
         }
         if (FAILED(hr)) {
             resource->Release();
@@ -7247,6 +7272,11 @@ private:
     // is only meaningful on textures; the layer reports RelaxedFormatCastingSupported, so each format is mapped and
     // handed to Vulkan as a VkImageFormatListCreateInfo. A nonzero count with a null list is no list, as on the PC
     // runtime.
+    // A null output is a capability check, as on the host (RX 5700): S_FALSE for arguments every check below passes
+    // (the device's answer for the texture's image included), whatever the interface, and the refusal otherwise.
+    // Nothing is created or allocated for it, so a lack of room never changes that answer: a full GPU address arena,
+    // a buffer larger than the arena, a texture larger than any memory heap. The host answers S_FALSE without an
+    // output up to a UINT64_MAX-byte buffer (E_OUTOFMEMORY with one) and an 8 TiB texture.
     HRESULT create_committed(const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS heap_flags,
                              const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES initial_state,
                              UINT32 castable_count, const DXGI_FORMAT* castable, REFIID riid, void** out) {
@@ -7256,13 +7286,12 @@ private:
             log_once("castable formats on a buffer are invalid; count", int(castable_count));
             return E_INVALIDARG;
         }
-        auto* resource = new Resource(state_, *desc, *heap, heap_flags);
-        resource->attach_device(identity());
+        const bool buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        Format format{};
+        std::vector<VkFormat> cast_formats;
         HRESULT hr = E_NOTIMPL;
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0
-                     ? resource->create_buffer(initial_state)
-                     : E_INVALIDARG;
+        if (buffer) {
+            hr = desc->SampleDesc.Count == 1 && desc->SampleDesc.Quality == 0 ? S_OK : E_INVALIDARG;
         } else if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
                    desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
@@ -7292,25 +7321,25 @@ private:
             hr = E_INVALIDARG;  // D3D12: nonzero power-of-two sample count up to 32; MSAA needs a single-mip 2D attachment
         } else {
             hr = S_OK;
-            const Format format = state_.texture_format(*desc);
+            format = state_.texture_format(*desc);
             if (format.format == VK_FORMAT_UNDEFINED) {
                 log_once("texture format not supported yet:", desc->Format);
                 hr = E_INVALIDARG;
             } else {
-                std::vector<VkFormat> cast_formats;
                 hr = castable_view_formats(format, castable_count, castable, cast_formats);
-                if (SUCCEEDED(hr)) hr = resource->create_texture(format, cast_formats);
-                if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
+                if (SUCCEEDED(hr) && !out) hr = Resource::texture_supported(state_, *desc, *heap, format, cast_formats);
             }
         }
+        if (FAILED(hr)) return hr;
+        if (!out) return S_FALSE;  // a capability check: valid, and nothing made
+        auto* resource = new Resource(state_, *desc, *heap, heap_flags);
+        resource->attach_device(identity());
+        hr = buffer ? resource->create_buffer(initial_state) : resource->create_texture(format, cast_formats);
         if (FAILED(hr)) {
             resource->Release();
             return hr;
         }
-        if (!out) {  // a capability check: D3D12 allows a null output
-            resource->Release();
-            return S_FALSE;
-        }
+        if (!buffer) resource->keep_castable_formats(castable_count, castable);
         return hand_out(resource, riid, out);
     }
 
@@ -7370,8 +7399,8 @@ private:
     // D3D12's layout rules for reserved resources. Buffers use sparse storage when supported.
     // The arguments are answered as the host runtime answers them (d3d12_vulkan_device_test's
     // compare_placed_reserved, RTX 3060 / 610.88): the description, initial state and clear value rules of a
-    // committed resource on a default heap, the reserved layouts below, and only then E_UNEXPECTED for a null
-    // output, with nothing made.
+    // committed resource on a default heap, the reserved layouts below and a texture's castable-format list (refused
+    // without an output too, RX 5700), and only then E_UNEXPECTED for a null output, with nothing made.
     HRESULT create_reserved(const char* method, const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
                             const D3D12_CLEAR_VALUE* clear, UINT32 castable_count, const DXGI_FORMAT* castable,
                             REFIID riid, void** out) {
@@ -7407,10 +7436,14 @@ private:
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-            // Extents, mips and samples, as the committed backing below checks them (GetResourceAllocationInfo).
+            // Extents, mips and samples, as the committed backing below checks them (GetResourceAllocationInfo), and
+            // the castable-format list it is given.
             D3D12_RESOURCE_DESC checked = backing;
             checked.SampleDesc.Quality = 0;
             if (allocation(checked).SizeInBytes == UINT64_MAX) return d3d12_trace::result(method, E_INVALIDARG);
+            std::vector<VkFormat> cast_formats;
+            if (FAILED(castable_view_formats(state_.texture_format(backing), castable_count, castable, cast_formats)))
+                return d3d12_trace::result(method, E_INVALIDARG);
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12Resource* resource = nullptr;
