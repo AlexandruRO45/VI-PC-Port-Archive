@@ -253,8 +253,10 @@ def blobs(source: str):
             def scan_failed(error: OSError) -> None:
                 raise error
 
-            paths = [os.path.join(r, f) for r, _d, fs in os.walk(source, onerror=scan_failed)
-                     for f in sorted(fs)]
+            paths = []
+            for r, dirs, fs in os.walk(source, onerror=scan_failed):
+                dirs.sort()  # the walk follows this order, not the file system's
+                paths.extend(os.path.join(r, f) for f in sorted(fs))
         for path in paths:
             if os.path.getsize(path) <= MAX_RESOURCE_BYTES:
                 with open(path, "rb") as fh:

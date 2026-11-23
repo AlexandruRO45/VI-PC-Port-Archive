@@ -271,6 +271,32 @@ class TestCli(unittest.TestCase):
             with open(report, "rb") as fh:
                 self.assertEqual(fh.read(), previous)
 
+    def test_subfolders_are_scanned_in_sorted_order(self):
+        walk = os.walk
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "source")
+            for name in ("c", "a", "b"):
+                os.makedirs(os.path.join(source, name))
+                write(os.path.join(source, name, "en.bin"), make_resource(EN))
+            wanted = [os.path.join(source, name, "en.bin") for name in ("a", "b", "c")]
+
+            for reverse in (False, True):
+                def walk_in_file_system_order(top, *args, **kwargs):
+                    for root, dirs, files in walk(top, *args, **kwargs):
+                        dirs.sort(reverse=reverse)  # the order a file system may hand back
+                        yield root, dirs, files
+
+                outs = {k: os.path.join(tmp, f"{k}-{reverse}.csv") for k in ("tables", "strings")}
+                with (patch.object(os, "walk", walk_in_file_system_order),
+                      contextlib.redirect_stdout(io.StringIO())):
+                    self.assertEqual(T.main([source, "--tables", outs["tables"], "--strings", outs["strings"]]), 0)
+                with open(outs["tables"], encoding="utf-8", newline="") as fh:
+                    self.assertEqual([row["source"] for row in csv.DictReader(fh)], wanted)
+                with open(outs["strings"], encoding="utf-8", newline="") as fh:
+                    sources = [row["source"] for row in csv.DictReader(fh)]
+                self.assertEqual(sorted(set(sources), key=sources.index), wanted)
+                self.assertEqual(sources, sorted(sources))
+
     def test_csv_exports_explicitly_empty_strings(self) -> None:
         strings = {"ZZ_SYNTHETIC_BLANK": "", "ZZ_SYNTHETIC_LINE": "This is the text you know"}
         with tempfile.TemporaryDirectory() as tmp:
