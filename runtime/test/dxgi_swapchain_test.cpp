@@ -538,6 +538,39 @@ int main() {
         if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd invalid sample description HRESULT");
     }
 
+    // D3D-444. Host DXGI on an HWND flip swapchain (Windows 11, RTX 5060 Ti, driver 621.14): DXGI_SCALING_NONE is
+    // created and GetDesc1 reports it; ASPECT_RATIO_STRETCH (CoreWindow and composition only) and values past it are
+    // DXGI_ERROR_INVALID_CALL. A NONE swapchain smaller than the window presents (unscaled, the rest cleared).
+    for (const UINT scaling : {UINT(DXGI_SCALING_ASPECT_RATIO_STRETCH), 3u, 4u}) {
+        DXGI_SWAP_CHAIN_DESC1 invalid = scd;
+        invalid.Scaling = DXGI_SCALING(scaling);
+        IDXGISwapChain1* rejected = nullptr;
+        const HRESULT hr = factory->CreateSwapChainForHwnd(queue, hwnd, &invalid, nullptr, nullptr, &rejected);
+        if (rejected) {
+            rejected->Release();
+            return fail("CreateSwapChainForHwnd returned an HWND swapchain for ASPECT_RATIO_STRETCH or a bad Scaling");
+        }
+        if (hr != DXGI_ERROR_INVALID_CALL) return fail("CreateSwapChainForHwnd bad Scaling HRESULT");
+    }
+    {
+        DXGI_SWAP_CHAIN_DESC1 unscaled = scd;
+        unscaled.Width = 64;  // smaller than the 128x128 window: Present takes the unscaled-copy path
+        unscaled.Height = 48;
+        unscaled.Scaling = DXGI_SCALING_NONE;
+        IDXGISwapChain1* none = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &unscaled, nullptr, nullptr, &none)) || !none)
+            return fail("CreateSwapChainForHwnd with DXGI_SCALING_NONE");
+        DXGI_SWAP_CHAIN_DESC1 got{};
+        const bool kept = SUCCEEDED(none->GetDesc1(&got)) && got.Scaling == DXGI_SCALING_NONE;
+        // The uncovered part of the window takes the background colour, as on the host (#4231).
+        const DXGI_RGBA blue{0.0f, 0.0f, 1.0f, 1.0f};
+        if (FAILED(none->SetBackgroundColor(&blue))) return fail("SetBackgroundColor on a DXGI_SCALING_NONE swapchain");
+        const HRESULT presented = none->Present(0, 0);
+        none->Release();
+        if (!kept) return fail("GetDesc1 did not keep DXGI_SCALING_NONE");
+        if (FAILED(presented)) return fail("Present of an unscaled 64x48 swapchain in a 128x128 window");
+    }
+
     IDXGISwapChain1* sc1 = nullptr;
     if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &scd, nullptr, nullptr, &sc1)) || !sc1)
         return fail("CreateSwapChainForHwnd");

@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <vulkan/vulkan.h>
 
+#include "../src/present_scaling.h"
 #include "../src/vulkan_backend.h"
 
 #include <algorithm>
@@ -56,6 +57,7 @@ struct SwapchainFunctions {
     PFN_vkEndCommandBuffer end_cmd_buf = nullptr;
     PFN_vkCmdPipelineBarrier cmd_barrier = nullptr;
     PFN_vkCmdBlitImage cmd_blit = nullptr;
+    PFN_vkCmdClearColorImage cmd_clear_color = nullptr;
     PFN_vkQueueSubmit queue_submit = nullptr;
 
     bool load(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, PFN_vkGetDeviceProcAddr gdpa, VkDevice device) {
@@ -92,6 +94,7 @@ struct SwapchainFunctions {
         LOAD_D(end_cmd_buf, vkEndCommandBuffer);
         LOAD_D(cmd_barrier, vkCmdPipelineBarrier);
         LOAD_D(cmd_blit, vkCmdBlitImage);
+        LOAD_D(cmd_clear_color, vkCmdClearColorImage);
         LOAD_D(queue_submit, vkQueueSubmit);
 #undef LOAD_I
 #undef LOAD_D
@@ -100,7 +103,7 @@ struct SwapchainFunctions {
                queue_present && create_fence && destroy_fence && wait_for_fences && reset_fences && device_wait_idle &&
                create_image && destroy_image && image_mem_req && alloc_mem && free_mem && bind_image_mem &&
                create_cmd_pool && destroy_cmd_pool && alloc_cmd_bufs && reset_cmd_buf && begin_cmd_buf &&
-               end_cmd_buf && cmd_barrier && cmd_blit && queue_submit;
+               end_cmd_buf && cmd_barrier && cmd_blit && cmd_clear_color && queue_submit;
     }
 };
 
@@ -144,6 +147,7 @@ public:
                 VkFormat preferred_format = VK_FORMAT_B8G8R8A8_UNORM, std::uint32_t buffer_count = 2,
                 bool allow_tearing = false) {
         if (!loaded_ || !acquire_fence_ || !hwnd) return false;
+        hwnd_ = hwnd;
         if (!surface_) {
             VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
             sci.hinstance = GetModuleHandleW(nullptr);
@@ -225,6 +229,11 @@ public:
     VkExtent2D extent() const { return extent_; }
     bool is_offscreen() const { return !offscreen_images_.empty(); }
     VkPresentModeKHR present_mode() const { return present_mode_; }
+    // How Present places the back buffer when it differs from the window's size (present_scaling.h).
+    void set_scaling(PresentScaling scaling) { scaling_ = scaling; }
+    PresentScaling scaling() const { return scaling_; }
+    // SetBackgroundColor: what fills the window outside an unscaled back buffer (opaque; the alpha isn't composed).
+    void set_background(float r, float g, float b) { background_ = {{r, g, b, 1.0f}}; }
     VkImage image(std::uint32_t i) const {
         if (i >= exposed_count_) return VK_NULL_HANDLE;
         return is_offscreen() ? offscreen_images_[i] : images_[i];
@@ -434,14 +443,41 @@ private:
         fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                         0, nullptr, 2, pre);
 
+        // A right-to-left window (WS_EX_LAYOUTRTL) has its origin at the top-right corner; read on every present,
+        // since the style can change after the swapchain was made.
+        const bool right_to_left = hwnd_ && (GetWindowLongPtrW(hwnd_, GWL_EXSTYLE) & WS_EX_LAYOUTRTL) != 0;
+        const SwapchainBlit rect = swapchain_blit(scaling_, extent_.width, extent_.height, surface_extent_.width,
+                                                  surface_extent_.height, right_to_left);
+        if (!rect.covers) {
+            // The copy leaves part of the window's image (undefined after the layout change): the background colour
+            // (SetBackgroundColor), then a write-after-write barrier before the blit lands in it.
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            fn_.cmd_clear_color(blit_cmd_, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background_,
+                                1, &range);
+            VkImageMemoryBarrier cleared{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            cleared.oldLayout = cleared.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            cleared.srcQueueFamilyIndex = cleared.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            cleared.image = dst_image;
+            cleared.subresourceRange = range;
+            fn_.cmd_barrier(blit_cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                            0, nullptr, 1, &cleared);
+        }
         VkImageBlit region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.srcOffsets[1] = {static_cast<std::int32_t>(extent_.width), static_cast<std::int32_t>(extent_.height), 1};
+        region.srcOffsets[0] = {static_cast<std::int32_t>(rect.src_x), 0, 0};
+        region.srcOffsets[1] = {static_cast<std::int32_t>(rect.src_x + rect.src_width),
+                                static_cast<std::int32_t>(rect.src_height), 1};
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstOffsets[1] = {static_cast<std::int32_t>(surface_extent_.width),
-                                static_cast<std::int32_t>(surface_extent_.height), 1};
-        fn_.cmd_blit(blit_cmd_, offscreen_images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_LINEAR);
+        region.dstOffsets[0] = {static_cast<std::int32_t>(rect.dst_x), static_cast<std::int32_t>(rect.dst_y), 0};
+        region.dstOffsets[1] = {static_cast<std::int32_t>(rect.dst_x + rect.dst_width),
+                                static_cast<std::int32_t>(rect.dst_y + rect.dst_height), 1};
+        // Texel for texel when nothing is scaled (DXGI_SCALING_NONE), filtered otherwise.
+        if (rect.dst_width && rect.dst_height)
+            fn_.cmd_blit(blit_cmd_, offscreen_images_[image_index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                         rect.scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 
         VkImageMemoryBarrier post[2]{};
         post[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -592,6 +628,9 @@ private:
     VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
     bool allow_tearing_ = false;
     VkExtent2D surface_extent_{0, 0};
+    PresentScaling scaling_ = PresentScaling::stretch;
+    VkClearColorValue background_{{0.0f, 0.0f, 0.0f, 1.0f}};
+    HWND hwnd_ = nullptr;
     VkExtent2D extent_{0, 0};
     std::vector<VkImage> images_;
     std::vector<bool> image_initialized_;

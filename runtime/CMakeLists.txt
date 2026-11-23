@@ -336,6 +336,9 @@ if(BUILD_TESTING)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
+  # Where Present puts a back buffer for each DXGI_SCALING (runtime/src/present_scaling.h, D3D-444): pure arithmetic.
+  add_executable(present_scaling_test test/present_scaling_test.cpp)
+  add_test(NAME present_scaling COMMAND present_scaling_test)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)

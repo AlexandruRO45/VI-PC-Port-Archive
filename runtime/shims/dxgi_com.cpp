@@ -229,6 +229,8 @@ public:
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const bool allow_tearing = (flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+        scaling_ = desc.Scaling;
+        swapchain_.set_scaling(leonida::PresentScaling(desc.Scaling));
         if (!swapchain_.create(hwnd, w, h, vk_fmt, desc.BufferCount, allow_tearing)) return false;
         if (flags_ & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
             // DXGI: waitable swapchains default to maximum frame latency 1.
@@ -422,7 +424,7 @@ public:
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         desc->BufferCount = swapchain_.image_count();
-        desc->Scaling = DXGI_SCALING_STRETCH;
+        desc->Scaling = scaling_;  // as created: host DXGI keeps NONE (D3D-444)
         desc->SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
         desc->Flags = flags_;
@@ -462,6 +464,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetBackgroundColor(const DXGI_RGBA* color) override {
         if (!color) return E_INVALIDARG;
         background_color_ = *color;
+        swapchain_.set_background(color->r, color->g, color->b);  // fills the window outside a NONE back buffer
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE GetBackgroundColor(DXGI_RGBA* color) override {
@@ -580,6 +583,7 @@ private:
     HWND hwnd_ = nullptr;
     IDXGIOutput* restrict_to_output_ = nullptr;
     UINT flags_ = 0;
+    DXGI_SCALING scaling_ = DXGI_SCALING_STRETCH;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
     std::atomic<UINT> present_count_{0};
