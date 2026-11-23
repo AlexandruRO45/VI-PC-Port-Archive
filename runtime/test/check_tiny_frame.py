@@ -93,7 +93,10 @@ def run_process(label, command, **kwargs):
     try:
         return subprocess.run(command, **kwargs)
     except OSError as error:
-        raise SystemExit(f"FAIL: cannot start {label} ({command[0]}): {error}") from error
+        location = str(command[0])
+        if error.filename is None and (cwd := kwargs.get("cwd")) is not None:
+            location += f", working directory {cwd}"
+        raise SystemExit(f"FAIL: cannot start {label} ({location}): {error}") from error
 
 
 def main():

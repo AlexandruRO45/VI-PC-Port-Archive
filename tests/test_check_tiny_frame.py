@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("check_tiny_frame", ROOT / "runtime" / "test" / "check_tiny_frame.py")
@@ -81,6 +82,11 @@ class SubsequenceTest(unittest.TestCase):
 
 
 class LaunchDiagnosticTest(unittest.TestCase):
+    def test_working_directory_is_reported_when_os_error_has_no_path(self):
+        with patch.object(check.subprocess, "run", side_effect=OSError("synthetic start error")):
+            with self.assertRaisesRegex(SystemExit, "working directory missing workspace"):
+                check.run_process("tiny-frame loader", ["loader"], cwd="missing workspace")
+
     def test_start_errors_name_the_stage_and_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
