@@ -132,6 +132,25 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(doc["summary"]["q28_null_targets"], 1)
         self.assertEqual(doc["summary"]["q28_tables_unread"], 0)
 
+    def test_q28_target_ranges_include_only_streams_read_for_the_page(self):
+        page = header(0x100, q28=0x100, q38=0xC0, counts=(5, 0, 1, 0))
+        put_q38(page, 0xC0, [(1, 1, 0x100)])
+        cont = bytearray(0xA0)
+        targets = [None, 0, 0x19F, 0x1A0, 0x1A1]
+        for i, target in enumerate(targets):
+            pointer = 0 if target is None else BASE + target
+            struct.pack_into("<IIQQII", cont, i * 32, i, 0, 0, pointer, 0, 0)
+        pages, _ = page_index.index_streams([(0, None, bytes(page)), (1, None, bytes(cont)),
+                                            (2, None, bytes(0x80))])
+        (parsed,) = pages
+        self.assertTrue(parsed["complete"])
+        self.assertEqual([r["target"] for r in parsed["q28_records"]], targets)
+        self.assertEqual([r["target_range"] for r in parsed["q28_records"]],
+                         ["null", "inside", "inside", "at_end", "beyond_end"])
+        summary = page_index.summarise(pages, "directory", "synthetic")
+        self.assertEqual(summary["q28_target_ranges"], {"null": 1, "inside": 2, "at_end": 1, "beyond_end": 1})
+        self.assertEqual(summary["q28_null_targets"], 1)
+
     def test_q28_pointer_with_another_base_still_stops_the_table(self):
         page = header(0x200, q28=0x140, q38=0x100, counts=(2, 0, 1, 0))
         put_q38(page, 0x100, [(0x1234, 0x40, 0x60)])

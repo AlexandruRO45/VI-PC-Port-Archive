@@ -14,7 +14,7 @@ The header has no key: what earlier reports called a 64-bit key at +0x60 is the 
 29,297 of 29,298 measured pages. This tool reports `payload_at_0x60` instead.
 
 The +0x28 table (32-byte records) is reported raw as `q28_records`: the hash in its first u32 matches a +0x38
-hash on most pages, its +0x10 pointer resolves in the resource or is null (`target` null), and its +0x1c word
+hash on most pages, its +0x10 pointer is reported as an offset or null (`target`), and its +0x1c word
 behaves as flags. The +0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`.
 The +0x30 and +0x40 tables are reported by offset only; their internal layout is not decoded here.
 
@@ -170,6 +170,17 @@ def _q38(data, q38, count):
     return records, True, ""
 
 
+def q28_target_range(target, bytes_read):
+    """Classify the decoded pointer against the inflated bytes available to the q28 parser."""
+    if target is None:
+        return "null"
+    if target < bytes_read:
+        return "inside"
+    if target == bytes_read:
+        return "at_end"
+    return "beyond_end"
+
+
 def _q28(data, q28, count):
     """Parse the +0x28 table raw. Unresolved words keep their measured names.
 
@@ -192,7 +203,8 @@ def _q28(data, q28, count):
             return out, "q28 entry %d has a non-0x50000000 pointer" % i
         out.append({
             "hash_a": hash_a, "hash_b": hash_b, "field_08": field_08,
-            "target": target, "count_or_size": count_or_size, "flags": flags,
+            "target": target, "target_range": q28_target_range(target, len(data)),
+            "count_or_size": count_or_size, "flags": flags,
         })
     return out, ""
 
@@ -342,6 +354,10 @@ def index_streams(streams, progress=None):
 
 
 def summarise(pages, mode, source):
+    ranges = dict.fromkeys(("null", "inside", "at_end", "beyond_end"), 0)
+    for page in pages:
+        for record in page["q28_records"]:
+            ranges[record["target_range"]] += 1
     complete = sum(1 for p in pages if p["complete"])
     return {
         "mode": mode,
@@ -352,7 +368,8 @@ def summarise(pages, mode, source):
         "q38_records": sum(len(p["q38_records"]) for p in pages),
         "q28_records": sum(len(p["q28_records"]) for p in pages),
         "q28_declared": sum(p["counts"][0] or 0 for p in pages),
-        "q28_null_targets": sum(1 for p in pages for r in p["q28_records"] if r["target"] is None),
+        "q28_null_targets": ranges["null"],
+        "q28_target_ranges": ranges,
         "q28_tables_unread": sum(1 for p in pages if p.get("q28_error") == Q28_UNREAD),
         "pages_with_continuations": sum(1 for p in pages if p["continuations"]),
         "span_bytes": sum(p["span"] for p in pages),

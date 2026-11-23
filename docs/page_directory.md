@@ -491,6 +491,12 @@ names a table that was cut short or not read), continuation streams, `span`,
 `page_offset,stored,inflated,version,page_count,q28_count,q30_count,q38_count,span,complete,record_index,hash,size,target,target_stream`.
 `target_stream` is 0 for the directory stream and 1..N for a continuation.
 
+Each JSON `q28_records` entry keeps its decoded `target` offset and adds `target_range`. A zero pointer
+is `null`. For a based pointer, offsets from zero through the last inflated byte read for this page are
+`inside`, the first offset after that byte is `at_end`, and larger offsets are `beyond_end`. The bound
+includes continuation bytes supplied to the q28 parser. This describes the pointer position only.
+The summary's `q28_target_ranges` counts emitted records in all four categories, including zero counts.
+
 Validation on the package used here:
 
 | Run | Streams | Pages | `q38` records | Complete | Continuations | Time |
