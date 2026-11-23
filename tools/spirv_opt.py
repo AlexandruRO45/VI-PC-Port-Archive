@@ -39,7 +39,13 @@ As a CLI:
 Usage: `python -I tools/spirv_opt.py --help` lists the options.
 """
 import argparse
+import os
 import sys
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import spirv_mem2reg  # noqa: E402
 
 _PURE_OPS = frozenset((
     "OpAccessChain",
@@ -386,7 +392,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                        int_const_by_val: dict[tuple[str, int], str],
                        int_type_info: dict[str, tuple[int, int]],
                        readonly_global_vars: set[str], glsl_sets: set[str],
-                       decorated_ids: set[str], max_passes: int = 4) -> tuple[list[str], set[str]]:
+                       decorated_ids: set[str], max_passes: int = 4,
+                       module_info: dict | None = None) -> tuple[list[str], set[str]]:
     """Optimize one OpFunction ... OpFunctionEnd slice. Returns (new_lines, deleted_ids)."""
     insts: list[list] = []
     for raw in body_lines:
@@ -400,6 +407,12 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
     deleted_ids: set[str] = set()
     const_true_id = next(iter(const_true)) if const_true else None
     const_false_id = next(iter(const_false)) if const_false else None
+    all_decorated = module_info["decorated_ids"] if module_info is not None else decorated_ids
+
+    if module_info is not None:
+        insts, _ = spirv_mem2reg.promote_function(
+            insts, _build_cfg_and_dom, _format_inst, module_info, deleted_ids,
+        )
 
     for _pass in range(max_passes):
         changed = False
@@ -423,6 +436,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 func_vars[res] = init
                 ptr_root[res] = res
                 ptr_slot[res] = (res,)
+                if res in all_decorated:
+                    escaped.add(res)
             elif op == "OpAccessChain" and res and len(args) >= 2:
                 base = args[1]
                 idxs = args[2:]
@@ -540,6 +555,9 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
         bool_mask_of: dict[str, tuple[str, bool]] = {}  # res_id -> (cond_id, True if cond->nz/!cond->0 else inverted)
         ctor_elems: dict[str, list[str]] = {}     # composite_id -> list of constituent IDs
         logical_not_of: dict[str, str] = {}       # res_id -> inner bool ID
+        and_pair_of: dict[str, tuple[str, str]] = {}   # res_id -> (a, b) for OpLogicalAnd
+        known_bool: dict[str, str] = {}           # bool_id -> const_true_id / const_false_id along dominated edges
+        block_label = [insts[b_insts[0]][0] for b_insts in blocks]
 
         def process_block(b: int, slot_val: dict[tuple, str], entry_null_zero: dict[str, str],
                           reachable: bool):
@@ -552,6 +570,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
             undo_bm: list[str] = []
             undo_ce: list[str] = []
             undo_ln: list[str] = []
+            undo_ap: list[str] = []
 
             for idx in blocks[b]:
                 entry = insts[idx]
@@ -613,20 +632,21 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                 continue
                     if op == "OpSelect" and len(args) == 4:
                         cond, x, y = args[1], args[2], args[3]
-                        if cond in const_true or x == y:
+                        kcond = known_bool.get(cond, cond)
+                        if kcond in const_true or x == y:
                             alias[res] = x
                             dead_idx.add(idx)
                             deleted_ids.add(res)
                             changed = True
                             continue
-                        if cond in const_false:
+                        if kcond in const_false:
                             alias[res] = y
                             dead_idx.add(idx)
                             deleted_ids.add(res)
                             changed = True
                             continue
                         if x in const_true and y in const_false:
-                            alias[res] = cond
+                            alias[res] = kcond
                             dead_idx.add(idx)
                             deleted_ids.add(res)
                             changed = True
@@ -641,7 +661,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                 bool_mask_of[res] = (cond, False)
                                 undo_bm.append(res)
                     if op == "OpLogicalNot" and len(args) == 2:
-                        inner = args[1]
+                        inner = known_bool.get(args[1], args[1])
                         if inner in const_true and const_false_id is not None:
                             alias[res] = const_false_id
                             dead_idx.add(idx)
@@ -664,7 +684,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         logical_not_of[res] = inner
                         undo_ln.append(res)
                     if op == "OpLogicalAnd" and len(args) == 3:
-                        a1, a2 = args[1], args[2]
+                        a1, a2 = known_bool.get(args[1], args[1]), known_bool.get(args[2], args[2])
                         if a1 == a2 or a2 in const_true:
                             alias[res] = a1
                             dead_idx.add(idx)
@@ -689,8 +709,24 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                             deleted_ids.add(res)
                             changed = True
                             continue
+                        ap1 = and_pair_of.get(a1)
+                        if ap1 is not None and (a2 == ap1[0] or a2 == ap1[1]):
+                            alias[res] = a1
+                            dead_idx.add(idx)
+                            deleted_ids.add(res)
+                            changed = True
+                            continue
+                        ap2 = and_pair_of.get(a2)
+                        if ap2 is not None and (a1 == ap2[0] or a1 == ap2[1]):
+                            alias[res] = a2
+                            dead_idx.add(idx)
+                            deleted_ids.add(res)
+                            changed = True
+                            continue
+                        and_pair_of[res] = (args[1], args[2])
+                        undo_ap.append(res)
                     if op == "OpLogicalOr" and len(args) == 3:
-                        a1, a2 = args[1], args[2]
+                        a1, a2 = known_bool.get(args[1], args[1]), known_bool.get(args[2], args[2])
                         if a1 == a2 or a2 in const_false:
                             alias[res] = a1
                             dead_idx.add(idx)
@@ -711,6 +747,20 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                             continue
                         if a2 in const_true:
                             alias[res] = a2
+                            dead_idx.add(idx)
+                            deleted_ids.add(res)
+                            changed = True
+                            continue
+                        ap1 = and_pair_of.get(a1)
+                        if ap1 is not None and (a2 == ap1[0] or a2 == ap1[1]):
+                            alias[res] = a2
+                            dead_idx.add(idx)
+                            deleted_ids.add(res)
+                            changed = True
+                            continue
+                        ap2 = and_pair_of.get(a2)
+                        if ap2 is not None and (a1 == ap2[0] or a1 == ap2[1]):
+                            alias[res] = a1
                             dead_idx.add(idx)
                             deleted_ids.add(res)
                             changed = True
@@ -844,7 +894,29 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                 last_store.pop(s, None)
                     continue
 
-            return undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln
+            return undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln, undo_ap
+
+        def _branch_edge_fact(parent: int, child: int):
+            """If parent ends in OpBranchConditional %c %t %f (%t != %f) and child is a single-pred
+            target of one arm, return (%c, const_true_id / const_false_id), else None."""
+            if all_preds[child] != {parent}:
+                return None
+            ch_lbl = block_label[child]
+            if ch_lbl is None:
+                return None
+            for idx in reversed(blocks[parent]):
+                _, op, args, _ = insts[idx]
+                if op is None:
+                    continue
+                if op == "OpBranchConditional" and len(args) >= 3 and args[1] != args[2]:
+                    cond = args[0]
+                    if cond not in const_true and cond not in const_false:
+                        if ch_lbl == args[1] and const_true_id is not None:
+                            return cond, const_true_id
+                        if ch_lbl == args[2] and const_false_id is not None:
+                            return cond, const_false_id
+                break
+            return None
 
         if blocks:
             # Initial state for entry block 0.
@@ -861,20 +933,26 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         entry_sv[(v,)] = init
 
             # Iterative dominator-tree preorder DFS.
-            dfs: list[tuple] = [("enter", 0, entry_sv, entry_nz)]
+            dfs: list[tuple] = [("enter", 0, entry_sv, entry_nz, None)]
             while dfs:
                 frame = dfs.pop()
                 if frame[0] == "enter":
-                    _, b, sv, nz = frame
+                    _, b, sv, nz, edge_fact = frame
+                    prev_kb = None
+                    if edge_fact is not None:
+                        fk, fv = edge_fact
+                        prev_kb = (fk, known_bool.get(fk))
+                        known_bool[fk] = fv
                     undos = process_block(b, sv, nz, reachable=True)
-                    dfs.append(("exit", undos))
+                    dfs.append(("exit", undos, prev_kb))
                     for ch in reversed(dom_children[b]):
+                        ef = _branch_edge_fact(b, ch)
                         if all_preds[ch] == {b}:
-                            dfs.append(("enter", ch, dict(sv), dict(nz)))
+                            dfs.append(("enter", ch, dict(sv), dict(nz), ef))
                         else:
-                            dfs.append(("enter", ch, dict(readonly_slot_val), dict(readonly_null_zero)))
+                            dfs.append(("enter", ch, dict(readonly_slot_val), dict(readonly_null_zero), None))
                 else:
-                    undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln = frame[1]
+                    undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln, undo_ap = frame[1]
                     for k in undo_ac:
                         del ac_cse[k]
                     for k in undo_val:
@@ -889,13 +967,22 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         del ctor_elems[k]
                     for k in undo_ln:
                         del logical_not_of[k]
+                    for k in undo_ap:
+                        del and_pair_of[k]
+                    prev_kb = frame[2]
+                    if prev_kb is not None:
+                        fk, old_v = prev_kb
+                        if old_v is None:
+                            known_bool.pop(fk, None)
+                        else:
+                            known_bool[fk] = old_v
 
             # Process any unreachable blocks (in case spirv-val inspects them) with fresh state.
             reachable_set = set(rpo)
             for b in range(len(blocks)):
                 if b not in reachable_set:
                     undos = process_block(b, dict(readonly_slot_val), dict(readonly_null_zero), reachable=False)
-                    undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln = undos
+                    undo_ac, undo_val, undo_ro, undo_bc, undo_bm, undo_ce, undo_ln, undo_ap = undos
                     for k in undo_ac:
                         del ac_cse[k]
                     for k in undo_val:
@@ -910,6 +997,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         del ctor_elems[k]
                     for k in undo_ln:
                         del logical_not_of[k]
+                    for k in undo_ap:
+                        del and_pair_of[k]
 
         if dead_idx:
             insts = [e for i, e in enumerate(insts) if i not in dead_idx]
@@ -924,6 +1013,19 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 if new_args != args:
                     entry[2] = new_args
                     changed = True
+
+        insts, phi_changed = spirv_mem2reg.collapse_trivial_phis(
+            insts, _build_cfg_and_dom, all_decorated, deleted_ids,
+        )
+        if phi_changed:
+            changed = True
+
+        insts, hoist_changed = spirv_mem2reg.hoist_common_pure_exprs(
+            insts, _build_cfg_and_dom, _format_inst,
+            const_int_val, int_type_info, all_decorated, deleted_ids,
+        )
+        if hoist_changed:
+            changed = True
 
         # 3. Whole-function dead-slot store elimination for non-escaped, statically-indexed Function vars:
         #    if a slot (var, ...) has zero remaining OpLoads anywhere in the function, every OpStore to it is dead.
@@ -946,42 +1048,12 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 insts = [e for i, e in enumerate(insts) if i not in dead_stores]
                 changed = True
 
-        # 4. Backward pure Dead-Code Elimination (DCE) + dead Function-scope OpVariable removal.
-        use_count: dict[str, int] = {}
-        for _res, op, args, _ in insts:
-            if op is None or not args:
-                continue
-            for tok in args:
-                if tok.startswith("%"):
-                    use_count[tok] = use_count.get(tok, 0) + 1
-
-        def is_pure_dce_candidate(res: str, op: str, args: list[str]) -> bool:
-            if op in _PURE_OPS or op == "OpPhi":
-                return True
-            if op == "OpExtInst" and len(args) >= 3 and args[1] in glsl_sets and args[2] in _PURE_GLSL_EXT:
-                return True
-            if op == "OpLoad" and len(args) >= 2 and not any("Volatile" in m for m in args[2:]):
-                ptr = args[1]
-                root = ptr_root.get(ptr)
-                return root in trackable or root in readonly_global_vars or ptr in readonly_global_vars
-            if op == "OpVariable" and len(args) >= 2 and args[1] == "Function" and res in trackable:
-                return True
-            return False
-
-        dce_dead: set[int] = set()
-        for idx in range(len(insts) - 1, -1, -1):
-            res, op, args, _ = insts[idx]
-            if res is None or op is None:
-                continue
-            if use_count.get(res, 0) == 0 and is_pure_dce_candidate(res, op, args):
-                dce_dead.add(idx)
-                deleted_ids.add(res)
-                for tok in args:
-                    if tok.startswith("%"):
-                        use_count[tok] = use_count.get(tok, 0) - 1
-
-        if dce_dead:
-            insts = [e for i, e in enumerate(insts) if i not in dce_dead]
+        # 4. Mark-and-sweep pure Dead-Code Elimination (removes dead OpPhi cycles and dead Function OpVariables).
+        insts, dce_changed = spirv_mem2reg.mark_and_sweep_dce(
+            insts, trackable, readonly_global_vars, ptr_root,
+            glsl_sets, _PURE_OPS, _PURE_GLSL_EXT, deleted_ids,
+        )
+        if dce_changed:
             changed = True
 
         if not changed:
@@ -1090,6 +1162,10 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         if elem_ty and elem_ty in zero_const_of_type:
             const_null_elem_zero[null_id] = zero_const_of_type[elem_ty]
 
+    module_info = spirv_mem2reg.collect_module_info(
+        lines, const_ids, const_type, const_int_val, const_null_elem_zero, spvasm=spvasm,
+    )
+
     all_deleted: set[str] = set()
     opt_funcs: dict[int, list[str]] = {}
     for start, end in func_ranges:
@@ -1097,7 +1173,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
             lines[start:end], const_ids, const_true, const_false,
             const_null_elem_zero, const_type, const_int_val, int_const_by_val,
             int_type_info, readonly_global_vars, glsl_sets, decorated_ids,
-            max_passes=max_passes,
+            max_passes=max_passes, module_info=module_info,
         )
         opt_funcs[start] = new_body
         all_deleted.update(deleted)
