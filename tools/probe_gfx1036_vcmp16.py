@@ -4,7 +4,9 @@
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
 Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+  python -I tools/probe_gfx1036_vcmp16.py
+
+Needs a gfx1036, `spirv-as` and `runtime/build/vk_compute_test.exe`; `--help` names the probe and needs none of them.
 """
 import argparse
 import math
