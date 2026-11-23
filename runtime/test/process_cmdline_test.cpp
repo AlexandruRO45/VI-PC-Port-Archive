@@ -78,6 +78,38 @@ void check_argv_lifetime() {
     }
 }
 
+void check_mixed_width_counts() {
+    wchar_t temp[MAX_PATH] = {};
+    GetTempPathW(MAX_PATH, temp);
+    const std::wstring dir = std::wstring(temp) + L"leonida_args_" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring first = dir + L"\\one.txt";
+    const std::wstring second = dir + L"\\two.txt";
+    if (!CreateDirectoryW(dir.c_str(), nullptr)) {
+        std::fprintf(stderr, "FAIL create argument test directory\n");
+        ++failures;
+        return;
+    }
+    HANDLE a = CreateFileW(first.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    HANDLE b = CreateFileW(second.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+    if (a != INVALID_HANDLE_VALUE) CloseHandle(a);
+    if (b != INVALID_HANDLE_VALUE) CloseHandle(b);
+    using Narrow = int(__cdecl*)(int*, char***, char***, int, void*);
+    const auto get = reinterpret_cast<Narrow>(rt::shims::find("msvcrt.dll", "__getmainargs"));
+    rt::process::set_command_line(L"game.exe", {dir + L"\\*.txt"});
+    int count = 0;
+    char** args = nullptr;
+    if (a == INVALID_HANDLE_VALUE || b == INVALID_HANDLE_VALUE || !get ||
+        get(&count, &args, nullptr, 0, nullptr) || count != 2 ||
+        configure(true, 2) || !wargv() || !wargv()[2] || wargv()[3] ||
+        get(&count, &args, nullptr, 0, nullptr) || count != 2 || !args || !args[1] || args[2]) {
+        std::fprintf(stderr, "FAIL mixed-width argument count\n");
+        ++failures;
+    }
+    DeleteFileW(first.c_str());
+    DeleteFileW(second.c_str());
+    RemoveDirectoryW(dir.c_str());
+}
+
 void check_argv_reset() {
     const int host_argc = __argc;
     char** const host_argv = __argv;
@@ -250,6 +282,7 @@ int main() {
 
     check_import_names();
     check_argv_lifetime();
+    check_mixed_width_counts();
     check_argv_reset();
     check_getmainargs_environment();
     check_winmain(L"game.exe", {L"-foo", L"with space"}, L"-foo \"with space\"", "arguments after a plain name");

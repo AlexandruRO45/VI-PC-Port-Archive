@@ -263,7 +263,10 @@ int configure_argv(int mode, const std::vector<std::basic_string<C>>& input,
     if (mode == 0) return 0;
     if (mode != 1 && mode != 2) return errno = EINVAL;
     // Already configured this way: the published table stays as it is.
-    if (published && configured_mode == mode) return 0;
+    if (published && configured_mode == mode) {
+        g_argc = static_cast<int>(strings.size());
+        return 0;
+    }
     try {
         auto next_strings = mode == 2 ? expand_arguments(input) : input;
         std::vector<C*> next_pointers;
