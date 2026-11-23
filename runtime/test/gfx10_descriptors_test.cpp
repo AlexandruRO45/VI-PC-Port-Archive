@@ -7,6 +7,7 @@
 #include "../src/gfx10_descriptors.h"
 
 #include <cstdio>
+#include <limits>
 #include <set>
 
 #define CHECK(condition) do {                                    \
@@ -386,6 +387,47 @@ int main() {
     CHECK(vulkan_reduction_mode(FilterMode::blend) == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);
+
+    // DERIV_ADJUST_EN (WORD2 bit 31) repurposes WORD3, so kIntegerBorderPtr there is not a layer integer marker.
+    for (const auto [type, want] : {std::pair{BorderColor::transparent_black, VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK},
+                                    std::pair{BorderColor::opaque_black, VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK},
+                                    std::pair{BorderColor::opaque_white, VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE}}) {
+        const Sampler deriv = decode(SamplerWords{0, 0, 1u << 31, (std::uint32_t(type) << 30) | kIntegerBorderPtr});
+        CHECK(!deriv.integer_border && deriv.border_color_index == kIntegerBorderPtr);
+        CHECK(vulkan_sampler(deriv).borderColor == want);
+    }
+
+    // Vulkan requires maxLod >= minLod (VUID-VkSamplerCreateInfo-maxLod-01973); when min_lod > max_lod, D3D12/RDNA2
+    // give MinLOD precedence.
+    for (const MipFilter mip : {MipFilter::point, MipFilter::linear, MipFilter(3)}) {
+        info = vulkan_sampler({.mip_filter = mip, .min_lod = 2.0f, .max_lod = 0.0f});
+        CHECK(info.minLod == 2.0f && info.maxLod == 2.0f);
+    }
+    info = vulkan_sampler(decode(SamplerWords{0x92, 0x200, 1u << 26, 0}));
+    CHECK(info.minLod == 2.0f && info.maxLod == 2.0f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = -1.0f, .max_lod = -3.0f});
+    CHECK(info.minLod == -1.0f && info.maxLod == -1.0f);
+    info = vulkan_sampler({.mip_filter = MipFilter::none, .min_lod = 2.0f, .max_lod = 0.0f});
+    CHECK(info.minLod == 0.0f && info.maxLod == 0.25f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = 2.0f, .max_lod = 0.0f, .unnormalized = true});
+    CHECK(info.minLod == 0.0f && info.maxLod == 0.0f);
+
+    // Non-finite LODs and non-positive or NaN max_lod_bias sanitize without NaN propagation or std::clamp UB.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = nan, .max_lod = 4.0f});
+    CHECK(info.minLod == 0.0f && info.maxLod == 4.0f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = 2.0f, .max_lod = nan});
+    CHECK(info.minLod == 2.0f && info.maxLod == 2.0f);
+    info = vulkan_sampler({.mip_filter = MipFilter::point, .min_lod = nan, .max_lod = nan});
+    CHECK(info.minLod == 0.0f && info.maxLod == 0.0f);
+    CHECK(vulkan_sampler({.lod_bias = nan}, 15.0f).mipLodBias == 0.0f);
+    CHECK(vulkan_sampler({.lod_bias = inf}, 15.0f).mipLodBias == 15.0f);
+    CHECK(vulkan_sampler({.lod_bias = -inf}, 15.0f).mipLodBias == -15.0f);
+    CHECK(vulkan_sampler({.lod_bias = 2.0f}, 0.0f).mipLodBias == 0.0f);
+    CHECK(vulkan_sampler({.lod_bias = 2.0f}, -5.0f).mipLodBias == 0.0f);
+    CHECK(vulkan_sampler({.lod_bias = -2.0f}, -5.0f).mipLodBias == 0.0f);
+    CHECK(vulkan_sampler({.lod_bias = 2.0f}, nan).mipLodBias == 0.0f);
 
     // ---- V# ----
     CHECK((encode(Buffer{}) == BufferWords{0, 0, 0, 0xFAC}));

@@ -546,7 +546,8 @@ inline Sampler decode(const SamplerWords& words) {
     sampler.mip_filter = MipFilter(get(words[2], 26, 2));
     sampler.border_color_index = get(words[3], 0, 12);
     sampler.border_color = BorderColor(get(words[3], 30, 2));
-    if (sampler.border_color != BorderColor::table && sampler.border_color_index == kIntegerBorderPtr) {
+    if (!deriv_adjust && sampler.border_color != BorderColor::table &&
+        sampler.border_color_index == kIntegerBorderPtr) {
         sampler.integer_border = true;
         sampler.border_color_index = 0;
     }
@@ -603,13 +604,18 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
+    const float bias_limit = max_lod_bias > 0.0f ? max_lod_bias : 0.0f;
+    const float lod_bias = sampler.lod_bias == sampler.lod_bias ? sampler.lod_bias : 0.0f;
+    info.mipLodBias = bias_limit > 0.0f ? detail::clamped(lod_bias, -bias_limit, bias_limit) : 0.0f;
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
     info.compareOp = VkCompareOp(sampler.compare);
-    info.minLod = sampler.min_lod;
-    info.maxLod = sampler.max_lod;
+    // VUID-VkSamplerCreateInfo-maxLod-01973 requires maxLod >= minLod (and finite comparisons). In D3D11/12
+    // (max(MinLOD, min(MaxLOD, lod))) and on GFX10/RDNA2, MinLOD takes precedence when MinLOD > MaxLOD.
+    info.minLod = sampler.min_lod == sampler.min_lod ? sampler.min_lod : 0.0f;
+    info.maxLod = sampler.max_lod == sampler.max_lod ? sampler.max_lod : 0.0f;
+    if (info.maxLod < info.minLod) info.maxLod = info.minLod;
     if (sampler.mip_filter == MipFilter::none) {
         info.minLod = 0.0f;
         info.maxLod = 0.25f;
