@@ -245,8 +245,10 @@ def main(argv=None):
         return 1
     new = os.path.join(a.out, "new")
     out_existed = os.path.isdir(a.out)
+    new_existed = os.path.isdir(new)
     try:
-        before = set(os.listdir(a.out)) if out_existed else set()
+        if out_existed:
+            os.listdir(a.out)  # an unreadable output folder is reported here, before anything is written
         os.makedirs(new, exist_ok=True)
     except OSError as e:
         ap.error(f"cannot create {new}: {e.strerror or e}")
@@ -256,16 +258,19 @@ def main(argv=None):
     try:
         vs = test_vertex_shader(a.out)
     except (OSError, subprocess.CalledProcessError) as e:
-        # Nothing this run created stays behind.
-        if not out_existed:
-            shutil.rmtree(a.out, ignore_errors=True)
-        else:
-            for entry in set(os.listdir(a.out)) - before:
-                path = os.path.join(a.out, entry)
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    os.remove(path)
+        # Remove only what this run created: its own files and the folders it made, and only while they are
+        # empty, so output another process wrote beside them survives.
+        for path in (os.path.join(a.out, "test_vs.spvasm"), os.path.join(a.out, "test_vs.spv")):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        for path, existed in ((new, new_existed), (a.out, out_existed)):
+            if not existed:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
         ap.error(f"cannot build the test vertex shader (needs spirv-as and spirv-val on PATH): {e}")
 
     print(f"{len(picked)} branchy pixel shaders picked ({'with loops' if a.loops == 'only' else 'loop-free'}); "
