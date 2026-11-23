@@ -273,15 +273,21 @@ The executable's first boot confirms them, or names the slots that differ.
 - **Storage:** `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`,
   names %-encoded: the layout `tools/saves.py import` writes ([saves.md](saves.md#importing-into-the-runtime)).
   `XGameSaveFilesGetFolderWithUi*` gives `<root>\files\<configId>`.
-- **Updates:** writes and deletes are buffered; `XGameSaveSubmitUpdate` writes each new blob beside its final name,
-  then renames it over, so a failed write leaves the container as it was. One write or delete per blob per update;
+- **Updates:** writes and deletes are buffered. `XGameSaveSubmitUpdate` builds the container's new contents in a
+  hidden staging folder next to it and swaps it in with two folder renames, so the container is wholly old or wholly
+  new, the "atomic updates at the container level" Microsoft's reference describes (RT-375; until then each blob was
+  renamed over on its own, and a failure or crash between two renames left the container half old and half new). A
+  process that dies between the two renames leaves only the old copy, which the next `XGameSaveInitializeProvider` puts
+  back. `xgameruntime_gamesave_test` checks both: an update blocked by a blob held open changes nothing and leaves no
+  hidden folder, and a left-over old copy is restored. One write or delete per blob per update;
   an update past 16 MB (`GS_MAX_BLOB_SIZE`) is `E_GS_UPDATE_TOO_BIG`.
 - **Names:** container names follow `XGameSaveCreateContainer`'s documented rule (`E_GS_INVALID_CONTAINER_NAME`
   otherwise).
 - **Reads:** `XGameSaveReadBlobData` fills the title's buffer with the `XGameSaveBlob` array, then each blob's bytes
   and name, which the array points into; a buffer too small is `E_GS_PROVIDED_BUFFER_TOO_SMALL`, a missing blob
   `E_GS_BLOB_NOT_FOUND`. The async read's result size (`XAsyncGetResultSize`) is the buffer it needs.
-- **ASSUMPTION:** a fixed 1 GiB quota, blob names of at most 256 bytes, `blobNames = nullptr` reads every blob,
+- **ASSUMPTION:** a 256 MB quota, the default Microsoft's "Debugging Game Saves" error table gives for
+  `0x80830006` E_QUOTA_EXCEEDED (it was 1 GiB until RT-375), blob names of at most 256 bytes, `blobNames = nullptr` reads every blob,
   and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
   ignored: nothing syncs offline.
 

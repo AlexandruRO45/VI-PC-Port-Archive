@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <iterator>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -53,6 +54,7 @@ struct Blob {
 };
 
 constexpr HRESULT E_GS_INVALID_CONTAINER_NAME = static_cast<HRESULT>(0x80830001);
+constexpr HRESULT E_GS_OUT_OF_LOCAL_STORAGE = static_cast<HRESULT>(0x80830003);
 constexpr HRESULT E_GS_UPDATE_TOO_BIG = static_cast<HRESULT>(0x80830005);
 constexpr HRESULT E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HRESULT>(0x80830007);
 constexpr HRESULT E_GS_BLOB_NOT_FOUND = static_cast<HRESULT>(0x80830008);
@@ -151,8 +153,8 @@ int main() {
     check(std::filesystem::is_directory(root / L"local-user"), "the provider's folder is <LEONIDA_SAVE_DIR>\\local-user");
 
     int64_t quota = 0;
-    check(at<Quota>(save, 7)(save, provider, &quota) == S_OK && quota == (int64_t{1} << 30),
-          "GetRemainingQuota of an empty provider is the whole 1 GiB");
+    check(at<Quota>(save, 7)(save, provider, &quota) == S_OK && quota == (int64_t{256} << 20),
+          "GetRemainingQuota of an empty provider is the whole documented default, 256 MB");
 
     // ---- containers and names ----
     Handle container = nullptr;
@@ -268,7 +270,7 @@ int main() {
     int64_t aquota = 0;
     check(at<WithAsync>(save, 8)(save, provider, &async) == S_OK && finished(&async) &&
               at<QuotaResult>(save, 9)(save, &async, &aquota) == S_OK &&
-              aquota == (int64_t{1} << 30) - static_cast<int64_t>(story.size()),
+              aquota == (int64_t{256} << 20) - static_cast<int64_t>(story.size()),
           "GetRemainingQuotaAsync subtracts what the saves hold");
 
     // ---- delete the container ----
@@ -277,6 +279,59 @@ int main() {
               at<AsyncOnly>(save, 12)(save, &async) == S_OK && !std::filesystem::exists(dir),
           "DeleteContainerAsync removes the container");
     at<Close>(save, 17)(save, container);
+
+    // ---- an update is atomic per container (RT-375) ----
+    {
+        const std::filesystem::path user_dir = root / L"local-user";
+        auto file_text = [](const std::filesystem::path& f) {
+            std::ifstream in(f, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        };
+        Handle atom = nullptr, up = nullptr;
+        check(at<Create>(save, 16)(save, provider, "atomic", &atom) == S_OK && atom, "CreateContainer atomic");
+        at<Create>(save, 23)(save, atom, "Atomic", &up);
+        at<Write>(save, 25)(save, up, "a", reinterpret_cast<const uint8_t*>("old-a"), 5);
+        at<Write>(save, 25)(save, up, "b", reinterpret_cast<const uint8_t*>("old-b"), 5);
+        check(at<Submit>(save, 27)(save, up) == S_OK, "a first update writes a and b");
+        at<Close>(save, 24)(save, up);
+        // Hold "b" open without FILE_SHARE_DELETE, so neither replacing it nor moving its folder can succeed. Replacing
+        // blob by blob (the old commit) renamed "a" first and failed on "b", leaving a mixed container.
+        const std::filesystem::path adir = user_dir / L"atomic";
+        HANDLE held = CreateFileW((adir / L"b").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        at<Create>(save, 23)(save, atom, nullptr, &up);
+        at<Write>(save, 25)(save, up, "a", reinterpret_cast<const uint8_t*>("new-a"), 5);
+        at<Write>(save, 25)(save, up, "b", reinterpret_cast<const uint8_t*>("new-b"), 5);
+        const HRESULT blocked = at<Submit>(save, 27)(save, up);
+        if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
+        check(held != INVALID_HANDLE_VALUE && blocked == E_GS_OUT_OF_LOCAL_STORAGE && file_text(adir / L"a") == "old-a" &&
+                  file_text(adir / L"b") == "old-b",
+              "an update that can't be applied leaves every blob as it was (container-level atomic)");
+        bool hidden = false;
+        for (const auto& e : std::filesystem::directory_iterator(user_dir)) hidden |= e.path().filename().wstring()[0] == L'.';
+        check(!hidden, "and leaves no staging or backup folder behind");
+        check(at<Submit>(save, 27)(save, up) == S_OK && file_text(adir / L"a") == "new-a" && file_text(adir / L"b") == "new-b",
+              "the same update succeeds once nothing holds the blob");
+        at<Close>(save, 24)(save, up);
+        at<Close>(save, 17)(save, atom);
+
+        // A commit that died between its two renames leaves only ".<name>.old-N"; opening a provider puts it back.
+        // Stale staging copies and old copies whose container exists are removed.
+        std::filesystem::create_directories(user_dir / L".crashed.old-1-1");
+        { std::ofstream(user_dir / L".crashed.old-1-1" / L"x", std::ios::binary) << "kept"; }
+        std::filesystem::create_directories(user_dir / L".atomic.staging-1-2");
+        std::filesystem::create_directories(user_dir / L".atomic.old-1-3");
+        Handle reopened = nullptr;
+        check(at<Init>(save, 3)(save, user, "SCID", false, &reopened) == S_OK && reopened &&
+                  file_text(user_dir / L"crashed" / L"x") == "kept" &&
+                  !std::filesystem::exists(user_dir / L".crashed.old-1-1") &&
+                  !std::filesystem::exists(user_dir / L".atomic.staging-1-2") &&
+                  !std::filesystem::exists(user_dir / L".atomic.old-1-3") && file_text(adir / L"a") == "new-a",
+              "opening a provider restores a container a crash left as its old copy, and removes stale copies");
+        at<Close>(save, 6)(save, reopened);
+        std::error_code rm;
+        std::filesystem::remove_all(user_dir / L"crashed", rm);
+        std::filesystem::remove_all(adir, rm);
+    }
 
     // ---- async provider, XGameSaveFiles ----
     async = XAsyncBlock{};
@@ -293,7 +348,7 @@ int main() {
               std::filesystem::is_directory(std::filesystem::u8path(folder.c_str())),
           "FilesGetFolderWithUiResult returns a folder that exists");
     int64_t fquota = 0;
-    check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{1} << 30),
+    check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{256} << 20),
           "FilesGetRemainingQuota of an empty folder");
 
     at<Close>(save, 6)(save, provider);
