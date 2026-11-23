@@ -1026,6 +1026,25 @@ int main() {
             return fail("DXGI_PRESENT_TEST should not increment GetLastPresentCount");
         if (sc->Present(5, 0) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before)
             return fail("Present(5, 0) should be DXGI_ERROR_INVALID_CALL and present nothing");
+        // Host DXGI (Windows 10 22H2, RTX 2060 566.14) refuses these flags on an unrestricted, non-stereo chain.
+        const UINT refused_flags[] = {DXGI_PRESENT_STEREO_PREFER_RIGHT,
+                                      DXGI_PRESENT_STEREO_TEMPORARY_MONO,
+                                      DXGI_PRESENT_RESTRICT_TO_OUTPUT,
+                                      0x80u,
+                                      0x400u,
+                                      0x80000000u,
+                                      DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE,
+                                      DXGI_PRESENT_TEST | DXGI_PRESENT_RESTART,
+                                      DXGI_PRESENT_TEST | DXGI_PRESENT_USE_DURATION};
+        for (const UINT flags : refused_flags) {
+            UINT count = 0;
+            if (sc->Present(0, flags) != DXGI_ERROR_INVALID_CALL || sc->GetCurrentBackBufferIndex() != before ||
+                FAILED(sc->GetLastPresentCount(&count)) || count != count_before) {
+                std::fprintf(stderr, "FAIL: Present(0, 0x%x) should be DXGI_ERROR_INVALID_CALL and present nothing\n",
+                             flags);
+                return 1;
+            }
+        }
         if (sc->GetLastPresentCount(nullptr) != E_INVALIDARG)
             return fail("GetLastPresentCount(nullptr) should return E_INVALIDARG");
 

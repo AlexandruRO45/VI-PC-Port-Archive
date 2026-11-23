@@ -300,6 +300,13 @@ public:
     // IDXGISwapChain
     HRESULT STDMETHODCALLTYPE Present(UINT sync, UINT flags) override {
         if (sync > 4) return DXGI_ERROR_INVALID_CALL;
+        // Host-measured: TEST with any other flag is refused too, not only the stereo and undefined bits.
+        constexpr UINT kPresentFlags = DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE | DXGI_PRESENT_RESTART |
+                                       DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTRICT_TO_OUTPUT |
+                                       DXGI_PRESENT_USE_DURATION | DXGI_PRESENT_ALLOW_TEARING;
+        if (flags & ~kPresentFlags) return DXGI_ERROR_INVALID_CALL;
+        if ((flags & DXGI_PRESENT_TEST) && flags != DXGI_PRESENT_TEST) return DXGI_ERROR_INVALID_CALL;
+        if ((flags & DXGI_PRESENT_RESTRICT_TO_OUTPUT) && !restrict_to_output_) return DXGI_ERROR_INVALID_CALL;
         if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
