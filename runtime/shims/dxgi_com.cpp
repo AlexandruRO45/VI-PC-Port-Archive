@@ -1235,15 +1235,20 @@ public:
     HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(UINT node_index, DXGI_MEMORY_SEGMENT_GROUP group,
                                                         UINT64 reservation) override {
         if (node_index != 0) return E_INVALIDARG;
+        if (group != DXGI_MEMORY_SEGMENT_GROUP_LOCAL && group != DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
+            return E_INVALIDARG;
+        // Native Windows 11 DXGI (RTX 5090 + WARP) rejects reservations strictly greater than AvailableForReservation
+        // with E_INVALIDARG and leaves CurrentReservation unchanged.
+        DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+        const HRESULT hr = QueryVideoMemoryInfo(node_index, group, &info);
+        if (FAILED(hr)) return hr;
+        if (reservation > info.AvailableForReservation) return E_INVALIDARG;
         if (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL) {
             reservations_->local.store(reservation, std::memory_order_relaxed);
             return S_OK;
         }
-        if (group == DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) {
-            reservations_->non_local.store(reservation, std::memory_order_relaxed);
-            return S_OK;
-        }
-        return E_INVALIDARG;
+        reservations_->non_local.store(reservation, std::memory_order_relaxed);
+        return S_OK;
     }
     // Microsoft documents only "an HRESULT success or error code" and a cookie for
     // UnregisterVideoMemoryBudgetChangeNotification. The budget here is recomputed on every QueryVideoMemoryInfo and
