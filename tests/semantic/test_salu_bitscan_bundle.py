@@ -198,5 +198,36 @@ class TestSFf0I32B32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_ff0_i32_b32(0xFFFFFFFF), MASK32)
 
 
+def ref_ff0_i32_b64(src0: int) -> int:
+    """Reference mathematical oracle for s_ff0_i32_b64.
+    Returns index of first 0 bit in 64-bit int (0..63, LSB to MSB), or -1 (0xFFFFFFFF) if all bits are 1.
+    """
+    val = src0 & MASK64
+    if val == MASK64:
+        return MASK32
+    inv = (~val) & MASK64
+    lsb = inv & (-inv)
+    return lsb.bit_length() - 1
+
+
+class TestSFf0I32B64Reference(unittest.TestCase):
+    """Reference oracle unit tests for s_ff0_i32_b64."""
+
+    def test_reference_zero(self):
+        self.assertEqual(ref_ff0_i32_b64(0), 0)
+
+    def test_reference_low_dword_zero(self):
+        self.assertEqual(ref_ff0_i32_b64(1), 1)
+        self.assertEqual(ref_ff0_i32_b64(0x7FFFFFFF), 31)
+
+    def test_reference_high_dword_zero(self):
+        self.assertEqual(ref_ff0_i32_b64(MASK32), 32)
+        self.assertEqual(ref_ff0_i32_b64(MASK64 ^ (1 << 45)), 45)
+        self.assertEqual(ref_ff0_i32_b64(MASK64 ^ (1 << 63)), 63)
+
+    def test_reference_all_ones(self):
+        self.assertEqual(ref_ff0_i32_b64(MASK64), MASK32)
+
+
 if __name__ == "__main__":
     unittest.main()
