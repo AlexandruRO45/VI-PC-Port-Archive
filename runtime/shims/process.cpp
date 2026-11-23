@@ -52,6 +52,9 @@ std::atomic<bool> g_running{false};
 std::atomic<bool> g_exited{false};
 std::atomic<int> g_exit_code{0};
 HANDLE g_done = nullptr;
+void (*g_shutdown)(void*) = nullptr;
+void* g_shutdown_context = nullptr;
+std::atomic<DWORD> g_shutdown_thread{0};
 
 std::wstring quote(const std::wstring& a) {
     if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
@@ -83,6 +86,14 @@ std::string narrow(const std::wstring& w) {
     bool expected = false;
     if (g_exited.compare_exchange_strong(expected, true)) {
         g_exit_code = code;
+        if (g_running && g_shutdown) {
+            g_shutdown_thread = GetCurrentThreadId();
+            g_shutdown(g_shutdown_context);
+            g_shutdown_thread = 0;
+        }
+        if (g_done) SetEvent(g_done);
+    } else if (g_running && g_shutdown_thread == GetCurrentThreadId()) {
+        // A detach callback called exit/ExitProcess on the shutting-down thread; unblock run_entry.
         if (g_done) SetEvent(g_done);
     }
     // Park until the host's ExitProcess, not ExitThread: Wine < 11.2 can exit 0 if the two race (4a9bc42a).
@@ -290,7 +301,8 @@ void set_command_line(const std::wstring& program, const std::vector<std::wstrin
     g_wargv_ptr = g_wargv.data();
 }
 
-int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* startup_context) {
+int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* startup_context,
+              void (*shutdown)(void*), void* shutdown_context) {
     {
         std::lock_guard<std::mutex> lock(g_atexit_lock);
         g_atexit.clear();  // a run never sees the handlers of an earlier one
@@ -298,6 +310,9 @@ int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* sta
     g_exiting_thread = 0;
     g_exited = false;
     g_exit_code = 0;
+    g_shutdown = shutdown;
+    g_shutdown_context = shutdown_context;
+    g_shutdown_thread = 0;
     g_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!g_done) return -1;
     g_running = true;
@@ -327,6 +342,8 @@ int run_entry(void* entry, size_t stack_bytes, void (*startup)(void*), void* sta
     CloseHandle(g_done);
     g_done = nullptr;
     g_running = false;
+    g_shutdown = nullptr;
+    g_shutdown_context = nullptr;
     return g_exit_code.load();
 }
 

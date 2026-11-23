@@ -67,6 +67,10 @@ void initialise_for_run(void* context) {
     std::fflush(stdout);
 }
 
+void shutdown_for_run(void* context) {
+    static_cast<RunStartup*>(context)->loader.detach_initialised_modules();
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
@@ -252,7 +256,8 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stdout);
         RunStartup startup{loader, main_module};
         const int code = rt::process::run_entry(main_module.base + main_module.entry_rva,
-                                                8u << 20, initialise_for_run, &startup);
+                                                8u << 20, initialise_for_run, &startup,
+                                                shutdown_for_run, &startup);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();
