@@ -35,6 +35,7 @@ import os
 import re
 import sys
 import tempfile
+from xml.sax.saxutils import escape
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -195,6 +196,15 @@ def _collisions(table: dict[int, set[str]]) -> int:
 
 _XML_ENTITY = re.compile(r"&(?:(amp|lt|gt|quot|apos)|#([0-9]+)|#x([0-9A-Fa-f]+));")
 _XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+# A valid comment may contain a literal XML declaration. For a broken comment, a new declaration
+# can mark the next document in a concatenated file. A second comment opener is invalid inside the first.
+_XML_MARKUP = re.compile(
+    r"<!--[^-]*(?:-(?!-)[^-]*)*-->"
+    r"|<!--.*?(?:-->|(?=<\?xml\s)|\Z)"
+    r"|<!\[CDATA\[(?:(?P<cdata>.*?)\]\]>|.*?(?=<\?xml\s|\Z))"
+    r"|<\?.*?(?:\?>|\Z)",
+    re.S,
+)
 
 
 def _xml_unescape(text: str) -> str:
@@ -299,10 +309,8 @@ class NameDictionary:
         with open(path, encoding="utf-8-sig", errors="replace") as handle:
             text = handle.read()
 
-        # Comments are dropped, CDATA and processing instructions are kept. The input may be many files joined
-        # together, so an unterminated comment ends at the next XML declaration, not at the end of the input.
-        text = re.sub(r"(<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|<!--.*?(?:-->|(?=<\?xml)|\Z)",
-                      lambda m: m[1] or "", text, flags=re.S)
+        # Escape CDATA so the tag search sees character data and _xml_unescape restores its literal value.
+        text = _XML_MARKUP.sub(lambda m: escape(m["cdata"] or ""), text)
 
         added = 0
         for match in re.finditer(r"<filename>(.*?)</filename>", text, re.S):

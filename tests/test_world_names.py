@@ -98,6 +98,15 @@ class DictionaryTest(unittest.TestCase):
             handle.write(text)
         return path
 
+    def test_xml_recovers_when_next_document_contains_a_comment(self):
+        xml = self.write("concat.xml", "<root><name>First</name><!-- cut off here\n"
+                         '<?xml version="1.0"?><root><!-- <name>Ignored</name> -->'
+                         "<name>RealName</name><filename>x/Real.rpf</filename></root>")
+        dictionary = WN.NameDictionary()
+        dictionary.add_xml(xml)
+        self.assertEqual(sorted(n for names in dictionary.to_json()["names"].values() for n in names),
+                         ["First", "Real", "Real.rpf", "RealName"])
+
     def test_build_from_all_sources(self):
         manifest = self.write("manifest.json", json.dumps({
             "Items": [
@@ -320,7 +329,8 @@ class CliTest(unittest.TestCase):
             xml = os.path.join(tmp, "names.xml")
             out = os.path.join(tmp, "out.json")
             with open(xml, "w", encoding="utf-8") as handle:
-                handle.write("<root><!-- <name>ghost</name><filename>ghost.rpf</filename> -->"
+                handle.write('<root><!-- <?xml version="1.0"?> '
+                             "<name>ghost</name><filename>ghost.rpf</filename> -->"
                              "<name>A&amp;B</name></root>\n"
                              '<?xml version="1.0"?><root>'
                              "<filename>levels/Cell&#x26;Prop.rpf</filename></root>")
@@ -330,6 +340,21 @@ class CliTest(unittest.TestCase):
                 names = json.load(handle)["names"]
             self.assertEqual(names, {WN.joaat_hex(name): [name]
                                      for name in ("A&B", "Cell&Prop", "Cell&Prop.rpf")})
+
+    def test_build_xml_treats_cdata_as_text_and_skips_processing_instructions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = os.path.join(tmp, "names.xml")
+            out = os.path.join(tmp, "out.json")
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><![CDATA[<name>ghost</name><filename>ghost.rpf</filename>]]>"
+                             "<?example <name>ghost_pi</name> ?>"
+                             "<name>Real<![CDATA[&lt;]]></name><filename>path/Real.rpf</filename></root>")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--xml", xml, "--out", out]), 0)
+            with open(out, encoding="utf-8") as handle:
+                names = json.load(handle)["names"]
+            self.assertEqual(names, {WN.joaat_hex(name): [name]
+                                     for name in ("Real&lt;", "Real", "Real.rpf")})
 
     def test_resolve_rejects_a_malformed_dictionary(self):
         with tempfile.TemporaryDirectory() as tmp:
