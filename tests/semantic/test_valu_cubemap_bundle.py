@@ -341,5 +341,20 @@ class VCubeTcScalarInterpreterTests(unittest.TestCase):
         # -Y major: (0.5, -3.0, 1.2) -> tc = -z = -1.2
         self.assertEqual(oracle_cubetc_f32(0.5, -3.0, 1.2), -1.2)
 
+class VCubeTcSimdDivergenceTests(unittest.TestCase):
+    def test_cubetc_simd_exec_masking(self):
+        wave = WavefrontSimdState(lane_count=32)
+        wave.exec_mask = 0xF0F0F0F0
+        for i in range(32):
+            wave.set_vgpr(i, 5, -555.0)
+            if (wave.exec_mask >> i) & 1:
+                # +Z major with varying Y
+                wave.set_vgpr(i, 5, oracle_cubetc_f32(0.0, float(i), 100.0))
+        for i in range(32):
+            if (0xF0F0F0F0 >> i) & 1:
+                self.assertEqual(wave.get_vgpr(i, 5), -float(i))
+            else:
+                self.assertEqual(wave.get_vgpr(i, 5), -555.0)
+
 if __name__ == "__main__":
     unittest.main()
