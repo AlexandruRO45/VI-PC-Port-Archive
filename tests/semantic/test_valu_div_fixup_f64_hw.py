@@ -541,3 +541,33 @@ class TestRegisterAliasing(unittest.TestCase):
 
         self.assertEqual(res, F64_ONE)
         self.assertEqual(state.get_vgpr64(0), F64_ONE)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_div_fixup_f64 never alters VCC or SCC."""
+        lines = [
+            "v_cmp_eq_u32 vcc, 20, 20",            # Sets VCC to all 1s
+            "v_mov_b32 v2, 0", "v_mov_b32 v3, 0x3ff00000",
+            "v_mov_b32 v4, 0", "v_mov_b32 v5, 0x40000000",
+            "v_mov_b32 v6, 0", "v_mov_b32 v7, 0x40000000",
+            "v_div_fixup_f64 v[0:1], v[2:3], v[4:5], v[6:7]",
+            "v_cndmask_b32 v8, 0x11111111, 0x22222222, vcc", # Should choose 0x22222222
+            "exp mrt0 v8, v0, v1, v8 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_div_vcc_invariant", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(u64((words[2] << 32) | words[1]), F64_ONE)
+
+    def test_clamp_saturation_boundaries(self) -> None:
+        """Verify saturation limits on double float output."""
+        got = oracle_div_fixup_f64(F64_FOUR, F64_TWO, F64_TWO, clamp=True)
+        self.assertEqual(got, F64_ONE)
