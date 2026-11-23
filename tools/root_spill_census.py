@@ -132,14 +132,22 @@ def main(argv=None):
         for other in (a.index, a.carve):
             if other and same_report_path(other, a.json):
                 ap.error("--json must not overwrite an input index")
-    with open(a.index, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
-        index = json.load(f)
+    for path in (a.index, a.carve):
+        if path and not os.path.exists(path):
+            print(f"ERROR: {path}: does not exist", file=sys.stderr)
+            return 2
+    try:
+        with open(a.index, encoding="utf-8-sig") as f:  # an index saved with a UTF-8 BOM is still JSON
+            index = json.load(f)
+        carve = None
+        if a.carve:
+            with open(a.carve, encoding="utf-8-sig") as f:  # same for the carve index
+                carve = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
     if not isinstance(index, dict):
         ap.error(f"{a.index} is not a translator index (expected a JSON object)")
-    carve = None
-    if a.carve:
-        with open(a.carve, encoding="utf-8-sig") as f:  # same for the carve index
-            carve = json.load(f)
     # --base overrides the stages it names and keeps the defaults for the rest, so a partial override never drops
     # a stage from the check.
     summary = census(index, {**DEFAULT_BASE, **dict(a.base)}, carve)

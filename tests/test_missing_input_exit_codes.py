@@ -23,6 +23,7 @@ MISSING_INPUT_TOOLS = (
     "gamedata_sps1",
     "navmesh_index",
     "pe_inspect",
+    "root_spill_census",
     "rtti_scan",
     "shader_disasm",
     "tile_probe",
