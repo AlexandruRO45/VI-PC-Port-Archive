@@ -190,6 +190,22 @@ class TestVCeilF32ReferenceOracle(unittest.TestCase):
         res = oracle_v_ceil_f32(0x3fc00000)
         self.assertEqual(res, 0x40000000)
 
+class TestVCeilF32ASTAndInterpreter(unittest.TestCase):
+    """Stage 2 for v_ceil_f32: AST and deterministic interpreter execution."""
+
+    def test_v_ceil_f32_ast_emission(self):
+        lines = [
+            "v_mov_b32 v1, 0x3fc00000",
+            "v_ceil_f32 v0, v1",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_ast_v_ceil_f32", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("Ceil", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40000000)
+
 
 if __name__ == '__main__':
     unittest.main()
