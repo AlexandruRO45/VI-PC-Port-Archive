@@ -382,9 +382,12 @@ class PipelineBatchesTest(unittest.TestCase):
         with mock.patch.object(make_game, "pipelines_fingerprint", return_value=fingerprint):
             return self.invoke(control)
 
+    def marker(self):
+        return (self.out / "pipelines.done").read_text(encoding="utf-8")
+
     def test_an_unchanged_run_is_skipped_until_something_changes(self):
         self.assertEqual(self.invoke_as("fp1")[0], 0)
-        self.assertEqual((self.out / "pipelines.done").read_text(encoding="utf-8"), "fp1\n")
+        self.assertEqual(self.marker(), f"fp1 {make_game.pipeline_cache_stamp(str(self.out / 'pipeline_cache.bin'))}\n")
         self.commands.clear()
         code, logs, _ = self.invoke_as("fp1")
         self.assertEqual(code, 0)
@@ -393,7 +396,7 @@ class PipelineBatchesTest(unittest.TestCase):
         code, _, _ = self.invoke_as("fp2")   # a new translation, checker or driver
         self.assertEqual(code, 0)
         self.assertNotEqual(self.commands, [])
-        self.assertEqual((self.out / "pipelines.done").read_text(encoding="utf-8"), "fp2\n")
+        self.assertTrue(self.marker().startswith("fp2 "), self.marker())
 
     def test_a_missing_cache_runs_the_stage_again(self):
         self.assertEqual(self.invoke_as("fp1")[0], 0)
@@ -402,6 +405,62 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(self.invoke_as("fp1")[0], 0)
         self.assertNotEqual(self.commands, [])
         self.assertTrue((self.out / "pipeline_cache.bin").exists())
+
+    def rerun_after(self, change):
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        cache = self.out / "pipeline_cache.bin"
+        change(cache)
+        self.commands.clear()
+        self.assertEqual(self.invoke_as("fp1")[0], 0)
+        self.assertNotEqual(self.commands, [])
+        self.assertEqual(set(json.loads(cache.read_text(encoding="utf-8"))), set(self.names))
+        self.commands.clear()
+        self.assertEqual(self.invoke_as("fp1")[0], 0)   # the rebuilt cache is recorded again
+        self.assertEqual(self.commands, [])
+
+    def test_an_empty_cache_runs_the_stage_again(self):
+        self.rerun_after(lambda cache: cache.write_bytes(b""))
+
+    def test_a_truncated_cache_with_its_old_time_runs_the_stage_again(self):
+        def truncate(cache):
+            info = cache.stat()
+            cache.write_bytes(cache.read_bytes()[:4])
+            os.utime(cache, ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.rerun_after(truncate)
+
+    def test_a_same_size_rewrite_of_the_cache_runs_the_stage_again(self):
+        def rewrite(cache):
+            info = cache.stat()
+            cache.write_bytes(b"x" * info.st_size)
+            os.utime(cache, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+        self.rerun_after(rewrite)
+
+    def test_the_fingerprint_follows_the_graphics_stubs(self):
+        def probe(args, **kwargs):
+            Path(args[2]).write_bytes(bytes(range(32)))   # the cache header the checker saves
+        self.out.mkdir()
+        exe = self.root / "checker.exe"
+        exe.write_bytes(b"checker")
+        stub = self.spirv / "stubs" / "vs_empty.spv"
+        stub.parent.mkdir()
+        stub.write_bytes(b"stub")
+
+        def fingerprint():
+            with mock.patch.object(make_game.subprocess, "run", side_effect=probe):
+                return make_game.pipelines_fingerprint(str(exe), str(self.spirv), str(self.out), len(self.names))
+
+        first = fingerprint()
+        self.assertTrue(first)
+        self.assertEqual(fingerprint(), first)
+        info = stub.stat()
+        stub.write_bytes(b"")
+        emptied = fingerprint()
+        self.assertNotEqual(emptied, first)
+        stub.write_bytes(b"stub")
+        os.utime(stub, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+        self.assertNotIn(fingerprint(), (first, emptied))
+        stub.unlink()
+        self.assertNotIn(fingerprint(), (first, emptied))
 
     def test_a_run_with_failures_leaves_no_marker(self):
         self.assertEqual(self.invoke_as("fp1")[0], 0)

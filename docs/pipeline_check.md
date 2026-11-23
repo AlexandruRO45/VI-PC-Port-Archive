@@ -356,11 +356,12 @@ every batch with the whole cache instead reads and rewrites it once per batch: o
 one-shader run takes 0.9 s with an empty cache and 36-51 s with the 5.1 GB cache of the full corpus. A checker
 without `--merge-cache` keeps that single shared cache.
 
-After a run in which every pipeline passed, the stage writes `pipelines.done`: a fingerprint of `index.json`, each
-module's size and modification time, the checker build, and the device's pipeline-cache identity (vendor, device and
-the driver's cache UUID, read from a run that checks no shader, about a second). The next run skips the stage while
-the fingerprint is unchanged. A new translation, a rebuilt checker or a driver update runs it again, and deleting
-`pipelines.done` forces it.
+After a run in which every pipeline passed, the stage writes `pipelines.done`: a fingerprint of `index.json`, the
+size and modification time of each module and each graphics partner stub in `stubs\`, the checker build, and the
+device's pipeline-cache identity (vendor, device and the driver's cache UUID, read from a run that checks no shader,
+about a second), followed by the finished `pipeline_cache.bin`'s file id, size and modification time. The next run
+skips the stage while both are unchanged. A new translation or stub, a rebuilt checker, a driver update, or a
+missing, empty or rewritten `pipeline_cache.bin` runs it again, and deleting `pipelines.done` forces it.
 
 Index entries whose SPIR-V bytes and pipeline fields (everything but `src_sha256` and `fssm_sha256`) equal an earlier
 entry's are listed in `pipeline_duplicates.txt` and skipped through `--duplicates-file`, counted per stage as

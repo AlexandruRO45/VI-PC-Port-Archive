@@ -2384,7 +2384,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     done = os.path.join(out, "pipelines.done")
     fingerprint = pipelines_fingerprint(exe, spirv, out, len(names)) if names else ""
-    if fingerprint and read_shader_setting(done) == fingerprint and os.path.isfile(cache):
+    stamp = pipeline_cache_stamp(cache)
+    if fingerprint and stamp and read_shader_setting(done) == f"{fingerprint} {stamp}":
         log("pipelines: every pipeline was already checked with these modules, this checker and this GPU driver; "
             "skipping (delete pipelines.done to check again)")
         return
@@ -2507,9 +2508,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             if crashed else ""
         checked = f"vk_pipeline_check exited with {exit_label(code)}{why}" if code else ""
         fail("; ".join(m for m in (merge_error, checked) if m))
-    if fingerprint:
+    stamp = pipeline_cache_stamp(cache)
+    if fingerprint and stamp:
         with open(done, "w", encoding="utf-8", newline="\n") as f:
-            f.write(fingerprint + "\n")
+            f.write(f"{fingerprint} {stamp}\n")
     log("pipelines: done")
 
 
@@ -2585,10 +2587,22 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
+def pipeline_cache_stamp(cache: str) -> str:
+    """The cache file as stat reports it (device, file id, size and time), so a replaced, truncated or rewritten
+    cache no longer matches pipelines.done. "" when the cache is missing or empty."""
+    try:
+        info = os.stat(cache)
+    except OSError:
+        return ""
+    if not stat.S_ISREG(info.st_mode) or not info.st_size:
+        return ""
+    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}"
+
+
 def pipelines_fingerprint(exe: str, spirv: str, out: str, entries: int) -> str:
-    """What a complete pipelines run depends on: the translated modules (index.json, each module's size and time),
-    the checker build, and the device's pipeline-cache identity (vendor, device and the driver's cache UUID, which a
-    driver update changes). "" when the device cannot be asked."""
+    """What a complete pipelines run depends on: the translated modules (index.json, each module's and each graphics
+    partner stub's size and time), the checker build, and the device's pipeline-cache identity (vendor, device and the
+    driver's cache UUID, which a driver update changes). "" when the device cannot be asked."""
     probe = os.path.join(out, "pipeline_probe.bin")
     drop(probe)
     try:
@@ -2609,10 +2623,13 @@ def pipelines_fingerprint(exe: str, spirv: str, out: str, entries: int) -> str:
     h.update(f"checker\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
     with open(os.path.join(spirv, "index.json"), "rb") as f:
         h.update(f.read())
-    with os.scandir(spirv) as it:
-        for entry in sorted((e for e in it if e.name.endswith(".spv")), key=lambda e: e.name):
-            info = entry.stat()
-            h.update(f"{entry.name}\0{info.st_size}\0{info.st_mtime_ns}\n".encode("utf-8"))
+    for folder, prefix in ((spirv, ""), (os.path.join(spirv, "stubs"), "stubs/")):
+        if not os.path.isdir(folder):
+            continue   # no stubs/: graphics pipelines are reported as skipped
+        with os.scandir(folder) as it:
+            for entry in sorted((e for e in it if e.name.endswith(".spv")), key=lambda e: e.name):
+                info = entry.stat()
+                h.update(f"{prefix}{entry.name}\0{info.st_size}\0{info.st_mtime_ns}\n".encode("utf-8"))
     return h.hexdigest()
 
 
