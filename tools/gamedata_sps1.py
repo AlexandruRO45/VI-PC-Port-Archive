@@ -73,14 +73,41 @@ def _preset_stem(preset_path: str) -> str:
     return base
 
 
+# One whole record: u8 preset_len, printable preset, NUL, u8 effect_len, printable effect, NUL, u8 bucket. The two
+# length bytes are checked against the matched strings afterwards; anything that does not match falls back to
+# _read_c_string, which names the exact fault.
+_RECORD = re.compile(rb"(.)([\x20-\x7e]+)\x00(.)([\x20-\x7e]+)\x00(.)", re.DOTALL)
+
+
+def _scan_records(blob: bytes, entry_count: int) -> tuple[list[tuple[str, str, int]], int]:
+    """Decode records with one regex per record; stop at the first one that is not well formed.
+
+    Returns the records decoded so far and the offset of the first record not decoded.
+    """
+    entries: list[tuple[str, str, int]] = []
+    add = entries.append
+    pos = HEADER
+    if entry_count:
+        for m in _RECORD.finditer(blob, HEADER):
+            if m.start() != pos:
+                break
+            lp, preset, le, effect, bucket = m.groups()
+            if lp[0] != len(preset) + 1 or le[0] != len(effect) + 1:
+                break
+            add((preset.decode("ascii"), effect.decode("ascii"), bucket[0]))
+            pos = m.end()
+            if len(entries) == entry_count:
+                break
+    return entries, pos
+
+
 def parse_sps1(blob: bytes) -> dict:
     """Decode an SPS1 binary blob into aggregate statistics plus private _entries."""
     if len(blob) < HEADER or blob[:4] != SPS1_MAGIC:
         raise ValueError("not an SPS1 payload")
     entry_count = struct.unpack_from("<I", blob, 4)[0]
-    pos = HEADER
-    entries = []
-    for index in range(entry_count):
+    entries, pos = _scan_records(blob, entry_count)
+    for index in range(len(entries), entry_count):
         preset, pos = _read_c_string(blob, pos, f"preset[{index}]")
         effect, pos = _read_c_string(blob, pos, f"effect[{index}]")
         if pos >= len(blob):
@@ -91,42 +118,58 @@ def parse_sps1(blob: bytes) -> dict:
     if pos != len(blob):
         raise ValueError(f"SPS1 trailing bytes: consumed {pos} of {len(blob)} bytes")
 
-    buckets_counter: Counter[int] = Counter()
-    buckets_by_effect: dict[str, set[int]] = defaultdict(set)
+    # Names are printable ASCII, so lowering once and cutting at the last separator matches _preset_stem(...).lower().
     distinct_presets: set[str] = set()
     distinct_stems: set[str] = set()
     root_stems: set[str] = set()
     subfolder_stems: list[str] = []
-    preset_lengths: list[int] = []
-    effect_lengths: list[int] = []
-    sps_ext = root_presets = subfolder_presets = identity = 0
+    effect_masks: dict[str, int] = {}
+    bucket_counts = [0] * 256
+    preset_min = effect_min = 1 << 30
+    preset_max = effect_max = 0
+    sps_ext = subfolder_presets = identity = 0
+    masks_get = effect_masks.get
 
     for preset, effect, bucket in entries:
         low_preset = preset.lower()
         low_effect = effect.lower()
-        stem = _preset_stem(preset).lower()
         distinct_presets.add(low_preset)
-        distinct_stems.add(stem)
-        preset_lengths.append(len(preset))
-        effect_lengths.append(len(effect))
-        buckets_counter[bucket] += 1
-        buckets_by_effect[low_effect].add(bucket)
-        if low_preset.endswith(".sps"):
-            sps_ext += 1
-        if "/" in preset or "\\" in preset:
+        base = low_preset
+        if "\\" in base:
+            base = base.replace("\\", "/")
+        cut = base.rfind("/")
+        if cut >= 0:
+            base = base[cut + 1:]
             subfolder_presets += 1
-            subfolder_stems.append(stem)
+            subfolder_stems.append(base[:-4] if base.endswith(".sps") else base)
+            stem = subfolder_stems[-1]
         else:
-            root_presets += 1
+            stem = base[:-4] if base.endswith(".sps") else base
             root_stems.add(stem)
+        if len(stem) != len(base):
+            sps_ext += 1
+        distinct_stems.add(stem)
+        n = len(preset)
+        if n < preset_min:
+            preset_min = n
+        if n > preset_max:
+            preset_max = n
+        n = len(effect)
+        if n < effect_min:
+            effect_min = n
+        if n > effect_max:
+            effect_max = n
+        bucket_counts[bucket] += 1
+        effect_masks[low_effect] = masks_get(low_effect, 0) | (1 << bucket)
         if stem == low_effect:
             identity += 1
 
-    multi_combos = Counter(
-        ",".join(str(b) for b in sorted(bset))
-        for bset in buckets_by_effect.values()
-        if len(bset) > 1
-    )
+    multi_combos: Counter[str] = Counter()
+    multi_bucket_effects = 0
+    for mask in effect_masks.values():
+        if mask & (mask - 1):
+            multi_bucket_effects += 1
+            multi_combos[",".join(str(b) for b in range(mask.bit_length()) if mask >> b & 1)] += 1
     low_byte = entry_count & 0xFF
     return {
         "type": "SPS1",
@@ -140,19 +183,19 @@ def parse_sps1(blob: bytes) -> dict:
             "data_bytes": len(blob) - HEADER,
             "distinct_presets": len(distinct_presets),
             "distinct_preset_stems": len(distinct_stems),
-            "distinct_effects": len(buckets_by_effect),
+            "distinct_effects": len(effect_masks),
             "sps_extension_count": sps_ext,
-            "root_presets": root_presets,
+            "root_presets": len(entries) - subfolder_presets,
             "subfolder_presets": subfolder_presets,
             "subfolder_stem_collisions": sum(1 for s in subfolder_stems if s in root_stems),
             "identity_presets": identity,
             "aliased_presets": len(entries) - identity,
-            "preset_length_min": min(preset_lengths) if preset_lengths else 0,
-            "preset_length_max": max(preset_lengths) if preset_lengths else 0,
-            "effect_length_min": min(effect_lengths) if effect_lengths else 0,
-            "effect_length_max": max(effect_lengths) if effect_lengths else 0,
-            "render_buckets": {str(k): buckets_counter[k] for k in sorted(buckets_counter)},
-            "multi_bucket_effects": sum(1 for bset in buckets_by_effect.values() if len(bset) > 1),
+            "preset_length_min": preset_min if entries else 0,
+            "preset_length_max": preset_max,
+            "effect_length_min": effect_min if entries else 0,
+            "effect_length_max": effect_max,
+            "render_buckets": {str(k): c for k, c in enumerate(bucket_counts) if c},
+            "multi_bucket_effects": multi_bucket_effects,
             "multi_bucket_combinations": {
                 k: multi_combos[k] for k in sorted(multi_combos, key=lambda s: (-multi_combos[s], s))
             },
