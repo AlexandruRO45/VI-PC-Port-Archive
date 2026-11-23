@@ -3908,13 +3908,22 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         resource.r9g9b9e5_as_r32_uint() ? VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 : resource.format();
     VkFormat named = resource_format;
     if (volume) {
-        const bool compatible = vulkan_format(desc.Format, false).typeless
-            ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
-              (view.format == DXGI_FORMAT_R8G8B8A8_UNORM || view.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
-            : view.format == DXGI_FORMAT_UNKNOWN || view.format == desc.Format;
-        if (!compatible) {
-            log_once("unsupported volume SRV format for this resource:", int(view.format));
-            return false;
+        const Format resource_fmt = texture_storage_format(desc.Format, false);
+        if (view.format == DXGI_FORMAT_UNKNOWN) {
+            if (resource_fmt.typeless) {
+                log_once("typeless volume SRV requires an explicit typed format:", int(desc.Format));
+                return false;
+            }
+        } else {
+            const Format view_fmt = texture_storage_format(view.format, false);
+            const bool same_family =
+                resource_fmt.typeless && format_family(view.format) == format_family(desc.Format);
+            const bool castable = resource.lists_castable_format(view.format);
+            if (view_fmt.format == VK_FORMAT_UNDEFINED || view_fmt.typeless ||
+                (view.format != desc.Format && !same_family && !castable)) {
+                log_once("unsupported volume SRV format for this resource:", int(view.format));
+                return false;
+            }
         }
     }
     // Depth and depth-stencil textures can only be viewed through their own family's depth-plane SRV format (or
