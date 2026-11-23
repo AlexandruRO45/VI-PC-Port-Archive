@@ -280,7 +280,12 @@ def main(argv=None):
     a = p.parse_args(argv)
     if a.self_test:
         return self_test()
-    waves = [int(w) for w in a.waves.split(",")]
+    tokens = [w.strip() for w in a.waves.split(",")]
+    # int() also takes "3_2", "+32" and non-ASCII digits ("\u0663\u0662") as 32; this flag names a wave size, so only
+    # the literal token counts, as buffer_store_probe does.
+    if any(not (t.isascii() and t.isdigit()) for t in tokens):
+        p.error("--waves takes 32 and/or 64")
+    waves = [int(t) for t in tokens]
     if any(w not in (32, 64) for w in waves):
         p.error("--waves takes 32 and/or 64")
     asm, runner = _import_oracle()

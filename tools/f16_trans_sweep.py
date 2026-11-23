@@ -435,10 +435,12 @@ def main(argv=None):
         return self_test()
     ops = [o.strip() for o in a.ops.split(",") if o.strip()]
     modes = [m.strip() for m in a.modes.split(",") if m.strip()]
-    try:
-        waves = [int(w.strip()) for w in a.waves.split(",") if w.strip()]
-    except ValueError:
+    tokens = [w.strip() for w in a.waves.split(",") if w.strip()]
+    # int() also takes "3_2", "+32" and non-ASCII digits ("\u0663\u0662") as 32; this flag names a wave size, so only
+    # the literal token counts, as buffer_store_probe does.
+    if any(not (t.isascii() and t.isdigit()) for t in tokens):
         ap.error("--waves must contain only 32 and/or 64")
+    waves = [int(t) for t in tokens]
     for option, values in (("--ops", ops), ("--modes", modes), ("--waves", waves)):
         if not values:
             ap.error(f"{option} must select at least one value")

@@ -134,6 +134,10 @@ class Cli(unittest.TestCase):
             (["--waves", ""], "--waves"),
             (["--waves", "32,nope"], "--waves"),
             (["--waves", "16"], "16"),
+            # int() also takes these as 32, so they used to run as a wave32 sweep.
+            (["--waves", "3_2"], "--waves"),
+            (["--waves", "+32"], "--waves"),
+            (["--waves", "\u0663\u0662"], "--waves"),
         ]
         for argv, message in cases:
             with self.subTest(argv=argv), mock.patch.object(runner, "open_oracle") as open_oracle:

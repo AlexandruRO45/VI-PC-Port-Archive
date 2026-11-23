@@ -199,10 +199,13 @@ def main():
     if args.self_test:
         self_test()
         return 0
-    waves = [int(w) for w in args.waves.split(",") if w.strip()]
-    if not waves or any(w not in (32, 64) for w in waves):
+    tokens = [w.strip() for w in args.waves.split(",") if w.strip()]
+    # int() also takes "3_2", "+32" and non-ASCII digits ("\u0663\u0662") as 32; this flag names a wave size, so only
+    # the literal token counts, as buffer_store_probe does.
+    if not tokens or any(t not in ("32", "64") for t in tokens):
         print("--waves must be a non-empty list of 32 and/or 64", file=sys.stderr)
         return 2
+    waves = [int(t) for t in tokens]
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle()
