@@ -1438,6 +1438,17 @@ def run_suite(a, work: str) -> int:
                     f.write(struct.pack("<3H", 0, 1, 2))
                 raw2 = os.path.join(raw_dir, f"{name}.u16.raw")
                 runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16")))
+                # The first three records form a degenerate triangle. Indexing restores the gradient.
+                rotated = os.path.join(work, "gs_tri_rotated.bin")
+                with open(rotated, "wb") as f:
+                    for v in (VS_TRI_OUTPUTS[2], VS_TRI_OUTPUTS[0], VS_TRI_OUTPUTS[0], VS_TRI_OUTPUTS[1]):
+                        f.write(struct.pack("<8f", *v))
+                idx32 = os.path.join(work, "gs_tri_indices_u32.bin")
+                with open(idx32, "wb") as f:
+                    f.write(struct.pack("<3I", 1, 3, 0))
+                raw32 = os.path.join(raw_dir, f"{name}.u32.raw")
+                runs.append(("permuted u32 indices", raw32, dict(env, VKH_GS_LINEAR=rotated,
+                             VKH_GS_INDICES=idx32, VKH_GS_INDEX_TYPE="32")))
                 capture = os.path.join(spirv_dir, f"{name}.gs_compute.spv")
                 ok, parts = True, []
                 for label, out, run_env in runs:
