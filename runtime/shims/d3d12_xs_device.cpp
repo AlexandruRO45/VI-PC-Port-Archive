@@ -6,9 +6,10 @@
 // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
 // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
 // are IUnknown (0-2), slot 14 (which wraps the heap), 62 and 76, plus the heap proxy's 9/10 conversion from the
-// PC hidden-pointer form to the Xbox RAX form. Slots 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap
-// what they create in queue and fence proxies built the same way, and slots 31/34/35/45/46/50 hand the real objects
-// behind heap, queue and fence proxies to the real device (see the command queue and fence section).
+// PC hidden-pointer form to the Xbox RAX form. Slot 8 (command queues), 36 (fences) and 32 (a shared fence) wrap
+// what they create in queue and fence proxies built the same way, and slots 31/34/35 and 84/85/89 hand the real
+// objects behind heap, queue and fence proxies to the real device (see the command queue and fence section). Past
+// slot 42 the table follows the console order (d3d12_xs_console_slots.h, "Console device methods" below).
 //
 // A thunk declares 14 argument words, but the title passes only as many as the method takes, so the caller's frame
 // may end right after the four register homes. The compiler owns a function's incoming stack-argument slots and may
@@ -24,10 +25,12 @@
 // behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
 #include "d3d12_trace.h"
+#include "d3d12_xs_console_slots.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
 #include <dxgi1_4.h>
+#include <intrin.h>
 
 #include <atomic>
 #include <cerrno>
@@ -39,13 +42,15 @@
 #include <iterator>
 #include <new>
 #include <memory>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace rt::d3d12_xs {
 namespace {
 
 constexpr unsigned kMaxSlots = 128;
-static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+static_assert(kMaxSlots >= console::kKnownDeviceSlots, "the proxy table must cover the known console device order");
 static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
 static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
               "the Xbox handle ABI is an 8-byte value in RAX; the heap thunk converts the PC hidden-pointer form");
@@ -69,6 +74,13 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
+    // Console slots 74/75: the page pools the title registered, by handle.
+    SRWLOCK pools_lock = SRWLOCK_INIT;
+    struct PagePool {
+        std::uint64_t handle, address, pages;
+    };
+    std::vector<PagePool> pools;
+    std::uint64_t next_pool = 0;
 };
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -134,20 +146,11 @@ const char* slot_name(unsigned slot) {
         case 34: return "MakeResident (proxies unwrapped)";
         case 35: return "Evict (proxies unwrapped)";
         case 36: return "CreateFence -> fence proxy";
-        case 43: return "GetAdapterLuid";
-        case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
-        case 46: return "SetResidencyPriority (proxies unwrapped)";
-        case 48: return "Xbox CreateCommandQueueX -> queue proxy";
-        case 50: return "EnqueueMakeResident (proxies unwrapped)";
-        case 62: return "Xbox CreateComputePipelineState";
-        case 67: return "Xbox DeserializeComputePipelineStateX";
-        case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
-        case 75: return "CreateCommandQueue1 -> queue proxy";
-        case 76: return "Xbox resource creation";
-        case 78: return "Xbox SetFrameIntervalX";
-        case 79: return "Xbox ScheduleFrameEventX";
-        case 80: return "Xbox WaitFrameEventX";
-        default: return "forwarded";
+        case 84: return "SetEventOnMultipleFenceCompletion (PC slot 45, fence proxies unwrapped)";
+        case 85: return "SetResidencyPriority (PC slot 46, proxies unwrapped)";
+        case 89: return "EnqueueMakeResident (PC slot 50, proxies unwrapped)";
+        case 111: return "CreateSamplerFeedbackUnorderedAccessViewX (PC slot 71)";
+        default: return console::device_slot(slot).name;
     }
 }
 
@@ -260,6 +263,30 @@ void note_heap_slot(unsigned slot) {
 
 std::uint64_t hr_to_u64(HRESULT hr) {
     return static_cast<std::uint64_t>(static_cast<std::uint32_t>(hr));
+}
+
+std::atomic<CallerDescriber> g_caller_describer{nullptr};
+
+// "module+0xRVA" for a title's return address: through the describer gta6rt installs (it knows the images its own
+// loader mapped), else through the host's modules, else the bare address.
+std::string describe_caller(const void* address) {
+    if (const CallerDescriber describe = g_caller_describer.load(std::memory_order_acquire))
+        return describe(reinterpret_cast<std::uint64_t>(address));
+    char text[MAX_PATH + 32];
+    HMODULE module = nullptr;
+    char path[MAX_PATH] = {};
+    if (address &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           static_cast<LPCSTR>(address), &module) &&
+        module && GetModuleFileNameA(module, path, MAX_PATH)) {
+        const char* slash = std::strrchr(path, '\\');
+        std::snprintf(text, sizeof text, "%s+0x%llx", slash ? slash + 1 : path,
+                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(address) -
+                                                      reinterpret_cast<std::uintptr_t>(module)));
+    } else {
+        std::snprintf(text, sizeof text, "%p", address);
+    }
+    return text;
 }
 
 unsigned long proxy_add_ref(DeviceProxy* self) {
@@ -618,7 +645,7 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
 
 // ---- Command queue and fence proxies --------------------------------------------------------------------------
 //
-// Device slots 8 (CreateCommandQueue), 75 (CreateCommandQueue1), 36 (CreateFence) and 32 (OpenSharedHandle, for a
+// Device slots 8 (CreateCommandQueue), 36 (CreateFence) and 32 (OpenSharedHandle, for a
 // fence) wrap what they create, so a title never holds a PC or Vulkan-layer queue or fence. The proxies forward
 // the public chain in PC order, exactly like the device proxy, and a slot past the PC vtable is logged and refused
 // with E_NOTIMPL. PresentX, SuspendX and ResumeX are queue methods past the public chain
@@ -714,7 +741,8 @@ const char* child_public_name(unsigned slot) {
                                             "GetCreationFlags"};
     if (slot < 8) return object[slot];
     if constexpr (K == ChildKind::queue) {
-        if (slot < kQueuePublicSlots) return queue[slot - 8];
+        // Past ExecuteCommandLists the name depends on the console layout (d3d12_xs_console_slots.h): SlotN.
+        if (slot <= 10) return queue[slot - 8];
     } else if constexpr (K == ChildKind::fence) {
         if (slot < kFence1PublicSlots) return fence[slot - 8];
     } else {
@@ -754,10 +782,10 @@ void note_child_slot(unsigned slot) {
     const char* method = child_public_name<K>(slot);
     if (first) {
         std::fprintf(stderr, "[rt] d3d12_xs: %s slot %u (%s) first call\n", child_kind_name<K>(), slot,
-                     method ? method : "past the public chain");
+                     method ? method : K == ChildKind::queue ? "console order" : "past the public chain");
     } else if (slot >= 3 && trace_enabled()) {
         std::fprintf(stderr, "[rt] d3d12_xs: %s slot %u (%s) call\n", child_kind_name<K>(), slot,
-                     method ? method : "past the public chain");
+                     method ? method : K == ChildKind::queue ? "console order" : "past the public chain");
     }
 }
 
@@ -970,6 +998,79 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// ---- The console queue layout --------------------------------------------------------------------------------
+//
+// Which of the two layouts of d3d12_xs_console_slots.h the title was built with. A title is built against one kit,
+// so this is one value per process, decided by the first call that proves it and logged then. Until then the slots
+// whose meaning differs between the two do nothing (S_OK, reported once each), so nothing is forwarded to a method
+// the title did not mean: a title signals a fence right after its first ExecuteCommandLists, which decides it.
+std::atomic<int> g_queue_layout{static_cast<int>(console::QueueLayout::undecided)};
+
+const char* queue_layout_name(console::QueueLayout layout) {
+    return layout == console::QueueLayout::kit2020 ? "kit 2020 (Signal 14, SignalX 23, GetDesc 26, PresentX 30)"
+                                                    : "later kit (Signal 16, SignalX 25, GetDesc 28, PresentX 32)";
+}
+
+// True when an argument word is the address of 8 readable bytes. Some of the slots that decide the layout take a
+// fence in one layout and anything at all in the other, so a word is checked before it is read as an object.
+bool readable_object(std::uint64_t address) {
+    if (address < 0x10000 || (address & 7)) return false;
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof info)) return false;
+    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    return info.State == MEM_COMMIT && (info.Protect & readable) && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+           address + sizeof(void*) <= end;
+}
+
+void decide_queue_layout(console::QueueLayout seen, unsigned slot, const void* caller) {
+    if (seen == console::QueueLayout::undecided) return;
+    int current = static_cast<int>(console::QueueLayout::undecided);
+    if (g_queue_layout.compare_exchange_strong(current, static_cast<int>(seen), std::memory_order_acq_rel)) {
+        std::fprintf(stderr, "[rt] d3d12_xs: command queue layout: %s, from a call at queue slot %u (caller %s)\n",
+                     queue_layout_name(seen), slot, describe_caller(caller).c_str());
+        return;
+    }
+    static std::atomic<bool> warned{false};
+    if (current != static_cast<int>(seen) && !warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: command queue slot %u (caller %s) fits the %s, but the queue was taken for the "
+                     "%s; kept\n",
+                     slot, describe_caller(caller).c_str(), queue_layout_name(seen),
+                     queue_layout_name(static_cast<console::QueueLayout>(current)));
+}
+
+// What queue slot \`slot\` is for this call, deciding the layout first when the call proves it.
+console::QueueSlot console_queue_slot(unsigned slot, std::uint64_t a1, const void* caller) {
+    auto layout = static_cast<console::QueueLayout>(g_queue_layout.load(std::memory_order_acquire));
+    if (layout == console::QueueLayout::undecided) {
+        const console::QueueLayout by_fence = console::layout_from_fence_call(slot);
+        if (by_fence != console::QueueLayout::undecided && readable_object(a1) &&
+            is_child_proxy<ChildKind::fence>(reinterpret_cast<const void*>(a1)))
+            decide_queue_layout(by_fence, slot, caller);
+    }
+    decide_queue_layout(console::layout_from_slot(slot), slot, caller);
+    layout = static_cast<console::QueueLayout>(g_queue_layout.load(std::memory_order_acquire));
+    return console::queue_slot(layout, slot);
+}
+
+// The first call of a queue slot that is not forwarded: what it is, its caller and its first four argument words.
+void report_queue_call(unsigned slot, const console::QueueSlot& info, bool succeeds, const void* caller,
+                       std::uint64_t a1, std::uint64_t a2, std::uint64_t a3, std::uint64_t a4) {
+    using S = ChildStats<ChildKind::queue>;
+    if (slot < S::kSlots && S::beyond_warned[slot].exchange(true, std::memory_order_relaxed)) return;
+    const char* outcome = info.kind == console::QueueMethod::present_x
+                              ? "accepted, not shown yet (the queue is not wired to the presentation core)"
+                          : info.kind == console::QueueMethod::undecided ? "ignored until the queue layout is known"
+                          : succeeds                                       ? "accepted with no effect"
+                                                                           : "not implemented (E_NOTIMPL)";
+    std::fprintf(stderr, "[rt] d3d12_xs: queue slot %u (%s) %s; caller %s, args 0x%llx 0x%llx 0x%llx 0x%llx\n", slot,
+                 info.name, outcome, describe_caller(caller).c_str(), static_cast<unsigned long long>(a1),
+                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                 static_cast<unsigned long long>(a4));
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -987,6 +1088,27 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         d3d12_trace::record(child_trace_name<K>(Slot));
         return hr_to_u64(child_get_device<K>(self, reinterpret_cast<const IID*>(a1),
                                              reinterpret_cast<void**>(a2)));
+    } else if constexpr (K == ChildKind::queue && Slot > 10) {
+        // Past ExecuteCommandLists the console queue has its own order, in one of two layouts
+        // (d3d12_xs_console_slots.h). Every word keeps its position, as in the generic branch below.
+        note_child_slot<K>(Slot);
+        const void* caller = _ReturnAddress();
+        const console::QueueSlot info = console_queue_slot(Slot, a1, caller);
+        using M = console::QueueMethod;
+        if (info.kind == M::pc || info.kind == M::signal_x || info.kind == M::get_desc) {
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            if (info.pc_slot == kQueueSignal || info.pc_slot == kQueueWait) a1 = unwrap_object(a1);
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[info.pc_slot]);
+            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
+        const bool succeeds = info.kind == M::accepted || info.kind == M::undecided || info.kind == M::present_x;
+        report_queue_call(Slot, info, succeeds, caller, a1, a2, a3, a4);
+        d3d12_trace::record(child_trace_name<K>(Slot), succeeds ? "called" : "unsupported");
+        return hr_to_u64(succeeds ? S_OK : E_NOTIMPL);
     } else {
         note_child_slot<K>(Slot);
         if (Slot >= self->slot_count) {
@@ -1130,10 +1252,9 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 }
 
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
-// (S_FALSE for a valid description on the PC), as #558 does for slot 14.
-HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
-                                   void** out) {
-    note_slot(8);
+// (S_FALSE for a valid description on the PC), as #558 does for slot 14. Console slot 48 (CreateCommandQueueX) ends
+// here too, with its description translated.
+HRESULT create_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid, void** out) {
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
@@ -1215,20 +1336,10 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word, 
     return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
 }
 
-// Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
-HRESULT proxy_create_command_queue1(DeviceProxy* self, std::uint64_t desc, std::uint64_t creator_id,
-                                    const IID* riid, void** out) {
-    note_slot(75);
-    if (out) *out = nullptr;  // as slot 8
-    if (self->slot_count <= 75) return refuse_beyond_device(75, self->slot_count);  // predates ID3D12Device9
-    if (!riid) return E_POINTER;
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, std::uint64_t, std::uint64_t, const IID*, void**);
-    const auto create = reinterpret_cast<Fn>(self->real_vtable[75]);
-    if (!out) return create(self->real, desc, creator_id, riid, nullptr);
-    void* created = nullptr;
-    const HRESULT hr = create(self->real, desc, creator_id, &__uuidof(ID3D12CommandQueue), &created);
-    if (FAILED(hr)) return hr;
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
+                                   void** out) {
+    note_slot(8);
+    return create_queue(self, desc, riid, out);
 }
 
 // Device slot 36: CreateFence(initial_value, flags, riid, out).
@@ -1304,17 +1415,19 @@ HRESULT proxy_open_shared_handle(DeviceProxy* self, std::uint64_t handle, const 
     return wrap_child<ChildKind::fence>(static_cast<IUnknown*>(fence), self, riid, out);
 }
 
-// Device slots that take heap, queue or fence objects: the real runtime gets the real objects.
+// Device slots that take heap, queue or fence objects: the real runtime gets the real objects. Slot is the PC slot;
+// Console is where the title calls it (d3d12_xs_console_slots.h: ID3D12Device1+ methods are 39 slots later).
 //   31 CreateSharedHandle(object, attributes, access, name, handle)
 //   34 MakeResident(count, objects)      35 Evict(count, objects)
-//   45 SetEventOnMultipleFenceCompletion(fences, values, count, flags, event)            (ID3D12Device1)
-//   46 SetResidencyPriority(count, objects, priorities)                                  (ID3D12Device1)
-//   50 EnqueueMakeResident(flags, count, objects, fence, value)                          (ID3D12Device3)
-template <unsigned Slot>
+//   45 SetEventOnMultipleFenceCompletion(fences, values, count, flags, event)    (ID3D12Device1, console 84)
+//   46 SetResidencyPriority(count, objects, priorities)                          (ID3D12Device1, console 85)
+//   50 EnqueueMakeResident(flags, count, objects, fence, value)                  (ID3D12Device3, console 89)
+template <unsigned Slot, unsigned Console = console::device_console_slot(Slot)>
 HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                               std::uint64_t a4, std::uint64_t a5) {
-    note_slot(Slot);
-    if (Slot >= self->slot_count) return refuse_beyond_device(Slot, self->slot_count);  // predates the interface
+    static_assert(console::device_slot(Console).pc_slot == Slot, "console and PC slot must name the same method");
+    note_slot(Console);
+    if (Slot >= self->slot_count) return refuse_beyond_device(Console, self->slot_count);  // predates the interface
     UnwrappedArray objects;
     std::uint64_t r1 = a1, r2 = a2, r3 = a3, r4 = a4;
     if constexpr (Slot == 31) {
@@ -1452,11 +1565,12 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
     return hr;
 }
 
-HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
-                              D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
-                              D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
-                              const IID* riid, void** out) {
-    note_slot(76);
+// A console resource description and state on a committed PC resource: slots 76 (CreateCommittedResourceX) and 44
+// (CreatePlacedResourceX, see there).
+HRESULT create_console_resource(DeviceProxy* self, unsigned slot, const D3D12_HEAP_PROPERTIES* heap_properties,
+                                D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
+                                D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                                const IID* riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!xbox_desc) return E_POINTER;
@@ -1470,14 +1584,239 @@ HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* he
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
 
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
+    if (slot < kMaxSlots && !g_beyond_warned[slot].exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 76 resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n",
+                     "[rt] d3d12_xs: slot %u resource: dimension=%d xbox layout=0x%x -> PC layout=0x%x\n", slot,
                      static_cast<int>(pc_desc.Dimension), xbox_layout, static_cast<unsigned>(pc_desc.Layout));
     }
     return self->real->CreateCommittedResource(heap_properties, heap_flags, &pc_desc, initial_state, clear_value,
                                                *riid, out);
+}
+
+HRESULT proxy_create_resource(DeviceProxy* self, const D3D12_HEAP_PROPERTIES* heap_properties,
+                              D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC* xbox_desc,
+                              D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE* clear_value,
+                              const IID* riid, void** out) {
+    note_slot(76);
+    return create_console_resource(self, 76, heap_properties, heap_flags, xbox_desc, initial_state, clear_value,
+                                   riid, out);
+}
+
+// ---- Console device methods (d3d12_xs_console_slots.h) -----------------------------------------------------------
+//
+// Every console slot the proxy does not forward is counted (note_slot) and its first call is reported with the
+// caller (module and RVA) and its first four argument words, so the first boot's log names every console method the
+// executable uses, also those that succeed.
+
+// The title's return address of the device call in progress on this thread: proxy_slot sets it before it calls a
+// handler. A handler does not take it as an argument, because a handler's arguments must keep the stack positions
+// the title passed them in (see "A thunk declares 14 argument words" at the top).
+thread_local const void* t_caller = nullptr;
+
+void report_console_call(unsigned slot, const char* outcome, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
+                         std::uint64_t a4) {
+    if (slot < kMaxSlots && g_beyond_warned[slot].exchange(true, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: device slot %u (%s) %s; caller %s, args 0x%llx 0x%llx 0x%llx 0x%llx\n", slot,
+                 slot_name(slot), outcome, describe_caller(t_caller).c_str(), static_cast<unsigned long long>(a1),
+                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                 static_cast<unsigned long long>(a4));
+}
+
+// Slot 43: GetAdapterLuid. The console returns the 8-byte LUID in RAX, as the descriptor heap's start handles
+// (heap slots 9/10, measured); the PC method writes it through a hidden pointer, which a title does not pass.
+std::uint64_t proxy_get_adapter_luid(DeviceProxy* self) {
+    note_slot(43);
+    LUID luid{};
+    using Fn = LUID*(WINAPI*)(ID3D12Device*, LUID*);
+    reinterpret_cast<Fn>(self->real_vtable[43])(self->real, &luid);
+    return static_cast<std::uint64_t>(luid.LowPart) |
+           static_cast<std::uint64_t>(static_cast<std::uint32_t>(luid.HighPart)) << 32;
+}
+
+// Slot 44: CreatePlacedResourceX(address, desc, state, clear, riid, out) places a resource on memory the title
+// allocated itself. Neither the PC runtime nor the Vulkan device can place a resource at a CPU address yet (the page
+// mapper of #5378 is not wired), so a committed default-heap resource of the same description stands in for it: the
+// title gets a working resource, but what it writes at that address does not reach it. Every call with its address
+// and size is logged under XS_TRACE, the first one always, so a run shows how much of the title's data goes this way.
+HRESULT proxy_create_placed_resource_x(DeviceProxy* self, std::uint64_t address, const D3D12_RESOURCE_DESC* desc,
+                                       D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE* clear, const IID* riid,
+                                       void** out) {
+    note_slot(44);
+    static std::atomic<bool> warned{false};
+    if (desc && (!warned.exchange(true, std::memory_order_relaxed) || trace_enabled()))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: CreatePlacedResourceX at 0x%llx (dimension %d, %llux%u) from %s: committed "
+                     "stand-in, the title's memory there is not shared with it\n",
+                     static_cast<unsigned long long>(address), static_cast<int>(desc->Dimension),
+                     static_cast<unsigned long long>(desc->Width), desc->Height, describe_caller(t_caller).c_str());
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    return create_console_resource(self, 44, &heap, D3D12_HEAP_FLAG_NONE, desc, state, clear, riid, out);
+}
+
+// The pipeline-state flags a PC device takes; the console defines more, which the PC runtime would refuse.
+constexpr std::uint32_t kPcPipelineFlags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG |
+                                           D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS |
+                                           D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+
+// Slot 60: CreateGraphicsPipelineStateX(desc, w2, w3, riid, out): the public description plus two words for the
+// console's extensions of it, which a PC or Vulkan pipeline cannot use (logged once when present).
+HRESULT proxy_create_graphics_pipeline_x(DeviceProxy* self, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                         std::uint64_t w2, std::uint64_t w3, const IID* riid, void** out) {
+    note_slot(60);
+    if (out) *out = nullptr;
+    if (!desc || !riid || !out) return !desc ? E_INVALIDARG : E_POINTER;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pc = *desc;
+    const auto console_flags = static_cast<std::uint32_t>(pc.Flags) & ~kPcPipelineFlags;
+    pc.Flags = static_cast<D3D12_PIPELINE_STATE_FLAGS>(static_cast<std::uint32_t>(pc.Flags) & kPcPipelineFlags);
+    if (w2 || w3 || console_flags)
+        report_console_call(60, "drops the console extensions (args: words 2-3, console flags)", w2, w3,
+                            console_flags, 0);
+    return self->real->CreateGraphicsPipelineState(&pc, *riid, out);
+}
+
+// Slot 61: CreateSamplerX(desc, handle). The console sampler has a filter per axis. Its layout (flags, the mag,
+// min, mip and z filters, the reduction mode, three address modes, min/max LOD, two LOD biases, max anisotropy,
+// anisotropy bias and threshold, comparison, border colour) is the June 2020 kit's, as read by xvalkyrie
+// (device.cpp:1375-1387); it is not measured on this game. Filters: 0 point, 1 linear, 2 and 3 the same with
+// anisotropy. Mip filter: 0 none, 1 point, 2 linear. Reduction: 0 standard, 1 minimum, 2 maximum.
+struct ConsoleSamplerDesc {
+    UINT flags, filter_mag, filter_min, filter_mip, filter_z, reduction;
+    D3D12_TEXTURE_ADDRESS_MODE address_u, address_v, address_w;
+    FLOAT min_lod, max_lod, lod_bias, lod_bias_secondary;
+    UINT max_anisotropy;
+    FLOAT anisotropy_bias;
+    UINT anisotropy_threshold;
+    D3D12_COMPARISON_FUNC comparison;
+    FLOAT border[4];
+};
+static_assert(sizeof(ConsoleSamplerDesc) == 84, "the kit's sampler description is 21 words");
+
+D3D12_TEXTURE_ADDRESS_MODE pc_address_mode(D3D12_TEXTURE_ADDRESS_MODE mode) {
+    return mode >= D3D12_TEXTURE_ADDRESS_MODE_WRAP && mode <= D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE
+               ? mode
+               : D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+}
+
+D3D12_SAMPLER_DESC pc_sampler(const ConsoleSamplerDesc& c) {
+    const bool compares = c.comparison > D3D12_COMPARISON_FUNC_NEVER && c.comparison < D3D12_COMPARISON_FUNC_ALWAYS;
+    const D3D12_FILTER_REDUCTION_TYPE reduction = compares             ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON
+                                                  : c.reduction == 1 ? D3D12_FILTER_REDUCTION_TYPE_MINIMUM
+                                                  : c.reduction == 2 ? D3D12_FILTER_REDUCTION_TYPE_MAXIMUM
+                                                                     : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+    const auto type = [](UINT filter) {
+        return (filter & 1) ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    };
+    const bool anisotropic = c.filter_mag >= 2 || c.filter_min >= 2;
+    D3D12_SAMPLER_DESC pc{};
+    pc.Filter = anisotropic ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+                            : D3D12_ENCODE_BASIC_FILTER(type(c.filter_min), type(c.filter_mag),
+                                                        c.filter_mip == 2 ? D3D12_FILTER_TYPE_LINEAR
+                                                                          : D3D12_FILTER_TYPE_POINT,
+                                                        reduction);
+    pc.AddressU = pc_address_mode(c.address_u);
+    pc.AddressV = pc_address_mode(c.address_v);
+    pc.AddressW = pc_address_mode(c.address_w);
+    pc.MipLODBias = c.lod_bias;
+    pc.MaxAnisotropy = anisotropic ? (c.max_anisotropy < 1 ? 1 : c.max_anisotropy > 16 ? 16 : c.max_anisotropy) : 1;
+    pc.ComparisonFunc = compares ? c.comparison : D3D12_COMPARISON_FUNC_NEVER;
+    for (int i = 0; i < 4; ++i) pc.BorderColor[i] = c.border[i];
+    pc.MinLOD = c.min_lod;
+    pc.MaxLOD = c.filter_mip ? c.max_lod : c.min_lod;  // no mip filter: the base level only
+    return pc;
+}
+
+void proxy_create_sampler_x(DeviceProxy* self, const ConsoleSamplerDesc* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    note_slot(61);
+    if (!desc) {
+        report_console_call(61, "was given no description; nothing written", 0, handle.ptr, 0, 0);
+        return;
+    }
+    const D3D12_SAMPLER_DESC pc = pc_sampler(*desc);
+    self->real->CreateSampler(&pc, handle);
+}
+
+// Slot 68: GetGpuHardwareConfigurationX(configuration): the console writes the GPU's clock and which console it
+// is. Neither value is measured for this game; the two words xvalkyrie writes (device.cpp:3837-3846) are written:
+// the timestamp frequency of the host, and 5, the Series X.
+constexpr std::uint64_t kConsoleSeriesX = 5;
+void proxy_get_gpu_hardware_configuration(std::uint64_t* configuration) {
+    note_slot(68);
+    report_console_call(68, "writes the host's timer frequency and Series X",
+                        reinterpret_cast<std::uint64_t>(configuration), 0, 0, 0);
+    if (!configuration) return;
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    configuration[0] = static_cast<std::uint64_t>(frequency.QuadPart);
+    configuration[1] = kConsoleSeriesX;
+}
+
+// Slots 74/75: RegisterPagePoolX(address, page count, &handle) and UnregisterPagePoolX(handle). The pages are the
+// title's own memory, which later page-mapping calls map for the GPU. Here the pool is recorded and a handle of
+// ours returned (never 0, never an address), so an unregister of a handle never handed out is caught.
+HRESULT proxy_register_page_pool(DeviceProxy* self, std::uint64_t address, std::uint64_t pages, std::uint64_t* handle) {
+    note_slot(74);
+    if (!handle) return E_POINTER;
+    AcquireSRWLockExclusive(&self->pools_lock);
+    const std::uint64_t made = ++self->next_pool;
+    try {
+        self->pools.push_back({made, address, pages});
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockExclusive(&self->pools_lock);
+        return E_OUTOFMEMORY;
+    }
+    ReleaseSRWLockExclusive(&self->pools_lock);
+    *handle = made;
+    report_console_call(74, "registers a page pool (address, pages, handle out)", address, pages,
+                        reinterpret_cast<std::uint64_t>(handle), made);
+    return S_OK;
+}
+
+HRESULT proxy_unregister_page_pool(DeviceProxy* self, std::uint64_t handle) {
+    note_slot(75);
+    AcquireSRWLockExclusive(&self->pools_lock);
+    bool found = false;
+    for (auto it = self->pools.begin(); it != self->pools.end(); ++it) {
+        if (it->handle != handle) continue;
+        self->pools.erase(it);
+        found = true;
+        break;
+    }
+    ReleaseSRWLockExclusive(&self->pools_lock);
+    if (!found) {
+        std::fprintf(stderr, "[rt] d3d12_xs: UnregisterPagePoolX of handle 0x%llx, which RegisterPagePoolX did not "
+                             "hand out (caller %s); E_INVALIDARG\n",
+                     static_cast<unsigned long long>(handle), describe_caller(t_caller).c_str());
+        return E_INVALIDARG;
+    }
+    return S_OK;
+}
+
+// Slot 81: GetFrameStatisticsX(token, type mask, &count, statistics). No frame source stands behind the device yet
+// (frame events and PresentX are not paced), so no statistics exist: count 0 and S_FALSE, which the public samples
+// read as "not available yet" (docs/d3d12_vulkan.md section 4.5, step 10). A null count is E_INVALIDARG.
+HRESULT proxy_get_frame_statistics_x(std::uint64_t token, std::uint64_t type_mask, std::uint32_t* count) {
+    note_slot(81);
+    report_console_call(81, "has no statistics yet (count 0, S_FALSE)", token, type_mask,
+                        reinterpret_cast<std::uint64_t>(count), 0);
+    if (!count) return E_INVALIDARG;
+    *count = 0;
+    return S_FALSE;
+}
+
+// Slot 111: CreateSamplerFeedbackUnorderedAccessViewX(target, feedback, view desc, handle): the console's takes a view
+// description before the handle (null for the whole map; xvalkyrie device.cpp:3906-3917). The PC method (slot 71)
+// has no description, so a non-null one is reported.
+void proxy_create_feedback_view(DeviceProxy* self, std::uint64_t target, std::uint64_t feedback, std::uint64_t view,
+                                std::uint64_t handle) {
+    note_slot(111);
+    if (71 >= self->slot_count) {
+        refuse_beyond_device(111, self->slot_count);
+        return;
+    }
+    if (view) report_console_call(111, "ignores the view description", target, feedback, view, handle);
+    using Fn = void(WINAPI*)(ID3D12Device*, std::uint64_t, std::uint64_t, std::uint64_t);
+    reinterpret_cast<Fn>(self->real_vtable[71])(self->real, target, feedback, handle);
 }
 
 template <unsigned Slot>
@@ -1504,11 +1843,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 32) {
         return hr_to_u64(proxy_open_shared_handle(self, a1, reinterpret_cast<const IID*>(a2),
                                                   reinterpret_cast<void**>(a3)));
-    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35 || Slot == 45 || Slot == 46 || Slot == 50) {
+    } else if constexpr (Slot == 31 || Slot == 34 || Slot == 35) {
         return hr_to_u64(proxy_unwrapping_call<Slot>(self, a1, a2, a3, a4, a5));
-    } else if constexpr (Slot == 75) {
-        return hr_to_u64(proxy_create_command_queue1(self, a1, a2, reinterpret_cast<const IID*>(a3),
-                                                     reinterpret_cast<void**>(a4)));
+    } else if constexpr (Slot == console::device_console_slot(45) || Slot == console::device_console_slot(46) ||
+                         Slot == console::device_console_slot(50)) {
+        return hr_to_u64(proxy_unwrapping_call<console::device_slot(Slot).pc_slot>(self, a1, a2, a3, a4, a5));
     } else if constexpr (Slot == 14) {
         return hr_to_u64(proxy_create_descriptor_heap(
             self, reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1),
@@ -1529,11 +1868,45 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 43) {
+        return proxy_get_adapter_luid(self);
+    } else if constexpr (Slot == 44) {
+        t_caller = _ReturnAddress();
+        return hr_to_u64(proxy_create_placed_resource_x(
+            self, a1, reinterpret_cast<const D3D12_RESOURCE_DESC*>(a2),
+            static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a3)),
+            reinterpret_cast<const D3D12_CLEAR_VALUE*>(a4), reinterpret_cast<const IID*>(a5),
+            reinterpret_cast<void**>(a6)));
+    } else if constexpr (Slot == 60) {
+        t_caller = _ReturnAddress();
+        return hr_to_u64(proxy_create_graphics_pipeline_x(
+            self, reinterpret_cast<const D3D12_GRAPHICS_PIPELINE_STATE_DESC*>(a1), a2, a3,
+            reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
+    } else if constexpr (Slot == 61) {
+        t_caller = _ReturnAddress();
+        proxy_create_sampler_x(self, reinterpret_cast<const ConsoleSamplerDesc*>(a1), D3D12_CPU_DESCRIPTOR_HANDLE{a2});
+        return 0;
+    } else if constexpr (Slot == 68) {
+        t_caller = _ReturnAddress();
+        proxy_get_gpu_hardware_configuration(reinterpret_cast<std::uint64_t*>(a1));
+        return 0;
+    } else if constexpr (Slot == 74) {
+        t_caller = _ReturnAddress();
+        return hr_to_u64(proxy_register_page_pool(self, a1, a2, reinterpret_cast<std::uint64_t*>(a3)));
+    } else if constexpr (Slot == 75) {
+        t_caller = _ReturnAddress();
+        return hr_to_u64(proxy_unregister_page_pool(self, a1));
+    } else if constexpr (Slot == 81) {
+        t_caller = _ReturnAddress();
+        return hr_to_u64(proxy_get_frame_statistics_x(a1, a2, reinterpret_cast<std::uint32_t*>(a3)));
+    } else if constexpr (Slot == 111) {
+        t_caller = _ReturnAddress();
+        proxy_create_feedback_view(self, a1, a2, a3, a4);
+        return 0;
     } else {
         note_slot(Slot);
-        // Xbox device slots, before the PC vtable is indexed: the public HLE's 78/79/80 would otherwise reach
-        // CreateReservedResource2/CreateSampler2 or fall past an 80-slot table, and 48/73 would reach unrelated PC
-        // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
+        // The public HLE's Xbox device slots (#6935: 48/73/78/79/80 by default, movable by environment) come first,
+        // so a moved route still wins over the console table below.
         const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
         if (Slot == routes.frame_interval) {
             log_xbox_route_once(Slot, "SetFrameIntervalX", a1, a2, a3, a4, a5);
@@ -1558,16 +1931,35 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             return hr_to_u64(proxy_create_command_list_x(self, a1, a2, a3, reinterpret_cast<const IID*>(a4),
                                                          reinterpret_cast<void**>(a5)));
         }
-        if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
-        // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
-        // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
-        using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                                 std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
-        return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        constexpr console::DeviceMethod kind = console::device_slot(Slot).kind;
+        static_assert(kind != console::DeviceMethod::handled, "a handled console slot needs its branch above");
+        if constexpr (kind == console::DeviceMethod::accepted) {
+            // A console method with no effect here: S_OK, never a PC method.
+            t_caller = _ReturnAddress();
+            report_console_call(Slot, "is accepted with no effect (S_OK)", a1, a2, a3, a4);
+            return hr_to_u64(S_OK);
+        } else if constexpr (kind != console::DeviceMethod::pc) {
+            // A console method the proxy does not implement (or a slot past the known order): never a PC method.
+            t_caller = _ReturnAddress();
+            report_console_call(Slot, kind == console::DeviceMethod::refused
+                                          ? "is not implemented (E_NOTIMPL)"
+                                          : "is not known (E_NOTIMPL); its caller names the method",
+                                a1, a2, a3, a4);
+            return hr_to_u64(E_NOTIMPL);
+        } else {
+            constexpr unsigned pc = console::device_slot(Slot).pc_slot;
+            if (pc >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
+
+            // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
+            // struct-return pointer and any stack arguments keep their positions; XMM registers are untouched.
+            using ForwardFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                                     std::uint64_t, std::uint64_t, std::uint64_t);
+            auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[pc]);
+            return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+        }
     }
 }
 
@@ -1658,6 +2050,10 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     return S_OK;
 }
 
+void set_caller_describer(CallerDescriber describer) {
+    g_caller_describer.store(describer, std::memory_order_release);
+}
+
 bool is_device_proxy(const void* device) {
     return device && *reinterpret_cast<void* const*>(device) == reinterpret_cast<void*>(get_vtable());
 }
@@ -1705,8 +2101,8 @@ ID3D12Device* device_proxy_real_device(const void* device) {
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
-        slot == 75 || slot == 76)
+        slot == 36 || slot == console::device_console_slot(45) || slot == console::device_console_slot(46) ||
+        slot == console::device_console_slot(50) || slot == 111 || console::device_slot(slot).kind != console::DeviceMethod::pc)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||

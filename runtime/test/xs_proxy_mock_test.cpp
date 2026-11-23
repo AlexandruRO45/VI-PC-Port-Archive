@@ -1,6 +1,7 @@
 // Xbox-ABI queue and fence proxies (d3d12_xs_device.h) over synthetic COM objects, with no D3D12 runtime and no GPU:
-//   - devices that stop at ID3D12Device, Device1, Device3 and Device9: the slots of a missing interface (45/46,
-//     50, 75) are refused without reaching the device, the others get the real objects behind the proxies;
+//   - devices that stop at ID3D12Device, Device1, Device3 and Device9: the public methods that take objects (PC
+//     45/46/50, called at console slots 84/85/89) are refused without the interface, and otherwise get the real
+//     objects behind the proxies;
 //   - fences with and without ID3D12Fence1: 11 or 12 public slots, QueryInterface and slot 11 to match;
 //   - creation that fails, that returns S_OK with no object, a null IID or output, and an interface the real object
 //     has but the proxy does not model;
@@ -188,7 +189,6 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         switch (slot) {
             case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
-            case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
             case 32:                                                                          // OpenSharedHandle
                 if (a1 == kFenceHandle) return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a2, a3));
@@ -351,9 +351,9 @@ int check_levels() {
         EXPECT(hr_of(raw(device, 31, word(fence), 0, GENERIC_ALL, 0, 0)) == S_OK);
         EXPECT(mock->calls[31] == 1 && mock->args[31][0] == real_fence);
 
-        // 45/46: ID3D12Device1
-        const HRESULT r45 = hr_of(raw(device, 45, word(fences), word(values), 2, 0, 0));
-        const HRESULT r46 = hr_of(raw(device, 46, 4, word(objects), word(priorities)));
+        // PC 45/46 (ID3D12Device1), called at console slots 84/85
+        const HRESULT r45 = hr_of(raw(device, 84, word(fences), word(values), 2, 0, 0));
+        const HRESULT r46 = hr_of(raw(device, 85, 4, word(objects), word(priorities)));
         if (l.level >= 1) {
             EXPECT(r45 == S_OK && mock->calls[45] == 1 && mock->array[45][0] == real_fence &&
                    mock->array[45][1] == real_fence);
@@ -363,22 +363,13 @@ int check_levels() {
             void* device1 = nullptr;
             EXPECT(FAILED(hr_of(raw(device, 0, word(&kDevice1Iid), word(&device1)))) && !device1);
         }
-        // 50: ID3D12Device3, with the fence argument unwrapped too
-        const HRESULT r50 = hr_of(raw(device, 50, 0, 4, word(objects), word(fence), 1));
+        // PC 50 (ID3D12Device3) at console slot 89, with the fence argument unwrapped too
+        const HRESULT r50 = hr_of(raw(device, 89, 0, 4, word(objects), word(fence), 1));
         if (l.level >= 3) {
             EXPECT(r50 == S_OK && mock->calls[50] == 1 && same(mock->array[50], unwrapped, 4) &&
                    mock->args[50][3] == real_fence);
         } else {
             EXPECT(r50 == E_NOTIMPL && mock->calls[50] == 0);
-        }
-        // 75: ID3D12Device9::CreateCommandQueue1
-        void* queue1 = reinterpret_cast<void*>(1);  // cleared on every failure (bc59ef46's convention)
-        const HRESULT r75 = hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&queue1)));
-        if (l.level >= 9) {
-            EXPECT(r75 == S_OK && xs::is_queue_proxy(queue1) && mock->calls[75] == 1);
-            EXPECT(release(queue1) == 0 && mock->last_child->refs == 0);
-        } else {
-            EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
         }
 
         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
@@ -387,8 +378,8 @@ int check_levels() {
         EXPECT(queue_mock->refs == 0 && fence_mock->refs == 0);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
-    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots, 45/46/50/75 refused "
-                "without the interface, residency arrays and fences unwrapped otherwise\n", g_label);
+    std::printf("%s: devices up to ID3D12Device, Device1, Device3, Device9: 44/47/51/76 slots, console 84/85/89 "
+                "refused without the interface, residency arrays and fences unwrapped otherwise\n", g_label);
     return 0;
 }
 
@@ -454,8 +445,6 @@ int check_create_failures() {
     mock->create_result = E_OUTOFMEMORY;  // the real failure, passed on
     out = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), word(&kQueueIid), word(&out))) == E_OUTOFMEMORY && !out);
-    out = reinterpret_cast<void*>(1);
-    EXPECT(hr_of(raw(device, 75, word(&kQueueDesc), 0, word(&kQueueIid), word(&out))) == E_OUTOFMEMORY && !out);
     mock->create_result = S_OK;
 
     const unsigned calls8 = mock->calls[8];
@@ -463,8 +452,6 @@ int check_create_failures() {
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), 0, word(&out))) == E_POINTER && !out && mock->calls[8] == calls8);
     out = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw(device, 36, 0, 0, 0, word(&out))) == E_POINTER && !out);
-    out = reinterpret_cast<void*>(1);
-    EXPECT(hr_of(raw(device, 75, word(&kQueueDesc), 0, 0, word(&out))) == E_POINTER && !out);
     // No output: the device's own answer (S_FALSE here), as the PC runtime gives it.
     EXPECT(hr_of(raw(device, 8, word(&kQueueDesc), word(&kQueueIid), 0)) == S_FALSE && mock->calls[8] == calls8 + 1);
     EXPECT(hr_of(raw(device, 36, 0, 0, word(&kFenceIid), 0)) == S_FALSE);
@@ -578,10 +565,10 @@ int check_alloc_failures() {
     const unsigned calls34 = mock->calls[34], calls45 = mock->calls[45], calls46 = mock->calls[46];
     const unsigned calls50 = mock->calls[50];
     EXPECT(failing([&] { return hr_of(raw(device, 34, kLong, word(many))); }) == E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 45, word(many_fences), word(values), kLong, 0, 0)); }) ==
+    EXPECT(failing([&] { return hr_of(raw(device, 84, word(many_fences), word(values), kLong, 0, 0)); }) ==
            E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 46, kLong, word(many), word(priorities))); }) == E_OUTOFMEMORY);
-    EXPECT(failing([&] { return hr_of(raw(device, 50, 0, kLong, word(many), word(fence), 1)); }) == E_OUTOFMEMORY);
+    EXPECT(failing([&] { return hr_of(raw(device, 85, kLong, word(many), word(priorities))); }) == E_OUTOFMEMORY);
+    EXPECT(failing([&] { return hr_of(raw(device, 89, 0, kLong, word(many), word(fence), 1)); }) == E_OUTOFMEMORY);
     EXPECT(mock->calls[34] == calls34 && mock->calls[45] == calls45 && mock->calls[46] == calls46 &&
            mock->calls[50] == calls50);  // nothing reached the device
     // And without the failure the long array arrives unwrapped.
@@ -835,7 +822,8 @@ int check_tail(bool want_guarded) {
     // Signal (14) still reaches the real queue, with the real fence.
     EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
            queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
-    for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot)
+    // Past both known console layouts (xs_console_slots_test covers 11-33): refused, never forwarded.
+    for (unsigned slot = 34; slot < xs::queue_proxy_table_size(); ++slot)
         EXPECT(hr_of(raw(queue, slot)) == E_NOTIMPL && queue_mock->calls[slot] == 0);
     for (unsigned slot = 12; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);

@@ -154,7 +154,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
-                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
+                     "(console slot order, d3d12_xs_console_slots.h).\n");
+        // The proxy's reports name a caller in the images this loader mapped, not only in the host's modules.
+        rt::d3d12_xs::set_caller_describer(&rt::shims::module_offset);
     }
 
 #ifdef LEONIDA_VULKAN_DEVICE

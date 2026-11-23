@@ -28,21 +28,23 @@
 // direct one-argument call against a real PC heap is invalid, so the device test exercises the conversion on the
 // wrapper and compares it with a hidden-pointer call against the real heap.
 //
-// Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
-// vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
-// shadowed. The full Xbox vtable order is not known from the spec; slots beyond the PC device's own vtable return
-// E_NOTIMPL and log once.
+// Past slot 42 the proxy's vtable follows the console order of d3d12_xs_console_slots.h: console methods at 43-82
+// and 104 (those it implements, those it accepts with no effect, and the rest refused with E_NOTIMPL), and the public
+// ID3D12Device1..8 methods at 83-103 and 105-112, forwarded to their PC slots 39 or 40 lower. Every other slot below
+// 43 is forwarded by a generated thunk that swaps `this` to the PC device. A slot the proxy does not forward is
+// counted and reported once with its caller and first argument words; none reaches a PC method at the same index.
+// The public HLE routes above (48/73/78/79/80, or the slots the environment moves them to) are checked first.
 //
-// Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
-// proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
-// in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
-// unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
-// CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
+// Command queues and fences (device slots 8, 36, and 32 for a shared fence) come back wrapped in queue and fence
+// proxies of the same kind. A fence proxy forwards the public chain (11 or 12 slots in SDK 10.0.26100) in PC order. A
+// queue proxy forwards the public chain up to ExecuteCommandLists (10); past it the queue follows one of the two
+// console layouts of d3d12_xs_console_slots.h, decided by the first call that proves it (docs/d3d12_command_objects.md
+// §5.2a). A slot past what is known, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with
+// its first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
+// reserved, never-committed region, and the fault is logged with the slot. Heap, queue and fence proxies are
+// unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait/SignalX, device
+// CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion, SetResidencyPriority and
+// EnqueueMakeResident (PC 45/46/50, console 84/85/89). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
 // heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
 // modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
 #pragma once
@@ -50,6 +52,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <string>
 
 namespace rt::d3d12_xs {
 
@@ -60,6 +63,11 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out);
 
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
+
+// Names a title's return address ("module+0xRVA") in the proxy's reports of console methods. gta6rt installs
+// rt::shims::module_offset, which knows the images its own loader mapped; without one the host's modules are asked.
+using CallerDescriber = std::string (*)(std::uint64_t address);
+void set_caller_describer(CallerDescriber describer);
 
 // IDXGIDevice1 on the device. A GDKX title asks its device for IDXGIDevice1, then GetAdapter and EnumOutputs(0),
 // to find the output it gives SetFrameIntervalX (docs/d3d12_vulkan.md section 4.5). The proxy answers IDXGIObject,
@@ -89,14 +97,14 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
-// True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 (queue proxies), 9
+// (allocator proxies), 14, 31/34/35 and 84/85/89 (proxies unwrapped), 32 and 36 (fence proxies), 111, every console
+// slot of d3d12_xs_console_slots.h that is not a public method, and the public HLE routes at their configured slots.
+// Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
-// Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
+// Queue and fence proxies created by device slots 8 and 48, and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.
 bool is_queue_proxy(const void* queue);
 bool is_fence_proxy(const void* fence);

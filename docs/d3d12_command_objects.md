@@ -755,9 +755,10 @@ first calls; a wrong slot would therefore be visible as a misnamed call, not a s
 
 Queues and fences are wrapped the same way.
 
-- **What is wrapped.** Device slots 8 (`CreateCommandQueue`), 75 (`CreateCommandQueue1`), 36
-  (`CreateFence`) and 32 (`OpenSharedHandle`, when it opens a fence) return queue and fence proxies. Each
-  proxy forwards the public chain in PC order: 19 queue slots, and 11 or 12 fence slots, in SDK 10.0.26100.
+- **What is wrapped.** Device slots 8 (`CreateCommandQueue`), 36 (`CreateFence`) and 32
+  (`OpenSharedHandle`, when it opens a fence) return queue and fence proxies. A fence proxy forwards the public
+  chain in PC order (11 or 12 slots in SDK 10.0.26100); a queue proxy forwards the public chain up to
+  `ExecuteCommandLists` (10) and follows the console order after it (§5.2a).
 - **Logging.** Each slot logs its first call. `--trace-d3d12` records every call except `AddRef`/`Release`,
   as `XboxID3D12CommandQueue::Signal called` or `XboxID3D12Fence::Slot40 unsupported` (the README's trace
   grammar); on the Vulkan device the layer's own record of the same call follows it. An interface the real
@@ -769,9 +770,9 @@ Queues and fences are wrapped the same way.
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
   lands beyond the reservation is not caught.
 - **Unwrapping.** Wherever a device or queue method hands a heap, queue or fence object to the real
-  runtime, the proxy passes the real object instead: queue `Signal`/`Wait` (14/15), and device `CreateSharedHandle` (31), `MakeResident`
-  and `Evict` (34/35), `SetEventOnMultipleFenceCompletion` (45), `SetResidencyPriority` (46) and
-  `EnqueueMakeResident` (50).
+  runtime, the proxy passes the real object instead: queue `Signal`/`Wait`/`SignalX` (§5.2a), and device
+  `CreateSharedHandle` (31), `MakeResident` and `Evict` (34/35), `SetEventOnMultipleFenceCompletion`,
+  `SetResidencyPriority` and `EnqueueMakeResident` (PC 45/46/50, console 84/85/89).
 - **QueryInterface.** It answers only the modelled interfaces, so no real object reaches the title.
 - **What is not covered.** Command lists are not wrapped yet: `ExecuteCommandLists` passes the lists through,
   and a heap proxy given to a list's `SetDescriptorHeaps` reaches the real list unchanged. The command-list
@@ -803,8 +804,8 @@ region, identity, and D3D12's allocator rules through the proxy, and runs a list
 proxy whose copies go through the queue and fence proxies and are read back.
 
 Which of this is measured: the slot numbers and signatures are the SDK's (public). That the console
-keeps the public queue and fence slots, and device slots 8/32/36/75, is an assumption the package cannot
-test, as above. The proxies make a wrong assumption visible in the log; they do not prove it right.
+keeps the public fence slots and device slots 8/32/36 is an assumption the package cannot test, as above;
+the queue past slot 10 and the device past slot 42 follow §5.2a. The proxies make a wrong assumption visible in the log; they do not prove it right.
 `queue_proxy_test` checks all of this with no game files, on the host runtime (WARP and a hardware
 adapter) and on the Vulkan device; `OpenSharedHandle` of a shared fence only on the host runtime, since the
 Vulkan device does not share fences (the test prints "not checked" there). Each error case runs in its own
@@ -824,6 +825,63 @@ value) is what the runtime implements. No Xbox-specific convention on a queue, l
 allocator has been measured. The only measured Xbox return-convention quirk in the graphics
 surface is the descriptor-heap start handle in RAX (prior art), which is a heap method, not a
 command object.
+
+
+### 5.2a The console order of the device and the queue
+
+`runtime/shims/d3d12_xs_console_slots.h` holds the order the proxies follow. Facts come from
+[sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie) (GPL-3.0) at commit `53af7df77c10`
+(`src/runtime/modules/d3d12x/device.cpp:2036-2186` and `:4196-4262`, `docs/research/d3d12x.md`), measured on
+other titles and kit headers, and are checked against what this repository measured. No code is copied.
+
+**Device.** Slots 0-42 are the public `ID3D12Device`. From 43 on, the console differs:
+
+| Slots | Console | PC device at the same index | Proxy |
+|---|---|---|---|
+| 43 | `GetAdapterLuid`, LUID in RAX | `GetAdapterLuid`, hidden return pointer | calls the PC method with its own buffer, returns the 8 bytes |
+| 44 | `CreatePlacedResourceX(address, desc, state, clear, iid, out)` | `CreatePipelineLibrary` | committed default-heap stand-in; the title's memory is not shared (logged) |
+| 48, 73, 78-80 | `CreateCommandQueueX`, `CreateCommandListX`, `Set/Schedule/WaitFrameEventX` | Device3/9/10/11/12 methods | refused and reported here (#6935 routes them) |
+| 49-54, 58, 69, 72 | driver hints, hang and debug callbacks | Device3/4/5/8 methods | `S_OK`, counted, first call reported |
+| 55 | `CreateDerivedGraphicsPipelineStateX` | `CreateReservedResource1` | refused, reported |
+| 60 | `CreateGraphicsPipelineStateX(desc, w2, w3, iid, out)` | `EnumerateMetaCommandParameters` | PC `CreateGraphicsPipelineState`, console flag bits removed |
+| 61 | `CreateSamplerX(desc, handle)` | `CreateMetaCommand` | PC `CreateSampler` from the per-axis console sampler |
+| 62, 67, 76 | measured here (§3.5a, d3d12_vulkan.md §7) | `CreateStateObject`, `CreateProtectedResourceSession1`, `CreateCommittedResource3` | unchanged |
+| 68 | `GetGpuHardwareConfigurationX(out)` | `GetResourceAllocationInfo2` | writes the host timer frequency and 5 (Series X) |
+| 74, 75 | `RegisterPagePoolX`, `UnregisterPagePoolX` | `ShaderCacheControl`, `CreateCommandQueue1` | records the pool, hands out a handle of its own; an unknown handle is `E_INVALIDARG` |
+| 81 | `GetFrameStatisticsX` | `OpenExistingHeapFromAddress1` | count 0, `S_FALSE` ("not available yet") |
+| 83-103, 105-112 | public `ID3D12Device1`-`5` and `6`-`8` | (PC 44-64, 65-72) | forwarded to the PC slot 39 or 40 lower |
+| 45-47, 56, 57, 59, 63-66, 70, 71, 77, 82, 104, 113+ | console methods no source names | | `E_NOTIMPL`, reported with the caller |
+
+Every slot the proxy does not forward is counted and its first call is logged with the caller (`module+RVA`,
+through the loader's own module list under gta6rt) and four argument words, so the first boot names every console
+method the executable uses. A slot past ID3D12Device8 no longer reaches a PC ID3D12Device9+ method.
+
+What this repository measured agrees: the package's device calls (1, 14, 15, 16, 18, 19, 27, 38 in PC order;
+62, 67, 76 console-only) all fit, and the three console-only ones lie inside 44-82. Slot 67 is ours: xvalkyrie
+leaves it unknown. Where this page inferred a shape from a UMD message (`CreateCommandQueueX` with a shader-queue
+parameter, §6 of d3d12_xs_surface.md), xvalkyrie's call site has three arguments; it is recorded, not used here.
+
+**Queue.** Two layouts are known; both keep the public order to `ExecuteCommandLists` (10).
+
+| Method | 2020 kit | later kit |
+|---|---|---|
+| `Signal`, `Wait` | 14, 15 | 16, 17 |
+| PIX capture | 16, 17 | 18, 19 |
+| `SuspendX`, `ResumeX` among five console methods | 18-22 | 20-24 |
+| `SignalX(fence, value, flags)` | 23 | 25 |
+| `GetDesc` | 26 | 28 |
+| page mapping | 27-29 | 29-31 |
+| `PresentX` | 30 | 32 |
+| `SetHDRToneMapperX` | 31 | 33 |
+
+The PC's `GetTimestampFrequency`, `GetClockCalibration` and `GetDesc` at 16-18 are in neither. The later kit's
+two extra methods sit before `Signal`, among the markers (11-15). The proxy decides the layout from the calls,
+once per process: every fence a title holds is a fence proxy, so a fence proxy as the first argument at 14, 15
+or 23 means the 2020 kit and at 16, 17 or 25 the later one, and a call at 32 or 33 means the later one. The word
+is checked with `VirtualQuery` before it is read, because those slots take other arguments in the other layout.
+Until the layout is known, a slot whose meaning differs does nothing (`S_OK`, reported). `PresentX` is accepted
+and counted, not shown: the queue is not wired to the presentation core (#6230). `xs_console_slots_test` checks
+both layouts and the decision by `PresentX`, with the PC methods each slot must and must not reach.
 
 ### 5.3 Blocked on the executable or console driver
 

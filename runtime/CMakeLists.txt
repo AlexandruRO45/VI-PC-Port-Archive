@@ -195,6 +195,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     )
     target_compile_definitions(xs_proxy_mock_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(xs_proxy_mock_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    # The console order of the device and queue proxies (d3d12_xs_console_slots.h) over synthetic COM objects.
+    add_executable(xs_console_slots_test
+      test/xs_console_slots_test.cpp
+      shims/d3d12_xs_device.cpp
+    )
+    target_compile_definitions(xs_console_slots_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(xs_console_slots_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
   else()
     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
   endif()
@@ -841,6 +848,12 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
+  endif()
+  if(TARGET xs_console_slots_test)
+    # The queue layout is decided once per process: one run per layout.
+    add_test(NAME xs_console_slots COMMAND xs_console_slots_test)
+    add_test(NAME xs_console_slots_later COMMAND xs_console_slots_test --later)
+    add_test(NAME xs_console_slots_present_32 COMMAND xs_console_slots_test --present-32)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
