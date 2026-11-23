@@ -264,5 +264,19 @@ class VCvtPknormI16F16AstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "v_cvt_pknorm_i16_f16")
         self.assertEqual(ast.op_sel, (1, 0, 0))
 
+def interpret_cvt_pknorm_i16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0)) -> int:
+    return ref_cvt_pknorm_i16_f16(s0, s1, sel=sel)
+
+
+class VCvtPknormI16F16ScalarInterpreterTests(unittest.TestCase):
+    def test_scalar_execution(self):
+        s0 = (0xBC00 << 16) | 0x3C00
+        s1 = (0x0000 << 16) | 0x3800
+        res = interpret_cvt_pknorm_i16_f16(s0, s1, sel=(0, 0))
+        self.assertEqual(res, (0x4000 << 16) | 0x7FFF)
+
+        res_hi = interpret_cvt_pknorm_i16_f16(s0, s1, sel=(1, 0))
+        self.assertEqual(res_hi, (0x4000 << 16) | 0x8001)
+
 if __name__ == '__main__':
     unittest.main()
