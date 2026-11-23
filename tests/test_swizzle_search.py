@@ -635,6 +635,25 @@ class TestSwizzleSearchOutGuard(unittest.TestCase):
             self.assertFalse((root / "never_created").exists())
             self.assertIn("ERROR:", err.getvalue())
 
+    @unittest.skipUnless(HAVE_NUMPY, "numpy required")
+    def test_missing_pillow_only_prevents_preview(self):
+        with tempfile.TemporaryDirectory() as td:
+            blob = Path(td) / "input.bin"
+            blob.write_bytes(bytes(128))
+            preview = Path(td) / "preview.png"
+            args = [str(blob), "--tile", "128", "--widths", "16", "--tiles", "1"]
+            output, errors = io.StringIO(), io.StringIO()
+            with mock.patch.dict(sys.modules, {"PIL": None}), \
+                 mock.patch.object(sys, "stdout", output), \
+                 mock.patch.object(sys, "stderr", errors):
+                self.assertIn(self.mod.main(args), (0, None))
+                self.assertIn("score ", output.getvalue())
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(self.mod.main([*args, "--out", str(preview)]), 2)
+
+            self.assertEqual(errors.getvalue(), "ERROR: --out requires Pillow (pip install Pillow)\n")
+            self.assertFalse(preview.exists())
+
     def test_render_valueerror_unknown_extension_returns_exit_2(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

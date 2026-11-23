@@ -163,6 +163,11 @@ def main(argv=None):
             if parent:
                 os.makedirs(parent, exist_ok=True)
             render(data, a.bpe, a.tile, res[0][1], res[0][2], a.out)
+        except ModuleNotFoundError as e:
+            if e.name != "PIL":
+                raise
+            print("ERROR: --out requires Pillow (pip install Pillow)", file=sys.stderr)
+            return 2
         except (OSError, ValueError) as e:
             detail = getattr(e, "strerror", None) or str(e)
             print(f"ERROR: cannot write {a.out}: {detail}", file=sys.stderr)
