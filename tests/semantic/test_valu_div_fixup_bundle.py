@@ -605,5 +605,32 @@ class TestVDivFixupF64SIMD(unittest.TestCase):
                 self.assertEqual(wave.vgprs[lane][0], 0)
 
 
+def run_hw_div_fixup_f64(s0: float, s1: float, s2: float) -> float:
+    u0 = f64_to_bits(s0)
+    u1 = f64_to_bits(s1)
+    u2 = f64_to_bits(s2)
+    lines = [
+        f"v_mov_b32 v0, {u0 & MASK32:#x}",
+        f"v_mov_b32 v1, {(u0 >> 32) & MASK32:#x}",
+        f"v_mov_b32 v2, {u1 & MASK32:#x}",
+        f"v_mov_b32 v3, {(u1 >> 32) & MASK32:#x}",
+        f"v_mov_b32 v4, {u2 & MASK32:#x}",
+        f"v_mov_b32 v5, {(u2 >> 32) & MASK32:#x}",
+        "v_div_fixup_f64 v[0:1], v[0:1], v[2:3], v[4:5]",
+        "exp mrt0 v0, v1, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_div_fixup_f64_hw", lines)
+    words = support.mrt0_words(spv)
+    return bits_to_f64((words[1] << 32) | words[0])
+
+
+class TestVDivFixupF64HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_div_fixup_f64."""
+
+    def test_translator_hardware_cases(self):
+        self.assertEqual(run_hw_div_fixup_f64(2.5, 2.0, 5.0), 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()
