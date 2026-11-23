@@ -37,3 +37,7 @@ __pycache__/
 *.exp
 *.log
 .vs/
+
+# Leonida Launcher: the exe that launcher-wpf/build.ps1 puts next to Build.bat, and its publish folder
+/Leonida.exe
+/launcher-wpf/dist/

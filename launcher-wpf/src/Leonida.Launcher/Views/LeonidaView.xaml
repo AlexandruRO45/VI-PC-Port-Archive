@@ -1,0 +1,85 @@
+<UserControl x:Class="Leonida.Launcher.Views.LeonidaView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid Margin="64,0,56,40">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*"/>
+      <ColumnDefinition Width="300"/>
+    </Grid.ColumnDefinitions>
+
+    <!-- The game: logo, one action, a way out when something is wrong -->
+    <StackPanel Grid.Column="0" VerticalAlignment="Center" HorizontalAlignment="Left" Margin="0,0,40,60">
+      <StackPanel Orientation="Horizontal">
+        <Image Source="/Assets/logo.png" Width="150" Height="150" RenderOptions.BitmapScalingMode="HighQuality" Margin="-14,0,4,0"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Text="LEONIDA" Style="{StaticResource H1}" FontSize="96" Margin="0,0,0,-16"/>
+          <TextBlock Text="PC PORT · BUILT FROM YOUR COPY" FontFamily="{StaticResource Display}" FontSize="17" Foreground="#555555" Margin="4,0,0,0"/>
+        </StackPanel>
+      </StackPanel>
+
+      <StackPanel Orientation="Horizontal" Margin="0,34,0,0">
+        <Button x:Name="MainButton" Style="{StaticResource Bevel}" Content="BUILD" Click="OnMain" MinWidth="300" Height="62" FontSize="27"/>
+        <Button x:Name="MoreButton" Style="{StaticResource Bevel}" Padding="0" AutomationProperties.Name="More"
+                MinWidth="62" Width="62" Height="62" Margin="12,0,0,0" Click="OnMore" ToolTip="More">
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+            <Ellipse Width="6" Height="6" Fill="#000000" Margin="3,0"/>
+            <Ellipse Width="6" Height="6" Fill="#000000" Margin="3,0"/>
+            <Ellipse Width="6" Height="6" Fill="#000000" Margin="3,0"/>
+          </StackPanel>
+          <Button.ContextMenu>
+            <ContextMenu x:Name="MoreMenu" Placement="Bottom" HorizontalOffset="-10" VerticalOffset="4">
+              <MenuItem x:Name="MenuOptions" Header="Build options…" Tag="&#xE713;" Click="OnBuildOptions"/>
+              <MenuItem x:Name="MenuRebuild" Header="Update the build" Tag="&#xE72C;" Click="OnRebuild"
+                        ToolTip="Run the build again: finished steps are kept, changed inputs (a new translator, other options) are redone."/>
+              <MenuItem x:Name="MenuCheck" Header="Check my game files" Tag="&#xE9D5;" Click="OnCheckFiles"/>
+              <MenuItem x:Name="MenuDryRun" Header="Check the game's imports (dry run)" Tag="&#xE943;" Click="OnDryRun"/>
+              <Separator/>
+              <MenuItem Header="Open the port's folder" Tag="&#xE838;" Click="OnOpenOutput"/>
+              <MenuItem Header="Open build logs" Tag="&#xE7C3;" Click="OnOpenLogs"/>
+              <MenuItem Header="Open the Leonida folder" Tag="&#xE8B7;" Click="OnOpenRepo"/>
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
+      </StackPanel>
+      <TextBlock x:Name="Status" FontSize="14" Foreground="#333333" Margin="2,16,0,0" TextWrapping="Wrap" MaxWidth="560" HorizontalAlignment="Left"/>
+      <Button Style="{StaticResource Link}" Content="Having trouble? Check your setup" Click="OnTrouble" HorizontalAlignment="Left" Margin="2,12,0,0"/>
+    </StackPanel>
+
+    <!-- A tile like a launcher's: art on top, a black caption -->
+    <Border Grid.Column="1" Style="{StaticResource Card}" VerticalAlignment="Center" Margin="0,0,0,60" Cursor="Hand" MouseLeftButtonUp="OnTile">
+      <DockPanel>
+        <Border DockPanel.Dock="Bottom" Style="{StaticResource Caption}" Padding="14,10">
+          <StackPanel>
+            <TextBlock x:Name="TileTitle" Text="Not built yet" Style="{StaticResource CaptionText}" FontSize="17"/>
+            <TextBlock x:Name="TileDetail" Foreground="#BDBDBD" FontSize="11.5" TextWrapping="Wrap" Margin="0,2,0,0"/>
+          </StackPanel>
+        </Border>
+        <Grid Height="260">
+          <Grid.Background>
+            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+              <GradientStop Color="#2A1452" Offset="0"/>
+              <GradientStop Color="#B42A78" Offset="0.62"/>
+              <GradientStop Color="#FF8A3D" Offset="1"/>
+            </LinearGradientBrush>
+          </Grid.Background>
+          <Ellipse Width="170" Height="170" Fill="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,30,0,0"/>
+          <Image Source="/Assets/logo.png" Width="190" Height="190" RenderOptions.BitmapScalingMode="HighQuality"/>
+          <UniformGrid Columns="3" VerticalAlignment="Bottom" Margin="12,0,12,10">
+            <StackPanel>
+              <TextBlock Text="SHADERS" Foreground="#E6FFFFFF" FontSize="10" FontWeight="Bold"/>
+              <TextBlock x:Name="PortShaders" Foreground="#FFFFFF" FontSize="12.5" FontWeight="SemiBold"/>
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Text="RUNTIME" Foreground="#E6FFFFFF" FontSize="10" FontWeight="Bold"/>
+              <TextBlock x:Name="PortRuntime" Foreground="#FFFFFF" FontSize="12.5" FontWeight="SemiBold"/>
+            </StackPanel>
+            <StackPanel>
+              <TextBlock Text="LAST BUILD" Foreground="#E6FFFFFF" FontSize="10" FontWeight="Bold"/>
+              <TextBlock x:Name="LastBuild" Foreground="#FFFFFF" FontSize="12.5" FontWeight="SemiBold"/>
+            </StackPanel>
+          </UniformGrid>
+        </Grid>
+      </DockPanel>
+    </Border>
+  </Grid>
+</UserControl>

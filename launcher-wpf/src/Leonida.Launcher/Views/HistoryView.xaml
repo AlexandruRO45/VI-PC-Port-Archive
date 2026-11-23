@@ -1,0 +1,56 @@
+<UserControl x:Class="Leonida.Launcher.Views.HistoryView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid Margin="56,0,56,20">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <DockPanel Grid.Row="0" Margin="0,0,0,16">
+      <Button DockPanel.Dock="Right" Style="{StaticResource Outline}" Content="Clear history" Click="OnClear" VerticalAlignment="Bottom"/>
+      <TextBlock Text="HISTORY" Style="{StaticResource H1}" FontSize="52"/>
+    </DockPanel>
+    <Border Grid.Row="1" Style="{StaticResource Card}">
+      <DockPanel>
+        <Border DockPanel.Dock="Bottom" Style="{StaticResource Caption}"><TextBlock x:Name="ChartCaption" Text="How long builds took (last 20)" Style="{StaticResource CaptionText}"/></Border>
+        <Grid Height="130" Margin="16,12,16,8">
+          <ItemsControl x:Name="Bars">
+            <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <Grid Margin="4,0" ToolTip="{Binding Tip}">
+                  <Grid.RowDefinitions><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                  <Rectangle VerticalAlignment="Bottom" Height="{Binding Height}" Fill="{Binding Fill}"/>
+                  <TextBlock Grid.Row="1" Text="{Binding Label}" FontSize="10" Foreground="#777777" HorizontalAlignment="Center" Margin="0,3,0,0"/>
+                </Grid>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <TextBlock x:Name="NoHistory" Text="No builds yet." Foreground="{StaticResource Faint}" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Grid>
+      </DockPanel>
+    </Border>
+    <Border Grid.Row="2" Style="{StaticResource Card}">
+      <ListView x:Name="List" BorderThickness="0" SelectionMode="Single" SelectionChanged="OnSelected" FontSize="13">
+        <ListView.View>
+          <GridView>
+            <GridViewColumn Header="Started" Width="140" DisplayMemberBinding="{Binding Started, StringFormat=yyyy-MM-dd HH:mm}"/>
+            <GridViewColumn Header="Result" Width="100" DisplayMemberBinding="{Binding Outcome}"/>
+            <GridViewColumn Header="Took" Width="110" DisplayMemberBinding="{Binding DurationText}"/>
+            <GridViewColumn Header="Stages done" Width="240" DisplayMemberBinding="{Binding StagesText}"/>
+            <GridViewColumn Header="Shaders compiled" Width="140" DisplayMemberBinding="{Binding ShadersText}"/>
+            <GridViewColumn Header="Warnings" Width="80" DisplayMemberBinding="{Binding Warnings}"/>
+            <GridViewColumn Header="Errors" Width="70" DisplayMemberBinding="{Binding Errors}"/>
+            <GridViewColumn Header="Peak RAM" Width="100" DisplayMemberBinding="{Binding MemoryText}"/>
+          </GridView>
+        </ListView.View>
+      </ListView>
+    </Border>
+    <Border Grid.Row="3" Style="{StaticResource Card}" Margin="0" x:Name="DetailCard" Visibility="Collapsed">
+      <DockPanel Margin="16,12">
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button Style="{StaticResource Dark}" Content="Open its log" Click="OnLog"/>
+          <Button Style="{StaticResource Outline}" Content="Build again with these options…" Click="OnReuse"/>
+        </StackPanel>
+        <TextBlock x:Name="Detail" TextWrapping="Wrap" FontSize="12" FontFamily="{StaticResource Mono}" Margin="0,0,16,0"/>
+      </DockPanel>
+    </Border>
+  </Grid>
+</UserControl>

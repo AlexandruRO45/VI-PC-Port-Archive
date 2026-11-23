@@ -1,0 +1,198 @@
+<UserControl x:Class="Leonida.Launcher.Views.BuildView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:core="clr-namespace:Leonida.Core;assembly=Leonida.Core">
+  <UserControl.Resources>
+    <Style x:Key="Num" TargetType="TextBlock">
+      <Setter Property="FontFamily" Value="{StaticResource DisplayBold}"/>
+      <Setter Property="FontSize" Value="24"/>
+      <Setter Property="Foreground" Value="#000000"/>
+      <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+    </Style>
+    <Style x:Key="NumLabel" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="10"/>
+      <Setter Property="FontWeight" Value="Bold"/>
+      <Setter Property="Foreground" Value="#7A7A7A"/>
+    </Style>
+    <Style x:Key="Small" TargetType="Button" BasedOn="{StaticResource Outline}">
+      <Setter Property="Padding" Value="10,3"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Margin" Value="6,0,0,0"/>
+    </Style>
+  </UserControl.Resources>
+
+  <Grid Margin="56,0,56,20">
+    <!-- Nothing has run yet -->
+    <StackPanel x:Name="Empty" VerticalAlignment="Center" HorizontalAlignment="Center" Margin="0,0,0,80">
+      <TextBlock Text="NO BUILD RUNNING" Style="{StaticResource H1}" FontSize="52" HorizontalAlignment="Center"/>
+      <TextBlock x:Name="EmptyText" Text="Start one and follow every stage here." FontSize="15" Foreground="#555555" HorizontalAlignment="Center" Margin="0,4,0,26"/>
+      <Button Style="{StaticResource Bevel}" Content="BUILD…" Click="OnNewBuild" HorizontalAlignment="Center" MinWidth="260"/>
+    </StackPanel>
+
+    <Grid x:Name="Live" Visibility="Collapsed">
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="Auto"/>
+        <RowDefinition Height="*" MinHeight="140"/>
+      </Grid.RowDefinitions>
+
+      <!-- Status and controls -->
+      <DockPanel Grid.Row="0" Margin="0,0,0,14">
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="StopButton" Style="{StaticResource Bevel}" Content="STOP" Click="OnStop" MinWidth="130" Height="46" FontSize="20"
+                  ToolTip="Stop the way Ctrl+C stops it. Every stage continues where it stopped the next time you build."/>
+          <Button x:Name="CancelButton" Style="{StaticResource Bevel}" Content="CANCEL" Click="OnCancel" MinWidth="130" Height="46" FontSize="20" Margin="12,0,0,0"
+                  ToolTip="End the build and every process it started at once. Use Stop unless the build no longer reacts."/>
+          <Button x:Name="AgainButton" Style="{StaticResource Bevel}" Content="BUILD…" Click="OnNewBuild" MinWidth="170" Height="46" FontSize="20"/>
+        </StackPanel>
+        <StackPanel VerticalAlignment="Center">
+          <StackPanel Orientation="Horizontal">
+            <Border x:Name="Badge" Background="#9A9A9A" CornerRadius="3" Padding="10,2" VerticalAlignment="Center">
+              <TextBlock x:Name="BadgeText" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="17"/>
+            </Border>
+            <TextBlock x:Name="Title" Margin="14,0,0,0" FontFamily="{StaticResource DisplayBold}" FontSize="30" VerticalAlignment="Center"/>
+          </StackPanel>
+          <TextBlock x:Name="Operation" FontSize="13" Foreground="#444444" Margin="2,6,0,0" TextTrimming="CharacterEllipsis" MaxWidth="760" HorizontalAlignment="Left"/>
+        </StackPanel>
+      </DockPanel>
+
+      <!-- Stages -->
+      <ItemsControl Grid.Row="1" x:Name="StageList" Margin="0,0,0,12">
+        <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+        <ItemsControl.ItemTemplate>
+          <DataTemplate>
+            <Border Margin="0,0,8,0" Padding="12,8" Background="{Binding Background}" BorderBrush="{Binding Border}" BorderThickness="1">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="{Binding Icon}" FontFamily="{StaticResource Icons}" FontSize="13" Foreground="{Binding Foreground}" Margin="0,3,8,0"/>
+                  <TextBlock Text="{Binding Name}" FontFamily="{StaticResource DisplayBold}" FontSize="17" Foreground="{Binding Foreground}"/>
+                </StackPanel>
+                <TextBlock Text="{Binding Detail}" FontSize="11.5" Foreground="{Binding Foreground}" Opacity="0.85" TextTrimming="CharacterEllipsis"/>
+              </StackPanel>
+            </Border>
+          </DataTemplate>
+        </ItemsControl.ItemTemplate>
+      </ItemsControl>
+
+      <!-- Measured numbers -->
+      <Border Grid.Row="2" x:Name="StatsPanel" Background="#FFFFFF" BorderBrush="#1A1A1A" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
+        <Grid Margin="16,10">
+          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="230"/></Grid.ColumnDefinitions>
+          <UniformGrid Columns="8">
+            <StackPanel><TextBlock Text="ELAPSED" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NElapsed" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel><TextBlock Text="CPU" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NCpu" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel ToolTip="Memory of every process the build runs"><TextBlock Text="BUILD RAM" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NMem" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel><TextBlock Text="PC RAM USED" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NSys" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel ToolTip="Processes running in the build: Python, translator shards, llvm-mc, compilers"><TextBlock Text="PROCESSES" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NProc" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel x:Name="SizeBox" ToolTip="Measured every minute while the build runs"><TextBlock Text="OUTPUT SIZE" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NSize" Style="{StaticResource Num}"/></StackPanel>
+            <StackPanel><TextBlock Text="WARNINGS" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NWarn" Style="{StaticResource Num}" Foreground="{StaticResource Warn}"/></StackPanel>
+            <StackPanel><TextBlock Text="ERRORS" Style="{StaticResource NumLabel}"/><TextBlock x:Name="NErr" Style="{StaticResource Num}" Foreground="{StaticResource Bad}"/></StackPanel>
+          </UniformGrid>
+          <Grid Grid.Column="1" Margin="14,0,0,0">
+            <TextBlock Text="CPU · BUILD RAM (5 MIN)" Style="{StaticResource NumLabel}"/>
+            <Canvas x:Name="Chart" Margin="0,14,0,0" ClipToBounds="True" Background="#F6F6F6">
+              <Polyline x:Name="CpuLine" Stroke="{StaticResource Pink}" StrokeThickness="1.8"/>
+              <Polyline x:Name="MemLine" Stroke="{StaticResource Purple}" StrokeThickness="1.4" StrokeDashArray="3 2"/>
+            </Canvas>
+          </Grid>
+        </Grid>
+      </Border>
+
+      <!-- Shader translation (only when the run has the shaders stage) -->
+      <Border Grid.Row="3" x:Name="ShaderPanel" Background="#FFFFFF" BorderBrush="#1A1A1A" BorderThickness="1" Margin="0,0,0,12" Effect="{StaticResource SoftShadow}">
+        <StackPanel>
+          <Border Background="#000000" Padding="16,7">
+            <DockPanel>
+              <TextBlock x:Name="ShPercent" DockPanel.Dock="Right" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
+              <TextBlock Text="SHADERS · RDNA2 → SPIR-V" Foreground="#FFFFFF" FontFamily="{StaticResource Display}" FontSize="16"/>
+            </DockPanel>
+          </Border>
+          <StackPanel Margin="16,10,16,10">
+            <ProgressBar x:Name="ShBar" Style="{StaticResource Meter}" Height="10" Margin="0,0,0,10"/>
+            <UniformGrid Columns="8">
+              <StackPanel><TextBlock Text="TOTAL" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShTotal" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+              <StackPanel ToolTip="Translated and passed spirv-val: the .spv module is written"><TextBlock Text="COMPILED" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShValid" Style="{StaticResource Num}" FontSize="20" Foreground="{StaticResource Ok}"/></StackPanel>
+              <StackPanel ToolTip="Unsupported, a translator error, or rejected by spirv-val"><TextBlock Text="FAILED" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShFailed" Style="{StaticResource Num}" FontSize="20" Foreground="{StaticResource Bad}"/></StackPanel>
+              <StackPanel ToolTip="Translator processes on a shader right now, one shader each"><TextBlock Text="COMPILING NOW" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShActive" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+              <StackPanel><TextBlock Text="REMAINING" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShRemaining" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+              <StackPanel ToolTip="Shaders finished per second over the last minute, all processes together"><TextBlock Text="SPEED" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShSpeed" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+              <StackPanel ToolTip="The time the translator processes ran, summed, over the shaders they finished"><TextBlock Text="AVG / SHADER" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShAvg" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+              <StackPanel ToolTip="The remaining shaders at the current speed; this step only"><TextBlock Text="ETA (THIS STEP)" Style="{StaticResource NumLabel}"/><TextBlock x:Name="ShEta" Style="{StaticResource Num}" FontSize="20"/></StackPanel>
+            </UniformGrid>
+            <TextBlock x:Name="ShNote" Style="{StaticResource Hint}" Margin="0,8,0,0"/>
+          </StackPanel>
+        </StackPanel>
+      </Border>
+
+      <!-- Console -->
+      <Border Grid.Row="4" Background="{StaticResource ConsoleBg}" BorderBrush="#000000" BorderThickness="1">
+        <DockPanel>
+          <Border DockPanel.Dock="Top" Background="#000000" Padding="12,6">
+            <DockPanel>
+              <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                <TextBox x:Name="SearchBox" Width="200" Height="26" FontSize="12" Padding="6,2" TextChanged="OnSearch" ToolTip="Search the output"
+                         Background="#1E1E1E" Foreground="#FFFFFF" BorderBrush="#3A3A3A" CaretBrush="#FFFFFF"/>
+                <ComboBox x:Name="FilterBox" Width="112" Height="26" MinHeight="26" FontSize="12" Padding="4,1" Margin="6,0,0,0" SelectionChanged="OnSearch">
+                  <ComboBoxItem Content="All lines" IsSelected="True"/><ComboBoxItem Content="Warnings"/><ComboBoxItem Content="Errors"/><ComboBoxItem Content="Steps only"/>
+                </ComboBox>
+                <CheckBox x:Name="AutoScroll" Content="Follow" Foreground="#DDDDDD" Margin="10,0,2,0" Checked="OnAutoScroll" Unchecked="OnAutoScroll"/>
+                <Button x:Name="ConsoleMenuButton" Style="{StaticResource Small}" Content="&#xE712;" FontFamily="{StaticResource Icons}" Click="OnConsoleMenu" ToolTip="Copy, clear, save, open the log">
+                  <Button.ContextMenu>
+                    <ContextMenu x:Name="ConsoleMenu">
+                      <MenuItem Header="Copy (selected lines, or all shown)" Tag="&#xE8C8;" Click="OnCopyLines"/>
+                      <MenuItem Header="Clear the view (the log file keeps everything)" Tag="&#xE894;" Click="OnClearConsole"/>
+                      <MenuItem Header="Save the whole log as…" Tag="&#xE74E;" Click="OnSaveLog"/>
+                      <MenuItem Header="Open the log file" Tag="&#xE7C3;" Click="OnOpenLog"/>
+                      <MenuItem Header="Open the logs folder" Tag="&#xE838;" Click="OnOpenLogs"/>
+                    </ContextMenu>
+                  </Button.ContextMenu>
+                </Button>
+                <Button x:Name="ExpandButton" Style="{StaticResource Small}" Content="&#xE740;" FontFamily="{StaticResource Icons}" Click="OnExpand" ToolTip="Make the console bigger"/>
+              </StackPanel>
+              <TextBlock Text="CONSOLE" Foreground="#FFFFFF" FontFamily="{StaticResource DisplayBold}" FontSize="15" VerticalAlignment="Center"/>
+              <TextBlock x:Name="ConsoleCount" Foreground="#888888" FontSize="11.5" Margin="12,0,0,0" VerticalAlignment="Center"/>
+            </DockPanel>
+          </Border>
+          <ListBox x:Name="ConsoleList" Background="{StaticResource ConsoleBg}" BorderThickness="0" SelectionMode="Extended"
+                   FontFamily="{StaticResource Mono}" FontSize="12.5" VirtualizingPanel.IsVirtualizing="True"
+                   VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.HorizontalScrollBarVisibility="Auto" KeyDown="OnConsoleKey">
+            <ListBox.Resources>
+              <Style TargetType="ScrollBar" BasedOn="{StaticResource {x:Type ScrollBar}}">
+                <Setter Property="Foreground" Value="#E0E0E0"/>
+              </Style>
+            </ListBox.Resources>
+            <ListBox.ItemContainerStyle>
+              <Style TargetType="ListBoxItem">
+                <Setter Property="Padding" Value="10,0"/>
+                <Setter Property="Template">
+                  <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                      <Border x:Name="b" Background="Transparent" Padding="{TemplateBinding Padding}"><ContentPresenter/></Border>
+                      <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="Background" Value="#44EC2F8C"/></Trigger>
+                      </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                  </Setter.Value>
+                </Setter>
+              </Style>
+            </ListBox.ItemContainerStyle>
+            <ListBox.ItemTemplate>
+              <DataTemplate DataType="{x:Type core:LogLine}">
+                <TextBlock x:Name="t" Text="{Binding Text}" Foreground="#D6D6D6"/>
+                <DataTemplate.Triggers>
+                  <DataTrigger Binding="{Binding Kind}" Value="Warning"><Setter TargetName="t" Property="Foreground" Value="#F2B33D"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Kind}" Value="Error"><Setter TargetName="t" Property="Foreground" Value="#FF6B6B"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Kind}" Value="Success"><Setter TargetName="t" Property="Foreground" Value="#5FD38D"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Kind}" Value="Command"><Setter TargetName="t" Property="Foreground" Value="#7F8FA6"/></DataTrigger>
+                  <DataTrigger Binding="{Binding Kind}" Value="Launcher"><Setter TargetName="t" Property="Foreground" Value="#F37BB8"/></DataTrigger>
+                </DataTemplate.Triggers>
+              </DataTemplate>
+            </ListBox.ItemTemplate>
+          </ListBox>
+        </DockPanel>
+      </Border>
+    </Grid>
+  </Grid>
+</UserControl>
