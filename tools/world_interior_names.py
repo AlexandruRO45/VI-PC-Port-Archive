@@ -378,7 +378,7 @@ def main(argv=None):
     ap.add_argument("--start", type=int, help="first byte of an RPF9 data-area window")
     ap.add_argument("--limit", type=int, help="window size in bytes (default: to the end of the archive)")
     ap.add_argument("--jobs", type=int, default=1, help="parallel windows over an RPF9 archive (default 1)")
-    ap.add_argument("--out", default=os.path.join("reports", "world_interior_names.json"))
+    ap.add_argument("--out", help="JSON report of every key (default: no report; it holds game data, so keep it local)")
     a = ap.parse_args(argv)
     for p in (a.path, a.names):
         if not os.path.exists(p):
@@ -389,11 +389,11 @@ def main(argv=None):
         ap.error("--start must not be negative")
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1 byte")  # 0 would scan nothing and report every count as 0
-    out_abs = os.path.abspath(a.out)
-    if same_report_path(a.out, a.path) or same_report_path(a.out, a.names) or _inside(a.path, out_abs):
+    out_abs = os.path.abspath(a.out) if a.out else None
+    if out_abs and (same_report_path(a.out, a.path) or same_report_path(a.out, a.names) or _inside(a.path, out_abs)):
         print("world_interior_names.py: --out would overwrite an input: %s" % a.out, file=sys.stderr)
         return 2
-    if os.path.isdir(a.out):
+    if out_abs and os.path.isdir(a.out):
         print("world_interior_names.py: --out is a directory: %s" % a.out, file=sys.stderr)
         return 2
     try:
@@ -407,9 +407,14 @@ def main(argv=None):
         print("world_interior_names.py: %s" % why, file=sys.stderr)
         return 2
     summary, rows = resolve(names, scan(a.path, a.start, a.limit, a.jobs), duplicate_keys, malformed)
-    os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+    if a.out:
+        try:
+            os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "keys": rows}, f, indent=1, sort_keys=True)
+        except OSError as exc:  # a report path the run cannot write is one line, not a traceback
+            print("world_interior_names.py: --out %s: %s" % (a.out, exc.strerror or exc), file=sys.stderr)
+            return 2
     print(json.dumps(summary, indent=1, sort_keys=True))
     return 0
 
