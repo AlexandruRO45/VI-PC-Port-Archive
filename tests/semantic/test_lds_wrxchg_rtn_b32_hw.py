@@ -513,5 +513,39 @@ class TestDSWrxchgRtnB32RegisterAliasing(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(0x20), 0x20)
 
 
+@dataclasses.dataclass
+class StatusFlags:
+    """Hardware status flags: SCC (Scalar Condition Code) and VCC (Vector Condition Code)."""
+    scc: int = 0
+    vcc: int = 0
+
+
+class TestDSWrxchgRtnB32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation neutrality."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(num_dwords=1024)
+        self.state = ScalarThreadState(self.lds)
+        self.interp = ScalarDSInterpreter()
+        self.flags = StatusFlags(scc=1, vcc=0xFFFFFFFF_FFFFFFFF)
+
+    def test_condition_codes_scc_vcc_unmodified(self) -> None:
+        self.lds.write_dword(0x40, 0xFFFFFFFF)
+        self.state.rf.set_vgpr(VGPR(1), 0x40)
+        self.state.rf.set_vgpr(VGPR(2), 0x00000000)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+        )
+        old, new = self.interp.execute(self.state, inst)
+        self.assertEqual(old, 0xFFFFFFFF)
+        self.assertEqual(new, 0)
+        self.assertEqual(self.flags.scc, 1)
+        self.assertEqual(self.flags.vcc, 0xFFFFFFFF_FFFFFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
