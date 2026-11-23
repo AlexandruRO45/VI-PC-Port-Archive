@@ -460,5 +460,28 @@ class TestSaluNandSaveexecB32ConditionCodes(unittest.TestCase):
         self.assertEqual(self.state.exec_lo, MASK32)
         self.assertEqual(self.state.scc, 1)
 
+# ==============================================================================
+# Unit Tests: IEEE 754 Boundary Extremes and Bit Patterns
+# ==============================================================================
+
+class TestSaluNandSaveexecB32IEEE754EdgeCases(unittest.TestCase):
+    """Unit tests for bit patterns corresponding to IEEE 754 floats."""
+
+    def test_float_bit_patterns(self) -> None:
+        patterns = [
+            (0x0000_0000, 0x8000_0000, "+0.0 and -0.0"),
+            (0x3F80_0000, 0xBF80_0000, "+1.0 and -1.0"),
+            (0x7F80_0000, 0xFF80_0000, "+Inf and -Inf"),
+            (0x7FC0_0000, 0x7F80_0001, "qNaN and sNaN"),
+            (0x7FFF_FFFF, 0x8000_0000, "Integer signed extremes"),
+        ]
+        for s0, exec_lo, desc in patterns:
+            with self.subTest(desc=desc):
+                new_exec, saved_d, scc = ref_nand_saveexec_b32(s0, exec_lo)
+                exp_new = (~(s0 & exec_lo)) & MASK32
+                self.assertEqual(new_exec, exp_new)
+                self.assertEqual(saved_d, exec_lo)
+                self.assertEqual(scc, 1 if exp_new != 0 else 0)
+
 if __name__ == "__main__":
     unittest.main()
