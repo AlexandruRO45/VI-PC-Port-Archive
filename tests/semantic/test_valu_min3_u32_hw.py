@@ -109,5 +109,91 @@ class TestValuMin3U32ReferenceOracle(unittest.TestCase):
         self.assertEqual(res2, res3)
         self.assertEqual(oracle_min3_u32(a, a, a), a)
 
+class RegKind(enum.Enum):
+    VGPR = enum.auto()
+    SGPR = enum.auto()
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+
+    def __post_init__(self) -> None:
+        if self.kind == RegKind.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of range [0, 255]")
+        if self.kind == RegKind.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of range [0, 105]")
+
+    def __str__(self) -> str:
+        prefix = "v" if self.kind == RegKind.VGPR else "s"
+        return f"{prefix}{self.index}"
+
+
+class Opcode(enum.Enum):
+    V_MIN3_U32 = "v_min3_u32"
+
+
+@dataclasses.dataclass
+class VOP3Instruction:
+    opcode: Opcode
+    dst: Register
+    src0: Union[Register, int]
+    src1: Union[Register, int]
+    src2: Union[Register, int]
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != RegKind.VGPR:
+            raise ValueError("VOP3 destination must be VGPR")
+        if self.opcode != Opcode.V_MIN3_U32:
+            raise ValueError(f"Invalid opcode {self.opcode}")
+
+    def to_asm(self) -> str:
+        s0 = f"{self.src0:#x}" if isinstance(self.src0, int) else str(self.src0)
+        s1 = f"{self.src1:#x}" if isinstance(self.src1, int) else str(self.src1)
+        s2 = f"{self.src2:#x}" if isinstance(self.src2, int) else str(self.src2)
+        return f"{self.opcode.value} {self.dst}, {s0}, {s1}, {s2}"
+
+
+class TestValuMin3U32AST(unittest.TestCase):
+    """Stage 2: Symbolic AST definitions and typed expressions for v_min3_u32."""
+
+    def test_instruction_creation_and_disasm(self) -> None:
+        dst = Register(RegKind.VGPR, 0)
+        s0 = Register(RegKind.VGPR, 1)
+        s1 = Register(RegKind.VGPR, 2)
+        s2 = Register(RegKind.VGPR, 3)
+        inst = VOP3Instruction(Opcode.V_MIN3_U32, dst, s0, s1, s2)
+        self.assertEqual(inst.to_asm(), "v_min3_u32 v0, v1, v2, v3")
+
+    def test_instruction_with_literals_and_sgprs(self) -> None:
+        dst = Register(RegKind.VGPR, 4)
+        s0 = Register(RegKind.SGPR, 0)
+        s1 = 0x100
+        s2 = Register(RegKind.VGPR, 5)
+        inst = VOP3Instruction(Opcode.V_MIN3_U32, dst, s0, s1, s2)
+        self.assertEqual(inst.to_asm(), "v_min3_u32 v4, s0, 0x100, v5")
+
+    def test_ast_emits_valid_spirv(self) -> None:
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 200",
+            inst.to_asm(),
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_min3", lines)
+        self.assertIn("UMin", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 50)
+
 if __name__ == "__main__":
     unittest.main()
