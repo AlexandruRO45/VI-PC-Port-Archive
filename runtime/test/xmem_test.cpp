@@ -9,6 +9,8 @@
 // graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
 // contents across unmap and remap, alias when mapped twice, and scatter-map per address.
 #include <windows.h>
+
+#include <vector>
 #include <psapi.h>
 
 #include <cstdint>
@@ -474,6 +476,57 @@ void test_placeholders(const PhysicalApi& api) {
     check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
+// The retail executable's descriptor pool (measured under gta6rt --run): a 185 MiB MEM_RESERVE_PLACEHOLDER region,
+// split into five ranges with VirtualFree(MEM_PRESERVE_PLACEHOLDER), each replaced by a reserve-only window with
+// MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | MEM_PHYSICAL | MEM_LARGE_PAGES, attribute 0x27 and PAGE_READWRITE | PAGE_WRITECOMBINE, then 0x5c80 physical pages
+// allocated and 0x2f0 of them mapped into the fourth window in one call.
+void test_retail_descriptor_pool(const PhysicalApi& api) {
+    constexpr SIZE_T kTotal = 0xb900000;
+    constexpr SIZE_T kOffsets[5] = {0, 0xa00000, 0xb00000, 0x2600000, 0x5500000};
+    constexpr SIZE_T kSizes[5] = {0xa00000, 0x100000, 0x1b00000, 0x2f00000, 0x6400000};
+    // The title has 0x2c60 pages of its own allocated (and mapped) before it builds the pool.
+    std::vector<uint64_t> earlier(0x2c60);
+    uint64_t earlier_count = earlier.size();
+    check(api.allocate(0x280, &earlier_count, earlier.data()) == TRUE && earlier_count == earlier.size(),
+          "retail pool: the 0x2c60 pages allocated earlier at startup");
+    auto* const base = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kTotal, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, 7, PAGE_NOACCESS));
+    check(base != nullptr, "retail pool: the 185 MiB placeholder is reserved");
+    if (!base) return;
+    bool split = true;
+    for (int i = 0; i < 4; ++i)
+        split &= VirtualFree(base + kOffsets[i], kSizes[i], MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
+    check(split, "retail pool: the placeholder splits into five ranges");
+    bool windows = true;
+    for (int i = 0; i < 5; ++i)
+        windows &= api.virtual_alloc(base + kOffsets[i], kSizes[i], 0x20406000, 0x27,
+                                     PAGE_READWRITE | PAGE_WRITECOMBINE) ==
+                   base + kOffsets[i];
+    check(windows, "retail pool: each range becomes a physical large-page window");
+    constexpr uint64_t kAllocated = 0x5c80, kMapped = 0x2f0;
+    std::vector<uint64_t> pages(kAllocated);
+    uint64_t count = kAllocated;
+    check(api.allocate(0x280, &count, pages.data()) == TRUE && count == kAllocated,
+          "retail pool: 0x5c80 physical pages are allocated");
+    uint8_t* const target = base + kOffsets[3];
+    uint64_t failed_at = kMapped;
+    DWORD error = 0;
+    for (uint64_t i = 0; i < kMapped && failed_at == kMapped; ++i) {
+        SetLastError(ERROR_SUCCESS);
+        if (api.map(target + i * kPage64k, 1, &pages[i]) == nullptr) {
+            failed_at = i;
+            error = GetLastError();
+        }
+    }
+    if (failed_at != kMapped)
+        std::printf("retail pool: page %llu of %llu failed to map, error %lu\n",
+                    static_cast<unsigned long long>(failed_at), static_cast<unsigned long long>(kMapped), error);
+    check(failed_at == kMapped, "retail pool: 0x2f0 pages map into the fourth window");
+    api.map(target, kMapped, nullptr);
+    api.free_pages(kAllocated, pages.data());
+    api.free_pages(earlier.size(), earlier.data());
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -718,6 +771,7 @@ int main() {
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");
     if (virtual_alloc && physical.allocate && physical.free_pages && physical.map && physical.scatter) {
         test_physical_pages(physical);
+        test_retail_descriptor_pool(physical);
         test_placeholders(physical);
     }
 

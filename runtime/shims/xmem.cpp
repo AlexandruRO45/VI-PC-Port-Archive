@@ -458,9 +458,12 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
 }
 
 // Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
+// GPU memory, which the D3D12 layer reads on the CPU. The cache modifiers are dropped from the view: the retail
+// descriptor pool's windows are PAGE_READWRITE | PAGE_WRITECOMBINE, Wine's MapViewOfFile3 refuses any modifier
+// (ERROR_INVALID_PARAMETER), and CPU reads of write-combined memory are uncached on Windows as well.
 DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
+    const DWORD protect = window.protect & ~static_cast<DWORD>(PAGE_WRITECOMBINE | PAGE_NOCACHE);
+    return protect == PAGE_NOACCESS ? PAGE_READWRITE : protect;
 }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
