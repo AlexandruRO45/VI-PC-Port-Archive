@@ -779,7 +779,7 @@ def main() -> int:
                  "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
                  "For Visual Studio, use: cmake --build <build-dir> --config RelWithDebInfo "
                  "--target vk_compute_test vk_store_test vk_harness.\n"
-                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+                 "CMake only builds them when it finds Vulkan. If it printed \"Vulkan headers not found\", install the "
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
     a.build = resolved_build
 

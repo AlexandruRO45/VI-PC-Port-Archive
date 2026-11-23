@@ -17,6 +17,8 @@ import check
 import run_gpu_tests
 
 PROGRAMS = tuple(t + check.EXE for t in check.TEST_PROGRAMS)
+# The missing-programs hints quote the configure warning; tests/test_cmake_vulkan_missing.py checks CMake prints it.
+CMAKE_WARNING = '"Vulkan headers not found"'
 
 
 def touch(folder: Path, names=PROGRAMS, mtime=None):
@@ -118,6 +120,7 @@ class PickBuildDir(unittest.TestCase):
         self.assertIn(f"Test programs not found in {self.build}: vk_harness", msg)
         for c in check.CONFIG_DIRS:
             self.assertIn(c, msg)
+        self.assertIn(CMAKE_WARNING, msg)
 
 
 class MainUsesTheResolvedFolder(unittest.TestCase):
@@ -146,6 +149,15 @@ class MainUsesTheResolvedFolder(unittest.TestCase):
             run_gpu_tests.main()
         self.assertIn("RelWithDebInfo", str(e.exception))
         self.assertIn("Test programs not found in", str(e.exception))
+
+    def test_run_gpu_tests_not_found_together_quotes_the_cmake_warning(self):
+        # The second exit: pick_build_dir found the programs, find_test_programs found no one folder with them.
+        argv = ["run_gpu_tests.py", "--build", str(self.build)]
+        with (patch.object(sys, "argv", argv), patch.object(run_gpu_tests, "find_test_programs", return_value=None),
+              redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as e):
+            run_gpu_tests.main()
+        self.assertIn("not found together in one build directory", str(e.exception))
+        self.assertIn(CMAKE_WARNING, str(e.exception))
 
     def test_check_hands_the_configuration_folder_to_the_first_test(self):
         class Stop(Exception):

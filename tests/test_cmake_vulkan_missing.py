@@ -38,8 +38,9 @@ class VulkanMissingMessageTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("CMake Warning", r.stderr)
         text = " ".join(r.stderr.split())
-        for part in ("Vulkan D3D12 device in gta6rt", "LEONIDA_D3D12=vulkan", "D3D12 layer and GPU tests",
-                     "CMakeCache.txt", "LEONIDA_VULKAN_HEADERS_FETCH=ON", "LEONIDA_REQUIRE_VULKAN=ON"):
+        for part in ("Vulkan headers not found", "Vulkan D3D12 device in gta6rt", "LEONIDA_D3D12=vulkan",
+                     "D3D12 layer and GPU tests", "CMakeCache.txt", "LEONIDA_VULKAN_HEADERS_FETCH=ON",
+                     "LEONIDA_REQUIRE_VULKAN=ON"):
             self.assertIn(part, text)
 
     def test_off_still_warns(self):

@@ -93,7 +93,7 @@ def not_found_message(build, missing):
     return (f"Test programs not found in {build}: {', '.join(missing)}\n"
             f"(its {', '.join(CONFIG_DIRS)} subfolders were searched too)\n"
             "Build them with cmake -S runtime -B runtime/build, then cmake --build runtime/build.\n"
-            "CMake only builds them when it finds Vulkan. If it printed \"Vulkan SDK not found\", install the "
+            "CMake only builds them when it finds Vulkan. If it printed \"Vulkan headers not found\", install the "
             "Vulkan headers (vulkan-headers on Arch) and configure again.")
 
 COMPUTE = [("cs_lds", "4", "mirror64"), ("cs_exec64", "1", "exec64"), ("cs_bvh", "1", "bvh"),
