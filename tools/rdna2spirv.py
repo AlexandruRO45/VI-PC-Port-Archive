@@ -10,7 +10,7 @@ Anything not modelled raises Unsupported and is reported, never guessed. The con
 ("Translator status and runtime contract") lists what each instruction family does and how it was confirmed.
 Vertex inputs: v0 = VertexIndex - BaseVertex and v3 = InstanceIndex - BaseInstance (the hardware's ids are zero-based).
 
-Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
+Usage (needs spirv-val on PATH, from the Vulkan SDK or spirv-tools; spirv-as too unless --assembler python):
     python3 -I rdna2spirv.py <disasm dir or .s> --out DIR [--limit N] [--shard i/n]
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from report_paths import path_key, same_report_path  # noqa: E402
 from shader_ir import HDR, parse_file  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 import cfg_structure  # noqa: E402
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
@@ -62,6 +63,7 @@ W64G_COUNTS = Counter()   # tiers of the wave64 VS/PS/GS translated so far, for 
 # (1,0,0), (0,1,0), (0,0,1) at the triangle's three vertices; interpolating those gives the perspective-correct
 # barycentrics, so .y/.z are AMD's i/j as with BaryCoordKHR.
 BARY_FALLBACK = False
+SHADER_CLOCK = False
 FMA_KHR = False          # --fma khr: fused multiply-adds are OpFmaKHR (SPV_KHR_fma, VK_KHR_shader_fma), not GLSL Fma
 FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from single-rounded f32 ops (Gen.fma_exact)
 # --texel-offset-fallback: image_sample*_o without VK_KHR_maintenance8. The run-time texel offset is folded into the
@@ -4965,6 +4967,21 @@ class Gen:
         self.emit(f"{word} = OpSelect %uint {upper} {hi} {lo}")
         return word
 
+    def wave32_first_running_lane(self):
+        """The lowest running lane of this wave32 fragment's 32-lane half (0-31): the lane a uniform value is read
+        from. A fixed lane (0 of the half) need not be running: a quad with no covered sample, or helpers a driver
+        leaves out of subgroup operations, read as undefined (SHADER-1016)."""
+        ballot, any_, lsb, first = (self.tmp() for _ in range(4))
+        self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} %true")
+        word = self.wave32_ballot_word(ballot)
+        # An empty word (a helper a driver leaves out of its own ballot) reads lane 0, as v_readfirstlane does,
+        # never FindILsb's 0xFFFFFFFF.
+        self.emit(f"{any_} = OpINotEqual %bool {word} {self.cu(0)}")
+        self.emit(f"{lsb} = OpExtInst %uint %glsl FindILsb {word}")
+        self.emit(f"{first} = OpSelect %uint {any_} {lsb} {self.cu(0)}")
+        self.uses_subgroup = self.uses_ballot = True
+        return first
+
     def ballot_lsb_by_words(self, bal):
         """The lowest set bit of a subgroup ballot, from its four words with FindILsb: the lane
         OpGroupNonUniformBallotFindLSB gives (a ballot has no bit at or above the subgroup size), without asking for
@@ -6961,7 +6978,14 @@ class Gen:
                 if kind in ("add", "sub"):
                     self.emit(f"{r} = {'OpIAdd' if kind == 'add' else 'OpISub'} %uint {v[0]} {v[1]}")
                 elif kind == "mul_lo":
-                    self.emit(f"{r} = OpIMul %uint {v[0]} {v[1]}")
+                    # The low 16 bits of the product as ((x << 16) * y) >> 16, not (x * y) & 0xffff: the AMD Windows driver
+                    # (26.10.1) dropped that mask when the other half of the result folded to zero (a constant half of 0:
+                    # 0x1234 * 0xaaaa came out 0x0c229e88 for 0x00009e88).
+                    xs = self.tmp()
+                    self.emit(f"{xs} = OpShiftLeftLogical %uint {v[0]} {self.cu(16)}")
+                    p16 = self.tmp()
+                    self.emit(f"{p16} = OpIMul %uint {xs} {v[1]}")
+                    self.emit(f"{r} = OpShiftRightLogical %uint {p16} {self.cu(16)}")
                 elif kind == "mad":
                     m = self.tmp()
                     self.emit(f"{m} = OpIMul %uint {v[0]} {v[1]}")
@@ -9323,6 +9347,8 @@ class Gen:
             d = a[0]
             if d["k"] != "sgpr" or d.get("n") != 2:
                 raise Unsupported(op + " destination")
+            if not SHADER_CLOCK:
+                raise Unsupported(op + " (needs --shader-clock khr)")
             scope = "subgroup" if op == "s_memtime" else "device"
             self.uses_clock.add(scope)
             v, lo, hi = self.tmp(), self.tmp(), self.tmp()
@@ -11759,8 +11785,10 @@ class Gen:
         if self.emulate:
             return r
         if self.wave32_fragment:
+            # Each 32-lane half of a wider subgroup is its own wave with its own SGPRs: broadcast from the half's
+            # first running lane, as OpGroupNonUniformBroadcastFirst does for the whole subgroup below.
             b = self.tmp()
-            self.g_shuffle(b, r, self.cu(0))
+            self.g_shuffle(b, r, self.wave32_first_running_lane())
             return b
         # The descriptor words are SGPRs, so the index is the same in every invocation of the subgroup; the
         # broadcast is an identity on every driver and makes that uniformity explicit to the compiler. Mesa ANV
@@ -14580,7 +14608,10 @@ def assemble(gen):
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
     for arity, fn_type in sorted(gen.x_round_fn_types.items()):
         types.append(f"{fn_type} = OpTypeFunction %uint " + " ".join(["%uint"] * arity))
-    if gen.uses_ballot:
+    # dedupe_types keeps the first uvec4 it meets: when the typed-image types follow, declare the ballot type after
+    # them, so a shader that gains a ballot keeps the name %v4uint_st (SHADER-1016).
+    st_types = gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image
+    if gen.uses_ballot and not st_types:
         types.append("%v4uint_bal = OpTypeVector %uint 4")       # dedupe_types merges it with any other uvec4
     if gen.uses_bvh and not any(t.startswith("%v3float = ") for t in types):
         types.append("%v3float = OpTypeVector %float 3")
@@ -14612,7 +14643,7 @@ def assemble(gen):
         types += ["%double = OpTypeFloat 64"]
     if gen.uses_f64 or gen.uses_clock:
         types += ["%v2uint_d = OpTypeVector %uint 2"]
-    if gen.uses_ballot:
+    if gen.uses_ballot and not st_types:
         types += ["%v4uint_bal = OpTypeVector %uint 4"]
     if gen.uses_fmt_size:
         sizes = [Gen.FORMATS[c][0] if c in Gen.FORMATS else 0 for c in range(128)]
@@ -14625,6 +14656,7 @@ def assemble(gen):
     if gen.uses_store_views or gen.uses_int_fetch or gen.uses_d16_image:
         u, si = Gen.int_format_masks()
         types += ["%v4uint_st = OpTypeVector %uint 4", "%v4int_st = OpTypeVector %int 4",
+                  *(["%v4uint_bal = OpTypeVector %uint 4"] if gen.uses_ballot else []),
                   f"%fmt_mask_arr = OpTypeArray %uint {gen.cu(16)}",
                   "%_ptr_Private_fmt = OpTypePointer Private %fmt_mask_arr",
                   "%_ptr_Private_uint = OpTypePointer Private %uint"]
@@ -17367,7 +17399,7 @@ def write_index(path, index):
         _json.dump(index, f, indent=0, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-    os.replace(tmp, path)   # ponytail: no retry; add one if a scanner on Windows ever holds the new file open
+    replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
 
 
 class ShardSetError(Exception):
@@ -17643,6 +17675,9 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
+                    help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
+                         "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
     ap.add_argument("--fma", choices=("glsl", "khr", "exact"), default="glsl",
                     help="how fused multiply-adds (v_fma_f32, v_fmac_f32, v_fmaak/fmamk_f32, v_fma_mix*) are emitted: "
                          "glsl = GLSL.std.450 Fma (default; the Vulkan spec lets a driver round twice), khr = OpFmaKHR "
@@ -17688,11 +17723,12 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
+    SHADER_CLOCK = a.shader_clock == "khr"
     FMA_EXACT = a.fma == "exact"
     STRUCTURED = not a.dispatch_loop
     global FLOAT_CONTROLS
