@@ -625,6 +625,17 @@ class ExportTest(unittest.TestCase):
         self.assertEqual((counts["dictionaries"], counts["bone_tracks"], counts["bone_tracks_in_skeleton"],
                           counts["dictionaries_all_bones_in_skeleton"]), (1, 3, 3, 1))
 
+    def test_a_jobs_count_below_one_is_refused(self):
+        # coverage() used max(1, jobs), so 0 and negatives ran one serial worker and still exited 0.
+        report = os.path.join(self.tmp.name, "coverage.json")
+        for jobs in ("0", "-4"):
+            r = self.run_tool(self.packs, "--coverage", "--skeleton", hex(self.offsets[0]), "--anim", self.anim,
+                              "--report", report, "--jobs", jobs)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--jobs", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.exists(report), "the run still wrote a report")
+
     def test_a_skeleton_whose_binds_disagree_is_refused(self):
         write_archive(self.packs, [[skeleton_resource(shift_bind=0.3)]])
         r = self.run_tool(self.packs, os.path.join(self.tmp.name, "x.glb"), "--skeleton", hex(self.offsets[0]),
@@ -669,6 +680,14 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertTrue(r.stderr.startswith("ERROR:"), r.stderr)
+
+    def test_a_missing_archive_prints_its_path_without_repr_escaping(self):
+        missing = os.path.join(self.tmp.name, "missing", "packs.rpf")
+        r = self.run_tool(missing, os.path.join(self.tmp.name, "x.glb"),
+                          "--skeleton", "0x1000", "--part", "0x1000")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(r.stderr.strip(), f"ERROR: {missing}: {os.strerror(2)}")
+        self.assertEqual(r.stdout, "")
 
 
 if __name__ == "__main__":
