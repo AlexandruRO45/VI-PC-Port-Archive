@@ -91,9 +91,9 @@ class GamedataMapsTest(unittest.TestCase):
             json.dump({"summary": {"archive": "synthetic", "files": len(self.rows)},
                        "files": self.rows}, f)
 
-    def run_tool(self):
+    def run_tool(self, *args):
         out = os.path.join(self.root, "maps.json")
-        p = subprocess.run([sys.executable, "-I", TOOL, self.carve, "--json", out],
+        p = subprocess.run([sys.executable, "-I", TOOL, self.carve, "--json", out, *args],
                            cwd=self.root, capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
         data = None
@@ -234,6 +234,16 @@ class GamedataMapsTest(unittest.TestCase):
         self.assertEqual(pamh["grid"]["cells"], 6)
         self.assertIn("filled rows", p.stdout)
         self.assertIn("min>max", p.stdout)
+
+    def test_exports_mhiu_pgm_in_row_order(self):
+        self.add(mhiu_payload(3, 2, [(0, 0, []), (1, 2, [0, 255])], pixels=b""))
+        self.finish()
+        directory = os.path.join(self.root, "images")
+        result, data = self.run_tool("--heightmap-dir", directory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        default = data["payloads"][0]["grid"]["default"]
+        with open(os.path.join(directory, "000000001000.pgm"), "rb") as image:
+            self.assertEqual(image.read(), b"P5\n3 2\n255\n" + bytes([default] * 4 + [0, 255]))
 
     def test_groups_mhiu_continuation_stream(self):
         payload = mhiu_payload(300, 1, [(0, 300, [i % 256 for i in range(300)])], pixels=b"\x07" * 90000)

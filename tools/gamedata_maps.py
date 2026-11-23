@@ -497,6 +497,7 @@ def _make_parent(path: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("carve_dir", help="rpf9_carve.py output directory")
+    ap.add_argument("--heightmap-dir", help="write each MHIU grid as an 8-bit binary PGM in a new directory")
     ap.add_argument("--json", help="write the decoded header and grid summary to this JSON")
     a = ap.parse_args()
     if not os.path.exists(a.carve_dir):
@@ -510,6 +511,19 @@ def main() -> int:
         if a.json:
             check_report_path(a.json, a.carve_dir, rows=rows)
         payloads = read_payloads(a.carve_dir, rows=rows)
+        maps = [p for p in payloads if p["type"] == "MHIU"]
+        if a.heightmap_dir and maps:
+            if a.json and same_report_path(a.json, a.heightmap_dir):
+                raise ValueError("--json and --heightmap-dir share a path")
+            os.makedirs(a.heightmap_dir, exist_ok=False)
+            for p in maps:
+                path = os.path.join(a.heightmap_dir, f'{p["offset"]:012x}.pgm')
+                if a.json and same_report_path(a.json, path):
+                    raise ValueError("--json would overwrite a heightmap")
+                with open(path, "xb") as image:
+                    grid = p["grid"]
+                    image.write(f'P5\n{grid["width"]} {grid["height"]}\n255\n'.encode("ascii"))
+                    image.write(p["_grid"])
     except (OSError, ValueError, KeyError, TypeError, struct.error) as e:
         print("error:", e, file=sys.stderr)
         return 1
