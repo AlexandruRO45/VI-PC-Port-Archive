@@ -1,5 +1,5 @@
-// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and
-// XLauncherImpl, offline: small classes a title calls early.
+// xgameruntime: XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl,
+// XLauncherImpl and XAppCaptureImpl, offline: small classes a title calls early.
 //
 // Each XGameEvent*, XGameUi* and XGameStreaming* function in xgameruntime.lib asks QueryApiImpl for its class and
 // calls one slot with its own arguments after `this`. The class and interface ids and the method order are
@@ -22,6 +22,7 @@
 //                       speech calls refuse the handle they were never given (E_INVALIDARG), speech-to-text display
 //                       calls fail (E_FAIL).
 //   XLauncherImpl       XLaunchUri and the display timeout deferral calls fail (E_FAIL); nothing is launched.
+//   XAppCaptureImpl     XAppCaptureTakeScreenshot and other capture calls fail (E_FAIL); no capture exists offline.
 //
 // Slots whose signature the public pages don't give answer with a value that is safe whichever way the caller reads
 // it: see `client_not_connected` (XGameStreaming) and `offline_failure`.
@@ -643,6 +644,48 @@ HRESULT STDMETHODCALLTYPE launcher_query_interface(void*, REFIID iid, void** out
     return answer(&g_launcher_object, &kLauncherClass, &kLauncherClass + 1, iid, out);
 }
 
+// ======================= XAppCaptureImpl =======================
+
+constexpr char kAppCaptureName[] = "XAppCaptureImpl";
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+const GUID kAppCaptureInterfaces[] = {
+    kAppCaptureClass,                                                   // IXAppCaptureImpl: the class id
+    {0x3a949778, 0x772e, 0x4799, {0xbd, 0xea, 0x0a, 0x66, 0x39, 0xe9, 0x6b, 0xaa}},   // IXAppCaptureImpl2
+    {0x2bbca60a, 0x619c, 0x4fe1, {0x81, 0x2e, 0xfb, 0x5c, 0x1d, 0xbd, 0xcf, 0x51}},   // IXAppCaptureImpl3
+    {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}},   // IXAppCaptureImpl4
+};
+
+// 3-17: IXAppCaptureImpl through IXAppCaptureImpl4 methods (capturing screenshots, clips, user recordings).
+// Captures and recordings are not available offline; all slots return E_FAIL.
+template <int Slot> HRESULT STDMETHODCALLTYPE app_capture_offline(void* self) {
+    return offline_failure<kAppCaptureName, Slot>(self);
+}
+
+HRESULT STDMETHODCALLTYPE app_capture_query_interface(void*, REFIID iid, void** out);
+const void* const kAppCaptureVtable[] = {
+    FN(app_capture_query_interface), FN(object_add_ref), FN(object_release),   // 0-2 IUnknown
+    FN(app_capture_offline<3>),    // 3  XAppCaptureTakeDiagnosticScreenshot
+    FN(app_capture_offline<4>),    // 4  XAppCaptureRecordDiagnosticClip
+    FN(app_capture_offline<5>),    // 5  XAppCaptureTakeScreenshot
+    FN(app_capture_offline<6>),    // 6  XAppCaptureOpenScreenshotStream
+    FN(app_capture_offline<7>),    // 7  XAppCaptureReadScreenshotStream
+    FN(app_capture_offline<8>),    // 8  XAppCaptureCloseScreenshotStream
+    FN(app_capture_offline<9>),    // 9  XAppCaptureEnableRecord
+    FN(app_capture_offline<10>),   // 10 XAppCaptureDisableRecord
+    FN(app_capture_offline<11>),   // 11 XAppCaptureGetVideoCaptureSettings
+    FN(app_capture_offline<12>),   // 12 XAppCaptureRecordTimespan
+    FN(app_capture_offline<13>),   // 13 XAppCaptureReadLocalStream
+    FN(app_capture_offline<14>),   // 14 XAppCaptureCloseLocalStream
+    FN(app_capture_offline<15>),   // 15 XAppCaptureStartUserRecord
+    FN(app_capture_offline<16>),   // 16 XAppCaptureStopUserRecord
+    FN(app_capture_offline<17>),   // 17 XAppCaptureCancelUserRecord
+};
+static_assert(std::size(kAppCaptureVtable) == 18, "IUnknown + IXAppCaptureImpl4's 15 methods");
+ClassObject g_app_capture_object{kAppCaptureVtable};
+HRESULT STDMETHODCALLTYPE app_capture_query_interface(void*, REFIID iid, void** out) {
+    return answer(&g_app_capture_object, std::begin(kAppCaptureInterfaces), std::end(kAppCaptureInterfaces), iid, out);
+}
+
 #undef FN
 
 }  // namespace
@@ -677,6 +720,10 @@ bool xgameruntime_offline_query(const GUID& class_id, REFIID interface_id, void*
     }
     if (class_id == kLauncherClass) {
         *hr = launcher_query_interface(nullptr, interface_id, out);
+        return true;
+    }
+    if (class_id == kAppCaptureClass) {
+        *hr = app_capture_query_interface(nullptr, interface_id, out);
         return true;
     }
     return false;

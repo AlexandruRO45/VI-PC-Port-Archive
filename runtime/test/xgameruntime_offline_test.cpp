@@ -1,5 +1,5 @@
-// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl and XLauncherImpl
-// through QueryApiImpl, called the way xgameruntime.lib's thunks
+// XGameEventImpl, XGameUiImpl, XGameStreamingImpl, XDisplayImpl, XUserDeviceImpl, XAccessibilityImpl, XLauncherImpl
+// and XAppCaptureImpl through QueryApiImpl, called the way xgameruntime.lib's thunks
 // call them: QueryApiImpl with the class id (or an interface id), one vtable slot with `this` first. Slots follow
 // xgameruntime-docs' layout; arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
@@ -72,6 +72,8 @@ constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb
 constexpr GUID kAccessibilityClass = {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}};
 constexpr GUID kAccessibility2 = {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}};
 constexpr GUID kLauncherClass = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+constexpr GUID kAppCaptureClass = {0xa4f1aee2, 0x4bf1, 0x4485, {0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27}};
+constexpr GUID kAppCapture4 = {0x22e672d7, 0xb4e3, 0x406c, {0xbd, 0x50, 0x8f, 0x0d, 0x25, 0x23, 0x6f, 0x9e}};
 
 using EnumVoices = HRESULT(STDMETHODCALLTYPE*)(void*, void*, void*);
 using SpeechCreate = HRESULT(STDMETHODCALLTYPE*)(void*, void**);
@@ -246,6 +248,21 @@ int main() {
     void* none = reinterpret_cast<void*>(1);
     check(query(&kLauncherClass, other, &none) == E_NOINTERFACE && none == nullptr,
           "XLauncherImpl refuses an interface id it doesn't implement");
+
+    // ---- XAppCapture ----
+    void* capture = nullptr;
+    void* capture4 = nullptr;
+    check(query(&kAppCaptureClass, kAppCaptureClass, &capture) == S_OK && capture &&
+              query(&kAppCaptureClass, kAppCapture4, &capture4) == S_OK && capture4 == capture,
+          "XAppCaptureImpl for its class id and IXAppCaptureImpl4");
+    if (!capture) return 1;
+    check(at<NoArgs>(capture, 5)(capture) == E_FAIL,
+          "XAppCaptureTakeScreenshot fails offline");
+    GUID other_capture = kAppCaptureClass;
+    other_capture.Data1 ^= 1;
+    none = reinterpret_cast<void*>(1);
+    check(query(&kAppCaptureClass, other_capture, &none) == E_NOINTERFACE && none == nullptr,
+          "XAppCaptureImpl refuses an interface id it doesn't implement");
 
     std::printf("xgameruntime_offline_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
