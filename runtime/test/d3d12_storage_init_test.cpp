@@ -1,4 +1,11 @@
 // Storage-image initialization and cross-queue init-fence coverage (docs/d3d12_vulkan.md section 6, M4):
+//   0. CPU replay contract (no GPU required; deterministic negative control vs. main):
+//      - Replaying CopyTextureRegion (upload) and CopyResource (multi-subresource: mip 0 GENERAL, mip 1 UNDEFINED) on
+//        a storage_image=true ResourceBinding leaves LayoutTracker in VK_IMAGE_LAYOUT_GENERAL for every touched
+//        subresource and passes GENERAL to the Vulkan copy commands (whereas non-storage textures still use
+//        TRANSFER_DST_OPTIMAL).
+//      - detail::initialize() returns true on UNDEFINED -> GENERAL and false when already GENERAL (preventing spurious
+//        init-fence publication on VulkanQueue).
 //   1. Copy-queue upload before first Dispatch: ALLOW_UNORDERED_ACCESS texture created in COMMON, uploaded via
 //      CopyTextureRegion on a COPY queue, then read by cs_m4_indirect on a COMPUTE queue with no barrier (implicit
 //      COMMON -> UNORDERED_ACCESS promotion). Verifies GENERAL layout and exact uploaded pattern.
@@ -17,6 +24,7 @@
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../src/shader_library.h"
+#include "../src/vulkan_replay.h"
 
 #include <array>
 #include <cstdint>
@@ -138,9 +146,186 @@ bool check_indirect_out_matches_image(const char* what, const std::uint8_t* base
     return bad == 0;
 }
 
+struct CpuReplayRecorder {
+    VkImageLayout last_buf_to_img_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout last_copy_img_src_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout last_copy_img_dst_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::uint32_t last_copy_img_regions = 0;
+    std::uint32_t buf_to_img_calls = 0;
+    std::uint32_t copy_img_calls = 0;
+    std::uint32_t clear_calls = 0;
+};
+
+CpuReplayRecorder* g_cpu_recorder = nullptr;
+
+void VKAPI_CALL stub_pipeline_barrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags,
+                                      std::uint32_t, const VkMemoryBarrier*, std::uint32_t,
+                                      const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+
+void VKAPI_CALL stub_clear_color_image(VkCommandBuffer, VkImage, VkImageLayout, const VkClearColorValue*,
+                                       std::uint32_t, const VkImageSubresourceRange*) {
+    if (g_cpu_recorder) ++g_cpu_recorder->clear_calls;
+}
+
+void VKAPI_CALL stub_copy_buffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {}
+
+void VKAPI_CALL stub_copy_buffer_to_image(VkCommandBuffer, VkBuffer, VkImage, VkImageLayout dst_layout,
+                                          std::uint32_t, const VkBufferImageCopy*) {
+    if (g_cpu_recorder) {
+        g_cpu_recorder->last_buf_to_img_layout = dst_layout;
+        ++g_cpu_recorder->buf_to_img_calls;
+    }
+}
+
+void VKAPI_CALL stub_copy_image_to_buffer(VkCommandBuffer, VkImage, VkImageLayout, VkBuffer, std::uint32_t,
+                                          const VkBufferImageCopy*) {}
+
+void VKAPI_CALL stub_copy_image(VkCommandBuffer, VkImage, VkImageLayout src_layout, VkImage, VkImageLayout dst_layout,
+                                std::uint32_t region_count, const VkImageCopy*) {
+    if (g_cpu_recorder) {
+        g_cpu_recorder->last_copy_img_src_layout = src_layout;
+        g_cpu_recorder->last_copy_img_dst_layout = dst_layout;
+        g_cpu_recorder->last_copy_img_regions = region_count;
+        ++g_cpu_recorder->copy_img_calls;
+    }
+}
+
+// Deterministic CPU-only replay contract test (no VkDevice required). Pins:
+//   (a) CopyTextureRegion upload and multi-subresource CopyResource (mip 0 GENERAL, mip 1 UNDEFINED) on a
+//       storage_image=true ResourceBinding keep every touched subresource in VK_IMAGE_LAYOUT_GENERAL in
+//       LayoutTracker and pass GENERAL to the Vulkan copy commands.
+//   (b) Non-storage textures (storage_image=false) still transition to VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL.
+//   (c) detail::initialize() returns true on UNDEFINED -> GENERAL and false when already GENERAL.
+int run_cpu_replay_contract_test() {
+    using namespace leonida;
+    CpuReplayRecorder rec{};
+    g_cpu_recorder = &rec;
+
+    ReplayFunctions vk{};
+    vk.pipeline_barrier = &stub_pipeline_barrier;
+    vk.clear_color_image = &stub_clear_color_image;
+    vk.copy_buffer = &stub_copy_buffer;
+    vk.copy_buffer_to_image = &stub_copy_buffer_to_image;
+    vk.copy_image_to_buffer = &stub_copy_image_to_buffer;
+    vk.copy_image = &stub_copy_image;
+
+    const auto dummy_cmd = reinterpret_cast<VkCommandBuffer>(std::uintptr_t(0x1));
+    constexpr ResourceId kUploadBuf = 1;
+    constexpr ResourceId kStorageDst = 2;
+    constexpr ResourceId kStorageSrc = 3;
+    constexpr ResourceId kRegularDst = 4;
+
+    ResourceBinding upload_buf{};
+    upload_buf.buffer = reinterpret_cast<VkBuffer>(std::uintptr_t(0x1001));
+    upload_buf.size = image_copy_bytes;
+
+    ResourceBinding storage_dst{};
+    storage_dst.image = reinterpret_cast<VkImage>(std::uintptr_t(0x2001));
+    storage_dst.format = VK_FORMAT_R32_UINT;
+    storage_dst.width = image_dim;
+    storage_dst.height = image_dim;
+    storage_dst.mip_levels = 2;
+    storage_dst.array_layers = 1;
+    storage_dst.aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    storage_dst.storage_image = true;
+
+    ResourceBinding storage_src = storage_dst;
+    storage_src.image = reinterpret_cast<VkImage>(std::uintptr_t(0x2002));
+
+    ResourceBinding regular_dst = storage_dst;
+    regular_dst.image = reinterpret_cast<VkImage>(std::uintptr_t(0x2003));
+    regular_dst.storage_image = false;
+
+    const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+        if (id == kUploadBuf) return &upload_buf;
+        if (id == kStorageDst) return &storage_dst;
+        if (id == kStorageSrc) return &storage_src;
+        if (id == kRegularDst) return &regular_dst;
+        return nullptr;
+    };
+
+    LayoutTracker tracker;
+    tracker.track(kStorageDst, storage_dst, VK_IMAGE_LAYOUT_UNDEFINED);
+    tracker.track(kStorageSrc, storage_src, VK_IMAGE_LAYOUT_GENERAL);
+    tracker.track(kRegularDst, regular_dst, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    // (a1) CopyTextureRegion upload into mip 0 of a storage_image=true texture.
+    {
+        CommandList list;
+        CopyTexture copy{};
+        copy.dst = {kStorageDst, false, 0, 0, 0, 0, 0, 0};
+        copy.src = {kUploadBuf, true, 0, 0, image_dim, image_dim, 1, image_pitch};
+        EXPECT(list.copy_texture(copy));
+        EXPECT(list.close());
+        EXPECT(replay(list, dummy_cmd, resolve, vk, &tracker) == ReplayResult::success);
+        EXPECT(rec.buf_to_img_calls == 1);
+        EXPECT(rec.last_buf_to_img_layout == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(tracker.layout(kStorageDst, 0) == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(tracker.layout(kStorageDst, 1) == VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+
+    // (a2) CopyResource (all 2 mips) into storage_dst where mip 0 is GENERAL and mip 1 is UNDEFINED.
+    {
+        CommandList list;
+        EXPECT(list.copy_resource({kStorageDst, kStorageSrc}));
+        EXPECT(list.close());
+        EXPECT(replay(list, dummy_cmd, resolve, vk, &tracker) == ReplayResult::success);
+        EXPECT(rec.copy_img_calls == 1);
+        EXPECT(rec.last_copy_img_regions == 2);
+        EXPECT(rec.last_copy_img_src_layout == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(rec.last_copy_img_dst_layout == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(tracker.layout(kStorageDst, 0) == VK_IMAGE_LAYOUT_GENERAL);
+        EXPECT(tracker.layout(kStorageDst, 1) == VK_IMAGE_LAYOUT_GENERAL);
+    }
+
+    // (b) Positive control: non-storage texture (storage_image=false) uses TRANSFER_DST_OPTIMAL.
+    {
+        CommandList list;
+        CopyTexture copy{};
+        copy.dst = {kRegularDst, false, 0, 0, 0, 0, 0, 0};
+        copy.src = {kUploadBuf, true, 0, 0, image_dim, image_dim, 1, image_pitch};
+        EXPECT(list.copy_texture(copy));
+        EXPECT(list.close());
+        EXPECT(replay(list, dummy_cmd, resolve, vk, &tracker) == ReplayResult::success);
+        EXPECT(rec.buf_to_img_calls == 2);
+        EXPECT(rec.last_buf_to_img_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        EXPECT(tracker.layout(kRegularDst, 0) == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        EXPECT(tracker.layout(kRegularDst, 1) == VK_IMAGE_LAYOUT_UNDEFINED);
+    }
+
+    // (c) detail::initialize() returns true when transitioning from UNDEFINED and false when already GENERAL.
+    {
+        constexpr ResourceId kInitTex = 5;
+        ResourceBinding init_tex = storage_dst;
+        init_tex.image = reinterpret_cast<VkImage>(std::uintptr_t(0x2004));
+        init_tex.mip_levels = 1;
+        tracker.track(kInitTex, init_tex, VK_IMAGE_LAYOUT_UNDEFINED);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+        LayoutPieces pieces;
+        EXPECT(tracker.pieces(kInitTex, range, pieces));
+        const bool first_init = detail::initialize(vk, dummy_cmd, init_tex, kInitTex, pieces, VK_IMAGE_LAYOUT_GENERAL,
+                                                   &tracker);
+        EXPECT(first_init);
+        EXPECT(tracker.layout(kInitTex, 0) == VK_IMAGE_LAYOUT_GENERAL);
+
+        pieces.clear();
+        EXPECT(tracker.pieces(kInitTex, range, pieces));
+        const bool second_init = detail::initialize(vk, dummy_cmd, init_tex, kInitTex, pieces, VK_IMAGE_LAYOUT_GENERAL,
+                                                    &tracker);
+        EXPECT(!second_init);
+        EXPECT(tracker.layout(kInitTex, 0) == VK_IMAGE_LAYOUT_GENERAL);
+    }
+
+    g_cpu_recorder = nullptr;
+    return 0;
+}
+
 }  // namespace
 
 int main() {
+    if (run_cpu_replay_contract_test() != 0) return 1;
+
     vktest::Device d;
     d.queue_count_wanted = 3;  // copy, compute and direct each get a VkQueue where the family has three
     const auto device_status = d.initialize();
@@ -333,11 +518,14 @@ int main() {
         }
 
         if (!skipped_for_push_constants) {
-            // Shared helper buffers for cs_m4_fill / cs_m4_indirect.
-            Ref<ID3D12Resource> zero_data, scratch_data, scratch_args;
+            // Shared helper buffers for cs_m4_fill / cs_m4_indirect. Sized to match each UAV slot's raw view so
+            // unused slots never trigger rejected-UAV diagnostics from the runtime.
+            Ref<ID3D12Resource> zero_data, scratch_data, scratch_args, scratch_in, scratch_out;
             EXPECT(create_buffer(zero_data, default_heap, data_bytes, uav_flag, uav_state));
             EXPECT(create_buffer(scratch_data, default_heap, data_bytes, uav_flag, uav_state));
             EXPECT(create_buffer(scratch_args, default_heap, args_bytes, uav_flag, uav_state));
+            EXPECT(create_buffer(scratch_in, default_heap, in_bytes, uav_flag, uav_state));
+            EXPECT(create_buffer(scratch_out, default_heap, out_bytes, uav_flag, uav_state));
 
             const auto fill_table = [&](UINT base_slot, ID3D12Resource* data_buf, ID3D12Resource* args_buf,
                                         ID3D12Resource* img, UINT mip_slice, ID3D12Resource* in_buf,
@@ -379,7 +567,7 @@ int main() {
                     up1->Unmap(0, nullptr);
                 }
                 // Table 0: slot 0 = zero_data, slot 2 = img1, slot 4 = out1
-                fill_table(0, zero_data.p, scratch_args.p, img1.p, 0, scratch_args.p, out1.p);
+                fill_table(0, zero_data.p, scratch_args.p, img1.p, 0, scratch_in.p, out1.p);
 
                 Ref<ID3D12CommandAllocator> up_alloc, cs_alloc, rb_alloc;
                 Ref<ID3D12GraphicsCommandList> up_list, cs_list, rb_list;
@@ -459,7 +647,7 @@ int main() {
                     up_in2->Unmap(0, nullptr);
                 }
                 // Table 1 (slots 5..9): slot 2 (index 7) already holds img2's UAV; bind the rest.
-                fill_table(5, scratch_data.p, scratch_args.p, img2.p, 0, in2.p, scratch_args.p);
+                fill_table(5, scratch_data.p, scratch_args.p, img2.p, 0, in2.p, scratch_out.p);
 
                 Ref<ID3D12CommandAllocator> up_alloc, cs_alloc, rb_alloc;
                 Ref<ID3D12GraphicsCommandList> up_list, cs_list, rb_list;
@@ -555,7 +743,7 @@ int main() {
                 }
 
                 // Create UAVs for ImgA (table 2: slots 10..14) and dispatch on COMPUTE queue.
-                fill_table(10, dataA.p, argsA.p, imgA.p, 0, inA.p, argsA.p);
+                fill_table(10, dataA.p, argsA.p, imgA.p, 0, inA.p, scratch_out.p);
                 {
                     Ref<ID3D12CommandAllocator> cs_alloc;
                     Ref<ID3D12GraphicsCommandList> cs_list;
@@ -578,7 +766,7 @@ int main() {
                 }
 
                 // Create UAVs for ImgB (table 3: slots 15..19) and dispatch on DIRECT queue (first shader on DIRECT).
-                fill_table(15, dataB.p, argsB.p, imgB.p, 0, inB.p, argsB.p);
+                fill_table(15, dataB.p, argsB.p, imgB.p, 0, inB.p, scratch_out.p);
                 {
                     Ref<ID3D12CommandAllocator> dir_alloc;
                     Ref<ID3D12GraphicsCommandList> dir_list;
@@ -665,8 +853,8 @@ int main() {
                 }
 
                 // Table 4 (slots 20..24): mip 0 UAV; Table 5 (slots 25..29): mip 1 UAV.
-                fill_table(20, zero_data.p, scratch_args.p, img4.p, 0, scratch_args.p, out4_m0.p);
-                fill_table(25, zero_data.p, scratch_args.p, img4.p, 1, scratch_args.p, out4_m1.p);
+                fill_table(20, zero_data.p, scratch_args.p, img4.p, 0, scratch_in.p, out4_m0.p);
+                fill_table(25, zero_data.p, scratch_args.p, img4.p, 1, scratch_in.p, out4_m1.p);
 
                 Ref<ID3D12CommandAllocator> up_alloc, cs_alloc, rb_alloc;
                 Ref<ID3D12GraphicsCommandList> up_list, cs_list, rb_list;
@@ -760,7 +948,7 @@ int main() {
         return 1;
     }
     if (skipped_for_push_constants) return 77;
-    std::printf("d3d12_storage_init: all 4 subtests passed (%zu VkQueues, 0 validation errors)\n",
+    std::printf("d3d12_storage_init: CPU replay contract + all 4 GPU subtests passed (%zu VkQueues, 0 validation errors)\n",
                 d.queues.size());
     return 0;
 }
