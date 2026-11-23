@@ -3438,7 +3438,11 @@ Vulkan AS would be invisible to them. Two paths:
    CPU-writable memory (an UPLOAD or write-back CUSTOM heap; WRITE_COMBINE CUSTOM is CPU-writable too); GPU-written
    DEFAULT and READBACK lists are refused as `unsupported` before submission, since their mapped bytes can still hold
    an earlier frame's pointers when the CPU prepares the build. Completed staging buffers
-   are reused, so a per-frame rebuild does not allocate memory each frame. Updates refit the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
+   are reused, so a per-frame rebuild does not allocate memory each frame. A structure may sit at any 256-byte
+   aligned address inside an acceleration-structure resource, committed or placed, as DXR allows: the first build
+   or lookup there makes a `GENERIC` structure at that offset (`runtime/src/acceleration_structure_ranges.h`, as
+   vkd3d-proton does), and releasing the resource frees them; checked by `runtime/test/d3d12_indirect_rt_test.cpp`
+   and `acceleration_structure_ranges_test`. Updates refit the source structure instead of rebuilding it, `CopyRaytracingAccelerationStructure` clones and compacts, and the
    postbuild compacted and current sizes are written ([bvh.md](bvh.md) §7a). Serialization and the Xbox
    batched/streaming builds are not implemented. The
    reported `RaytracingTier` is unchanged (`NOT_SUPPORTED`). Checked by `runtime/test/d3d12_xdxr_rt_test.cpp` through

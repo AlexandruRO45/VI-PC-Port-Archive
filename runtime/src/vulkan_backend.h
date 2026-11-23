@@ -9,6 +9,7 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include "acceleration_structure_ranges.h"
 #include "binary_occlusion_spirv.h"
 #include "buffer_va_index.h"
 #include "occlusion_sum_spirv.h"
@@ -1044,9 +1045,8 @@ public:
         }
         if (!xdxr_ && ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR) {
             replay_.build_acceleration_structures = vk.vkCmdBuildAccelerationStructuresKHR;
-            replay_.resolve_acceleration_structure = [this](std::uint64_t va) {
-                const auto it = acceleration_structures_.find(va);
-                return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+            replay_.resolve_acceleration_structure = [this](std::uint64_t va) {  // resource_mutex_ is held
+                return resolve_acceleration_structure_locked(va);
             };
         }
         replay_.image_view = [this](const ResourceBinding& r, const VkImageSubresourceRange& range) {
@@ -1345,16 +1345,39 @@ public:
         acceleration_structures_[va] = as;
     }
 
+    // An acceleration-structure resource's bytes, `size` of them at `offset` in `buffer`, named from `va` on: a
+    // structure the application builds or names at `va` + N (N a multiple of 256) gets a GENERIC structure of its
+    // own there on first use (acceleration_structure_ranges.h). unregister_acceleration_structure(va) forgets them.
+    void register_acceleration_structure_storage(std::uint64_t va, std::uint64_t size, VkBuffer buffer,
+                                                 VkDeviceSize offset) {
+        if (!va || !size || !buffer) return;
+        std::vector<VkAccelerationStructureKHR> retired;
+        {
+            std::lock_guard lock(acceleration_storage_mutex_);
+            acceleration_storage_.add(va, size, AccelerationStorage{buffer, offset}, retired);
+        }
+        for (const VkAccelerationStructureKHR as : retired)
+            defer_destroy(DeferredDeletionQueue::Kind::acceleration_structure, as);
+    }
+
     void unregister_acceleration_structure(std::uint64_t va) {
         if (!va) return;
-        std::unique_lock lock(resource_mutex_);
-        acceleration_structures_.erase(va);
+        {
+            std::unique_lock lock(resource_mutex_);
+            acceleration_structures_.erase(va);
+        }
+        std::vector<VkAccelerationStructureKHR> retired;
+        {
+            std::lock_guard lock(acceleration_storage_mutex_);
+            acceleration_storage_.remove(va, retired);
+        }
+        for (const VkAccelerationStructureKHR as : retired)
+            defer_destroy(DeferredDeletionQueue::Kind::acceleration_structure, as);
     }
 
     VkAccelerationStructureKHR resolve_acceleration_structure(std::uint64_t va) {
         std::shared_lock lock(resource_mutex_);
-        const auto it = acceleration_structures_.find(va);
-        return it == acceleration_structures_.end() ? VK_NULL_HANDLE : it->second;
+        return resolve_acceleration_structure_locked(va);
     }
 
     // `prepare` is called at the start of the command buffer of every ExecuteCommandLists, before the lists are
@@ -1627,6 +1650,38 @@ private:
         return framebuffer;
     }
 
+    // Called with resource_mutex_ held (shared is enough): the structure registered at `va`, else one at `va` inside
+    // a registered acceleration-structure resource, made on first use. The made structure must answer `va` to
+    // vkGetAccelerationStructureDeviceAddressKHR, as an instance that names it holds `va`; the spec keeps the offsets
+    // between the GENERIC structures of one buffer, so it does whenever the resource's own structure answers its
+    // start. GPU-assisted validation also wants instance addresses to be ones that call returned.
+    VkAccelerationStructureKHR resolve_acceleration_structure_locked(std::uint64_t va) {
+        if (const auto it = acceleration_structures_.find(va); it != acceleration_structures_.end()) return it->second;
+        if (!va || !vk.vkCreateAccelerationStructureKHR || !vk.vkDestroyAccelerationStructureKHR)
+            return VK_NULL_HANDLE;
+        std::lock_guard lock(acceleration_storage_mutex_);
+        return acceleration_storage_.find(va, [&](const AccelerationStorage& where, std::uint64_t offset,
+                                                  std::uint64_t room) -> VkAccelerationStructureKHR {
+            VkAccelerationStructureCreateInfoKHR info{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+            info.buffer = where.buffer;
+            info.offset = where.offset + offset;
+            info.size = room;
+            info.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
+            VkAccelerationStructureKHR as = VK_NULL_HANDLE;
+            if (vk.vkCreateAccelerationStructureKHR(device_, &info, nullptr, &as) != VK_SUCCESS) return VK_NULL_HANDLE;
+            if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                VkAccelerationStructureDeviceAddressInfoKHR address{
+                    VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                address.accelerationStructure = as;
+                if (vk.vkGetAccelerationStructureDeviceAddressKHR(device_, &address) != va) {
+                    vk.vkDestroyAccelerationStructureKHR(device_, as, nullptr);  // never used: no deferral needed
+                    return VK_NULL_HANDLE;
+                }
+            }
+            return as;
+        });
+    }
+
     VkDevice device_;
     bool loaded_ = false;
     bool ray_tracing_ = false;
@@ -1647,6 +1702,13 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
+    struct AccelerationStorage {
+        VkBuffer buffer;
+        VkDeviceSize offset;
+    };
+    // A leaf lock (taken under a shared resource_mutex_ by prepare): guards acceleration_storage_ only.
+    std::mutex acceleration_storage_mutex_;
+    AccelerationStructureRanges<VkAccelerationStructureKHR, AccelerationStorage> acceleration_storage_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
     std::unordered_set<ResourceId> storage_pending_;

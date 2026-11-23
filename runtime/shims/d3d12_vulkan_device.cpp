@@ -1804,6 +1804,8 @@ public:
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    device_.context->register_acceleration_structure_storage(gpu_va_, desc_.Width,
+                                                                             device_.arena.buffer, arena_offset_);
                 }
             }
             device_.context->add_resource(id(), binding);
@@ -1872,6 +1874,7 @@ public:
                 const std::uint64_t as_va = vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
                 if (as_va) gpu_va_ = as_va;
                 device_.context->register_acceleration_structure(gpu_va_, accel_);
+                device_.context->register_acceleration_structure_storage(gpu_va_, desc_.Width, buffer_, 0);
                 if (buffer_va_ && buffer_va_ != gpu_va_)
                     device_.context->register_acceleration_structure(buffer_va_, accel_);
             }
@@ -1975,10 +1978,27 @@ public:
 
     // A placed buffer is a range of the heap's arena memory: it has no VkBuffer of its own and its console VA is
     // where it sits in the arena. The arena is host-visible, so an upload or readback place maps that same range.
-    HRESULT create_placed_buffer() {
+    // A placed acceleration-structure buffer gets a GENERIC structure over its range, as a committed one in the
+    // arena does, and is named by the same real device address (heap base + offset) the driver builds into.
+    HRESULT create_placed_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         if (!device_.arena.mapped) return E_OUTOFMEMORY;
         if (cpu_visible()) mapped_ = device_.arena.mapped + va_;
         std::memset(device_.arena.mapped + va_, 0, std::size_t(desc_.Width));  // a fresh place reads as zeroed
+        auto& vk = device_.context->vk;
+        if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
+            vk.vkCreateAccelerationStructureKHR) {
+            VkAccelerationStructureCreateInfoKHR asci{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR};
+            asci.buffer = device_.arena.buffer;
+            asci.offset = va_;
+            asci.size = desc_.Width;
+            asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
+            if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
+                gpu_va_ = device_.arena.address + va_;
+                device_.context->register_acceleration_structure(gpu_va_, accel_);
+                device_.context->register_acceleration_structure_storage(gpu_va_, desc_.Width, device_.arena.buffer,
+                                                                         va_);
+            }
+        }
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
@@ -6947,7 +6967,7 @@ public:
         resource->attach_device(identity());
         HRESULT hr = E_NOTIMPL;
         if (buffer) {
-            hr = resource->create_placed_buffer();
+            hr = resource->create_placed_buffer(state);
         } else {
             hr = S_OK;
             const Format format = state_.texture_format(*desc);

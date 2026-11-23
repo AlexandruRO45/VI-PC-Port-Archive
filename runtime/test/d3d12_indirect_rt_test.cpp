@@ -774,6 +774,84 @@ int main() {
             rt::d3d12::vulkan_acceleration_structure(dev, tlas_ptr_buf->GetGPUVirtualAddress());
         if (!tlas_vk || !tlas_ptr_vk) return fail("vulkan_acceleration_structure(TLAS)");
 
+        // Structures packed into one acceleration-structure resource: DXR only asks a build's destination and an
+        // instance's BLAS to be 256-byte aligned inside one. A second BLAS is built at packed + blas_bytes, a TLAS
+        // names it there, and a BLAS goes at the same offset of a placed acceleration-structure buffer. They used to
+        // resolve to nothing (only a resource's start was registered, and a placed buffer had no structure), so the
+        // whole ExecuteCommandLists was dropped as unresolved_resource.
+        const UINT64 blas_bytes = blas_desc.Width;
+        auto packed_desc = make_buf_desc(2 * blas_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        ID3D12Resource* packed_buf = nullptr;
+        ID3D12Resource* tlas_off_buf = nullptr;
+        ID3D12Resource* inst_off_buf = nullptr;
+        if (FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &packed_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&packed_buf))) ||
+            FAILED(dev->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &tlas_desc,
+                                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                                IID_PPV_ARGS(&tlas_off_buf))) ||
+            FAILED(dev->CreateCommittedResource(&up_hp, D3D12_HEAP_FLAG_NONE, &inst_desc_buf,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&inst_off_buf))))
+            return fail("CreateCommittedResource(packed AS buffers)");
+        D3D12_HEAP_DESC as_heap_desc{};
+        as_heap_desc.SizeInBytes = (2 * blas_bytes + 0xFFFFu) & ~UINT64(0xFFFFu);
+        as_heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        as_heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+        as_heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        ID3D12Heap* as_heap = nullptr;
+        ID3D12Resource* placed_as_buf = nullptr;
+        if (FAILED(dev->CreateHeap(&as_heap_desc, IID_PPV_ARGS(&as_heap))) ||
+            FAILED(dev->CreatePlacedResource(as_heap, 0, &packed_desc,
+                                             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                                             IID_PPV_ARGS(&placed_as_buf))))
+            return fail("CreatePlacedResource(acceleration-structure buffer)");
+        const D3D12_GPU_VIRTUAL_ADDRESS packed_blas_va = packed_buf->GetGPUVirtualAddress() + blas_bytes;
+        const D3D12_GPU_VIRTUAL_ADDRESS placed_blas_va = placed_as_buf->GetGPUVirtualAddress() + blas_bytes;
+        inst_off_buf->Map(0, nullptr, &p);
+        D3D12_RAYTRACING_INSTANCE_DESC inst_off = inst;
+        inst_off.AccelerationStructure = packed_blas_va;
+        std::memcpy(p, &inst_off, sizeof(inst_off));
+        inst_off_buf->Unmap(0, nullptr);
+
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC packed_blas_build = blas_build;
+        packed_blas_build.DestAccelerationStructureData = packed_blas_va;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC placed_blas_build = blas_build;
+        placed_blas_build.DestAccelerationStructureData = placed_blas_va;
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlas_off_build = tlas_build;
+        tlas_off_build.DestAccelerationStructureData = tlas_off_buf->GetGPUVirtualAddress();
+        tlas_off_build.Inputs.InstanceDescs = inst_off_buf->GetGPUVirtualAddress();
+
+        ID3D12Fence* packed_fence = nullptr;
+        if (FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&packed_fence))))
+            return fail("CreateFence(packed AS)");
+        alloc->Reset();
+        cl->Reset(alloc, nullptr);
+        cl->BuildRaytracingAccelerationStructure(&packed_blas_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&placed_blas_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        cl->BuildRaytracingAccelerationStructure(&tlas_off_build, 0, nullptr);
+        cl->ResourceBarrier(1, &uav_b);
+        if (FAILED(cl->Close())) return fail("packed AS build Close");
+        queue->ExecuteCommandLists(1, lists);
+        if (rt::d3d12::last_execute_result(queue) != leonida::ReplayResult::success) {
+            std::fprintf(stderr, "FAIL: builds at an offset inside an AS resource: ExecuteCommandLists result %d\n",
+                         static_cast<int>(rt::d3d12::last_execute_result(queue)));
+            return 1;
+        }
+        queue->Signal(packed_fence, 1);
+        if (!wait_fence(packed_fence, 1)) return fail("wait_fence(packed AS build)");
+        const VkAccelerationStructureKHR packed_blas_vk = rt::d3d12::vulkan_acceleration_structure(dev, packed_blas_va);
+        const VkAccelerationStructureKHR tlas_off_vk =
+            rt::d3d12::vulkan_acceleration_structure(dev, tlas_off_buf->GetGPUVirtualAddress());
+        if (!packed_blas_vk || !tlas_off_vk || !rt::d3d12::vulkan_acceleration_structure(dev, placed_blas_va) ||
+            packed_blas_vk == rt::d3d12::vulkan_acceleration_structure(dev, packed_buf->GetGPUVirtualAddress()))
+            return fail("vulkan_acceleration_structure(AS at an offset)");
+        if (rt::d3d12::vulkan_acceleration_structure(dev, packed_blas_va + 16))
+            return fail("an address that is not 256-byte aligned must name no acceleration structure");
+        std::printf("  [PASS] BLAS built at an offset inside committed and placed AS resources, TLAS names it\n");
+
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
         if (!read_spv(LEONIDA_TEST_CS_RAYQUERY_SPV, rq_words)) return fail("read cs_rayquery.spv");
@@ -865,13 +943,47 @@ int main() {
 
         VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+
+        // First the TLAS whose only instance is the BLAS at packed + blas_bytes: the ray hits only if that BLAS was
+        // built where the instance names it. (It runs before the queries below, which depend on the first build list.)
+        as_write.pAccelerationStructures = &tlas_off_vk;
+        vkUpdateDescriptorSets(vk_dev, 1, writes, 0, nullptr);
+        VkCommandBuffer cb_off = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(vk_dev, &cbai, &cb_off);
+        vkBeginCommandBuffer(cb_off, &bi);
+        vkCmdBindPipeline(cb_off, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
+        vkCmdBindDescriptorSets(cb_off, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
+        vkCmdDispatch(cb_off, 1, 1, 1);
+        vkCmdPipelineBarrier(cb_off, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0,
+                             nullptr, 0, nullptr);
+        vkEndCommandBuffer(cb_off);
+        VkSubmitInfo si_off{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si_off.commandBufferCount = 1;
+        si_off.pCommandBuffers = &cb_off;
+        vkQueueSubmit(vk_queue, 1, &si_off, VK_NULL_HANDLE);
+        vkQueueWaitIdle(vk_queue);
+        out_buf->Map(0, nullptr, &p);
+        const auto* res_off = static_cast<const std::uint32_t*>(p);
+        const std::uint32_t hit_off = res_off[0];
+        const std::uint32_t miss_off = res_off[1];
+        out_buf->Unmap(0, nullptr);
+        if (hit_off != 1u || miss_off != 0u) {
+            std::fprintf(stderr, "FAIL: RayQueryKHR BLAS at an offset expected hit=1 miss=0, got hit=%u miss=%u\n",
+                         hit_off, miss_off);
+            return 1;
+        }
+        std::printf("  [PASS] RayQueryKHR through a BLAS at an offset inside its resource (hit=%u, miss=%u)\n",
+                    hit_off, miss_off);
+        as_write.pAccelerationStructures = &tlas_vk;
+        vkUpdateDescriptorSets(vk_dev, 1, writes, 0, nullptr);
+
         vkBeginCommandBuffer(cb, &bi);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pso);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &dset, 0, nullptr);
         vkCmdDispatch(cb, 1, 1, 1);
-        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr,
                              0, nullptr);
         vkEndCommandBuffer(cb);
@@ -1003,6 +1115,18 @@ int main() {
         zero_ptr_buf->Release();
         stale_ptr_buf->Release();
         placed_heap->Release();
+
+        // Releasing an acceleration-structure resource forgets the structures made inside it.
+        placed_as_buf->Release();
+        packed_buf->Release();
+        if (rt::d3d12::vulkan_acceleration_structure(dev, packed_blas_va) ||
+            rt::d3d12::vulkan_acceleration_structure(dev, placed_blas_va))
+            return fail("a released AS resource's offset structures must be forgotten");
+        std::printf("  [PASS] releasing an AS resource forgets the structures at its offsets\n");
+        as_heap->Release();
+        packed_fence->Release();
+        tlas_off_buf->Release();
+        inst_off_buf->Release();
 
         inst_ptr_buf->Release();
         inst_buf->Release();
