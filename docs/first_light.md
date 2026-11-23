@@ -143,8 +143,9 @@ magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 1
 `python -I tests/test_first_light.py -v` runs **46 tests: 42 passed, 4 skipped** (the 3 package-gated
 `FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`, and `test_harness_rejects_wrapped_tsharp_va_overflow` needs a
 built `vk_harness`; the 4 `OracleTests`, the 6 `RunFolderTests` and the other 11 `TexturedOracleTests` run without a
-package). With `LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 46 is
-skipped.
+package, as do the remaining 21 tests of the eight other classes). With `LEONIDA_FIRST_LIGHT_DIR` set against a local
+package run (and `vk_harness` found) none of the 46 is skipped, though the `RunFolderTests` link cases need the right
+to make directory symlinks.
 
 ```sh
 python -I tools/first_light.py --game "<package>" --work ~/leonida-work \
