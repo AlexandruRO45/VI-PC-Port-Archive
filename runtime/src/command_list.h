@@ -339,6 +339,7 @@ struct CopyTexture {
     CopyLocation src;
     bool has_box;
     CopyBox box;
+    bool tile_footprint = false;  // RGBA8 CopyTiles: rows in a linear 64 KiB tile, at any byte offset
 };
 
 // CopyResource: every subresource, or the whole buffer.
@@ -413,9 +414,11 @@ struct DrawViews {
     std::uint32_t render_target_count = 8;
 };
 
-// DrawInstanced / DrawIndexedInstanced, with everything they use captured when they are recorded: D3D12 reads
-// render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the list's state at
-// the draw. resource 0 marks an unbound render-target slot or no depth buffer.
+// DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
+// D3D12 reads render-target and depth descriptors at OMSetRenderTargets, and every other piece of state is the
+// list's state at the draw. resource 0 marks an unbound render-target slot or no depth buffer. A mesh draw
+// (DispatchMesh) takes its thread-group counts in count (x), instances (y) and first (z), and ignores the vertex
+// and index buffers and the topology.
 // Render targets and vertex buffer views are inlined (8 simultaneous targets, 32 input slots), eliminating heap allocations
 // during command list recording (D3D-289).
 struct Draw {
@@ -436,6 +439,7 @@ struct Draw {
     std::uint32_t first = 0;  // first vertex or first index
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
+    bool mesh = false;
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
@@ -623,6 +627,9 @@ struct BuildAccelerationStructure {
     std::uint64_t scratch_va = 0;
     std::uint64_t instances_va = 0;
     std::uint32_t instance_count = 0;
+    // D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS: instances_va is an array of instance_count GPU virtual addresses, one
+    // per 64-byte D3D12_RAYTRACING_INSTANCE_DESC; otherwise the descs themselves, consecutively.
+    bool instance_pointers = false;
     std::vector<RtTriangleGeometry> triangles;
 };
 
@@ -699,15 +706,18 @@ public:
     }
 
     bool copy_texture(const CopyTexture& copy) {
-        if (!valid(copy.dst) || !valid(copy.src) || (copy.dst.footprint && copy.src.footprint)) return false;
+        const auto alignment = copy.tile_footprint ? 1u : texture_data_placement_alignment;
+        if (!valid(copy.dst, alignment) || !valid(copy.src, alignment) || (copy.dst.footprint && copy.src.footprint))
+            return false;
         if (copy.has_box && (copy.box.right <= copy.box.left || copy.box.bottom <= copy.box.top ||
                              copy.box.back <= copy.box.front))
-            return false;
+            return !closed_;  // D3D12 accepts empty/inverted source boxes; emit no zero-extent Vulkan region.
         return append(copy);
     }
 
     bool copy_resource(const CopyResource& copy) {
-        if (!copy.dst || !copy.src || copy.dst == copy.src) return false;
+        if (!copy.dst || !copy.src) return false;
+        if (copy.dst == copy.src) return !closed_;  // A self-copy is a legal no-op, not a failed command list.
         return append(copy);
     }
 
@@ -731,10 +741,11 @@ public:
         return append(dispatch);
     }
 
-    // A draw with no vertices or instances does nothing in D3D12, and is not recorded.
+    // A draw with no vertices or instances, or a mesh draw with no thread groups, does nothing in D3D12, and is
+    // not recorded.
     bool draw(const Draw& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(draw);
     }
     bool draw(Draw&& draw) {
@@ -900,11 +911,11 @@ private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
 
     // A placed footprint needs aligned offsets and pitches and a non-empty size.
-    static bool valid(const CopyLocation& location) {
+    static bool valid(const CopyLocation& location, std::uint32_t alignment) {
         if (!location.resource) return false;
         if (!location.footprint) return true;
         return location.width && location.height && location.depth && location.row_pitch &&
-               location.offset % texture_data_placement_alignment == 0 &&
+               location.offset % alignment == 0 &&
                location.row_pitch % texture_data_pitch_alignment == 0;
     }
 

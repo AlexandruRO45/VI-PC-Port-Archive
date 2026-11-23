@@ -99,7 +99,7 @@ def scan_archive(path, start=None, limit=None):
             if start is None:
                 start = u32(m, 4) or 0
             if not 0 <= start < size:
-                raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
+                raise ValueError(f"start {start} is outside {path} ({size} bytes)")
             end = min(size, start + limit) if limit else size
             rows, total, last, unread, zero = [], 0, start, 0, 0
             total_stored = total_inflated = 0
@@ -228,6 +228,9 @@ def _publish(dest, write, newline):
     except BaseException:
         if temp is not None:
             with suppress(OSError):
+                # The staging file may have inherited a read-only destination's mode; make it deletable
+                # first, or Windows strands it beside the report when the replace fails.
+                os.chmod(temp, 0o600)
                 os.unlink(temp)
         raise
 
@@ -270,11 +273,13 @@ def offset(text):
 
 
 def is_scanned_input(path, input_path, pattern):
-    """True when a report path is one of the files the scan reads: writing it would destroy the input."""
+    """True when a report path would replace the carve manifest or a scanned input."""
     if same_report_path(path, input_path):
         return True
     if not os.path.isdir(input_path) or not os.path.isfile(path):
         return False
+    if same_report_path(path, os.path.join(input_path, "index.json")):
+        return True
     pattern = pattern or "*.bin"
     # Walk up from the report path and compare each folder like same_report_path does (normcase, realpath,
     # samefile), so a spelling that differs only in case, or goes through a link, is still inside the input.
@@ -330,10 +335,13 @@ def main() -> int:
             with open(a.input, "rb") as f:
                 magic = f.read(8)
         except OSError as e:
-            raise SystemExit(f"{a.input}: {e.strerror or e}")
+            ap.error(f"{a.input}: {getattr(e, 'strerror', None) or e}")
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":
-            raise SystemExit(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
-        rows, summary = scan_archive(a.input, a.start, a.limit)
+            ap.error(f"{a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})")
+        try:
+            rows, summary = scan_archive(a.input, a.start, a.limit)
+        except ValueError as e:
+            ap.error(str(e))
 
     add_distribution(summary, rows)
     written = write_outputs(rows, summary, out_path, a.csv)
