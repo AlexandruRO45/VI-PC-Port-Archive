@@ -18,6 +18,47 @@
 namespace {
 int failures = 0;
 
+using QuickRegister = int(__cdecl*)(void(__cdecl*)());
+using QuickExit = void(__cdecl*)(int);
+QuickRegister quick_register;
+QuickExit quick_terminate;
+int quick_order = 0;
+void __cdecl quick_first() { quick_order = quick_order * 10 + 1; }
+void __cdecl quick_second() { quick_order = quick_order * 10 + 2; }
+DWORD WINAPI quick_entry(void*) {
+    if (quick_register(quick_first) || quick_register(quick_second)) return 99;
+    quick_terminate(23);
+    return 99;
+}
+void check_quick_exit() {
+    for (const char* dll : {"ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "msvcrt.dll"}) {
+        for (const char* name : {"at_quick_exit", "_crt_at_quick_exit"}) {
+            quick_register = reinterpret_cast<QuickRegister>(rt::shims::find(dll, name));
+            if (!quick_register) {
+                std::fprintf(stderr, "FAIL missing %s!%s\n", dll, name);
+                ++failures;
+                continue;
+            }
+            for (const char* exit_name : {"quick_exit", "_exit"}) {
+                quick_terminate = reinterpret_cast<QuickExit>(rt::shims::find(dll, exit_name));
+                if (!quick_terminate) {
+                    std::fprintf(stderr, "FAIL missing %s!%s\n", dll, exit_name);
+                    ++failures;
+                    continue;
+                }
+                quick_order = 0;
+                int code = rt::process::run_entry(reinterpret_cast<void*>(quick_entry), 0);
+                int expected = std::strcmp(exit_name, "quick_exit") == 0 ? 21 : 0;
+                if (code != 23 || quick_order != expected) {
+                    std::fprintf(stderr, "FAIL %s!%s via %s: code %d order %d, expected 23 and %d\n",
+                                 dll, name, exit_name, code, quick_order, expected);
+                    ++failures;
+                }
+            }
+        }
+    }
+}
+
 wchar_t** wargv() {
     using Fn = wchar_t*** (__cdecl*)();
     return *reinterpret_cast<Fn>(rt::shims::find("ucrtbase.dll", "__p___wargv"))();
@@ -218,6 +259,7 @@ void check_getmainargs_environment() {
 }  // namespace
 
 int main() {
+    check_quick_exit();
     round_trip({L"plain", L"with space"}, "plain and spaced arguments");
     round_trip({L"C:\\My Games\\", L"next"}, "a quoted argument ending in a backslash");
     round_trip({L"a\\\"b"}, "a backslash before a quote");
