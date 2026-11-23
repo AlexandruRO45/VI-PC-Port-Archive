@@ -83,17 +83,36 @@ OpDecorate %in16 Location 0
 OpReturn
 OpFunctionEnd
 """,
-    # Maintenance8 Offset form (game uses image_sample with Offset on non-gather).
+    # Maintenance8 Offset form: a non-gather image sample with an Offset operand, which is what the
+    # game emits, so the case measures the pattern rather than a placeholder shader.
     "maintenance8_offset": r"""
 OpCapability Shader
 OpCapability ImageGatherExtended
 OpMemoryModel Logical GLSL450
-OpEntryPoint Fragment %main "main"
+OpEntryPoint Fragment %main "main" %tex
 OpExecutionMode %main OriginUpperLeft
+OpDecorate %tex DescriptorSet 0
+OpDecorate %tex Binding 0
 %void = OpTypeVoid
+%f32 = OpTypeFloat 32
+%v2f = OpTypeVector %f32 2
+%v4f = OpTypeVector %f32 4
+%i32 = OpTypeInt 32 1
+%v2i = OpTypeVector %i32 2
+%img = OpTypeImage %f32 2D 0 0 0 1 Unknown
+%simg = OpTypeSampledImage %img
+%ptr_simg = OpTypePointer UniformConstant %simg
+%tex = OpVariable %ptr_simg UniformConstant
+%half = OpConstant %f32 0.5
+%uv = OpConstantComposite %v2f %half %half
+%one = OpConstant %i32 1
+%zero = OpConstant %i32 0
+%offset = OpConstantComposite %v2i %one %zero
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
+%sampled = OpLoad %simg %tex
+%sample = OpImageSampleImplicitLod %v4f %sampled %uv Offset %offset
 OpReturn
 OpFunctionEnd
 """,
