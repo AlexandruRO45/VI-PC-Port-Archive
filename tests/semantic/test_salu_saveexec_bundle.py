@@ -693,6 +693,24 @@ class TestSaveExecASTInterpreter_xnor(unittest.TestCase):
         self.assertEqual(sim.exec_mask, expected_exec)
         self.assertEqual(sim.scc, expected_scc)
 
+class TestSaveExecDivergenceFlags_xnor(unittest.TestCase):
+    def test_simd_lane_divergence(self):
+        # Wave64 low half (lanes 0..31) vs high half (lanes 32..63)
+        low_lanes = 0x0000_0000_FFFF_FFFF
+        high_lanes = 0xFFFF_FFFF_0000_0000
+        new_exec, d_val, scc = model_saveexec("xnor", low_lanes, high_lanes)
+        self.assertEqual(d_val, high_lanes)
+        self.assertEqual(scc, int(new_exec != 0))
+        self.assertEqual(bin(d_val).count("1"), 32)
+
+    def test_walking_bit_divergence(self):
+        for lane in (0, 1, 31, 32, 62, 63):
+            old_exec = 1 << lane
+            s0 = MASK64
+            new_exec, d_val, scc = model_saveexec("xnor", s0, old_exec)
+            self.assertEqual(d_val, old_exec)
+            self.assertEqual(scc, int(new_exec != 0))
+
 
 if __name__ == "__main__":
     unittest.main()
