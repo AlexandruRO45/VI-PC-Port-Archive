@@ -301,6 +301,92 @@ class TestSymbolicAST(unittest.TestCase):
         with self.assertRaises(ValueError):
             Operand.vgpr(300)  # Out of range
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.vcc = 0
+        self.scc = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            raw = self.vgprs[op.index]
+        elif op.reg_type == RegType.SGPR:
+            raw = self.sgprs[op.index]
+        else:
+            raw = op.literal_val
+        return apply_src_mods(raw, op.neg, op.abs_)
+
+    def write_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def __init__(self, state: Optional[ScalarRegisterState] = None):
+        self.state = state if state is not None else ScalarRegisterState()
+
+    def step(self, insn: VMin3F32Instruction) -> int:
+        u0 = self.state.read_operand(insn.src0)
+        u1 = self.state.read_operand(insn.src1)
+        u2 = self.state.read_operand(insn.src2)
+        res = ref_min2_f32(ref_min2_f32(u0, u1), u2)
+        if insn.clamp:
+            if is_nan_u32(res):
+                res = POS_ZERO
+            else:
+                f_res = u32_to_f32(res)
+                if f_res < 0.0:
+                    res = POS_ZERO
+                elif f_res > 1.0:
+                    res = ONE_F32
+        self.state.write_vgpr(insn.dst.index, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step_and_chaining(self):
+        interp = ScalarInterpreter()
+        interp.state.vgprs[0] = f32_to_u32(10.0)
+        interp.state.vgprs[1] = f32_to_u32(5.0)
+        interp.state.vgprs[2] = f32_to_u32(8.0)
+        interp.state.vgprs[4] = f32_to_u32(2.0)
+        interp.state.vgprs[5] = f32_to_u32(7.0)
+
+        # Insn 1: v3 = min(v0, v1, v2) -> min(10, 5, 8) = 5
+        insn1 = VMin3F32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        res1 = interp.step(insn1)
+        self.assertEqual(res1, f32_to_u32(5.0))
+        self.assertEqual(interp.state.vgprs[3], f32_to_u32(5.0))
+
+        # Insn 2: v6 = min(v3, v4, v5) -> min(5, 2, 7) = 2
+        insn2 = VMin3F32Instruction(
+            dst=Operand.vgpr(6),
+            src0=Operand.vgpr(3),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr(5),
+        )
+        res2 = interp.step(insn2)
+        self.assertEqual(res2, f32_to_u32(2.0))
+        self.assertEqual(interp.state.vgprs[6], f32_to_u32(2.0))
+
+    def test_scalar_interpreter_matches_translator_chain(self):
+        lines = [
+            f"v_mov_b32 v0, {f32_to_u32(10.0):#x}",
+            f"v_mov_b32 v1, {f32_to_u32(5.0):#x}",
+            f"v_mov_b32 v2, {f32_to_u32(8.0):#x}",
+            f"v_mov_b32 v4, {f32_to_u32(2.0):#x}",
+            f"v_mov_b32 v5, {f32_to_u32(7.0):#x}",
+            "v_min3_f32 v3, v0, v1, v2",
+            "v_min3_f32 v3, v3, v4, v5",
+        ]
+        words = run_ps_min3(lines)
+        self.assertEqual(words[0], f32_to_u32(2.0))
+
 
 if __name__ == "__main__":
     unittest.main()
