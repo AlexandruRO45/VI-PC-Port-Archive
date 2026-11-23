@@ -137,3 +137,105 @@ class TestCmpClassF16Oracle(unittest.TestCase):
         # Zero mask never matches
         res_zero, _ = run_cmp_shader("f16", 0x3C00, 0, is_cmpx=False, test_id="zero_mask")
         self.assertEqual(res_zero, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f16 AST & Scalar Machine
+# ------------------------------------------------------------------------------
+
+class OperandType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    VCC = auto()
+    EXEC = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class RegisterOperand:
+    op_type: OperandType
+    index: int = 0
+
+    def __post_init__(self):
+        if self.op_type == OperandType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index out of range: {self.index}")
+        if self.op_type == OperandType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index out of range: {self.index}")
+
+    @property
+    def name(self) -> str:
+        if self.op_type == OperandType.VGPR:
+            return f"v{self.index}"
+        elif self.op_type == OperandType.SGPR:
+            return f"s{self.index}"
+        elif self.op_type == OperandType.VCC:
+            return "vcc_lo"
+        elif self.op_type == OperandType.EXEC:
+            return "exec_lo"
+        return "lit"
+
+
+@dataclass(frozen=True)
+class LiteralOperand:
+    value: int
+
+    def __post_init__(self):
+        if not (-0x8000_0000 <= self.value <= 0xFFFF_FFFF_FFFF_FFFF):
+            raise ValueError(f"Literal out of range: {self.value}")
+
+
+@dataclass
+class VCmpClassF16Instruction:
+    dst: RegisterOperand
+    src0: Union[RegisterOperand, LiteralOperand]
+    mask: Union[RegisterOperand, LiteralOperand]
+
+
+class ScalarMachineClassLogic:
+    def __init__(self):
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+        self.vcc: int = 0
+        self.exec: int = MASK32
+
+    def read_operand(self, op: Union[RegisterOperand, LiteralOperand]) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index]
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index]
+        elif op.op_type == OperandType.VCC:
+            return self.vcc
+        elif op.op_type == OperandType.EXEC:
+            return self.exec
+        raise TypeError(f"Unknown operand: {op}")
+
+    def step_cmp_class_f16(self, insn: VCmpClassF16Instruction):
+        s0 = self.read_operand(insn.src0) & 0xFFFF
+        mask = self.read_operand(insn.mask) & 0xFFFF
+        res = 1 if ref_cmp_class_f16(s0, mask) else 0
+        if insn.dst.op_type == OperandType.VCC:
+            self.vcc = MASK32 if res else 0
+        elif insn.dst.op_type == OperandType.SGPR:
+            self.sgprs[insn.dst.index] = MASK32 if res else 0
+
+
+class TestCmpClassF16ASTAndScalar(unittest.TestCase):
+    def test_ast_and_scalar_matches_hardware(self):
+        machine = ScalarMachineClassLogic()
+        machine.vgprs[1] = 0x3C00  # +1.0 (class 8: +normal)
+        insn = VCmpClassF16Instruction(
+            dst=RegisterOperand(OperandType.VCC),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            mask=LiteralOperand(CLASS_POS_NORMAL),
+        )
+        machine.step_cmp_class_f16(insn)
+
+        val_hw, _ = run_cmp_shader("f16", 0x3C00, CLASS_POS_NORMAL, is_cmpx=False, test_id="ast_scalar")
+        self.assertEqual(machine.vcc, MASK32)
+        self.assertEqual(val_hw, 1)
+
+    def test_scalar_sgpr_dst_hardware(self):
+        val_sgpr, _ = run_cmp_shader("f16", 0xFC00, CLASS_NEG_INF, is_cmpx=False, test_id="sgpr_dst")
+        self.assertEqual(val_sgpr, 1)
