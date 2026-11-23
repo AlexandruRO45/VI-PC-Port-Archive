@@ -99,7 +99,7 @@ def log(msg: str) -> None:
     print(line, flush=True)
 
 
-def fail(msg: str) -> "None":
+def _report_error(msg: str) -> None:
     board = leonida_tui.current_board()
     if board is not None:
         stage = leonida_tui.current_stage()
@@ -107,8 +107,12 @@ def fail(msg: str) -> "None":
         if stage:
             board.set_status(stage, "failed")
         # Do not print through the board's stderr proxy (would duplicate into the pane).
-        sys.exit(1)
+        return
     print(f"\nERROR: {msg}", file=sys.stderr)
+
+
+def fail(msg: str) -> "None":
+    _report_error(msg)
     sys.exit(1)
 
 
@@ -2317,15 +2321,20 @@ def path_is_within(path: str, directory: str) -> bool:
 
 
 def _invoke_stage(name: str, fn) -> None:
-    """Run a stage (optionally on a worker thread). fail() uses sys.exit; turn that into an exception the pool
-    can collect so siblings can finish before the process stops."""
+    """Report stage errors before handing them to the scheduler, which collects failures without reprinting them."""
     with leonida_tui.stage_scope(name):
         try:
             fn()
         except SystemExit as e:
-            if e.code in (0, None):
+            if e.code is None or (isinstance(e.code, int) and e.code == 0):
                 return
+            # fail() already reported its integer exit. A non-integer exit carries a message Python would normally print.
+            if not isinstance(e.code, int):
+                _report_error(f"{name}: {e.code}")
             raise RuntimeError(f"stage exited with {e.code}") from e
+        except Exception as e:
+            _report_error(f"{name}: {type(e).__name__}: {e}")
+            raise
 
 
 def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, wav: bool, jobs: int,
@@ -2428,7 +2437,7 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
         raise
 
     if failed:
-        # The failing stage already printed through fail(); stop without a second message.
+        # The failing stage already reported its diagnostic; stop without a second message.
         sys.exit(1)
 
 

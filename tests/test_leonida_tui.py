@@ -2,6 +2,7 @@
 
     python -I tests/test_leonida_tui.py
 """
+import io
 import os
 import sys
 import tempfile
@@ -285,6 +286,56 @@ class StageScopeTest(unittest.TestCase):
 
 
 class SerialOverlapTest(unittest.TestCase):
+    @staticmethod
+    def run_runtime_and_pipelines(overlap):
+        make_game.run_build_stages(
+            ["runtime", "pipelines"], game="game", work="work", out="out", v={}, wav=False, jobs=2,
+            runtime_build=None, emulate=False, keep_emulated=False, fallbacks=(), overlap=overlap)
+
+    def test_unexpected_stage_failure_is_reported_once(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                with (mock.patch.object(make_game, "runtime", side_effect=FileNotFoundError("synthetic tool missing")),
+                      mock.patch.object(make_game, "pipelines") as pipelines, mock.patch.object(make_game, "log"),
+                      mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+                      self.assertRaises(SystemExit) as stopped):
+                    self.run_runtime_and_pipelines(overlap)
+                self.assertEqual(stopped.exception.code, 1)
+                pipelines.assert_not_called()
+                self.assertEqual(stderr.getvalue().strip(), "ERROR: runtime: FileNotFoundError: synthetic tool missing")
+
+    def test_stage_exit_message_is_not_lost(self):
+        with (mock.patch.object(make_game, "runtime", side_effect=SystemExit("synthetic tool diagnostic")),
+              mock.patch.object(make_game, "pipelines"), mock.patch.object(make_game, "log"),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, self.assertRaises(SystemExit) as stopped):
+            self.run_runtime_and_pipelines(True)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(stderr.getvalue().strip(), "ERROR: runtime: synthetic tool diagnostic")
+
+    def test_existing_fail_message_is_not_duplicated(self):
+        def broken_stage(*args, **kwargs):
+            make_game.fail("synthetic known failure")
+
+        with (mock.patch.object(make_game, "runtime", side_effect=broken_stage),
+              mock.patch.object(make_game, "pipelines"), mock.patch.object(make_game, "log"),
+              mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, self.assertRaises(SystemExit) as stopped):
+            self.run_runtime_and_pipelines(True)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(stderr.getvalue().strip(), "ERROR: synthetic known failure")
+
+    def test_unexpected_stage_failure_goes_to_its_tui_pane(self):
+        board = mock.Mock()
+        with (mock.patch.object(leonida_tui, "current_board", return_value=board),
+              mock.patch.object(make_game, "runtime", side_effect=OSError("synthetic I/O error")),
+              mock.patch.object(make_game, "pipelines"), mock.patch("sys.stderr") as stderr,
+              self.assertRaises(SystemExit) as stopped):
+            self.run_runtime_and_pipelines(True)
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual([call.args for call in board.write.call_args_list if "ERROR:" in call.args[1]],
+                         [("runtime", "ERROR: runtime: OSError: synthetic I/O error")])
+        board.set_status.assert_any_call("runtime", "failed")
+        stderr.write.assert_not_called()
+
     def test_overlap_false_runs_in_order(self):
         order = []
 
