@@ -220,6 +220,30 @@ class RunTestTest(unittest.TestCase):
                 status, detail = self.run_entry(ctest_entry("regex", self.command_for(exe), props))
                 self.assertEqual(status, expected, detail)
 
+    def test_output_expressions_follow_ctest_windows_line_endings(self):
+        pattern = "prefix\nsuffix"
+        cases = (
+            ("FAIL_REGULAR_EXPRESSION", 0, "fail"),
+            ("PASS_REGULAR_EXPRESSION", 2, "pass"),
+            ("SKIP_REGULAR_EXPRESSION", 0, "skip"),
+        )
+        for newline in (b"\n", b"\r\n", b"\r\r\n"):
+            output = newline.join((b"prefix", b"suffix\rkept", b""))
+            for expression, exit_code, expected in cases:
+                with self.subTest(newline=newline, expression=expression):
+                    body = f"import sys\nsys.stdout.buffer.write({output!r})\nraise SystemExit({exit_code})\n"
+                    exe = self.program("regex.py", body)
+                    entry = ctest_entry("regex", self.command_for(exe), {expression: pattern})
+                    status, detail = self.run_entry(entry)
+                    self.assertEqual(status, expected, detail)
+                    self.assertIn(output.decode("ascii"), detail)
+
+        exe = self.program("lone_cr.py", "import sys\nsys.stdout.buffer.write(b'prefix\\rsuffix')\n")
+        entry = ctest_entry("lone_cr", self.command_for(exe), {"FAIL_REGULAR_EXPRESSION": pattern})
+        status, detail = self.run_entry(entry)
+        self.assertEqual(status, "pass", detail)
+        self.assertIn("prefix\rsuffix", detail)
+
     def test_a_scalar_output_expression_is_matched_as_one_pattern(self):
         required = {"PASS_REGULAR_EXPRESSION": "usage: gta6rt"}
         forbidden = {"FAIL_REGULAR_EXPRESSION": r"module\(s\) mapped"}
