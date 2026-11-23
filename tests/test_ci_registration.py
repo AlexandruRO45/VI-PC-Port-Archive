@@ -22,8 +22,9 @@ drift) and fails on the three ways a test goes missing without CI turning red --
 * a nested ``tests/*/test_*.cjs`` file that ``fnmatch`` matches across ``/`` but the non-recursive
   ``node --test tests/test_*.cjs`` command never runs.
 
-It also runs the ``check`` loop itself, taken from the workflow, under bash on a synthetic tree: the loop has
-to run every file and then fail, since stopping at the first failure hides the files sorted after it.
+It also runs the standard-library loops themselves (``check`` on Windows and ``stdlib-tests-linux``), taken
+from the workflow, under bash on a synthetic tree: each loop has to run every file and then fail, since
+stopping at the first failure hides the files sorted after it.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
 needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
@@ -78,6 +79,8 @@ def ci_rules(root):
 
 
 STDLIB_STEP = "Tests (standard library only, no game data)"
+LINUX_STDLIB_STEP = "Tests (standard library only, Linux)"
+STDLIB_STEPS = (STDLIB_STEP, LINUX_STDLIB_STEP)
 
 
 def step_script(root, step_name):
@@ -533,14 +536,18 @@ class RepositoryRegistrationTest(unittest.TestCase):
 
 
 class StdlibLoopTest(unittest.TestCase):
-    """The check job's loop runs every file and then fails, so one failure cannot hide the files after it."""
+    """Each standard-library loop runs every file and then fails, so one failure cannot hide the files after it."""
 
     def test_loop_runs_past_a_failure_and_names_every_failed_file(self):
         if not git_bash():
             # On a runner a missing bash would turn this check into a silent skip.
             self.assertFalse(os.environ.get("GITHUB_ACTIONS"), "no bash found on the CI runner")
             self.skipTest("needs bash (Git for Windows on Windows)")
-        script = step_script(ROOT, STDLIB_STEP)
+        for step in STDLIB_STEPS:
+            with self.subTest(step=step):
+                self.check_loop(step_script(ROOT, step))
+
+    def check_loop(self, script):
         markers = ci_rules(ROOT)[0]
         failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
         passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
@@ -577,9 +584,11 @@ class StdlibLoopTest(unittest.TestCase):
         self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
 
     def test_step_script_reads_the_check_loop(self):
-        script = step_script(ROOT, STDLIB_STEP)
-        self.assertIn('python -I "$t"', script)
-        self.assertIn("-name 'test_*.py'", script)
+        for step in STDLIB_STEPS:
+            with self.subTest(step=step):
+                script = step_script(ROOT, step)
+                self.assertIn('python -I "$t"', script)
+                self.assertIn("-name 'test_*.py'", script)
 
 
 if __name__ == "__main__":
