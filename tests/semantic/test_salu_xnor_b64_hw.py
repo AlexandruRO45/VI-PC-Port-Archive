@@ -60,5 +60,49 @@ class SXnorB64ReferenceOracleTests(unittest.TestCase):
         self.assertEqual(oracle_xnor_b64(MASK64, MASK64), (MASK64, 1))
         self.assertEqual(oracle_xnor_b64(0, MASK64), (0, 0))
 
+class RegKind(enum.Enum):
+    SGPR = "sgpr"
+    IMM = "imm"
+    SPECIAL = "special"
+
+
+@dataclass(frozen=True)
+class Operand64:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class InstructionAST:
+    mnemonic: str
+    dst: Operand64
+    src0: Operand64
+    src1: Operand64
+
+
+class SXnorB64AstValidationTests(unittest.TestCase):
+    def test_ast_construction(self):
+        ast = InstructionAST(
+            mnemonic="s_xnor_b64",
+            dst=Operand64(RegKind.SGPR, index=4),
+            src0=Operand64(RegKind.SGPR, index=0),
+            src1=Operand64(RegKind.SGPR, index=2),
+        )
+        self.assertEqual(ast.mnemonic, "s_xnor_b64")
+        self.assertEqual(ast.dst.index, 4)
+        self.assertEqual(ast.src0.index, 0)
+        self.assertEqual(ast.src1.index, 2)
+
+    def test_ast_imm_operand(self):
+        ast = InstructionAST(
+            mnemonic="s_xnor_b64",
+            dst=Operand64(RegKind.SGPR, index=0),
+            src0=Operand64(RegKind.SGPR, index=0),
+            src1=Operand64(RegKind.IMM, raw_val=0),
+        )
+        self.assertEqual(ast.src1.kind, RegKind.IMM)
+        self.assertEqual(ast.src1.raw_val, 0)
+
 if __name__ == "__main__":
     unittest.main()
