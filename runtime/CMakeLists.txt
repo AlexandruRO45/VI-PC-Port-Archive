@@ -881,6 +881,8 @@ if(BUILD_TESTING)
     add_test(NAME xgameruntime_offline COMMAND xgameruntime_offline_test)
     add_test(NAME xgameruntime_offline_hdr COMMAND xgameruntime_offline_test)
     set_tests_properties(xgameruntime_offline_hdr PROPERTIES ENVIRONMENT "LEONIDA_HDR=1")
+    add_test(NAME xgameruntime_offline_add_by_id COMMAND xgameruntime_offline_test)
+    set_tests_properties(xgameruntime_offline_add_by_id PROPERTIES ENVIRONMENT "LEONIDA_TEST_ADD_BY_ID=1")
     add_test(NAME xgameruntime_user_gamertag COMMAND xgameruntime_user_test --expect-gamertag Tester42)
     set_tests_properties(xgameruntime_user_gamertag PROPERTIES ENVIRONMENT "LEONIDA_GAMERTAG=Tester42")
     # Longer than getenv_s's old 64-byte buffer: still the "Player" fallback (and its message), not a silent one.

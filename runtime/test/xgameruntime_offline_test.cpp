@@ -79,6 +79,9 @@ void CALLBACK on_state(void*, uint64_t, uint32_t) {}
 }  // namespace
 
 int main() {
+    char by_id_env[4] = {};
+    size_t by_id_len = 0;
+    const bool by_id = getenv_s(&by_id_len, by_id_env, "LEONIDA_TEST_ADD_BY_ID") == 0 && std::strcmp(by_id_env, "1") == 0;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("xgameruntime_offline_test: XGameEvent, XGameUi, XGameStreaming, XDisplay, XUserDevice\n");
     auto query = reinterpret_cast<Query>(rt::shims::find("xgameruntime.dll", "QueryApiImpl"));
@@ -159,19 +162,42 @@ int main() {
     uint8_t device_id[32] = {7};
     void* user = nullptr;
     // RT-382: before the title has added a user (XUserAddAsync) no user is associated with the device.
+    constexpr HRESULT kNotFound = static_cast<HRESULT>(0x89245104);   // E_GAMEUSER_USER_NOT_FOUND
     user = reinterpret_cast<void*>(1);
-    check(at<FindUser>(device, 3)(device, device_id, &user) == static_cast<HRESULT>(0x89245104) && !user &&
+    check(at<FindUser>(device, 3)(device, device_id, &user) == kNotFound && !user &&
               rt::shims::xgameruntime_user_open_handles() == 0,
           "XUserFindForDevice before XUserAddAsync: E_GAMEUSER_USER_NOT_FOUND, no handle");
+    check(at<FindUser>(device, 3)(device, nullptr, &user) == E_INVALIDARG &&
+              at<FindUser>(device, 3)(device, device_id, nullptr) == E_INVALIDARG,
+          "XUserFindForDevice: a null device id or a null out pointer is E_INVALIDARG, added or not");
     {
         using AddAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, XAsyncBlock*);
         using AddResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+        using AddByIdAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint64_t, XAsyncBlock*);
+        constexpr uint64_t kXuid = 0x0009000000000001ull;   // the offline user's id (xgameruntime_user.cpp)
         void* users = user_object(query);
-        XAsyncBlock add{};
+        // Adds that do not give the title a user leave the device without one.
+        XAsyncBlock bad{}, other{}, pending{};
+        void* none = reinterpret_cast<void*>(1);
+        check(at<AddAsync>(users, 7)(users, 0x01 | 0x02, &bad) == E_INVALIDARG,
+              "an add the shim refuses (guests with the silent default) starts nothing");
+        check(at<AddByIdAsync>(users, 37)(users, kXuid + 1, &other) == S_OK && finished(&other) &&
+                  at<AddResult>(users, 38)(users, &other, &none) == kNotFound && !none,
+              "an add by another id fails");
+        check(at<AddAsync>(users, 7)(users, 0x01, &pending) == S_OK && finished(&pending),
+              "an add that completed but whose result the title has not collected");
+        user = reinterpret_cast<void*>(1);
+        check(at<FindUser>(device, 3)(device, device_id, &user) == kNotFound && !user,
+              "XUserFindForDevice is still E_GAMEUSER_USER_NOT_FOUND after refused, failed and uncollected adds");
         void* added = nullptr;
-        check(at<AddAsync>(users, 7)(users, 0x01, &add) == S_OK && finished(&add) &&
-                  at<AddResult>(users, 8)(users, &add, &added) == S_OK && added,
-              "XUserAddAsync collected");
+        if (by_id) {   // LEONIDA_TEST_ADD_BY_ID=1: only the add-by-id path gives the title its user
+            XAsyncBlock ok{};
+            check(at<AddByIdAsync>(users, 37)(users, kXuid, &ok) == S_OK && finished(&ok) &&
+                      at<AddResult>(users, 38)(users, &ok, &added) == S_OK && added,
+                  "an add by the local user's id is collected");
+        } else {
+            check(at<AddResult>(users, 8)(users, &pending, &added) == S_OK && added, "the pending add is collected now");
+        }
         at<CloseUser>(users, 4)(users, added);
     }
     check(at<FindUser>(device, 3)(device, device_id, &user) == S_OK && user, "XUserFindForDevice: the offline user");
