@@ -206,7 +206,9 @@ class RuntimeBuildPreflightTest(unittest.TestCase):
 
 class RuntimePackagingTest(unittest.TestCase):
     def setUp(self):
-        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        # Resolved: on macOS the temp folder is under /var, a link to /private/var, and the launched stub reports
+        # its working folder by the resolved name.
+        self.root = os.path.realpath(self.enterContext(tempfile.TemporaryDirectory()))
         self.build = os.path.join(self.root, "runtime", "build")
         self.game = os.path.join(self.root, "game")
         self.out = os.path.join(self.root, "out")
