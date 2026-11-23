@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCS = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
+README = ROOT / "README.md"
+DOCS = [README, *sorted((ROOT / "docs").rglob("*.md"))]
 
 
 class DocsTableRowsTest(unittest.TestCase):
@@ -44,6 +45,35 @@ class DocsTableRowsTest(unittest.TestCase):
                     check(block)
                     block = []
             check(block)
+
+    def test_no_repeated_first_cell_in_readme_tables(self):
+        # A repeated first cell in the README status table means a merge kept
+        # both sides of the same component row (PROC-313: four "Xbox D3D12 →
+        # Vulkan" rows with contradicting statuses). Only the README is checked:
+        # docs tables group rows under a repeated first cell on purpose.
+        lines = README.read_text(encoding="utf-8").splitlines()
+
+        def check(rows):
+            seen = {}
+            for lineno, row in rows:
+                first = [c.strip() for c in row.strip().strip("|").split("|")][0]
+                if not first or set(first) <= set("-:"):
+                    continue  # separator row; an empty first cell is a continuation
+                if first in seen:
+                    self.fail(
+                        f"README.md:{seen[first]} and {lineno}: repeated first cell "
+                        f"{first!r} in the same table (keep only the newest variant)"
+                    )
+                seen[first] = lineno
+
+        block = []
+        for i, line in enumerate(lines, 1):
+            if line.startswith("|"):
+                block.append((i, line))
+            elif block:
+                check(block)
+                block = []
+        check(block)
 
 
 if __name__ == "__main__":
