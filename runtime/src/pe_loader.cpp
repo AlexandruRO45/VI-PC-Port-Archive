@@ -21,10 +21,18 @@
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
 
-// src/host_tls_pad.cpp: the runtime's only static TLS variable and the end of the region the title's template may
-// overwrite. Host TLS variables live after that end, so the mirror below cannot touch them.
-unsigned char* guest_tls_pad();
-unsigned char* guest_tls_pad_end();
+// The runtime's only static TLS variable and the end of the region the title's template may overwrite. It lives in
+// this file so every target that compiles the loader links without a separate translation unit; only gta6rt.exe,
+// which owns static TLS index 0, defines LEONIDA_MIRROR_INDEX0 and gets the real pad. Other targets return null and
+// never set Module::mirror_index0.
+#ifdef LEONIDA_MIRROR_INDEX0
+__declspec(thread) unsigned char g_guest_tls_pad[8192];
+unsigned char* guest_tls_pad() { return g_guest_tls_pad; }
+unsigned char* guest_tls_pad_end() { return g_guest_tls_pad + sizeof g_guest_tls_pad; }
+#else
+unsigned char* guest_tls_pad() { return nullptr; }
+unsigned char* guest_tls_pad_end() { return nullptr; }
+#endif
 
 namespace rt {
 

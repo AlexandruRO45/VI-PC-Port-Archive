@@ -379,14 +379,15 @@ inline bool open(const wchar_t* path, int* error = nullptr) {
                 const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
                 void** vector = reinterpret_cast<void**>(__readgsqword(0x58));
                 const auto* pad = reinterpret_cast<const uint8_t*>(guest_tls_pad());
-                const uint64_t pad_offset = reinterpret_cast<uint64_t>(pad) - reinterpret_cast<uint64_t>(vector[0]);
+                const uint64_t pad_offset =
+                    pad ? reinterpret_cast<uint64_t>(pad) - reinterpret_cast<uint64_t>(vector[0]) : 0;
                 std::fprintf(stderr,
                              "[rt] host tls index=%lu block=%p vector[0]=%p vector[index]=%p template=%llu "
                              "pad_offset=%llu pad_in_block=%d\n",
                              static_cast<unsigned long>(index), vector[0], vector[0], vector[index],
                              static_cast<unsigned long long>(tls->EndAddressOfRawData - tls->StartAddressOfRawData),
                              static_cast<unsigned long long>(pad_offset),
-                             static_cast<int>(reinterpret_cast<const uint8_t*>(vector[0]) + pad_offset == pad));
+                             static_cast<int>(pad && reinterpret_cast<const uint8_t*>(vector[0]) + pad_offset == pad));
             }
         }
     }

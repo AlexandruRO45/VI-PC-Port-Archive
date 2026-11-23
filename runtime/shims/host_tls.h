@@ -2,9 +2,9 @@
 //
 // The mapped title was linked with its static TLS at module index 0, and its CRT inlines gs:[58][0] at every
 // thread-local access. gta6rt.exe is the first module in the process, so index 0 is this program's own module index:
-// the loader copies the title's 5,248-byte template to the base of that block, into the room src/host_tls_pad.cpp
-// reserves in front of the runtime's own TLS variables. Anything the runtime needs per thread therefore lives here,
-// in a dynamic TLS slot, where the title's writes cannot reach it.
+// the loader copies the title's 5,248-byte template to the base of that block, into the room the pad in
+// src/pe_loader.cpp reserves in front of the runtime's own TLS variables. Anything the runtime needs per thread
+// therefore lives here, in a dynamic TLS slot, where the title's writes cannot reach it.
 #pragma once
 
 #include <windows.h>
