@@ -254,7 +254,6 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 
     // Classes nobody serves yet are still refused, and logged, as before.
     const GUID refused[] = {
-        {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}},  // XLauncherImpl
         {0x3e241977, 0x6237, 0x41e9, {0x85, 0x59, 0x10, 0x2c, 0x2d, 0x99, 0x83, 0xf1}},  // XAccessibilityImpl
         {0x12345678, 0x9abc, 0xdef0, {0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0}},  // no such class
     };
@@ -263,7 +262,18 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
         void* out = reinterpret_cast<void*>(1);
         all_refused = all_refused && query(&cls, cls, &out) == static_cast<HRESULT>(0x80070032) && out == nullptr;
     }
-    check(all_refused, "XLauncherImpl, XAccessibilityImpl and an unknown class are still refused");
+    check(all_refused, "XAccessibilityImpl and an unknown class are still refused");
+
+    // XLauncherImpl is served (a shell handoff must not stall the boot): the class id answers, and the object has
+    // the four-slot vtable whose last slot is the launch.
+    const GUID launcher_cls = {0x1b339674, 0x328d, 0x4283, {0xa2, 0x00, 0x31, 0x71, 0xf1, 0x8d, 0x36, 0x39}};
+    void* launcher = nullptr;
+    check(query(&launcher_cls, launcher_cls, &launcher) == S_OK && launcher != nullptr, "XLauncherImpl answers its id");
+    if (launcher) {
+        auto* vtable = *reinterpret_cast<void***>(launcher);
+        check(vtable != nullptr && vtable[3] != nullptr, "the launcher object carries a launch slot at 3");
+        release_object(launcher);
+    }
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five

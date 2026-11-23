@@ -219,15 +219,15 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
 
     SetLastError(ERROR_SUCCESS);
-    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
-                                           PAGE_READWRITE);
-    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "unsupported large-page allocation is rejected before host allocation");
+    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0, PAGE_READWRITE);
+    check(large_page != nullptr && GetLastError() != ERROR_NOT_SUPPORTED,
+          "the console large-page bit is folded onto the host instead of rejected");
+    if (large_page) check(VirtualFree(large_page, 0, MEM_RELEASE), "release the 2 MiB-rounded region");
 
     SetLastError(ERROR_SUCCESS);
     void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+    check(attributed != nullptr, "a nonzero XMem attribute word is accepted (the word is undecoded, not rejected)");
+    if (attributed) check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
