@@ -197,6 +197,53 @@ class PsocacheInspectTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             psocache_inspect.inspect(self.path, entry=99)
 
+    def test_meta_entry_span_past_meta_blob_does_not_crash_or_read_code_blob(self):
+        meta_index_off = HEADER + GRAPHICS * 0x70 + COMPUTE * 0x18
+        code_off = meta_index_off + META_INDEX * 8 + SHADER_INDEX * 8 + META_SIZE
+
+        # Case 1: span runs past EOF (previously crashed with unhandled struct.error).
+        data_eof = bytearray(build())
+        struct.pack_into("<2I", data_eof, meta_index_off + 8, META_SIZE + 0x1000, CHUNK)
+        eof_path = os.path.join(self.tmp.name, "oob_eof.cache")
+        with open(eof_path, "wb") as f:
+            f.write(data_eof)
+        p = run(eof_path, "--entry", "1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("points past the 0x%x-byte meta blob" % META_SIZE, p.stdout)
+
+        # Case 2: span extends past meta_blob into code_blob (previously decoded code_blob bytes as a chunk).
+        data_spill = bytearray(build())
+        struct.pack_into("<8I", data_spill, code_off, 0x41, 0x300, 0x10, 0x99, 0x01, 0x00000104, 0xFFFFFFFF, 0)
+        struct.pack_into("<2I", data_spill, meta_index_off + 8, ENTRY0, ENTRY1 + CHUNK)
+        spill_path = os.path.join(self.tmp.name, "oob_spill.cache")
+        with open(spill_path, "wb") as f:
+            f.write(data_spill)
+        r = psocache_inspect.inspect(spill_path, entry=1)
+        self.assertEqual(r["verdict"], "disagrees with the model")
+        self.assertEqual(
+            r["meta_entry"],
+            ["entry offset 0x%x size %d: points past the 0x%x-byte meta blob" % (ENTRY0, ENTRY1 + CHUNK, META_SIZE)],
+        )
+
+        # Direct parse_chunks bounds check (no struct.error on OOB or negative spans).
+        self.assertEqual(psocache_inspect.parse_chunks(b"\x00" * 64, 0, 32, 64), (None, None))
+        self.assertEqual(psocache_inspect.parse_chunks(b"\x00" * 64, -1, 0, 32), (None, None))
+        self.assertEqual(psocache_inspect.parse_chunks(b"\x00" * 64, 0, -4, 32), (None, None))
+        self.assertEqual(psocache_inspect.parse_chunks(b"\x00" * 64, 0, 0, -32), (None, None))
+
+    def test_negative_or_bool_entry_and_bool_limit_rejected_even_on_truncated_file(self):
+        # Truncate inside meta_blob so meta_blob does not fit.
+        meta_off = HEADER + GRAPHICS * 0x70 + COMPUTE * 0x18 + META_INDEX * 8 + SHADER_INDEX * 8
+        with open(self.path, "r+b") as f:
+            f.truncate(meta_off + 16)
+        with self.assertRaises(ValueError):
+            psocache_inspect.inspect(self.path, entry=-1)
+        with self.assertRaises(ValueError):
+            psocache_inspect.inspect(self.path, entry=False)
+        with self.assertRaises(ValueError):
+            psocache_inspect.inspect(self.path, limit=True)
+
     def test_meta_cli(self):
         p = run(self.path, "--meta", "--entry", "0")
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -248,6 +295,45 @@ class PsocacheInspectTest(unittest.TestCase):
         self.assertIn("record references", p.stdout)
         self.assertIn("graphics out of range 1", p.stdout)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_zero_meta_index_still_checks_pso_references(self):
+        # Graphics record with meta_index == 0: all 0xFFFFFFFF holes hold; a non-hole ref disagrees.
+        gfx_holes = bytearray(HEADER + 0x70)
+        gfx_holes[0:4] = b"PS\x00\x09"
+        struct.pack_into("<4I", gfx_holes, 0x50, 1, 0, 0, 0)
+        for delta in (8, 0xC, 0x50, 0x54, 0x58, 0x5C):
+            struct.pack_into("<I", gfx_holes, HEADER + delta, 0xFFFFFFFF)
+        p_ok = os.path.join(self.tmp.name, "gfx_zero_meta_ok.cache")
+        with open(p_ok, "wb") as f:
+            f.write(gfx_holes)
+        r_ok = psocache_inspect.inspect(p_ok)
+        self.assertEqual(r_ok["verdict"], "model holds")
+        self.assertEqual(
+            r_ok["references"],
+            {"limit": 0, "graphics_out_of_range": 0, "compute_out_of_range": 0},
+        )
+
+        gfx_bad = bytearray(gfx_holes)
+        struct.pack_into("<I", gfx_bad, HEADER + 8, 0)
+        p_bad = os.path.join(self.tmp.name, "gfx_zero_meta_bad.cache")
+        with open(p_bad, "wb") as f:
+            f.write(gfx_bad)
+        r_bad = psocache_inspect.inspect(p_bad)
+        self.assertEqual(r_bad["verdict"], "disagrees with the model")
+        self.assertEqual(r_bad["references"]["graphics_out_of_range"], 1)
+        self.assertEqual(run(p_bad).returncode, 1)
+
+        # Compute record with meta_index == 0: all 4 ref fields are out of range.
+        comp_bad = bytearray(HEADER + 0x18)
+        comp_bad[0:4] = b"PS\x00\x09"
+        struct.pack_into("<4I", comp_bad, 0x50, 0, 1, 0, 0)
+        p_comp = os.path.join(self.tmp.name, "comp_zero_meta_bad.cache")
+        with open(p_comp, "wb") as f:
+            f.write(comp_bad)
+        r_comp = psocache_inspect.inspect(p_comp)
+        self.assertEqual(r_comp["verdict"], "disagrees with the model")
+        self.assertEqual(r_comp["references"]["compute_out_of_range"], 4)
+        self.assertEqual(run(p_comp).returncode, 1)
 
     def test_bad_magic_exits_two(self):
         with open(self.path, "r+b") as f:

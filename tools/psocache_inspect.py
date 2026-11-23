@@ -97,6 +97,8 @@ def parse_chunks(m, base, start, size):
     The first header length, in 4-byte steps, that covers the entry exactly with 32-byte chunks all of type
     0x41/0x42/0x43 wins. Returns ``(header_size, [(tag, word1), ...])`` or ``(None, None)`` when no length fits.
     """
+    if base < 0 or start < 0 or size < 0 or base + start + size > len(m):
+        return None, None
     for header in range(0, ENTRY_HEADER_MAX + 1, 4):
         if size < header or (size - header) % CHUNK_SIZE:
             continue
@@ -124,8 +126,13 @@ def entry_chunks(m, base, start, size):
     ]
 
 
-def describe_entry(m, base, start, size):
+def describe_entry(m, base, start, size, meta_size=None):
     """Human-readable lines for one meta index entry. The 0x43 16-byte value is not printed."""
+    if meta_size is not None and (start < 0 or size < 0 or start + size > meta_size):
+        return [
+            "entry offset 0x%x size %d: points past the 0x%x-byte meta blob"
+            % (start, size, meta_size)
+        ]
     chunks = entry_chunks(m, base, start, size)
     if chunks is None:
         return [
@@ -267,8 +274,10 @@ def decode_meta(m, base, spans, limit=None):
 
 def inspect(path, with_meta=False, entry=None, limit=None):
     """Read ``path`` and return the report as a dict. Raises OSError/ValueError on unusable input."""
-    if limit is not None and limit < 1:
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("--limit must be at least 1")
+    if entry is not None and (isinstance(entry, bool) or not isinstance(entry, int) or entry < 0):
+        raise ValueError("--entry must be at least 0")
     with open(path, "rb") as fh:
         size = os.fstat(fh.fileno()).st_size
         if size < HEADER_SIZE:
@@ -355,7 +364,7 @@ def inspect(path, with_meta=False, entry=None, limit=None):
             if (
                 regions["graphics"]["fits"]
                 and regions["compute"]["fits"]
-                and counts["meta_index"]
+                and (counts["meta_index"] or counts["graphics"] or counts["compute"])
             ):
                 meta_limit = counts["meta_index"]
                 bad_graphics = 0
@@ -471,7 +480,9 @@ def inspect(path, with_meta=False, entry=None, limit=None):
                             "--entry %d is outside the %d-entry meta index"
                             % (entry, len(entries))
                         )
-                    report["meta_entry"] = describe_entry(m, meta_off, *entries[entry])
+                    report["meta_entry"] = describe_entry(
+                        m, meta_off, *entries[entry], meta_size=meta_size
+                    )
 
             # Shader index: (offset, size) pairs inside the code blob, in ascending offset order.
             if regions["shader_index"]["fits"] and regions["code_blob"]["fits"]:
