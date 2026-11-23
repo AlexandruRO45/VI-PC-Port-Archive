@@ -388,7 +388,12 @@ int main() {
                 D3D12_RENDER_TARGET_VIEW_DESC d{};
                 d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
                 d.ViewDimension = vdim;
-                if (!run_invalid("2D 1x dim mismatch", rd2d, D3D12_RESOURCE_STATE_RENDER_TARGET, &d)) return 1;
+                // D3D12's debug layer accepts a 1-sample TEXTURE2DMS view (1x MSAA) on a SampleDesc.Count==1
+                // texture, whereas our Vulkan backend intentionally requires SampleDesc.Count > 1 for MS RTVs.
+                const bool check_host =
+                    vdim != D3D12_RTV_DIMENSION_TEXTURE2DMS && vdim != D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                if (!run_invalid("2D 1x dim mismatch", rd2d, D3D12_RESOURCE_STATE_RENDER_TARGET, &d, check_host))
+                    return 1;
             }
 
             const auto rdms = tex_desc(D3D12_RESOURCE_DIMENSION_TEXTURE2D, DXGI_FORMAT_R32_FLOAT, 8, 8, 2, 1, 4, kRT);
