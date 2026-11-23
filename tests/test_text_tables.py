@@ -11,6 +11,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -253,6 +254,48 @@ class TestVariants(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual((rows[0]["gender"], rows[0]["plurality"], rows[0]["text"]),
                              ("None", "Singular", "Bonjour"))
+
+    def test_variants_read_the_source_once(self):
+        # A source that disappears as soon as its scan ends must not be reopened for the variant rows: they
+        # come from the bytes already read. A second read used to be an uncaught FileNotFoundError, raised
+        # after the other reports had been staged.
+        res = make_variant_resource([("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "fr.bin"), res)
+            out = os.path.join(tmp, "variants.csv")
+            read, scans = T.blobs, []
+
+            def once(path):
+                scans.append(path)
+                try:
+                    yield from read(path)
+                finally:
+                    os.remove(path)
+
+            with patch.object(T, "blobs", once), contextlib.redirect_stdout(io.StringIO()):
+                rc = T.main([src, "--variants", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(scans), 1)
+            with open(out, encoding="utf-8", newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual([row["text"] for row in rows], ["Bonjour"])
+
+    def test_variants_read_error_is_the_input_error_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write(os.path.join(tmp, "fr.bin"), make_variant_resource(
+                [("ZZ_GREET", 10, 11, [("Bonjour", 0, 1, 0)])]))
+            out = os.path.join(tmp, "variants.csv")
+
+            def vanishing(path):
+                raise OSError("source vanished")
+                yield  # unreachable; keeps this a generator like blobs()
+
+            with patch.object(T, "blobs", vanishing), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(T.main([src, "--variants", out]), 2)
+            self.assertIn("cannot read input", err.getvalue())
+            self.assertFalse(os.path.exists(out))
 
 
 class TestCli(unittest.TestCase):

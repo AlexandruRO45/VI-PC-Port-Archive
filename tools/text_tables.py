@@ -25,10 +25,13 @@ code when a table has no marker).
 Usage:
     python -I text_tables.py <source> [<source> ...] [--labels FILE ...]
                              [--dialogue dialogue.csv] [--tables tables.csv] [--strings strings.csv]
+                             [--variants variants.csv]
 
 A source is an ``rpf9_carve.py`` directory, an ``.rpf`` archive (read through ``gamedata_index.py``; nothing is
 written), or files and directories of whole resources. ``--labels`` adds label names (word lists or a
-``hashdict.py`` JSON) so non-dialogue strings and table groups can be named. Standard library only. The outputs
+``hashdict.py`` JSON) so non-dialogue strings and table groups can be named. Every report, ``--variants``
+included, is written from the same single pass over the sources, so no report describes a different revision
+of the input than another. Standard library only. The outputs
 quote game text: they are local work products and must not be committed or attached to an issue. The tests use
 synthetic resources.
 """
@@ -241,18 +244,6 @@ def variant_tables(buf: bytes):
             yield out
 
 
-def collect_variants(sources) -> list:
-    """Scan `sources` for 0x956a9df5 / 0x10075946 variant tables as [(source, offset, lang, vtable), ...]."""
-    out = []
-    for source in sources:
-        for label, offset, data in blobs(source):
-            if _is_resource(data) and b"\x01\x01\x00\x00" in data:
-                for vtable in variant_tables(data):
-                    texts = [v["text"] for items in vtable.values() for v in items]
-                    out.append((label, offset, language(texts), vtable))
-    return out
-
-
 # ---- sources ----
 def _is_resource(data: bytes) -> bool:
     return data[0x10:0x14] == RESOURCE_MAGIC
@@ -358,6 +349,26 @@ class Scan:
                 yield row
 
 
+class VariantScan(Scan):
+    """A Scan that also collects 0x956a9df5 / 0x10075946 variant rows during the one pass over the sources.
+
+    ``add`` forwards its arguments unchanged rather than repeating the parameter list of ``Scan.add`` (which
+    grew a nested-archive argument on ``main``): the subclass only observes the bytes the scan already read.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.variant_found = []                             # (source, offset, lang, {hash: [variant]})
+
+    def add(self, *args, **kwargs):
+        super().add(*args, **kwargs)
+        source, offset, data = args[0], args[1], args[2]
+        if _is_resource(data) and b"\x01\x01\x00\x00" in data:
+            for table in variant_tables(data):
+                texts = [v["text"] for items in table.values() for v in items]
+                self.variant_found.append((source, offset, language(texts), table))
+
+
 def _clean(s: str) -> str:
     return s.replace("\t", " ").replace("\r", " ").replace("\n", " ")
 
@@ -409,7 +420,7 @@ def main(argv=None) -> int:
         if any(os.path.exists(o) and os.path.samefile(path, o) for o in outs):
             ap.error("an output must not overwrite an input")
 
-    scan = Scan()
+    scan = VariantScan() if a.variants is not None else Scan()
     try:
         for source in a.sources:
             for label, offset, data in blobs(source):
@@ -447,7 +458,7 @@ def main(argv=None) -> int:
                      ({"source": s, "offset": o, "lang": lang, "hash": f"{h:08x}", "label": names.get(h, ""),
                        "gender": v["gender"], "plurality": v["plurality"], "case": v["case"],
                        "text": _clean(v["text"])}
-                      for s, o, lang, vt in collect_variants(a.sources) for h, items in vt.items() for v in items)))
+                      for s, o, lang, vt in scan.variant_found for h, items in vt.items() for v in items)))
     # Stage every report next to its destination, then swap them all in. A write that fails part-way must
     # leave the previous reports intact instead of truncating the ones that came before it.
     staged = []

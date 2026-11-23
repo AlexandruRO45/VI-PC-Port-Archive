@@ -145,12 +145,13 @@ group.
 ```sh
 python -I tools/text_tables.py <carve>/data <carve>/story000 <carve>/story000_restofworld <carve>/shared_minigame000 \
     --labels <temp>/hashes.json \
-    --dialogue <temp>/dialogue.csv --tables <temp>/tables.csv --strings <temp>/strings.csv
+    --dialogue <temp>/dialogue.csv --tables <temp>/tables.csv --strings <temp>/strings.csv \
+    --variants <temp>/variants.csv
 ```
 
 A source is an `rpf9_carve.py` directory, an `.rpf` archive (read through `gamedata_index.py`; nothing is written),
 or files and directories of whole resources. All sources are read before anything is written, because dialogue
-keys and their text sit in different archives.
+keys and their text sit in different archives, and every report comes from that one pass.
 
 | Output | Columns |
 |---|---|
