@@ -236,6 +236,16 @@ refusal list. Older outputs can still establish successes. Missing listings, mis
 and contradictory or incomplete outputs count as unaccounted, with a breakdown by reason.
 Assembler or validator failures and internal translator errors do not establish an explicit refusal.
 
+To compare a listing run with a direct binary run, use
+`python -I tools/fspx_coverage.py OLD_INPUT OLD_OUTPUT --compare NEW_INPUT NEW_OUTPUT --sources listing code`.
+Each side needs its matching unpack index and kind-6 `.code` files. The JSON transition table counts distinct
+SHA-256 identities of the complete code bytes. Read the outer key as the old outcome and the inner key as the new
+one. For example, `refused to validated` counts newly validated programs and `validated to refused` counts explicit
+translation regressions. Each indexed module is checked again with the translator's Vulkan 1.2 `spirv-val` flags.
+Missing results, validation failures and missing inputs have separate outcomes. Duplicate code identities on
+either side are marked ambiguous on that side. Rows without readable identity evidence (missing or empty code)
+are counted outside the table. The report prints only counts.
+
 ## Translation status
 
 With `tools/fspx_unpack.py --disasm` and `tools/rdna2spirv.py` on the 29 programs (`main` at `aa2988cc` with the
