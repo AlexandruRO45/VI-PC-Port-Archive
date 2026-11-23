@@ -249,5 +249,88 @@ class TestASTDefinitions(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0xFFFFFFFF)
 
+
+# ==============================================================================
+# SECTION 3: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+@dataclass
+class ScalarMachineState:
+    sgprs: Dict[int, int] = field(default_factory=dict)
+    scc: int = 0
+
+    def get_sgpr(self, idx: int) -> int:
+        return self.sgprs.get(idx, 0)
+
+    def set_sgpr(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = u32(val)
+
+
+class ScalarInterpreter:
+    def resolve_operand(self, op: Operand, state: ScalarMachineState) -> int:
+        if op.kind == OperandKind.SGPR:
+            return state.get_sgpr(op.value)
+        elif op.kind == OperandKind.IMMEDIATE:
+            return u32(op.value)
+        else:
+            raise ValueError(f"Unsupported operand kind for scalar ALU: {op.kind}")
+
+    def step(self, instr: SXnorB32Instruction, state: ScalarMachineState) -> int:
+        val0 = self.resolve_operand(instr.src0, state)
+        val1 = self.resolve_operand(instr.src1, state)
+        res, scc = ref_s_xnor_b32(val0, val1)
+        state.set_sgpr(instr.dst.value, res)
+        state.scc = scc
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        """Verify interpreter state progression and register file updates."""
+        state = ScalarMachineState()
+        state.set_sgpr(0, 0x0F0F0F0F)
+        state.set_sgpr(1, 0x00FF00FF)
+
+        interp = ScalarInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        res = interp.step(instr, state)
+
+        expected_res, expected_scc = ref_s_xnor_b32(0x0F0F0F0F, 0x00FF00FF)
+        self.assertEqual(res, expected_res)
+        self.assertEqual(state.get_sgpr(2), expected_res)
+        self.assertEqual(state.scc, expected_scc)
+
+    def test_scalar_interpreter_immediate_operand(self) -> None:
+        """Verify scalar interpreter with inline immediate constant."""
+        state = ScalarMachineState()
+        state.set_sgpr(0, 0xF0F0F0F0)
+
+        interp = ScalarInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(3), src0=SGPR(0), src1=Immediate(0x0F0F0F0F))
+        res = interp.step(instr, state)
+
+        # 0xF0F0F0F0 ^ 0x0F0F0F0F = 0xFFFFFFFF -> ~(0xFFFFFFFF) = 0x00000000
+        self.assertEqual(res, 0x00000000)
+        self.assertEqual(state.get_sgpr(3), 0x00000000)
+        self.assertEqual(state.scc, 0)
+
+    def test_scalar_interpreter_cross_validation_with_translator(self) -> None:
+        """Cross-validate interpreter step against translated SPIR-V shader."""
+        state = ScalarMachineState()
+        v0 = 0x13579BDF
+        v1 = 0x2468ACE0
+        state.set_sgpr(0, v0)
+        state.set_sgpr(1, v1)
+
+        interp = ScalarInterpreter()
+        instr = SXnorB32Instruction(dst=SGPR(2), src0=SGPR(0), src1=SGPR(1))
+        interp_res = interp.step(instr, state)
+
+        trans_res, trans_scc = run_translator_salu_xnor(v0, v1, name="ps_scalar_xnor_cross")
+        self.assertEqual(interp_res, trans_res)
+        self.assertEqual(state.scc, trans_scc)
+
 if __name__ == "__main__":
     unittest.main()
