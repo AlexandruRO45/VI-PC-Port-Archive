@@ -104,6 +104,20 @@ class FindHashLookupTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("ERROR", r.stderr)
 
+    def test_a_json_that_names_a_folder_is_refused_before_the_scan(self):
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", tmp],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("--json is a directory", r.stderr)
+            self.assertEqual(len(r.stderr.strip().splitlines()), 1)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertNotIn("occurrence", r.stdout)  # refused before the scan prints anything
+
 
 if __name__ == "__main__":
     unittest.main()
