@@ -288,6 +288,31 @@ class NotWholeWave(unittest.TestCase):
                 self.assertIs(judge(0, DEVICE_64 + "out[0..7] = 55 48 BAD 0 0 0 0 0\n", **kw)[0], False)
 
 
+class Float64CapabilitySkip(unittest.TestCase):
+    """A 32-wide fixture needing shaderFloat64 exits 77 on a device without it: that is a skip, not a FAIL.
+
+    cs_f64_add has always done this at its call site; the shared dump judge did not, so a new f64 fixture was
+    reported as a failure on Apple Silicon / MoltenVK even though the harness named the missing feature.
+    """
+    NO_F64 = (DEVICE_32 + "unsupported: /tmp/cs_w32_trig_preop.spv uses Float64 "
+              "and the device has no shaderFloat64\n")
+
+    def test_a_32_wide_f64_fixture_skips_instead_of_failing(self):
+        self.assertEqual(judge(77, self.NO_F64), (None, "SKIP (no shaderFloat64 on this device)"))
+
+    def test_the_capability_skip_applies_in_every_dump_mode(self):
+        for kw in ({}, {"emulated": True}, {"partial": True}, {"wave64": True}):
+            with self.subTest(**kw):
+                ok, detail = judge(77, self.NO_F64, **kw)
+                self.assertIs(ok, None)
+                self.assertEqual(detail, "SKIP (no shaderFloat64 on this device)")
+
+    def test_other_exit_77_reasons_are_not_mistaken_for_a_float64_skip(self):
+        self.assertIs(judge(77, DEVICE_32 + "unsupported: need 144 push constant bytes, device has 128\n")[0], False)
+
+    def test_a_running_module_is_still_judged_by_its_words(self):
+        self.assertEqual(judge(0, self.NO_F64 + dump(WANT)), (True, "55 48"))
+
 
 class UniformBranchCheck(unittest.TestCase):
     """check_uniform_branch (ps_uniform_branch, ps_scc_mask32) must reject a readback in which no bit=0 pixel got

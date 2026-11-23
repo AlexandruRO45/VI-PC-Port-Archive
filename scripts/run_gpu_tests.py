@@ -343,7 +343,11 @@ def judge_cs_dump(rc: int, msg: str, want: list[int], *, wave64: bool, partial: 
     """Judge one vk_compute_test "dump" run: (True, words), (False, why), or (None, why) when the device can't run it.
     wave64: it was run with --require-wave64, so exit 77 is a skip and the 64-wide confirmation must be printed.
     partial: a group smaller than a wave, run at subgroup size 64 without full subgroups; skipped when the device
-    reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size."""
+    reports no subgroup size of 64. emulated: translated with --wave64-emulate, runs on any subgroup size.
+    A module needing shaderFloat64 that the device lacks is also a skip: the harness exits 77 and names the
+    missing feature, whatever subgroup size the fixture was written for (cs_f64_add does the same at its call)."""
+    if rc == UNSUPPORTED and "shaderFloat64" in msg:
+        return None, "SKIP (no shaderFloat64 on this device)"
     no64 = partial and not emulated and not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg))
     if (wave64 and rc == 77) or (no64 and rc == 0):
         return None, "SKIP (no 64-wide compute subgroup on this device)"
