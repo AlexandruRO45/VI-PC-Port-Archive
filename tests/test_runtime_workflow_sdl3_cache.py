@@ -81,7 +81,9 @@ class Sdl3CacheTest(unittest.TestCase):
         self.assertIn("${{ env.SDL3_TARBALL_SHA256 }}", key.group(1))
         self.assertIn("${{ env.SDL3_CACHE_SALT }}", key.group(1))
         self.assertIn("${{ steps.sdl3-toolset.outputs.version }}", key.group(1))
-        self.assertIn("version=$version", self.toolset)
+        self.assertIn("$env:GITHUB_OUTPUT", self.toolset)
+        self.assertRegex(self.toolset, r'"version=\$')
+        self.assertIn("-replace", self.toolset)
 
     def test_the_toolset_step_reads_cls_file_version(self):
         self.assertIn("shell: pwsh", self.toolset)
