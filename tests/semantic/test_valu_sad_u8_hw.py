@@ -421,5 +421,42 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(result, 9)
 
 
+class TestBoundaryExtremes(unittest.TestCase):
+    def test_all_bytes_max_difference(self):
+        # 0xFF vs 0x00 for each byte: sum = 255*4 = 1020
+        self.assertEqual(ref_sad_u8(0xFFFFFFFF, 0x00000000, 0), 1020)
+        self.assertEqual(ref_sad_u8(0x00000000, 0xFFFFFFFF, 0), 1020)
+
+    def test_single_byte_difference(self):
+        # Only lowest byte differs by 1
+        self.assertEqual(ref_sad_u8(0x00000001, 0x00000000, 0), 1)
+        # Only highest byte differs by 255
+        self.assertEqual(ref_sad_u8(0xFF000000, 0x00000000, 0), 255)
+
+    def test_accumulator_32bit_overflow_wrapping(self):
+        # 0xFFFFFFFF + 1020 wraps: 0xFFFFFFFF + 1020 = 0x1000003FB -> 0x000003FB
+        result = ref_sad_u8(0xFFFFFFFF, 0x00000000, 0xFFFFFFFF)
+        self.assertEqual(result, (0xFFFFFFFF + 1020) & MASK32)
+
+    def test_float_bit_patterns_treated_as_raw_bits(self):
+        # -0.0 (0x80000000) vs +0.0 (0x00000000):
+        # bytes: 0x00, 0x00, 0x00, 0x80 vs 0x00, 0x00, 0x00, 0x00
+        # diff = 0 + 0 + 0 + 128 = 128
+        self.assertEqual(ref_sad_u8(0x80000000, 0x00000000, 0), 128)
+
+        words = run_ps_sad_u8([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 0x00000000",
+            "v_mov_b32 v2, 0",
+            "v_sad_u8 v3, v0, v1, v2",
+        ])
+        self.assertEqual(words[0], 128)
+
+    def test_integer_extremes(self):
+        # INT_MAX (0x7FFFFFFF) vs 0x00000000:
+        # bytes: 0xFF, 0xFF, 0xFF, 0x7F -> sum = 255+255+255+127 = 892
+        self.assertEqual(ref_sad_u8(0x7FFFFFFF, 0x00000000, 0), 892)
+
+
 if __name__ == "__main__":
     unittest.main()
