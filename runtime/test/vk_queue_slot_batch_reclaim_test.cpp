@@ -307,7 +307,11 @@ int main() {
             const auto peak_pools = batch_tracker::live_pools.load(std::memory_order_relaxed);
             const bool signaled = gate.signal(gate_val);
             const bool idled = queue.idle();
-            if (!submitted || !signaled || !idled) {
+            // vkQueueWaitIdle can return before the queue's progress timeline reads the last ticket (AMD Windows
+            // 32.0.32029 can read 3 of 4 right after idle), so wait on the retire timeline before acquire() reads it.
+            const std::uint64_t target_ticket = context.submitted_retire_ticket();
+            const bool retired = idled && context.wait_retire_ticket(target_ticket) >= target_ticket;
+            if (!submitted || !signaled || !retired) {
                 std::fprintf(stderr, "%s: burst submit/signal/idle failed\n", label);
                 return false;
             }
@@ -378,7 +382,9 @@ int main() {
             const bool ok1 = queue.execute({&list_ptr, 1}) == ReplayResult::success;
             const bool sig = gate.signal(gate_val);
             const bool idl = queue.idle();
-            if (!ok0 || !ok1 || !sig || !idl || batch_tracker::live_buffers.load() < 2) {
+            const std::uint64_t reset_ticket = context.submitted_retire_ticket();
+            const bool ret = idl && context.wait_retire_ticket(reset_ticket) >= reset_ticket;
+            if (!ok0 || !ok1 || !sig || !ret || batch_tracker::live_buffers.load() < 2) {
                 std::fprintf(stderr, "reset_failure: setup failed\n");
                 rc = 1;
             } else {
