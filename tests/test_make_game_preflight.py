@@ -259,6 +259,28 @@ class GameCheckTest(PreflightTestBase):
                                       match="test_game.exe is 256 bytes, the manifest has 512.")
                     verify.assert_not_called()
 
+    def test_a_recorded_size_with_a_missing_executable_still_reports_the_note(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=256)
+            os.remove(os.path.join(game_dir, "test_game.exe"))
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch("sys.stdout", stdout_buf):
+                    make_game.check(game_dir, full=False)
+            self.assertIn("is not in the folder", stdout_buf.getvalue())
+            self.assertNotIn("Executable found", stdout_buf.getvalue())
+
+    def test_a_recorded_hash_is_not_read_without_full(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(
+                tmp, expected_exe_size=256, expected_exe_sha256="0" * 64)
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch("sys.stdout", stdout_buf):
+                    make_game.check(game_dir, full=False)
+            self.assertIn("Executable found.", stdout_buf.getvalue())
+            self.assertNotIn("sha256", stdout_buf.getvalue())
+
     def test_full_check_reports_a_matching_executable_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             exe_bytes = b"x" * 256
