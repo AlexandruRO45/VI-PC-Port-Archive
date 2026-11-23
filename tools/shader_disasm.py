@@ -93,7 +93,11 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # One 4-byte word per line: an invalid word then makes llvm-mc echo just that word (and the words it spans)
+    # instead of the whole program, which for the pipeline library is gigabytes of error output. llvm-mc reads
+    # the bytes as one stream regardless of the line breaks, so the decode is unchanged.
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 4])
+                      for i in range(0, len(code), 4))
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
