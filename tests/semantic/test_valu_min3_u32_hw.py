@@ -552,5 +552,39 @@ class TestValuMin3U32ConditionCodes(unittest.TestCase):
         self.assertTrue(flags.is_min_src1)
         self.assertEqual(flags.tie_count, 1)
 
+class TestValuMin3U32IEEE754EdgeCases(unittest.TestCase):
+    """Stage 7: Boundary extremes, subnormals, and NaN handling for v_min3_u32."""
+
+    def test_integer_boundary_extremes(self) -> None:
+        self.assertEqual(oracle_min3_u32(0, 1, 2), 0)
+        self.assertEqual(oracle_min3_u32(MASK32, MASK32 - 1, MASK32), MASK32 - 1)
+        self.assertEqual(oracle_min3_u32(0x8000_0000, 0x7FFF_FFFF, 0x8000_0001), 0x7FFF_FFFF)
+        self.assertEqual(oracle_min3_u32(0x1000_0000, 0x2000_0000, 0x4000_0000), 0x1000_0000)
+
+    def test_float_bitpatterns_treated_as_integers(self) -> None:
+        # In RDNA2, v_min3_u32 treats IEEE 754 bit-patterns strictly as raw unsigned integers
+        pos_inf = struct.unpack(">I", struct.pack(">f", float("inf")))[0]   # 0x7F80_0000
+        neg_inf = struct.unpack(">I", struct.pack(">f", float("-inf")))[0]  # 0xFF80_0000
+        qnan = struct.unpack(">I", struct.pack(">f", float("nan")))[0]      # 0x7FC0_0000
+        
+        # In unsigned integer order: 0x7F80_0000 < 0x7FC0_0000 < 0xFF80_0000
+        self.assertEqual(oracle_min3_u32(pos_inf, neg_inf, qnan), pos_inf)
+        res_trans = run_translated_min3_u32(pos_inf, neg_inf, qnan)
+        self.assertEqual(res_trans, pos_inf)
+
+    def test_float_signed_zeros_treated_as_integers(self) -> None:
+        pos_zero = 0x0000_0000  # +0.0
+        neg_zero = 0x8000_0000  # -0.0
+        # In unsigned integer order: 0x0000_0000 (0) < 0x8000_0000 (2147483648)
+        self.assertEqual(oracle_min3_u32(pos_zero, neg_zero, 100), pos_zero)
+        self.assertEqual(run_translated_min3_u32(pos_zero, neg_zero, 100), pos_zero)
+
+    def test_subnormal_bitpatterns_treated_as_integers(self) -> None:
+        subnormal_min = 1
+        subnormal_max = 0x007F_FFFF
+        normal_min = 0x0080_0000
+        self.assertEqual(oracle_min3_u32(subnormal_min, subnormal_max, normal_min), subnormal_min)
+        self.assertEqual(run_translated_min3_u32(subnormal_min, subnormal_max, normal_min), subnormal_min)
+
 if __name__ == "__main__":
     unittest.main()
