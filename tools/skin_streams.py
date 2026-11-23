@@ -45,6 +45,10 @@ import sys
 import time
 import zlib
 
+# -I keeps the script directory off sys.path; add it back so the sibling helper is importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
+
 PAGE = 4096
 MAX_SYS = 32 * 1024 * 1024
 MAX_GFX = 224 * 1024 * 1024
@@ -342,24 +346,16 @@ def validate(mesh, gfx, layout):
 
 
 def inflate_at(m, at, size):
-    """Inflate the zlib stream at `at`; returns (data, consumed) or (None, 0)."""
-    d = zlib.decompressobj()
-    out, p = [], at
+    """Inflate the zlib stream at `at`; returns (data, consumed) or (None, 0).
+
+    Bounded by tools/bounded_inflate.py: a stream that inflates past its cap is (None, 0), like one that does
+    not end before `size`."""
     try:
-        while not d.eof and p < size:
-            chunk = m[p:min(p + (1 << 20), size)]
-            if not chunk:
-                break
-            out.append(d.decompress(chunk))
-            p += len(chunk)
-            if d.unused_data or d.eof:
-                break
-        data = b"".join(out) + d.flush()
+        data, used, _why = inflate(m, at, size)
     except zlib.error:
         return None, 0
-    if not d.eof:
-        return None, 0
-    return data, p - at - len(d.unused_data)
+    return (data, used) if data is not None else (None, 0)
+
 
 def next_stream(m, fp, size):
     """The next zlib stream at or after `fp` (padding between streams is zero): (data, start, used)."""

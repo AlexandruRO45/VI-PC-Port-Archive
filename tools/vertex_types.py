@@ -45,6 +45,7 @@ import sys
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
 from meshlet_page import PageError, parse_group  # noqa: E402  (same group validation as the 63 30 pages)
 
 MAGIC = 0x4042
@@ -513,26 +514,19 @@ def iter_blocks(path, limit):
                 if head != b"\x42\x40\x00\x00":
                     pos = s + 1
                     continue
-                d = zlib.decompressobj()
-                parts, p = [], s
                 try:
-                    while not d.eof and p < size:
-                        chunk = m[p:p + (1 << 20)]
-                        parts.append(d.decompress(chunk))
-                        p += len(chunk)
-                        if d.unused_data or d.eof:
-                            break
+                    data, used, _why = inflate(m, s, size)
                 except zlib.error:
                     pos = s + 1
                     continue
-                if not d.eof:
+                if data is None:
                     pos = s + 1
                     continue
-                yield os.path.basename(path), s, b"".join(parts) + d.flush()
+                yield os.path.basename(path), s, data
                 found += 1
                 if limit and found >= limit:
                     return
-                pos = p - len(d.unused_data)
+                pos = s + used
         finally:
             m.close()
 

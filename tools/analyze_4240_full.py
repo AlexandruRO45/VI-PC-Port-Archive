@@ -14,6 +14,10 @@ import struct
 import sys
 import zlib
 
+# -I keeps the script directory off sys.path; add it back so the sibling helper is importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
+
 # Constants from meshlet_page.py
 BLOCK_MAGIC = 0x3063       # 63 30 00 00
 OTHER_BLOCK_MAGIC = 0x4042 # 42 40 00 00
@@ -78,25 +82,16 @@ def iter_archive_streams(path):
                     break
                 s = match.start()
                 try:
-                    d = zlib.decompressobj()
-                    chunks = []
-                    p = s
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
-                        chunks.append(d.decompress(block))
-                        p += len(block)
-                        if d.unused_data or d.eof:
-                            break
-                    out = b"".join(chunks) + d.flush()
+                    out, used, _why = inflate(m, s, size)
                 except zlib.error:
                     pos = s + 1
                     continue
-                if not d.eof or len(out) < 64:
+                if out is None or len(out) < 64:
                     pos = s + 1
                     continue
                 if is_mesh_page(out):
                     yield f"0x{s:x}", out
-                pos = p - len(d.unused_data)
+                pos = s + used
         finally:
             m.close()
 

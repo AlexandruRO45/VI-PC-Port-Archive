@@ -119,11 +119,15 @@ def scan_archive(path, start=None, limit=None):
                         chunk = m[p:min(p + CHUNK, end)]
                         if not chunk:
                             break
-                        out = d.decompress(chunk)
-                        if len(head) < HEAD:
-                            head.extend(out[:HEAD - len(head)])
-                        total_out += len(out)
                         p += len(chunk)
+                        # At most CHUNK bytes of output per call (one compressed chunk could otherwise inflate
+                        # to about 1000x its size at once); the rest of the input waits in unconsumed_tail.
+                        while chunk and not d.eof:
+                            out = d.decompress(chunk, CHUNK)
+                            chunk = d.unconsumed_tail
+                            if len(head) < HEAD:
+                                head.extend(out[:HEAD - len(head)])
+                            total_out += len(out)
                         if d.unused_data or d.eof:
                             break
                     tail = d.flush()
