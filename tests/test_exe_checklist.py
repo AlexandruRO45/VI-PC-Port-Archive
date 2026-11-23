@@ -134,6 +134,32 @@ class ExeChecklist(unittest.TestCase):
         text = ec.render(ec.collect(self.root), ec.called_classes([report]))
         self.assertIn("demo.cpp:3` ASSUMPTION (not called)", text)
 
+    def test_a_root_that_is_not_a_folder_is_exit_1(self):
+        # A mistyped --root used to list 0 notes and exit 0, which reads as "nothing left to confirm".
+        for root in (os.path.join(self.root, "missing"),
+                     os.path.join(self.root, "runtime", "shims", "demo.cpp")):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(ec.main(["--root", root]), 1, root)
+            self.assertIn("cannot scan", stderr.getvalue())
+
+    def test_a_folder_with_nothing_to_list_still_works(self):
+        # scripts/first_look.ps1 runs the tool on a root that holds only the tools, so a folder without
+        # runtime/src or docs is not a mistake; it lists nothing and says so.
+        empty = os.path.join(self.root, "empty")
+        os.makedirs(empty)
+        out = os.path.join(self.root, "none.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", empty, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("0 notes", f.read())
+
+    def test_an_out_that_is_a_folder_is_exit_1(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", self.root, "--out", self.root]), 1)
+        self.assertIn("path is a folder", stderr.getvalue())
+
     def test_an_unreadable_report_is_exit_1(self):
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):

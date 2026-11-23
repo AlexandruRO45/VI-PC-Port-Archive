@@ -14,9 +14,10 @@ several). A shim note then says whether the executable calls a runtime class tha
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
 
-Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or
-the checklist cannot be written to --out; 2 when --out refers to an input report.
-Standard library only.
+Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when --root is not a folder (a mistyped one
+would otherwise list nothing, as if nothing needed confirming), when --out is a folder, when a --gdk-calls file
+can't be read, or when the checklist cannot be written to --out; 2 when --out refers to an input report. Reads files
+only. Standard library only.
 Usage: `python -I tools/exe_checklist.py --help` lists the options.
 """
 from __future__ import annotations
@@ -181,7 +182,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", help="write the checklist here instead of stdout")
     ap.add_argument("--root", default=DEFAULT_ROOT, help="the repository (default: %(default)s)")
     a = ap.parse_args(argv)
+    if not os.path.isdir(a.root):
+        print(f"cannot scan {a.root}: not a directory", file=sys.stderr)
+        return 1
     if a.out:
+        if os.path.isdir(a.out):
+            print(f"cannot write the checklist to {a.out}: path is a folder, not a file", file=sys.stderr)
+            return 1
         for report in a.gdk_calls:
             if same_report_path(a.out, report):
                 ap.error(f"--out {a.out} would overwrite the --gdk-calls report {report}")
