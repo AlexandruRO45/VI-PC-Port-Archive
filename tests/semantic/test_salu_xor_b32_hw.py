@@ -17,7 +17,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import enum
-import math
 import os
 import struct
 import sys
@@ -42,18 +41,44 @@ def oracle_xor_b32(s0: int, s1: int) -> tuple[int, int]:
     scc = 1 if res != 0 else 0
     return res, scc
 
+
+def run_hw_xor(s0_val: int, s1_val: int, name: str = "ps_xor_run") -> tuple[int, int]:
+    """Execute s_xor_b32 through rdna2spirv translator and return (sdst, scc)."""
+    s0 = s0_val & MASK32
+    s1 = s1_val & MASK32
+    lines = [
+        f"s_mov_b32 s0, {s0:#x}",
+        f"s_mov_b32 s2, {s1:#x}",
+        "s_xor_b32 s0, s0, s2",
+        "s_cselect_b32 s1, 1, 0",
+        "v_mov_b32_e32 v0, s0",
+        "v_mov_b32_e32 v1, s1",
+        "exp mrt0 v0, v1, v0, v1 done vm",
+        "s_endpgm",
+    ]
+    spv = translate_lines(name, lines)
+    words = mrt0_words(spv)
+    return words[0], words[1]
+
+
 class SXorB32ReferenceOracleTests(unittest.TestCase):
     def test_oracle_identity(self):
         # x ^ x == 0, SCC == 0
         res, scc = oracle_xor_b32(0x12345678, 0x12345678)
         self.assertEqual(res, 0)
         self.assertEqual(scc, 0)
+        hw_res, hw_scc = run_hw_xor(0x12345678, 0x12345678, "ps_oracle_ident")
+        self.assertEqual(hw_res, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_oracle_zero_identity(self):
         # x ^ 0 == x
         res, scc = oracle_xor_b32(0x87654321, 0)
         self.assertEqual(res, 0x87654321)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(0x87654321, 0, "ps_oracle_zero_ident")
+        self.assertEqual(hw_res, 0x87654321)
+        self.assertEqual(hw_scc, 1)
 
     def test_oracle_inversion(self):
         # x ^ ~x == 0xFFFFFFFF, SCC == 1
@@ -62,14 +87,40 @@ class SXorB32ReferenceOracleTests(unittest.TestCase):
         res, scc = oracle_xor_b32(x, not_x)
         self.assertEqual(res, MASK32)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(x, not_x, "ps_oracle_inv")
+        self.assertEqual(hw_res, MASK32)
+        self.assertEqual(hw_scc, 1)
 
     def test_oracle_commutativity(self):
         a, b = 0xF0F00F0F, 0x0F0FAFAF
         self.assertEqual(oracle_xor_b32(a, b), oracle_xor_b32(b, a))
+        hw_ab, scc_ab = run_hw_xor(a, b, "ps_oracle_comm_ab")
+        hw_ba, scc_ba = run_hw_xor(b, a, "ps_oracle_comm_ba")
+        self.assertEqual(hw_ab, hw_ba)
+        self.assertEqual(hw_ab, (a ^ b) & MASK32)
+        self.assertEqual(scc_ab, scc_ba)
+        self.assertEqual(scc_ab, 1)
 
     def test_oracle_zeros(self):
         self.assertEqual(oracle_xor_b32(0, 0), (0, 0))
         self.assertEqual(oracle_xor_b32(MASK32, MASK32), (0, 0))
+        hw_z, scc_z = run_hw_xor(0, 0, "ps_oracle_zeros")
+        self.assertEqual(hw_z, 0)
+        self.assertEqual(scc_z, 0)
+        hw_m, scc_m = run_hw_xor(MASK32, MASK32, "ps_oracle_all_ones")
+        self.assertEqual(hw_m, 0)
+        self.assertEqual(scc_m, 0)
+
+    def test_oracle_overlapping_bits(self):
+        # When bits overlap, XOR clears them (0), while OR preserves them (1)
+        a = 0xAAAAAAAA
+        b = 0xEEEEEEEE
+        res, scc = oracle_xor_b32(a, b)
+        self.assertEqual(res, 0x44444444)
+        self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(a, b, "ps_oracle_overlap")
+        self.assertEqual(hw_res, 0x44444444)
+        self.assertEqual(hw_scc, 1)
 
 class RegKind(enum.Enum):
     SGPR = "sgpr"
@@ -104,6 +155,9 @@ class SXorB32AstValidationTests(unittest.TestCase):
         self.assertEqual(ast.dst.index, 2)
         self.assertEqual(ast.src0.index, 0)
         self.assertEqual(ast.src1.index, 1)
+        hw_res, hw_scc = run_hw_xor(0x12345678, 0x12345678, "ps_ast_construct_hw")
+        self.assertEqual(hw_res, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_ast_imm_operand(self):
         ast = InstructionAST(
@@ -114,6 +168,19 @@ class SXorB32AstValidationTests(unittest.TestCase):
         )
         self.assertEqual(ast.src1.kind, RegKind.IMM)
         self.assertEqual(ast.src1.raw_val, 0x1234)
+        lines = [
+            "s_mov_b32 s0, 0x12340000",
+            "s_xor_b32 s0, s0, 0x1234",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_ast_imm_lowering", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x12341234)
+        self.assertEqual(words[1], 1)
 
     def test_ast_special_operand(self):
         ast = InstructionAST(
@@ -123,6 +190,13 @@ class SXorB32AstValidationTests(unittest.TestCase):
             src1=Operand32(RegKind.IMM, raw_val=0xFFFFFFFF),
         )
         self.assertEqual(ast.dst.kind, RegKind.SPECIAL)
+        lines = [
+            "s_mov_b32 s0, 0xFFFFFFFF",
+            "s_xor_b32 exec_lo, exec_lo, s0",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_ast_special_hw", lines)
+        self.assertIn("OpBitwiseXor", spv)
 
 class ScalarRegisterState:
     def __init__(self):
@@ -165,6 +239,9 @@ class SXorB32ScalarInterpreterTests(unittest.TestCase):
         res = state.get_sgpr(2)
         self.assertEqual(res, 0x0FF00FF0)
         self.assertEqual(state.scc, 1)
+        hw_res, hw_scc = run_hw_xor(0x00FF00FF, 0x0F0F0F0F, "ps_interp_basic")
+        self.assertEqual(hw_res, 0x0FF00FF0)
+        self.assertEqual(hw_scc, 1)
 
     def test_scalar_execution_zero_result(self):
         state = ScalarRegisterState()
@@ -179,19 +256,35 @@ class SXorB32ScalarInterpreterTests(unittest.TestCase):
         execute_scalar_xor_b32(state, ast)
         self.assertEqual(state.get_sgpr(2), 0)
         self.assertEqual(state.scc, 0)
+        hw_res, hw_scc = run_hw_xor(0xABCD1234, 0xABCD1234, "ps_interp_zero")
+        self.assertEqual(hw_res, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_scalar_execution_with_immediate(self):
         state = ScalarRegisterState()
-        state.set_sgpr(0, 0x12340000)
+        state.set_sgpr(0, 0x12345678)
         ast = InstructionAST(
             "s_xor_b32",
             Operand32(RegKind.SGPR, 0),
             Operand32(RegKind.SGPR, 0),
-            Operand32(RegKind.IMM, raw_val=0x00005678),
+            Operand32(RegKind.IMM, raw_val=0x12340000),
         )
         execute_scalar_xor_b32(state, ast)
-        self.assertEqual(state.get_sgpr(0), 0x12345678)
+        self.assertEqual(state.get_sgpr(0), 0x00005678)
         self.assertEqual(state.scc, 1)
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_xor_b32 s0, s0, 0x12340000",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_interp_imm", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x00005678)
+        self.assertEqual(words[1], 1)
 
 class WavefrontState:
     def __init__(self, lane_count: int = 32):
@@ -221,6 +314,13 @@ class SXorB32SimdDivergenceTests(unittest.TestCase):
         # Vector registers are unaffected by scalar operations
         for lane in range(32):
             self.assertEqual(wave.vgprs[lane][0], 0)
+        hw_res, hw_scc = run_hw_xor(0xFF00FF00, 0x00FF00FF, "ps_wave32_uniform")
+        self.assertEqual(hw_res, MASK32)
+        self.assertEqual(hw_scc, 1)
+        exp_res2, exp_scc2 = oracle_xor_b32(0xFFFF00FF, 0x00FFFF0F)
+        hw_res2, hw_scc2 = run_hw_xor(0xFFFF00FF, 0x00FFFF0F, "ps_w32_overlap")
+        self.assertEqual(hw_res2, exp_res2)
+        self.assertEqual(hw_scc2, exp_scc2)
 
     def test_salu_uniform_execution_wave64(self):
         wave = WavefrontState(lane_count=64)
@@ -237,12 +337,18 @@ class SXorB32SimdDivergenceTests(unittest.TestCase):
         self.assertEqual(wave.scalar_state.scc, 1)
         for lane in range(64):
             self.assertEqual(wave.vgprs[lane][0], 0)
+        hw_res, hw_scc = run_hw_xor(0xAAAAAAAA, 0x55555555, "ps_wave64_uniform")
+        self.assertEqual(hw_res, MASK32)
+        self.assertEqual(hw_scc, 1)
+        hw_res2, hw_scc2 = run_hw_xor(0xFFFFFFFF, 0xAAAAAAAA, "ps_w64_overlap")
+        self.assertEqual(hw_res2, 0x55555555)
+        self.assertEqual(hw_scc2, 1)
 
 class SXorB32RegisterAliasingTests(unittest.TestCase):
     def test_dst_aliases_src0(self):
         state = ScalarRegisterState()
-        state.set_sgpr(0, 0x0F0F0F0F)
-        state.set_sgpr(1, 0xF0F0F0F0)
+        state.set_sgpr(0, 0x0FFFFFFF)
+        state.set_sgpr(1, 0x0F0F0F0F)
         ast = InstructionAST(
             "s_xor_b32",
             Operand32(RegKind.SGPR, 0),
@@ -250,8 +356,11 @@ class SXorB32RegisterAliasingTests(unittest.TestCase):
             Operand32(RegKind.SGPR, 1),
         )
         execute_scalar_xor_b32(state, ast)
-        self.assertEqual(state.get_sgpr(0), MASK32)
+        self.assertEqual(state.get_sgpr(0), 0x00F0F0F0)
         self.assertEqual(state.scc, 1)
+        hw_res, hw_scc = run_hw_xor(0x0FFFFFFF, 0x0F0F0F0F, "ps_alias_dst_s0")
+        self.assertEqual(hw_res, 0x00F0F0F0)
+        self.assertEqual(hw_scc, 1)
 
     def test_dst_aliases_src1(self):
         state = ScalarRegisterState()
@@ -266,6 +375,20 @@ class SXorB32RegisterAliasingTests(unittest.TestCase):
         execute_scalar_xor_b32(state, ast)
         self.assertEqual(state.get_sgpr(1), 0)
         self.assertEqual(state.scc, 0)
+        lines = [
+            "s_mov_b32 s0, 0x11111111",
+            "s_mov_b32 s2, 0x11111111",
+            "s_xor_b32 s2, s0, s2",
+            "s_cselect_b32 s1, 1, 0",
+            "v_mov_b32_e32 v0, s2",
+            "v_mov_b32_e32 v1, s1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_alias_dst_s1", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0)
+        self.assertEqual(words[1], 0)
 
     def test_all_operands_alias(self):
         state = ScalarRegisterState()
@@ -279,6 +402,9 @@ class SXorB32RegisterAliasingTests(unittest.TestCase):
         execute_scalar_xor_b32(state, ast)
         self.assertEqual(state.get_sgpr(0), 0)
         self.assertEqual(state.scc, 0)
+        hw_res, hw_scc = run_hw_xor(0x12345678, 0x12345678, "ps_alias_all")
+        self.assertEqual(hw_res, 0)
+        self.assertEqual(hw_scc, 0)
 
     def test_unrelated_registers_preserved(self):
         state = ScalarRegisterState()
@@ -297,6 +423,25 @@ class SXorB32RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(1), 0x22)
         self.assertEqual(state.get_sgpr(2), 0x11 ^ 0x22)
         self.assertEqual(state.get_sgpr(3), 0x44)
+        lines = [
+            "s_mov_b32 s0, 0x11",
+            "s_mov_b32 s1, 0x22",
+            "s_mov_b32 s2, 0x33",
+            "s_mov_b32 s3, 0x44",
+            "s_xor_b32 s2, s0, s1",
+            "v_mov_b32_e32 v0, s0",
+            "v_mov_b32_e32 v1, s1",
+            "v_mov_b32_e32 v2, s2",
+            "v_mov_b32_e32 v3, s3",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_unrelated_preserve", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x11)
+        self.assertEqual(words[1], 0x22)
+        self.assertEqual(words[2], 0x11 ^ 0x22)
+        self.assertEqual(words[3], 0x44)
 
 class SXorB32ConditionCodesTests(unittest.TestCase):
     def test_scc_nonzero_and_zero_transitions(self):
@@ -312,6 +457,8 @@ class SXorB32ConditionCodesTests(unittest.TestCase):
         )
         execute_scalar_xor_b32(state, ast1)
         self.assertEqual(state.scc, 1)
+        hw1, scc1 = run_hw_xor(1, 0, "ps_scc_nz")
+        self.assertEqual(scc1, 1)
 
         # Zero result transitions SCC to 0
         state.set_sgpr(0, 0x55555555)
@@ -324,17 +471,25 @@ class SXorB32ConditionCodesTests(unittest.TestCase):
         )
         execute_scalar_xor_b32(state, ast2)
         self.assertEqual(state.scc, 0)
+        hw2, scc2 = run_hw_xor(0x55555555, 0x55555555, "ps_scc_z")
+        self.assertEqual(scc2, 0)
 
     def test_scc_msb_and_lsb_activation(self):
         # MSB (bit 31) only set -> non-zero -> SCC == 1
         res, scc = oracle_xor_b32(0, 0x80000000)
         self.assertEqual(res, 0x80000000)
         self.assertEqual(scc, 1)
+        hw_msb, scc_msb = run_hw_xor(0, 0x80000000, "ps_scc_msb")
+        self.assertEqual(hw_msb, 0x80000000)
+        self.assertEqual(scc_msb, 1)
 
         # LSB (bit 0) only set -> non-zero -> SCC == 1
         res, scc = oracle_xor_b32(0, 1)
         self.assertEqual(res, 1)
         self.assertEqual(scc, 1)
+        hw_lsb, scc_lsb = run_hw_xor(0, 1, "ps_scc_lsb")
+        self.assertEqual(hw_lsb, 1)
+        self.assertEqual(scc_lsb, 1)
 
 class SXorB32Ieee754BoundariesTests(unittest.TestCase):
     def test_float_sign_bit_toggle(self):
@@ -344,6 +499,9 @@ class SXorB32Ieee754BoundariesTests(unittest.TestCase):
         res, scc = oracle_xor_b32(pos_one_bits, 0x80000000)
         self.assertEqual(res, neg_one_bits)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(pos_one_bits, 0x80000000, "ps_flt_sign")
+        self.assertEqual(hw_res, neg_one_bits)
+        self.assertEqual(hw_scc, 1)
 
     def test_float_nan_payload_preservation(self):
         # XOR with zero preserves NaN bit pattern exactly without canonicalization
@@ -351,6 +509,9 @@ class SXorB32Ieee754BoundariesTests(unittest.TestCase):
         res, scc = oracle_xor_b32(qnan_bits, 0)
         self.assertEqual(res, qnan_bits)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(qnan_bits, 0, "ps_flt_nan")
+        self.assertEqual(hw_res, qnan_bits)
+        self.assertEqual(hw_scc, 1)
 
     def test_subnormal_float_preservation(self):
         # Subnormal float pattern 0x00000001 XOR 0 is preserved (no flush to zero)
@@ -358,6 +519,9 @@ class SXorB32Ieee754BoundariesTests(unittest.TestCase):
         res, scc = oracle_xor_b32(subnorm_bits, 0)
         self.assertEqual(res, subnorm_bits)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(subnorm_bits, 0, "ps_flt_subn")
+        self.assertEqual(hw_res, subnorm_bits)
+        self.assertEqual(hw_scc, 1)
 
     def test_infinity_sign_toggle(self):
         pos_inf_bits = struct.unpack(">I", struct.pack(">f", float("inf")))[0]
@@ -365,6 +529,9 @@ class SXorB32Ieee754BoundariesTests(unittest.TestCase):
         res, scc = oracle_xor_b32(pos_inf_bits, 0x80000000)
         self.assertEqual(res, neg_inf_bits)
         self.assertEqual(scc, 1)
+        hw_res, hw_scc = run_hw_xor(pos_inf_bits, 0x80000000, "ps_flt_inf")
+        self.assertEqual(hw_res, neg_inf_bits)
+        self.assertEqual(hw_scc, 1)
 
 class SXorB32NegativeControlsAndRejectionTests(unittest.TestCase):
     def test_missing_operand_rejection(self):
@@ -432,6 +599,68 @@ class SXorB32TranslatorIntegrationTests(unittest.TestCase):
         res, scc = self._run_ps(lines)
         self.assertEqual(res, 0xFFFFFFFF)
         self.assertEqual(scc, 1)
+
+    def test_translator_emits_bitwise_xor(self):
+        """Verify that support.translate_lines emits OpBitwiseXor for s_xor_b32."""
+        lines = [
+            "s_mov_b32 s0, 0",
+            "s_xor_b32 exec_lo, exec_lo, s0",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_xor_spv_emission", lines)
+        self.assertIn("OpBitwiseXor", spv)
+
+    def test_translator_inline_constants(self):
+        """Verify execution of inline 0 and -1 constants via support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_xor_b32 s1, s0, 0",
+            "s_xor_b32 s2, s0, -1",
+            "v_mov_b32_e32 v0, s1",
+            "v_mov_b32_e32 v1, s2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_xor_inline_consts", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x12345678)
+        self.assertEqual(words[1], (~0x12345678) & MASK32)
+
+    def test_translator_literal_constants(self):
+        """Verify execution with 32-bit literal constants via support.mrt0_words."""
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_xor_b32 s1, s0, 0x00FF00FF",
+            "s_xor_b32 s2, 0x55555555, s0",
+            "v_mov_b32_e32 v0, s1",
+            "v_mov_b32_e32 v1, s2",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_xor_literals", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(words[0], 0x12345678 ^ 0x00FF00FF)
+        self.assertEqual(words[1], 0x55555555 ^ 0x12345678)
+
+    def test_translator_bitwise_patterns_and_checkerboards(self):
+        """Verify execution across standard alternating bit checkerboards."""
+        hw1, scc1 = run_hw_xor(0x55555555, 0xAAAAAAAA, "ps_cb_5_a")
+        self.assertEqual(hw1, 0xFFFFFFFF)
+        self.assertEqual(scc1, 1)
+        hw2, scc2 = run_hw_xor(0x33333333, 0xCCCCCCCC, "ps_cb_3_c")
+        self.assertEqual(hw2, 0xFFFFFFFF)
+        self.assertEqual(scc2, 1)
+        hw3, scc3 = run_hw_xor(0x0F0F0F0F, 0xF0F0F0F0, "ps_cb_0f_f0")
+        self.assertEqual(hw3, 0xFFFFFFFF)
+        self.assertEqual(scc3, 1)
+
+    def test_translator_mutation_xor_to_or_caught(self):
+        """Verify that replacing OpBitwiseXor with OpBitwiseOr produces detectable failure."""
+        res, scc = run_hw_xor(0x12345678, 0x12345678, "ps_mut_test_xor_or")
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+        or_result = 0x12345678 | 0x12345678
+        self.assertNotEqual(res, or_result)
 
 
 if __name__ == "__main__":
