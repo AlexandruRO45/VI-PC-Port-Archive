@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 from dataclasses import dataclass
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,26 @@ class Mutant:
     new: str       # the whole mutated line
 
 
+def _branch_header(lines: list[str], first: int) -> tuple[list[str], int]:
+    """Collect string literals up to the colon that ends an if or elif header."""
+    source = (lines[i] + "\n" for i in range(first, len(lines)))
+    names = []
+    depth = 0
+    for token in tokenize.generate_tokens(lambda: next(source, "")):
+        if token.type == tokenize.STRING and token.string[0] in ("'", '"'):
+            names.append(token.string[1:-1])
+        elif token.type == tokenize.OP:
+            if token.string == ":" and depth == 0:
+                return names, first + token.start[0] - 1
+            if token.string in ("(", "[", "{"):
+                depth += 1
+            elif token.string in (")", "]", "}"):
+                depth -= 1
+        elif token.type == tokenize.NEWLINE:
+            break
+    return [], first
+
+
 def find_branch(lines: list[str], op: str) -> tuple[int, int]:
     """(first, last) 0-based line indices of the if/elif branch whose condition names `op` as a string literal."""
     quoted = f'"{op}"'
@@ -68,11 +89,8 @@ def find_branch(lines: list[str], op: str) -> tuple[int, int]:
         stripped = line.lstrip()
         if not re.match(r"(el)?if\b", stripped) or "op" not in stripped:
             continue
-        cond, j = line, i
-        while not cond.rstrip().endswith(":") and j + 1 < len(lines):     # a condition spread over several lines
-            j += 1
-            cond += lines[j]
-        if quoted not in cond:
+        names, j = _branch_header(lines, i)
+        if op not in names:
             continue
         indent = len(line) - len(stripped)
         end = j
@@ -117,12 +135,9 @@ def table_mutants(lines: list[str], op: str, limit: int = 6) -> list[Mutant]:
 
 
 def branch_ops(lines: list[str], first: int) -> list[str]:
-    """The op names a branch's condition lists (its string literals), in order."""
-    cond, j = lines[first], first
-    while not cond.rstrip().endswith(":") and j + 1 < len(lines):
-        j += 1
-        cond += lines[j]
-    return re.findall(r'"([a-z][a-z0-9_]*)"', cond)
+    """The opcode names in a branch condition, in order."""
+    names, _ = _branch_header(lines, first)
+    return [name for name in names if re.fullmatch(r"[a-z][a-z0-9_]*", name)]
 
 
 def find_function(lines: list[str], name: str) -> tuple[int, int]:

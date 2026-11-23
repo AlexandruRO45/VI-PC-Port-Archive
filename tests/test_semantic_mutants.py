@@ -43,6 +43,23 @@ class BranchLookup(unittest.TestCase):
         self.assertIn("comment line", SOURCE[last])          # the branch runs up to the next elif
         self.assertEqual(sm.branch_ops(SOURCE, first), ["v_one", "v_two", "v_three"])
 
+    def test_branch_lookup_and_shared_ops_ignore_header_comments(self):
+        source = textwrap.dedent('''\
+            if op in (
+                "v_first", 'v_shared',  # "v_comment" is not an opcode in this branch
+            ):  # "v_target" is handled below
+                self.emit(f"{r} = OpIAdd %uint {x} {y}")
+            elif op == "v_target":
+                self.emit(f"{r} = OpISub %uint {x} {y}")
+            ''').splitlines()
+
+        self.assertEqual(sm.find_branch(source, "v_first"), (0, 3))
+        self.assertEqual(sm.find_branch(source, "v_shared"), (0, 3))
+        self.assertEqual(sm.find_branch(source, "v_target"), (4, 5))
+        self.assertEqual(sm.branch_ops(source, 0), ["v_first", "v_shared"])
+        with self.assertRaises(LookupError):
+            sm.find_branch(source, "v_comment")
+
     def test_missing_op_and_function(self):
         with self.assertRaises(LookupError):
             sm.find_branch(SOURCE, "v_five")
