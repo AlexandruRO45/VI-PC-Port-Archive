@@ -102,6 +102,8 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
           ("cs_dpp_bank", [0xffffffff, 0xfffffffe, 0xfffffffd, 0xfffffffc, 7, 7, 7, 7]),
           ("cs_dpp_fi", [1, 2, 3, 0x7777, 5, 6, 7, 0x7777])]
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
+# cs_sopp_noops checks lane 0's own scalar, SCC, VCC and LDS word: it needs no 64-wide subgroup either
+WAVE32_DUMPS += ("cs_sopp_noops",)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
@@ -156,7 +158,11 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_barrier_loop", [128, 96, 64, 32, 128, 96, 64, 0xEEEEEEEE]),
             # SHADER-21 part 2: a mask copied to a VGPR with v_mov_b32 respects EXEC (inactive lanes keep the old VGPR)
             ("cs_mask_vgpr_exec", [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
-                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF])]
+                                   0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF, 0xDEADBEEF]),
+            # the seven instructions translated as nothing: a scalar, SCC, VCC and one LDS word set before them
+            # survive (cs_sopp_noops.asm), as the interpreter checks the same state in test_sopp_noops.py
+            ("cs_sopp_noops", [0x11111111, 0xAAAAAAAA, 0xDDDDDDDD, 0x77,
+                               0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE])]
 # num_records bounds check (cs_bounds.asm): one thread, so no 64-wide subgroup requirement.
 # The SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm header): one thread too.
 # Never run cs_smem_sload_neg with a translator that zero-extends the s_load immediate: it reads 4 GiB past the heap.

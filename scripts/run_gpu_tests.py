@@ -1120,6 +1120,14 @@ def run_suite(a, work: str) -> int:
                     unjudged = ", ".join(str(i) for i, w in enumerate(want) if w is None)
                     detail += f" (words {unjudged} not judged on this device: UNJUDGED_WORDS in check.py)"
             results.append((name, ok, detail))
+        elif name == "cs_sopp_noops":
+            # The seven instructions translated as nothing (cs_sopp_noops.asm): a scalar, SCC, VCC and one LDS
+            # word set before them come back unchanged. Lane 0 only, so no 64-wide subgroup is needed.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            want = [0x11111111, 0xAAAAAAAA, 0xDDDDDDDD, 0x77,
+                    0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE]
+            ok, detail = judge_cs_dump(rc, msg, want, wave64=False, partial=False, emulated=False)
+            results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
             results.append((name, rc == 0, msg.splitlines()[-1] if msg else ""))
