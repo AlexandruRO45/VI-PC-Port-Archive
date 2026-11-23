@@ -265,6 +265,12 @@ class TestPermLaneX16Reference(unittest.TestCase):
         self.assertIn("OpBitwiseXor", spv)
         self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLaneX16RowSwap(unittest.TestCase):
+    def test_row_xor_16(self):
+        # Confirms XOR 16 for opposite half routing
+        spv = run_cs_permlane("v_permlanex16_b32", 0x01234567, 0x89ABCDEF, name="cs_px16_xor16")
+        self.assertIn("OpBitwiseXor", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
