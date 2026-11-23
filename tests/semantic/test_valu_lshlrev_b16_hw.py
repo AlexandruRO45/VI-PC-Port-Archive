@@ -97,3 +97,87 @@ class TestValuLshlrevB16Oracle(unittest.TestCase):
         self.assertNotEqual(res0, res1)
         self.assertEqual(res0, 6)
         self.assertEqual(res1, 8)
+
+
+class Opcode(Enum):
+    V_LSHLREV_B16 = auto()
+
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL16 = auto()
+    INLINE_CONST = auto()
+
+
+@dataclass(frozen=True)
+class ASTOperand:
+    kind: OperandKind
+    index: int = 0
+    value: int = 0
+
+    @classmethod
+    def vgpr(cls, index: int) -> ASTOperand:
+        if index < 0 or index > 255:
+            raise ValueError(f"VGPR index out of range: v{index}")
+        return cls(kind=OperandKind.VGPR, index=index)
+
+    @classmethod
+    def sgpr(cls, index: int) -> ASTOperand:
+        if index < 0 or index > 105:
+            raise ValueError(f"SGPR index out of range: s{index}")
+        return cls(kind=OperandKind.SGPR, index=index)
+
+    @classmethod
+    def literal16(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.LITERAL16, value=u16(val))
+
+    @classmethod
+    def inline_const(cls, val: int) -> ASTOperand:
+        return cls(kind=OperandKind.INLINE_CONST, value=u16(val))
+
+
+@dataclass(frozen=True)
+class ASTInstruction:
+    opcode: Opcode
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+
+    def validate(self) -> None:
+        if self.opcode != Opcode.V_LSHLREV_B16:
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
+
+
+class TestValuLshlrevB16AST(unittest.TestCase):
+    """Test suite for AST opcode definitions and operand validation."""
+
+    def test_ast_construction_valid_operands(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.vgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        inst.validate()
+        self.assertEqual(inst.opcode, Opcode.V_LSHLREV_B16)
+        self.assertEqual(inst.dst.kind, OperandKind.VGPR)
+        self.assertEqual(inst.dst.index, 0)
+        self.assertEqual(inst.src0.index, 1)
+        self.assertEqual(inst.src1.index, 2)
+
+    def test_ast_rejects_out_of_range_vgpr(self):
+        with self.assertRaises(ValueError):
+            ASTOperand.vgpr(256)
+
+    def test_ast_rejects_invalid_dst_kind(self):
+        inst = ASTInstruction(
+            opcode=Opcode.V_LSHLREV_B16,
+            dst=ASTOperand.sgpr(0),
+            src0=ASTOperand.vgpr(1),
+            src1=ASTOperand.vgpr(2),
+        )
+        with self.assertRaises(TypeError):
+            inst.validate()
