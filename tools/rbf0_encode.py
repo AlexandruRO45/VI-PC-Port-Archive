@@ -95,10 +95,10 @@ class _Writer:
                 raise EncodeError("value", f"float spelling {special!r}")
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise EncodeError("value", f"float value {value!r}")
-        fval = float(value)
-        if math.isnan(fval):
-            raise EncodeError("nan", "a NaN float's bits are not in the tree")
         try:
+            fval = float(value)
+            if math.isnan(fval):
+                raise EncodeError("nan", "a NaN float's bits are not in the tree")
             return struct.pack("<d" if self.wide else "<f", fval)
         except OverflowError:
             raise EncodeError("value", f"float value {value!r} overflows {'double' if self.wide else 'float32'}") from None

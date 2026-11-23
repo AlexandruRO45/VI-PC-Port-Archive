@@ -256,6 +256,9 @@ class Refusals(unittest.TestCase):
         self.assertEqual(self.reason(doc=doc), "value")
         doc["tree"]["content"][0]["value"] = math.nan
         self.assertEqual(self.reason(doc=doc), "nan")
+        doc_wide = rbf0_tree.parse_resource(Stream(True).open("r").float("f", 1.5).close().bytes())
+        doc_wide["tree"]["content"][0]["value"] = 10**400
+        self.assertEqual(self.reason(doc=doc_wide), "value")
 
     def test_bool_rejected_for_descriptor_and_attrs_declared(self):
         doc = rbf0_tree.parse_resource(every_record(True))
