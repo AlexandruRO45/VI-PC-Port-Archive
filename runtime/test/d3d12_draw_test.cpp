@@ -84,6 +84,10 @@ int main() {
     const auto stale_ps_program = fssm_program({0x50530004, 0xbf810000, 0, 0x3f800000});
     const auto vs_code_container = shader_container(vs_code_program), ps_code_container = shader_container(ps_code_program);
     const auto stale_ps_container = shader_container(stale_ps_program);
+    // The same PS once more, with an index entry that names dwords 38-39 but declares only 144 bytes (a hand-made or
+    // broken index; the translator writes 160): the layout must still cover what it reads.
+    const auto short_ps_program = fssm_program({0x50530005, 0xbf810000, 0, 0x3f800000});
+    const auto short_ps_container = shader_container(short_ps_program);
     const testfiles::ScratchDir scratch("leonida_draw_test");
     const auto& library = scratch.path();
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_SPV), library / "vs_draw.spv"));
@@ -95,6 +99,7 @@ int main() {
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_VS_CODE_SPV), library / "vs_code.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_CODE_SPV), library / "ps_code.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_CODE_SPV), library / "ps_code_stale.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_PS_CODE_SPV), library / "ps_code_short.spv"));
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"vs_draw\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_program)
@@ -122,7 +127,10 @@ int main() {
               << "\", \"bindings\": [], \"push_constant_bytes\": 160, \"uses_code_base\": true, "
                  "\"code_base_dword\": 38, \"outputs\": [0]},\n"
                  " \"ps_code_stale\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(stale_ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, \"outputs\": [0]},\n"
+                 " \"ps_code_short\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(short_ps_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"uses_code_base\": true, "
+                 "\"code_base_dword\": 38, \"outputs\": [0]}}";
     }
 
     constexpr UINT size = 64;
@@ -187,7 +195,7 @@ int main() {
         pso_desc.NumRenderTargets = 1;
         pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pso_desc.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen, code_pso;
+        Ref<ID3D12PipelineState> pso, unfed, mrt, instanced, refused, xor_pso, fullscreen, code_pso, code_short_pso;
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
         pso_desc.InputLayout = {elements, 1};  // COLOR missing: D3D12 rejects a layout that leaves an input unfed
         EXPECT(device->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&unfed.p)) == E_INVALIDARG && !unfed.p);
@@ -311,6 +319,41 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&code_desc, IID_PPV_ARGS(&code_pso.p))));
         code_desc.PS = {stale_ps_container.data(), stale_ps_container.size()};
         EXPECT(device->CreateGraphicsPipelineState(&code_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
+        // A PS entry that reads 38-39 but declares 144 bytes still gets a 160-byte range: drawn below, top-left.
+        code_desc.PS = {short_ps_container.data(), short_ps_container.size()};
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&code_desc, IID_PPV_ARGS(&code_short_pso.p))));
+        // Devices whose maxPushConstantsSize is too small (simulated limits): at 152 bytes the plain 144-byte block
+        // fits but a PS's 160-byte one does not, so both code-base pipelines are refused (the short-metadata one too,
+        // as its range is raised to 160) and a plain pipeline is not; at 128 bytes every pipeline is refused. A
+        // refused pipeline creates no layout, so nothing breaks VUID-VkPushConstantRange-size-00298.
+        for (const std::uint32_t limit : {152u, 128u}) {
+            rt::d3d12::VulkanDeviceInfo narrow_info = info;
+            narrow_info.max_push_constants_size = limit;
+            narrow_info.push_constants_need_fallback = limit < 144;
+            ID3D12Device* narrow_inner = nullptr;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(narrow_info, IID_PPV_ARGS(&narrow_inner))));
+            Ref<ID3D12Device> narrow;
+            EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(narrow_inner, __uuidof(ID3D12Device),
+                                                               reinterpret_cast<void**>(&narrow.p))));
+            rt::d3d12::set_device_outer(narrow_inner, narrow.p);
+            Ref<ID3D12RootSignature> narrow_root;
+            EXPECT(SUCCEEDED(narrow->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                          IID_PPV_ARGS(&narrow_root.p))));
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC narrow_desc = code_desc;
+            narrow_desc.pRootSignature = narrow_root.p;
+            Ref<ID3D12PipelineState> narrow_pso;
+            narrow_desc.PS = {ps_code_container.data(), ps_code_container.size()};
+            EXPECT(narrow->CreateGraphicsPipelineState(&narrow_desc, IID_PPV_ARGS(&narrow_pso.p)) == E_NOTIMPL &&
+                   !narrow_pso.p);
+            narrow_desc.PS = {short_ps_container.data(), short_ps_container.size()};
+            EXPECT(narrow->CreateGraphicsPipelineState(&narrow_desc, IID_PPV_ARGS(&narrow_pso.p)) == E_NOTIMPL &&
+                   !narrow_pso.p);
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC plain_desc = fullscreen_desc;
+            plain_desc.pRootSignature = narrow_root.p;
+            EXPECT(narrow->CreateGraphicsPipelineState(&plain_desc, IID_PPV_ARGS(&narrow_pso.p)) ==
+                   (limit >= 144 ? S_OK : E_NOTIMPL));
+            EXPECT((narrow_pso.p != nullptr) == (limit >= 144));
+        }
 
         // Geometry: a quad in the top-left quadrant (front-facing, clockwise in D3D screen space) and a triangle in
         // the bottom-left one wound the other way (back-facing).
@@ -476,7 +519,8 @@ int main() {
 
         // Second pass on the same target, cleared blue again: the full-screen triangle (yellow, red tint: red)
         // through a viewport on the bottom-right quadrant, with no vertex buffer in its pipeline, and the code-base
-        // pipeline on the top-right quadrant: red from the VS's program, green from the PS's, so yellow.
+        // pipeline on the top-right quadrant: red from the VS's program, green from the PS's, so yellow. The same
+        // pipeline with the short-metadata PS entry (ps_code_short) draws the top-left quadrant yellow too.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         D3D12_RESOURCE_BARRIER to_target = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -493,6 +537,12 @@ int main() {
         const D3D12_VIEWPORT bottom_right{float(size / 2), float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_right);
         list->SetPipelineState(fullscreen.p);
+        list->DrawInstanced(3, 1, 0, 0);
+        // The short-metadata PS first, right after the 144-byte full-screen pass, so nothing has pushed dwords 38-39
+        // yet: with a 144-byte range its green channel would be lost here.
+        const D3D12_VIEWPORT top_left_quadrant{0, 0, float(size / 2), float(size / 2), 0, 1};
+        list->RSSetViewports(1, &top_left_quadrant);
+        list->SetPipelineState(code_short_pso.p);
         list->DrawInstanced(3, 1, 0, 0);
         const D3D12_VIEWPORT top_right_quadrant{float(size / 2), 0, float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &top_right_quadrant);
@@ -1055,7 +1105,7 @@ int main() {
         EXPECT(list->Close() == E_INVALIDARG);
 
         for (auto* r : {&vertex_buffer, &upload, &readback, &target, &uint_target}) r->reset();
-        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen, &code_pso}) p->reset();
+        for (auto* p : {&mrt, &instanced, &refused, &unfed, &xor_pso, &fullscreen, &code_pso, &code_short_pso}) p->reset();
         pso.reset();
         root.reset();
         rtv_heap.reset();
@@ -1086,13 +1136,14 @@ int main() {
         }
     }
     EXPECT(!mismatches);
-    // Second pass: full-screen triangle bottom-right, the code-base pipeline's yellow top-right, blue elsewhere.
+    // Second pass: full-screen triangle bottom-right, the code-base pipeline's yellow top-right, the same pipeline
+    // with the short-metadata PS entry yellow top-left, blue bottom-left.
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel want = !top && !left ? Pixel{255, 0, 0, 255}
-                               : top && !left ? Pixel{255, 255, 0, 255}
+                               : top          ? Pixel{255, 255, 0, 255}
                                               : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = second_pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;

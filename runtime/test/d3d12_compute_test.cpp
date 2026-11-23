@@ -466,6 +466,25 @@ int main() {
             EXPECT(limited->CreateComputePipelineState(&limited_desc, IID_PPV_ARGS(&refused.p)) == E_NOTIMPL && !refused.p);
         }
 
+        // A compute layout is the 144-byte block (shader_user_data_bytes), not sizeof(ShaderUserData), which counts a
+        // pixel shader's own code-base slot too (160 since SHADER-67). So on a device with 152 bytes (simulated) the
+        // compute PSO is created. A device-limit check sized from sizeof would refuse it here, which is what this
+        // guards; a layout sized from sizeof behind a 144-byte check would only show under the validation layers.
+        {
+            rt::d3d12::VulkanDeviceInfo narrow_info = info;
+            narrow_info.max_push_constants_size = 152;
+            Ref<ID3D12Device> narrow;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(narrow_info, IID_PPV_ARGS(&narrow.p))));
+            EXPECT(!rt::d3d12::device_push_constants_need_fallback(narrow.p));
+            Ref<ID3D12RootSignature> narrow_root;
+            EXPECT(SUCCEEDED(narrow->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+                                                        IID_PPV_ARGS(&narrow_root.p))));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC narrow_desc = pso_desc;
+            narrow_desc.pRootSignature = narrow_root.p;
+            Ref<ID3D12PipelineState> narrow_pso;
+            EXPECT(SUCCEEDED(narrow->CreateComputePipelineState(&narrow_desc, IID_PPV_ARGS(&narrow_pso.p))) && narrow_pso.p);
+        }
+
         // The GPU address arena is no larger than the device's maxBufferSize and maxMemoryAllocationSize
         // (src/arena_size.h), whatever LEONIDA_ARENA_MB asks for: with LEONIDA_ARENA_MB=3000 on a GPU that reports
         // 2 GiB (RX 6800), a run under LEONIDA_VK_VALIDATION=1 has no vkAllocateMemory error. A device that reports

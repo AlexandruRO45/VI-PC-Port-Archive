@@ -3368,6 +3368,18 @@ public:
                     return E_NOTIMPL;
                 }
                 slot = &stage;
+                // The slot sets the block size too, not only push_constant_bytes: a PS that reads its code base from
+                // dwords 38-39 needs 160 bytes even if its index entry says less (the translator always writes 160;
+                // a hand-made or broken index may not). Taking the larger keeps the range over what the shader reads;
+                // the sizeof(ShaderUserData) cap and the device limit below still decide. A stage whose code base
+                // lives in a --pc-tail-ubo tail instead would need this skipped once the runtime binds tails (#2402).
+                const std::uint32_t need = (dword + 2) * 4;
+                if (stage.entry->push_constant_bytes && stage.entry->push_constant_bytes < need)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s reads its code base from dwords %u-%u but its index entry declares "
+                                 "%u push-constant bytes; the layout takes %u\n",
+                                 stage.entry->name.c_str(), dword, dword + 1, stage.entry->push_constant_bytes, need);
+                graphics_.push_bytes = std::max(graphics_.push_bytes, need);
             }
             stage.words = library->spirv(*stage.entry);
             if (stage.words.empty()) return E_FAIL;
