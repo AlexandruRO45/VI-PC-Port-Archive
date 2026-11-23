@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import collections
 from dataclasses import dataclass
+import gc
 import json
 import mmap
 import os
@@ -103,6 +104,26 @@ MAX_INFLATE = 64 << 20
 MAX_CONTINUATIONS = 2048
 RPF9_MAGIC = b"9FPR"
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
+
+# Precompiled record layouts: the parser decodes tens of thousands of records per catalogue, and one
+# `Struct` per record shape avoids re-parsing a format string for every field.
+_TAG_SLOT = struct.Struct("<IxxxxIIQ")
+_EXT_SLOT = struct.Struct("<IxxxxQ")
+_CULL_RECORD = struct.Struct("<QQ")
+# preset: id, parent_id, state count, state capacity, state ptr, category, (gap), tag ptr (+0x30), tag count (+0x38)
+_PRESET_FIELDS = struct.Struct("<IIIIQI20xQH")
+# state: state_id, flags, h0, albedo, normal, extra, ext flag, ext ptr, ext count, ext capacity
+_STATE_FIELDS = struct.Struct("<II4QQQHH")
+_STATE_TAG_FIELDS = struct.Struct("<QH")  # state tag map: ptr at +0xa8, count at +0xb0
+_U32_ARRAYS: list[struct.Struct | None] = [None] * (MAX_TAG_VALUES + 1)
+
+
+def _u32_array(n: int) -> struct.Struct:
+    """Return the cached `Struct` for `n` little-endian `u32`s (`n <= MAX_TAG_VALUES`, so the cache is bounded)."""
+    st = _U32_ARRAYS[n]
+    if st is None:
+        st = _U32_ARRAYS[n] = struct.Struct(f"<{n}I")
+    return st
 
 
 def decode_ptr(ptr: int) -> tuple[int, int]:
@@ -379,25 +400,28 @@ def read_tag_map(
     tags: dict[int, tuple[int, ...]] = {}
     if not count or not map_ptr:
         return tags
-    tb, to = decode_ptr(map_ptr)
-    if tb not in blocks:
+    tb = map_ptr & 0xFFFFF
+    to = map_ptr >> 20
+    block = blocks.get(tb)
+    if block is None:
         if warnings is not None:
             warnings.append(f"tag map points to missing block {tb}")
         return tags
-    bk, tdata = blocks[tb]
+    bk, tdata = block
     if not (SYNTHETIC_BLOCK_MIN <= bk <= SYNTHETIC_BLOCK_MAX):
         if warnings is not None:
             warnings.append(f"tag map points to non-synthetic block type 0x{bk:x}")
         return tags
     if observed_block_types is not None:
         observed_block_types[bk] += 1
-    if to < 0 or to + count * TAG_MAP_SLOT_SIZE > len(tdata):
+    n_slots = count
+    if to + count * TAG_MAP_SLOT_SIZE > len(tdata):
         if warnings is not None:
             warnings.append(f"tag map truncated at block {tb}+0x{to:x} (count={count})")
-    max_slots = max(0, (len(tdata) - to) // TAG_MAP_SLOT_SIZE) if to >= 0 else 0
-    for j in range(min(count, max_slots)):
-        slot_off = to + j * TAG_MAP_SLOT_SIZE
-        tk, tc, _tcap, tpp = struct.unpack_from("<IxxxxIIQ", tdata, slot_off)
+        n_slots = (len(tdata) - to) // TAG_MAP_SLOT_SIZE  # `to` is never negative: it is `ptr >> 20`
+        if n_slots <= 0:
+            return tags
+    for tk, tc, _tcap, tpp in _TAG_SLOT.iter_unpack(tdata[to:to + n_slots * TAG_MAP_SLOT_SIZE]):
         if not tc:
             tags[tk] = ()
             continue
@@ -405,18 +429,22 @@ def read_tag_map(
             if warnings is not None:
                 warnings.append(f"tag key 0x{tk:08x} value count {tc} exceeds cap {MAX_TAG_VALUES}")
             continue
-        ub, uo = decode_ptr(tpp)
-        if ub not in blocks or blocks[ub][0] != TAG_VALUE_BLOCK_TYPE:
+        ub = tpp & 0xFFFFF
+        uo = tpp >> 20
+        ublock = blocks.get(ub)
+        if ublock is None or ublock[0] != TAG_VALUE_BLOCK_TYPE:
             if warnings is not None:
                 warnings.append(f"tag key 0x{tk:08x} value block {ub} missing or not 0x4a")
             continue
-        udata = blocks[ub][1]
-        if uo < 0 or uo + tc * 4 > len(udata):
+        udata = ublock[1]
+        ulen = len(udata)
+        if uo + tc * 4 > ulen:
             if warnings is not None:
                 warnings.append(f"tag key 0x{tk:08x} value array truncated in block {ub}+0x{uo:x}")
-        avail = max(0, (len(udata) - uo) // 4) if uo >= 0 else 0
-        vals = tuple(struct.unpack_from("<I", udata, uo + 4 * q)[0] for q in range(min(tc, avail)))
-        tags[tk] = vals
+            n_vals = min(tc, max(0, (ulen - uo) // 4))
+        else:
+            n_vals = tc
+        tags[tk] = _u32_array(n_vals).unpack_from(udata, uo) if n_vals else ()
     return tags
 
 
@@ -435,35 +463,41 @@ def read_cull_drawable(
     """
     if not ext_count or not ext_ptr:
         return None, ()
-    mb, mo = decode_ptr(ext_ptr)
-    if mb not in blocks:
+    mb = ext_ptr & 0xFFFFF
+    mo = ext_ptr >> 20
+    block = blocks.get(mb)
+    if block is None:
         if warnings is not None:
             warnings.append(f"0xb70a22c1 map points to missing block {mb}")
         return None, ()
-    mbk, mdata = blocks[mb]
+    mbk, mdata = block
     if not (SYNTHETIC_BLOCK_MIN <= mbk <= SYNTHETIC_BLOCK_MAX):
         if warnings is not None:
             warnings.append(f"0xb70a22c1 map points to non-synthetic block type 0x{mbk:x}")
         return None, ()
     if observed_block_types is not None:
         observed_block_types[mbk] += 1
-    if mo < 0 or mo + ext_count * EXT_MAP_SLOT_SIZE > len(mdata):
+    n_slots = ext_count
+    if mo + ext_count * EXT_MAP_SLOT_SIZE > len(mdata):
         if warnings is not None:
             warnings.append(f"0xb70a22c1 map truncated at block {mb}+0x{mo:x} (count={ext_count})")
-    max_slots = max(0, (len(mdata) - mo) // EXT_MAP_SLOT_SIZE) if mo >= 0 else 0
+        n_slots = (len(mdata) - mo) // EXT_MAP_SLOT_SIZE  # `mo` is never negative: it is `ptr >> 20`
+        if n_slots <= 0:
+            return None, ()
     keys: list[int] = []
     cull_ref: CullDrawableRef | None = None
-    for j in range(min(ext_count, max_slots)):
-        mk, mp = struct.unpack_from("<IxxxxQ", mdata, mo + j * EXT_MAP_SLOT_SIZE)
+    for mk, mp in _EXT_SLOT.iter_unpack(mdata[mo:mo + n_slots * EXT_MAP_SLOT_SIZE]):
         keys.append(mk)
         if mk != CULL_DRAWABLE_KEY or cull_ref is not None:
             continue
-        tb, to = decode_ptr(mp)
-        if tb not in blocks:
+        tb = mp & 0xFFFFF
+        to = mp >> 20
+        target = blocks.get(tb)
+        if target is None:
             if warnings is not None:
                 warnings.append(f"cull_drawable points to missing block {tb}")
             continue
-        tbk, tdata = blocks[tb]
+        tbk, tdata = target
         if tbk != CULL_DRAWABLE_STRUCT_HASH:
             if warnings is not None:
                 warnings.append(f"cull_drawable target block {tb} has type 0x{tbk:08x}, expected 0x3d780b74")
@@ -472,7 +506,7 @@ def read_cull_drawable(
             if warnings is not None:
                 warnings.append(f"cull_drawable record truncated at block {tb}+0x{to:x}")
             continue
-        header_qword, cull_hash = struct.unpack_from("<QQ", tdata, to)
+        header_qword, cull_hash = _CULL_RECORD.unpack_from(tdata, to)
         cull_ref = CullDrawableRef(
             key=mk,
             block=tb,
@@ -492,6 +526,25 @@ def parse_catalogue_blocks(
     source: str = "",
 ) -> CatalogueContainer:
     """Parse a `0x8dcb4cf5` ped appearance catalogue from a validated 1-based block dictionary."""
+    # The parse allocates one record object per preset and state and creates no reference cycles, so the cyclic
+    # collector only rescans the growing result; pause it for the duration and restore the caller's setting.
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        return _parse_catalogue_blocks(blocks, root_block, framing=framing, source=source)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+
+
+def _parse_catalogue_blocks(
+    blocks: dict[int, tuple[int, memoryview]],
+    root_block: int,
+    *,
+    framing: str,
+    source: str,
+) -> CatalogueContainer:
     if root_block not in blocks:
         raise ValueError(f"root block {root_block} not present in block table")
     root_type, root_data = blocks[root_block]
@@ -531,42 +584,49 @@ def parse_catalogue_blocks(
             warnings.append(f"0xf795e8ba block {bnum} size {len(data)} is not a multiple of {PRESET_STRIDE}")
         for idx in range(len(data) // PRESET_STRIDE):
             base = idx * PRESET_STRIDE
-            pid, parent_id, c1, _cap1, p1, cat = struct.unpack_from("<IIIIQI", data, base)
-            p2 = struct.unpack_from("<Q", data, base + 48)[0]
-            c2 = struct.unpack_from("<H", data, base + 56)[0]
-            tags = read_tag_map(blocks, p2, c2, warnings=warnings, observed_block_types=tag_block_types)
+            pid, parent_id, c1, _cap1, p1, cat, p2, c2 = _PRESET_FIELDS.unpack_from(data, base)
+            tags = (
+                read_tag_map(blocks, p2, c2, warnings=warnings, observed_block_types=tag_block_types)
+                if c2 and p2
+                else {}
+            )
 
             states: list[StateRecord] = []
             if c1:
-                rb, ro = decode_ptr(p1)
-                if rb not in blocks:
+                rb = p1 & 0xFFFFF
+                ro = p1 >> 20
+                rblock = blocks.get(rb)
+                if rblock is None:
                     warnings.append(f"preset 0x{pid:08x} state array points to missing block {rb}")
-                elif blocks[rb][0] != STATE_STRUCT_HASH:
+                elif rblock[0] != STATE_STRUCT_HASH:
                     warnings.append(
-                        f"preset 0x{pid:08x} state array points to block type 0x{blocks[rb][0]:08x}, expected 0x37e52277"
+                        f"preset 0x{pid:08x} state array points to block type 0x{rblock[0]:08x}, expected 0x37e52277"
                     )
                 else:
-                    rdata = blocks[rb][1]
-                    if ro < 0 or ro + c1 * STATE_STRIDE > len(rdata):
+                    rdata = rblock[1]
+                    n_states = c1
+                    if ro + c1 * STATE_STRIDE > len(rdata):
                         warnings.append(f"preset 0x{pid:08x} state array truncated at block {rb}+0x{ro:x} (count={c1})")
-                    avail = max(0, (len(rdata) - ro) // STATE_STRIDE) if ro >= 0 else 0
-                    for si in range(min(c1, avail)):
+                        n_states = max(0, (len(rdata) - ro) // STATE_STRIDE)
+                    for si in range(n_states):
                         sbase = ro + si * STATE_STRIDE
-                        state_id, sflags = struct.unpack_from("<II", rdata, sbase)
-                        h0, alb, nrm, h3 = struct.unpack_from("<QQQQ", rdata, sbase + STATE_INNER_OFFSET)
-                        _ext_flag, ext_ptr, ext_cnt, _ext_cap = struct.unpack_from("<QQHH", rdata, sbase + EXT_MAP_OFFSET)
-                        cull_ref, ext_keys = read_cull_drawable(
-                            blocks,
-                            ext_ptr,
-                            ext_cnt,
-                            warnings=warnings,
-                            observed_block_types=ext_block_types,
+                        state_id, sflags, h0, alb, nrm, h3, _ext_flag, ext_ptr, ext_cnt, _ext_cap = (
+                            _STATE_FIELDS.unpack_from(rdata, sbase)
                         )
-                        sp2 = struct.unpack_from("<Q", rdata, sbase + 168)[0]
-                        sc2 = struct.unpack_from("<H", rdata, sbase + 176)[0]
+                        if ext_cnt and ext_ptr:
+                            cull_ref, ext_keys = read_cull_drawable(
+                                blocks,
+                                ext_ptr,
+                                ext_cnt,
+                                warnings=warnings,
+                                observed_block_types=ext_block_types,
+                            )
+                        else:
+                            cull_ref, ext_keys = None, ()
+                        sp2, sc2 = _STATE_TAG_FIELDS.unpack_from(rdata, sbase + 168)
                         stags = (
                             read_tag_map(blocks, sp2, sc2, warnings=warnings, observed_block_types=tag_block_types)
-                            if sc2
+                            if sc2 and sp2
                             else {}
                         )
                         cull_hash = cull_ref.drawable_hash if cull_ref is not None else None
@@ -837,7 +897,8 @@ def resolve_preset_bindings(
 
     out: list[ResolvedBinding] = []
     for preset in catalogue.presets:
-        preset_dtags = [v for tk in DRAWABLE_TAG_KEYS for v in preset.tags.get(tk, ()) if v]
+        preset_tags = preset.tags
+        preset_dtags = [v for tk in DRAWABLE_TAG_KEYS for v in preset_tags.get(tk, ()) if v] if preset_tags else []
         inherited_tags: dict[int, tuple[int, ...]] | None = None
         inherited_chain: tuple[int, ...] = ()
 
@@ -847,7 +908,8 @@ def resolve_preset_bindings(
             if cull_only and not state.cull_drawable:
                 continue
 
-            state_dtags = [v for tk in DRAWABLE_TAG_KEYS for v in state.tags.get(tk, ()) if v]
+            state_tags = state.tags
+            state_dtags = [v for tk in DRAWABLE_TAG_KEYS for v in state_tags.get(tk, ()) if v] if state_tags else []
             cull_name = m64_names[state.cull_drawable][0] if state.cull_drawable in m64_names else None
 
             candidates: list[tuple[str, int, int, tuple[int, ...]]] = []
