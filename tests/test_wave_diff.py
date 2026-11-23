@@ -7,10 +7,14 @@ wave_diff.WaveRef, with lane values chosen so that a wrong lane, a wrong half or
 number. The seeded runs execute the repository's translator (tools/rdna2spirv.py) on tests/semantic/spirv_mini_interp.py
 across a whole wave. Standard library only: no llvm-mc, SPIR-V tools, GPU or game data.
 """
+import contextlib
+import io
 import os
+import shlex
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -120,6 +124,72 @@ class Fuzzer(unittest.TestCase):
         self.assertEqual(counts["mismatch"], 0, first)
         self.assertEqual(counts["harness-error"], 0, first)
         self.assertEqual(counts["pass"], 8, counts["skip"])
+
+    def test_replay_compares_only_case_five_of_the_same_mixed_wave_batch(self):
+        options = ["--seed", "1", "--max-ops", "10", "--wave", "both"]
+        with patch.object(wave_diff, "run_one", wraps=wave_diff.run_one) as runner:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(wave_diff.main(["--programs", "6", *options]), 0)
+            self.assertEqual([call.args[2] for call in runner.call_args_list], [32, 64, 32, 64, 32, 64])
+            case_five = runner.call_args_list[5]
+            self.assertEqual(case_five.args[0], "cs_wdiff_0005")
+            runner.reset_mock()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(wave_diff.main(["--program-index", "5", *options]), 0)
+            runner.assert_called_once_with(*case_five.args)
+            self.assertIn("1 pass, 0 mismatch, 0 skipped, 0 harness errors", output.getvalue())
+
+    def test_failure_commands_replay_the_reported_cases(self):
+        options = ["--seed", "37", "--max-ops", "9", "--wave", "32", "--masks-as-data", "--permlane-partial"]
+        for status, code, reporting in [("mismatch", 1, []), ("error", 2, ["--report-all"])]:
+            with self.subTest(status=status), patch.object(wave_diff, "run_one", return_value=(status, "test")) as runner:
+                with contextlib.chdir(ROOT), contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(wave_diff.main(["--programs", "2", *options, *reporting]), code)
+                batch = runner.call_args_list[:]
+                commands = [line.removeprefix("Replay: ").split() for line in output.getvalue().splitlines()
+                            if line.startswith("Replay: ")]
+                self.assertEqual(len(commands), 2 if reporting else 1)
+                for i, command in enumerate(commands):
+                    self.assertEqual(command[:3], ["python", "-I", "tools/wave_diff.py"])
+                    self.assertEqual(command[3:], ["--program-index", str(i), *options])
+                    runner.reset_mock()
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(wave_diff.main(command[3:]), code)
+                    runner.assert_called_once_with(*batch[i].args)
+
+    def test_replay_command_from_another_directory_locates_the_script(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.chdir(tmp):
+            with patch.object(wave_diff, "run_one", return_value=("mismatch", "test")):
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(wave_diff.main(["--program-index", "0"]), 1)
+            line = next(line for line in output.getvalue().splitlines() if line.startswith("Replay: "))
+            prefix, options = line.removeprefix("Replay: python -I ").split(" --program-index ", 1)
+            if os.name == "nt" and prefix.startswith("'"):
+                self.assertTrue(prefix.endswith("'"))
+                script = prefix[1:-1].replace("''", "'")
+            elif os.name == "nt":
+                self.assertTrue(prefix.startswith('"') and prefix.endswith('"'))
+                script = prefix[1:-1]
+            else:
+                script, = shlex.split(prefix)
+            self.assertTrue(os.path.samefile(script, wave_diff.__file__))
+            self.assertTrue(options.startswith("0 "))
+
+    def test_existing_batch_abbreviations_keep_their_meaning(self):
+        for args in (["--pr=2"], ["--program", "2"]):
+            with self.subTest(args=args), patch.object(wave_diff, "run_one", return_value=("match", "")) as runner:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(wave_diff.main(args), 0)
+                self.assertEqual([call.args[0] for call in runner.call_args_list], ["cs_wdiff_0000", "cs_wdiff_0001"])
+
+    def test_invalid_replay_options_fail_before_running_a_case(self):
+        for args in (["--program-index", "-1"], ["--program-index", "0", "--programs", "1"],
+                     ["--program-index", "0", "--self-test"]):
+            with self.subTest(args=args), patch.object(wave_diff, "run_one") as runner:
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    wave_diff.main(args)
+                self.assertEqual(error.exception.code, 2)
+                runner.assert_not_called()
 
 
 if __name__ == "__main__":

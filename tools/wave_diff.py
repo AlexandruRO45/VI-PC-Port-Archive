@@ -25,6 +25,7 @@ a v_cndmask condition) or as data (s_bcnt, s_ff). Known gaps on main stay off un
   --permlane-partial   v_permlane16/x16 under a partial EXEC, where a source lane can be off: SHADER-74, #580
 
     python -I tools/wave_diff.py [--programs N] [--seed S] [--max-ops N] [--wave 32|64|both] [--masks-as-data]
+    python -I tools/wave_diff.py --program-index 5 --seed 1 --max-ops 12 --wave both
     python -I tools/wave_diff.py --self-test       # canaries: a match, a caught sabotage, a counted skip
 
 Exit code 0 when every program matches, 1 on a mismatch (lane, register, both words and the listing), 2 on harness
@@ -34,6 +35,7 @@ import argparse
 import gc
 import os
 import random
+import shlex
 import struct
 import sys
 import tempfile
@@ -436,15 +438,18 @@ def run_one(name, lines, wave=64):
     return ("match", "") if bad is None else ("mismatch", bad)
 
 
-def run_suite(programs, seed, max_ops, waves=(64,), masks_as_data=False, report=None, permlane_partial=False):
+def run_suite(programs, seed, max_ops, waves=(64,), masks_as_data=False, report=None, permlane_partial=False, *,
+              start=0):
     """`report`, when given, is called with (wave, program index, status, detail) for every mismatch and error."""
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
     first = None
     rng = random.Random(seed)
     for i in range(programs):
         wave = waves[i % len(waves)]
-        name = f"cs_wdiff_{i:04d}"
         lines = generate_program(rng, rng.randrange(1, max_ops + 1), wave, masks_as_data, permlane_partial)
+        if i < start:  # Each earlier program consumes a variable number of draws from the same RNG.
+            continue
+        name = f"cs_wdiff_{i:04d}"
         try:
             status, detail = run_one(name, lines, wave)
         except Exception as e:  # noqa: BLE001 - harness and translator crashes must be loud
@@ -497,9 +502,23 @@ def self_test():
     return True
 
 
+def _replay_script():
+    path = os.path.abspath(__file__)
+    if os.path.abspath("tools/wave_diff.py") == path:
+        return "tools/wave_diff.py"
+    if os.name == "nt":
+        if "$" in path or "`" in path:  # Avoid PowerShell interpolation.
+            return "'" + path.replace("'", "''") + "'"
+        return '"' + path + '"'  # Works in both PowerShell and cmd, including paths with spaces.
+    return shlex.quote(path)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="CPU differential fuzzer for wave operations: reference vs translated SPIR-V.")
-    ap.add_argument("--programs", type=int, default=200)
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--programs", type=int, default=200)
+    selection.add_argument("--program-index", type=int, metavar="I",
+                           help="generate the original seeded sequence and run only zero-based case I")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-ops", type=int, default=12)
     ap.add_argument("--wave", choices=("32", "64", "both"), default="both")
@@ -508,21 +527,52 @@ def main(argv=None):
                     help="also v_permlane16/x16 under a partial EXEC (FI = 0, source off: SHADER-74, #580)")
     ap.add_argument("--report-all", action="store_true", help="print one line per mismatch, not only the first")
     ap.add_argument("--self-test", action="store_true", help="run the harness canaries and exit")
-    a = ap.parse_args(argv)
+    # Before --program-index, argparse accepted every prefix from --pr through --program for --programs.
+    args = []
+    for arg in sys.argv[1:] if argv is None else argv:
+        option, equals, value = arg.partition("=")
+        if option.startswith("--pr") and "--programs".startswith(option):
+            arg = "--programs" + equals + value
+        args.append(arg)
+    a = ap.parse_args(args)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
+    if a.program_index is not None:
+        if a.program_index < 0:
+            ap.error("--program-index must be nonnegative")
+        if a.self_test:
+            ap.error("--program-index cannot be combined with --self-test")
     if a.self_test:
         return 0 if self_test() else 1
     waves = (32, 64) if a.wave == "both" else (int(a.wave),)
-    report = (lambda w, i, st, d: print(f"  wave{w} program {i}: {st}: {d}", flush=True)) if a.report_all else None
-    counts, first = run_suite(a.programs, a.seed, a.max_ops, waves, a.masks_as_data, report, a.permlane_partial)
+    first_replay = None
+
+    def report(wave, index, status, detail):
+        nonlocal first_replay
+        command = (f"python -I {_replay_script()} --program-index {index} --seed {a.seed} "
+                   f"--max-ops {a.max_ops} --wave {a.wave}")
+        if a.masks_as_data:
+            command += " --masks-as-data"
+        if a.permlane_partial:
+            command += " --permlane-partial"
+        if first_replay is None:
+            first_replay = command
+        if a.report_all:
+            print(f"  wave{wave} program {index}: {status}: {detail}\nReplay: {command}", flush=True)
+
+    stop = a.programs if a.program_index is None else a.program_index + 1
+    start = 0 if a.program_index is None else a.program_index
+    counts, first = run_suite(stop, a.seed, a.max_ops, waves, a.masks_as_data, report, a.permlane_partial, start=start)
     skips = sum(counts["skip"].values())
-    print(f"{a.programs} programs (seed {a.seed}, wave {a.wave}): {counts['pass']} pass, {counts['mismatch']} "
+    cases = f"{a.programs} programs" if a.program_index is None else f"1 program (index {a.program_index})"
+    print(f"{cases} (seed {a.seed}, wave {a.wave}): {counts['pass']} pass, {counts['mismatch']} "
           f"mismatch, {skips} skipped, {counts['harness-error']} harness errors")
     for reason, n in sorted(counts["skip"].items(), key=lambda x: -x[1]):
         print(f"  skip x{n}: {reason}")
     if first is not None:
         print("FIRST FAILURE:\n" + first)
+        if not a.report_all:
+            print("Replay:", first_replay)
         return 1 if counts["mismatch"] else 2
     return 0
 
