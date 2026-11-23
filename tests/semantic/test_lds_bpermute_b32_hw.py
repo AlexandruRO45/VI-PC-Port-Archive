@@ -16,11 +16,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum, auto
-import math
 import os
 import struct
 import sys
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -564,12 +563,38 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         self.assertIn("OpGroupNonUniformBallot", spv)
 
+    def test_translator_offset_affects_source_lane(self):
+        # Every lane has vaddr=0 and vdata=lane*7+1; offset:16 means src_lane=(0+16)//4=4.
+        # Result: each dst lane reads lane 4's value = 4*7+1 = 29.
+        # With offset:0 each dst lane reads lane 0's value = 1.
+        lines_offset16 = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mad_u32_u24 v2, v0, 7, 1",
+            "ds_bpermute_b32 v3, v1, v2 offset:16",
+        ]
+        results_offset16 = run_cs_bpermute(lines_offset16, 32)
+        self.assertTrue(all(v == 29 for v in results_offset16))
+
+        lines_offset0 = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mad_u32_u24 v2, v0, 7, 1",
+            "ds_bpermute_b32 v3, v1, v2",
+        ]
+        results_offset0 = run_cs_bpermute(lines_offset0, 32)
+        self.assertTrue(all(v == 1 for v in results_offset0))
+
+    def test_translator_offset_124_reads_correct_lane(self):
+        # vaddr=0, offset:124 -> src_lane=(0+124)//4=31; each dst gets lane 31's value = 31*7+1=218.
+        lines = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mad_u32_u24 v2, v0, 7, 1",
+            "ds_bpermute_b32 v3, v1, v2 offset:124",
+        ]
+        results = run_cs_bpermute(lines, 32)
+        self.assertTrue(all(v == 218 for v in results))
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
-
 
 
