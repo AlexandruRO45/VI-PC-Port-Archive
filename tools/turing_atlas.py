@@ -198,7 +198,8 @@ def vulkan_matrix():
 
         for path in files:
             try:
-                with open(path, encoding="utf-8") as f:
+                # utf-8-sig: accept vulkaninfo profile JSON saved with a UTF-8 BOM on Windows.
+                with open(path, encoding="utf-8-sig") as f:
                     doc = json.load(f)
             except (OSError, ValueError):
                 continue

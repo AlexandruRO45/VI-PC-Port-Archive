@@ -150,6 +150,21 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertEqual(matrix["device"]["name"], "Discrete GPU 1")
         self.assertEqual(calls, [("vulkaninfo", "-j"), ("vulkaninfo", "--summary"), ("vulkaninfo", "-j=1")])
 
+    def test_bom_prefixed_profile_json_is_read(self):
+        doc = report()
+
+        def run(cmd, cwd):
+            Path(cwd, "VP_VULKANINFO_Example.json").write_bytes(
+                b"\xef\xbb\xbf" + json.dumps(doc).encode("utf-8")
+            )
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"):
+            with patch.object(turing_atlas, "run", run):
+                matrix = turing_atlas.vulkan_matrix()
+        self.assertEqual(matrix["vulkaninfo"], "ok")
+        self.assertEqual(matrix["device"]["name"], "Example GPU")
+
 
 
 
