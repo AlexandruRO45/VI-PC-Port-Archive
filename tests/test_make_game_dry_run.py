@@ -486,7 +486,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             mock_run.assert_not_called()
             mock_py.assert_not_called()
 
-    def test_texture_pools_resume_only_when_their_listed_dds_files_exist(self) -> None:
+    def test_texture_pools_resume_only_when_their_listed_dds_files_are_nonempty(self) -> None:
         assets = Path(self.work_dir, "assets")
         audio = assets / "audio"
         audio.mkdir(parents=True)
@@ -506,9 +506,11 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
             (dest / "sample" / make_game.DECODER_RECORD).write_text(make_game.decoder_digest(), encoding="utf-8")
         (pack_dest / "sample" / "second.dds").mkdir()
+        (base_dest / "sample" / "empty.dds").touch()
 
         valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
         legacy = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": "second.dds"}]})
+        empty = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": "empty.dds"}]})
         base_call = mock.call(["rpf9dump", "ttpf", str(base_source), str(base_dest)])
         pack_call = mock.call(["rpf9dump", "ttpf", str(pack_source), str(pack_dest)])
         def publish_catalog(cmd):
@@ -518,6 +520,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             ("complete including skipped rows", valid, valid, []),
             ("listed DDS is missing", legacy, valid, [base_call]),
             ("listed DDS is a directory", valid, legacy, [pack_call]),
+            ("listed DDS is empty", empty, valid, [base_call]),
             ("missing texture list", "{}", valid, [base_call]),
             ("incomplete row list", '{"Count": 2, "Textures": [{"File": "first.dds"}]}', valid, [base_call]),
             ("missing File field", valid, '{"Count": 1, "Textures": [{}]}', [pack_call]),
@@ -532,6 +535,35 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
                         mock.patch.object(make_game, "log"), mock.patch("shutil.which", return_value=None):
                     make_game.assets(self.game_dir, self.work_dir, wav=False, jobs=1)
                 self.assertEqual(run.call_args_list, expected)
+
+    def test_ttpf_manifest_requires_nonempty_listed_dds_files(self) -> None:
+        pool_dir = os.path.join(self.tmp.name, "pool")
+        os.makedirs(pool_dir)
+        manifest = {"Count": 3, "Textures": [
+            {"File": "first.dds"}, {"File": "second.dds"},
+            {"File": None, "BCPackLimitation": "unsupported codec"},
+        ]}
+        with open(os.path.join(pool_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f)
+        first = os.path.join(pool_dir, "first.dds")
+        second = os.path.join(pool_dir, "second.dds")
+        for path in (first, second):
+            with open(path, "wb") as f:
+                f.write(b"dds")
+        with mock.patch.object(make_game.os, "stat", side_effect=AssertionError("unexpected path stat")):
+            self.assertEqual(make_game.ttpf_manifest(pool_dir), manifest)
+
+        alt_case = {"Count": 2, "Textures": [{"File": "FIRST.DDS"}, {"File": "second.dds"}]}
+        with open(os.path.join(pool_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(alt_case, f)
+        with mock.patch.object(make_game.os, "stat", side_effect=PermissionError):
+            self.assertIsNone(make_game.ttpf_manifest(pool_dir))
+
+        with open(os.path.join(pool_dir, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f)
+        with open(second, "wb"):
+            pass
+        self.assertIsNone(make_game.ttpf_manifest(pool_dir))
 
     def test_pending_exports_refresh_the_existing_helper_once(self) -> None:
         # Built under the repo (not --work) so `dotnet -o` is not pointed at a locked remote path.
