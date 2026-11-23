@@ -654,6 +654,76 @@ void test_initialise_rejects() {
     }
 }
 
+// An image with no relocation directory whose preferred base is taken. Windows' loader (LdrRelocateImage) refuses to
+// move an image only when IMAGE_FILE_RELOCS_STRIPPED is set; with the flag clear it maps it elsewhere and fixes up
+// nothing, as it does for a second copy of such a DLL. The DllMain stub stores through an absolute address in this
+// process, not in the image, so it runs correctly wherever the image lands.
+void test_moved_without_relocations() {
+    auto img = make_image();
+    auto* nt = nt_of(img);
+    nt->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+    nt->OptionalHeader.ImageBase = leonida_test::free_image_base(0x1C0000000);
+    nt->OptionalHeader.AddressOfEntryPoint = 0x1040;
+    emit_store_stub(img, 0x240, reinterpret_cast<uint64_t>(&g_main_ran), 5, 1);
+    const uint64_t preferred = nt->OptionalHeader.ImageBase;
+    void* held = VirtualAlloc(reinterpret_cast<void*>(preferred), 0x2000, MEM_RESERVE, PAGE_NOACCESS);
+    if (!held) {
+        // Something else holds it already, which is the case under test as well; but make sure it is held.
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(preferred), &info, sizeof info) || info.State == MEM_FREE)
+            return failed("an image without relocations moves when its base is taken", "cannot hold its base");
+    }
+    {
+        const char* what = "an image without relocations, flag clear, moves when its base is taken";
+        g_main_ran = 0;
+        auto p = write_image(img);
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(p);
+            if (reinterpret_cast<uint64_t>(m.base) == preferred || !m.relocated)
+                failed(what, "it was not moved");
+            else if (std::memcmp(m.base + 0x1000, text_raw(img), 0x200) != 0)
+                failed(what, "the mapped section doesn't match the file (something was fixed up)");
+            else {
+                loader.initialise();
+                if (g_main_ran != 5) failed(what, "its DllMain never ran at the new address");
+                else pass(what);
+            }
+        } catch (const std::exception& e) {
+            failed(what, e.what());
+        }
+    }
+    {
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        std::string error;
+        const char* what = "an image with IMAGE_FILE_RELOCS_STRIPPED is refused when its base is taken";
+        if (load(write_image(stripped), error) == 0) failed(what, "the image loaded");
+        else if (error.find("stripped") == std::string::npos) failed(what, "refused for another reason: " + error);
+        else pass(what);
+    }
+    if (held) VirtualFree(held, 0, MEM_RELEASE);
+    {
+        // The flag only forbids moving: at a free base such an image maps as usual.
+        auto stripped = img;
+        nt_of(stripped)->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        expect_loads("an image with IMAGE_FILE_RELOCS_STRIPPED maps at its free base", stripped);
+    }
+    {
+        // Windows refuses on the flag, whatever the relocation directory holds. ImageBase 0 makes the loader move it.
+        auto stripped = make_image();
+        auto* snt = nt_of(stripped);
+        snt->FileHeader.Characteristics |= IMAGE_FILE_RELOCS_STRIPPED;
+        snt->OptionalHeader.ImageBase = 0;
+        snt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {0x1000, 0x0A};
+        auto* block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(stripped.data() + 0x200);
+        block->VirtualAddress = 0x1000;
+        block->SizeOfBlock = 0x0A;
+        reinterpret_cast<uint16_t*>(block + 1)[0] = IMAGE_REL_BASED_DIR64 << 12;
+        expect_rejects("an image with IMAGE_FILE_RELOCS_STRIPPED and a relocation table is not moved", stripped);
+    }
+}
+
 // The images below jump to host observers so notifications remain observable after the mappings are freed.
 // The FLS destructor itself starts in mapped code: leaving it registered would call unmapped memory at exit.
 void emit_jump_stub(std::vector<uint8_t>& img, size_t off, uint64_t target) {
@@ -1335,6 +1405,7 @@ int main() {
         test_section_bounds();
         test_truncation();
         test_relocations();
+        test_moved_without_relocations();
         test_exports();
         test_empty_named_export();
         test_imports();

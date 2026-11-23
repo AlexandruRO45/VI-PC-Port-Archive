@@ -63,7 +63,10 @@ inline void* commit_reserved(std::uint64_t base, std::uint64_t size) {
 }
 
 // The preferred range of `image` when it has no relocations and that range is not free in this process; nullopt
-// when the image can be mapped as it is (or is not a readable PE32+, which the loader reports itself).
+// when the image can be mapped as it is (or is not a readable PE32+, which the loader reports itself). "No
+// relocations" is either IMAGE_FILE_RELOCS_STRIPPED, which the loader refuses to move, or an empty relocation
+// directory with the flag clear, which it moves with nothing fixed up (as Windows does): that is right only for an
+// image with no absolute addresses in it, so its range is kept free all the same.
 inline std::optional<Range> needed(const std::filesystem::path& image) {
     std::ifstream file(image, std::ios::binary);
     IMAGE_DOS_HEADER dos{};
@@ -75,7 +78,8 @@ inline std::optional<Range> needed(const std::filesystem::path& image) {
         !nt.OptionalHeader.SizeOfImage)
         return std::nullopt;
     const auto& oh = nt.OptionalHeader;
-    if (oh.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
+    if (!(nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) &&
+        oh.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC &&
         oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
         return std::nullopt;  // relocatable: the loader moves it if the base is taken
     const Range r{oh.ImageBase, (static_cast<std::uint64_t>(oh.SizeOfImage) + 0xffff) & ~std::uint64_t{0xffff}};
