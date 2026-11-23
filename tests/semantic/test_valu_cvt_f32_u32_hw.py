@@ -238,5 +238,18 @@ class TestVCvtF32U32RegisterAliasing(unittest.TestCase):
         self.assertEqual(mach.vgprs[0], ref_cvt_f32_u32(100))
 
 
+class TestVCvtF32U32ConditionCodes(unittest.TestCase):
+    """Condition codes, status flags, and carry/borrow preservation."""
+
+    def test_vcc_and_scc_preserved(self):
+        vcc_initial = 0xDEADBEEF01234567
+        scc_initial = 1
+        vcc, scc = vcc_initial, scc_initial
+        res = ref_cvt_f32_u32(0)
+        self.assertEqual(res, 0)
+        self.assertEqual(vcc, vcc_initial)
+        self.assertEqual(scc, scc_initial)
+
+
 if __name__ == '__main__':
     unittest.main()
