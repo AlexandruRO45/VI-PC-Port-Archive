@@ -38,6 +38,13 @@ def run_module(directory, module, verbose):
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
+    # A worker that exits 0 without unittest's terminal line did not finish: a file that prints a nested runner's
+    # "Ran N tests ... OK" and then leaves the process would otherwise be counted as a pass with those N tests.
+    finished = re.search(r"^(OK|FAILED)\b", p.stdout, re.M)
+    if p.returncode == 0 and not finished:
+        return 1, int(ran.group(1)) if ran else 0, p.stdout + (
+            "run_semantic_tests: the worker exited 0 without unittest's OK/FAILED line, so this file did not "
+            "finish\n")
     return p.returncode, int(ran.group(1)) if ran else 0, p.stdout
 
 

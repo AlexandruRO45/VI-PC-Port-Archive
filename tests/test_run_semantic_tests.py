@@ -19,6 +19,12 @@ PASS = "import unittest\nimport helper\nclass T(unittest.TestCase):\n    def tes
        "    def test_b(self): pass\n"
 FAIL = "import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertEqual(1, 2, 'boom-msg')\n"
 BROKEN = "import no_such_module_anywhere\n"
+# Prints what a nested runner prints, then leaves before the outer unittest reaches its own summary. Exiting 0 here
+# used to be counted as a pass with that nested "Ran 1 test".
+UNFINISHED = ('import os\n'
+              'print("Ran 1 test in 0.001s")\n'
+              'print("OK")\n'
+              'os._exit(0)\n')
 
 
 def suite(tmp, files):
@@ -70,6 +76,15 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS})
             self.assertEqual(run(tmp, "-j", "1")[0], 0)
+
+    def test_a_worker_that_exits_0_before_unittest_finishes_fails_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "test_short.py": UNFINISHED})
+            code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 1, out)
+            self.assertIn("==== FAILED: test_short", out)
+            self.assertIn("did not finish", out)
+            self.assertIn("1 files failed", out)
 
     def test_an_empty_suite_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
