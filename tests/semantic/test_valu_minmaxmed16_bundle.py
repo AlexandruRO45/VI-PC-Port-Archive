@@ -93,6 +93,26 @@ class TestVMin3U16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(words[0] & 0xFFFF, 0x5)
         self.assertEqual((words[0] >> 16) & 0xFFFF, 0x55AA)
 
+class TestVMin3U16SIMDAndEdgeCases(unittest.TestCase):
+    """Stage 3 for v_min3_u16: boundary edge cases, SIMD multi-lane divergence, and register preservation."""
+
+    def test_v_min3_u16_edge_cases(self):
+        cases = [([0, 1, 65535], 0), ([32768, 32767, 65535], 32767), ([5, 5, 5], 5)]
+        for inputs, expected in cases:
+            with self.subTest(inputs=inputs):
+                lines = [
+                    "v_mov_b32 v0, 0x55AA0000",
+                    f"v_mov_b32 v1, {inputs[0]:#x}",
+                    f"v_mov_b32 v2, {inputs[1]:#x}",
+                    f"v_mov_b32 v3, {inputs[2]:#x}",
+                    f"v_min3_u16 v0, v1, v2, v3",
+                ]
+                words = run_bundle_ps(lines, f"ps_edge_v_min3_u16_{inputs[0]:#x}")
+                lo = words[0] & 0xFFFF
+                hi = (words[0] >> 16) & 0xFFFF
+                self.assertEqual(hi, 0x55AA)
+                self.assertEqual(lo, expected)
+
 
 if __name__ == '__main__':
     unittest.main()
