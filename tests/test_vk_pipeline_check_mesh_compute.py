@@ -97,7 +97,26 @@ class MeshComputeEntries(unittest.TestCase):
             self.skipTest("no Vulkan device: " + (r.stderr.strip().splitlines() or ["(no output)"])[-1])
         return r
 
+    def require_compute_pipelines(self):
+        """Skip a test that needs a pipeline to be created when the same module fails as an ordinary cs too.
+
+        An ms-compute entry gets the checker's compute pipeline layout. Where the device refuses that layout itself
+        (Intel UHD 770 on Windows, 101.7088: the per-stage sampler and image arrays exceed
+        maxPerStageDescriptor*, so vkCreateComputePipelines returns -3 for every cs on main as well), the
+        ms-compute result says nothing about this change. The control runs once per class."""
+        cls = type(self)
+        if not hasattr(cls, "_cs_control"):
+            r = self.run_tool({"cs": {"stage": "cs", "subgroup_size": None}})
+            cls._cs_control = r.stdout + r.stderr
+        if "cs pipelines: 1 ok, 0 failed, 0 skipped" not in cls._cs_control:
+            lines = [ln.strip() for ln in cls._cs_control.splitlines()]
+            why = [ln for ln in lines if ln.startswith(("PIPELINE FAIL", "MODULE FAIL"))] or \
+                  [ln for ln in lines if ln.startswith("cs pipelines:")] or ["no cs pipeline was reported"]
+            self.skipTest("this device can't create an ordinary cs pipeline with the checker's layout either: "
+                          + why[0])
+
     def test_mesh_compute_entry_is_a_compute_pipeline(self):
+        self.require_compute_pipelines()
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None}})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("ms-compute: 1 modules ok, 0 failed", r.stdout)
@@ -105,6 +124,7 @@ class MeshComputeEntries(unittest.TestCase):
         self.assertNotIn("no VK_EXT_mesh_shader", r.stdout)
 
     def test_counted_apart_from_compute_shaders(self):
+        self.require_compute_pipelines()
         r = self.run_tool({"cs": {"stage": "cs", "subgroup_size": None},
                            "mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None}})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -112,6 +132,7 @@ class MeshComputeEntries(unittest.TestCase):
         self.assertIn("ms-compute pipelines: 1 ok, 0 failed, 0 skipped", r.stdout)
 
     def test_compute_only_includes_it_and_graphics_only_leaves_it_out(self):
+        self.require_compute_pipelines()
         index = {"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None}}
         r = self.run_tool(index, "--compute-only")
         self.assertIn("ms-compute pipelines: 1 ok", r.stdout)
@@ -134,6 +155,7 @@ class MeshComputeEntries(unittest.TestCase):
             self.assertIn("no VK_EXT_mesh_shader", r.stdout)
 
     def test_push_constant_layout_covers_the_index_size(self):
+        self.require_compute_pipelines()
         # rdna2spirv.py records 152 bytes for a --mesh-compute module (the buffer address after the 144-byte user
         # SGPRs). The entry is built as compute, so it has to find the 152-byte layout, next to a 144-byte cs.
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": LAYOUT, "subgroup_size": None,
@@ -150,6 +172,7 @@ class MeshComputeEntries(unittest.TestCase):
         self.assertIn("ms-compute pipelines: 0 ok, 0 failed, 1 skipped", r.stdout)
 
     def test_bool_and_null_forms(self):
+        self.require_compute_pipelines()
         r = self.run_tool({"mc": {"stage": "ms", "mesh_compute": True, "subgroup_size": None}})
         self.assertIn("ms-compute pipelines: 1 ok", r.stdout)
         # Absent or null: a real mesh shader as before (created with VK_EXT_mesh_shader, or skipped without it),
