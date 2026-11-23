@@ -4,7 +4,9 @@
 
 Every byte is synthesized by the test. No game file, game audio, or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rsc8_audio.py")
@@ -631,6 +634,35 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
             finally:
                 os.chmod(sub, 0o755)
+
+    def test_unlistable_subfolder_is_a_clean_error_when_chmod_is_not_enough(self):
+        # The chmod case above self-skips on Windows and as root, and CI only runs this file on
+        # windows-latest, so the guard went unexercised there. Forcing os.scandir to raise for one
+        # folder gives os.walk the same PermissionError a real lockout would, on every platform.
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.awc"), "wb") as f:
+                f.write(bank)
+            sub = os.path.join(tmp, "sub")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "b.awc"), "wb") as f:
+                f.write(bank)
+            real_scandir = os.scandir
+            locked = os.path.normcase(os.path.abspath(sub))
+
+            def scandir(path, *args, **kwargs):
+                if os.path.normcase(os.path.abspath(str(path))) == locked:
+                    raise PermissionError(13, "Access is denied", str(path))
+                return real_scandir(path, *args, **kwargs)
+
+            err = io.StringIO()
+            with mock.patch.object(rsc8_audio.os, "scandir", scandir):
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(rsc8_audio.main([tmp, "--quiet"]), 2)
+            self.assertIn("Access is denied", err.getvalue())
+            self.assertIn("sub", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
     def test_window_edges_inside_a_bank(self):
         """--start/--limit inside a bank: adat_bytes stays within the span, and RSC8 headers in a bank that
