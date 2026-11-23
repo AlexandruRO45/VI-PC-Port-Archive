@@ -316,6 +316,24 @@ int main() {
     CHECK(detail::prepare_texture_copy(copy, upload) == ReplayResult::invalid_copy);
     CHECK(upload.buffer_image_copies.size() == 1);
 
+    // A transfer-only COPY family wants buffer offsets that are multiples of 4 (VUID ...-07737, -07746), even for a
+    // 1-byte texel; the same footprint is fine elsewhere and at an offset of 4. The list is refused, not recorded.
+    {
+        detail::Prepared p{};
+        p.binding = upload.binding;
+        p.binding.volume = false;
+        p.binding.depth = 1;
+        p.source = upload.source;
+        CopyTexture odd{};
+        odd.src = {2, true, 0, 2, 4, 3, 1, 256};
+        CHECK(detail::prepare_texture_copy(odd, p) == ReplayResult::success);
+        p.buffer_image_copies.clear();
+        CHECK(detail::prepare_texture_copy(odd, p, true) == ReplayResult::unsupported);
+        CHECK(p.buffer_image_copies.empty());
+        odd.src.offset = 4;
+        CHECK(detail::prepare_texture_copy(odd, p, true) == ReplayResult::success);
+    }
+
     // Block-compressed texture to texture between mips of a 24x24 BC1 texture (mips 24, 12, 6, 3, 1). The host
     // copies whole blocks; where one vkCmdCopyImage extent cannot reach the edge of both mips, the copy is described
     // as a read into transfer scratch and a write from it (offsets from the scratch's start; prepare allocates it).

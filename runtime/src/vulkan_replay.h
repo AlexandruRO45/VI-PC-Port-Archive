@@ -813,6 +813,8 @@ struct ReplayFunctions {
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
+    // The list runs on a queue family without graphics: buffer/image copy offsets must be multiples of 4.
+    bool transfer_only = false;
     PFN_vkCmdCopyBuffer copy_buffer = nullptr;                  // copies
     PFN_vkCmdCopyBufferToImage copy_buffer_to_image = nullptr;
     PFN_vkCmdCopyImageToBuffer copy_image_to_buffer = nullptr;
@@ -1655,7 +1657,10 @@ inline bool copy_subresource(const ResourceBinding& resource, std::uint32_t subr
 
 // CopyTextureRegion: texture to texture, footprint to texture (upload) or texture to footprint (readback).
 // Block-compressed footprints are padded to whole blocks; the Vulkan extent stops at the mip edge.
-inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
+// `transfer_only`: the list runs on a queue family without graphics (a dedicated COPY family). Vulkan then wants every
+// buffer offset of a buffer/image copy to be a multiple of 4 (VUID-vkCmdCopyBufferToImage-commandBuffer-07737,
+// VUID-vkCmdCopyImageToBuffer-commandBuffer-07746), whatever the texel size; D3D12 only asks for the texel size.
+inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p, bool transfer_only = false) {
     if (!copy.dst.footprint && !copy.src.footprint) {
         VkImageSubresourceRange dst{}, src{};
         if (!copy_subresource(p.binding, copy.dst.subresource, dst) ||
@@ -1833,6 +1838,7 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     if (buffer.size > UINT64_MAX - buffer.buffer_offset) return ReplayResult::invalid_copy;
     const VkDeviceSize backing_offset = buffer.buffer_offset + offset;
     if (backing_offset % alignment && !copy.tile_footprint) return ReplayResult::unsupported;
+    if (transfer_only && backing_offset % 4 && !copy.tile_footprint) return ReplayResult::unsupported;
     VkBufferImageCopy region{};
     region.bufferOffset = backing_offset;
     region.bufferRowLength = placed.row_pitch / format.bytes * format.block;
@@ -2748,7 +2754,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         return ReplayResult::unsupported;
                 } else p.buffer_copies.push_back({src, dst, buffer_copy->size});
             } else if (const auto* texture_copy = std::get_if<CopyTexture>(&command)) {
-                result = detail::prepare_texture_copy(*texture_copy, p);
+                result = detail::prepare_texture_copy(*texture_copy, p, vk.transfer_only);
                 if (result == ReplayResult::success && !p.staged_reads.empty()) {
                     // A block-compressed copy staged through transfer scratch (prepare_texture_copy): whole blocks of
                     // the read's row length and height, one region a copy.

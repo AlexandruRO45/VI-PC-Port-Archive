@@ -2201,6 +2201,7 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
+        replay.transfer_only = transfer_only;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
