@@ -663,15 +663,15 @@ int main() {
         // Without VK_KHR_shader_fma (e.g. Pascal / GTX 1070), FMAKHR entries are rejected with an actionable message;
         // entries with only "fma": "khr" and no shaderFmaFloat32 / FMAKHR are accepted.
         std::string reason;
-        CHECK(!check_shader_fma_support(*e_feat, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
+        CHECK(!check_shader_fma_support(*e_feat, false, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
         reason.clear();
-        CHECK(!check_shader_fma_support(*e_cap, false, &reason) && reason.find("--fma glsl") != std::string::npos &&
+        CHECK(!check_shader_fma_support(*e_cap, false, false, &reason) && reason.find("--fma glsl") != std::string::npos &&
               reason.find("--fma exact") != std::string::npos);
-        CHECK(check_shader_fma_support(*e_noop, false, &reason));
+        CHECK(check_shader_fma_support(*e_noop, false, false, &reason));
 
         // Enabling shader_fma_float32 allows FMAKHR shaders.
-        CHECK(check_shader_fma_support(*e_feat, true, &reason));
-        CHECK(check_shader_fma_support(*e_cap, true, &reason));
+        CHECK(check_shader_fma_support(*e_feat, true, false, &reason));
+        CHECK(check_shader_fma_support(*e_cap, true, false, &reason));
 
         // Direct SPIR-V scanning catches unindexed OpCapability FMAKHR (6030) and safely ignores malformed streams.
         const std::vector<std::uint32_t> spv_plain = {0x07230203u, 0x00010500u, 0u, 2u, 0u, (2u << 16) | 17u, 1u};
@@ -683,12 +683,29 @@ int main() {
         CHECK(spirv_declares_capability(spv_fma, kSpvCapabilityFmaKhr));
         CHECK(!spirv_declares_capability(spv_malformed, kSpvCapabilityFmaKhr));
         CHECK(!spirv_declares_capability(spv_truncated, kSpvCapabilityFmaKhr));
-        CHECK(check_shader_fma_support(spv_plain, false, &reason));
+        CHECK(check_shader_fma_support(spv_plain, false, false, &reason));
         reason.clear();
-        CHECK(!check_shader_fma_support(spv_fma, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
-        CHECK(check_shader_fma_support(spv_fma, true, &reason));
-        CHECK(check_shader_fma_support(spv_malformed, false, &reason));
-        CHECK(check_shader_fma_support(spv_truncated, false, &reason));
+        CHECK(!check_shader_fma_support(spv_fma, false, false, &reason) && reason.find("VK_KHR_shader_fma") != std::string::npos);
+        CHECK(check_shader_fma_support(spv_fma, true, false, &reason));
+        CHECK(check_shader_fma_support(spv_malformed, false, false, &reason));
+        CHECK(check_shader_fma_support(spv_truncated, false, false, &reason));
+
+        ShaderEntry doubles;
+        doubles.features = {"shaderFmaFloat64"};
+        CHECK(!check_shader_fma_support(doubles, true, false, &reason));
+        auto double_fma = spv_fma;
+        // A vector of doubles as the OpFmaKHR result. The device has only shaderFmaFloat32.
+        double_fma.insert(double_fma.end(), {0x30016, 1, 64, 0x40017, 2, 1, 2,
+                                             0x60000 | 4427, 2, 3, 4, 5, 6});
+        CHECK(!check_shader_fma_support(double_fma, true, false, &reason));
+
+        CHECK(check_shader_fma_support(doubles, false, true, &reason));
+        CHECK(check_shader_fma_support(double_fma, false, true, &reason));
+        CHECK(!check_shader_fma_support(*e_feat, false, true, &reason));
+        CHECK(check_shader_fma_support(*e_cap, false, true, &reason));
+        doubles.features.push_back("shaderFmaFloat32");
+        CHECK(!check_shader_fma_support(doubles, false, true, &reason));
+        CHECK(check_shader_fma_support(doubles, true, true, &reason));
 
         std::filesystem::remove_all(caps_dir);
     }

@@ -8,6 +8,7 @@
 // writes into `spirv/index.json`, next to `<name>.spv`. This header needs no Windows, Vulkan or third-party code:
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
+#include "spirv_fma_widths.h"
 #include "spirv_words.h"
 
 #include <algorithm>
@@ -723,10 +724,12 @@ struct ShaderEntry {
     std::vector<std::string> features;
     std::vector<std::string> capabilities;
 
-    // True when the index records OpFmaKHR / VK_KHR_shader_fma (shaderFmaFloat32 or capability FMAKHR).
-    // Note: the index's "fma": "khr" flag is not checked because a shader with no f32 FMA ops emits neither.
+    bool has_feature(std::string_view feature) const {
+        return std::find(features.begin(), features.end(), feature) != features.end();
+    }
+
     bool needs_shader_fma() const {
-        return std::find(features.begin(), features.end(), "shaderFmaFloat32") != features.end() ||
+        return has_feature("shaderFmaFloat32") || has_feature("shaderFmaFloat64") ||
                std::find(capabilities.begin(), capabilities.end(), "FMAKHR") != capabilities.end();
     }
 };
@@ -748,30 +751,29 @@ inline bool spirv_declares_capability(std::span<const std::uint32_t> words, std:
     return false;
 }
 
-// Checks whether `entry`'s index metadata (`features`, `capabilities`) requires VK_KHR_shader_fma (OpFmaKHR /
-// shaderFmaFloat32) when the device does not have it enabled. Returns true when supported; otherwise sets `reason`
-// (if non-null) to an actionable diagnostic and returns false.
-inline bool check_shader_fma_support(const ShaderEntry& entry, bool shader_fma_float32,
-                                     std::string* reason = nullptr) {
-    if (entry.needs_shader_fma() && !shader_fma_float32) {
-        if (reason)
-            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
-                      "retranslate with --fma glsl or --fma exact";
-        return false;
-    }
+inline bool missing_shader_fma(const char* feature, std::string* reason) {
+    if (reason)
+        *reason = std::string("needs OpFmaKHR (VK_KHR_shader_fma, ") + feature +
+                  "), which the device does not have enabled; retranslate with --fma glsl or --fma exact";
+    return false;
+}
+
+inline bool check_shader_fma_support(const ShaderEntry& entry, bool f32, bool f64, std::string* reason = nullptr) {
+    if (!f64 && entry.has_feature("shaderFmaFloat64")) return missing_shader_fma("shaderFmaFloat64", reason);
+    if (!f32 && entry.has_feature("shaderFmaFloat32")) return missing_shader_fma("shaderFmaFloat32", reason);
+    // Capability-only metadata carries no width. If either is enabled, inspect the actual module next.
+    if (!f32 && !f64 && entry.needs_shader_fma()) return missing_shader_fma("FMAKHR", reason);
     return true;
 }
 
-// Checks whether a SPIR-V module declares OpCapability FMAKHR (6030) when the device does not have VK_KHR_shader_fma
-// enabled (catches modules whose index.json omitted `features` / `capabilities`).
-inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool shader_fma_float32,
+inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool f32, bool f64,
                                      std::string* reason = nullptr) {
-    if (!shader_fma_float32 && spirv_declares_capability(words, kSpvCapabilityFmaKhr)) {
-        if (reason)
-            *reason = "needs OpFmaKHR (VK_KHR_shader_fma, shaderFmaFloat32), which the device does not have enabled; "
-                      "retranslate with --fma glsl or --fma exact";
-        return false;
-    }
+    if ((f32 && f64) || !spirv_declares_capability(words, kSpvCapabilityFmaKhr)) return true;
+    if (!f32 && !f64) return missing_shader_fma("FMAKHR", reason);
+    bool needs32, needs64;
+    spirv_fma_widths(words.data(), words.size(), needs32, needs64);
+    if (needs32 && !f32) return missing_shader_fma("shaderFmaFloat32", reason);
+    if (needs64 && !f64) return missing_shader_fma("shaderFmaFloat64", reason);
     return true;
 }
 

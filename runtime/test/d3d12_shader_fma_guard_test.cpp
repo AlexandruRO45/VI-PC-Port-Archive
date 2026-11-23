@@ -83,6 +83,18 @@ constexpr std::uint32_t kCsFma[] = {
     0x00010038u,
 };
 
+// Hand-written compute module with a double-precision OpFmaKHR of three constants.
+constexpr std::uint32_t kCsFma64[] = {
+    0x07230203u, 0x00010500u, 0x00070000u, 0x00000008u, 0x00000000u, 0x00020011u, 0x00000001u, 0x00020011u,
+    0x0000000au, 0x00020011u, 0x0000178eu, 0x0004000au, 0x5f565053u, 0x5f52484bu, 0x00616d66u, 0x0003000eu,
+    0x00000000u, 0x00000001u, 0x0005000fu, 0x00000005u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00060010u,
+    0x00000001u, 0x00000011u, 0x00000001u, 0x00000001u, 0x00000001u, 0x00020013u, 0x00000002u, 0x00030021u,
+    0x00000003u, 0x00000002u, 0x00030016u, 0x00000004u, 0x00000040u, 0x0005002bu, 0x00000004u, 0x00000005u,
+    0x00000000u, 0x3ff00000u, 0x00050036u, 0x00000002u, 0x00000001u, 0x00000000u, 0x00000003u, 0x000200f8u,
+    0x00000006u, 0x0006114bu, 0x00000004u, 0x00000007u, 0x00000005u, 0x00000005u, 0x00000005u, 0x000100fdu,
+    0x00010038u,
+};
+
 constexpr std::uint32_t kVsPlain[] = {
     0x07230203u, 0x00010500u, 0x00070000u, 0x0000000cu, 0x00000000u, 0x00020011u, 0x00000001u, 0x0003000eu,
     0x00000000u, 0x00000001u, 0x0006000fu, 0x00000000u, 0x00000001u, 0x6e69616du, 0x00000000u, 0x00000002u,
@@ -189,6 +201,8 @@ int main() {
     const auto p_cs_fma_feat = fssm_program({0x43530002u, 0xbf810000u});
     const auto p_cs_fma_cap = fssm_program({0x43530003u, 0xbf810000u});
     const auto p_cs_fma_spv = fssm_program({0x43530004u, 0xbf810000u});
+    const auto p_cs_fma64 = fssm_program({0x43530005u, 0xbf810000u});
+    const auto c_cs_fma64 = shader_container(p_cs_fma64);
     const auto p_vs_plain = fssm_program({0x56530001u, 0xbf810000u});
     const auto p_vs_fma = fssm_program({0x56530002u, 0xbf810000u});
     const auto p_ps_plain = fssm_program({0x50530001u, 0xbf810000u});
@@ -210,6 +224,7 @@ int main() {
     EXPECT(write_spv(library / "cs_fma_feat.spv", kCsFma));
     EXPECT(write_spv(library / "cs_fma_cap.spv", kCsFma));
     EXPECT(write_spv(library / "cs_fma_spv.spv", kCsFma));
+    EXPECT(write_spv(library / "cs_fma64.spv", kCsFma64));
     EXPECT(write_spv(library / "vs_plain.spv", kVsPlain));
     EXPECT(write_spv(library / "vs_fma.spv", kVsFma));
     EXPECT(write_spv(library / "ps_plain.spv", kPsPlain));
@@ -226,6 +241,8 @@ int main() {
               << "\", \"capabilities\": [\"Shader\", \"FMAKHR\"], \"bindings\": [], \"local_size\": [1, 1, 1]},\n"
               << "  \"cs_fma_spv\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(p_cs_fma_spv)
               << "\", \"bindings\": [], \"local_size\": [1, 1, 1]},\n"
+              << "  \"cs_fma64\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(p_cs_fma64)
+              << "\", \"capabilities\": [\"FMAKHR\"], \"bindings\": [], \"local_size\": [1, 1, 1]},\n"
               << "  \"vs_plain\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(p_vs_plain)
               << "\", \"bindings\": [], \"input_signature\": []},\n"
               << "  \"vs_fma\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(p_vs_fma)
@@ -297,6 +314,18 @@ int main() {
 
         root.reset();
         device.reset();
+        if (d.shader_fma) {
+            // Expose only shaderFmaFloat32 through the caller-owned device contract.
+            info.shader_fma = true;
+            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+            EXPECT(SUCCEEDED(make_root(device.p, &root.p)));
+            const auto cs = compute_desc(root.p, c_cs_fma64);
+            ID3D12PipelineState* refused = reinterpret_cast<ID3D12PipelineState*>(std::uintptr_t{1});
+            EXPECT(device->CreateComputePipelineState(&cs, IID_PPV_ARGS(&refused)) == E_NOTIMPL && !refused);
+            root.reset();
+            device.reset();
+            std::printf("caller-owned f32-only contract: double OpFmaKHR refused\n");
+        }
         EXPECT(d.validation_errors() == 0);
         std::printf("shader_fma=false device: FMAKHR CS/VS/PS refused (E_NOTIMPL), plain CS/VS+PS created%s\n",
                     validating ? "; validation errors: 0" : "");
@@ -340,6 +369,18 @@ int main() {
             } else {
                 EXPECT(hr == E_NOTIMPL && raw == nullptr);
             }
+        }
+        {
+            const auto cs = compute_desc(root.p, c_cs_fma64);
+            ID3D12PipelineState* raw = reinterpret_cast<ID3D12PipelineState*>(std::uintptr_t{1});
+            const HRESULT hr = device->CreateComputePipelineState(&cs, IID_PPV_ARGS(&raw));
+            if (info->shader_fma_float64) {
+                EXPECT(hr == S_OK && raw != nullptr);
+                raw->Release();
+            } else {
+                EXPECT(hr == E_NOTIMPL && raw == nullptr);
+            }
+            std::printf("standalone double OpFmaKHR pipeline: shaderFmaFloat64=%d\n", info->shader_fma_float64);
         }
         {
             const auto gfx = graphics_desc(root.p, c_vs_plain, c_ps_fma);
