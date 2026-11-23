@@ -19,9 +19,11 @@ import sys
 
 try:
     from tools import navmesh_decode as nd
+    from tools.report_paths import same_report_path
 except ImportError:  # pragma: no cover - direct script execution
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import navmesh_decode as nd
+    from report_paths import same_report_path
 
 
 CHECK_NAMES = (
@@ -337,9 +339,15 @@ def main(argv=None):
         if os.path.isdir(args.out):
             sys.stderr.write(f"error: --out path is a directory: {args.out}\n")
             return 2
-        if os.path.abspath(args.out) == os.path.abspath(args.input):
+        if same_report_path(args.out, args.input):
             sys.stderr.write("error: --out must not overwrite the input path\n")
             return 2
+
+    if args.out and os.path.isdir(args.input):
+        for name in os.listdir(args.input):
+            if name.endswith(".bin") and same_report_path(args.out, os.path.join(args.input, name)):
+                sys.stderr.write("error: --out must not overwrite an input stream\n")
+                return 2
 
     doc = scan(args.input, start=args.start, limit=args.limit)
     if args.out is not None:

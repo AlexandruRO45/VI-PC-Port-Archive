@@ -203,6 +203,35 @@ def build_tile(
 
 
 class NavmeshLinksTest(unittest.TestCase):
+    def test_report_preserves_archive_and_carved_input_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "nav.rpf")
+            make_rpf(archive, build_tile())
+            folder = os.path.join(tmp, "carved")
+            os.mkdir(folder)
+            stream = os.path.join(folder, "tile.bin")
+            with open(stream, "wb") as f:
+                f.write(build_tile()[0])
+            for source, protected in ((archive, archive), (folder, stream)):
+                with open(protected, "rb") as f:
+                    original = f.read()
+                alias = os.path.join(tmp, "report.json")
+                os.link(protected, alias)
+                try:
+                    for report in (protected, alias):
+                        with self.subTest(source=source, report=report):
+                            with open(protected, "wb") as f:
+                                f.write(original)
+                            result = subprocess.run(
+                                [sys.executable, "-I", TOOL, source, "--out", report, "--quiet"],
+                                capture_output=True, text=True)
+                            with open(protected, "rb") as f:
+                                self.assertEqual(f.read(), original)
+                            self.assertEqual(result.returncode, 2, result.stderr)
+                finally:
+                    os.unlink(alias)
+
+
     def test_valid_rpf_and_carved_dir(self):
         s1 = build_tile(flags=3)
         s2 = build_tile(flags=1, sector=(260 << 9) | 251, two_streams=True)
