@@ -5,10 +5,13 @@
 Nothing here starts XCL or gta6rt, and no game files are read. The run tests start a small Python script that
 prints the test title's line format in place of a title.
 """
+import contextlib
+import io
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import xcl_compare as xc  # noqa: E402
@@ -155,6 +158,28 @@ class Restart(unittest.TestCase):
         self.assertEqual(attempts, [0, 1])
         self.assertEqual(run.checks["b"]["status"], "HANG")
         self.assertNotIn("c", run.checks)  # run_all marks it NOT RUN
+
+
+class RestartCLI(unittest.TestCase):
+    def test_negative_max_restarts_fails_before_comparison(self):
+        argv = ["xcl_compare.py", "--xcl", "synthetic", "--max-restarts", "-1", "--gui"]
+        stderr = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys, "platform", "win32"), \
+                mock.patch.object(xc, "gui") as gui, contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as error:
+                xc.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("--max-restarts must be non-negative", stderr.getvalue())
+        gui.assert_not_called()
+
+    def test_zero_and_positive_max_restarts_reach_comparison(self):
+        for limit in (0, 1):
+            argv = ["xcl_compare.py", "--xcl", "synthetic", "--max-restarts", str(limit), "--gui"]
+            with self.subTest(limit=limit), mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(sys, "platform", "win32"), mock.patch.object(xc, "gui") as gui:
+                self.assertEqual(xc.main(), 0)
+            gui.assert_called_once()
+            self.assertEqual(gui.call_args.args[0].max_restarts, limit)
 
 
 if __name__ == "__main__":
