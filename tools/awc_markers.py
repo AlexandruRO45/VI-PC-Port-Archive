@@ -20,8 +20,8 @@ with the length of its own stream in 48 kHz frames: for streamed music the descr
 (interleaved samples divided by the packet channel count, read from the TOC stereo bit of the channel's first
 packet), otherwise the Opus format tag (samples / channels). Streams with neither have no length and are counted.
 
-The report holds counts, sizes, 32-bit hashes and numeric ranges only. `--out` is refused, before anything is read, when it names a
-directory or one of the files the scan reads.
+The report holds counts, sizes, 32-bit hashes and numeric ranges only. `--out` is refused, before anything is read,
+when it names a directory or one of the files the scan reads.
 """
 import argparse
 import json
