@@ -736,17 +736,22 @@ class MainTest(unittest.TestCase):
     # --jobs N: more than one test at a time, with the same results, and no overlap CTest would not allow.
 
     def marker(self, name, body="pass"):
-        """A program that logs its start and end (with the time) to markers.log, runs `body`, and exits 0."""
-        log = (self.root / "markers.log").as_posix()
+        """A program that records its start and end (with the time) in markers/, runs `body`, and exits 0. Each mark is
+        its own new file: appends from processes running side by side to one shared file can lose lines on Windows."""
+        marks = (self.root / "markers").as_posix()
         (self.artifact / name).write_text(
-            "import os, sys, time\n"
-            f"def mark(what):\n    open({log!r}, 'a').write(f'{{what}} {{os.path.basename(sys.argv[0])}} {{time.monotonic():.3f}}\\n')\n"
+            "import os, sys, time, uuid\n"
+            f"def mark(what):\n"
+            f"    with open(os.path.join({marks!r}, uuid.uuid4().hex), 'x') as f:\n"
+            f"        f.write(f'{{what}} {{os.path.basename(sys.argv[0])}} {{time.monotonic():.3f}}')\n"
             f"mark('start')\n{body}\nmark('end')\n", encoding="utf-8")
+        (self.root / "markers").mkdir(exist_ok=True)
         return self.command(name)
 
     def marks(self):
-        rows = [line.split() for line in (self.root / "markers.log").read_text().splitlines()]
-        return [(what, name, float(t)) for what, name, t in rows]
+        rows = [path.read_text().split() for path in (self.root / "markers").iterdir()]
+        # a mark cut short by a kill is an empty or partial file: it records nothing
+        return sorted(((what, name, float(t)) for what, name, t in (r for r in rows if len(r) == 3)), key=lambda r: r[2])
 
     def spans(self, name):
         rows = [r for r in self.marks() if r[1] == name]
