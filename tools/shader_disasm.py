@@ -10,13 +10,18 @@ Usage:
 Writes <out>/<name>.s and prints a summary (decoded cleanly / with invalid words / failed).
 Set LLVM_MC to llvm-mc's path, or to a whole command such as
 'wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc' when the tool is not on PATH.
+One llvm-mc call may take LEONIDA_MC_TIMEOUT seconds (120 by default), and ten shaders in a row with no
+disassembly, and no listing between them, end the run: that is a disassembler that has stopped working.
 """
 import argparse
+import math
 import os
+import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -29,14 +34,71 @@ TRIPLE = "amdgcn--amdpal"
 ENDPGM = b"\x00\x00\x81\xbf"
 PROBE = "0x00 0x00 0x81 0xbf"  # s_endpgm: the one instruction every shader ends with
 FAILED = []                    # (path, first stderr line) for shaders that produced no disassembly
-
+IN_A_ROW = [0, None]           # of those: how many since the last listing was written, and the first of them
+IN_A_ROW_LOCK = threading.Lock()
+EXECUTOR = [None]              # the pool main() runs; the worker that counts the tenth failure in a row closes it
 
 MC = mc_command()
+DEFAULT_MC_TIMEOUT = 120.0     # seconds one llvm-mc call may take: the largest shader of a 1.0.2.1 corpus took 5.7 s
+                               # through WSL while a build was running, and the others under 0.6 s
+MAX_IN_A_ROW = 10              # shaders with no disassembly, and no listing between them, that end the run
 
 
 def fail(msg: str) -> "None":
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def mc_timeout() -> float:
+    """Seconds one llvm-mc call may take. LEONIDA_MC_TIMEOUT overrides the default; an invalid value is one line, so
+    a typo cannot quietly remove the limit."""
+    raw = (os.environ.get("LEONIDA_MC_TIMEOUT") or "").strip()
+    if not raw:
+        return DEFAULT_MC_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        fail(f"LEONIDA_MC_TIMEOUT must be a number of seconds greater than zero, not {raw!r}")
+    return value
+
+
+MC_TIMEOUT = mc_timeout()
+
+
+class McTimeout(Exception):
+    """llvm-mc did not answer within MC_TIMEOUT seconds."""
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Stop llvm-mc and every process it started. A relay hands the work to a child that keeps the output pipes open
+    (wsl.exe starts another wsl.exe), and a call stopped at llvm-mc alone waits for that child: a 1 s timeout
+    took 12 s while the child slept. taskkill /T is what tools/xcl_compare.py does; the new session and killpg
+    are what scripts/run_wine_tests.py does."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.kill()
+    proc.wait()
+
+
+def run_mc(args: list, text: str) -> subprocess.CompletedProcess:
+    """One llvm-mc call with `text` on stdin. subprocess.TimeoutExpired when it has not answered within
+    MC_TIMEOUT seconds."""
+    proc = subprocess.Popen(MC + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, errors="replace", start_new_session=os.name != "nt",
+                            creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    try:
+        out, err = proc.communicate(text, timeout=MC_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)    # its output is not collected: a process that outlived the kill may still hold the pipes
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def output_path(path: str, out: str) -> str:
@@ -73,9 +135,10 @@ def positive_int(text: str) -> int:
 def probe(mcpu: str) -> None:
     """Disassemble one s_endpgm first, so a missing tool or AMDGPU target fails now and not per shader."""
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}"],
-                           input=PROBE, capture_output=True, text=True, errors="replace",
-                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+        p = run_mc(["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}"], PROBE)
+    except subprocess.TimeoutExpired:
+        fail(f"'{' '.join(MC)}' did not answer within {MC_TIMEOUT:g} s. Check that the command still runs; "
+             f"LEONIDA_MC_TIMEOUT gives a slow machine more seconds per call")
     except OSError as e:
         fail(f"'{MC[0]}' could not be started: {e}. Put llvm-mc on PATH or set LLVM_MC to it (on Windows,\n"
              f"scripts\\build_llvm_mc.ps1 builds one and sets it), e.g.\n"
@@ -95,9 +158,9 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
         return asm, bad, ""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
-                           input=text, capture_output=True, text=True, errors="replace",
-                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+        p = run_mc(["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"], text)
+    except subprocess.TimeoutExpired:
+        raise McTimeout from None
     except OSError as e:
         return "", 0, str(e)
     bad = p.stderr.count("invalid instruction encoding")
@@ -148,26 +211,49 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
+def no_disassembly(path: str, reason: str) -> None:
+    """Count a shader llvm-mc gave no disassembly for. Ten in a row with no listing between them is a disassembler
+    that has stopped working, not ten shaders: left alone, it costs its failure once per shader for the rest of the
+    run (about 100 s each on WSL 2.6.3, for about 60 hours over the 9,092 shaders left)."""
+    FAILED.append((path, reason))
+    with IN_A_ROW_LOCK:
+        if IN_A_ROW[0] == 0:
+            IN_A_ROW[1] = (path, reason)
+        IN_A_ROW[0] += 1
+        ended = IN_A_ROW[0] == MAX_IN_A_ROW
+    if ended and EXECUTOR[0] is not None:
+        EXECUTOR[0].shutdown(wait=False, cancel_futures=True)   # the shaders still queued are not started
+
+
+def listing_written() -> None:
+    with IN_A_ROW_LOCK:
+        IN_A_ROW[0] = 0
+
+
 def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
     start, end, how = code_range(b)
     if end is None:
         return "no s_endpgm"
-    if start is None:
-        # Walk back in 4-byte steps from the end and keep the longest clean decode.
-        start, best = end - 4, None
-        for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-            _, bad, _ = disasm(b[s:end], mcpu, backend=backend)
-            if bad == 0:
-                best = s
-        if best is None:
-            return "scan failed"
-        start = best
-    asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
+    try:
+        if start is None:
+            # Walk back in 4-byte steps from the end and keep the longest clean decode.
+            start, best = end - 4, None
+            for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
+                _, bad, _ = disasm(b[s:end], mcpu, backend=backend)
+                if bad == 0:
+                    best = s
+            if best is None:
+                return "scan failed"
+            start = best
+        asm, bad, err = disasm(b[start:end], mcpu, backend=backend)
+    except McTimeout:
+        no_disassembly(path, f"llvm-mc did not answer within {MC_TIMEOUT:g} s")
+        return "failed"
     if not asm.strip():  # a broken toolchain, not a shader: never report this as "clean"
         reason = (err.strip().splitlines() or ["no output"])[0]
-        FAILED.append((path, reason))
+        no_disassembly(path, reason)
         return "failed"
     name = os.path.splitext(os.path.basename(path))[0]
     # Only a published listing can be reused after an interruption.
@@ -183,6 +269,7 @@ def one(path, out, mcpu, backend="llvm-mc"):
     finally:
         if os.path.exists(listing.name):
             os.unlink(listing.name)
+    listing_written()
     return "clean" if bad == 0 else "invalid words"
 
 
@@ -232,6 +319,7 @@ def main():
         fail(f"cannot create the output folder {out}: {e.strerror or e}")
     from collections import Counter
     res = Counter()
+    IN_A_ROW[:] = [0, None]    # a second main() in one process counts from its own shaders
     total = len(files)
     every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
     if a.skip_existing:
@@ -247,8 +335,23 @@ def main():
         if a.backend == "llvm-mc":
             probe(a.mcpu)
         with ThreadPoolExecutor(a.jobs) as ex:
-            res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
+            EXECUTOR[0] = ex
+            futures = []
+            for path in files:
+                try:
+                    futures.append(ex.submit(one, path, out, a.mcpu, backend=a.backend))
+                except RuntimeError:     # a worker has already ended the run
+                    break
+        EXECUTOR[0] = None
+        for fut in futures:
+            if not fut.cancelled():      # queued behind ten failures in a row: never started
+                res.update((fut.result(),))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
+    if IN_A_ROW[0] >= MAX_IN_A_ROW:
+        path, reason = IN_A_ROW[1]
+        fail(f"llvm-mc gave no disassembly for {MAX_IN_A_ROW} shaders in a row with no listing between them, "
+             f"first {path}: {reason}. It has stopped working, so the run ended here; once it answers again, the "
+             f"next run resumes with --skip-existing")
     if FAILED:
         path, reason = FAILED[0]
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")

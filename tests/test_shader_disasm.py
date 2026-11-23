@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -468,6 +469,171 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assert_unchanged(inp, data)
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
+
+
+class DisasmStopsEarlyTest(unittest.TestCase):
+    """An llvm-mc that stops answering, or stops answering anything, ends the run instead of failing every shader left.
+
+    Issue: with LLVM_MC set to a WSL command (WSL 2.6.3), every call failed after about 16,600 shaders, each after
+    about 100 s. Each one was reported as a failed shader and the workers went on to the next file, which would
+    have taken about 60 hours for the 9,092 left. Now a call that does not answer within its time limit is a failed
+    call, and ten shaders in a row with no disassembly, and no listing between them, end the run with that reason.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.src = os.path.join(self.dir, "fssm")
+        self.out = os.path.join(self.dir, "out")
+        os.makedirs(self.src)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name: str, code: bytes = CODE) -> None:
+        blob = bytearray(0x200)
+        blob[0:4] = b"FSSM"
+        blob[0xC0:0xC4] = (0x100).to_bytes(4, "little")
+        blob[0x128:0x128 + len(code)] = code
+        with open(os.path.join(self.src, name + ".fssm"), "wb") as f:
+            f.write(blob)
+
+    def run_tool(self, body: str, *args: str, timeout: str | None = None) -> tuple[subprocess.CompletedProcess, float]:
+        """Run the tool over self.src with `body` as llvm-mc; returns the process and the seconds it took."""
+        mc = os.path.join(self.dir, "fake_mc.py")
+        with open(mc, "w", encoding="utf-8") as f:
+            f.write(body)
+        env = dict(os.environ, LLVM_MC=f'"{sys.executable}" "{mc}"')
+        env.pop("LEONIDA_MC_TIMEOUT", None)
+        if timeout is not None:
+            env["LEONIDA_MC_TIMEOUT"] = timeout
+        started = time.monotonic()
+        p = subprocess.run([sys.executable, "-I", TOOL, self.src, "--out", self.out, *args],
+                           capture_output=True, text=True, errors="replace", env=env)
+        return p, time.monotonic() - started
+
+    def test_an_llvm_mc_that_fails_every_shader_ends_the_run(self):
+        for i in range(12):
+            self.write(f"s{i:02d}")
+        p, _ = self.run_tool("import sys\n"
+                             "if sys.stdin.read().strip() == %r:\n"
+                             "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                             "else:\n"
+                             "    sys.stderr.write('error: the relay did not answer\\n')\n"
+                             "    sys.exit(1)\n" % PROBE, "--jobs", "1")
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("'failed': 10", p.stdout)      # the last two were never started
+        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+        self.assertIn("llvm-mc gave no disassembly for 10 shaders in a row with no listing between them", p.stderr)
+        self.assertIn(os.path.join(self.src, "s00.fssm"), p.stderr)
+        self.assertIn("error: the relay did not answer", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_failed_shaders_apart_from_each_other_do_not_end_the_run(self):
+        """Three failures in twelve, each with a listing after it, are three failed shaders as before."""
+        other = b"\x01\x00\x80\xbf\x00\x00\x81\xbf"   # s_nop 1: its input starts with 0x01, which the fake can see
+        for i in range(12):
+            self.write(f"s{i:02d}", other if i in (1, 5, 9) else CODE)
+        p, _ = self.run_tool("import sys\n"
+                             "data = sys.stdin.read().strip()\n"
+                             "if data == %r:\n"
+                             "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                             "elif data.startswith('0x01'):\n"
+                             "    sys.stderr.write('error: this one is refused\\n')\n"
+                             "    sys.exit(1)\n"
+                             "else:\n"
+                             "    print(%r)\n" % (PROBE, ASM), "--jobs", "1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("'clean': 9, 'failed': 3", p.stdout)
+        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+        self.assertIn("3 shader(s) produced no disassembly", p.stderr)
+        self.assertNotIn("in a row", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(len(os.listdir(self.out)), 9)
+
+    def test_an_llvm_mc_that_hangs_is_stopped_and_reported(self):
+        """A relay's child keeps the output pipes open, so llvm-mc alone must not be the only process stopped."""
+        self.write("one")
+        p, seconds = self.run_tool("import subprocess, sys, time\n"
+                                   "if sys.stdin.read().strip() != %r:   # not the probe: the relay hands the work on\n"
+                                   "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                                   "    time.sleep(60)\n"
+                                   "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n" % PROBE,
+                                   "--jobs", "1", timeout="1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertLess(seconds, 20, "the 1 s limit was not kept")
+        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+        self.assertIn("1 shader(s) produced no disassembly", p.stderr)
+        self.assertIn("llvm-mc did not answer within 1 s", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_a_hang_at_the_probe_is_reported_at_once(self):
+        self.write("one")
+        p, seconds = self.run_tool("import subprocess, sys, time\n"
+                                   "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                                   "time.sleep(60)\n"
+                                   "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n", timeout="2")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertLess(seconds, 20, "the 2 s limit was not kept")
+        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+        self.assertIn("did not answer within 2 s", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_the_next_run_resumes_from_the_listings_written_before_it_ended(self):
+        """Three listings, then a disassembler that fails from the fourth call on, which make_game.py resumes."""
+        for i in range(14):
+            self.write(f"s{i:02d}")
+        calls = os.path.join(self.dir, "calls")
+        p, _ = self.run_tool("import os, sys\n"
+                             "if sys.stdin.read().strip() == %r:\n"
+                             "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                             "else:\n"
+                             "    n = (int(open(%r).read()) if os.path.exists(%r) else 0) + 1\n"
+                             "    open(%r, 'w').write(str(n))\n"
+                             "    if n > 3:\n"
+                             "        sys.stderr.write('error: the relay did not answer\\n')\n"
+                             "        sys.exit(1)\n"
+                             "    print(%r)\n" % (PROBE, calls, calls, calls, ASM), "--jobs", "1")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("'clean': 3, 'failed': 10", p.stdout)
+        self.assertEqual(sorted(os.listdir(self.out)), ["s00.s", "s01.s", "s02.s"])
+
+        p, _ = self.run_tool("import sys\n"
+                             "probe = sys.stdin.read().strip() == %r\n"
+                             "print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]' if probe else %r)\n" % (PROBE, ASM),
+                             "--jobs", "1", "--skip-existing")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'reused': 3, 'clean': 11", p.stdout)
+        self.assertEqual(len(os.listdir(self.out)), 14)
+
+    def test_the_timeout_must_be_a_positive_number_of_seconds(self):
+        self.write("one")
+        for value in ("0", "-5", "soon", "inf", "nan"):
+            with self.subTest(value=value):
+                p, _ = self.run_tool("import sys\nprint('s_endpgm')\n", timeout=value)
+                self.assertEqual(p.returncode, 1, p.stderr)
+                self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+                self.assertIn("LEONIDA_MC_TIMEOUT must be a number of seconds greater than zero", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertEqual(os.path.exists(self.out), False)   # refused before anything is created
+
+    def test_the_timeout_comes_from_the_environment(self):
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        saved = os.environ.pop("LEONIDA_MC_TIMEOUT", None)
+        try:
+            import shader_disasm
+            self.assertEqual(shader_disasm.MC_TIMEOUT, shader_disasm.DEFAULT_MC_TIMEOUT)
+            for raw, want in (("30", 30.0), (" 45.5 ", 45.5), ("2e1", 20.0)):
+                with self.subTest(raw=raw):
+                    os.environ["LEONIDA_MC_TIMEOUT"] = raw
+                    self.assertEqual(shader_disasm.mc_timeout(), want)
+        finally:
+            os.environ.pop("LEONIDA_MC_TIMEOUT", None)
+            if saved is not None:
+                os.environ["LEONIDA_MC_TIMEOUT"] = saved
 
 
 if __name__ == "__main__":

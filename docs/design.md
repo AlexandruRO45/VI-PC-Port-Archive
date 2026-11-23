@@ -560,7 +560,10 @@ the tests, `runtime/test/shaders/build.py` and `scripts/run_gpu_tests.py`; the a
 on stdin, so a WSL command never receives a Windows file path.
 
 `shader_disasm.py` disassembles one `s_endpgm` before starting, so a missing tool or AMDGPU target stops the run
-with that reason instead of writing empty `.s` files. To disassemble by hand inside WSL:
+with that reason instead of writing empty `.s` files. One `llvm-mc` call may take 120 s (`LEONIDA_MC_TIMEOUT`
+changes it), and ten shaders in a row with no disassembly, and no listing between them, end the run with that
+reason: a disassembler that has stopped answering or working then costs its failure ten times, not once per shader.
+The next run resumes from the listings written. To disassemble by hand inside WSL:
 
 ```
 LLVM_MC=/usr/lib/llvm-21/bin/llvm-mc python3 -I <repo>/tools/shader_disasm.py <work>/shaders/fssm
