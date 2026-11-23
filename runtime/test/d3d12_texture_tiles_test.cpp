@@ -166,10 +166,14 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     const D3D12_TILED_RESOURCE_COORDINATE starts[] = {origin, right};
     const D3D12_TILE_REGION_SIZE column_regions[] = {column, column};
     const UINT heap_offset = 0;
-    queue->UpdateTileMappings(a.Get(), 2, starts, column_regions, heap.Get(), 1, nullptr, &heap_offset, nullptr,
-                              D3D12_TILE_MAPPING_FLAG_NONE);
-    queue->CopyTileMappings(b.Get(), &right, a.Get(), &origin, &column, D3D12_TILE_MAPPING_FLAG_NONE);
-    queue->CopyTileMappings(b.Get(), &origin, a.Get(), &right, &column, D3D12_TILE_MAPPING_FLAG_NONE);
+    // Keep the native reference's setup on its copy queue: AMD can read incorrect texels
+    // after a direct-to-copy mapping handoff. The Vulkan layer still tests that handoff, and
+    // both paths still hand off from the copy to the direct queue for the final snapshot.
+    auto* mapping_queue = !layer && separate_copy_queue ? copy_queue.Get() : queue.Get();
+    mapping_queue->UpdateTileMappings(a.Get(), 2, starts, column_regions, heap.Get(), 1, nullptr, &heap_offset,
+                                     nullptr, D3D12_TILE_MAPPING_FLAG_NONE);
+    mapping_queue->CopyTileMappings(b.Get(), &right, a.Get(), &origin, &column, D3D12_TILE_MAPPING_FLAG_NONE);
+    mapping_queue->CopyTileMappings(b.Get(), &origin, a.Get(), &right, &column, D3D12_TILE_MAPPING_FLAG_NONE);
     transition(*lists[1].Get(), a.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     lists[1]->CopyTiles(a.Get(), &origin, &all, upload.Get(), tile_copy_offset, to_tiled);
     transition(*lists[1].Get(), a.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
