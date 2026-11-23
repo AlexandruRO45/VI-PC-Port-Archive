@@ -523,6 +523,35 @@ class TestDSSubU32RegisterAliasing(unittest.TestCase):
         # 100 - 0x40 (64) = 36
         self.assertEqual(self.lds.read_dword(0x40), 36)
 
+class TestDSSubU32ConditionCodesAndStatusFlags(unittest.TestCase):
+    """Part 6: Condition codes, status flags, and lgkmcnt tracking."""
+
+    def test_status_flags_invariance(self) -> None:
+        lds = LDSMemory(size_bytes=4096)
+        state = ScalarThreadState(lds)
+        state.sgprs[0] = 0xABCD1234
+        lds.write_dword(0x10, 50)
+        state.set_vgpr(VGPR(1), 0x10)
+        state.set_vgpr(VGPR(2), 20)
+
+        interp = ScalarDSInterpreter(lds)
+        inst = DSSubU32Instruction.parse("ds_sub_rtn_u32 v5, v1, v2")
+        interp.execute(state, inst)
+
+        self.assertEqual(state.sgprs[0], 0xABCD1234)
+        self.assertEqual(state.lgkm_cnt, 1)
+
+    def test_lgkmcnt_counter_tracking(self) -> None:
+        lds = LDSMemory(size_bytes=4096)
+        state = ScalarThreadState(lds)
+        interp = ScalarDSInterpreter(lds)
+
+        for i in range(4):
+            inst = DSSubU32Instruction.parse(f"ds_sub_u32 v1, v2 offset:{i*4}")
+            interp.execute(state, inst)
+
+        self.assertEqual(state.lgkm_cnt, 4)
+
 
 if __name__ == '__main__':
     unittest.main()
