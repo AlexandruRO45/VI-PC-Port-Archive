@@ -79,9 +79,10 @@ cmake --build runtime/build/linux --parallel $(nproc)
 134 of 134 targets built in 1 minute 34 seconds on 24 cores. Then run the suite from the same checkout, with the
 options described in [testing.md](testing.md):
 
-```sh
+```bash
 LLVM_MC=llvm-mc LEONIDA_VK_DEVICE="GTX 1660" \
   python3 -I scripts/run_gpu_tests.py --build runtime/build/linux --work "$LEO/run" --require-pass | tee "$LEO/run.log"
+echo "runner exit code: ${PIPESTATUS[0]}"   # 1 when any test fails; a plain `| tee` would report tee's 0 instead
 grep 'device:' "$LEO/run.log" | head -3
 ```
 
@@ -96,7 +97,8 @@ Expected on the machine above, three runs in a row with identical results (a run
   FAIL  ms_wave_info_s3   at (0,0): got (-1.0000,-1.0000,-1.0000,-1.0000), want (0.0078,0.0078,0.5,1.0)
 ```
 
-Each skip is printed with its reason; here they were tests that need a 64-wide subgroup (this GPU has 32) and tests that
+The runner exits with 1 here because of that one failure (it does so whenever a test fails, with or without
+`--require-pass`, which only adds an exit code of 1 when nothing passes). Each skip is printed with its reason; here they were tests that need a 64-wide subgroup (this GPU has 32) and tests that
 another harness runs. `ms_wave_info_s3` is a known mesh-shader failure (#6172, see
 [gpu_test_results.md](gpu_test_results.md)); other GPUs will show different counts. Post yours in
 [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
