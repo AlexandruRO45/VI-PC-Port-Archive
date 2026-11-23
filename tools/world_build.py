@@ -567,8 +567,8 @@ def _run_jobs(fn, jobs, workers: int):
             raise
 
 
-def _build_instanced_world(entries, texture_indexes, shared_textures, *, placements, lod_levels, region, out_dir, chunk_size,
-                           textures, max_tex_size, base_color_param, workers, mode, glb_mod, limit,
+def _build_instanced_world(entries, model_textures, *, placements, lod_levels, region, out_dir, chunk_size,
+                           textures, max_tex_size, workers, mode, glb_mod, limit,
                            lod_sets=False) -> dict:
     """``build_world --placements`` with shared geometry: memory holds about 100 bytes per placement plus the
     models of the chunk being written, not a copy of every placed model."""
@@ -624,8 +624,7 @@ def _build_instanced_world(entries, texture_indexes, shared_textures, *, placeme
         for mid, (models_dir, item) in enumerate(model_src):
             rel_file = item.get("File")
             obj_path = os.path.join(models_dir, rel_file) if isinstance(rel_file, str) and rel_file.strip() else ""
-            tex_map = (resolve_model_textures(models_dir, item, texture_indexes[models_dir], base_color_param, shared_textures)
-                       if textures else {})
+            tex_map = model_textures(models_dir, item)
             jobs.append((mid, obj_path, _list_field(item, "MeshShaders"), tex_map, textures,
                          os.path.join(pack_dir, f"{mid}.lpk")))
         info: list[dict | None] = [None] * len(model_src)
@@ -936,18 +935,23 @@ def resolve_model_textures(
     ttpf_index: dict[str, str],
     base_color_param: str | None = None,
     shared_textures: dict[str, str] | None = None,
+    *,
+    declared_embedded_only: bool = False,
 ) -> dict[int, str]:
     """Resolve shader_index -> existing absolute .dds path for a model manifest item.
 
     With base_color_param (normalized uppercase 8-hex), only texture references whose Param
     matches are considered and the empty-Materials fallback is disabled; unmatched shaders
     are left out so they render as clay.
+    For a repeat export, declared_embedded_only requires an Embedded record for any DDS hit.
     """
     result: dict[int, str] = {}
     file_name = item.get("File")
     stem = os.path.splitext(file_name)[0] if isinstance(file_name, str) and file_name else ""
     tex_dir = os.path.join(models_dir, f"{stem}_tex") if stem else ""
     dds_files, disk_by_index = _scan_embedded_dir(tex_dir)
+    if declared_embedded_only:
+        disk_by_index = {}
 
     emb_by_index: dict[int, str] = {}
     emb_by_key: dict[str, str] = {}
@@ -1040,7 +1044,7 @@ def resolve_model_textures(
                 result[sidx] = chosen
         for sidx, path in fallback.items():
             result.setdefault(sidx, path)
-    elif dds_files and base_color_param is None:
+    elif dds_files and base_color_param is None and not declared_embedded_only:
         # Fallback when Materials is empty/missing and no parameter is selected: map embedded indices and 0.
         for idx, path in emb_by_index.items():
             result[idx] = path
@@ -1049,6 +1053,51 @@ def resolve_model_textures(
         result.setdefault(0, os.path.abspath(os.path.join(tex_dir, dds_files[0])))
 
     return result
+
+
+def _indexed_records(item: dict, field: str, index_field: str) -> dict[int, list[dict]]:
+    records: dict[int, list[dict]] = {}
+    for record in _list_field(item, field):
+        if not isinstance(record, dict) or type(record.get(index_field)) is not int:
+            return {}
+        records.setdefault(record[index_field], []).append(record)
+    return records
+
+
+def _fill_repeat_textures(result: dict[int, str], item: dict, repeats: list[tuple[str, dict]],
+                          base_color_param: str | None) -> None:
+    """Fill unbound shaders from declared DDS entries in the same drawable's other exports."""
+    mesh_shaders = _list_field(item, "MeshShaders")
+    if not mesh_shaders or any(type(index) is not int for index in mesh_shaders):
+        return
+    missing = set(mesh_shaders) - result.keys()
+    if not missing:
+        return
+    materials = _indexed_records(item, "Materials", "ShaderIndex")
+    embedded = _indexed_records(item, "Embedded", "Index")
+    if not materials or not embedded:
+        return
+    for models_dir, repeat in repeats:
+        repeat_shaders = _list_field(repeat, "MeshShaders")
+        if repeat_shaders != mesh_shaders or any(type(index) is not int for index in repeat_shaders):
+            continue
+        repeat_materials = _indexed_records(repeat, "Materials", "ShaderIndex")
+        matched_materials = [mat for index, records in materials.items()
+                             if index in missing and records == repeat_materials.get(index) for mat in records]
+        if not matched_materials:
+            continue
+        repeat_embedded = _indexed_records(repeat, "Embedded", "Index")
+        matched_embedded = [records[0] for index, records in repeat_embedded.items()
+                            if index >= 0 and len(records) == 1 and records == embedded.get(index)]
+        if not matched_embedded:
+            continue
+        # Use the same reference order and parameter filter, with only the confirmed embedded records.
+        matched = {"File": repeat.get("File"), "Materials": matched_materials, "Embedded": matched_embedded}
+        recovered = resolve_model_textures(models_dir, matched, {}, base_color_param, declared_embedded_only=True)
+        result.update(recovered)
+        missing.difference_update(recovered)
+        if not missing:
+            break
 
 
 def _assign_materials(prims: list[dict], mesh_shaders: list, tex_map: dict, textures: bool) -> dict[str, str]:
@@ -1539,6 +1588,7 @@ def build_world(
 
     texture_indexes = {os.path.dirname(path): root_indexes[root] for path, root in manifest_roots.items()}
     source_entries = {}
+    repeat_entries: dict[int, list[tuple[str, dict]]] = {}
     entries: list[tuple[str, dict]] = []
     for mpath in sorted(manifest_roots):
         data = _load_json_dict(mpath)
@@ -1567,19 +1617,35 @@ def build_world(
                     old_dir, old = entries[previous]
                     if (not os.path.isfile(os.path.join(old_dir, str(old.get("File"))))
                             and os.path.isfile(os.path.join(models_dir, str(item.get("File"))))):
+                        if textures:
+                            repeat_entries.setdefault(previous, []).insert(0, (old_dir, old))
                         entries[previous] = (models_dir, item)
+                    elif textures:
+                        repeat_entries.setdefault(previous, []).append((models_dir, item))
                     continue
                 source_entries[identity] = len(entries)
             entries.append((models_dir, item))
+
+    # Tie repeats to the selected manifest row, even if another row reuses its OBJ path.
+    repeats_by_item = {id(entries[index][1]): repeats for index, repeats in repeat_entries.items()}
+
+    def model_textures(models_dir: str, item: dict) -> dict[int, str]:
+        if not textures:
+            return {}
+        result = resolve_model_textures(models_dir, item, texture_indexes[models_dir], base_color_param, shared_textures)
+        repeats = repeats_by_item.get(id(item))
+        if repeats:
+            _fill_repeat_textures(result, item, repeats, base_color_param)
+        return result
 
     if limit is not None:
         entries = entries[:limit]
 
     if placements is not None and instancing != "bake":
         return _build_instanced_world(
-            entries, texture_indexes, shared_textures, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
+            entries, model_textures, placements=placements, lod_levels=lod_levels, region=region, out_dir=out_dir,
             chunk_size=chunk_size, textures=textures, max_tex_size=max_tex_size,
-            base_color_param=base_color_param, workers=workers, mode=instancing, glb_mod=glb_mod, limit=limit,
+            workers=workers, mode=instancing, glb_mod=glb_mod, limit=limit,
             lod_sets=lod_sets,
         )
 
@@ -1600,11 +1666,7 @@ def build_world(
         if bounds is None or len(bounds) != 6 or not all(math.isfinite(v) for v in bounds):
             return None
 
-        tex_map = (
-            resolve_model_textures(models_dir, item, texture_indexes[models_dir], base_color_param, shared_textures)
-            if textures
-            else {}
-        )
+        tex_map = model_textures(models_dir, item)
         mat_to_dds = _assign_materials(prims, _list_field(item, "MeshShaders"), tex_map, textures)
         return {"prims": prims, "bounds": bounds, "mat_to_dds": mat_to_dds}
 

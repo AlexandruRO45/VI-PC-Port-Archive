@@ -592,6 +592,11 @@ export LOD and model names identify repeat observations. Keep exports from diffe
 Rows without a complete source address remain separate candidates. An ambiguous placement is skipped in all
 three instancing modes.
 
+For an unbound shader, the chosen model can use an embedded DDS from a repeat observation of the same
+drawable. Both manifests need the same mesh-to-shader mapping, matching material records for that shader,
+and a matching embedded texture record. Repeats are tried in manifest order after the usual local and
+cross-root lookups. An existing DDS path counts as a binding even if decoding later fails.
+
 On a private CPU-only `--lod-sets --no-textures` run, one export placed 1,488 of 75,551 rows. Adding two
 windows with no complementary matches gave the same count. Adding a complementary export and its repeat
 placed 1,663 rows using 1,501 distinct models (+175 placements, +63 models). The other 73,888 rows had
