@@ -94,9 +94,12 @@ class GuestSceneTests(unittest.TestCase):
         (self.cwd / "occupied").touch()
         output = Path("occupied") / "run"
         result = self.invoke(self.cli, "guest-scene", *args, "--out", str(output))
-        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, b"")
-        self.assertTrue(result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(b"cannot create output directory", result.stderr)
+        self.assertIn(str(output).encode("ascii"), result.stderr)
+        self.assertTrue((self.cwd / "occupied").is_file())
         self.assertFalse((self.cwd / output / "report.json").exists())
 
 
