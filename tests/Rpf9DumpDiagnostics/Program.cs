@@ -44,6 +44,26 @@ try
          && !File.Exists(stale + ".partial")
          && Directory.GetFiles(dir, "c.xma.wav*partial").Length == 0,
          "stale .partial is replaced");
+
+    // Windows refuses to replace a file another process has open, as access denied: the write waits for it to be
+    // closed. (Elsewhere the rename succeeds at once.)
+    string held = Path.Combine(dir, "held.dds");
+    File.WriteAllText(held, "old");
+    var reader = new FileStream(held, FileMode.Open, FileAccess.Read, FileShare.Read);
+    var release = Task.Run(async () => { await Task.Delay(300); reader.Dispose(); });
+    Util.WriteAllText(held, "new");
+    release.Wait();
+    Check(File.ReadAllText(held) == "new", "a destination that was held open is replaced");
+
+    // A folder in the way does not go away: the write fails at once instead of after every retry.
+    if (OperatingSystem.IsWindows())
+    {
+        string blocked = Path.Combine(dir, "blocked.dds");
+        Directory.CreateDirectory(blocked);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try { Util.WriteAllText(blocked, "new"); Check(false, "a folder in the way is an error"); }
+        catch (UnauthorizedAccessException) { Check(clock.ElapsedMilliseconds < 5000, "a folder in the way is not waited for"); }
+    }
 }
 finally { Directory.Delete(dir, true); }
 Console.WriteLine("Atomic write tests passed.");

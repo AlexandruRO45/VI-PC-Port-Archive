@@ -388,7 +388,7 @@ else if (mode is "models" or "textures")
     // a retry, but a run with write failures must not mark the stage finished: withdraw a stale marker and
     // drop the partial instead of publishing it.
     if (writeFail == 0)
-        File.Move(partial, manifestPath, true);
+        Util.MoveReplace(partial, manifestPath);
     else
     {
         Console.WriteLine($"  {writeFail} write failure(s): manifest withheld; rerun retries the missing files");

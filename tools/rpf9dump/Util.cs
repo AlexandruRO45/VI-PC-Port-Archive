@@ -55,7 +55,7 @@ public static class Util
     /// <summary>Atomic publish with retries (File.Move onto a briefly locked target can fail).</summary>
     public static void MoveReplace(string src, string dst)
     {
-        IOException? last = null;
+        Exception? last = null;
         for (int i = 0; i < 20; i++)
         {
             try
@@ -63,13 +63,23 @@ public static class Util
                 File.Move(src, dst, overwrite: true);
                 return;
             }
-            catch (IOException ex)
+            catch (Exception ex) when (ex is IOException || (ex is UnauthorizedAccessException && MayBeHeld(dst)))
             {
                 last = ex;
                 Thread.Sleep(50 * (i + 1));
             }
         }
         throw last!;
+    }
+
+    // Windows reports a held source as a sharing violation (IOException), but a destination another process has open
+    // (a virus scanner, the search indexer, a viewer) as access denied (UnauthorizedAccessException). A folder or a
+    // read-only file in the way gives the same error and does not go away, so only a plain writable file is waited for.
+    private static bool MayBeHeld(string dst)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        var file = new FileInfo(dst);
+        return file.Exists && !file.IsReadOnly;
     }
 
     // The decoder names every geometry mesh `model_{mi}_geometry_{gi}`, where mi is the position of the model in the
