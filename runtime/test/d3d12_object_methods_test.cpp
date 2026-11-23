@@ -453,12 +453,9 @@ const Case kCases[] = {
     // ---- device-level calls without a creation argument to refuse
     CASE("device: GetNodeCount") { return d->GetNodeCount(); } END,
     CASE("device: GetDeviceRemovedReason") { return hr(d->GetDeviceRemovedReason()); } END,
-    CASE("device: SetStablePowerState FALSE") { return hr(d->SetStablePowerState(FALSE)); } END,
-    CASE("device: SetStablePowerState TRUE") {
-        const HRESULT r = d->SetStablePowerState(TRUE);
-        d->SetStablePowerState(FALSE);
-        return hr(r);
-    } END,
+    // SetStablePowerState is not a table row: the host answers E_FAIL without Developer Mode, and a failed call
+    // leaves the host device removed (every later CreateFence is DXGI_ERROR_DEVICE_REMOVED), so it runs last on a
+    // throwaway device (stable_power).
     CASE("device6: SetBackgroundProcessingMode valid") {
         Ref<ID3D12Device6> d6; if (FAILED(d->QueryInterface(IID_PPV_ARGS(&d6.p)))) return -2;
         return hr(d6->SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE_ALLOWED, D3D12_MEASUREMENTS_ACTION_KEEP_ALL, nullptr, nullptr));
@@ -567,6 +564,13 @@ std::vector<Row> run(ID3D12Device* d) {
     for (const Case& c : kCases) rows.push_back({c.name, guarded(c.fn, d)});
     return rows;
 }
+// SetStablePowerState on a fresh device of its own. Only a host that accepts the call (Developer Mode on) gives
+// an answer to compare; otherwise the row is not comparable here and is left out.
+std::int64_t stable_power(ID3D12Device* d) {
+    const HRESULT r = d->SetStablePowerState(TRUE);
+    if (SUCCEEDED(r)) d->SetStablePowerState(FALSE);
+    return hr(r);
+}
 }  // namespace
 
 int main() {
@@ -600,9 +604,31 @@ int main() {
         }
     }
     int mismatches = 0, compared = 0;
+    // SetStablePowerState: every host device is a new one, since a refused call removes it.
+    {
+        bool any = false, all_accept = true;
+        for (const bool warp : {false, true}) {
+            Ref<IDXGIAdapter> adapter;
+            Ref<ID3D12Device> host;
+            std::string name;
+            if (!factory.p || !hostadapter::reference(factory.p, vk, warp, &adapter.p, name)) continue;
+            if (FAILED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) continue;
+            any = true;
+            if (FAILED(static_cast<HRESULT>(stable_power(host.p)))) all_accept = false;
+        }
+        if (any && all_accept) {
+            ++compared;
+            if (stable_power(ours.p) != 0) {
+                ++mismatches;
+                std::fprintf(stderr, "device: SetStablePowerState: layer refuses, the hosts accept\n");
+            }
+        } else if (any) {
+            std::printf("SetStablePowerState: a host refuses it (no Developer Mode), row not compared\n");
+        }
+    }
     for (std::size_t i = 0; i < mine.size(); ++i) {
         bool hosts_agree = !hosts.empty();
-        for (const auto& h : hosts) hosts_agree = hosts_agree && h[i].code == hosts[0][i].code;
+        for (const auto& h : hosts) hosts_agree = hosts_agree && h[i].code == hosts[0][i].code && h[i].code >= 0;
         const bool differs = hosts_agree && mine[i].code != hosts[0][i].code;
         if (probe) {
             std::printf("%s | layer %llx", mine[i].name.c_str(), static_cast<unsigned long long>(mine[i].code));
