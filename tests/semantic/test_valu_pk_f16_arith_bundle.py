@@ -574,5 +574,32 @@ class TestValuPkF16ArithBundle(unittest.TestCase):
         # lo: -3.0 + 1.0 = -2.0 (0xc000), hi: 2.0 + 5.0 = 7.0 (0x4700)
         self.assertEqual(res_mod, 0x4700c000)
 
+    def test_v_pk_add_f16_translator_integration_and_negative_controls(self):
+        lines = [
+            "v_mov_b32 v1, 0x40003c00", # hi: 2.0, lo: 1.0
+            "v_mov_b32 v2, 0x42004000", # hi: 3.0, lo: 2.0
+            "v_pk_add_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_v_pk_add_f16", lines)
+        out = mrt0_words(spv)[0]
+        self.assertEqual(out, 0x45004200)
+
+        # Modifier test in translator
+        lines_mod = [
+            "v_mov_b32 v1, 0x42004000",
+            "v_mov_b32 v2, 0x45003c00",
+            "v_pk_add_f16 v0, v1, v2 op_sel:[1,0] op_sel_hi:[0,1] neg_lo:[1,0]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv_mod = translate_lines("ps_v_pk_add_f16_mod", lines_mod)
+        out_mod = mrt0_words(spv_mod)[0]
+        self.assertEqual(out_mod, 0x4700c000)
+
+        with self.assertRaises((ValueError, IndexError, rdna2spirv.Unsupported)):
+            translate_lines("ps_bad_pk_add", ["v_pk_add_f16 v0", "s_endpgm"])
+
 if __name__ == '__main__':
     unittest.main()
