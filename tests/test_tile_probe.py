@@ -102,6 +102,25 @@ class TileProbeInputTest(unittest.TestCase):
         tile_probe.check_preview_path(preview, self.blob)
         self.assertTrue(os.path.isdir(os.path.dirname(preview)), "the preview's folder is created")
 
+    @unittest.skipUnless(HAVE_PIL_ISOLATED, "the preview needs Pillow")
+    def test_unknown_preview_extension_is_a_message_not_a_traceback(self):
+        output = os.path.join(self.tmp.name, "preview.invalidsuffix")
+        result = self.run_tool(self.blob, "--out", output)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("--out", result.stderr)
+        self.assertIn(output, result.stderr)
+        self.assertIn("unknown file extension", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(output))
+
+    @unittest.skipUnless(HAVE_PIL_ISOLATED, "the preview needs Pillow")
+    def test_png_preview_is_written(self):
+        output = os.path.join(self.tmp.name, "preview.png")
+        result = self.run_tool(self.blob, "--out", output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(output, "rb") as preview:
+            self.assertEqual(preview.read(8), b"\x89PNG\r\n\x1a\n")
+
     @unittest.skipIf(HAVE_PIL_ISOLATED, "this interpreter's -I can import Pillow")
     def test_preview_without_pillow_is_a_message_not_a_traceback(self):
         # Before: the probe ran, then render()'s lazy PIL import raised after all the work was done.
