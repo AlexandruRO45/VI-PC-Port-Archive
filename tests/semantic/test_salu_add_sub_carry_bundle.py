@@ -109,6 +109,19 @@ class TestSAddI32OverflowAndSCC(unittest.TestCase):
         # Min negative int32 + -1 -> overflow
         self.assertEqual(ref_s_add_i32(0x80000000, 0xFFFFFFFF), (0x7FFFFFFF, 1))
 
+class TestSAddI32Translator(unittest.TestCase):
+    def test_translator_s_add_i32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0x7fffffff",
+            "s_add_i32 s5, s4, 1",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_add_i32")
+        for l in range(32):
+            self.assertEqual(results[l], 0x80000000)
+
 
 if __name__ == "__main__":
     unittest.main()
