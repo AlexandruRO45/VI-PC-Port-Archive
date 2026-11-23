@@ -21,31 +21,20 @@ The requested command (`python -I tools/rpf9_carve.py <package>/anim.rpf <work>/
 
 | Measure | rpf9_carve |
 |---|---:|
-| validated zlib streams | 130,449 |
-| stored (compressed) bytes | 4,204,677,247 (3.92 GiB) |
-| inflated bytes | 11,592,111,696 (10.80 GiB) |
-| zero padding | 180,165,556 (4.09% of span) |
-| unread bytes | 23,664,707 (0.54% of span) |
-| readable | 95.40% of span |
-| Bink 2 | 0 streams |
-| elapsed | 141 s |
-
-`rpf9_carve.py` overreads its last stream: it advances a 1 MiB read cursor by 1 MiB even when the final mmap
-slice is shorter. That makes the last `PSIN` stream look 974,742 bytes stored instead of 1,766 and skips 21
-streams at the tail. `tools/anim_index.py` advances by the actual slice length. Its corrected walk finds:
-
-| Measure | corrected walk |
-|---|---:|
-| streams | 130,470 |
-| stored bytes | 4,203,762,662 (3.915 GiB) |
+| validated zlib streams | 130,470 |
+| stored (compressed) bytes | 4,203,762,662 (3.915 GiB) |
 | inflated bytes | 11,593,460,132 (10.80 GiB) |
-| zero padding | 180,167,209 (4.09%) |
-| unread bytes | 23,678,497 (0.54%) |
-| readable | 95.38% |
-| elapsed | ~140 s |
+| zero padding | 180,167,209 (4.09% of span) |
+| unread bytes | 23,678,497 (0.54% of span) |
+| readable | 95.4% of span |
+| Bink 2 | 0 streams |
+| elapsed | 289 s |
 
-The 21 extra streams are the 1.35 MB `RBF0` rig metadata at the end of the data area (below). The class table
-uses the corrected counts: the `PSIN` group is 213,747 stored in total, and the tail is its own row.
+`tools/anim_index.py` walks the same way and reports the same counts. A `rpf9_carve.py` from before 4f27dd0
+(2026-11-21) advanced its 1 MiB read cursor by the whole request over a short final slice, so it reported 130,449
+streams and 4,204,677,247 stored bytes and skipped the 21 streams whose 1.35 MB `RBF0` rig metadata ends the
+data area (below). The class table uses the counts above: the `PSIN` group is 213,747 stored in total, and the
+tail is its own row.
 
 | Class (first bytes) | Streams | Stored | Inflated | Median | Max | Where |
 |---|---:|---:|---:|---:|---:|---|
