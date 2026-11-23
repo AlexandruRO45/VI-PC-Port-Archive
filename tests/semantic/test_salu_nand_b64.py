@@ -598,6 +598,124 @@ class SaluNandB64Ieee754EdgeCasesTests(unittest.TestCase):
         self.assertEqual(res, (~packed) & MASK64)
         self.assertEqual(ref_scc(res), 1)
 
+class SaluNandB64TranslatorTests(unittest.TestCase):
+    """End-to-end SPIR-V translation and mini-interpreter execution for s_nand_b64."""
+
+    def test_translator_emitted_spirv_opcodes(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x9abcdef0",
+            "s_mov_b32 s2, 0x0fedcba9",
+            "s_mov_b32 s3, 0x87654321",
+            "s_nand_b64 s[4:5], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s4",
+            "v_mov_b32 v1, s5",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_b64_opcodes", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+        self.assertIn("OpBitwiseOr", spv)
+
+    def test_translator_mrt0_execution_against_oracle(self):
+        test_pairs = [
+            (0x01234567_89ABCDEF, 0x00FF00FF_0F0F0F0F),
+            (0x00000000_00000000, 0xFFFFFFFF_FFFFFFFF),
+            (0x55555555_55555555, 0xAAAAAAAA_AAAAAAAA),
+            (0xFFFFFFFF_FFFFFFFF, 0xFFFFFFFF_FFFFFFFF),
+            (0x00000001_00000000, 0x00000001_00000000),
+            (0x00000000_00000001, 0x00000000_00000001),
+        ]
+        for idx, (v0, v1) in enumerate(test_pairs):
+            with self.subTest(idx=idx, v0=hex(v0), v1=hex(v1)):
+                s0_lo = v0 & MASK32
+                s0_hi = (v0 >> 32) & MASK32
+                s1_lo = v1 & MASK32
+                s1_hi = (v1 >> 32) & MASK32
+                lines = [
+                    f"s_mov_b32 s0, {s0_lo:#x}",
+                    f"s_mov_b32 s1, {s0_hi:#x}",
+                    f"s_mov_b32 s2, {s1_lo:#x}",
+                    f"s_mov_b32 s3, {s1_hi:#x}",
+                    "s_nand_b64 s[4:5], s[0:1], s[2:3]",
+                    "v_mov_b32 v0, s4",
+                    "v_mov_b32 v1, s5",
+                    "s_cselect_b32 s6, 1, 0",
+                    "v_mov_b32 v2, s6",
+                    "v_mov_b32 v3, 0",
+                    "exp mrt0 v0, v1, v2, v3 done vm",
+                    "s_endpgm",
+                ]
+                spv = translate_lines(f"ps_nand_b64_exec_{idx}", lines)
+                out = mrt0_words(spv)
+                res64 = (out[1] << 32) | out[0]
+                expected = ref_nand_b64(v0, v1)
+                expected_scc = ref_scc(expected)
+                self.assertEqual(res64, expected)
+                self.assertEqual(out[2], expected_scc)
+
+    def test_translator_destination_aliasing(self):
+        v0 = 0x12345678_9ABCDEF0
+        v1 = 0x0F0F0F0F_F0F0F0F0
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_nand_b64 s[0:1], s[0:1], s[2:3]",
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v2, s6",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_alias", lines)
+        out = mrt0_words(spv)
+        res64 = (out[1] << 32) | out[0]
+        expected = ref_nand_b64(v0, v1)
+        self.assertEqual(res64, expected)
+        self.assertEqual(out[2], ref_scc(expected))
+
+    def test_translator_null_destination(self):
+        v0 = 0xFFFFFFFF_FFFFFFFF
+        v1 = 0xFFFFFFFF_FFFFFFFF
+        lines = [
+            f"s_mov_b32 s0, {v0 & MASK32:#x}",
+            f"s_mov_b32 s1, {(v0 >> 32) & MASK32:#x}",
+            f"s_mov_b32 s2, {v1 & MASK32:#x}",
+            f"s_mov_b32 s3, {(v1 >> 32) & MASK32:#x}",
+            "s_nand_b64 null, s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_null_dst", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(out[0], 0)
+
+    def test_translator_mask_lowering(self):
+        lines = [
+            "s_nand_b64 exec, exec, vcc",
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_nand_mask", lines)
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpNot", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
