@@ -22,7 +22,6 @@ import argparse
 import collections
 import os
 import re
-import shutil
 import struct
 import subprocess
 import sys
