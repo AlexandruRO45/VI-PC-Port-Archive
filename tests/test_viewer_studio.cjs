@@ -23,6 +23,7 @@ function fakeElement() {
         focus() { this.focused = true; },
         replaceChildren(...children) { this.children = children; },
         appendChild(child) { this.children.push(child); },
+        get childElementCount() { return this.children.length; },
         remove() {},
     };
 }
@@ -38,7 +39,7 @@ function loadStudio() {
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
+        document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
@@ -205,4 +206,73 @@ test('language and equivalent search text preserve model pages and the selected 
     studio.run(`document.getElementById('model-search').value = 'Props'; onModelSearch();`);
     assert.equal(groups().length, 1);
     assert.equal(groups()[0].children[0].children[1].innerText, '1–100 / 201');
+});
+
+test('DDS inspector selects a mip and layer and clears controls for ordinary images', async () => {
+    const { context, elements, run } = loadStudio();
+    context.fetch = async () => ({ ok: true, json: async () => ({ width: 5, height: 3, mip_count: 3, array_size: 2 }) });
+    await run("openModal({name:'a', preview:'/a.png', ddsPreview:'/api/dds/a.dds'})");
+    const image = elements.get('modal-img');
+    const controls = elements.get('dds-controls');
+    const [mip, layer, dimensions] = controls.children;
+    assert.equal(image.src, '/api/dds/a.dds?mip=0&layer=0');
+    for (const label of [mip, layer]) {
+        const input = label.children[0];
+        Object.assign(input, {value: '1', valueAsNumber: 1, validity: {valid: true}});
+        input.onchange();
+    }
+    assert.equal(image.src, '/api/dds/a.dds?mip=1&layer=1');
+    assert.equal(dimensions.textContent, '2 \u00d7 1');
+    await run("openModal({name:'b', preview:'/b.png'})");
+    assert.equal(image.src, '/b.png');
+    assert.equal(controls.children.length, 0);
+});
+
+test('volume slices shrink with the selected mip', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {dimension: '3d', width: 9, height: 3, depth: 5, mip_count: 3, array_size: 1};
+    context.fetch = async () => ({ok: true, json: async () => info});
+    await run("openModal({name:'v', preview:'/v.png', ddsPreview:'/api/dds/v.dds'})");
+    const [mip, slice, dimensions] = elements.get('dds-controls').children;
+    const z = slice.children[0];
+    const image = elements.get('modal-img');
+    function select(input, value) {
+        Object.assign(input, {value: String(value), valueAsNumber: value, validity: {valid: true}});
+        input.onchange();
+    }
+    assert.equal(z.max, 4);
+    select(z, 4);
+    assert.equal(image.src, '/api/dds/v.dds?mip=0&z=4');
+    select(mip.children[0], 1);
+    assert.equal(z.max, 1);
+    assert.equal(z.value, 1);
+    assert.equal(dimensions.textContent, '4 \u00d7 1');
+    assert.equal(image.src, '/api/dds/v.dds?mip=1&z=1');
+    select(mip.children[0], 2);
+    assert.equal(z.disabled, true);
+    assert.equal(image.src, '/api/dds/v.dds?mip=2&z=0');
+    select(mip.children[0], 0);
+    assert.equal(z.disabled, false);
+});
+
+test('half-float coordinates follow the selected mip and late reads cannot replace its value', async () => {
+    const { context, elements, run } = loadStudio();
+    const info = {format: 'R16_FLOAT', width: 5, height: 3, mip_count: 2, array_size: 1};
+    const pending = [];
+    context.fetch = url => url.endsWith('?info') ? {ok: true, json: async () => info} :
+        new Promise(resolve => pending.push({url, resolve}));
+    await run("openModal({name:'a', preview:'/a.png', ddsPreview:'/api/dds/a.dds'})");
+    const [mip, x, y, output] = elements.get('dds-controls').children;
+    x.children[0].value = 4;
+    y.children[0].value = 2;
+    const older = x.children[0].onchange();
+    assert.match(pending[1].url, /mip=0&layer=0&x=4&y=2$/);
+    Object.assign(mip.children[0], {value: '1', valueAsNumber: 1, validity: {valid: true}});
+    mip.children[0].onchange();
+    assert.match(pending[2].url, /mip=1&layer=0&x=1&y=0$/);
+    pending[2].resolve({ok: true, json: async () => ({R: '-2.5'})});
+    await new Promise(resolve => setImmediate(resolve));
+    pending[1].resolve({ok: false});
+    await older;
+    assert.equal(output.textContent, 'R = -2.5');
 });
