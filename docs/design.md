@@ -205,6 +205,11 @@ could overflow to inf), and pixel interpolation (`v_interp_p1/p2/mov` become fra
 location). MODE writes (`s_setreg`) model the f16/f64 rounding field, FP_ROUND[3:2], the only MODE field the
 corpus writes; other MODE writes are refused (see Known approximations).
 
+`--opt` is off by default and runs a basic-block peephole pass, `tools/spirv_opt.py`, over the emitted
+module before it is assembled: register store-to-load forwarding, `OpAccessChain` CSE, dead-store
+elimination, `OpSelect`/`OpCopyObject` folding and DCE. Only Function-scope variables that do not escape
+are tracked, and a variable with any dynamic index is excluded from whole-function dead-slot elimination.
+
 ### GPU tests (RTX 4060 Ti)
 
 `runtime\test\vk_harness.cpp` (CMake target `vk_harness`, built by `scripts\build_runtime.ps1` or
