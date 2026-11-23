@@ -593,6 +593,20 @@ class ExportBankTest(unittest.TestCase):
                     # Reading the bank needs one payload-sized allocation. A second full copy, as a slice
                     # or a combined RIFF buffer, would exceed this generous allowance for headers and I/O.
                     self.assertLess(peak, payload_size * 2, f"peak {peak:,} for {payload_size:,} PCM bytes")
+    def test_pcm_rate_outside_the_music_rate_bound_is_skipped(self):
+        # A zero rate in the format tag used to be copied into a WAV header with sample rate 0.
+        # Use the same 1000..192000 bound as streamed-music channels; other streams survive.
+        path = os.path.join(self.tmp.name, "rates.awc")
+        with open(path, "wb") as f:
+            f.write(build_bank([(1, format_block(4, 0, 0x00, 1), bytes(8)),
+                                (2, format_block(4, 999, 0x02, 1), bytes(16)),
+                                (3, format_block(4, 1000, 0x00, 1), bytes(8)),
+                                (4, format_block(4, 48000, 0x02, 1), bytes(16))]))
+        counts = awc.export_bank(path, self.out)
+        self.assertEqual(counts, {"opus": 0, "pcm": 2, "other": 2, "music": 0})
+        self.assertEqual(os.listdir(os.path.join(self.out, "rates")),
+                         ["00000003.wav", "00000004.wav"])
+        self.assertEqual(read_wav(os.path.join(self.out, "rates", "00000003.wav"))["rate"], 1000)
 
     def test_stereo_plain_stream_length_is_per_channel(self):
         # A stereo format tag stores interleaved samples: 3840 counts = 1920 frames per channel.

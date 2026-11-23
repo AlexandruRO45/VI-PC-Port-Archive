@@ -429,12 +429,14 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
                                pre_skip=pre_skip)
                 counts["opus"] += 1
                 continue
-        if s["codec"] == 2 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 4:
+        if (s["codec"] == 2 and s["channels"] in (1, 2) and 1000 <= s["rate"] <= 192000
+                and size == s["samples"] * s["channels"] * 4):
             # codec 2: 32-bit float PCM (4 bytes per sample; values can exceed +-1, e.g. impulse responses)
             write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"], True)
             counts["pcm"] += 1
             continue
-        if s["codec"] == 0 and s["channels"] in (1, 2) and size == s["samples"] * s["channels"] * 2:
+        if (s["codec"] == 0 and s["channels"] in (1, 2) and 1000 <= s["rate"] <= 192000
+                and size == s["samples"] * s["channels"] * 2):
             write_wav(os.path.join(od, stem + ".wav"), memoryview(d)[at:at + size], s["rate"], s["channels"])
             counts["pcm"] += 1
             continue
