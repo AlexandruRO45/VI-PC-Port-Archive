@@ -2487,9 +2487,11 @@ public:
         agg->display_name.codePointCount = static_cast<uint32_t>(agg->name.size());
         agg->info.displayName = &agg->display_name;
 
+        // The prefix is 27 bytes. Keep the whole kind in the four bytes after the NUL: gamepad, arcade stick,
+        // flight stick and racing wheel differ only above bit 15, so the low two bytes alone made them collide.
         std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
-        agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
-        agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+        for (int i = 0; i < 4; ++i)
+            agg->info.deviceId.value[28 + i] = static_cast<uint8_t>((kind >> (8 * i)) & 0xff);
 
         g().devices.push_back(agg);
         agg->AddRef();

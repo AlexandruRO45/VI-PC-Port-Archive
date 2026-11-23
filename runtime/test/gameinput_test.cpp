@@ -1081,7 +1081,7 @@ bool found_is(IGameInput* input, IGameInputDevice* dev) {
     return ok;
 }
 
-// Pads SDL cannot tell apart: the same name, vendor and product, no serial, no path. Runs with no other pad connected.
+// One aggregate device per supported GameInputKind, each with its own id. Runs with no pad connected.
 void test_aggregate_device(IGameInput* input) {
     check(input->CreateAggregateDevice(GameInputKindGamepad, nullptr) == E_POINTER,
           "CreateAggregateDevice rejects null output pointer");
@@ -1108,6 +1108,37 @@ void test_aggregate_device(IGameInput* input) {
         check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
               "CreateAggregateDevice returns existing aggregate instance for the same kind");
         if (agg2) agg2->Release();
+
+        constexpr uint32_t kAggregateKinds[] = {
+            GameInputKindKeyboard,    GameInputKindMouse,    GameInputKindArcadeStick,
+            GameInputKindFlightStick, GameInputKindGamepad, GameInputKindRacingWheel,
+        };
+        IGameInputDevice* by_kind[std::size(kAggregateKinds)] = {};
+        bool made_all = true;
+        for (size_t i = 0; i < std::size(kAggregateKinds); ++i)
+            made_all = input->CreateAggregateDevice(kAggregateKinds[i], &by_kind[i]) == S_OK && by_kind[i] &&
+                       made_all;
+        check(made_all, "aggregate device: one device per supported kind");
+
+        bool ids_differ = made_all;
+        for (size_t i = 0; ids_differ && i < std::size(by_kind); ++i)
+            for (size_t j = i + 1; ids_differ && j < std::size(by_kind); ++j)
+                ids_differ = std::memcmp(&by_kind[i]->GetDeviceInfo()->deviceId,
+                                         &by_kind[j]->GetDeviceInfo()->deviceId,
+                                         sizeof(AppLocalDeviceId)) != 0;
+        check(ids_differ, "aggregate device: every supported kind has a distinct device id");
+
+        bool found_all = made_all;
+        for (size_t i = 0; found_all && i < std::size(by_kind); ++i) {
+            IGameInputDevice* found = nullptr;
+            found_all = input->FindDeviceFromId(&by_kind[i]->GetDeviceInfo()->deviceId, &found) == S_OK &&
+                        found == by_kind[i];
+            if (found) found->Release();
+        }
+        check(found_all, "aggregate device: FindDeviceFromId returns each kind's aggregate");
+
+        for (IGameInputDevice* d : by_kind)
+            if (d) d->Release();
 
         // Reading test with no connected pad
         IGameInputReading* r = nullptr;
