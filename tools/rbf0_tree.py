@@ -13,6 +13,10 @@ Usage:
 
 The input directory holds inflated zlib streams or complete RBF0 resources. A file name that starts with a
 hexadecimal archive offset is used to order and label the resource, as in the rbf0_index.py carve layout.
+
+Exit status: 0 when every selected resource decoded, 1 when the scan ran and some resource was rejected as bad (a tree
+deeper than the export depth limit, or a report that could not be written, included), 2 when the source could not be
+read.
 """
 import argparse
 import collections
@@ -724,9 +728,11 @@ def main(argv=None):
             print(f"[{n}/{total}] resources", flush=True)
 
     path = args.source
+    source_read = False
     try:
         docs, summary = decode_source(path, roots=args.root, offset=args.offset,
                                       limit=args.limit, progress=progress)
+        source_read = True
         path = args.out
         write_json(path, docs, summary)
         if args.csv:
@@ -742,8 +748,9 @@ def main(argv=None):
         print(f"{path}: tree exceeds the export depth limit", file=sys.stderr)
         return 1
     except OSError as error:
+        # The source could not be read (2: the scan never ran) or a report could not be written (1: it ran).
         print(f"{path}: {error.strerror or error}", file=sys.stderr)
-        return 1
+        return 1 if source_read else 2
     if not args.quiet:
         print(f"{summary['resources']} resources: {summary['ok']} ok, {summary['bad']} bad, "
               f"{summary['truncated']} truncated, {summary['trailing']} trailing")

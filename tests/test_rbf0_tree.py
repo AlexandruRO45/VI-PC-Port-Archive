@@ -553,6 +553,39 @@ class OutputTest(unittest.TestCase):
         self.assertIn("must be different files", result.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_could_not_run_is_exit_2_while_a_rejected_resource_keeps_1(self):
+        """A missing path never ran the scan, so it is 2; a scan that ran and rejected a resource keeps 1."""
+        out = os.path.join(self.root, "tree.json")
+        missing = os.path.join(self.root, "no-such-dir")
+        result = self._run_cli(missing, out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(os.path.basename(missing), result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(os.path.exists(out))
+        # One good resource and one truncated one: the scan runs, so the code stays 1 ("found problems").
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        with open(os.path.join(self.root, "00001000.bin"), "wb") as f:
+            f.write(wide_blob()[:-1])
+        ran = self._run_cli(self.root, out)
+        self.assertEqual(ran.returncode, 1, ran.stderr)
+        self.assertEqual(ran.stderr, "")
+        self.assertTrue(os.path.exists(out))
+
+    def test_a_valid_run_still_exits_0_with_the_same_report(self):
+        with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
+            f.write(wide_blob())
+        out = os.path.join(self.root, "tree.json")
+        result = self._run_cli(self.root, out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(os.path.isfile(out))
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual([d["status"] for d in doc["resources"]], ["ok"])
+
     def test_root_filter_and_limit(self):
         with open(os.path.join(self.root, "00000000.bin"), "wb") as f:
             f.write(wide_blob())
