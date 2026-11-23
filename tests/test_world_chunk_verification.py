@@ -7,6 +7,7 @@ import hashlib
 import mmap
 from pathlib import Path
 import struct
+import subprocess
 import sys
 import tempfile
 import tracemalloc
@@ -59,13 +60,30 @@ class StagedChunkVerificationTests(unittest.TestCase):
         self.assertGreater(size, 8_000_000)
         before = digest(path)
 
-        gc.collect()
-        tracemalloc.start()
-        try:
-            world_build._verify_staged_chunk(str(path), size, glb_writer)
-            peak = tracemalloc.get_traced_memory()[1]
-        finally:
-            tracemalloc.stop()
+        # Isolate the verifier from fixture/import peaks and leave caller-owned tracing alone.
+        was_tracing = tracemalloc.is_tracing()
+        measured = subprocess.run([
+            sys.executable, "-I", "-c", """
+import gc
+import sys
+import tracemalloc
+sys.path.insert(0, sys.argv[1])
+import glb_writer
+import world_build
+path = sys.argv[2]
+size = int(sys.argv[3])
+gc.collect()
+tracemalloc.start()
+try:
+    world_build._verify_staged_chunk(path, size, glb_writer)
+    peak = tracemalloc.get_traced_memory()[1]
+finally:
+    tracemalloc.stop()
+print(peak)
+""", str(Path(__file__).resolve().parents[1] / "tools"), str(path), str(size),
+        ], capture_output=True, text=True, check=True, timeout=30)
+        peak = int(measured.stdout)
+        self.assertEqual(tracemalloc.is_tracing(), was_tracing)
         # JSON metadata still allocates; the 8.4 MB geometry payload need not.
         self.assertLess(peak, 2 * 1024 * 1024, f"verification allocated {peak} bytes")
         self.assertEqual(digest(path), before)
