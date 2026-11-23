@@ -289,6 +289,27 @@ class BootTraceTests(unittest.TestCase):
         self.assertIn("ID3D12CommandQueue::ExecuteCommandLists", text)
         self.assertIn("[rt] diagnostics are not summarized", text)
 
+    def test_d3d12_text_reports_omitted_calls_for_each_outcome(self):
+        outcomes = ("failed", "unsupported", "refused", "partial")
+        self.write_lines(self.d3d12, [
+            f"[d3d12-trace] #{seq} Example {outcome}"
+            for seq, outcome in enumerate(outcomes * 3, 1)
+        ])
+        for limit, omitted in ((1, 2), (3, 0)):
+            with self.subTest(limit=limit):
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(bt.main(["--d3d12", self.d3d12, "--limit", str(limit)]), 0)
+                report = stdout.getvalue().splitlines()
+                for seq, outcome in enumerate(outcomes, 1):
+                    line = next(line for line in report if line.startswith(f"  {outcome}: "))
+                    self.assertTrue(line.startswith(f"  {outcome}: #{seq} Example"))
+                    if omitted:
+                        self.assertTrue(line.endswith(", ... 2 more"), line)
+                    else:
+                        self.assertNotIn("more", line)
+                        self.assertIn(f"#{seq + 8} Example", line)
+
     def test_partial_submissions_are_named_in_text_and_json(self):
         method = "ID3D12CommandQueue::ExecuteCommandLists"
         self.write_lines(self.d3d12, [
