@@ -961,6 +961,8 @@ def main():
     ap.add_argument("--warn", action="store_true",
                     help="with --check: show a popup when the PC is weak")
     args = ap.parse_args()
+    if args.ram is not None and args.ram <= 0:
+        ap.error("--ram must be a positive integer")
     if args.check:
         sys.exit(run_check(args))
     if args.cli or tk is None:
