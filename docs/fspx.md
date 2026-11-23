@@ -4,7 +4,9 @@ The package's FSR upscaler, `amd_fidelityfx_upscaler_xbox.dll`, carries 29 compu
 `SFI0`, `ISG1`, `OSG1`, `PSV0`, `RTS0`, `HASH` and `ACCC` parts and no `DXIL` ([d3d12_command_objects.md](d3d12_command_objects.md)
 §3.5a). The `ACCC` part is an `FSPX` payload: a small directory around a precompiled RDNA2 program. It is not the
 `XBCH`/`FSSM` format of the game's own shaders ([design.md](design.md)), but it holds the same kind of program, and
-`tools/fspx_unpack.py` lays it out so `tools/rdna2spirv.py` translates it like a game compute shader.
+`tools/fspx_unpack.py` lays it out so `tools/rdna2spirv.py` translates it like a game compute shader, and
+`scripts/check_no_game_data.py` matches the `FSPX` tag, so a payload carved out of the DLL or a container and renamed
+past the extension check is still reported as game data.
 
 Everything below was measured on the 1.0.2.1 package's DLL (SHA-256 `faff02f2…a75fa`). "Read from the DLL" means
 Ghidra 12.2 output (through REA) for the named function; "measured" means checked on all 29 programs unless a count is
