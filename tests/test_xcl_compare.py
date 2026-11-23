@@ -262,6 +262,18 @@ class RestartTraces(unittest.TestCase):
             self.assertEqual(trace0.read_text(encoding="utf-8"), '{"attempt": 0}\n')
             self.assertEqual(trace1.read_text(encoding="utf-8"), '{"attempt": 1}\n')
 
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(xc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    xc.write_json_report(path, {"new": True})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()

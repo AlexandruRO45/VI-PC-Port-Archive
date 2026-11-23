@@ -30,12 +30,17 @@ import math
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CDB_DEFAULT = Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe")
@@ -282,9 +287,7 @@ def run_all(args, events):
     report["transcripts"] = {k: str(v) for k, v in transcripts.items()}
     out = Path(args.out) if args.out else work / "report.json"
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    write_json_report(str(out), report)
     events.put(("done", report, str(out)))
     return report, out
 
@@ -504,6 +507,41 @@ def main():
     print()
     print_report(report, out)
     return 0
+
+
+def write_json_report(path, payload):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".xcl_compare-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=2, ensure_ascii=False)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
