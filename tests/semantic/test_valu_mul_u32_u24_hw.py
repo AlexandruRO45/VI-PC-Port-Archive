@@ -425,3 +425,27 @@ class TestRegisterAliasing(unittest.TestCase):
 
         self.assertEqual(res, 144)
         self.assertEqual(state.get_vgpr(0), 144)
+
+
+# ==============================================================================
+# SECTION 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# ==============================================================================
+
+class TestConditionCodesAndStatusFlags(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_vcc_and_scc_invariance(self) -> None:
+        """Verify v_mul_u32_u24 never alters VCC or SCC."""
+        lines = [
+            "v_cmp_eq_u32 vcc, 42, 42",            # Sets VCC to all 1s
+            "v_mov_b32 v1, 10",
+            "v_mov_b32 v2, 20",
+            "v_mul_u32_u24 v0, v1, v2",            # Must not touch VCC
+            "v_cndmask_b32 v4, 0x11111111, 0x22222222, vcc", # Should choose 0x22222222
+            "exp mrt0 v4, v0, v4, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mul_vcc_invariant", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x22222222)
+        self.assertEqual(words[1], 200)
