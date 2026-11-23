@@ -383,6 +383,29 @@ class Counts(unittest.TestCase):
         self.assertIn("--ops: must be at least 1 (got 0)", r.stderr)
         self.assertEqual(r.stdout, "")
 
+    def test_invalid_start_index_is_rejected_before_the_harness(self):
+        for args in (["--start-index", "-1"], ["--dpp-sweep", "--start-index", "1"]):
+            with self.subTest(args=args):
+                result = self.run_tool("--exe", os.path.join(TOOLS, "missing-harness"), *args)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("--start-index", result.stderr)
+                self.assertNotIn("unrecognized arguments", result.stderr)
+
+    def test_start_index_selects_the_same_program_sources(self):
+        def sources(count, *offset):
+            argv = [TOOL, "--exe", sys.executable, "--programs", str(count), "--wave", "both",
+                    "--seed", "11", "--ops", "3", *offset]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(X, "run_translator") as runner, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(X.main(), 0)
+            return [(p.wave, p.source()) for p in runner.call_args.args[2]]
+
+        batch = sources(6)
+        self.assertEqual([wave for wave, _ in batch], [32, 64, 32, 64, 32, 64])
+        self.assertEqual(sources(6, "--start-index", "0"), batch)
+        self.assertEqual(sources(3, "--start-index", "1"), batch[1:4])
+
     def test_the_count_is_checked_before_the_harness_is_looked_for(self):
         # Both are wrong here: a count below 1 is a usage error whatever the state of the build is.
         r = self.run_tool("--exe", os.path.join(TOOLS, "no-such-build", "vk_compute_test"), "--programs", "0")
