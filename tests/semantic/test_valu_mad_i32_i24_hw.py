@@ -369,5 +369,52 @@ class TestMadI32I24SIMDDivergence(unittest.TestCase):
             self.assertEqual(wave.vgprs[10][lane], expected)
 
 
+# ==============================================================================
+# Register Aliasing and In-Place Operand Preservation
+# ==============================================================================
+
+class TestMadI32I24RegisterAliasing(unittest.TestCase):
+    def test_dst_aliases_src0(self):
+        machine = ScalarMachine()
+        machine.vgprs[0] = 2
+        machine.vgprs[1] = 3
+        machine.vgprs[2] = 4
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+            src1=RegisterOperand(OperandType.VGPR, 1),
+            src2=RegisterOperand(OperandType.VGPR, 2),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[0], 10)
+
+    def test_dst_aliases_src2(self):
+        machine = ScalarMachine()
+        machine.vgprs[0] = 4
+        machine.vgprs[1] = 2
+        machine.vgprs[2] = 3
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 0),
+        )
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[0], 10)
+
+    def test_dst_aliases_all_sources(self):
+        machine = ScalarMachine()
+        machine.vgprs[0] = 3
+        insn = VMadI32I24Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 0),
+            src1=RegisterOperand(OperandType.VGPR, 0),
+            src2=RegisterOperand(OperandType.VGPR, 0),
+        )
+        # 3 * 3 + 3 = 12
+        machine.step(insn)
+        self.assertEqual(machine.vgprs[0], 12)
+
+
 if __name__ == '__main__':
     unittest.main()
