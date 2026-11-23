@@ -276,3 +276,16 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     await older;
     assert.equal(output.textContent, 'R = -2.5');
 });
+
+test('each library falls back to its CDN copy while the page is parsed, before the inline script runs', () => {
+    // An onerror that swaps src loads the CDN copy asynchronously, after the inline script has thrown on THREE.
+    assert.doesNotMatch(html, /<script[^>]*\bonerror=/);
+    for (const [file, global] of [['three.min.js', 'window.THREE'], ['OrbitControls.js', 'THREE.OrbitControls'],
+                                  ['GLTFLoader.js', 'THREE.GLTFLoader']]) {
+        const local = html.indexOf(`<script src="/vendor/${file}"></script>`);
+        assert.ok(local > 0, `${file} is loaded from /vendor first`);
+        const fallback = html.slice(local).split('\n')[1];
+        assert.match(fallback, new RegExp(`^<script>.*${global.replace('.', '\.')}.*\|\| document\.write\('<script src="https://[^"]*/${file.replace('.', '\.')}"><\\/script>'\);</script>$`));
+        assert.ok(local < html.indexOf('<script>\n'), `${file} and its fallback come before the inline script`);
+    }
+});
