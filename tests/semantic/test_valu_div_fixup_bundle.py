@@ -459,5 +459,22 @@ class TestVDivFixupF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_div_fixup_f32(3.0, -1.0, 3.0), -3.0)
 
 
+def ref_div_fixup_f16(s0: int, s1: int, s2: int) -> int:
+    """Reference mathematical oracle for RDNA2 v_div_fixup_f16 on 16-bit words."""
+    sign_out = (s1 ^ s2) & 0x8000
+    # Finite normal case
+    return (s0 & 0x7FFF) | sign_out
+
+
+class TestVDivFixupF16Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_div_fixup_f16."""
+
+    def test_reference_sign_propagation(self):
+        # positive s1 (0x3c00), negative s2 (0xbc00) -> negative sign (0x8000)
+        self.assertEqual(ref_div_fixup_f16(0x3c00, 0x3c00, 0xbc00), 0xbc00)
+        # positive s1, positive s2 -> positive sign
+        self.assertEqual(ref_div_fixup_f16(0x3c00, 0x3c00, 0x3c00), 0x3c00)
+
+
 if __name__ == "__main__":
     unittest.main()
