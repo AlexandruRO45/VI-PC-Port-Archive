@@ -581,5 +581,23 @@ class TestInterpP1llF16SIMD(unittest.TestCase):
             self.assertEqual(wave.vgprs[2][lane], expected)
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p1ll_f16 Rejection & Hardware Translator
+# ------------------------------------------------------------------------------
+
+class TestInterpP1llF16HardwareTranslator(unittest.TestCase):
+    def test_hardware_translator_execution(self):
+        prog = [
+            "v_mov_b32 v10, 0",
+            "v_interp_p1ll_f16 v2, v0, attr0.x",
+            "v_interp_p2_f16 v2, v1, attr0.x, v2",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_interp_p1ll_hw", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
+
 if __name__ == '__main__':
     unittest.main()
