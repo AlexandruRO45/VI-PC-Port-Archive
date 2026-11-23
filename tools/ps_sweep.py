@@ -37,8 +37,9 @@ with a gradient (VKS_TEX=1), so sampled values are not all zero. `--lo/--hi` spl
 and `--only 3,7` re-runs single shaders (into `<tag>_<variant>_re`, which `compare` prefers), for example the ones that
 timed out while another process was starting.
 
-Shaders are numbered by their place in `sample.json`; the summary lines and everything under `<dir>` except
-`sample.json` (which names the sampled shaders, so keep it out of reports) are counts and numbers only.
+Shaders are numbered by sample position. Keep sample.json, readbacks and per-draw reports local.
+Result rows record source hashes supplied by the selected translation. Paired reports retain both
+identities in tag order. An empty identity means the translation supplied no usable source hash.
 """
 from collections import Counter
 import argparse
@@ -46,6 +47,7 @@ import json
 import math
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -60,6 +62,16 @@ def load_ps(spirv):
     with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     return {k: v for k, v in index.items() if v.get("stage") == "ps"}
+
+
+def source_identity(meta):
+    """Copy only full SHA-256 values. Listing and FSSM hashes identify different inputs."""
+    identity = {}
+    for key in ("fssm_sha256", "src_sha256"):
+        value = meta.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[a-fA-F0-9]{64}", value):
+            identity[key] = value.lower()
+    return identity
 
 
 def stratum(meta):
@@ -202,15 +214,21 @@ def cmd_run(a):
                         raise SystemExit("different depth mode needs a fresh tag or suffix")
                     if previous["code"] != NOT_TRANSLATED and bool(previous.get("two_clear")) != a.two_clear:
                         raise SystemExit("different two-clear mode needs a fresh tag or suffix")
-                    done.add(previous["i"])
+                    i = previous["i"]
+                    if "source_identity" in previous:
+                        if (type(i) is not int or not 0 <= i < len(sample) or
+                                previous["source_identity"] != source_identity(ps.get(sample[i]["name"], {}))):
+                            raise SystemExit("different source identity needs a fresh tag or suffix")
+                    done.add(i)
     hi = a.hi or len(sample)
     for i, s in enumerate(sample):
         if i < a.lo or i >= hi or i in done or (a.only and i not in a.only):
             continue
         meta = ps.get(s["name"])
+        receipt = {"i": i, "source_identity": source_identity(meta or {})}
         if meta is None:   # the translation in --spirv refused it (e.g. --bary-fallback and a computed I/J pair)
             with open(log, "a", encoding="utf-8", newline="\n") as f:
-                f.write(json.dumps({"i": i, "code": NOT_TRANSLATED, "reason": "not translated", "targets": 0, "sec": 0}) + "\n")
+                f.write(json.dumps({**receipt, "code": NOT_TRANSLATED, "reason": "not translated", "targets": 0, "sec": 0}) + "\n")
             continue
         raw = os.path.join(out_dir, f"{i}.raw")
         if os.path.exists(raw):
@@ -219,7 +237,7 @@ def cmd_run(a):
         gs = gs_for(a.spirv, s["name"]) if meta.get("bary_fallback_input") else None
         if meta.get("bary_fallback_input") and not gs:   # a missing companion is not a pipeline failure
             with open(log, "a", encoding="utf-8", newline="\n") as f:
-                f.write(json.dumps({"i": i, "code": NOT_TRANSLATED, "reason": "no bary_gs companion", "targets": 0, "sec": 0}) + "\n")
+                f.write(json.dumps({**receipt, "code": NOT_TRANSLATED, "reason": "no bary_gs companion", "targets": 0, "sec": 0}) + "\n")
             continue
         env = job_env(os.environ, a.timeout, a.variant, meta, gs)
         cmd = [a.exe, make_vs(a.glslang, meta, cache), os.path.join(a.spirv, s["name"] + ".spv"), raw,
@@ -262,7 +280,7 @@ def cmd_run(a):
                 if line.startswith(("FAILED", "DEVICE_LOST", "PIPELINE")):
                     reason = line.split(" (line")[0][:60]
                     break
-        rec = {"i": i, "code": code, "reason": reason, "targets": targets, "sec": round(time.time() - start, 2)}
+        rec = {**receipt, "code": code, "reason": reason, "targets": targets, "sec": round(time.time() - start, 2)}
         if a.depth:
             rec["depth"] = True
         if a.two_clear:
@@ -387,7 +405,18 @@ def exact_pair(i, left, right):
 
 def draw_measurements(left, right):
     counts = [rec.get("samples_passed") if rec and rec["code"] == 0 else None for rec in (left, right)]
-    return {"samples_passed": counts} if any(count is not None for count in counts) else {}
+    fields = {"samples_passed": counts} if any(count is not None for count in counts) else {}
+    if any(rec and "source_identity" in rec for rec in (left, right)):
+        identities = [rec.get("source_identity") if rec else None for rec in (left, right)]
+        fields["source_identity"] = identities
+        a, b = identities
+        if a and b:
+            for key in ("fssm_sha256", "src_sha256"):
+                if key in a and key in b:
+                    if a[key] != b[key]:
+                        raise SystemExit(f"source identity differs between tags at draw {left['i']}")
+                    break
+    return fields
 
 
 def depth_measurements(i, left, right):

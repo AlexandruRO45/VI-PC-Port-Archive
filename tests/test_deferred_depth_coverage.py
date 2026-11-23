@@ -46,6 +46,28 @@ class CoverageTests(unittest.TestCase):
         (self.results / "0.raw.depth").write_bytes(bytes(4096))
         self.assertEqual(coverage(self.payloads, self.translation, self.results)["depth_measured"], 1)
 
+    def test_receipts_survive_reordered_sample_renamed_or_absent_inventory(self):
+        log = self.results / "results_0.jsonl"
+        digest, = self.payloads
+        self.write(log, dict(i=1, depth=True, code=0, source_identity={"fssm_sha256": digest}))
+        (self.results / "1.raw.depth").write_bytes(bytes(4096))
+        self.write(self.root / "sample.json", [{"name": "renamed"}, {"name": "other"}])
+        self.write(self.index, {"other": dict(self.meta, fssm_sha256="b" * 64), "renamed": self.meta})
+        self.assertEqual(coverage(self.payloads, self.translation, self.results)["depth_measured"], 1)
+        (self.root / "sample.json").unlink()
+        self.index.unlink()
+        self.assertEqual(coverage(self.payloads, results=self.results)["depth_measured"], 1)
+        self.write(self.results / "results_2.jsonl", dict(i=2, code=3, source_identity={"fssm_sha256": digest}))
+        self.assertEqual(coverage(self.payloads, results=self.results)["ambiguous_sample"], 1)
+
+    def test_modern_missing_hash_never_falls_back_to_sample_name_or_listing(self):
+        self.write(self.results / "results_0.jsonl", dict(i=0, code=0, depth=True, source_identity={
+            "src_sha256": self.payloads[0], "fssm_sha256": "invalid"}))
+        (self.results / "0.raw.depth").write_bytes(bytes(4096))
+        counts = coverage(self.payloads, self.translation, self.results)
+        self.assertEqual(counts["unknown_sample_identity"], 1)
+        self.assertEqual(counts["depth_measured"], 0)
+
     def test_duplicate_and_missing_identity(self):
         self.write(self.index, {"first": self.meta, "second": self.meta})
         self.assertEqual(coverage(self.payloads, self.translation), {"ambiguous_identity": 1})

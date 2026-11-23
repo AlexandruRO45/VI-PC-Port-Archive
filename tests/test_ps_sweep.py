@@ -11,6 +11,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 import ps_sweep  # noqa: E402
@@ -189,6 +191,39 @@ class Classification(unittest.TestCase):
 
 
 class CompareCommand(unittest.TestCase):
+    def test_run_and_compare_record_actual_tag_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            identity = {"fssm_sha256": "a" * 64, "src_sha256": "b" * 64}
+            sample = [{"name": name, "stratum": [], "fssm_sha256": "0" * 64}
+                      for name in ("translated", "missing", "no-companion")]
+            (out / "sample.json").write_text(json.dumps(sample), encoding="utf-8", newline="\n")
+            for tag in ("a", "b"):
+                inventory = {"no-companion": dict(stage="ps", bary_fallback_input=1, src_sha256="bad"),
+                             "translated": dict(stage="ps", **identity)}
+                if tag == "b":
+                    inventory["translated"].pop("src_sha256")
+                (out / "index.json").write_text(json.dumps(inventory), encoding="utf-8", newline="\n")
+                with patch.object(ps_sweep, "make_vs", return_value="vertex"), patch.object(
+                        ps_sweep.subprocess, "run", return_value=ps_sweep.subprocess.CompletedProcess([], 3, "", "")):
+                    ps_sweep.main(["run", "--out", tmp, "--spirv", tmp, "--tag", tag, "--exe", "worker"])
+                rows = [json.loads(line) for line in (out / (tag + "_z") / "results_0.jsonl").read_bytes().splitlines()]
+                self.assertEqual([r["source_identity"] for r in rows],
+                                 [ps_sweep.source_identity(inventory["translated"]), {}, {}])
+            for flags, filename in (([], "classes_z.json"), (["--exact"], "exact_z.json")):
+                ps_sweep.main(["compare", "--out", tmp, *flags])
+                report = json.loads((out / filename).read_bytes())
+                rows = report["rows"] if flags else report
+                self.assertEqual(rows[0]["source_identity"], [identity, {"fssm_sha256": "a" * 64}])
+
+            inventory["translated"]["fssm_sha256"] = "c" * 64
+            (out / "index.json").write_text(json.dumps(inventory), encoding="utf-8", newline="\n")
+            with self.assertRaisesRegex(SystemExit, "different source identity"):
+                ps_sweep.main(["run", "--out", tmp, "--spirv", tmp, "--tag", "b", "--exe", "worker"])
+            with self.assertRaisesRegex(SystemExit, "differs between tags"):
+                ps_sweep.draw_measurements({"i": 0, "code": 3, "source_identity": identity},
+                                           {"i": 0, "code": 3, "source_identity": inventory["translated"]})
+
     def test_rerun_overrides_and_counts(self):
         with tempfile.TemporaryDirectory() as out:
             with open(os.path.join(out, "sample.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -215,7 +250,6 @@ class CompareCommand(unittest.TestCase):
             self.assertNotIn("timeout", buf.getvalue())
 
     def test_exact_readbacks_and_rerun(self):
-        from pathlib import Path
 
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -281,7 +315,6 @@ class CompareCommand(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a precise-query Vulkan worker")
     def test_clear_draws_with_opposite_coverage(self):
-        from pathlib import Path
         import subprocess
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,7 +342,6 @@ class CompareCommand(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker with D32 readback")
     def test_equal_color_different_depth(self):
-        from pathlib import Path
         import subprocess
 
         with tempfile.TemporaryDirectory() as tmp:
