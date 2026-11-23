@@ -378,6 +378,7 @@ BARY_FALLBACK = barycentric_fallback()
 F16_HALVES = os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1"
 W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_readlane", [121, 121, 16, 97, 16, 100, 100, 121]),
+              ("cs_w64_fminmax_nan", [1065353216, 1065353216, 1065353216, 1073741824, 1065353216, 1065353216, 4286578688, 2139095040]),
               ("cs_w64x_writelane", [4660, 77, 99, 2748, 0, 0, 4660, 99]),
               ("cs_w64x_readfirstlane", [140, 140, 163, 132, 100, 105, 133, 48]),
               ("cs_w64x_bpermute", [36, 316, 253, 218, 435, 225, 0, 442]),

@@ -1152,7 +1152,7 @@ def run_suite(a, work: str) -> int:
                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
                       "cs_dpp_bound", "cs_dpp_w64",
                       "cs_w64_mask_detect",
-                      "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
+                      "cs_w64_fminmax_nan", "cs_w64x_readlane", "cs_w64x_writelane", "cs_w64x_readfirstlane", "cs_w64x_bpermute", "cs_w64x_permute",
                       "cs_w64x_branch", "cs_w64x_ballot", "cs_w64x_wg128_branches", "cs_w64x_lds_raw",
                       "cs_w64x_lds_war", "cs_w64x_partial", "cs_w64x_sbarrier", "cs_w64x_load_ballot_load",
                       "cs_w64x_mask_reuse", "cs_w64x_mask_reuse2", "cs_w64x_chain_barrier", "cs_barrier_divergent",
@@ -1220,6 +1220,7 @@ def run_suite(a, work: str) -> int:
                 "cs_wqm_w64_half": [11, 14, 0, 1, 6, 8, 12, 2],
                 # cross-half tests (derivations in each .asm); need exact wave64 or its emulation
                 "cs_w64x_readlane": [121, 121, 16, 97, 16, 100, 100, 121],
+                "cs_w64_fminmax_nan": [1065353216, 1065353216, 1065353216, 1073741824, 1065353216, 1065353216, 4286578688, 2139095040],       # SHADER-985, cs_w64_fminmax_nan.asm,
                 "cs_w64x_writelane": [4660, 77, 99, 2748, 0, 0, 4660, 99],
                 "cs_w64x_readfirstlane": [140, 140, 163, 132, 100, 105, 133, 48],
                 "cs_w64x_bpermute": [36, 316, 253, 218, 435, 225, 0, 442],
