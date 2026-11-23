@@ -6719,6 +6719,17 @@ class Gen:
         self.emit(f"{ptr} = OpAccessChain %_ptr_Function_uint %vgpr {safe}")
         return ptr, valid
 
+    def validate_int3_vop3(self, ins, op, a, mods):
+        """Validate a 3-input 32-bit integer VOP3 op: plain 4-operand VGPR-dst form, no DPP/SDWA or modifiers."""
+        if ins["op"].endswith(("_dpp", "_sdwa")):
+            raise Unsupported(ins["op"])
+        if mods:
+            raise Unsupported(f"{op} modifiers: {' '.join(mods)}")
+        if len(a) != 4 or a[0]["k"] != "vgpr" or any(s.get("n", 1) != 1 for s in a):
+            raise Unsupported(f"{op} operands")
+        if any(s.get("neg") or s.get("abs") or s.get("sext") for s in a):
+            raise Unsupported(f"{op} operand modifiers")
+
     def _insn(self, ins):
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
@@ -6795,12 +6806,6 @@ class Gen:
             m = self.nminmax_f32(f, x, y, y_src=a[2])
             r = self.nminmax_f32(f, m, z, y_src=a[3])
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
-        elif op == "v_and_or_b32":
-            x, y, z = (self.src_u(t) for t in a[1:4])
-            m, r = self.tmp(), self.tmp()
-            self.emit(f"{m} = OpBitwiseAnd %uint {x} {y}")
-            self.emit(f"{r} = OpBitwiseOr %uint {m} {z}")
-            self.dst(a[0], r)
         elif op == "s_brev_b64":
             # D = the 64 bits of S0 in reverse order: D.lo = reverse(S0.hi), D.hi = reverse(S0.lo). SCC is not
             # written. The pair is 64-bit data (as for s_lshl_b64); a lane-mask source stays Unsupported (#210).
@@ -7273,7 +7278,8 @@ class Gen:
             self.emit(f"{r} = OpFAdd %float {m} {z}")
             self.dst(a[0], self.tou(r))
         elif op == "v_bfi_b32":
-            mask = None if "sdwa_sel" in a[1] else self.imm_val(a[1])
+            self.validate_int3_vop3(ins, op, a, mods)
+            mask = self.imm_val(a[1])
             y, z = (self.src_u(t) for t in a[2:4])
             if mask == 0:
                 self.dst(a[0], z)
@@ -7304,7 +7310,8 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {p} {q}")
             self.dst(a[0], r)
         elif op in ("v_lshl_or_b32", "v_lshl_add_u32", "v_add_lshl_u32", "v_or3_b32", "v_xor3_b32",
-                    "v_add3_u32", "v_and_or_b32_"):
+                    "v_add3_u32", "v_and_or_b32"):
+            self.validate_int3_vop3(ins, op, a, mods)
             x, y, z = (self.src_u(t) for t in a[1:4])
             r = self.tmp()
             if op in ("v_lshl_or_b32", "v_lshl_add_u32"):
@@ -7317,6 +7324,10 @@ class Gen:
                 self.emit(f"{s} = OpIAdd %uint {x} {y}")
                 self.emit(f"{m} = OpBitwiseAnd %uint {z} {self.cu(31)}")
                 self.emit(f"{r} = OpShiftLeftLogical %uint {s} {m}")
+            elif op == "v_and_or_b32":
+                m = self.tmp()
+                self.emit(f"{m} = OpBitwiseAnd %uint {x} {y}")
+                self.emit(f"{r} = OpBitwiseOr %uint {m} {z}")
             else:
                 k = {"v_or3_b32": "OpBitwiseOr", "v_xor3_b32": "OpBitwiseXor", "v_add3_u32": "OpIAdd"}[op]
                 s = self.tmp()
