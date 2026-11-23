@@ -171,6 +171,10 @@ def _native_load():
         lib.amd_swizzle_offsets.argtypes = [p, p, n, n, n, u64, u64, u64, p]
         lib.amd_swizzle_detile.argtypes = [p, n, n, p, p, n, n, n, u64, u64, u64, p]
         lib.amd_swizzle_offsets.restype = lib.amd_swizzle_detile.restype = ctypes.c_int32
+        differences = getattr(lib, "amd_swizzle_neighbor_differences", None)
+        if differences is not None:
+            differences.argtypes = [p, n, n, n, n, p, n]
+            differences.restype = ctypes.c_int32
     except (OSError, AttributeError):
         return None
     return lib
@@ -229,7 +233,7 @@ def _native_detile(lib, data, eq, bpe, wb, hb, block_bytes):
 
 
 def _native_self_check(lib):
-    """Compare both kernels with the numpy code on a few seeded random layouts; False on any difference."""
+    """Compare the native kernels with the NumPy code on seeded inputs."""
     import random
     rng = random.Random(0x5EED)
     for case in range(24):
@@ -251,6 +255,13 @@ def _native_self_check(lib):
             return False
         if want is not None and (got.shape != want.shape or not np.array_equal(got, want)):
             return False
+    if hasattr(lib, "amd_swizzle_neighbor_differences"):
+        from tile_probe import score
+        for bpe in (1, 2, 4, 8, 16):
+            linear = np.frombuffer(rng.randbytes(19 * 17 * bpe), np.uint8).reshape(-1, bpe)
+            want = score(feature(linear, bpe).reshape(17, 19, 3))
+            if _native_candidate_score(lib, linear, bpe, 19, 17) != want:
+                return False
     return True
 
 
@@ -278,6 +289,28 @@ def feature(linear, bpe):
         return np.repeat(linear.reshape(-1, 1).astype(np.float32), 3, axis=1)
     from tile_probe import block_feature
     return block_feature(linear, bpe)
+
+
+def _native_candidate_score(lib, linear, bpe, wb, hb):
+    differences = getattr(lib, "amd_swizzle_neighbor_differences", None)
+    if differences is None or wb < 1 or hb < 1 or bpe not in (1, 2, 4, 8, 16):
+        return _REFUSED
+    if linear.shape != (wb * hb, bpe) or linear.dtype != np.uint8 or not linear.flags.c_contiguous:
+        return _REFUSED
+    x_len = 3 * hb * (wb - 1)
+    diffs = np.empty(x_len + 3 * wb * (hb - 1), np.float32)
+    if differences(linear.ctypes.data, linear.size, bpe, wb, hb, diffs.ctypes.data, diffs.size) != 0:
+        return _REFUSED
+    # Keep score()'s two NumPy means and their order, including NumPy's scalar promotion.
+    return float(sum(axis.mean() for axis in (diffs[:x_len], diffs[x_len:]) if axis.size))
+
+
+def _candidate_score(linear, bpe, wb, hb):
+    native = _native_candidate_score(_native(), linear, bpe, wb, hb)
+    if native is not _REFUSED:
+        return native
+    from tile_probe import score
+    return score(feature(linear, bpe).reshape(hb, wb, 3))
 
 
 def detile(data, eq, bpe, wb, hb, block_bytes=65536):
@@ -329,7 +362,7 @@ def validate_out_path(out, blob, same_report_path):
 
 def main(argv=None):
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import same_report_path, score
+    from tile_probe import same_report_path
     from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
@@ -368,8 +401,7 @@ def main(argv=None):
             lin = detile(data, eq, a.bpe, wb, hb, 1 << bits)
             if lin is None:
                 continue
-            img = feature(lin, a.bpe).reshape(hb, wb, 3)
-            res.append((score(img), tname, e[5], e, bits))
+            res.append((_candidate_score(lin, a.bpe, wb, hb), tname, e[5], e, bits))
     res.sort(key=lambda r: r[0])
     seen = set()
     for s, t, c, _, _ in res:

@@ -302,6 +302,93 @@ pub unsafe extern "C" fn amd_swizzle_detile(
     }
 }
 
+// Keep feature values in half-unit steps so every difference converts exactly to float32.
+fn feature_twice<const BPE: usize>(element: &[u8]) -> [u16; 3] {
+    let a = u16::from(element[0]);
+    match BPE {
+        1 => [2 * a; 3],
+        2 => {
+            let b = u16::from(element[1]);
+            [2 * a, 2 * b, a + b]
+        }
+        4 => [2 * a, 2 * u16::from(element[1]), 2 * u16::from(element[2])],
+        8 | 16 => {
+            let at = if BPE == 16 { 8 } else { 0 };
+            let c = u16::from_le_bytes([element[at], element[at + 1]]);
+            let r = ((c >> 11) & 31) * 255 / 31;
+            let g = ((c >> 5) & 63) * 255 / 63;
+            let b = (c & 31) * 255 / 31;
+            let r = if BPE == 16 { (r + a) / 2 } else { r };
+            [2 * r, 2 * g, 2 * b]
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn neighbor_differences<const BPE: usize>(src: &[u8], wb: usize, x: &mut [f32], y: &mut [f32]) {
+    let mut above = vec![[0; 3]; wb];
+    let mut horizontal = x.chunks_exact_mut(3);
+    let mut vertical = y.chunks_exact_mut(3);
+    for (row_index, row) in src.chunks_exact(wb * BPE).enumerate() {
+        let mut left = [0; 3];
+        for (column, (element, above)) in row.chunks_exact(BPE).zip(&mut above).enumerate() {
+            let rgb = feature_twice::<BPE>(element);
+            if column > 0 {
+                let diff = horizontal.next().unwrap();
+                for c in 0..3 {
+                    diff[c] = f32::from(rgb[c].abs_diff(left[c])) * 0.5;
+                }
+            }
+            if row_index > 0 {
+                let diff = vertical.next().unwrap();
+                for c in 0..3 {
+                    diff[c] = f32::from(rgb[c].abs_diff(above[c])) * 0.5;
+                }
+            }
+            left = rgb;
+            *above = rgb;
+        }
+    }
+}
+
+/// Write horizontal and then vertical RGB differences in NumPy C order. The caller computes
+/// the means of the two slices with NumPy, preserving its reduction order and rounding.
+///
+/// # Safety
+/// `src` must point to `src_len` readable bytes and `out` to `out_len` writable floats.
+/// The input and output buffers must not overlap.
+#[no_mangle]
+pub unsafe extern "C" fn amd_swizzle_neighbor_differences(
+    src: *const u8,
+    src_len: usize,
+    bpe: usize,
+    wb: usize,
+    hb: usize,
+    out: *mut f32,
+    out_len: usize,
+) -> i32 {
+    if wb == 0 || hb == 0 || !matches!(bpe, 1 | 2 | 4 | 8 | 16) || src.is_null() || out.is_null() {
+        return REFUSE_PARAMS;
+    }
+    let Some(cells) = wb.checked_mul(hb) else { return REFUSE_PARAMS };
+    let Some(x_len) = (cells - hb).checked_mul(3) else { return REFUSE_PARAMS };
+    let y_len = (cells - wb).checked_mul(3);
+    if cells.checked_mul(bpe) != Some(src_len) || y_len.and_then(|n| n.checked_add(x_len)) != Some(out_len) {
+        return REFUSE_PARAMS;
+    }
+    let src = unsafe { std::slice::from_raw_parts(src, src_len) };
+    let (x, y) = unsafe { std::slice::from_raw_parts_mut(out, out_len) }.split_at_mut(x_len);
+    match bpe {
+        1 => neighbor_differences::<1>(src, wb, x, y),
+        2 => neighbor_differences::<2>(src, wb, x, y),
+        4 => neighbor_differences::<4>(src, wb, x, y),
+        8 => neighbor_differences::<8>(src, wb, x, y),
+        16 => neighbor_differences::<16>(src, wb, x, y),
+        _ => unreachable!(),
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +512,19 @@ mod tests {
             assert_eq!(amd_swizzle_detile(src.as_ptr(), 4, 0, xm.as_ptr(), ym.as_ptr(), 2, 2, 2, 2, 2, 4, out.as_mut_ptr()), REFUSE_PARAMS);
             let r = amd_swizzle_detile(std::ptr::null(), 0, 4, std::ptr::null(), std::ptr::null(), 0, 0, 7, 1, 1, 4, std::ptr::null_mut());
             assert_eq!(r, 0);
+        }
+    }
+
+    #[test]
+    fn neighbor_difference_lengths_and_order() {
+        let src = [0u8, 3, 6, 10];
+        let mut diffs = [0.0; 12];
+        // SAFETY: the array pointers are valid for the lengths passed.
+        unsafe {
+            assert_eq!(amd_swizzle_neighbor_differences(src.as_ptr(), 4, 1, 2, 2, diffs.as_mut_ptr(), 12), 0);
+            assert_eq!(diffs, [3.0, 3.0, 3.0, 4.0, 4.0, 4.0, 6.0, 6.0, 6.0, 7.0, 7.0, 7.0]);
+            assert_eq!(amd_swizzle_neighbor_differences(src.as_ptr(), 4, 1, 2, 2, diffs.as_mut_ptr(), 11), REFUSE_PARAMS);
+            assert_eq!(amd_swizzle_neighbor_differences(src.as_ptr(), 3, 1, 2, 2, diffs.as_mut_ptr(), 12), REFUSE_PARAMS);
         }
     }
 }

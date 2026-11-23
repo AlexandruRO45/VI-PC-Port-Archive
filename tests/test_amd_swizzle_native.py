@@ -102,6 +102,19 @@ class NativeMatchesNumpy(unittest.TestCase):
         data = bytes(65536 * 2)
         self.assertIsNot(A._native_detile(LIB, data, eq, 8, 64, 64, 65536), A._REFUSED)
 
+    def test_native_candidate_scores_match_numpy_bits(self):
+        from tile_probe import score
+        rng = np.random.default_rng(616)
+        for bpe in (1, 2, 4, 8, 16):
+            for wb, hb in ((1, 1), (1, 37), (27, 1), (3, 5), (71, 19), (513, 257)):
+                with self.subTest(bpe=bpe, width=wb, height=hb):
+                    linear = rng.integers(0, 256, (wb * hb, bpe), dtype=np.uint8)
+                    want = score(A.feature(linear, bpe).reshape(hb, wb, 3))
+                    got = A._native_candidate_score(LIB, linear, bpe, wb, hb)
+                    self.assertIsNot(got, A._REFUSED)
+                    self.assertEqual(got.hex(), want.hex())
+                    self.assertEqual(A._candidate_score(linear, bpe, wb, hb).hex(), want.hex())
+
     def test_1500_random_layouts(self):
         rng = random.Random(20261123)
         sizes = (0, 1, 2, 3, 5, 7, 16, 31, 64, 100, 129, 257)
@@ -269,6 +282,13 @@ class Fallbacks(unittest.TestCase):
         finally:
             os.path.isfile = real_isfile
             A._NATIVE[:] = saved
+
+    def test_old_library_keeps_numpy_candidate_scoring(self):
+        linear = np.arange(12, dtype=np.uint8).reshape(6, 2)
+        with numpy_only():
+            want = A._candidate_score(linear, 2, 3, 2)
+        with native_lib(_FakeLib()):
+            self.assertEqual(A._candidate_score(linear, 2, 3, 2).hex(), want.hex())
 
     def test_wrong_abi_and_failed_self_check_turn_native_off(self):
         import ctypes
