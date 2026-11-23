@@ -3,7 +3,8 @@
     python -I tests/test_find_hash_lookup.py
 
 The images are synthetic PE files: one executable section holding `mov ecx, <hash>` followed by calls, with a
-"lookup" called from many places and a decoy called once.
+"lookup" called from many places and a decoy called once. Two more images hold the hash in a data section and
+nowhere: an id no immediate carries is reported as data or absent, never as a --window too small.
 """
 import json
 import os
@@ -20,19 +21,26 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import find_hash_lookup as fhl  # noqa: E402
 
 TEXT_RVA, TEXT_RAW = 0x1000, 0x400
+DATA_RVA = 0x4000
 
 
-def pe(code):
-    """A minimal PE32+ file whose only section, .text (executable), holds `code`."""
+def pe(code, data=b""):
+    """A minimal PE32+ file: .text (executable) holds `code`, and an optional .data (readable) holds `data`."""
     header = bytearray(TEXT_RAW)
     header[0:2] = b"MZ"
     struct.pack_into("<I", header, 0x3C, 0x40)
     header[0x40:0x44] = b"PE\0\0"
-    struct.pack_into("<HHIIIHH", header, 0x44, 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
+    struct.pack_into("<HHIIIHH", header, 0x44, 0x8664, 2 if data else 1, 0, 0, 0, 0xF0, 0x22)
     first = 0x44 + 20 + 0xF0
     struct.pack_into("<8sIIIIIIHHI", header, first, b".text", len(code), TEXT_RVA, len(code), TEXT_RAW,
                      0, 0, 0, 0, 0x60000020)
-    return bytes(header) + code
+    body = code
+    if data:
+        raw = TEXT_RAW + len(code) + (-len(code) % 0x200)
+        struct.pack_into("<8sIIIIIIHHI", header, first + 40, b".data", len(data), DATA_RVA, len(data), raw,
+                         0, 0, 0, 0, 0x40000040)
+        body = code + b"\0" * (raw - TEXT_RAW - len(code)) + data
+    return bytes(header) + body
 
 
 def call(at, target):
@@ -80,6 +88,49 @@ class FindHashLookupTest(unittest.TestCase):
         self.assertEqual(int(report["candidates"][1]["rva"], 16), decoy)
         self.assertEqual({h["name"]: h["occurrences"] for h in report["hashes"]},
                          {"player_story000_00": 2, "cs_mandy": 1})
+
+    def test_a_hash_outside_the_code_says_which_section_holds_it(self):
+        """A value in a data section is not an immediate: the report names the section and never blames --window."""
+        lucia = fhl.joaat("player_story000_00")
+        data = pe(b"\xCC" * 0x40, b"\0\0\0\0" + struct.pack("<I", lucia) + b"\0\0\0\0")
+        h = fhl.rank(data, [("player_story000_00", lucia)])["hashes"][0]
+        self.assertEqual((h["occurrences"], h["image_occurrences"], h["data_sections"]), (0, 1, [".data"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--hash", "player_story000_00"],
+                               capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 occurrence(s) in code, 1 in the file (only in .data)", r.stdout)
+        self.assertIn("no --window size finds the lookup", r.stdout)
+        self.assertNotIn("try a larger --window", r.stdout)
+
+    def test_a_hash_the_image_does_not_hold_is_not_reported_as_a_small_window(self):
+        """The retail executable holds neither model id, so the advice must not send a reader to --window."""
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(pe(b"\x90" * 0x40))
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--hash", "cs_mandy"],
+                               capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("0 occurrence(s) in code, 0 in the file", r.stdout)
+        self.assertNotIn("try a larger --window", r.stdout)
+        self.assertNotIn("(only in", r.stdout)
+
+    def test_an_immediate_with_no_call_after_it_still_suggests_a_larger_window(self):
+        """The negative control: the window hint stays correct for the case it was written for."""
+        code = b"\xB9" + struct.pack("<I", fhl.joaat("player_story000_00")) + b"\x90" * 0x40
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(pe(code))
+            r = subprocess.run([sys.executable, "-I", TOOL, exe, "--hash", "player_story000_00"],
+                               capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("1 occurrence(s) in code", r.stdout)
+        self.assertIn("try a larger --window", r.stdout)
 
     def test_an_encrypted_file_is_refused_clearly(self):
         with self.assertRaisesRegex(ValueError, "encrypted"):
