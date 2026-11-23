@@ -233,6 +233,11 @@ MALFORMED = {
     "none_list": lambda r: None,
     "none_entry": lambda r: r[:1] + [None] + r[2:],
     "int_entry": lambda r: r[:1] + [0] + r[2:],
+    "int_list": lambda r: 5,
+    "generator": lambda r: iter(r),
+    "none_word": lambda r: r[:1] + [[None] * len(r[1])] + r[2:],
+    "float_words": lambda r: r[:1] + [[float(w) for w in r[1]]] + r[2:],
+    "hex_words": lambda r: r[:1] + [[f"{w:08x}" for w in r[1]]] + r[2:],
 }
 
 
@@ -243,7 +248,7 @@ def test_run_hw_rejects_a_malformed_result_list(kind):
         imf.run_hw(MalformedOracle(cases, MALFORMED[kind]), cases, Args())
 
 
-@pytest.mark.parametrize("kind", ["truncated", "none_entry"])
+@pytest.mark.parametrize("kind", ["truncated", "none_entry", "float_words"])
 def test_negative_control_rejects_a_malformed_result_list(kind):
     cases = imf.make_cases(4, 1, list(imf.FORMATS))
     with pytest.raises(RuntimeError, match="hardware runner returned"):

@@ -476,13 +476,13 @@ def run_hw(oracle, cases, a, quiet=False, fmt_override=None):
     Raises RuntimeError when the runner's answer is not one result per kernel (a list of ints or a str)."""
     kernels = [hw_kernel(oracle.arch, c, fmt_override(c) if fmt_override else None) for c in cases]
     results = oracle.run(kernels)
-    if results is None or len(results) != len(kernels):
-        raise RuntimeError(f"the hardware runner returned {0 if results is None else len(results)} results "
-                           f"for {len(kernels)} kernels")
+    if not isinstance(results, list) or len(results) != len(kernels):
+        n = len(results) if isinstance(results, list) else type(results).__name__
+        raise RuntimeError(f"the hardware runner returned {n} results for {len(kernels)} kernels")
     stats = {}
     failed, words = [], {}
     for c, got in zip(cases, results):
-        if got is None or not isinstance(got, (str, list)):
+        if not isinstance(got, str) and not (isinstance(got, list) and all(isinstance(w, int) for w in got)):
             raise RuntimeError(f"{c.name}: the hardware runner returned {got!r}, not words or a rejection")
         st = stats.setdefault(c.wave, {"cases": 0, "match": 0, "mismatch": 0, "rejected": 0})
         st["cases"] += 1
