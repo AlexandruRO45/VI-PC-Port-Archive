@@ -84,6 +84,16 @@ class Interface(unittest.TestCase):
             with open(written[0], encoding="utf-8") as f:
                 self.assertEqual(f.read(), vs.vs_spvasm(layout(clip=1)))
 
+    def test_write_for_index_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = os.path.join(tmp, "index.json")
+            with open(index_path, "w", encoding="utf-8-sig") as f:
+                json.dump({"ms_bom": {"mesh_compute": layout(clip=1)}}, f)
+            written = vs.write_for_index(tmp)
+            self.assertEqual([os.path.basename(p) for p in written], ["ms_bom.mesh_vs.spvasm"])
+            with open(written[0], encoding="utf-8") as f:
+                self.assertEqual(f.read(), vs.vs_spvasm(layout(clip=1)))
+
 
 class Assembly(unittest.TestCase):
     def test_every_layout_assembles_and_validates(self):

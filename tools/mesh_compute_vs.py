@@ -229,7 +229,7 @@ def write_for_index(spirv_dir):
     if not os.path.isfile(index_path):
         return []
     try:
-        with open(index_path, encoding="utf-8") as f:
+        with open(index_path, encoding="utf-8-sig") as f:
             index = json.load(f)
     except (ValueError, RecursionError) as e:
         raise RuntimeError(f"{index_path}: invalid JSON ({e})") from None
