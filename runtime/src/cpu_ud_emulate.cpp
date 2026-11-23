@@ -27,6 +27,7 @@ bool writable(const void* p, size_t n) {
 
 // The line the last write_fault() on this thread reported.
 thread_local uintptr_t t_fault_address = 0;
+thread_local bool t_fault_write = true;
 
 // Zeroes the line under SEH: another thread may unmap or reprotect it after writable() looked.
 bool zero_line(uint8_t* line) {
@@ -137,19 +138,52 @@ size_t modrm_length(const uint8_t* code, size_t available, size_t at) {
     return at + length <= available ? length : 0;
 }
 
-// CLWB, 66 [REX] 0F AE /6 with a memory operand: write the cache line back without evicting it. That changes no
-// architectural state, so the emulation is a no-op that skips the instruction; the work is its length (prefix, ModRM,
-// SIB, displacement). 0F AE /6 without the 66 is XSAVEOPT and 66 0F AE /7 is CLFLUSHOPT: neither is taken.
-size_t emulate_clwb(CONTEXT&, const uint8_t* code, size_t available) {
+// CLWB, 66 [REX] 0F AE /6: validate the memory operand before skipping the instruction. Segment overrides are ignored.
+size_t emulate_clwb(CONTEXT& ctx, const uint8_t* code, size_t available) {
     size_t at = 0;
-    if (available < 4 || code[at++] != 0x66) return 0;
-    if ((code[at] & 0xF0) == 0x40) ++at;  // REX
+    bool operand_prefix = false;
+    while (at < available) {
+        const uint8_t b = code[at];
+        if (b == 0x66) operand_prefix = true;
+        else if (b != 0x2e && b != 0x36 && b != 0x3e && b != 0x26 && b != 0x64 && b != 0x65) break;
+        ++at;
+    }
+    if (!operand_prefix || at >= available) return 0;
+    unsigned rex = 0;
+    if ((code[at] & 0xF0) == 0x40) rex = code[at++];
     if (at + 3 > available || code[at] != 0x0F || code[at + 1] != 0xAE) return 0;
     at += 2;
     const unsigned modrm = code[at];
     if ((modrm >> 6) == 3 || ((modrm >> 3) & 7) != 6) return 0;
     const size_t tail = modrm_length(code, available, at);
-    return tail ? at + tail : 0;
+    if (!tail) return 0;
+    const DWORD64 regs[] = {ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.Rsp, ctx.Rbp, ctx.Rsi, ctx.Rdi,
+                            ctx.R8, ctx.R9, ctx.R10, ctx.R11, ctx.R12, ctx.R13, ctx.R14, ctx.R15};
+    const unsigned mod = modrm >> 6, rm = modrm & 7;
+    size_t pos = at + 1;
+    uint64_t address = 0;
+    bool disp32 = mod == 2;
+    if (rm == 4) {
+        const unsigned sib = code[pos++], base = sib & 7, index = (sib >> 3) & 7;
+        if (index != 4 || (rex & 2)) address += regs[index | ((rex & 2) ? 8 : 0)] << (sib >> 6);
+        if (mod == 0 && base == 5) disp32 = true;
+        else address += regs[base | ((rex & 1) ? 8 : 0)];
+    } else if (mod == 0 && rm == 5) {
+        address = ctx.Rip + at + tail;
+        disp32 = true;
+    } else {
+        address = regs[rm | ((rex & 1) ? 8 : 0)];
+    }
+    if (mod == 1) address += static_cast<int8_t>(code[pos]);
+    else if (disp32) {
+        int32_t displacement;
+        std::memcpy(&displacement, code + pos, sizeof displacement);
+        address += displacement;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!canonical(address) || VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof mbi) != sizeof mbi ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return fault_at(address, false);
+    return at + tail;
 }
 
 // MONITORX (0F 01 FA) and MWAITX (0F 01 FB), AMD's user-mode MONITOR/MWAIT. MONITORX only arms an address monitor and
@@ -185,10 +219,13 @@ LONG CALLBACK handler(EXCEPTION_POINTERS* info) { return emulate(info); }
 
 }  // namespace
 
-size_t write_fault(uintptr_t address) {
+size_t fault_at(uintptr_t address, bool write) {
     t_fault_address = address;
+    t_fault_write = write;
     return kFault;
 }
+
+size_t write_fault(uintptr_t address) { return fault_at(address, true); }
 
 LONG emulate(EXCEPTION_POINTERS* info) {
     if (!info || !info->ExceptionRecord || !info->ContextRecord) return EXCEPTION_CONTINUE_SEARCH;
@@ -207,7 +244,7 @@ LONG emulate(EXCEPTION_POINTERS* info) {
             EXCEPTION_RECORD& record = *info->ExceptionRecord;
             record.ExceptionCode = STATUS_ACCESS_VIOLATION;
             record.NumberParameters = 2;
-            record.ExceptionInformation[0] = 1;  // a write
+            record.ExceptionInformation[0] = t_fault_write ? 1 : 0;
             record.ExceptionInformation[1] = t_fault_address;
             return EXCEPTION_CONTINUE_SEARCH;
         }

@@ -14,8 +14,9 @@
 //
 // Faults. An instruction that the real CPU would fault on (CLZERO on a read-only page, say) must not look like a
 // #UD to the next handler. The emulator reports it by returning `write_fault(address)`: the dispatcher then rewrites
-// the exception record in place into the page fault the CPU would have raised (STATUS_ACCESS_VIOLATION,
-// ExceptionInformation = {1 (write), address}), leaves the CONTEXT as it was and returns EXCEPTION_CONTINUE_SEARCH.
+// the exception record in place into STATUS_ACCESS_VIOLATION with {1 (write), address}. For a read fault use
+// fault_at(address, false), which reports {0 (read), address}. The CONTEXT is left unchanged and the dispatcher
+// returns EXCEPTION_CONTINUE_SEARCH.
 #pragma once
 
 #include <windows.h>
@@ -44,6 +45,8 @@ inline constexpr size_t kFault = SIZE_MAX;
 // cannot write). It records the address for the dispatcher, on this thread, and returns kFault. The emulator must not
 // have modified `ctx`.
 size_t write_fault(uintptr_t address);
+// As above, with the access type explicit (false means read).
+size_t fault_at(uintptr_t address, bool write);
 
 struct Emulator {
     const char* name;

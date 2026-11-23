@@ -37,7 +37,7 @@ constexpr size_t kPage = 4096;
 
 // Runs the dispatcher on `bytes` (followed by NOP padding, so a too-long length would show) and returns how far RIP
 // moved, or -1 when the exception was passed on. Registers and flags must come back unchanged either way.
-long run(const std::vector<uint8_t>& bytes, bool* state_kept = nullptr) {
+long run(const std::vector<uint8_t>& bytes, bool* state_kept = nullptr, int length_case = -1) {
     std::vector<uint8_t> code = bytes;
     code.insert(code.end(), 16, 0x90);
     EXCEPTION_RECORD record{};
@@ -50,11 +50,25 @@ long run(const std::vector<uint8_t>& bytes, bool* state_kept = nullptr) {
     context.Rcx = 0x2222;
     context.Rsp = 0x3333;
     context.EFlags = 0x246;
+    void* page = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    const DWORD64 target = reinterpret_cast<DWORD64>(page) + 128;
+    if (length_case >= 0) {
+        context.Rax = target; context.Rcx = target; context.Rsp = target;
+        context.Rbp = target; context.R12 = target; context.R13 = target; context.Rdi = target;
+        if (length_case == 2) context.Rax -= 8;
+        if (length_case == 3) context.Rax -= 0x12345678;
+        if (length_case == 6) context.Rsp -= 0x20;
+        if (length_case == 8) context.Rdx = (target - 0x1000) / 4;
+        if (length_case == 11) context.R12 -= 0x10;
+        if (length_case == 12) context.R8 = target - 0x1000;
+    }
+    const CONTEXT before = context;
     pointers.ExceptionRecord = &record;
     pointers.ContextRecord = &context;
     const LONG r = ud::emulate(&pointers);
     if (state_kept)
-        *state_kept = context.Rax == 0x1111 && context.Rcx == 0x2222 && context.Rsp == 0x3333 && context.EFlags == 0x246;
+        *state_kept = context.Rax == before.Rax && context.Rcx == before.Rcx && context.Rsp == before.Rsp && context.EFlags == before.EFlags;
+    VirtualFree(page, 0, MEM_RELEASE);
     if (r == EXCEPTION_CONTINUE_SEARCH) return context.Rip == reinterpret_cast<DWORD64>(code.data()) ? -1 : -2;
     return static_cast<long>(context.Rip - reinterpret_cast<DWORD64>(code.data()));
 }
@@ -64,6 +78,61 @@ struct Encoding {
     std::vector<uint8_t> bytes;
     long length;  // by hand
 };
+
+void test_fault_addresses() {
+    struct Case { const char* name; std::vector<uint8_t> bytes; DWORD64 rax, rcx, rdx, r8, r9, r12, r13; uintptr_t expected; };
+    const Case cases[] = {
+        {"base", {0x66,0x0f,0xae,0x31}, 0,0x10,0,0,0,0,0,0x10},
+        {"ignored segment override", {0x64,0x66,0x0f,0xae,0x31}, 0,0x10,0,0,0,0,0,0x10},
+        {"disp8 negative", {0x66,0x0f,0xae,0x71,0xf0}, 0,0x40,0,0,0,0,0,0x30},
+        {"disp32", {0x66,0x0f,0xae,0xb0,0x34,0x12,0,0}, 0x20,0,0,0,0,0,0,0x1254},
+        {"SIB scale", {0x66,0x0f,0xae,0x74,0x90,0x08}, 0x20,0,3,0,0,0,0,0x34},
+        {"SIB no base", {0x66,0x0f,0xae,0x34,0x95,0x00,0x10,0,0}, 0,0,3,0,0,0,0,0x100c},
+        {"REX B and X", {0x66,0x43,0x0f,0xae,0x74,0xc8,0xf0}, 0,0,0,0x40,3,0,0,0x48},
+        {"r12 base", {0x66,0x41,0x0f,0xae,0x34,0x24}, 0,0,0,0,0,0x50,0,0x50},
+        {"r13 base", {0x66,0x41,0x0f,0xae,0x75,0}, 0,0,0,0,0,0,0x60,0x60},
+    };
+    for (const auto& c : cases) {
+        CONTEXT ctx{}; EXCEPTION_RECORD rec{};
+        ctx.Rip = reinterpret_cast<DWORD64>(c.bytes.data());
+        ctx.Rax=c.rax; ctx.Rcx=c.rcx; ctx.Rdx=c.rdx; ctx.R8=c.r8; ctx.R9=c.r9; ctx.R12=c.r12; ctx.R13=c.r13;
+        rec.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION; rec.ExceptionAddress = const_cast<uint8_t*>(c.bytes.data());
+        EXCEPTION_POINTERS info{&rec, &ctx};
+        const auto result = ud::emulate(&info);
+        check(result == EXCEPTION_CONTINUE_SEARCH && rec.ExceptionCode == STATUS_ACCESS_VIOLATION &&
+              rec.NumberParameters == 2 && rec.ExceptionInformation[0] == 0 &&
+              rec.ExceptionInformation[1] == c.expected && ctx.Rip == reinterpret_cast<DWORD64>(c.bytes.data()), c.name);
+    }
+    uint8_t rip_code[] = {0x66,0x0f,0xae,0x35,0,0,0,0x80}; // RIP - 0x80000000
+    CONTEXT ctx{}; EXCEPTION_RECORD rec{};
+    ctx.Rip = reinterpret_cast<DWORD64>(rip_code);
+    rec.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+    EXCEPTION_POINTERS info{&rec, &ctx};
+    auto result = ud::emulate(&info);
+    check(result == EXCEPTION_CONTINUE_SEARCH && rec.ExceptionCode == STATUS_ACCESS_VIOLATION &&
+          rec.ExceptionInformation[0] == 0 && rec.ExceptionInformation[1] == ctx.Rip + 8 - 0x80000000ULL,
+          "RIP-relative negative displacement");
+    uint8_t code[] = {0x66,0x0f,0xae,0x31};
+    void* page = VirtualAlloc(nullptr, kPage, MEM_RESERVE | MEM_COMMIT, PAGE_NOACCESS);
+    ctx = {}; ctx.Rip = reinterpret_cast<DWORD64>(code); ctx.Rcx = reinterpret_cast<DWORD64>(page);
+    rec = {}; rec.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+    result = ud::emulate(&info);
+    check(result == EXCEPTION_CONTINUE_SEARCH && rec.ExceptionCode == STATUS_ACCESS_VIOLATION &&
+          rec.ExceptionInformation[0] == 0 && rec.ExceptionInformation[1] == reinterpret_cast<DWORD64>(page),
+          "PAGE_NOACCESS faults as a read");
+    DWORD old;
+    VirtualProtect(page, kPage, PAGE_READONLY, &old);
+    ctx.Rip = reinterpret_cast<DWORD64>(code); rec.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+    result = ud::emulate(&info);
+    check(result == EXCEPTION_CONTINUE_EXECUTION && ctx.Rip == reinterpret_cast<DWORD64>(code) + sizeof code,
+          "PAGE_READONLY is accepted");
+    VirtualProtect(page, kPage, PAGE_READONLY | PAGE_GUARD, &old);
+    ctx.Rip = reinterpret_cast<DWORD64>(code); rec.ExceptionCode = STATUS_ILLEGAL_INSTRUCTION;
+    result = ud::emulate(&info);
+    check(result == EXCEPTION_CONTINUE_SEARCH && rec.ExceptionCode == STATUS_ACCESS_VIOLATION &&
+          rec.ExceptionInformation[1] == reinterpret_cast<DWORD64>(page), "PAGE_GUARD faults");
+    VirtualFree(page, 0, MEM_RELEASE);
+}
 
 void test_lengths() {
     const Encoding cases[] = {
@@ -84,9 +153,10 @@ void test_lengths() {
         {"clwb [rip+0x100] with REX.W", {0x66, 0x48, 0x0F, 0xAE, 0x35, 0x00, 0x01, 0x00, 0x00}, 9},
         {"clwb [r15] with bare REX (40)", {0x66, 0x40, 0x0F, 0xAE, 0x37}, 5},
     };
+    int case_index = 0;
     for (const Encoding& c : cases) {
         bool kept = false;
-        const long got = run(c.bytes, &kept);
+        const long got = run(c.bytes, &kept, case_index++);
         char label[200];
         std::snprintf(label, sizeof label, "%s: RIP moves %ld bytes (got %ld), registers untouched", c.what, c.length, got);
         check(got == c.length && kept, label);
@@ -216,6 +286,7 @@ void test_installed_handler() {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    test_fault_addresses();
     test_lengths();
     test_other_instructions_pass();
     test_cut_off_by_unreadable_memory();
