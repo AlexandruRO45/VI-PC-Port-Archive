@@ -437,5 +437,61 @@ class TestVFloorF32IEEE754Bitwise(unittest.TestCase):
         self.assertEqual(v_floor_f32_oracle(qnan), qnan)
         self.assertEqual(v_floor_f32_oracle(snan), snan)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestVFloorF32NegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_out_of_bounds_vgpr(self):
+        for oob in (256, 300, 512):
+            with self.subTest(oob=oob):
+                instr = VFloorF32Instruction(
+                    dst=RegOperand(RegisterKind.VGPR, index=oob),
+                    src0=RegOperand(RegisterKind.VGPR, index=0)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_invalid_destination_kind(self):
+        for bad_kind in (RegisterKind.SGPR, RegisterKind.LITERAL32):
+            with self.subTest(bad_kind=bad_kind):
+                instr = VFloorF32Instruction(
+                    dst=RegOperand(bad_kind, index=0),
+                    src0=RegOperand(RegisterKind.VGPR, index=0)
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_mutation_detector_ceil_mutant(self):
+        """Verify detection of mutant ceil implementation."""
+        def mutant_ceil(u: int) -> int:
+            f = to_f32(u)
+            return to_u32(float(math.ceil(f)))
+
+        val = to_u32(1.5)
+        correct = v_floor_f32_oracle(val)
+        mutant = mutant_ceil(val)
+        # floor(1.5) = 1.0, ceil(1.5) = 2.0
+        self.assertEqual(correct, to_u32(1.0))
+        self.assertEqual(mutant, to_u32(2.0))
+        self.assertNotEqual(mutant, correct)
+
+    def test_mutation_detector_trunc_mutant(self):
+        """Verify detection of mutant trunc implementation (differs on negative non-integers)."""
+        def mutant_trunc(u: int) -> int:
+            f = to_f32(u)
+            return to_u32(float(math.trunc(f)))
+
+        val = to_u32(-1.5)
+        correct = v_floor_f32_oracle(val)
+        mutant = mutant_trunc(val)
+        # floor(-1.5) = -2.0, trunc(-1.5) = -1.0
+        self.assertEqual(correct, to_u32(-2.0))
+        self.assertEqual(mutant, to_u32(-1.0))
+        self.assertNotEqual(mutant, correct)
+
+
 if __name__ == "__main__":
     unittest.main()
