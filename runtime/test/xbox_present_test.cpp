@@ -1101,8 +1101,12 @@ int main() {
                 // three presents after SetWindowPos (seen on an RTX 5060 Ti, driver 621.24: still 400x300 at round 3,
                 // about 1 run in 6). Present until the frame has the new size: at least 3 rounds, at most 30.
                 const auto at_new_size = [&] { return frame.extent.width == size[0] && frame.extent.height == size[1]; };
-                for (int round = 0; round < 30 && (round < 3 || !at_new_size()); ++round) {
-                    if (round >= 3) pump();
+                int rounds = 0;
+                for (int round = 0; round < 30 && (round < 3 || !at_new_size()); ++round, ++rounds) {
+                    if (round >= 3) {
+                        Sleep(1);  // give a compositor that updates the surface extent on wall-clock time a chance
+                        pump();
+                    }
                     one = parameters(quad.source, &middle_half, xbox_scale_filter_point);
                     // (A present the driver reports out of date right after the resize is not counted as shown, so the counter
                     // is not checked here; the frame is still composed and read back.)
@@ -1115,6 +1119,8 @@ int main() {
                     resized.dest[3] = middle_half.bottom * double(frame.extent.height);
                     EXPECT(frame_matches(frame, &resized, 1, false, 203.0, 0));
                 }
+                if (rounds > 3)
+                    std::printf("compose: %ux%u reached after %d presents\n", unsigned(size[0]), unsigned(size[1]), rounds);
                 EXPECT(at_new_size());
             }
             want_w = width;
