@@ -1330,6 +1330,30 @@ def gpu_env(prog, emulate, dump, base=None):
 class HarnessError(RuntimeError):
     """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
 
+    def __init__(self, message, *, kind=None, returncode=None):
+        super().__init__(message)
+        self.kind = kind
+        self.returncode = returncode
+
+
+_HARNESS_TIMEOUT_RE = re.compile(r"^(?:harness error:\s*)?vk_compute_test timed out\b")
+_HARNESS_NO_DUMP_RE = re.compile(r"^(?:harness error:\s*)?vk_compute_test gave no dump \(exit (-?\d+)\)")
+
+
+def harness_error_key(error):
+    """Failure class of a HarnessError or its 'harness error: ...' summary, so --minimize stays on the same failure."""
+    if isinstance(error, tuple):
+        return error
+    if isinstance(error, HarnessError) and error.kind is not None:
+        return (error.kind, error.returncode)
+    text = str(error)
+    if _HARNESS_TIMEOUT_RE.match(text):
+        return ("timeout", None)
+    m = _HARNESS_NO_DUMP_RE.match(text)
+    if m:
+        return ("no_dump", int(m.group(1)))
+    return ("other", None)
+
 
 class Unpinned(RuntimeError):
     """vk_compute_test ran a wave32 program but couldn't pin the 32-lane subgroups it needs, so its words came from
@@ -1348,7 +1372,7 @@ def run_gpu(exe, spv, prog, work, emulate):
     try:
         r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
+        raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s", kind="timeout") from None
     import compute_fixture
     lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
     if lanes:
@@ -1356,7 +1380,10 @@ def run_gpu(exe, spv, prog, work, emulate):
                        "not available)")
     if not os.path.exists(dump):
         detail = " ".join(f"{r.stdout}{r.stderr}".split())
-        raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
+        raise HarnessError(
+            f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}",
+            kind="no_dump", returncode=r.returncode,
+        )
     with open(dump, "rb") as f:
         data = f.read()
     return list(struct.unpack(f"<{len(data) // 4}I", data))
@@ -1383,20 +1410,22 @@ def describe(prog, bad, limit=6):
     return "\n".join(lines)
 
 
-def minimize(prog, mode, ctx):
-    """Greedy: drop ops while the program still mismatches (same mode). Returns the reduced op list."""
+def minimize(prog, mode, ctx, harness_error=None):
+    """Greedy: drop ops while the program still fails in the same way (mismatch, or the same harness error).
+    Returns the reduced op list."""
     ops = list(prog.ops)
     i = len(ops) - 1
     while i >= 0:
         trial = ops[:i] + ops[i + 1:]
-        if still_fails(prog, trial, mode, ctx):
+        if still_fails(prog, trial, mode, ctx, harness_error=harness_error):
             ops = trial
         i -= 1
     return ops
 
 
-def still_fails(prog, ops, mode, ctx):
+def still_fails(prog, ops, mode, ctx, harness_error=None):
     mc, exe = ctx
+    expect = harness_error_key(harness_error) if harness_error is not None else None
     with tempfile.TemporaryDirectory(prefix="xlmin-") as work:
         for d in ("disasm", "fssm"):
             os.mkdir(os.path.join(work, d))
@@ -1409,9 +1438,16 @@ def still_fails(prog, ops, mode, ctx):
         if not os.path.exists(spv):
             return False
         try:
-            bad, hyp = compare(prog, run_gpu(exe, spv, prog, work, mode == "emulate"), ops)
-        except (HarnessError, Unpinned):
-            return False                # a reduction that hangs or crashes is not the mismatch being reduced
+            got = run_gpu(exe, spv, prog, work, mode == "emulate")
+        except HarnessError as e:
+            if expect is None:
+                return False            # a reduction that hangs or crashes is not the mismatch being reduced
+            return harness_error_key(e) == expect
+        except Unpinned:
+            return False
+        if expect is not None:
+            return False                # a reduction that runs without hitting the harness error is no longer failing
+        bad, hyp = compare(prog, got, ops)
         return bool(bad) and not hyp
 
 
@@ -1564,16 +1600,23 @@ def main():
                 os.makedirs(args.keep, exist_ok=True)
                 with open(os.path.join(args.keep, f"{p.name}_{mode}.asm"), "w", encoding="utf-8", newline="\n") as f:
                     f.write(kept_source(p, mode, None, not args.no_hw_guard))
-            if args.minimize and bad and what.startswith("mismatch"):
+            if args.minimize and (
+                (bad and what.startswith("mismatch"))
+                or (mode != "hw" and what.startswith("harness error:"))
+            ):
                 if mode == "hw":
                     ops = minimize_hw(p, oracle, not args.no_hw_guard)
                 elif mc is not None:
-                    ops = minimize(p, mode, (mc, args.exe))
+                    expect = harness_error_key(what) if what.startswith("harness error:") else None
+                    ops = minimize(p, mode, (mc, args.exe), harness_error=expect)
                 else:
                     continue
-                hyp_ops = p.expected(ops)[1]
-                print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
-                                                         for i, o in enumerate(ops)))
+                hyp_ops = p.expected(ops)[1] if bad else set()
+                if ops:
+                    print("  minimized:\n\t" + "\n\t".join(o.text + ("   ; hypothesis op" if i in hyp_ops else "")
+                                                             for i, o in enumerate(ops)))
+                else:
+                    print("  minimized: (no ops; wrapper alone fails)")
                 if args.keep:
                     with open(os.path.join(args.keep, f"{p.name}_{mode}_min.asm"), "w", encoding="utf-8", newline="\n") as f:
                         f.write(kept_source(p, mode, ops, not args.no_hw_guard))

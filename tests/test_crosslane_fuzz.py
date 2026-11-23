@@ -673,6 +673,231 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn("match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 0", out)
 
 
+class MinimizeHarnessError(unittest.TestCase):
+    """--minimize reduces harness crashes and hangs as well as mismatches, without drifting across failure classes."""
+
+    @staticmethod
+    def _expected_words(prog, ops=None):
+        exp, _ = prog.expected(ops)
+        words = [0] * (prog.group * len(X.OUT_REGS))
+        for (tid, j), v in exp.items():
+            words[tid * len(X.OUT_REGS) + j] = v
+        return words
+
+    @staticmethod
+    def _fake_pipeline():
+        """Fake assemble/translate that store each trial's source inside its .spv so fake run_gpu sees the exact ops."""
+        def assemble(mc, prog, src, disasm, fssm):
+            with open(os.path.join(disasm, prog.name + ".s"), "wb") as f:
+                f.write(src.encode("utf-8"))
+
+        def translate(work, emulate):
+            spdir = os.path.join(work, "spirv_emu" if emulate else "spirv_nat")
+            os.makedirs(spdir, exist_ok=True)
+            disasm = os.path.join(work, "disasm")
+            for name in os.listdir(disasm):
+                if name.endswith(".s"):
+                    with open(os.path.join(disasm, name), "rb") as src_f:
+                        data = src_f.read()
+                    with open(os.path.join(spdir, name[:-2] + ".spv"), "wb") as dst_f:
+                        dst_f.write(data)
+            return spdir, ""
+
+        return assemble, translate
+
+    def test_harness_error_key_classifies_timeouts_exit_codes_and_fallback(self):
+        self.assertEqual(X.harness_error_key(X.HarnessError("vk_compute_test timed out after 60 s", kind="timeout")),
+                         ("timeout", None))
+        self.assertEqual(X.harness_error_key("harness error: vk_compute_test timed out after 60 s"),
+                         ("timeout", None))
+        self.assertEqual(
+            X.harness_error_key(X.HarnessError("vk_compute_test gave no dump (exit 3221225477): amdvlk64",
+                                               kind="no_dump", returncode=3221225477)),
+            ("no_dump", 3221225477),
+        )
+        self.assertEqual(
+            X.harness_error_key("harness error: vk_compute_test gave no dump (exit 3221225477): amdvlk64"),
+            ("no_dump", 3221225477),
+        )
+        self.assertEqual(
+            X.harness_error_key("harness error: vk_compute_test gave no dump (exit -11): SIGSEGV"),
+            ("no_dump", -11),
+        )
+        # Stderr mentioning "timed out" after an exit code must stay classified as that exit code, not a timeout.
+        self.assertEqual(
+            X.harness_error_key("harness error: vk_compute_test gave no dump (exit 1): vkWaitForFences timed out"),
+            ("no_dump", 1),
+        )
+        self.assertEqual(X.harness_error_key(X.HarnessError("device lost")), ("other", None))
+
+    def test_run_gpu_sets_structured_error_metadata(self):
+        prog = X.make_program(1, 32, 4)
+        with tempfile.TemporaryDirectory() as work, \
+                mock.patch.object(X.subprocess, "run", side_effect=subprocess.TimeoutExpired(["x"], 60)):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertEqual((ctx.exception.kind, ctx.exception.returncode), ("timeout", None))
+
+        done = subprocess.CompletedProcess(["x"], 3221225477, stdout="", stderr="access violation\n")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertEqual((ctx.exception.kind, ctx.exception.returncode), ("no_dump", 3221225477))
+
+    def test_still_fails_mismatch_mode_still_rejects_harness_error(self):
+        prog = X.make_program(1, 32, 4, allow_maskdata=False)
+        assemble, translate = self._fake_pipeline()
+        crash = X.HarnessError("vk_compute_test gave no dump (exit 3221225477)", kind="no_dump", returncode=3221225477)
+        with mock.patch.object(X, "assemble", side_effect=assemble), \
+                mock.patch.object(X, "translate", side_effect=translate):
+            with mock.patch.object(X, "run_gpu", side_effect=crash):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe")))
+            with mock.patch.object(X, "run_gpu", side_effect=X.Unpinned("unpinned")):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe")))
+            wrong = [w ^ 1 for w in self._expected_words(prog)]
+            with mock.patch.object(X, "run_gpu", return_value=wrong):
+                self.assertTrue(X.still_fails(prog, prog.ops, "native", (["mc"], "exe")))
+            with mock.patch.object(X, "run_gpu", return_value=self._expected_words(prog)):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe")))
+
+    def test_still_fails_harness_mode_requires_same_failure_class(self):
+        prog = X.make_program(1, 32, 4, allow_maskdata=False)
+        assemble, translate = self._fake_pipeline()
+        crash_key = ("no_dump", 3221225477)
+        same_crash = X.HarnessError("vk_compute_test gave no dump (exit 3221225477): different path",
+                                    kind="no_dump", returncode=3221225477)
+        other_exit = X.HarnessError("vk_compute_test gave no dump (exit 1): bad spirv", kind="no_dump", returncode=1)
+        timeout = X.HarnessError("vk_compute_test timed out after 60 s", kind="timeout")
+        wrong = [w ^ 1 for w in self._expected_words(prog)]
+
+        with mock.patch.object(X, "assemble", side_effect=assemble), \
+                mock.patch.object(X, "translate", side_effect=translate):
+            with mock.patch.object(X, "run_gpu", side_effect=same_crash):
+                self.assertTrue(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"),
+                                               harness_error=("timeout", None)))
+            with mock.patch.object(X, "run_gpu", side_effect=other_exit):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+            with mock.patch.object(X, "run_gpu", side_effect=timeout):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+                self.assertTrue(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"),
+                                              harness_error=("timeout", None)))
+            with mock.patch.object(X, "run_gpu", side_effect=X.Unpinned("unpinned")):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+            with mock.patch.object(X, "run_gpu", return_value=wrong):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+            with mock.patch.object(X, "run_gpu", return_value=self._expected_words(prog)):
+                self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+
+        # Broken assembly or translator rejection during reduction must not count as reproducing the GPU crash.
+        with mock.patch.object(X, "assemble", side_effect=RuntimeError("bad asm")):
+            self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+        with mock.patch.object(X, "assemble", side_effect=assemble), \
+                mock.patch.object(X, "translate", side_effect=lambda work, emu: (work, "rejected")):
+            self.assertFalse(X.still_fails(prog, prog.ops, "native", (["mc"], "exe"), harness_error=crash_key))
+
+    def _run_main(self, run_gpu, argv):
+        assemble, translate = self._fake_pipeline()
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as build:
+            exe = os.path.join(build, "vk_compute_test.exe")
+            open(exe, "wb").close()
+            with mock.patch.object(X, "assemble", side_effect=assemble), \
+                    mock.patch.object(X, "translate", side_effect=translate), \
+                    mock.patch.object(X, "run_gpu", side_effect=run_gpu), \
+                    mock.patch.object(sys, "argv", ["crosslane_fuzz.py", "--exe", exe] + argv), \
+                    contextlib.redirect_stdout(out):
+                code = X.main()
+        return code, out.getvalue()
+
+    def test_main_minimize_reduces_harness_crash_and_writes_min_asm(self):
+        # Build the exact program main() generates for --seed 7 --wave 32 --ops 8 --no-maskdata.
+        prog = X.make_program(7 * 100003, 32, 8, allow_maskdata=False)
+        keep_a, keep_b = prog.ops[2].text, prog.ops[5].text
+        # Ensure our two chosen trigger ops have distinct text from the rest so the reduction target is unique.
+        self.assertNotEqual(keep_a, keep_b)
+        other_texts = [o.text for i, o in enumerate(prog.ops) if i not in (2, 5)]
+
+        def run_gpu(exe, spv, p, work, emulate):
+            with open(spv, "r", encoding="utf-8") as f:
+                src = f.read()
+            if keep_a in src and keep_b in src:
+                raise X.HarnessError(
+                    "vk_compute_test gave no dump (exit 3221225477): amdvlk64 access violation",
+                    kind="no_dump", returncode=3221225477,
+                )
+            # If only keep_a remains without keep_b, simulate a different error (timeout): must NOT be accepted.
+            if keep_a in src and keep_b not in src and all(t not in src for t in other_texts):
+                raise X.HarnessError("vk_compute_test timed out after 60 s", kind="timeout")
+            return self._expected_words(p)
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._run_main(
+                run_gpu,
+                ["--seed", "7", "--programs", "1", "--ops", "8", "--wave", "32", "--modes", "native",
+                 "--no-maskdata", "--minimize", "--keep", keep],
+            )
+            min_path = os.path.join(keep, f"{prog.name}_native_min.asm")
+            self.assertTrue(os.path.isfile(min_path), os.listdir(keep))
+            with open(min_path, "rb") as f:
+                min_bytes = f.read()
+
+        self.assertEqual(code, 2, out)
+        self.assertIn("harness error: vk_compute_test gave no dump (exit 3221225477)", out)
+        self.assertIn("  minimized:\n\t", out)
+        self.assertNotIn("; hypothesis op", out)
+        self.assertNotIn(b"\r\n", min_bytes)
+        min_text = min_bytes.decode("utf-8")
+        self.assertEqual(min_text, prog.source([prog.ops[2], prog.ops[5]]))
+
+    def test_main_minimize_handles_wrapper_only_crash(self):
+        prog = X.make_program(3 * 100003, 32, 4, allow_maskdata=False)
+
+        def run_gpu(exe, spv, p, work, emulate):
+            raise X.HarnessError("vk_compute_test gave no dump (exit -11): SIGSEGV", kind="no_dump", returncode=-11)
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._run_main(
+                run_gpu,
+                ["--seed", "3", "--programs", "1", "--ops", "4", "--wave", "32", "--modes", "native",
+                 "--no-maskdata", "--minimize", "--keep", keep],
+            )
+            min_path = os.path.join(keep, f"{prog.name}_native_min.asm")
+            with open(min_path, "r", encoding="utf-8") as f:
+                min_text = f.read()
+
+        self.assertEqual(code, 2, out)
+        self.assertIn("  minimized: (no ops; wrapper alone fails)", out)
+        self.assertEqual(min_text, prog.source([]))
+
+    def test_main_minimize_mismatch_still_rejects_crashing_trials(self):
+        prog = X.make_program(9 * 100003, 32, 4, allow_maskdata=False)
+        keep_op = prog.ops[1].text
+        drop_op = prog.ops[0].text
+        self.assertNotEqual(keep_op, drop_op)
+
+        def run_gpu(exe, spv, p, work, emulate):
+            with open(spv, "r", encoding="utf-8") as f:
+                src = f.read()
+            if keep_op not in src:
+                raise X.HarnessError("vk_compute_test gave no dump (exit 3221225477)",
+                                     kind="no_dump", returncode=3221225477)
+            return [w ^ 1 for w in self._expected_words(p)]
+
+        with tempfile.TemporaryDirectory() as keep:
+            code, out = self._run_main(
+                run_gpu,
+                ["--seed", "9", "--programs", "1", "--ops", "4", "--wave", "32", "--modes", "native",
+                 "--no-maskdata", "--minimize", "--keep", keep],
+            )
+            min_path = os.path.join(keep, f"{prog.name}_native_min.asm")
+            with open(min_path, "r", encoding="utf-8") as f:
+                min_text = f.read()
+
+        self.assertEqual(code, 1, out)
+        self.assertEqual(min_text, prog.source([prog.ops[1]]))
+
+
 def mask_name(text):
     """'vcc' / 'exec' / the first SGPR of 's[16:17]', as Wave.mask takes it."""
     m = re.fullmatch(r"s\[(\d+):\d+\]", text)
