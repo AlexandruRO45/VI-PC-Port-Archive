@@ -94,6 +94,8 @@ _SDWA_SELS = {
 _SDWA_UNUSED = {0: "UNUSED_PAD", 1: "UNUSED_SEXT", 2: "UNUSED_PRESERVE"}
 _OMOD_MODS = {1: "mul:2", 2: "mul:4", 3: "div:2"}
 
+_DS_2ADDR = tuple(f"ds_{op}{st}_" for op in ("read2", "write2", "wrxchg2") for st in ("", "st64"))
+
 _HWREG_NAMES = {
     1: "HW_REG_MODE",
     2: "HW_REG_STATUS",
@@ -1017,7 +1019,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "DATA1":
                 args.append(_vreg(data1, w))
         mods = []
-        is_2addr = ("2_" in name or "2st64_" in name)
+        # ds_read2*/ds_write2*/ds_wrxchg2* carry two 8-bit offsets; "2_" alone also matched condxchg32_rtn and *_src2_*.
+        is_2addr = name.startswith(_DS_2ADDR)
         if name == "ds_swizzle_b32":
             mods.append(_format_ds_swizzle(offset0 | (offset1 << 8)))
         elif is_2addr:

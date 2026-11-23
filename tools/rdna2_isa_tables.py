@@ -113,6 +113,22 @@ DS = {
     0x77: ('ds_read2_b64', (('VDST', 4, 'i'), ('ADDR', 1, 'i'))),
     0x78: ('ds_read2st64_b64', (('VDST', 4, 'i'), ('ADDR', 1, 'i'))),
     0x7e: ('ds_condxchg32_rtn_b64', (('VDST', 2, 'i'), ('ADDR', 1, 'i'), ('DATA0', 2, 'i'))),
+    0x80: ('ds_add_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x81: ('ds_sub_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x82: ('ds_rsub_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x83: ('ds_inc_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x84: ('ds_dec_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x85: ('ds_min_src2_i32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x86: ('ds_max_src2_i32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x87: ('ds_min_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x88: ('ds_max_src2_u32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x89: ('ds_and_src2_b32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x8a: ('ds_or_src2_b32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x8b: ('ds_xor_src2_b32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x8d: ('ds_write_src2_b32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x92: ('ds_min_src2_f32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x93: ('ds_max_src2_f32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0x95: ('ds_add_src2_f32', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
     0xa0: ('ds_write_b8_d16_hi', (('ADDR', 1, 'i'), ('DATA0', 1, 'i'))),
     0xa1: ('ds_write_b16_d16_hi', (('ADDR', 1, 'i'), ('DATA0', 1, 'i'))),
     0xa2: ('ds_read_u8_d16', (('VDST', 1, 'i'), ('ADDR', 1, 'i'))),
@@ -125,6 +141,21 @@ DS = {
     0xb1: ('ds_read_addtid_b32', (('VDST', 1, 'i'),)),
     0xb2: ('ds_permute_b32', (('VDST', 1, 'i'), ('ADDR', 1, 'i'), ('DATA0', 1, 'i'))),
     0xb3: ('ds_bpermute_b32', (('VDST', 1, 'i'), ('ADDR', 1, 'i'), ('DATA0', 1, 'i'))),
+    0xc0: ('ds_add_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc1: ('ds_sub_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc2: ('ds_rsub_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc3: ('ds_inc_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc4: ('ds_dec_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc5: ('ds_min_src2_i64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc6: ('ds_max_src2_i64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc7: ('ds_min_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc8: ('ds_max_src2_u64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xc9: ('ds_and_src2_b64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xca: ('ds_or_src2_b64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xcb: ('ds_xor_src2_b64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xcd: ('ds_write_src2_b64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xd2: ('ds_min_src2_f64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
+    0xd3: ('ds_max_src2_f64', (('ADDR', 1, 'i'),)),  # GFX10 src2 op; not in the XML, named as llvm-mc names it
     0xde: ('ds_write_b96', (('ADDR', 1, 'i'), ('DATA0', 3, 'i'))),
     0xdf: ('ds_write_b128', (('ADDR', 1, 'i'), ('DATA0', 4, 'i'))),
     0xfe: ('ds_read_b96', (('VDST', 3, 'i'), ('ADDR', 1, 'i'))),
