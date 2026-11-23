@@ -135,6 +135,20 @@ class MemoryType(unittest.TestCase):
             pc.sys.platform, pc._run = plat, run
 
 
+class EvaluateRamKind(unittest.TestCase):
+    def test_generation_labels_the_ram_row(self):
+        _, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 24, "DDR5")
+        self.assertEqual(rows[2][3], "24 GB DDR5")
+        self.assertEqual(rows[2][1], pc.BELOW)                # 24 GB still below the 32 GB ref
+
+    def test_no_generation_leaves_the_row_as_before(self):
+        _, _, rows = pc.evaluate(XBOX, "AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 24)
+        self.assertEqual(rows[2][3], "24 GB")
+        text = pc.result_as_text(XBOX, *pc.evaluate(XBOX, "AMD Ryzen 5 5600",
+                                                    "NVIDIA GeForce RTX 3070", 24))
+        self.assertIn("your PC: 24 GB)", text)                # no trailing space
+
+
 class Api(unittest.TestCase):
     GOOD = ("AMD Ryzen 5 5600", "NVIDIA GeForce RTX 3070", 32)
     WEAK = ("Intel Core i3-10100F", "NVIDIA GeForce GTX 1650", 8)
