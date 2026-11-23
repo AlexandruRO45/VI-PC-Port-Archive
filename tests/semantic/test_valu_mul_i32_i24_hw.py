@@ -156,5 +156,57 @@ class TestMul24ASTAndTypes(unittest.TestCase):
         self.assertEqual(words[0], (-21) & MASK32)
 
 
+class VectorInterpreter:
+    """Deterministic vector instruction interpreter for 24-bit multiplication."""
+
+    def __init__(self) -> None:
+        self.vgprs = [0] * 64
+
+    def exec_line(self, line: str) -> None:
+        tokens = line.strip().replace(",", " ").split()
+        if not tokens:
+            return
+        op = tokens[0]
+        if op == "v_mov_b32":
+            dst = int(tokens[1].lstrip("v"))
+            val = int(tokens[2], 0)
+            self.vgprs[dst] = val & MASK32
+        elif op == "v_mul_i32_i24":
+            dst = int(tokens[1].lstrip("v"))
+            src0 = self.resolve_src(tokens[2])
+            src1 = self.resolve_src(tokens[3])
+            self.vgprs[dst] = v_mul_i32_i24_oracle(src0, src1)
+
+    def resolve_src(self, tok: str) -> int:
+        if tok.startswith("v"):
+            return self.vgprs[int(tok.lstrip("v"))]
+        return int(tok, 0) & MASK32
+
+
+class TestMul24ScalarInterpreter(unittest.TestCase):
+    """Commit 3: deterministic scalar instruction interpreter for v_mul_i32_i24."""
+
+    def test_sequential_chained_multiplication(self):
+        interp = VectorInterpreter()
+        lines = [
+            "v_mov_b32 v0, 3",
+            "v_mov_b32 v1, 5",
+            "v_mul_i32_i24 v0, v0, v1",   # 15
+            "v_mov_b32 v2, -2",
+            "v_mul_i32_i24 v0, v0, v2",   # -30
+        ]
+        for ln in lines:
+            interp.exec_line(ln)
+        self.assertEqual(interp.vgprs[0], (-30) & MASK32)
+
+        prog = lines + [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_mul24_ps(prog, "ps_mul24_chained")
+        self.assertEqual(words[0], (-30) & MASK32)
+
+
 if __name__ == '__main__':
     unittest.main()
