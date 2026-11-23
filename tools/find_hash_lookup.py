@@ -10,6 +10,10 @@ target is a candidate; candidates are ranked by how many of the hashes lead to t
 the whole image makes to them. RAGE's archetype lookup by hash takes the hash and is called from hundreds of places,
 so it should rank first; pass its RVA to `gta6rt --archetype-lookup`.
 
+Each hash's line also says how often the whole file holds the value and, when no executable section does, which
+section does: a build that keeps the id in its data (the retail 1.0.2.1 executable holds it in no byte) has no
+immediate to start from, and a larger --window cannot help there.
+
 Standard library only. No game data is written: the report holds RVAs and counts. The report destination must not
 name the scanned executable, which it would truncate.
 """
@@ -79,7 +83,8 @@ def direct_calls(code, base_rva):
 
 
 def rank(data, hashes, window=48, top=15):
-    code_sections = [s for s in sections(data) if s[4]]
+    all_sections = sections(data)
+    code_sections = [s for s in all_sections if s[4]]
     if not code_sections:
         raise ValueError("no executable section")
     lo = min(s[1] for s in code_sections)
@@ -91,8 +96,11 @@ def rank(data, hashes, window=48, top=15):
                 all_calls[target].extend(sites)
     leads = defaultdict(set)      # candidate rva -> hashes that lead to it
     hits = Counter()              # hash -> occurrences found
+    elsewhere = {}                # hash -> sections holding it outside the code
     for name, value in hashes:
         needle = struct.pack("<I", value)
+        elsewhere[name] = [s[0] for s in all_sections
+                           if not s[4] and s[3] and data.find(needle, s[2], s[2] + s[3]) >= 0]
         for _, rva, raw, size, _ in code_sections:
             code = data[raw:raw + size]
             at = code.find(needle)
@@ -109,7 +117,9 @@ def rank(data, hashes, window=48, top=15):
                 at = code.find(needle, at + 1)
     ranked = sorted(leads, key=lambda t: (-len(leads[t]), -len(all_calls.get(t, ())), t))[:top]
     return {
-        "hashes": [{"name": n, "value": f"0x{v:08X}", "occurrences": hits[n]} for n, v in hashes],
+        "hashes": [{"name": n, "value": f"0x{v:08X}", "occurrences": hits[n],
+                    "image_occurrences": data.count(struct.pack("<I", v)), "data_sections": elsewhere[n]}
+                   for n, v in hashes],
         "candidates": [{"rva": f"0x{t:X}", "led_by": sorted(leads[t]), "direct_callers": len(all_calls.get(t, ()))}
                        for t in ranked],
     }
@@ -142,9 +152,18 @@ def main(argv=None):
         print(f"ERROR: {a.exe}: {e}", file=sys.stderr)
         return 2
     for h in report["hashes"]:
-        print(f"{h['name']} = {h['value']}: {h['occurrences']} occurrence(s) in code")
+        line = (f"{h['name']} = {h['value']}: {h['occurrences']} occurrence(s) in code, "
+                f"{h['image_occurrences']} in the file")
+        if not h["occurrences"] and h["image_occurrences"]:
+            where = ", ".join(h["data_sections"]) or "bytes outside the sections"
+            line += f" (only in {where})"
+        print(line)
     if not report["candidates"]:
-        print("no direct call follows any of the hashes: try a larger --window, or the lookup is reached indirectly")
+        if any(h["occurrences"] for h in report["hashes"]):
+            print("no direct call follows any of the hashes: try a larger --window, or the lookup is reached indirectly")
+        else:
+            print("no hash occurs in an executable section: this build does not load the id as an immediate, so no "
+                  "--window size finds the lookup and it has to be found by its shape")
     for c in report["candidates"]:
         print(f"  {c['rva']:>12}  callers {c['direct_callers']:>6}  led by {', '.join(c['led_by'])}")
     if a.json:
