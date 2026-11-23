@@ -731,8 +731,10 @@ def main(argv=None):
     ap.add_argument("--programs", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--max-ops", type=int, default=6)
-    ap.add_argument("--ops", default=None, help="comma-separated opcodes (default: all)")
-    ap.add_argument("--list-ops", action="store_true")
+    ap.add_argument("--ops", default=None,
+                    help="comma-separated opcodes (by default, omit lane mask ops "
+                         "unless --oracle hw is used alone)")
+    ap.add_argument("--list-ops", action="store_true", help="list every supported reference opcode")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--all-failures", action="store_true", help="print every failing program, not just the first")
     ap.add_argument("--bfe-any", action="store_true",
