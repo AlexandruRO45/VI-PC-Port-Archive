@@ -172,5 +172,166 @@ class TestValuFrexpMantF64ReferenceOracle(unittest.TestCase):
         self.assertEqual(res_hi, 0x3FE00000)
         self.assertEqual(res_lo, 0x0)
 
+# ---------------------------------------------------------------------------
+# Phase 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ---------------------------------------------------------------------------
+
+class Opcode(str, enum.Enum):
+    V_FREXP_MANT_F64 = "v_frexp_mant_f64"
+    V_FREXP_MANT_F64_E64 = "v_frexp_mant_f64_e64"
+
+
+class RegKind(str, enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    kind: RegKind
+    index: int
+    count: int = 1
+
+    def __post_init__(self) -> None:
+        if self.index < 0 or self.index >= 256:
+            raise ValueError(f"Register index out of range [0, 255]: {self.index}")
+        if self.count < 1 or (self.index + self.count) > 256:
+            raise ValueError(f"Register span out of bounds [0, 255]: index={self.index}, count={self.count}")
+
+    def __str__(self) -> str:
+        if self.count == 1:
+            return f"{self.kind.value}{self.index}"
+        return f"{self.kind.value}[{self.index}:{self.index + self.count - 1}]"
+
+
+def VGPR64(index: int) -> Register:
+    return Register(RegKind.VGPR, index, 2)
+
+
+def SGPR64(index: int) -> Register:
+    return Register(RegKind.SGPR, index, 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class InlineConstant64:
+    val: float
+
+    def __str__(self) -> str:
+        return str(self.val)
+
+
+Operand64 = Union[Register, InlineConstant64]
+
+
+@dataclasses.dataclass
+class ValuFrexpMantF64Instruction:
+    """AST node for v_frexp_mant_f64 and v_frexp_mant_f64_e64 instructions."""
+    opcode: Opcode
+    dst: Register
+    src: Operand64
+    clamp: bool = False
+    neg: bool = False
+    abs_val: bool = False
+
+    def __post_init__(self) -> None:
+        if self.opcode not in (Opcode.V_FREXP_MANT_F64, Opcode.V_FREXP_MANT_F64_E64):
+            raise ValueError(f"Unsupported opcode: {self.opcode}")
+        if self.dst.kind != RegKind.VGPR or self.dst.count != 2:
+            raise ValueError(f"Destination must be a 64-bit VGPR pair (count=2), got {self.dst}")
+        if isinstance(self.src, Register):
+            if self.src.count != 2:
+                raise ValueError(f"Register source operand must be 64-bit (count=2), got {self.src}")
+        if (self.clamp or self.neg or self.abs_val) and self.opcode != Opcode.V_FREXP_MANT_F64_E64:
+            raise ValueError("Modifiers clamp, neg, and abs require VOP3 e64 encoding")
+
+    @classmethod
+    def parse(cls, asm: str) -> ValuFrexpMantF64Instruction:
+        raw_tokens = asm.strip().split()
+        if not raw_tokens:
+            raise ValueError("Empty assembly string")
+
+        op_str = raw_tokens[0]
+        if op_str not in (Opcode.V_FREXP_MANT_F64.value, Opcode.V_FREXP_MANT_F64_E64.value):
+            raise ValueError(f"Expected opcode '{Opcode.V_FREXP_MANT_F64.value}', got '{op_str}'")
+        opcode = Opcode(op_str)
+
+        rest = " ".join(raw_tokens[1:]).replace(",", " ").split()
+        if len(rest) < 2:
+            raise ValueError(f"Too few operands for {op_str}: {asm}")
+
+        def parse_reg(tok: str) -> Register:
+            if tok.startswith("v[") and tok.endswith("]"):
+                parts = tok[2:-1].split(":")
+                return VGPR64(int(parts[0]))
+            elif tok.startswith("s[") and tok.endswith("]"):
+                parts = tok[2:-1].split(":")
+                return SGPR64(int(parts[0]))
+            raise ValueError(f"Expected 64-bit register span, got {tok}")
+
+        dst = parse_reg(rest[0])
+        src_tok = rest[1]
+        clamp = "clamp" in rest[2:]
+        neg = False
+        abs_val = False
+
+        if src_tok.startswith("-"):
+            neg = True
+            src_tok = src_tok[1:]
+        if src_tok.startswith("|") and src_tok.endswith("|"):
+            abs_val = True
+            src_tok = src_tok[1:-1]
+
+        if src_tok.startswith("v[") or src_tok.startswith("s["):
+            src: Operand64 = parse_reg(src_tok)
+        else:
+            try:
+                src = InlineConstant64(float(src_tok))
+            except ValueError:
+                raise ValueError(f"Invalid source operand: {src_tok}")
+
+        return cls(
+            opcode=opcode,
+            dst=dst,
+            src=src,
+            clamp=clamp,
+            neg=neg,
+            abs_val=abs_val,
+        )
+
+
+class TestValuFrexpMantF64Ast(unittest.TestCase):
+    """Phase 2: Unit tests for symbolic AST representation and VOP1/VOP3 encoding."""
+
+    def test_parse_vop1_standard(self) -> None:
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[2:3]")
+        self.assertEqual(inst.opcode, Opcode.V_FREXP_MANT_F64)
+        self.assertEqual(inst.dst, VGPR64(0))
+        self.assertEqual(inst.src, VGPR64(2))
+        self.assertFalse(inst.clamp)
+        self.assertFalse(inst.neg)
+        self.assertFalse(inst.abs_val)
+
+    def test_parse_vop3_modifiers(self) -> None:
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64_e64 v[4:5], -|v[6:7]| clamp")
+        self.assertEqual(inst.opcode, Opcode.V_FREXP_MANT_F64_E64)
+        self.assertEqual(inst.dst, VGPR64(4))
+        self.assertEqual(inst.src, VGPR64(6))
+        self.assertTrue(inst.clamp)
+        self.assertTrue(inst.neg)
+        self.assertTrue(inst.abs_val)
+
+    def test_translator_vop3_modifier_execution(self) -> None:
+        """Verify support.translate_lines and mrt0_words execution for VOP3 neg/abs/clamp."""
+        lines = [
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0x40000000",  # 2.0
+            "v_frexp_mant_f64_e64 v[0:1], -v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_mant_neg", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[1], 0xBFE00000)  # -0.5
+
 if __name__ == "__main__":
     unittest.main()
