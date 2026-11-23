@@ -16,7 +16,16 @@ import os
 import re
 import sys
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and usage errors must work on a machine without it (the GUI tests skip)."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 HEADER = os.environ.get("AMD_SWIZZLE_HEADER", r"<ref>\mesa-addrlib\gfx10SwizzlePattern.h")
 BPE_INDEX = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4}
@@ -165,8 +174,6 @@ def validate_out_path(out, blob, same_report_path):
 
 def main(argv=None):
     sys.path.insert(0, os.path.dirname(__file__))
-    from tile_probe import same_report_path, score
-    from swizzle_search import render  # noqa: F401
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
     ap.add_argument("--bpe", type=int, default=8)
@@ -176,6 +183,9 @@ def main(argv=None):
     ap.add_argument("--modes", default="_64K_")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
+    # The decode helpers need numpy; import them after --help/usage errors so those work on a numpy-less checkout.
+    from tile_probe import same_report_path, score
+    from swizzle_search import render  # noqa: F401
     if a.out is not None:
         err = validate_out_path(a.out, a.blob, same_report_path)
         if err:

@@ -13,7 +13,16 @@ import os
 import sys
 from collections import Counter
 
-import numpy as np
+class _LazyNumpy:
+    """Import numpy on first use: --help and usage errors must work on a machine without it (the GUI tests skip)."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 sys.path.insert(0, os.path.dirname(__file__))
 from amd_swizzle import _parity, equation, load  # noqa: E402

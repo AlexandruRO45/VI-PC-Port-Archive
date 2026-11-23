@@ -3,7 +3,19 @@
 Endpoints and palette colours are computed in floating point. The averages can differ from GPU readback
 when the hardware quantizes the decoded RGB values.
 """
-import numpy as np
+
+from __future__ import annotations
+
+class _LazyNumpy:
+    """Import numpy on first use: --help and usage errors must work on a machine without it (the GUI tests skip)."""
+
+    def __getattr__(self, name):
+        import numpy
+        globals()["np"] = numpy
+        return getattr(numpy, name)
+
+
+np = _LazyNumpy()
 
 
 def _565(c):
