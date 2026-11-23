@@ -131,6 +131,28 @@ class TimecyclePairsTests(unittest.TestCase):
         self.assertEqual(summary["vars_with_b_outside_0_1"]["far_clip"]["keyframe_range"], [500, 700])
         json.dumps(summary, allow_nan=False)
 
+
+    def test_large_finite_pair_medians_remain_finite(self):
+        for first, second, expected in (
+                ("1e308", "1e308", 1e308),
+                ("-1e308", "-1e308", -1e308),
+                ("1e308", "1.6e308", 1.3e308),
+                ("-1e308", "1e308", 0.0),
+                ("5e-324", "5e-324", 5e-324)):
+            with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as tmp:
+                source = os.path.join(tmp, "in.xml")
+                report = os.path.join(tmp, "report.json")
+                xml = ('<?xml version="1.0"?><timecycle_modifier_data><modifier>'
+                       f'<x>{first} {first}</x><y>{second} {second}</y>'
+                       '</modifier></timecycle_modifier_data>')
+                with open(source, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(xml)
+                self.assertEqual(tp.main([source, "--out", report]), 0)
+                with open(report, encoding="utf-8") as f:
+                    result = json.load(f, parse_constant=lambda token: self.fail(token))
+                for key in ("first_number", "second_number"):
+                    self.assertEqual(result[key]["median"], round(expected, 6))
+
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             in_xml = os.path.join(tmp, "mod.xml")

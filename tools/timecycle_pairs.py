@@ -194,6 +194,12 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
     def _dist(vals: list[float]) -> dict:
         if not vals:
             return {"count": 0}
+        median = statistics.median(vals)
+        if not math.isfinite(median):
+            # The sum of two finite middle values can overflow before division.
+            ordered = sorted(vals)
+            middle = len(ordered) // 2
+            median = ordered[middle - 1] / 2 + ordered[middle] / 2
         return {
             "count": len(vals),
             "lt0": sum(1 for x in vals if x < 0.0),
@@ -202,7 +208,7 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
             "eq1": sum(1 for x in vals if x == 1.0),
             "gt1": sum(1 for x in vals if x > 1.0),
             "min": min(vals),
-            "median": round(statistics.median(vals), 6),
+            "median": round(median, 6),
             "max": max(vals),
             "distinct_round6": len({round(x, 6) for x in vals}),
         }
