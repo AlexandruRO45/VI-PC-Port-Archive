@@ -528,5 +528,31 @@ class VPackB32F16EdgeCasesTests(unittest.TestCase):
         res = ref_pack_b32_f16(qnan, snan)
         self.assertEqual(res, (snan << 16) | qnan)
 
-if __name__ == '__main__':
+class VPackB32F16TranslatorTests(unittest.TestCase):
+    def test_translation_basic(self):
+        lines = [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_pack_b32_f16 v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pack_basic", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word, 0xDEF05678)
+
+    def test_translation_opsel(self):
+        lines = [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_pack_b32_f16 v0, v1, v2 op_sel:[1,1,0]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_pack_opsel", lines)
+        word = mrt0_words(spv)[0]
+        self.assertEqual(word, 0x9ABC1234)
+
+
+if __name__ == "__main__":
     unittest.main()
