@@ -75,6 +75,38 @@ D3D12_RESOURCE_DESC make_buf_desc(UINT64 bytes, D3D12_RESOURCE_FLAGS flags = D3D
     return d;
 }
 
+// A driver whose GENERIC acceleration structures do not sit at buffer address + offset, through the device's own
+// function lookup (VulkanDeviceInfo::get_instance_proc): vkGetAccelerationStructureDeviceAddressKHR answers the real
+// address plus kShiftedAsDelta. Only resource creation and the address lookup run on such a device, no builds: the
+// shifted address names no real structure.
+constexpr VkDeviceAddress kShiftedAsDelta = 0x10000000;
+PFN_vkGetInstanceProcAddr g_real_gipa = nullptr;
+PFN_vkGetDeviceProcAddr g_real_gdpa = nullptr;
+PFN_vkGetAccelerationStructureDeviceAddressKHR g_real_as_address = nullptr;
+
+VKAPI_ATTR VkDeviceAddress VKAPI_CALL shifted_as_address(VkDevice device,
+                                                         const VkAccelerationStructureDeviceAddressInfoKHR* info) {
+    const VkDeviceAddress real = g_real_as_address(device, info);
+    return real ? real + kShiftedAsDelta : 0;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL shifted_gdpa(VkDevice device, const char* name) {
+    if (!std::strcmp(name, "vkGetAccelerationStructureDeviceAddressKHR")) {
+        g_real_as_address =
+            reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(g_real_gdpa(device, name));
+        return g_real_as_address ? reinterpret_cast<PFN_vkVoidFunction>(&shifted_as_address) : nullptr;
+    }
+    return g_real_gdpa(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL shifted_gipa(VkInstance instance, const char* name) {
+    if (!std::strcmp(name, "vkGetDeviceProcAddr")) {
+        g_real_gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(g_real_gipa(instance, name));
+        return reinterpret_cast<PFN_vkVoidFunction>(&shifted_gdpa);
+    }
+    return g_real_gipa(instance, name);
+}
+
 }  // namespace
 
 int main() {
@@ -795,6 +827,42 @@ int main() {
             }
         }
         std::printf("  [PASS] AS resource GPU VAs are the driver's acceleration structure addresses\n");
+
+        // The same on a driver that answers another address than buffer address + offset: the resource's GPU VA is
+        // the driver's, the arena address still names the structure, and releasing the resource forgets both.
+        {
+            g_real_gipa = gipa;
+            rt::d3d12::VulkanDeviceInfo shifted_info = info;
+            shifted_info.get_instance_proc = &shifted_gipa;
+            ID3D12Device5* shifted = nullptr;
+            if (FAILED(rt::d3d12::create_vulkan_device(shifted_info, IID_PPV_ARGS(&shifted))) || !shifted)
+                return fail("create_vulkan_device(shifted AS addresses)");
+            ID3D12Resource* as_buf = nullptr;
+            if (FAILED(shifted->CreateCommittedResource(&def_hp, D3D12_HEAP_FLAG_NONE, &blas_desc,
+                                                        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                                                        nullptr, IID_PPV_ARGS(&as_buf))))
+                return fail("CreateCommittedResource(AS, shifted addresses)");
+            const D3D12_GPU_VIRTUAL_ADDRESS va = as_buf->GetGPUVirtualAddress();
+            VkAccelerationStructureDeviceAddressInfoKHR dai{
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+            dai.accelerationStructure = rt::d3d12::vulkan_acceleration_structure(shifted, va);
+            if (!dai.accelerationStructure) return fail("shifted AS: the GPU VA does not name the structure");
+            const VkDeviceAddress buffer_va = vkGetAccelerationStructureDeviceAddressKHR(vk_dev, &dai);
+            if (va != buffer_va + kShiftedAsDelta) {
+                std::fprintf(stderr, "FAIL: shifted AS: GPU VA 0x%llx, driver address 0x%llx\n",
+                             static_cast<unsigned long long>(va),
+                             static_cast<unsigned long long>(buffer_va + kShiftedAsDelta));
+                return 1;
+            }
+            if (rt::d3d12::vulkan_acceleration_structure(shifted, buffer_va) != dai.accelerationStructure)
+                return fail("shifted AS: the arena address does not name the structure");
+            as_buf->Release();
+            if (rt::d3d12::vulkan_acceleration_structure(shifted, va) ||
+                rt::d3d12::vulkan_acceleration_structure(shifted, buffer_va))
+                return fail("shifted AS: an address still names the structure after Release");
+            shifted->Release();
+            std::printf("  [PASS] a driver address other than buffer address + offset is the GPU VA; both freed\n");
+        }
 
 #if defined(LEONIDA_TEST_CS_RAYQUERY_SPV)
         std::vector<std::uint32_t> rq_words;
