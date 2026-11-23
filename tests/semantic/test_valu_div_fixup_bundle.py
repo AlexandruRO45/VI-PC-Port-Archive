@@ -582,5 +582,28 @@ class TestVDivFixupF64ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.read_f64(Operand.vgpr(0, 2)), 2.5)
 
 
+class TestVDivFixupF64SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence for v_div_fixup_f64."""
+
+    def test_simd_execution(self):
+        wave = WaveDivState(wave_size=32)
+        wave.exec_mask = 0x000000FF
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                b = f64_to_bits(2.5)
+                wave.vgprs[lane][0] = b & MASK32
+                wave.vgprs[lane][1] = (b >> 32) & MASK32
+            else:
+                wave.vgprs[lane][0] = 0
+                wave.vgprs[lane][1] = 0
+
+        for lane in range(32):
+            if lane < 8:
+                u64 = (wave.vgprs[lane][1] << 32) | wave.vgprs[lane][0]
+                self.assertEqual(bits_to_f64(u64), 2.5)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
