@@ -1461,7 +1461,7 @@ DWORD WINAPI get_compressed_file_size_a(LPCSTR name, LPDWORD high) {
 // ---- ReplaceFile: done on the overlay copies, so the package keeps its files
 //
 // Both files are brought into the overlay (copied up when only the package has them) and the host's ReplaceFile runs
-// there; a replacement that only the package had is then deleted by a marker, since ReplaceFile consumes it. The backup,
+// there; a replacement that only the package had is deleted by a marker, since ReplaceFile consumes it. The backup,
 // when asked for, is written in the overlay. Errors for a missing file, a missing folder, a folder, and a backup whose
 // folder is missing are the host's (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED,
 // ERROR_UNABLE_TO_REMOVE_REPLACED), the replaced file checked before the replacement; a mix of console and host
@@ -1505,12 +1505,20 @@ BOOL WINAPI replace_file_w(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup
     if (dst_target.error) return fail_bool(dst_target.error);
     const Target src_target = write_target(replacement, true);
     if (src_target.error) return fail_bool(src_target.error);
-    if (!::ReplaceFileW(dst_target.path.c_str(), src_target.path.c_str(), backup ? backup_path.c_str() : nullptr, flags,
-                        exclude, reserved))
-        return FALSE;
+    // The marker that hides a package replacement is written after both copy-ups (a marker would stop them) and
+    // before the host's ReplaceFile consumes the overlay copy, so a marker that can't be written fails the call with
+    // nothing replaced; a failed ReplaceFile removes the marker again.
+    std::filesystem::path new_marker;
     if (src_view.in_package) {
         DWORD error = 0;
-        if (!write_marker(marker(r.overlay, src), error)) return fail_bool(error);
+        new_marker = marker(r.overlay, src);
+        if (!write_marker(new_marker, error)) return fail_bool(error);
+    }
+    if (!::ReplaceFileW(dst_target.path.c_str(), src_target.path.c_str(), backup ? backup_path.c_str() : nullptr, flags,
+                        exclude, reserved)) {
+        const DWORD error = ::GetLastError();
+        if (!new_marker.empty()) ::DeleteFileW(new_marker.c_str());
+        return fail_bool(error);
     }
     return TRUE;
 }

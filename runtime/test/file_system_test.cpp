@@ -1602,6 +1602,39 @@ void run_checks(const std::filesystem::path& root) {
                   read_game(L"GAME:\\replace\\a_new.txt") == "<missing>",
               "ReplaceFileA replaces a package file with an overlay-only one");
     }
+
+    // ReplaceFile writes the marker that hides a package replacement before the host consumes the overlay copy: if
+    // the marker can't be written, nothing is replaced, and a failed ReplaceFile removes a new marker again.
+    {
+        const auto replace_m = resolve<ReplaceFileWFn>("kernel32.dll", "ReplaceFileW");
+        const auto pkg = root / "rm-package", ovl = root / "rm-overlay";
+        write_path(pkg / "r" / "target.txt", "old");
+        write_path(pkg / "r" / "new.txt", "new");
+        write_path(ovl / ".gta6rt-deleted", "obstructed marker directory");
+        rt::fs::configure(pkg, ovl);
+        auto read_view = [&](const wchar_t* name) {
+            const HANDLE h = create_w(name, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::string("<missing>");
+            std::string text = read_handle(h);
+            ::CloseHandle(h);
+            return text;
+        };
+        SetLastError(0);
+        const BOOL obstructed = replace_m(L"GAME:\\r\\target.txt", L"GAME:\\r\\new.txt", nullptr, 0, nullptr, nullptr);
+        check(obstructed == FALSE && GetLastError() != ERROR_SUCCESS && read_view(L"GAME:\\r\\target.txt") == "old" &&
+                  read_view(L"GAME:\\r\\new.txt") == "new",
+              "ReplaceFileW whose marker can't be written fails with nothing replaced");
+        std::filesystem::remove(ovl / ".gta6rt-deleted");
+        check(replace_m(L"GAME:\\r\\target.txt", L"GAME:\\r\\new.txt", nullptr, 0, nullptr, nullptr) != FALSE &&
+                  read_view(L"GAME:\\r\\target.txt") == "new" && read_view(L"GAME:\\r\\new.txt") == "<missing>",
+              "and succeeds once the marker folder can be made");
+        write_path(pkg / "r" / "new2.txt", "new2");
+        check(replace_m(L"GAME:\\r\\new2.txt", L"GAME:\\r\\new2.txt", nullptr, 0, nullptr, nullptr) == FALSE &&
+                  !std::filesystem::exists(ovl / ".gta6rt-deleted" / "r" / "new2.txt") &&
+                  read_view(L"GAME:\\r\\new2.txt") == "new2",
+              "a ReplaceFileW the host refuses removes the marker it wrote");
+        rt::fs::configure(package, overlay);
+    }
 }
 
 }  // namespace
