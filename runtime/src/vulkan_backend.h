@@ -2131,11 +2131,13 @@ private:
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
-            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64 || va > UINT64_MAX - vk.heap_base) {
+            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64) {
                 funcs.vkUnmapMemory(context_.device(), stage.memory);
                 discard();
                 return ReplayResult::invalid_copy;
             }
+            // A buffer outside the arena (an upload heap placed below it) has a console VA of its device address
+            // minus heap_base, which wraps; adding heap_base back wraps to the real address.
             const std::uint64_t device_address = vk.heap_base + va;
             std::memcpy(static_cast<std::uint8_t*>(mapped) + 8ull * i, &device_address, sizeof(device_address));
         }
