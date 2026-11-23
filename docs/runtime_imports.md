@@ -162,7 +162,7 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XGameProtocolImpl` and `XGameInviteImpl` from xgameruntime-docs' layout; for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -204,6 +204,14 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XGameProtocolImpl` (`IXGameProtocolImpl`, slots 3-4) and `XGameInviteImpl` (`IXGameInviteImpl`/`2`, slots 3-7)
+(`runtime/shims/xgameruntime_activation.cpp`) are served from xgameruntime-docs' layout alone: no package DLL calls
+them, so the slots are **not measured** yet. Protocol activations and invites come from the console shell, so nothing
+ever fires: `XGameProtocolRegisterForActivation` and `XGameInviteRegisterForEvent` succeed and hand out a token per
+registration, and the matching `Unregister` returns true once for a live token and false after. The three
+`IXGameInviteImpl2` slots (pending-invite register, unregister, accept; October 2025 GDK, no public signature) answer
+`E_NOTIMPL`/false and log once. `XGameActivationImpl` is not served. `xgameruntime_activation_test` calls each slot.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
