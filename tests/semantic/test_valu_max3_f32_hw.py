@@ -119,5 +119,39 @@ class TestReferenceOracle(unittest.TestCase):
         self.assertEqual(ref_max3_f32(-5.0, -2.0, -1.0, clamp=True), 0.0)
         self.assertEqual(ref_max3_f32(0.2, 0.5, 0.8, clamp=True), 0.8)
 
+class TestOpcodeTranslation(unittest.TestCase):
+    """Opcode translation to SPIR-V assembly validation."""
+
+    def test_translate_basic_instruction(self):
+        prog = [
+            "v_max3_f32 v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_op", prog)
+        self.assertIn("OpCapability Shader", spv)
+        self.assertIn("OpExtInst %float %glsl NMax", spv)
+        self.assertEqual(spv.count("NMax"), 2)
+
+    def test_translate_clamp_modifier(self):
+        prog = [
+            "v_max3_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_clamp", prog)
+        self.assertIn("NMax", spv)
+
+    def test_translate_input_modifiers(self):
+        prog = [
+            "v_max3_f32 v0, |v1|, -v2, -|v3|",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_max3_mods", prog)
+        self.assertIn("FAbs", spv)
+        self.assertIn("OpFNegate", spv)
+        self.assertIn("NMax", spv)
+
 if __name__ == "__main__":
     unittest.main()
