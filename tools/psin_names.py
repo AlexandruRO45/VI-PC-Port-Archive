@@ -61,13 +61,22 @@ class HashWalker(psin_data.Walker):
         finally:
             self._structs.pop()
 
+    def _in_block(self, m, t, at):
+        """The block-end check psin_data.Walker.value makes before it reads a member: a hash that it rejects as
+        "member past block end" is not recorded either, and one past the blob is never unpacked (struct.error)."""
+        need = self._read_size(m)
+        if need is None:
+            need = struct.calcsize(psin_data.HASHES[t])
+        end = self._active_end(at)
+        return end is not None and at >= 0 and at + need <= end <= len(self.c.blob)
+
     def value(self, m, members, at, depth):
         named = m["hash"] != psin_data.ELEMENT
         if named:
             self._fields.append(m["hash"])
         try:
             t = m["type"]
-            if t in psin_data.HASHES and self._structs and self._fields:
+            if t in psin_data.HASHES and self._structs and self._fields and self._in_block(m, t, at):
                 v = struct.unpack_from(psin_data.HASHES[t], self.c.blob, at)[0]
                 self.found.append((self._structs[-1], self._fields[-1], t, v))
             return super().value(m, members, at, depth)

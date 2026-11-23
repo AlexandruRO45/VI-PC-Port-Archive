@@ -51,6 +51,15 @@ class TestHashValues(unittest.TestCase):
         self.assertEqual(found[0][3], joaat("prop_crate_01"))
         self.assertEqual(found[2][3], mm64("prop_crate_01"))
 
+    def test_a_member_past_the_block_end_is_not_recorded(self):
+        # cynbun's finding: psin_data skips a member that runs past its block ("member past block end"), and so must
+        # the hash scan. A 12-byte struct whose schema puts a u64 key at 0x08 ends 4 bytes into the key.
+        schema = [(ROOT_T, 0x3, 0x0C, 1, [(0x100, 0, 0x4A, 0, 0, 0), (MODEL, 0x00, 0x4A, 0, 0, 0),
+                                          (KEY, 0x08, 0x4F, 0, 0, 0)])]
+        root = struct.pack("<II", joaat("prop_crate_01"), 0) + b"\x11\x22\x33\x44"
+        found = N.hash_values(make_container([(ROOT_T, root)], schema))
+        self.assertEqual([(s, f) for s, f, _, _ in found], [(ROOT_T, MODEL)])
+
     def test_not_a_container(self):
         with self.assertRaises(ValueError):
             N.hash_values(b"PSIN" + b"\0" * 12)

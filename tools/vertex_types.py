@@ -328,8 +328,8 @@ NORMAL_CANDIDATES = {
 
 def half(h):
     s, e, m = h >> 15, (h >> 10) & 31, h & 1023
-    if e == 31:
-        return math.nan
+    if e == 31:  # IEEE binary16: mantissa 0 is +/-infinity, anything else NaN
+        return (-math.inf if s else math.inf) if m == 0 else math.nan
     v = (m / 1024.0) * 2.0 ** -14 if e == 0 else (1 + m / 1024.0) * 2.0 ** (e - 15)
     return -v if s else v
 

@@ -195,6 +195,21 @@ class BlockTests(unittest.TestCase):
         self.assertEqual(out["pos_header_finite"], 1)
 
 
+class HalfTests(unittest.TestCase):
+    def test_binary16_values(self):
+        self.assertEqual(vt.half(0x3C00), 1.0)
+        self.assertEqual(vt.half(0xC000), -2.0)
+        self.assertEqual(vt.half(0x0001), 2.0 ** -24)       # the smallest subnormal
+
+    def test_infinity_is_infinity_and_other_exponent_31_values_are_nan(self):
+        # cynbun's finding: exponent 31 with mantissa 0 is +/-infinity in IEEE binary16, not NaN
+        self.assertEqual(vt.half(0x7C00), math.inf)
+        self.assertEqual(vt.half(0xFC00), -math.inf)
+        for h in (0x7C01, 0x7E00, 0xFFFF):
+            self.assertTrue(math.isnan(vt.half(h)), hex(h))
+        self.assertEqual(vt.half(0x7C00), struct.unpack("<e", struct.pack("<H", 0x7C00))[0])
+
+
 class Normal0x21Tests(unittest.TestCase):
     @staticmethod
     def encode(n, bits):
