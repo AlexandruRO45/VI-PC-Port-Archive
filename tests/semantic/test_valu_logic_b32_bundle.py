@@ -1211,3 +1211,59 @@ class TestOr3B32ASTAndScalar(unittest.TestCase):
             "v_or3_b32 v0, v0, v1, v2",
         ])
         self.assertEqual(val_inplace, 0x1110)
+
+
+# ------------------------------------------------------------------------------
+# v_or3_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+def step_or3_simd(wave: SIMDWaveLogic, insn: VOr3B32Instruction):
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane]
+            s1 = wave.vgprs[insn.src1.index][lane]
+            s2 = wave.vgprs[insn.src2.index][lane]
+            wave.vgprs[insn.dst.index][lane] = ref_or3_b32(s0, s1, s2)
+
+
+class TestOr3B32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[2][i] = 0x100
+            wave.vgprs[3][i] = 0x200
+            wave.vgprs[0][i] = 0
+
+        insn = VOr3B32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+            src2=RegisterOperand(OperandType.VGPR, 3),
+        )
+        step_or3_simd(wave, insn)
+
+        val_hw, _ = run_shader("ps_or3_simd_hw", [
+            "v_mov_b32 v1, 1",
+            "v_mov_b32 v2, 0x100",
+            "v_mov_b32 v3, 0x200",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        self.assertEqual(wave.vgprs[0][0], val_hw)
+        self.assertEqual(val_hw, 0x301)
+
+    def test_algebraic_properties_hardware(self):
+        # Permutation invariance: a | b | c == c | b | a
+        val_abc, _ = run_shader("ps_or3_perm_abc", [
+            "v_mov_b32 v1, 0x0000000F",
+            "v_mov_b32 v2, 0x000000F0",
+            "v_mov_b32 v3, 0x00000F00",
+            "v_or3_b32 v0, v1, v2, v3",
+        ])
+        val_cba, _ = run_shader("ps_or3_perm_cba", [
+            "v_mov_b32 v1, 0x0000000F",
+            "v_mov_b32 v2, 0x000000F0",
+            "v_mov_b32 v3, 0x00000F00",
+            "v_or3_b32 v0, v3, v2, v1",
+        ])
+        self.assertEqual(val_abc, val_cba)
