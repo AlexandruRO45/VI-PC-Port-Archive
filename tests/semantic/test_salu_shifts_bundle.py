@@ -150,6 +150,22 @@ class TestSLshrB32Oracle(unittest.TestCase):
         self.assertEqual(ref_s_lshr_b32(0x10, 32), (0x10, 1))
         self.assertEqual(ref_s_lshr_b32(0x10, 33), (0x08, 1))
 
+class SLshrB32Expr(ASTNode):
+    def __init__(self, src: int, shift: int) -> None:
+        self.src = src
+        self.shift = shift
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_lshr_b32(self.src, self.shift)
+
+
+class TestSLshrB32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SLshrB32Expr(0xF0, 4)
+        self.assertEqual(expr.eval(), (0x0F, 1))
+        expr_zero = SLshrB32Expr(1, 1)
+        self.assertEqual(expr_zero.eval(), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
