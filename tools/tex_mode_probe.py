@@ -44,13 +44,30 @@ def mip_bytes(w: int, h: int, bpe: int, align: int) -> int:
 
 def offsets_for(eq, bb, bpe, wb, hb):
     bw, bh = _tile_shape(1 << bb, bpe)
-    y, x = np.mgrid[0:hb, 0:wb].astype(np.int64)
-    o = np.zeros_like(x)
+    # Every address bit is the XOR of an x-bit parity and a y-bit parity, so the in-tile offset of (x, y) is
+    # xt[x] ^ yt[y]: evaluate the two 1-D tables (wb and hb long), not the parity over the whole hb x wb grid.
+    xc, yc = np.arange(wb, dtype=np.int64), np.arange(hb, dtype=np.int64)
+    xt, yt = np.zeros_like(xc), np.zeros_like(yc)
     for bit, (mx, my) in enumerate(eq):
-        if mx or my:
-            o |= (_parity(x & mx) ^ _parity(y & my)) << bit
+        if mx:
+            xt |= _parity(xc & mx) << bit
+        if my:
+            yt |= _parity(yc & my) << bit
+    # For a power-of-two element size that divides the tile, the division by bpe is a right shift: it distributes
+    # over the XOR and over the sum with the tile base, so it is applied to the 1-D parts, not to the grid.
+    unit = 1 << bb
+    shift = bpe.bit_length() - 1 if not bpe & (bpe - 1) and unit % bpe == 0 else None
+    if shift is not None:
+        xt >>= shift
+        yt >>= shift
+        unit >>= shift
     nbx = (wb + bw - 1) // bw
-    return (o + ((y // bh) * nbx + x // bw) * (1 << bb)) // bpe
+    o = np.bitwise_xor(yt[:, None], xt[None, :])  # the only hb x wb array
+    o += ((yc // bh) * (nbx * unit))[:, None]
+    o += ((xc // bw) * unit)[None, :]
+    if shift is None:
+        o //= bpe
+    return o
 
 
 def gpu_blob(carve, t):

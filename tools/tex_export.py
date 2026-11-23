@@ -63,13 +63,30 @@ def detile_offsets(bpe, we, he):
     lb = elems.bit_length() - 1
     bw = 1 << ((lb + 1) // 2)
     bh = elems // bw
-    y, x = np.mgrid[0:he, 0:we].astype(np.int64)
-    o = np.zeros_like(x)
+    # Every address bit is the XOR of an x-bit parity and a y-bit parity, so the in-tile offset of (x, y) is
+    # xt[x] ^ yt[y]: evaluate the two 1-D tables (we and he long), not the parity over the whole he x we grid.
+    xc, yc = np.arange(we, dtype=np.int64), np.arange(he, dtype=np.int64)
+    xt, yt = np.zeros_like(xc), np.zeros_like(yc)
     for bit, (mx, my) in enumerate(eq):
-        if mx or my:
-            o |= (_parity(x & mx) ^ _parity(y & my)) << bit
+        if mx:
+            xt |= _parity(xc & mx) << bit
+        if my:
+            yt |= _parity(yc & my) << bit
+    # For a power-of-two element size the division by bpe is a right shift, which distributes over the XOR and
+    # splits over the sum with the (multiple-of-bpe) tile base, so it is applied to the 1-D parts, not the grid.
+    shift = bpe.bit_length() - 1 if not bpe & (bpe - 1) else None
+    unit = 4096
+    if shift is not None:
+        xt >>= shift
+        yt >>= shift
+        unit >>= shift
     nbx = (we + bw - 1) // bw
-    return ((o + ((y // bh) * nbx + x // bw) * 4096) // bpe).reshape(-1), bw, bh
+    o = np.bitwise_xor(yt[:, None], xt[None, :])  # the only he x we array
+    o += ((yc // bh) * (nbx * unit))[:, None]
+    o += ((xc // bw) * unit)[None, :]
+    if shift is None:
+        o //= bpe
+    return o.reshape(-1), bw, bh
 
 
 def level_bytes(we, he, bpe, bw, bh):
@@ -137,7 +154,7 @@ def export_one(t, carve, out, blob_cache, png=False):
     for place, start in (("first", t["data_off"]), ("last", t["data_off"] + chain - top)):
         if start < 0 or start + need > len(G):
             continue
-        raw = np.frombuffer(G[start:start + need], np.uint8).reshape(-1, bpe)
+        raw = np.frombuffer(memoryview(G)[start:start + need], f"V{bpe}")  # one whole element per item
         payload = raw[offs].tobytes()
         try:
             s = score_image(w, h, fmt, payload, bpe)
