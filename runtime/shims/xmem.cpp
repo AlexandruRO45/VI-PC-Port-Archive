@@ -34,34 +34,35 @@
 namespace {
 
 constexpr size_t kAlign = 64;
+constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
-// gta6rt --trace FILE: the first XMemAlloc and the first XMemFree for each distinct raw attribute word go to the
+// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
 // startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
 // bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
 // which would fill the file. Off: one relaxed load per call.
-void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
-    static std::set<std::pair<bool, uint64_t>> seen;
+    static std::set<std::pair<std::string, uint64_t>> seen;
     {
         const std::lock_guard lock(mutex);
-        if (!seen.insert({is_alloc, attributes}).second) return;
+        if (!seen.insert({api, attributes}).second) return;
     }
-    std::string fields = std::string("\"api\":\"") + (is_alloc ? "XMemAlloc" : "XMemFree") +
+    std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
+    if (size != kNoSize) fields += ",\"size\":" + std::to_string(size);
     fields += ",\"caller\":" +
               rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
 }
 
@@ -69,12 +70,12 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
 // __XMemAllocationHooks__ export) fall back to. The retail executable's default hook node for every allocator id
 // tail-calls XMemAllocDefault (RVA 0x4deb540 -> import thunk 0x5f3fd40). Same block as XMemAlloc.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+    note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
     return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
-    note_attributes(false, attributes, 0, _ReturnAddress());
+    note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
 }
 

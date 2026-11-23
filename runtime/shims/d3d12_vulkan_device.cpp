@@ -591,6 +591,10 @@ struct DeviceState {
     };
     SubgroupFacts subgroups;
     std::once_flag subgroups_once;
+    // VkPhysicalDeviceMeshShaderPropertiesEXT, read on first use by a mesh PSO; zeros when it cannot be asked.
+    VkPhysicalDeviceMeshShaderPropertiesEXT mesh_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+    bool mesh_properties_read = false;
+    std::mutex mesh_properties_mutex;
     PFN_vkGetPhysicalDeviceFormatProperties format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
@@ -633,6 +637,8 @@ struct DeviceState {
     PFN_vkCopyMemoryToImageEXT copy_memory_to_image = nullptr;
     PFN_vkCopyImageToMemoryEXT copy_image_to_memory = nullptr;
     PFN_vkTransitionImageLayoutEXT transition_image_layout = nullptr;
+    // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
+    PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
 
     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
     // the device's VkQueue and waited for. Created on first use.
@@ -910,6 +916,20 @@ struct DeviceState {
             properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU && !intel_xe_lpg_or_later &&
             subgroups.lane_min <= kIntelD3D12Lanes && kIntelD3D12Lanes <= subgroups.lane_max)
             subgroups.lane_min = subgroups.lane_max = kIntelD3D12Lanes;
+    }
+
+    // The device's mesh-shader limits (output vertices and primitives, workgroup size), for mesh PSO creation.
+    const VkPhysicalDeviceMeshShaderPropertiesEXT& mesh_limits() {
+        std::lock_guard lock(mesh_properties_mutex);
+        if (mesh_properties_read) return mesh_properties;
+        mesh_properties_read = true;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2") : nullptr);
+        if (!properties2 || !info.physical || !info.mesh_shader) return mesh_properties;
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &mesh_properties};
+        properties2(info.physical, &properties);
+        mesh_properties.pNext = nullptr;
+        return mesh_properties;
     }
 
     // Integer sampled images need not support multisampling. Pick a supported count for the
@@ -1886,6 +1906,86 @@ public:
         return S_OK;
     }
 
+    // A buffer on the caller's own pages (Xbox device slot 133, create_buffer_at_host_address): `address` is imported
+    // with VK_EXT_external_memory_host and the buffer bound to it at offset 0, so the CPU's writes there are the GPU's
+    // reads with no copy. Its console VA is `address` itself, the VA the title chose, so vertex, index and immediate
+    // writes the title names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to
+    // that VA does not reach it: the title's own V#s into these pages need the single address space of
+    // docs/d3d12_vulkan.md section 3.3, which this does not decide. The pages stay the caller's: nothing is zeroed.
+    HRESULT create_host_buffer(void* address) {
+        auto& vk = device_.context->vk;
+        const VkDeviceSize alignment = device_.info.host_pointer_alignment;
+        if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
+        const auto start = reinterpret_cast<std::uintptr_t>(address);
+        if (!address || !desc_.Width || (start & (alignment - 1)) || desc_.Width > UINT64_MAX - alignment)
+            return E_INVALIDARG;
+        const VkDeviceSize bytes = (desc_.Width + alignment - 1) & ~(alignment - 1);
+        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        info.size = desc_.Width;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        device_.share(info);
+        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+        VkMemoryRequirements requirements{};
+        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (device_.get_host_pointer_properties(device_.info.device,
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, address,
+                                                &host) != VK_SUCCESS)
+            return E_INVALIDARG;
+        const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
+        if (!types || bytes < requirements.size) return E_NOTIMPL;
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = address;
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
+        // buffer take.
+        for (const VkMemoryPropertyFlags want :
+             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+              VkMemoryPropertyFlags(0)}) {
+            for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && !memory_; ++i) {
+                if (!(types & (1u << i)) || (device_.memory.memoryTypes[i].propertyFlags & want) != want) continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                              need_bda ? static_cast<const void*>(&flags) : &import};
+                allocate.allocationSize = bytes;
+                allocate.memoryTypeIndex = i;
+                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS)
+                    memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
+                else
+                    memory_ = VK_NULL_HANDLE;
+            }
+            if (memory_) break;
+        }
+        if (!memory_) return E_OUTOFMEMORY;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return E_OUTOFMEMORY;
+        mapped_ = address;
+        va_ = start;
+        if (need_bda && vk.vkGetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer_;
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            gpu_va_ = buffer_va_;
+        }
+        device_.log_va("title-placed buffer", va_, desc_.Width);
+        leonida::ResourceBinding binding{};
+        binding.buffer = buffer_;
+        binding.size = desc_.Width;
+        binding.host = static_cast<const std::uint8_t*>(address);
+        binding.host_readable = true;
+        binding.va = va_;
+        device_.context->add_resource(id(), binding);
+        return S_OK;
+    }
+
     HRESULT create_sparse_buffer() {
         constexpr std::uint64_t tile_bytes = leonida::tile_size_in_bytes;
         if (!desc_.Width || desc_.Width > UINT64_MAX - tile_bytes ||
@@ -2598,6 +2698,20 @@ public:
         }
     }
 
+    // An existing heap (OpenExistingHeapFromAddress): `memory` is the caller's committed range imported with
+    // VK_EXT_external_memory_host, and the heap owns that VkDeviceMemory, not the range. Not in the arena.
+    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc, VkDeviceMemory memory, std::uint32_t memory_type,
+         const void* address)
+        : device_(device), desc_(desc), host_address_(address) {
+        allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
+            new leonida::TileHeapAllocation{memory, 0, desc_.SizeInBytes, memory_type},
+            [device = device_.info.device, free = device_.context->vk.vkFreeMemory]
+            (const leonida::TileHeapAllocation* allocation) {
+                free(device, allocation->memory, nullptr);
+                delete allocation;
+            });
+    }
+
     // As the host reports it (measured against the PC runtime, d3d12_vulkan_device_test compare_heap_descs): the
     // alignment the heap was placed with (64 KiB for an Alignment of 0) and the one node for a node mask of 0, as the
     // layer's resources, descriptor heaps and queues already answer.
@@ -2610,6 +2724,8 @@ public:
     }
 
     bool reserved() const { return bool(allocation_); }
+    // An existing heap: the caller's memory, not an arena range, so offset() is not a place in the arena.
+    const void* host_address() const { return host_address_; }
     VkDeviceSize offset() const { return allocation_->offset; }
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
@@ -2619,7 +2735,7 @@ public:
                                                            std::uint32_t memory_types) {
         const auto denied = image ? D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES : D3D12_HEAP_FLAG_DENY_BUFFERS;
         if (device_.context.get() != &context || desc_.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
-            (desc_.Flags & denied)) return {};
+            (desc_.Flags & denied) || host_address_) return {};
         std::lock_guard lock(backing_mutex_);
         if (!image && device_.tiles_share_arena()) {
             if (tile_allocation_) return {};
@@ -2661,6 +2777,7 @@ public:
 private:
     DeviceState& device_;
     D3D12_HEAP_DESC desc_;
+    const void* host_address_ = nullptr;
     std::shared_ptr<const leonida::TileHeapAllocation> allocation_;
     std::mutex backing_mutex_;
     std::shared_ptr<const leonida::TileHeapAllocation> tile_allocation_;
@@ -2865,6 +2982,201 @@ public:
 
 // A pipeline state. Compute only for now: the shader is found by the SHA-256 of its FSSM program in the
 // translator's index, and the FSSM blob is copied into the arena as the shader's code base.
+// A D3D12_PIPELINE_STATE_STREAM_DESC (ID3D12Device2::CreatePipelineState) as the descriptions the PSO creators take.
+// The stream is a run of subobjects, each a D3D12_PIPELINE_STATE_SUBOBJECT_TYPE followed by its description at that
+// description's alignment, each subobject starting at pointer alignment (the d3dx12.h layout, `alignas(void*)`). A
+// subobject that is absent takes the runtime's default (the CD3DX12 defaults: depth test on with LESS, back-face
+// culling, no blending, sample mask 0xFFFFFFFF, one sample). A type given twice, a truncated stream or an unknown
+// type is E_INVALIDARG, as on the PC runtime; state this layer cannot honour yet is E_NOTIMPL with a log.
+struct PipelineStream {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
+    D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+    D3D12_SHADER_BYTECODE ms{};
+    D3D12_SHADER_BYTECODE as{};
+    bool has_cs = false;
+    bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
+};
+
+HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
+    if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
+    for (auto& target : g.BlendState.RenderTarget) {
+        target.SrcBlend = target.SrcBlendAlpha = D3D12_BLEND_ONE;
+        target.DestBlend = target.DestBlendAlpha = D3D12_BLEND_ZERO;
+        target.BlendOp = target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        target.LogicOp = D3D12_LOGIC_OP_NOOP;
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    g.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    g.RasterizerState.DepthClipEnable = TRUE;
+    g.DepthStencilState.DepthEnable = TRUE;
+    g.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    g.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+    g.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    g.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    g.DepthStencilState.FrontFace = g.DepthStencilState.BackFace = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+    g.SampleMask = UINT_MAX;
+    g.SampleDesc = {1, 0};
+
+    const auto* base = static_cast<const std::uint8_t*>(desc.pPipelineStateSubobjectStream);
+    const std::size_t size = desc.SizeInBytes;
+    const auto round_up = [](std::size_t v, std::size_t a) { return (v + a - 1) / a * a; };
+    std::uint64_t seen = 0;
+    std::size_t at = 0;
+    while (at < size) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+        if (size - at < sizeof(type)) return E_INVALIDARG;
+        std::memcpy(&type, base + at, sizeof(type));
+        // The versioned depth-stencil and rasterizer subobjects describe the same state as their base type, so the
+        // stream contract counts any two of one family as duplicates; the payload below still follows `type`.
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE family = type;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1 ||
+            type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2)
+            family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1 ||
+                 type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2)
+            family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1)) return E_INVALIDARG;
+        seen |= std::uint64_t(1) << unsigned(family);
+        bool ok = true;
+        const auto take = [&](auto& value) {
+            using T = std::remove_reference_t<decltype(value)>;
+            const std::size_t payload = round_up(at + sizeof(type), alignof(T));
+            if (payload > size || size - payload < sizeof(T)) {
+                ok = false;
+                return;
+            }
+            std::memcpy(&value, base + payload, sizeof(T));
+            at = round_up(payload + sizeof(T), sizeof(void*));
+        };
+        const auto stage = [&](D3D12_SHADER_BYTECODE& code) {
+            take(code);
+            out.has_graphics_stage = true;
+        };
+        switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+            take(g.pRootSignature);
+            out.compute.pRootSignature = g.pRootSignature;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS: stage(g.VS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS: stage(g.PS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: stage(g.DS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+            take(out.compute.CS);
+            out.has_cs = true;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT: take(g.StreamOutput); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND: take(g.BlendState); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK: take(g.SampleMask); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER: take(g.RasterizerState); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL: take(g.DepthStencilState); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT: take(g.InputLayout); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE: take(g.IBStripCutValue); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY: take(g.PrimitiveTopologyType); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS: {
+            D3D12_RT_FORMAT_ARRAY formats{};
+            take(formats);
+            if (formats.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+            g.NumRenderTargets = formats.NumRenderTargets;
+            std::copy(std::begin(formats.RTFormats), std::end(formats.RTFormats), std::begin(g.RTVFormats));
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT: take(g.DSVFormat); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: take(g.SampleDesc); break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+            take(g.NodeMask);
+            out.compute.NodeMask = g.NodeMask;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+            take(g.CachedPSO);
+            out.compute.CachedPSO = g.CachedPSO;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+            take(g.Flags);
+            out.compute.Flags = g.Flags;
+            break;
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: {
+            D3D12_DEPTH_STENCIL_DESC1 d{};
+            take(d);
+            if (ok && d.DepthBoundsTestEnable) {
+                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
+                return E_NOTIMPL;
+            }
+            g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable, d.StencilReadMask,
+                                   d.StencilWriteMask, d.FrontFace, d.BackFace};
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: {
+            D3D12_DEPTH_STENCIL_DESC2 d{};
+            take(d);
+            if (!ok) break;
+            if (d.DepthBoundsTestEnable) {
+                log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
+                return E_NOTIMPL;
+            }
+            // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
+            if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
+                                    d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
+                log_once("separate front and back stencil masks are not supported yet; stream subobject", int(type));
+                return E_NOTIMPL;
+            }
+            const auto face = [](const D3D12_DEPTH_STENCILOP_DESC1& f) {
+                return D3D12_DEPTH_STENCILOP_DESC{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc};
+            };
+            g.DepthStencilState = {d.DepthEnable, d.DepthWriteMask, d.DepthFunc, d.StencilEnable,
+                                   UINT8(d.FrontFace.StencilReadMask), UINT8(d.FrontFace.StencilWriteMask),
+                                   face(d.FrontFace), face(d.BackFace)};
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2: {
+            // Their DepthBias is a float; the PSO path takes D3D12_RASTERIZER_DESC's integer one.
+            FLOAT bias = 0;
+            D3D12_RASTERIZER_DESC& r = g.RasterizerState;
+            if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1) {
+                D3D12_RASTERIZER_DESC1 d{};
+                take(d);
+                r = {d.FillMode, d.CullMode, d.FrontCounterClockwise, 0, d.DepthBiasClamp, d.SlopeScaledDepthBias,
+                     d.DepthClipEnable, d.MultisampleEnable, d.AntialiasedLineEnable, d.ForcedSampleCount,
+                     d.ConservativeRaster};
+                bias = d.DepthBias;
+            } else {
+                D3D12_RASTERIZER_DESC2 d{};
+                take(d);
+                r = {d.FillMode, d.CullMode, d.FrontCounterClockwise, 0, d.DepthBiasClamp, d.SlopeScaledDepthBias,
+                     d.DepthClipEnable, FALSE, FALSE, d.ForcedSampleCount, d.ConservativeRaster};
+                bias = d.DepthBias;
+            }
+            r.DepthBias = INT(bias);
+            if (ok && FLOAT(r.DepthBias) != bias) log_once("a fractional depth bias is truncated; bias x1000", int(bias * 1000));
+            break;
+        }
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING: {
+            D3D12_VIEW_INSTANCING_DESC d{};
+            take(d);
+            if (ok && d.ViewInstanceCount) {
+                log_once("view instancing is not supported yet; views", int(d.ViewInstanceCount));
+                return E_NOTIMPL;
+            }
+            break;
+        }
+        default:
+            log_once("unknown pipeline state stream subobject type:", int(type));
+            return E_INVALIDARG;
+        }
+        if (!ok) return E_INVALIDARG;
+    }
+    if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
+    if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+    return S_OK;
+}
+
 class PipelineState final
     : public Child<PipelineState, XboxPipelineStateStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                    ID3D12PipelineState> {
@@ -2957,10 +3269,26 @@ public:
     // device lacks (including the geometryShader feature a GS needs). A GS takes triangles; the sample count may
     // be above one. Viewport, scissor, topology, vertex strides, stencil reference and blend factor are dynamic,
     // set from the list's state at each draw.
-    HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+    // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
+    // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
+    // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+    HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
+                            const D3D12_SHADER_BYTECODE* as = nullptr) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
-        if (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength) return E_INVALIDARG;
+        const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
+        if (as && as->pShaderBytecode && as->BytecodeLength) {
+            log_once("amplification shaders are not supported (the game has none); bytes", int(as->BytecodeLength));
+            return E_NOTIMPL;
+        }
+        if (mesh && (desc.VS.BytecodeLength || desc.HS.BytecodeLength || desc.DS.BytecodeLength ||
+                     desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
+            return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
+        if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
+        if (mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT)) {
+            log_once("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
+            return E_NOTIMPL;
+        }
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
@@ -3017,7 +3345,8 @@ public:
             std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
         };
-        Stage stages[3] = {{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
+        Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
+                                : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
@@ -3070,6 +3399,26 @@ public:
                 }
                 uses_bindless = true;
                 register_literal_samplers(device_, *stage.entry);
+            }
+            if (stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT) {
+                // The SPIR-V's output arrays are sized from PSV0 (the index's max_vertices / max_primitives); Vulkan
+                // has no per-pipeline limit to set, so a mesh shader beyond the device's is refused here
+                // (docs/d3d12_vulkan.md, "Pipelines").
+                const VkPhysicalDeviceMeshShaderPropertiesEXT& limits = device_.mesh_limits();
+                const auto& n = stage.entry->local_size;
+                if (stage.entry->max_vertices > limits.maxMeshOutputVertices ||
+                    stage.entry->max_primitives > limits.maxMeshOutputPrimitives ||
+                    n[0] > limits.maxMeshWorkGroupSize[0] || n[1] > limits.maxMeshWorkGroupSize[1] ||
+                    n[2] > limits.maxMeshWorkGroupSize[2] ||
+                    std::uint64_t(n[0]) * n[1] * n[2] > limits.maxMeshWorkGroupInvocations) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: %s needs %u vertices, %u primitives, %ux%ux%u threads; the device "
+                                 "allows %u, %u, %u invocations\n",
+                                 stage.entry->name.c_str(), stage.entry->max_vertices, stage.entry->max_primitives,
+                                 n[0], n[1], n[2], limits.maxMeshOutputVertices, limits.maxMeshOutputPrimitives,
+                                 limits.maxMeshWorkGroupInvocations);
+                    return E_NOTIMPL;
+                }
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -3167,13 +3516,13 @@ public:
             stage_infos.push_back(info);
         }
 
-        // Input layout -> vertex input, by semantic.
+        // Input layout -> vertex input, by semantic. A mesh pipeline has none.
         std::vector<VkVertexInputAttributeDescription> attributes;
         std::vector<VkVertexInputBindingDescription> bindings;
         std::vector<VkVertexInputBindingDivisorDescriptionEXT> divisors;
         std::uint32_t divisor_slots = 0;
         UINT slot_end[D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
-        for (UINT i = 0; i < desc.InputLayout.NumElements; ++i) {
+        for (UINT i = 0; !mesh && i < desc.InputLayout.NumElements; ++i) {
             const D3D12_INPUT_ELEMENT_DESC& element = desc.InputLayout.pInputElementDescs[i];
             if (element.InputSlot >= D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) return E_INVALIDARG;
             VkFormat format;
@@ -3225,7 +3574,7 @@ public:
             }
         }
         VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
-        switch (desc.PrimitiveTopologyType) {
+        switch (mesh ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE : desc.PrimitiveTopologyType) {  // mesh: not used
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT: assembly.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
         case D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE: assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
@@ -3233,13 +3582,15 @@ public:
             log_once("primitive topology type not supported:", desc.PrimitiveTopologyType);
             return E_INVALIDARG;
         }
-        if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED &&
-            desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF &&
-            desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF) {
-            log_once("index-buffer strip cut value not supported:", desc.IBStripCutValue);
-            return E_INVALIDARG;
+        if (!mesh) {  // a mesh PSO has no index buffer: its strip cut is ignored
+            if (desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED &&
+                desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF &&
+                desc.IBStripCutValue != D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF) {
+                log_once("index-buffer strip cut value not supported:", desc.IBStripCutValue);
+                return E_INVALIDARG;
+            }
+            graphics_.strip_cut = desc.IBStripCutValue;
         }
-        graphics_.strip_cut = desc.IBStripCutValue;
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
         if (r.ConservativeRaster != D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF &&
@@ -3444,6 +3795,8 @@ public:
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
+        graphics_.mesh = mesh;
+        recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
@@ -3589,6 +3942,7 @@ public:
 private:
     // What a graphics pipeline is made from, so variants can be built at draw time.
     struct Recipe {
+        bool mesh = false;  // no vertex input or input assembly state, and no dynamic topology or strides
         std::vector<VkPipelineShaderStageCreateInfo> stages;
         // One per entry of create_graphics's stage table (VS, GS, PS), static_assert there; what `stages` chain.
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_sizes[3]{};
@@ -3657,15 +4011,25 @@ private:
         VkPipelineColorBlendStateCreateInfo blend = r.blend;
         blend.attachmentCount = std::uint32_t(r.blends.size());
         blend.pAttachments = r.blends.data();
+        // A mesh pipeline takes neither the topology nor the strides as dynamic state
+        // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
+        static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-        dynamic.pDynamicStates = dynamic_states;
+        if (r.mesh) {
+            dynamic.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
+            dynamic.pDynamicStates = mesh_dynamic_states;
+        } else {
+            dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
+            dynamic.pDynamicStates = dynamic_states;
+        }
 
         VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
         info.stageCount = std::uint32_t(r.stages.size());
         info.pStages = r.stages.data();
-        info.pVertexInputState = &vertex_input;
-        info.pInputAssemblyState = &r.assembly;
+        info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
+        info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
         info.pViewportState = &viewport;
         info.pRasterizationState = &raster;
         info.pMultisampleState = &multisample;
@@ -4504,6 +4868,10 @@ public:
     static constexpr GUID kTag{0xc58e1d27, 0x3a96, 0x4b4f, {0x9e, 0x72, 0x6d, 0x0a, 0x8b, 0x5f, 0x3c, 0x61}};
 
     explicit Device(const VulkanDeviceInfo& info) {
+        // Every Vulkan device serves Xbox device slot 133, whichever entry made it: create_vulkan_device and the
+        // standalone device gta6rt --run uses both come through here (found in review: registering only in
+        // create_vulkan_device left the retail path without it).
+        rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -4632,6 +5000,9 @@ public:
             }
         }
         if (info.host_image_copy) load_host_image_copy(get_device);
+        if (info.host_pointer_alignment)
+            state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+                get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -5304,14 +5675,31 @@ public:
         D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* out) override {
         if (!out) return;
         *out = {};
+        if (!desc) return;
+        if (desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
+            desc->Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL)
+            return;
+        if (desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY &&
+            desc->DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
+            return;
+        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
+        if (!is_tlas && desc->NumDescs > 0) {
+            if (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY) {
+                if (!desc->pGeometryDescs) return;
+            } else {
+                if (!desc->ppGeometryDescs) return;
+                for (UINT i = 0; i < desc->NumDescs; ++i)
+                    if (!desc->ppGeometryDescs[i]) return;
+            }
+        }
         auto& vk = state_.context->vk;
-        if (desc && state_.context->xdxr_acceleration_structures()) {
+        if (state_.context->xdxr_acceleration_structures()) {
             // XDXR records: the layout depends only on the triangle or instance count and on whether the nodes are
             // BOX16 (MINIMIZE_MEMORY, bottom level; xdxr_build.h). Its size has room for the most nodes a tree of
             // that many elements can have; a build's own size, in its header, is what COMPACTED_SIZE reports. An
             // update refits (no sort); the build's scratch size covers it.
             leonida::BuildAccelerationStructure build{};
-            build.is_tlas = desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+            build.is_tlas = is_tlas;
             if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)
                 build.build_flags |= VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
             if (build.is_tlas) {
@@ -5320,9 +5708,9 @@ public:
                 for (UINT i = 0; i < desc->NumDescs; ++i) {
                     const D3D12_RAYTRACING_GEOMETRY_DESC* gd =
                         (desc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS)
-                            ? (desc->ppGeometryDescs ? desc->ppGeometryDescs[i] : nullptr)
-                            : (desc->pGeometryDescs ? &desc->pGeometryDescs[i] : nullptr);
-                    if (!gd || gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
+                            ? desc->ppGeometryDescs[i]
+                            : &desc->pGeometryDescs[i];
+                    if (gd->Type != D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) continue;
                     leonida::RtTriangleGeometry t{};
                     t.vertex_count = gd->Triangles.VertexCount;
                     t.index_count = gd->Triangles.IndexCount;
@@ -5339,9 +5727,8 @@ public:
             out->UpdateScratchDataSizeInBytes = layout.scratch;
             return;
         }
-        if (!desc || !state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
+        if (!state_.info.ray_tracing || !vk.vkGetAccelerationStructureBuildSizesKHR) return;
 
-        const bool is_tlas = (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL);
         std::vector<VkAccelerationStructureGeometryKHR> geoms;
         std::vector<std::uint32_t> max_prims;
         if (is_tlas) {
@@ -5613,6 +6000,27 @@ public:
                 registry.disabled.store(false, std::memory_order_relaxed);
         }
         return d3d12_trace::result(method, S_OK);
+    }
+
+    // ID3D12Device2: a PSO from a pipeline state stream. A CS makes a compute PSO, an MS a mesh PSO, a VS the same
+    // graphics PSO CreateGraphicsPipelineState makes (parse_pipeline_stream).
+    HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID riid,
+                                                  void** out) override {
+        constexpr const char* method = "ID3D12Device2::CreatePipelineState";
+        if (!out) return d3d12_trace::result(method, E_POINTER);
+        *out = nullptr;
+        if (!desc) return d3d12_trace::result(method, E_INVALIDARG);
+        PipelineStream stream;
+        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return d3d12_trace::result(method, hr);
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+        if (FAILED(hr)) {
+            pipeline->Release();
+            return d3d12_trace::result(method, hr);
+        }
+        return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
     UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
@@ -6416,16 +6824,141 @@ public:
 
     // Heaps and placed resources (section 3.3). A heap reserves its size in the arena, so a buffer placed at a
     // 64 KiB-aligned offset is simply that offset into the arena, and its console VA is the heap's place plus it.
-    // Existing-memory heaps and lifetime trackers. CheckFeatureSupport reports EXISTING_HEAPS unsupported, so a call
-    // the host accepts stays E_NOTIMPL; the host refuses a null address, a file mapping that is not a handle and a
-    // null lifetime owner with E_INVALIDARG on WARP, NVIDIA and Intel (d3d12_existing_heap_test). Docs:
+    // Existing-memory heaps and lifetime trackers. The host refuses a null address, a file mapping that is not a
+    // handle and a null lifetime owner with E_INVALIDARG on WARP, NVIDIA and Intel (d3d12_existing_heap_test). Docs:
     // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress
-    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void* address, REFIID, void** out) override {
+    //
+    // OpenExistingHeapFromAddress answers as the host runtime does on an RTX 4090 and WARP (d3d12_existing_heap_test
+    // open_cases): the address must be the base of a VirtualAlloc allocation that is committed read-write over its
+    // whole size; an address inside it, a partly committed or reserved-only allocation, a read-only one and an
+    // uncached one are E_INVALIDARG. The heap is the allocation's size, 64 KiB aligned, CUSTOM / L0 with WRITE_BACK
+    // (WRITE_COMBINE for a PAGE_WRITECOMBINE range), flags SHARED |
+    // SHARED_CROSS_ADAPTER | ALLOW_SHADER_ATOMICS. Its backing is that memory itself, imported with
+    // VK_EXT_external_memory_host, so the GPU sees the caller's writes. Without the extension, or when the range is
+    // not aligned to minImportedHostPointerAlignment or no memory type takes it, the call stays E_NOTIMPL, and
+    // CheckFeatureSupport(EXISTING_HEAPS) reports the extension's absence. The console title opens the 64 KiB
+    // graphics region it has just committed with XMemVirtualAlloc this way, right after its first queue and fence.
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void* address, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device3::OpenExistingHeapFromAddress";
         if (out) *out = nullptr;
         if (!address || !out) return d3d12_trace::result(method, E_INVALIDARG);
-        log_once("OpenExistingHeapFromAddress (existing heaps are not supported)", 0);
-        return d3d12_trace::result(method, E_NOTIMPL);
+        SIZE_T size = 0;
+        DWORD protect = 0;
+        if (!existing_allocation_size(address, size, protect)) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!state_.get_host_pointer_properties) {
+            log_once("OpenExistingHeapFromAddress (no VK_EXT_external_memory_host; existing heaps are not supported)", 0);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        const VkDeviceSize alignment = state_.info.host_pointer_alignment;
+        if ((reinterpret_cast<std::uintptr_t>(address) | size) & (alignment - 1)) {
+            log_once("OpenExistingHeapFromAddress: range not aligned to minImportedHostPointerAlignment; alignment",
+                     int(alignment));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (state_.get_host_pointer_properties(state_.info.device,
+                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, address,
+                                               &host) != VK_SUCCESS ||
+            !host.memoryTypeBits) {
+            log_once("OpenExistingHeapFromAddress: no memory type imports this host range", 0);
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        import.pHostPointer = const_cast<void*>(address);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint32_t memory_type = 0;
+        // Host-visible and coherent first, as the caller's pages are; then any type the driver offers.
+        for (const VkMemoryPropertyFlags want :
+             {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+              VkMemoryPropertyFlags(0)}) {
+            for (std::uint32_t i = 0; i < state_.memory.memoryTypeCount && !memory; ++i) {
+                if (!(host.memoryTypeBits & (1u << i)) ||
+                    (state_.memory.memoryTypes[i].propertyFlags & want) != want)
+                    continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                allocate.allocationSize = size;
+                allocate.memoryTypeIndex = i;
+                if (state_.context->vk.vkAllocateMemory(state_.info.device, &allocate, nullptr, &memory) ==
+                    VK_SUCCESS)
+                    memory_type = i;
+                else
+                    memory = VK_NULL_HANDLE;
+            }
+            if (memory) break;
+        }
+        if (!memory) {
+            log_once("OpenExistingHeapFromAddress: importing the host range failed; size in KiB", int(size / 1024));
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
+        D3D12_HEAP_DESC desc{};
+        desc.SizeInBytes = size;
+        desc.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+        desc.Properties.CPUPageProperty = (protect & PAGE_WRITECOMBINE) ? D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE
+                                                                        : D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        desc.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+        desc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER |
+                     D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS;
+        auto* heap = new Heap(state_, desc, memory, memory_type, address);
+        heap->attach_device(identity());
+        return d3d12_trace::result(method, hand_out(heap, riid, out));
+    }
+
+    // The size of the VirtualAlloc allocation `address` starts, and its protection, when the whole of it is committed
+    // PAGE_READWRITE, or PAGE_READWRITE | PAGE_WRITECOMBINE: what the host runtime accepts (a write-combined range
+    // opens as a WRITE_COMBINE heap). False for an address inside an allocation, a reserved or free page, another
+    // protection (read-only, PAGE_NOCACHE), or two protections in one allocation.
+    static bool existing_allocation_size(const void* address, SIZE_T& size, DWORD& protect) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(address, &region, sizeof(region)) || region.AllocationBase != address) return false;
+        protect = region.Protect;
+        if (protect != PAGE_READWRITE && protect != (PAGE_READWRITE | PAGE_WRITECOMBINE)) return false;
+        size = 0;
+        const char* at = static_cast<const char*>(address);
+        while (VirtualQuery(at + size, &region, sizeof(region)) && region.AllocationBase == address) {
+            if (region.State != MEM_COMMIT || region.Protect != protect) return false;
+            size += region.RegionSize;
+        }
+        return size != 0;
+    }
+
+    // create_buffer_at_host_address (Xbox device slot 133). The heap the resource reports is CUSTOM / WRITE_BACK / L0,
+    // what OpenExistingHeapFromAddress gives the same pages, since the CPU keeps writing them.
+    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
+        constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+        if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            log_once("a title-placed texture (device slot 133) is not supported yet; dimension", int(desc.Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+        heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
+        resource->attach_device(identity());
+        const HRESULT hr = resource->create_host_buffer(address);
+        if (hr == E_INVALIDARG) {
+            resource->Release();
+            return d3d12_trace::result(method, hr);
+        }
+        if (FAILED(hr)) {
+            // The driver would not import these pages: RADV refuses a view of a pagefile-backed section, the form
+            // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
+            // VK_EXT_external_memory_host has no import at all. The boot goes on with an ordinary DEFAULT buffer
+            // of the same description, as #6915's stand-in did: the title gets a resource, but its writes at
+            // `address` do not reach it.
+            resource->Release();
+            log_once("a title-placed buffer (device slot 133) could not import its pages, so it is an ordinary buffer "
+                     "the title's writes do not reach; HRESULT",
+                     int(hr));
+            const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
+        }
+        return d3d12_trace::result(method, hand_out(resource, riid, out));
     }
 
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE file_mapping, REFIID, void** out) override {
@@ -6527,6 +7060,13 @@ public:
         if (out) *out = nullptr;
         auto* heap = Heap::from<Heap>(heap_interface);
         if (!heap || !desc) return d3d12_trace::result(method, E_INVALIDARG);
+        if (heap->host_address()) {
+            // An existing heap is not an arena range, and the placed path addresses resources by arena offset.
+            log_once("a placed resource in an existing heap (OpenExistingHeapFromAddress) is not supported yet; "
+                     "dimension",
+                     int(desc->Dimension));
+            return d3d12_trace::result(method, E_NOTIMPL);
+        }
         if (castable_count && castable && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             log_once("castable formats on a placed buffer are invalid; count", int(castable_count));
             return d3d12_trace::result(method, E_INVALIDARG);
@@ -6892,7 +7432,11 @@ public:
             if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(data);
             *opts = {};
-            opts->MeshShaderTier = D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            // Tier 1 is mesh PSOs and DispatchMesh, on VK_EXT_mesh_shader. Amplification shaders are part of the tier
+            // but refused at PSO creation (the game has none); OPTIONS9's mesh statistics and full-range render
+            // target array index stay FALSE.
+            opts->MeshShaderTier =
+                state_.info.mesh_shader ? D3D12_MESH_SHADER_TIER_1 : D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
             opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
             return d3d12_trace::result(method, S_OK);
         }
@@ -7408,7 +7952,8 @@ public:
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_EXISTING_HEAPS:
-            return write_supported_feature<D3D12_FEATURE_DATA_EXISTING_HEAPS>(method, data, size, FALSE);
+            return write_supported_feature<D3D12_FEATURE_DATA_EXISTING_HEAPS>(
+                method, data, size, state_.get_host_pointer_properties ? TRUE : FALSE);
         case D3D12_FEATURE_SERIALIZATION: {
             if (size != sizeof(D3D12_FEATURE_DATA_SERIALIZATION)) return d3d12_trace::result(method, E_INVALIDARG);
             auto* ser = static_cast<D3D12_FEATURE_DATA_SERIALIZATION*>(data);
@@ -8060,6 +8605,16 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     return nullptr;
 }
 
+HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+                                      REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;
+    return d->create_at_host_address(address, desc, riid, out);
+}
+
 bool device_supports_ray_tracing(ID3D12Device* device) {
     if (!device) return false;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
@@ -8371,6 +8926,21 @@ std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, H
                                                                                 static_cast<uint32_t>(r.bottom - r.top)};
                                                                     }
                                                                     return {0, 0};
+                                                                },
+                                                                [create_surface, hinstance = GetModuleHandleW(nullptr),
+                                                                 hwnd = window, instance = info.instance]() -> VkSurfaceKHR {
+                                                                    // A lost surface (display gone) is remade for the
+                                                                    // same window; VulkanSwapchain never retained the
+                                                                    // hwnd, this callback does.
+                                                                    VkWin32SurfaceCreateInfoKHR surface_info{
+                                                                        VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+                                                                    surface_info.hinstance = hinstance;
+                                                                    surface_info.hwnd = hwnd;
+                                                                    VkSurfaceKHR made = VK_NULL_HANDLE;
+                                                                    if (create_surface(instance, &surface_info, nullptr,
+                                                                                       &made) != VK_SUCCESS)
+                                                                        return VK_NULL_HANDLE;
+                                                                    return made;
                                                                 });
     if (!presenter->ok()) {
         std::fprintf(stderr, "[rt] d3d12: cannot present to this window from the device's queue family\n");
@@ -8610,6 +9180,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -8629,8 +9200,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 has_dho = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME)) {
                 has_rq = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_MESH_SHADER_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.mesh_shader = mesh_features.meshShader == VK_TRUE;
             }
         }
+        if (!info.mesh_shader)
+            std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -8659,7 +9236,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     enable_as.accelerationStructure = VK_TRUE;
 
+    // Only meshShader: the game has no amplification (task) shaders, and multiview and shading-rate mesh features
+    // are not used.
+    VkPhysicalDeviceMeshShaderFeaturesEXT enable_mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    enable_mesh.meshShader = VK_TRUE;
+
     void* ext_chain = nullptr;
+    if (info.mesh_shader) {
+        enable_mesh.pNext = ext_chain;
+        ext_chain = &enable_mesh;
+    }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
         enable_as.pNext = &enable_rq;
@@ -9009,6 +9595,18 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // Optional: VK_EXT_external_memory_host lets OpenExistingHeapFromAddress import the caller's committed memory as
+    // the heap's backing, so the GPU reads what the CPU writes there without a copy.
+    if (std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+            return std::strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
+        })) {
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_memory{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host_memory};
+        vkGetPhysicalDeviceProperties2(info.physical, &properties);
+        info.host_pointer_alignment = host_memory.minImportedHostPointerAlignment;
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9035,6 +9633,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // VK_KHR_swapchain requires VK_KHR_surface on the instance (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
+    if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
@@ -9043,6 +9642,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.presentation = has_swapchain && instance_has_surface;
     info.swapchain_colorspace = info.presentation && swapchain_colorspace_enabled;
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
+    if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
