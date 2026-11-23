@@ -1132,7 +1132,7 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14.
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
-                                   void** out) {
+                                   void** out, bool console_route) {
     note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
@@ -1142,23 +1142,30 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     // passes Flags=0x2, a console-only bit, the PC runtime fails the call, and the title checks the
     // HRESULT and hits its own int3 at exe+0x2478866. PC CreateCommandQueue defines Flags NONE (0) and
     // DISABLE_GPU_TIMEOUT (0x1) only, so drop the other bits before the forward and log the drop once.
-    static std::atomic<bool> masked_flags_logged{false};
-    D3D12_COMMAND_QUEUE_DESC pc_desc = *desc;
-    constexpr UINT kPcQueueFlags = D3D12_COMMAND_QUEUE_FLAG_NONE | D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
-    if (pc_desc.Flags & ~kPcQueueFlags) {
-        const UINT original = pc_desc.Flags;
-        pc_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(pc_desc.Flags & kPcQueueFlags);
-        if (!masked_flags_logged.exchange(true)) {
-            std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueue desc flags 0x%x masked to 0x%x (console-only bits)\n",
-                         original, pc_desc.Flags);
+    // The mask is the console route's (slot 48) only: PC slot 8 keeps the PC semantics, where an undefined
+    // flag bit is the caller's bug and the PC backend's E_INVALIDARG is the answer to preserve.
+    D3D12_COMMAND_QUEUE_DESC local_desc{};
+    if (console_route && desc) {
+        static std::atomic<bool> masked_flags_logged{false};
+        local_desc = *desc;
+        constexpr UINT kPcQueueFlags = D3D12_COMMAND_QUEUE_FLAG_NONE | D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
+        if (local_desc.Flags & ~kPcQueueFlags) {
+            const UINT original = local_desc.Flags;
+            local_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(local_desc.Flags & kPcQueueFlags);
+            if (!masked_flags_logged.exchange(true)) {
+                std::fprintf(stderr, "[rt] d3d12_xs: CreateCommandQueue desc flags 0x%x masked to 0x%x (console-only bits)\n",
+                             original, local_desc.Flags);
+            }
         }
+        desc = &local_desc;
     }
     // The caller's null output goes to the real device on purpose: its answer (S_FALSE, E_UNEXPECTED, ...) is the
-    // one to give, although the SDK annotates the parameter as required.
+    // one to give, although the SDK annotates the parameter as required. A null desc goes through as it did
+    // before the mask: the real device refuses it (E_INVALIDARG), and d3d12_method_variants_test pins that.
 #pragma warning(suppress : 6387)
-    if (!out) return self->real->CreateCommandQueue(&pc_desc, *riid, nullptr);
+    if (!out) return self->real->CreateCommandQueue(desc, *riid, nullptr);
     void* created = nullptr;
-    const HRESULT hr = self->real->CreateCommandQueue(&pc_desc, __uuidof(ID3D12CommandQueue), &created);
+    const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
     return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
 }
@@ -1511,7 +1518,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_release(self);
     } else if constexpr (Slot == 8) {
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
-                                                    reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+                                                    reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3),
+                                                    /*console_route=*/false));
     } else if constexpr (Slot == 9) {
         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
                                                         reinterpret_cast<void**>(a3)));
@@ -1568,7 +1576,8 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             log_xbox_route_once(Slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
             return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                         reinterpret_cast<const IID*>(a2),
-                                                        reinterpret_cast<void**>(a3)));
+                                                        reinterpret_cast<void**>(a3),
+                                                        /*console_route=*/true));
         }
         if (Slot == routes.list_x) {
             log_xbox_route_once(Slot, "CreateCommandListX", a1, a2, a3, a4, a5);

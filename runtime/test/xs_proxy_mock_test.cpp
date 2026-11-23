@@ -748,6 +748,21 @@ int check_xbox_slots() {
     EXPECT(mock->last_queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT);
     EXPECT(release(flagged_queue) == 0);
 
+    // PC slot 8 keeps the PC semantics: an undefined flag bit is the caller's bug and reaches the real device
+    // unchanged (the PC backend's E_INVALIDARG is the answer to preserve), unlike the console slot 48 route.
+    xbox_flags_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2);
+    EXPECT(hr_of(raw(device, 8, word(&xbox_flags_desc), word(&kQueueIid), word(&flagged_queue))) == S_OK);
+    EXPECT(mock->last_queue_desc.Flags == static_cast<D3D12_COMMAND_QUEUE_FLAGS>(0x2));
+    EXPECT(release(flagged_queue) == 0);
+
+    // A null desc goes through to the real device on both routes (the PC runtime refuses it with E_INVALIDARG,
+    // which d3d12_method_variants_test pins for slot 8/75 agreement); the shim must not dereference it.
+    void* null_desc_queue = nullptr;
+    EXPECT(hr_of(raw(device, 8, 0, word(&kQueueIid), word(&null_desc_queue))) == S_OK && mock->args[8][0] == 0);
+    EXPECT(release(null_desc_queue) == 0);
+    EXPECT(hr_of(raw(device, 48, 0, word(&kQueueIid), word(&null_desc_queue))) == S_OK && mock->args[8][0] == 0);
+    EXPECT(release(null_desc_queue) == 0);
+
     // 73 CreateCommandListX(desc, allocator, initialState, riid, out): the type is desc's first word, the allocator
     // proxy is unwrapped, the node mask is 0 and the PC six-argument CreateCommandList (slot 12) is reached.
     const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
