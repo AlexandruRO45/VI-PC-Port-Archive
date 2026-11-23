@@ -72,9 +72,10 @@ class CapturedShadersTest(unittest.TestCase):
         else:  # pragma: no cover - a tool this test does not expect
             raise AssertionError(f"unexpected tool {tool}")
 
-    def run_step(self):
+    def run_step(self, **options):
+        options.setdefault("mc_signature", '["llvm-mc", "synthetic 0"]')
         with mock.patch.object(make_game, "py", self.fake_py):
-            make_game.captured_shaders(str(self.work), 2)
+            make_game.captured_shaders(str(self.work), 2, **options)
 
     def write_capture(self, name, stage="cs", body=None):
         """A capture as the runtime writes it: the file is named after the program's SHA-256."""
@@ -181,6 +182,67 @@ class CapturedShadersTest(unittest.TestCase):
         two = self.write_capture("1" * 64, stage="cs")
         self.run_step()
         self.assertEqual(sorted(self.captured_now()), sorted(["captured_" + one[:16], "captured_" + two[:16]]))
+
+    # -- the settings the modules were built with (review finding: a rerun in another mode kept the old modules) ----
+    def captured_record(self):
+        path = self.spirv / "captured" / make_game.CAPTURE_RECORD
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+
+    def test_what_built_the_modules_is_recorded(self):
+        self.write_capture("j" * 64)
+        self.run_step(emulate=True, fallbacks=("--texel-offset-fallback",))
+        record = self.captured_record()
+        self.assertTrue(record, "the sub-index records what translated it, as fspx_build.json does")
+        self.assertTrue(record.get("wave64_emulate"))
+        self.assertEqual(record.get("fallbacks"), ["--texel-offset-fallback"])
+        self.assertTrue(record.get("translator") and record.get("llvm_mc"))
+        self.calls.clear()
+        self.run_step(emulate=True, fallbacks=("--texel-offset-fallback",))
+        self.assertEqual(self.calls, [], "the same settings translate nothing again")
+
+    def test_a_capture_is_translated_again_when_the_mode_changes(self):
+        """SamuelReeder's rerun: native first, then --wave64-emulate --bary-fallback on the same work folder.
+
+        The main library is retranslated under the new mode, so the capture must be too; skipping it by hash left a
+        native module in an emulated library, the one thing the recorded mode was meant to prevent.
+        """
+        digest = self.write_capture("g" * 64)
+        self.run_step(emulate=False, fallbacks=())
+        self.assertEqual(len(self.captured_now()), 1)
+        self.calls.clear()
+        self.run_step(emulate=True, fallbacks=("--bary-fallback",))
+        translated = [args for tool, args in self.calls if tool == "rdna2spirv.py"]
+        self.assertEqual(len(translated), 1, "the capture is translated again under the new mode")
+        self.assertIn("--wave64-emulate", translated[0])
+        self.assertIn("--bary-fallback", translated[0])
+        self.assertEqual(list(self.captured_now()), ["captured_" + digest[:16]])
+        record = self.captured_record()
+        self.assertTrue(record["wave64_emulate"])
+        self.assertEqual(record["fallbacks"], ["--bary-fallback"])
+
+    def test_a_tree_from_before_the_record_is_translated_again(self):
+        self.write_capture("k" * 64)
+        self.run_step(emulate=False, fallbacks=())
+        (self.spirv / "captured" / make_game.CAPTURE_RECORD).unlink()
+        self.calls.clear()
+        self.run_step(emulate=False, fallbacks=())
+        self.assertEqual([tool for tool, _ in self.calls].count("rdna2spirv.py"), 1,
+                         "a sub-index with no record cannot be shown to match: built again in this run's mode")
+
+    def test_stale_modules_without_their_containers_are_kept_and_named(self):
+        """No container to translate again from: the modules stay (they are the shaders the run needs) and the
+        stage names the folder to delete, rather than leaving modules built another way in the library silently."""
+        digest = self.write_capture("h" * 64)
+        self.run_step(emulate=False, fallbacks=())
+        shutil.rmtree(self.caught)
+        self.calls.clear()
+        with mock.patch.object(make_game, "log") as logged:
+            self.run_step(emulate=True, fallbacks=())
+        self.assertEqual(self.calls, [], "no container, so nothing to translate")
+        self.assertEqual(list(self.captured_now()), ["captured_" + digest[:16]], "the module is kept")
+        warnings = [call.args[0] for call in logged.call_args_list if call.args and call.args[0].startswith("captured: WARNING")]
+        self.assertEqual(len(warnings), 1, "the stale sub-index is named once")
+        self.assertIn(str(self.spirv / "captured"), warnings[0])
 
 
 if __name__ == "__main__":

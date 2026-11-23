@@ -1317,7 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
-    captured_shaders(work, jobs, emulate=emulate, fallbacks=fallbacks)
+    captured_shaders(work, jobs, emulate=emulate, fallbacks=fallbacks, mc_signature=signature)
     log("shaders: done")
 
 
@@ -1325,10 +1325,51 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
 # LEONIDA_SHADER_CAPTURE names it (runtime/src/shader_capture.h). The modules go to <spirv>/captured, a
 # sub-index the loader reads on its own, so the main index stays exactly what the carve translated.
 CAPTURED = "captured"
+# Beside <spirv>/captured/index.json: what those modules were translated with (translator source, llvm-mc, wave64
+# mode, fallback flags). fspx_build.json and bvh_build.json are the same record for their sub-indexes.
+CAPTURE_RECORD = "captured_build.json"
+
+
+def capture_settings(emulate: bool, fallbacks: "tuple[str, ...]", mc_signature: "str | None" = None) -> str:
+    """What a captured shader's module depends on, as one line: a change to any of it makes the modules stale.
+
+    llvm-mc counts because the translator consumes its listing, as for fspx_build.json and bvh_build.json; the
+    stage already has the signature, so it is passed in rather than probed again.
+    """
+    return json.dumps({"translator": translation_sources_digest(),
+                       "llvm_mc": mc_signature if mc_signature is not None else llvm_mc_signature(),
+                       "wave64_emulate": bool(emulate), "fallbacks": list(fallbacks)}, sort_keys=True)
+
+
+def capture_settings_note(line: str) -> str:
+    """A recorded capture settings line readable in the stage log; "no recorded settings" when absent or unreadable."""
+    try:
+        record = json.loads(line)
+        flags = " ".join(record.get("fallbacks") or ()) or "none"
+        return f"wave64 emulation {'on' if record.get('wave64_emulate') else 'off'}, fallback flags {flags}"
+    except (TypeError, ValueError):
+        return "no recorded settings"
+
+
+def capture_translation(work: str, spirv: str, emulate: "bool | None", fallbacks: "tuple[str, ...] | None",
+                        mc_signature: "str | None" = None) -> "tuple[bool, tuple[str, ...], str]":
+    """(wave64 mode, fallback flags, settings line) for the captures: this run's when it has them, the library's
+    recorded ones otherwise.
+
+    A capture must not be the one module in a library built another way, so the recorded mode and flags win over
+    this run's defaults. The settings line is what tells a later run whether the modules on disk are still the ones
+    these settings produce.
+    """
+    if emulate is None and fallbacks is None:
+        recorded_mode = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
+        mode, flags = recorded_mode == "on", tuple(recorded_fallback_flags(work))
+    else:
+        mode, flags = bool(emulate), tuple(fallbacks or ())
+    return mode, flags, capture_settings(mode, flags, mc_signature)
 
 
 def captured_shaders(work: str, jobs: "int | None" = None, emulate: "bool | None" = None,
-                     fallbacks: "tuple[str, ...] | None" = None) -> None:
+                     fallbacks: "tuple[str, ...] | None" = None, mc_signature: "str | None" = None) -> None:
     """Translate the containers a run captured with LEONIDA_SHADER_CAPTURE (#8851 A40/A44).
 
     The title builds some shader programs at run time, so they sit in no archive and the carve never produces them:
@@ -1345,6 +1386,10 @@ def captured_shaders(work: str, jobs: "int | None" = None, emulate: "bool | None
 
     These captures are game data: they stay in the work folder and are never committed. Idempotent - a container
     whose program is already in either index is skipped - and free when the folder is absent or empty.
+
+    What the modules were translated with is recorded beside them (CAPTURE_RECORD), so a later run that changes the
+    mode, the fallback flags or the translator/llvm-mc builds them again instead of leaving modules built another
+    way in the library (found in review: a rerun with --wave64-emulate --bary-fallback kept the native capture).
     """
     caught = os.path.join(work, "shaders", CAPTURED)
     containers = []
@@ -1360,12 +1405,34 @@ def captured_shaders(work: str, jobs: "int | None" = None, emulate: "bool | None
             log(f"captured: skipping {os.path.basename(path)}: its sidecar names no stage")
             continue
         containers.append((path, stage))
+    spirv = os.path.join(work, "shaders", "spirv")
+    out_dir = os.path.join(spirv, CAPTURED)
+    out_index = os.path.join(out_dir, "index.json")
+    record = os.path.join(out_dir, CAPTURE_RECORD)
+    if not containers and not os.path.isfile(out_index):
+        return   # nothing captured now and nothing captured before: no work, and no llvm-mc probe
+    # Before anything is dropped: the stage that calls this has just translated, so a missing main index is a
+    # different problem, and it must not cost the captures their modules.
+    require_translated_shaders(work)
+    mode, flags, settings = capture_translation(work, spirv, emulate, fallbacks, mc_signature)
+    had_record = read_shader_setting(record)
+    if had_record != settings and os.path.isfile(out_index):
+        if not containers:
+            # The containers that produced them are gone, so they cannot be translated again: name the folder
+            # instead of leaving modules built another way in place, since the runtime loads them.
+            log(f"captured: WARNING: the modules in {out_dir} were translated with "
+                f"{capture_settings_note(had_record)}, this run needs {capture_settings_note(settings)}, and their "
+                f"containers are no longer in {caught}: delete {out_dir} and capture again to rebuild them. The "
+                f"stale modules are still loaded, so a pipeline that needs one may get a module built for other "
+                f"settings")
+            return
+        log(f"captured: the modules in {out_dir} were translated with {capture_settings_note(had_record)}, this "
+            f"run needs {capture_settings_note(settings)}: translating the captures again")
+        # The index and its modules are the stale part; the containers are the input and stay.
+        drop(out_index, record, *glob.glob(os.path.join(out_dir, "*.spv")))
     if not containers:
         return
 
-    spirv = require_translated_shaders(work)
-    out_dir = os.path.join(spirv, CAPTURED)
-    out_index = os.path.join(out_dir, "index.json")
     known = set()
     for index in (os.path.join(spirv, "index.json"), out_index):
         if not os.path.isfile(index):
@@ -1428,13 +1495,9 @@ def captured_shaders(work: str, jobs: "int | None" = None, emulate: "bool | None
         return
     write_index(todo)
 
-    # The mode the library was built in: a capture translated natively into an emulated library (or the other way)
-    # would be the only entry of its kind, so the recorded mode and flags win over this run's defaults.
-    if emulate is None and fallbacks is None:
-        recorded_mode = read_shader_setting(os.path.join(spirv, "wave64_emulate.txt"), default="off")
-        extra = (["--wave64-emulate"] if recorded_mode == "on" else []) + list(recorded_fallback_flags(work))
-    else:
-        extra = (["--wave64-emulate"] if emulate else []) + list(fallbacks or ())
+    # The mode the library was built in (capture_translation, above): the same mode and flags the carve's index was
+    # translated with, recorded in <spirv>/captured/captured_build.json once the modules are in place.
+    extra = (["--wave64-emulate"] if mode else []) + list(flags)
 
     disasm = os.path.join(staging, "disasm")
     py("shader_disasm.py", fssm, "--out", disasm, *(["--jobs", str(jobs)] if jobs else []))
@@ -1465,6 +1528,8 @@ def captured_shaders(work: str, jobs: "int | None" = None, emulate: "bool | None
     with open(marker, "w", encoding="utf-8", newline="\n") as f:
         json.dump(library, f, sort_keys=True)
     os.replace(marker, out_index)
+    with open(record, "w", encoding="utf-8", newline="\n") as f:
+        f.write(settings + "\n")
     shutil.rmtree(staging, ignore_errors=True)
     log(f"captured: {len(fresh)} of {len(containers)} container(s) translated and added to {out_dir}")
 

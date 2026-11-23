@@ -532,6 +532,47 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // The programs the title builds at run time, translated into <dir>/captured (entries named "captured/<name>" and
+    // found by fssm_sha256 like the game's). They load into the same lookup as the carve's entries, but no RPF
+    // container holds them, so the corpus check must be able to leave them out of its one-to-one count: counting
+    // them in made a working capture read as a corpus gap (the review finding on #9403).
+    {
+        const std::string captured_hash = sha256_hex(bytes("a program the title builds at run time"));
+        const std::uint32_t words[5] = {0x07230203, 0x00010500, 0, 1, 0};
+        std::filesystem::create_directories(dir / "captured");
+        const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        write(dir / "index.json", "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write(dir / "captured" / "index.json",
+              "{\"captured_0123456789abcdef\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + captured_hash + "\"}}");
+        {
+            std::ofstream spv(dir / "captured" / "captured_0123456789abcdef.spv", std::ios::binary);
+            spv.write(reinterpret_cast<const char*>(words), sizeof(words));
+        }
+        ShaderLibrary captured;
+        CHECK(captured.load(dir.string(), &error) && captured.size() == 2 && captured.captured_size() == 1 &&
+              captured.fspx_size() == 0 && captured.bvh_size() == 0);
+        // Found by content, like a carved shader: that is why the runtime looks a capture up at all.
+        const ShaderEntry* built = captured.find("cs", captured_hash);
+        CHECK(built && built->name == "captured/captured_0123456789abcdef");
+        CHECK(captured.spirv(*built).size() == 5);  // <dir>/captured/captured_0123456789abcdef.spv
+        CHECK(captured.find("cs", hash) && captured.find("cs", hash)->name == "cs_game");
+        // The count the corpus check takes: only the entries an RPF container can reach, exactly as before captures
+        // existed. Reached entries (1: cs_game) must equal it, not size().
+        CHECK(captured.size() - captured.fspx_size() - captured.bvh_size() - captured.captured_size() == 1);
+        // A second load does not add the sub-index twice: the counters restart with the main index.
+        CHECK(captured.load(dir.string(), &error) && captured.size() == 2 && captured.captured_size() == 1);
+        // A broken or absent captured/index.json leaves the main index loaded and counts nothing.
+        write(dir / "captured" / "index.json", "{broken");
+        CHECK(captured.load(dir.string(), &error) && captured.size() == 1 && captured.captured_size() == 0 &&
+              captured.find("cs", hash) && !captured.find("cs", captured_hash));
+        std::filesystem::remove(dir / "captured" / "index.json");
+        CHECK(captured.load(dir.string(), &error) && captured.size() == 1 && captured.captured_size() == 0);
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.

@@ -299,7 +299,12 @@ carve uses - `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` - and adds th
 `captured/` sub-index (`<work>/shaders/spirv/captured/index.json`, read like `fspx/` and `bvh/`), so a later run
 finds it and the top-level index stays exactly what the carve translated. The modules are translated in the mode the
 rest of the library was - the recorded wave64 emulation and fallback flags - so a capture is never the one entry
-built differently.
+built differently. What built them is recorded beside the sub-index in `captured_build.json` (the translator source,
+llvm-mc, the mode and the flags): when a later run's settings no longer match, the index and its modules are dropped
+and the captures are translated again. With their containers gone they cannot be rebuilt, so they are kept - they are
+the shaders a run needs - and the stage names the folder to delete instead of leaving modules built another way in
+place silently. The corpus check (`shader_library_corpus_test`) leaves captured entries out of its one-to-one count,
+like the `fspx/` and `bvh/` ones, because no RPF container holds them.
 
 A compute program that is a bare FSPX payload (the slot-67 form) is reported, not captured: the step translates
 FSSM programs, and an FSPX payload written out as a `.dxbc` is not something `fssm_unpack.py` can read. Carrying its

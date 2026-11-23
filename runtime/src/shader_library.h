@@ -764,6 +764,11 @@ public:
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
     std::size_t bvh_size() const { return bvh_count_; }
+    // Entries loaded from <dir>/captured/index.json. No RPF container reaches these as RPF containers either: they
+    // are the programs the title built at run time, which is why the carve never produced them. A caller comparing
+    // reached entries with size() must leave them out, like the two above, or a working capture reads as a corpus
+    // gap (runtime/test/shader_library_corpus_test.cpp).
+    std::size_t captured_size() const { return captured_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -867,6 +872,7 @@ private:
             count_ = 0;
             fspx_count_ = 0;
             bvh_count_ = 0;
+            captured_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -932,6 +938,7 @@ private:
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && prefix == "fspx/") ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "captured/") ++captured_count_;
             ++count_;
         }
         return true;
@@ -941,6 +948,7 @@ private:
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
     std::size_t bvh_count_ = 0;
+    std::size_t captured_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;
