@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -589,6 +590,18 @@ class SamplerSourceCensus(unittest.TestCase):
         p = subprocess.run([sys.executable, "-I", TOOL, self.work.disasm], capture_output=True, text=True)
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR: cannot read the carve index"), p.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(ssc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    ssc.write_json_report(path, {"total": {}})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
