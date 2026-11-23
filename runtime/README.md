@@ -303,12 +303,11 @@ yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local dest
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
 the verdict, the `shim` binding and the call order in the `--trace-d3d12` output, and skips without a Vulkan GPU).
-The game does not boot yet. The missing executable blocks the import-driven work: the real device
-entry point, command-list/queue/fence extensions, `PresentX`, and most of the `xgameruntime` surface (an offline
-shim covers `XGameRuntimeInitialize`, device/console queries, `XTaskQueue` and `XAsync`; see `xgameruntime_test`). The
-D3D12-to-Vulkan design and the measured console ABI are in
-The game does not boot yet, and none of this has been measured against the real executable. The missing executable
-blocks the import-driven work:
+The game does not boot yet. The executable's import table is measured
+([runtime_imports.md](../docs/runtime_imports.md#the-retail-executable-rt-5)) and a
+[measured retail boot chain](../docs/retail_boot_chain.md) reached the first descriptor heap on one machine, with the
+pull requests and local stand-ins listed there on top of `main`; nothing has reached a draw or a present. What
+`main` itself still lacks:
 
 - The device entry point: `D3D12XboxCreateDevice` exists and wraps the PC or the Vulkan-backed device in the
   measured-slot proxy, but its parameter and flag layout is unmeasured, and the Xbox device vtable is only partly
