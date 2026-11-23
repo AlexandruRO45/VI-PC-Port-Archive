@@ -157,5 +157,35 @@ class VMin3F32TranslatorIntegrationTests(unittest.TestCase):
         max_res = f32_to_bits(max(bits_to_f32(a), bits_to_f32(b), bits_to_f32(c)))
         self.assertNotEqual(min_res, max_res)
 
+def ref_max3_f32_bits(b0: int, b1: int, b2: int) -> int:
+    """RDNA2 v_max3_f32: maximum of 3 floats; any NaN operand is ignored in favor of non-NaN."""
+    nans = [is_nan_f32(b) for b in (b0, b1, b2)]
+    if all(nans):
+        return b0
+    valid_floats = [bits_to_f32(b) for b, is_n in zip((b0, b1, b2), nans) if not is_n]
+    res_f = max(valid_floats)
+    return f32_to_bits(res_f)
+
+
+class VMax3F32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_max3_f32."""
+
+    def test_basic_ordering(self):
+        a, b, c = f32_to_bits(1.0), f32_to_bits(5.0), f32_to_bits(2.5)
+        self.assertEqual(ref_max3_f32_bits(a, b, c), b)
+        self.assertEqual(ref_max3_f32_bits(b, a, c), b)
+        self.assertEqual(ref_max3_f32_bits(c, a, b), b)
+
+    def test_negative_floats(self):
+        a, b, c = f32_to_bits(-10.0), f32_to_bits(-5.0), f32_to_bits(-1.0)
+        self.assertEqual(ref_max3_f32_bits(a, b, c), c)
+
+    def test_nan_ignoring_behavior(self):
+        qnan = 0x7FC00001
+        v1 = f32_to_bits(12.0)
+        v2 = f32_to_bits(4.0)
+        self.assertEqual(ref_max3_f32_bits(qnan, v1, v2), v1)
+        self.assertEqual(ref_max3_f32_bits(v2, qnan, v1), v1)
+
 if __name__ == "__main__":
     unittest.main()
