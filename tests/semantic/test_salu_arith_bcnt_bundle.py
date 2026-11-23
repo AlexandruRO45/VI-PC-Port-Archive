@@ -441,6 +441,33 @@ class TestSBcnt1I32B64ReferenceOracle(unittest.TestCase):
         res = oracle_s_bcnt1_i32_b64(0x7, 0x1)
         self.assertEqual(res, 0x4)
 
+class TestSBcnt1I32B64ASTAndInterpreter(unittest.TestCase):
+    """Stage 2 for s_bcnt1_i32_b64: AST and deterministic scalar interpreter execution."""
+
+    def test_s_bcnt1_i32_b64_ast_and_execution(self):
+        ast_prog = ['s_bcnt1_i32_b64 s0, s[2:3]'] + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_ast_s_bcnt1_i32_b64", ast_prog)
+        for needle in ['OpBitCount', 'OpIAdd', '%scc']:
+            self.assertIn(needle, spv)
+
+        exec_prog = ['s_mov_b32 s2, 7', 's_mov_b32 s3, 1', 's_bcnt1_i32_b64 s0, s[2:3]'] + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        words = run_salu_bundle_ps(exec_prog, "ps_exec_s_bcnt1_i32_b64")
+        self.assertEqual(words[0], 0x4)
+
 
 if __name__ == '__main__':
     unittest.main()
