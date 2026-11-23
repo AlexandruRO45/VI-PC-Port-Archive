@@ -161,6 +161,40 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_a_malformed_report_is_exit_1_not_a_traceback(self):
+        # null images or classes, a non-object at either level and a non-string class_id were TypeErrors (or were
+        # silently accepted); each is one error line and exit 1 now.
+        cases = [
+            ({"images": None}, "is not a list"),
+            ({"images": [None]}, "not a JSON object"),
+            ({"images": [{"classes": None}]}, "is not a list"),
+            ({"images": [{"classes": [None]}]}, "not a JSON object"),
+            ({"images": [{"classes": [{"class_id": True}]}]}, "is not a string"),
+            ({"images": [{"classes": [{"class_id": 123}]}]}, "is not a string"),
+            ({"images": [{"classes": [{"class_id": ["704c3f58"]}]}]}, "is not a string"),
+            ({"images": "demo"}, "is not a list"),
+            (["images"], "not a JSON object"),
+        ]
+        for content, message in cases:
+            with self.subTest(content=content):
+                report = os.path.join(self.root, "broken.json")
+                with open(report, "w", encoding="utf-8") as f:
+                    json.dump(content, f)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report]), 1)
+                self.assertIn("cannot read the gdk_runtime_calls report", stderr.getvalue())
+                self.assertIn(message, stderr.getvalue())
+
+    def test_a_null_or_empty_class_id_names_no_class_and_an_uppercase_one_is_lowered(self):
+        report = os.path.join(self.root, "ids.json")
+        with open(report, "w", encoding="utf-8") as f:
+            json.dump({"images": [{"classes": [
+                {"class_id": None}, {"class_id": ""},
+                {"class_id": SAVE_CLASS.upper()}, {"other": "entry"},
+            ]}]}, f)
+        self.assertEqual(ec.called_classes([report]), {SAVE_CLASS})
+
     def assert_report_output_rejected(self, reports, output):
         original = [report.read_bytes() for report in reports]
         args = ["--root", self.root, "--out", str(output)]

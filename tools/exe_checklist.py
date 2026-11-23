@@ -14,8 +14,8 @@ several). A shim note then says whether the executable calls a runtime class tha
 the ones a boot can reach, so they come first; "not called" ones can wait. The classes of a file are its
 `constexpr GUID k...Class` ids, as gdk_runtime_calls reads them.
 
-Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or
-the checklist cannot be written to --out; 2 when --out refers to an input report.
+Output: Markdown, to stdout or --out (LF). Exit status 0 on success; 1 when a --gdk-calls file can't be read or is
+malformed, or the checklist cannot be written to --out; 2 when --out refers to an input report.
 Standard library only.
 Usage: `python -I tools/exe_checklist.py --help` lists the options.
 """
@@ -135,15 +135,37 @@ def collect(root: str) -> list[dict]:
 
 
 def called_classes(paths: list[str]) -> set[str]:
-    """The class ids the executable's gdk_runtime_calls reports list (any image in them)."""
+    """The class ids the executable's gdk_runtime_calls reports list (any image in them).
+
+    A report is a JSON object holding either an "images" list of image objects or the image's own fields, and each
+    image's "classes" list holds {"class_id": <GUID string>, ...} entries; a class_id that is absent or null names
+    no class. Anything else is malformed, and raises ValueError so main() reports it and exits 1.
+    """
     ids = set()
     for p in paths:
         with open(p, encoding="utf-8") as f:
             doc = json.load(f)
-        for image in doc.get("images", [doc]):
-            for c in image.get("classes", []):
-                if c.get("class_id"):
-                    ids.add(str(c["class_id"]).lower())
+        if not isinstance(doc, dict):
+            raise ValueError(f"{p}: the report's top level is not a JSON object")
+        images = doc["images"] if "images" in doc else [doc]
+        if not isinstance(images, list):
+            raise ValueError(f"{p}: \"images\" is not a list")
+        for image in images:
+            if not isinstance(image, dict):
+                raise ValueError(f"{p}: an entry of \"images\" is not a JSON object")
+            classes = image["classes"] if "classes" in image else []
+            if not isinstance(classes, list):
+                raise ValueError(f"{p}: \"classes\" is not a list")
+            for c in classes:
+                if not isinstance(c, dict):
+                    raise ValueError(f"{p}: an entry of \"classes\" is not a JSON object")
+                class_id = c.get("class_id")
+                if class_id is None:
+                    continue
+                if not isinstance(class_id, str):
+                    raise ValueError(f"{p}: class_id {class_id!r} is not a string")
+                if class_id:
+                    ids.add(class_id.lower())
     return ids
 
 
