@@ -868,6 +868,7 @@ constexpr unsigned kQueueSignal = 14, kQueueWait = 15;  // (ID3D12Fence*, UINT64
 constexpr unsigned kFenceSignal = 10;                   // ID3D12Fence::Signal(UINT64), from the CPU
 constexpr unsigned kFenceCompletedValueSlot = 12;       // one past ID3D12Fence1: the completed value's address
 constexpr unsigned kConsoleListReset = 139;  // the retail title's Reset(allocator, pso) -> PC list slot 10
+constexpr unsigned kAllocatorPoolSlot = 9;   // the retail allocator pool path's first call past the public chain
 static_assert(kFenceCompletedValueSlot >= kFence1PublicSlots && kFenceCompletedValueSlot < kFenceSlots,
               "fence slot 12 is past the public chain and inside the table");
 
@@ -949,6 +950,7 @@ const char* child_public_name(unsigned slot) {
         if (slot == kConsoleListReset) return "Reset139";
     } else {
         if (slot == 8) return "Reset";
+        if (slot == kAllocatorPoolSlot) return "PoolPath9";
     }
     return nullptr;
 }
@@ -1400,6 +1402,36 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             using ResetFn = HRESULT(WINAPI*)(void*, void*, void*);
             return hr_to_u64(reinterpret_cast<ResetFn>(self->real_vtable[10])(
                 self->real, reinterpret_cast<void*>(a1), reinterpret_cast<void*>(a2)));
+        }
+        // The allocator's pool path calls one slot past the public chain. Its shape is not measured; the first calls
+        // are logged and S_OK keeps the title alive without touching a caller pointer, except for the one observed
+        // poison: if the first word names writable memory that holds all ones (the value the title then reads
+        // through), null it, the COM convention for "no object", and say so.
+        if constexpr (K == ChildKind::allocator && Slot == kAllocatorPoolSlot) {
+            static std::atomic<unsigned> calls{0};
+            const unsigned call = calls.fetch_add(1, std::memory_order_relaxed);
+            std::uint64_t* out = reinterpret_cast<std::uint64_t*>(a1);
+            bool repaired = false;
+            MEMORY_BASIC_INFORMATION info{};
+            if (out && VirtualQuery(out, &info, sizeof(info)) == sizeof(info) &&
+                info.State == MEM_COMMIT &&
+                (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) &&
+                !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                reinterpret_cast<std::uintptr_t>(out + 1) <=
+                    reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize &&
+                *out == ~std::uint64_t{0}) {
+                *out = 0;
+                repaired = true;
+            }
+            if (call < 8)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: allocator slot 9 (past the public chain) call #%u args 0x%llx 0x%llx "
+                             "0x%llx 0x%llx -> S_OK%s\n",
+                             call, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                             repaired ? " (the all-ones word at the first argument became null)" : "");
+            d3d12_trace::record(child_trace_name<K>(Slot));
+            return hr_to_u64(S_OK);
         }
         if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
             // The retail executable presents through queue slot 32 (0x100): PresentX(plane_count, planes, params),

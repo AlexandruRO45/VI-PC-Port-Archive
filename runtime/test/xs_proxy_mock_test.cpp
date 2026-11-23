@@ -884,9 +884,16 @@ int check_allocators() {
         EXPECT(xs::is_allocator_proxy(allocator) && word(xs::allocator_proxy_real_allocator(allocator)) == word(real));
         EXPECT(mock->args[9][0] == D3D12_COMMAND_LIST_TYPE_DIRECT && real->refs == 1);
         EXPECT(xs::allocator_proxy_slot_count(allocator) == 9 && xs::device_proxy_ref_count(device) == device_refs + 1);
-        // Reset (slot 8) reaches the real allocator; every slot past it up to the table end is refused.
+        // Reset (slot 8) reaches the real allocator. Slot 9 is the pool path: S_OK without forwarding, and the observed
+        // all-ones poison word becomes null; every other slot up to the table end is refused.
         EXPECT(hr_of(raw(allocator, 8)) == S_OK && real->calls[8] == 1);
-        for (unsigned slot = 9; slot < xs::allocator_proxy_table_size(); ++slot)
+        std::uint64_t poison = ~std::uint64_t{0};
+        EXPECT(hr_of(raw(allocator, 9, word(&poison), 0xabc, 0xdef)) == S_OK);
+        EXPECT(poison == 0 && real->calls[9] == 0);
+        std::uint64_t kept = 0x1234;
+        EXPECT(hr_of(raw(allocator, 9, word(&kept))) == S_OK && kept == 0x1234);
+        EXPECT(hr_of(raw(allocator, 9, 0)) == S_OK);
+        for (unsigned slot = 10; slot < xs::allocator_proxy_table_size(); ++slot)
             EXPECT(hr_of(raw(allocator, slot)) == E_NOTIMPL && real->calls[slot] == 0);
         // The tag and the real object stay hidden: QueryInterface answers only the modelled interfaces.
         void* found = reinterpret_cast<void*>(1);
@@ -941,8 +948,9 @@ int check_allocators() {
         EXPECT(mock->last_child->refs == 0);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }
-    std::printf("%s: allocators answering Leonida's tag are wrapped (Reset forwarded, tail refused, residency "
-                "unwrapped, references balanced); others come back unwrapped; failures leave no reference\n", g_label);
+    std::printf("%s: allocators answering Leonida's tag are wrapped (Reset forwarded, pool slot 9 answered and its "
+                "poison word nulled, tail refused, residency unwrapped, references balanced); others come back "
+                "unwrapped; failures leave no reference\n", g_label);
     return 0;
 }
 

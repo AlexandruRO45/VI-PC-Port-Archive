@@ -792,7 +792,11 @@ Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllo
 
 - **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
   end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
-  The console allocator's extra methods cannot be measured from the package (D3D-360). No shipped module creates,
+  **Slot 9** is the retail title's allocator-pool path: it is logged with its first arguments and answers `S_OK`
+  without forwarding (the console method's shape is unmeasured, D3D-360). The one observed poison is repaired: when
+  the first word names writable memory that holds all ones (the value the title then reads through), it is set to
+  null, the COM convention for "no object"; no other caller memory is written.
+  The console allocator's other extra methods cannot be measured from the package (D3D-360). No shipped module creates,
   receives or calls an allocator (§3.5). The package has no `d3d12_xs.dll` either, and no export of the three
   D3D12 clients takes an allocator. `dumpbin /exports` (MSVC 19.52) lists the BVH builder's 12 exports, which take
   an `ID3D12Device11` or a command list (`docs/d3d12_xs_surface.md`), and the FSR loader's and upscaler's

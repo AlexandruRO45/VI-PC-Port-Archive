@@ -237,8 +237,11 @@ bool command_object_tables_guarded();
 
 // Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded, a
 // slot past it up to the end of the table (64 slots) is logged and refused with E_NOTIMPL, and a read past the
-// table faults in a guard region, as for queues and fences. The console allocator's extra methods are not
-// measured and not guessed. Slot 9 wraps only an allocator that answers kLeonidaCommandAllocatorTag, Leonida's
+// table faults in a guard region, as for queues and fences. Slot 9 is the served exception (the retail title's
+// allocator-pool path): it logs its first calls and answers S_OK without forwarding, and if its first word is
+// writable memory holding all ones (the poison the title reads through) it sets that word to null. The console
+// allocator's other extra methods are not measured and not guessed. Slot 9 of the device wraps only an allocator
+// that answers kLeonidaCommandAllocatorTag, Leonida's
 // own Vulkan-layer allocator: its command lists resolve the proxy (CreateCommandList, Reset). A PC runtime
 // allocator goes back unchanged, because the PC runtime's lists would take a proxy for their own allocator; a
 // command-list proxy that unwraps at Reset is what lets the host backend wrap allocators too.
