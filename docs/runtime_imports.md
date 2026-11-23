@@ -162,7 +162,7 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XAccessibilityImpl` from xgameruntime-docs' layout; for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
 the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
@@ -204,6 +204,18 @@ connectivity (level None), the port and URL security-information queries fail wi
 `HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)` (the `*Async` ones complete with it through XAsync), the
 certificate check fails the same way, change registrations return tokens that never fire, and the three
 `IXNetworkingImpl2` additions are `E_NOTIMPL`.
+
+`XAccessibilityImpl` (`runtime/shims/xgameruntime_accessibility.cpp`, `IXAccessibilityImpl`/`2`, slots 3-21) is served
+from xgameruntime-docs' layout alone: no package DLL calls an `XClosedCaption*`, `XHighContrast*`, `XSpeechToText*` or
+`XSpeechSynthesizer*` slot, so its slots are **not measured** yet. It answers like a console with every accessibility
+feature off. `XClosedCaptionGetProperties` reports captions off (scale 1, opaque white font colour, the other two
+colours zero, default edge and style) until the title calls `XClosedCaptionSetEnabled`; `XHighContrastGetMode` is
+`Off`; the speech-to-text calls are accepted and dropped (the title's text is never logged), with a hypothesis id
+handed out by `Begin` and checked by `Update`/`Finalize`/`Cancel`. No voice is installed: the voice enumeration calls
+back zero times, a synthesizer handle can be created and closed, and the calls that would produce audio
+(`XSpeechSynthesizerCreateStreamFromText`/`Ssml`, a custom voice) fail with `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
+`XColor`'s byte layout is not in the pages read, so only the font colour, which is the same in any channel order,
+is filled in. `xgameruntime_accessibility_test` calls each slot.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
