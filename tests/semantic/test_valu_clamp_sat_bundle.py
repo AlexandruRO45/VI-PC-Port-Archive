@@ -267,6 +267,27 @@ class TestValuAddF32BoundaryExtremes(unittest.TestCase):
         hw = run_binary_f32("v_add_f32", 1e-40, 0.5, clamp=True)
         self.assertAlmostEqual(hw, 0.5, places=6)
 
+class TestValuAddF32NegativeControls(unittest.TestCase):
+    """Stage 6: Negative controls and mutation detection for v_add_f32."""
+
+    def test_mutation_missing_clamp(self):
+        with_clamp = run_binary_f32("v_add_f32", 0.8, 0.8, clamp=True)
+        without_clamp = run_binary_f32("v_add_f32", 0.8, 0.8, clamp=False)
+        self.assertNotEqual(with_clamp, without_clamp)
+        self.assertAlmostEqual(with_clamp, 1.0, places=6)
+        self.assertAlmostEqual(without_clamp, 1.6, places=6)
+
+    def test_spirv_emission_fclamp(self):
+        lines = [
+            "v_mov_b32 v0, 0x3f000000",
+            "v_mov_b32 v1, 0x3f000000",
+            "v_add_f32_e64 v2, v0, v1 clamp",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(next_test_id("ps_spv_add_clamp"), lines)
+        self.assertIn("FClamp", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
