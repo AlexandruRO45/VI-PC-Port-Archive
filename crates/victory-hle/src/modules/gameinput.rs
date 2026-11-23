@@ -80,6 +80,37 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'H', RIGHT_STICK),
 ];
 
+/// `VICTORY_PAD`'s list, `<seconds>:<button>,...`: when each button is
+/// pressed. Buttons (any case): A B X Y Menu View Up Down Left Right LB RB.
+/// Entries that do not parse are left out.
+#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
+fn pad_script(list: &str) -> Vec<(Duration, u32)> {
+    list.split(',')
+        .filter_map(|entry| {
+            let (at, button) = entry.split_once(':')?;
+            let button = match button.trim().to_ascii_uppercase().as_str() {
+                "A" => A,
+                "B" => B,
+                "X" => X,
+                "Y" => Y,
+                "MENU" => MENU,
+                "VIEW" => VIEW,
+                "UP" => UP,
+                "DOWN" => DOWN,
+                "LEFT" => LEFT,
+                "RIGHT" => RIGHT,
+                "LB" => LEFT_SHOULDER,
+                "RB" => RIGHT_SHOULDER,
+                _ => return None,
+            };
+            Some((
+                Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
+                button,
+            ))
+        })
+        .collect()
+}
+
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1144,7 +1175,13 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            #[allow(unused_mut)]
+            let mut pad = convert(&state.Gamepad);
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                pad.buttons |= scripted_pad();
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1182,6 +1219,24 @@ mod host {
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
         }
+    }
+
+    /// Debugging aid: `VICTORY_PAD=<seconds>:<button>,...` holds a button of
+    /// the host pad in slot 0 for 0.2 s that long after input starts. For a
+    /// run with a controller connected, where the keyboard's stand-in pad
+    /// (and so `VICTORY_KEYS`) is gone.
+    #[cfg(feature = "diagnostics")]
+    fn scripted_pad() -> u32 {
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u32)>)> = LazyLock::new(|| {
+            let list = std::env::var("VICTORY_PAD").unwrap_or_default();
+            (Instant::now(), pad_script(&list))
+        });
+        let (start, presses) = &*SCRIPT;
+        let now = start.elapsed();
+        presses
+            .iter()
+            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
+            .fold(0, |b, &(_, button)| b | button)
     }
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
@@ -1263,6 +1318,24 @@ mod tests {
     use super::*;
     use crate::HleResolver;
     use crate::HostPolicy;
+
+    #[test]
+    fn pad_scripts_parse_buttons_at_times() {
+        let script = pad_script(" 1.5:A, 2:down,3:LB , 4:rb,5:Menu,6:view,bad, x:A, 7:Start, 8:");
+        assert_eq!(
+            script,
+            [
+                (Duration::from_millis(1500), A),
+                (Duration::from_secs(2), DOWN),
+                (Duration::from_secs(3), LEFT_SHOULDER),
+                (Duration::from_secs(4), RIGHT_SHOULDER),
+                (Duration::from_secs(5), MENU),
+                (Duration::from_secs(6), VIEW),
+            ]
+        );
+        assert!(pad_script("").is_empty());
+        assert!(pad_script("-1:A").is_empty(), "a negative time is refused");
+    }
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
 
