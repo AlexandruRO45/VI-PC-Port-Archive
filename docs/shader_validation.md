@@ -1997,7 +1997,6 @@ limits: `--set` is refused (RADV keeps the SPI setup in its own structs, so a te
 needs), and only GFX10 (RDNA1/RDNA2) devices are taken, from the chip name RADV puts in the device name; GFX11 and
 later interpolate with `lds_param_load` instead of `v_interp_*`, so e.g. an RX 9070 XT (`RADV GFX1201`) gets
 `unsupported architecture` and exit 77.
-### Packed 16-bit integer operations on RDNA2 (SHADER-302)
 
 Mesa optimises varyings across stages, so a template's parameter layout can differ from the Windows driver's:
 RADV moves `interp2`'s `in0 + in1` into the vertex shader and the pixel shader reads one parameter, attr0 =
@@ -2012,9 +2011,6 @@ the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) giv
 P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
 is cached).
 
-- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
-- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
-- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 #### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
 
 What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and
