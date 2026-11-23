@@ -1470,8 +1470,13 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             }
             if constexpr (Slot == 35) {
                 using ExecuteFn = void(WINAPI*)(void*, UINT, ID3D12CommandList* const*);
-                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(
-                    self->real, static_cast<UINT>(a1), reinterpret_cast<ID3D12CommandList* const*>(a2));
+                const UINT count = static_cast<UINT>(a1);
+                auto* source = reinterpret_cast<ID3D12CommandList* const*>(a2);
+                std::vector<ID3D12CommandList*> lists;
+                lists.reserve(count);
+                for (UINT i = 0; i < count; ++i)
+                    lists.push_back(reinterpret_cast<ID3D12CommandList*>(unwrap_object(reinterpret_cast<std::uintptr_t>(source[i]))));
+                reinterpret_cast<ExecuteFn>(self->real_vtable[10])(self->real, count, lists.data());
                 d3d12_trace::record("XboxID3D12CommandQueue::ExecuteCommandListsX");
                 return 0;
             }
