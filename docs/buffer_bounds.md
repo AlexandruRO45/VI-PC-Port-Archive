@@ -39,10 +39,17 @@ column**. The witnesses include mode 0 stride 16 at offset 13 (out of range on h
 column), mode 3 `NUM_RECORDS` 18 at offset 16 (out of range), mode 3 `NUM_RECORDS` 3 at offset 0 (out of range),
 and mode 3 offset 8 with `soffset` 8 and `NUM_RECORDS` 18 (out of range, confirming that `soffset` is part of the
 RAW check). Swizzled V#s and unaligned addresses were not covered. This makes GFX10.1 follow GFX10.3 here in the
-cases tried, but gfx1013 itself is still unmeasured: the card used was gfx1011 (Navi 12), not the console part.
+cases tried; the card used was gfx1011 (Navi 12), not the console part.
 
-**Open:** measure the same table on gfx1013 (PS5) itself when a card with that ID is available, and extend the
-probe to swizzled V#s and unaligned accesses.
+**gfx1013 measurement:** the same probe through `tools/hw_oracle` (Linux libdrm launcher, clang 22.1.8) on an
+**AMD BC-250, Cyan Skillfish / gfx1013, GFX10.1** (`1002:13fe`, external revision 0x84, kernel 7.3.3, Fedora 44)
+ran the 12 cases at wave32 and wave64 (24 groups, 0 wave32/64 differences). Every case followed the RDNA2 / Mesa
+GFX11 column and **4 of the 12 cases (8 of the 24 groups) disagreed with Mesa's GFX10 column**, the same witnesses
+as on gfx1011: mode 0 stride 16 at offset 13, mode 3 `NUM_RECORDS` 18 at offset 16, mode 3 `NUM_RECORDS` 3 at
+offset 0 and mode 3 offset 8 with `soffset` 8 and `NUM_RECORDS` 18 are out of range. Swizzled V#s and unaligned
+addresses were not covered.
+
+**Open:** extend the probe to swizzled V#s and unaligned accesses.
 
 ## How it was measured
 
