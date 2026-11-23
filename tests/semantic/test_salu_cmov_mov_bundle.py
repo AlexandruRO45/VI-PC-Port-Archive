@@ -309,6 +309,19 @@ class TestSCmovkI32SignAndGating(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xFFFF8000)
 
+class TestSCmovkI32Translator(unittest.TestCase):
+    def test_translator_s_cmovk_i32_execution(self) -> None:
+        body = [
+            "s_cmp_eq_u32 0, 0",
+            "s_mov_b32 s4, 0",
+            "s_cmovk_i32 s4, 1234",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmovk_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 1234)
+
 
 if __name__ == "__main__":
     unittest.main()
