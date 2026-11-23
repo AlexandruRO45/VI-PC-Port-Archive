@@ -385,5 +385,100 @@ class TestValuMin3U32SIMD(unittest.TestCase):
         spv = support.translate_lines("ps_simd_min3", lines)
         self.assertIn("OpExtInst", spv)
 
+class TestValuMin3U32RegisterAliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation for v_min3_u32."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+
+    def test_in_place_dst_equals_src0(self) -> None:
+        self.state.vgprs[1] = 100
+        self.state.vgprs[2] = 20
+        self.state.vgprs[3] = 300
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 20)
+        self.assertEqual(self.state.vgprs[1], 20)
+
+    def test_in_place_dst_equals_src1(self) -> None:
+        self.state.vgprs[1] = 100
+        self.state.vgprs[2] = 200
+        self.state.vgprs[3] = 30
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 30)
+        self.assertEqual(self.state.vgprs[2], 30)
+
+    def test_in_place_dst_equals_src2(self) -> None:
+        self.state.vgprs[1] = 10
+        self.state.vgprs[2] = 200
+        self.state.vgprs[3] = 300
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 3),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 10)
+        self.assertEqual(self.state.vgprs[3], 10)
+
+    def test_in_place_all_operands_aliased(self) -> None:
+        self.state.vgprs[1] = 42
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 1),
+        )
+        res = self.state.step(inst)
+        self.assertEqual(res, 42)
+        self.assertEqual(self.state.vgprs[1], 42)
+
+    def test_in_place_translated_shader(self) -> None:
+        lines = [
+            "v_mov_b32 v1, 100",
+            "v_mov_b32 v2, 50",
+            "v_mov_b32 v3, 300",
+            "v_min3_u32 v1, v1, v2, v3",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_inplace_min3", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 50)
+
+    def test_surrounding_registers_unmodified(self) -> None:
+        self.state.vgprs[0] = 0xAAAA_AAAA
+        self.state.vgprs[4] = 0xBBBB_BBBB
+        self.state.vgprs[1] = 10
+        self.state.vgprs[2] = 20
+        self.state.vgprs[3] = 30
+        inst = VOP3Instruction(
+            Opcode.V_MIN3_U32,
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+        )
+        self.state.step(inst)
+        self.assertEqual(self.state.vgprs[0], 0xAAAA_AAAA)
+        self.assertEqual(self.state.vgprs[2], 10)
+        self.assertEqual(self.state.vgprs[4], 0xBBBB_BBBB)
+
 if __name__ == "__main__":
     unittest.main()
