@@ -708,6 +708,83 @@ int main() {
         CHECK(memory_type_order(memory, 0xF, host, local, 256 * mib) == (order{3, 1, 2}));
     }
 
+    // small_bar_type, BAR1-first memory_type_order deprioritization, and allocate_memory retry/pNext handling.
+    {
+        constexpr VkMemoryPropertyFlags local = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkMemoryPropertyFlags cached = host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        constexpr VkDeviceSize mib = VkDeviceSize(1) << 20;
+
+        // BAR1 (214 MiB) listed at index 0 ahead of 8 GiB VRAM (index 1) and 16 GiB system RAM (indices 2, 3).
+        VkPhysicalDeviceMemoryProperties memory{};
+        memory.memoryHeapCount = 3;
+        memory.memoryHeaps[0] = {8ull << 30, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryHeaps[1] = {16ull << 30, 0};
+        memory.memoryHeaps[2] = {224395264ull, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};  // 214 MiB BAR1
+        memory.memoryTypeCount = 4;
+        memory.memoryTypes[0] = {local | host, 2};
+        memory.memoryTypes[1] = {local, 0};
+        memory.memoryTypes[2] = {host, 1};
+        memory.memoryTypes[3] = {cached, 1};
+
+        CHECK(small_bar_type(memory, 0));
+        CHECK(!small_bar_type(memory, 1));
+        CHECK(!small_bar_type(memory, 2));
+        CHECK(!small_bar_type(memory, 3));
+        CHECK(!small_bar_type(memory, 4));  // out of range
+
+        // Exact 256 MiB window is still small BAR; one byte more is Resizable BAR.
+        memory.memoryHeaps[2].size = 256 * mib;
+        CHECK(small_bar_type(memory, 0));
+        memory.memoryHeaps[2].size = 256 * mib + 1;
+        CHECK(!small_bar_type(memory, 0));
+        memory.memoryHeaps[2].size = 224395264ull;
+
+        using order = std::vector<std::uint32_t>;
+        // Host staging avoids 214 MiB BAR1 even when BAR1 is type 0, keeping it only as a last-resort fallback.
+        CHECK(memory_type_order(memory, 0xF, host, 0, 64 * 1024) == (order{2, 3, 0}));
+        // Host readback tries cached sysmem, then uncached sysmem, then BAR1 last.
+        CHECK(memory_type_order(memory, 0xF, host, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 64 * 1024) == (order{3, 2, 0}));
+        // Device-local allocations prefer main 8 GiB VRAM before 214 MiB BAR1 before system-RAM spillover.
+        CHECK(memory_type_order(memory, 0xF, 0, local, 1 * mib) == (order{1, 0, 2, 3}));
+
+        // allocate_memory retries past VK_ERROR_OUT_OF_DEVICE_MEMORY and forwards pNext on every attempt.
+        struct MockAllocState {
+            std::vector<std::uint32_t> tried;
+            std::vector<const void*> p_nexts;
+            std::uint32_t fail_mask = 0;
+        };
+        static MockAllocState state;
+        state = {};
+        state.fail_mask = (1u << 1) | (1u << 0);  // both main VRAM (1) and BAR1 (0) OOM
+        const auto mock_alloc = +[](VkDevice, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks*,
+                                    VkDeviceMemory* out) -> VkResult {
+            state.tried.push_back(info->memoryTypeIndex);
+            state.p_nexts.push_back(info->pNext);
+            if (state.fail_mask & (1u << info->memoryTypeIndex)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            *out = reinterpret_cast<VkDeviceMemory>(std::uintptr_t(0x1000u + info->memoryTypeIndex));
+            return VK_SUCCESS;
+        };
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+        flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        const VkMemoryRequirements reqs{1 * mib, 256, 0xFu};
+        VkMemoryPropertyFlags chosen_flags = 0;
+        std::uint32_t chosen_type = UINT32_MAX;
+        const VkDeviceMemory mem = allocate_memory(mock_alloc, VK_NULL_HANDLE, memory, reqs, 0, local, &flags,
+                                                   &chosen_flags, &chosen_type);
+        CHECK(mem == reinterpret_cast<VkDeviceMemory>(std::uintptr_t(0x1002u)));
+        CHECK(state.tried == (order{1, 0, 2}));
+        CHECK(state.p_nexts.size() == 3 && state.p_nexts[0] == &flags && state.p_nexts[1] == &flags &&
+              state.p_nexts[2] == &flags);
+        CHECK(chosen_type == 2 && chosen_flags == host);
+        CHECK(spilled_to_host(0, local, chosen_flags));
+
+        // Null function pointer or total OOM returns VK_NULL_HANDLE cleanly.
+        CHECK(allocate_memory(nullptr, VK_NULL_HANDLE, memory, reqs, 0, local) == VK_NULL_HANDLE);
+        state.fail_mask = 0xFu;
+        CHECK(allocate_memory(mock_alloc, VK_NULL_HANDLE, memory, reqs, 0, local) == VK_NULL_HANDLE);
+    }
+
     // block_format: bytes per texel, or per 4x4 block for block-compressed formats, of one aspect as a copy lays a
     // subresource out in a buffer. Each expected size is the format's own texel/block size, derived independently of
     // the table under test, so a mistyped entry (a wrong byte count or a missed 4x4 block) is caught before it

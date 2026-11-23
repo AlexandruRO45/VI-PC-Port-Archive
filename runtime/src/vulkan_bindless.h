@@ -43,6 +43,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include "descriptor_table.h"
+#include "vulkan_memory.h"
 
 #include <vulkan/vulkan.h>
 
@@ -609,12 +610,6 @@ private:
         return 0;
     }
 
-    std::uint32_t memory_type(std::uint32_t allowed, VkMemoryPropertyFlags wanted) const {
-        for (std::uint32_t i = 0; i < memory_.memoryTypeCount; ++i)
-            if ((allowed & (1u << i)) && (memory_.memoryTypes[i].propertyFlags & wanted) == wanted) return i;
-        return 0xffffffffu;
-    }
-
     bool create_layout() {
         const bindless::SetLayout layout(features_);
         const std::uint32_t count = layout.info.bindingCount;
@@ -716,12 +711,9 @@ private:
                 if (vk_.vkCreateImage(device_, &info, nullptr, &image.image) != VK_SUCCESS) return false;
                 VkMemoryRequirements requirements{};
                 vk_.vkGetImageMemoryRequirements(device_, image.image, &requirements);
-                VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-                allocation.allocationSize = requirements.size;
-                allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, 0);
-                if (allocation.memoryTypeIndex == 0xffffffffu ||
-                    vk_.vkAllocateMemory(device_, &allocation, nullptr, &image.memory) != VK_SUCCESS ||
-                    vk_.vkBindImageMemory(device_, image.image, image.memory, 0) != VK_SUCCESS)
+                image.memory = allocate_memory(vk_.vkAllocateMemory, device_, memory_, requirements, 0,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                if (!image.memory || vk_.vkBindImageMemory(device_, image.image, image.memory, 0) != VK_SUCCESS)
                     return false;
             }
         }
@@ -763,22 +755,16 @@ private:
         if (vk_.vkCreateBuffer(device_, &info, nullptr, &made.buffer) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, made.buffer, &requirements);
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex =
-            device_local ? memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                         : memory_type(requirements.memoryTypeBits,
-                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (device_local && allocation.memoryTypeIndex == 0xffffffffu)
-            allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits,
-                                                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        constexpr VkMemoryPropertyFlags host_flags =
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        VkMemoryPropertyFlags chosen_flags = 0;
+        made.memory = allocate_memory(vk_.vkAllocateMemory, device_, memory_, requirements,
+                                      device_local ? 0 : host_flags,
+                                      device_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, nullptr, &chosen_flags);
         if (got_device_local)
-            *got_device_local = allocation.memoryTypeIndex != 0xffffffffu &&
-                                (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
-                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-        bool ready = allocation.memoryTypeIndex != 0xffffffffu &&
-                     vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS &&
+            *got_device_local = made.memory != VK_NULL_HANDLE &&
+                                (chosen_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        bool ready = made.memory != VK_NULL_HANDLE &&
                      vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS;
         if (ready && !device_local)
             ready = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped) == VK_SUCCESS;

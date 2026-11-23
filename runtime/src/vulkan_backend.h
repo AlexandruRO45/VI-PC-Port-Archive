@@ -18,6 +18,7 @@
 #include "vulkan13_features.h"
 #include "vulkan_depth24.h"
 #include "vulkan_indirect_dispatch_count.h"
+#include "vulkan_memory.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
@@ -170,21 +171,9 @@ public:
         if (vk_.vkCreateBuffer(device_, &buffer, nullptr, &scratch_) != VK_SUCCESS) return false;
         VkMemoryRequirements requirements{};
         vk_.vkGetBufferMemoryRequirements(device_, scratch_, &requirements);
-        auto type = memory.memoryTypeCount;
-        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-            if (!(requirements.memoryTypeBits & (1u << i))) continue;
-            if (type == memory.memoryTypeCount) type = i;
-            if (memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-                type = i;
-                break;
-            }
-        }
-        if (type == memory.memoryTypeCount) return false;
-        VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocation.allocationSize = requirements.size;
-        allocation.memoryTypeIndex = type;
-        if (vk_.vkAllocateMemory(device_, &allocation, nullptr, &memory_) != VK_SUCCESS ||
-            vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS)
+        memory_ = allocate_memory(vk_.vkAllocateMemory, device_, memory, requirements, 0,
+                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (!memory_ || vk_.vkBindBufferMemory(device_, scratch_, memory_, 0) != VK_SUCCESS)
             return false;
 
         const VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -2094,24 +2083,11 @@ private:
             const auto& memory = context_.occlusion_resolve_memory_;
             constexpr VkMemoryPropertyFlags host_flags =
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            std::uint32_t type = memory.memoryTypeCount;
-            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
-                if (!(requirements.memoryTypeBits & (1u << i))) continue;
-                if ((memory.memoryTypes[i].propertyFlags & host_flags) == host_flags) {
-                    type = i;
-                    break;
-                }
-            }
-            if (type == memory.memoryTypeCount) {
-                discard();
-                return ReplayResult::unsupported;
-            }
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
             flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-            allocation.allocationSize = requirements.size;
-            allocation.memoryTypeIndex = type;
-            if (funcs.vkAllocateMemory(context_.device(), &allocation, nullptr, &stage.memory) != VK_SUCCESS ||
+            stage.memory = allocate_memory(funcs.vkAllocateMemory, context_.device(), memory, requirements,
+                                           host_flags, 0, &flags);
+            if (!stage.memory ||
                 funcs.vkBindBufferMemory(context_.device(), stage.buffer, stage.memory, 0) != VK_SUCCESS) {
                 discard();
                 return ReplayResult::unsupported;

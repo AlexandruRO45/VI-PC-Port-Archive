@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include "indirect_dispatch_count_spv.h"
+#include "vulkan_memory.h"
 
 namespace leonida {
 
@@ -77,22 +78,11 @@ public:
             VkMemoryRequirements requirements{};
             owner.fn<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(
                 owner.device_, a.buffer, &requirements);
-            std::uint32_t memory_type = UINT32_MAX;
-            for (std::uint32_t i = 0; i < owner.memory_.memoryTypeCount; ++i) {
-                if (!(requirements.memoryTypeBits & (1u << i))) continue;
-                if (memory_type == UINT32_MAX) memory_type = i;
-                if (owner.memory_.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
-                    memory_type = i;
-                    break;
-                }
-            }
-            if (memory_type == UINT32_MAX) return false;
             VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
             flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-            allocation.allocationSize = requirements.size;
-            allocation.memoryTypeIndex = memory_type;
-            if (owner.fn<PFN_vkAllocateMemory>("vkAllocateMemory")(owner.device_, &allocation, nullptr, &a.memory) != VK_SUCCESS ||
+            a.memory = allocate_memory(owner.fn<PFN_vkAllocateMemory>("vkAllocateMemory"), owner.device_,
+                                       owner.memory_, requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &flags);
+            if (!a.memory ||
                 owner.fn<PFN_vkBindBufferMemory>("vkBindBufferMemory")(owner.device_, a.buffer, a.memory, 0) != VK_SUCCESS)
                 return false;
             const auto address = owner.fn<PFN_vkGetBufferDeviceAddress>("vkGetBufferDeviceAddress");
