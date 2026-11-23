@@ -190,6 +190,16 @@ class RepositoryLinksTest(unittest.TestCase):
         self.assertEqual(unclosed_fences("# Title\n\n```powershell\nexample\n```\n\n## Next\n"), [])
         self.assertEqual(unclosed_fences("```\nplain\n```\n"), [])
 
+    def test_every_code_fence_closes(self):
+        problems = []
+        for path in markdown_files(ROOT):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                problems.extend(f"{os.path.relpath(path, ROOT)}:{line}"
+                                for line in unclosed_fences(f.read()))
+        self.assertEqual(problems, [],
+                         "code fences left open, so the rest of the page renders as code: "
+                         + ", ".join(problems))
+
     def test_the_checker_flags_a_missing_file_and_a_bad_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
             def write(name, text):
