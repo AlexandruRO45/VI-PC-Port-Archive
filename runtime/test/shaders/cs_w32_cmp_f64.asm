@@ -1,5 +1,5 @@
 ; v_cmp_*_f64 / v_cmpx_*_f64 (docs/design.md row "v_cmp_*_f64, v_cmpx_*_f64"), run on a GPU.
-; Every lane computes the same values and stores six dwords. Predicate order k = f lt eq le gt lg ge o u nge nlg ngt nle neq nlt tru.
+; Every lane computes the same values; EXEC is cut to lane 0 before the stores, so the 32 lanes do not race on one address (as in cs_w32_new_ops). Predicate order k = f lt eq le gt lg ge o u nge nlg ngt nle neq nlt tru.
 ;   out[0] bit k = v_cmp_<k>_f64(1.0, 2.0), bit 16+k = v_cmp_<k>_f64(2.0, 2.0) = 0xCCCCAAAA
 ;   out[1] bit k = v_cmp_<k>_f64(-0.0, 0.0), bit 16+k = v_cmp_<k>_f64(1.0, NaN) = 0xFF00CCCC
 ;   out[2] bit k = v_cmp_<k>_f64(-inf, inf), bit 16+k = v_cmp_<k>_f64(2.0, 1.0) = 0xF0F0AAAA
@@ -471,6 +471,7 @@ v_mov_b32_e32 v25, 0x66
 v_cmpx_gt_f64_e32 v[10:11], v[12:13]
 v_mov_b32_e32 v25, 2
 s_mov_b32 exec_lo, s20
+v_cmpx_eq_u32_e32 0, v0
 v_mov_b32_e32 v30, 0
 buffer_store_dword v20, v30, s[0:3], 0 offen
 v_mov_b32_e32 v30, 4
