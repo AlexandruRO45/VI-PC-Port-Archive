@@ -189,6 +189,43 @@ class BlockTests(unittest.TestCase):
                 self.assertEqual(nrm[f"tangent{form}_sign_agree"], checked if agree else 0)
                 self.assertLess(nrm[f"tangent{form}_rotated_along_u"], checked)
 
+    def folded(self, rise):
+        """The flat grid folded along its middle column: the second half rises `rise` per 100 units across, so the
+        two halves meet at atan(rise / 100); rise=None stands the second half up as a wall (90 degrees). Every
+        normal is +z (10-bit form), so it matches only the flat half."""
+        mesh = bytearray(block(normal=struct.pack("<I", 0x80000000 | 512 | 512 << 10)))
+        slots, _, _ = vt.parse_slots(mesh)
+        ridge = GRID // 2
+        for v in range(GRID * GRID):
+            i, j = v % GRID, v // GRID
+            up = max(i - ridge, 0)
+            x, z = (100 * min(i, ridge), 100 * up) if rise is None else (100 * i, rise * up)
+            struct.pack_into("<Q", mesh, slots[0][1] + 8 * v, pack_position(x, 100 * j, z))
+        return measure(bytes(mesh))[1]
+
+    def test_crease_split_on_a_90_degree_fold(self):
+        out = self.folded(None)
+        self.assertEqual(out["crease_vertices"], GRID)  # the ridge column
+        self.assertEqual(out["crease_vertex_share_median"], round(1 / GRID, 3))
+        nrm = out["tags"]["slot2:21"]
+        self.assertGreater(nrm["facenormal_crease_corners"], 0)
+        self.assertLess(nrm["facenormal_crease_good"], nrm["facenormal_crease_corners"])
+        self.assertGreater(nrm["facenormal_flat_good"], 0)
+
+    def test_a_60_degree_fold_is_not_a_crease(self):
+        # |cos 60| = 0.5 > CREASE_COS: the bisector is within |cos| 0.866 of both faces, so one normal can pass both
+        self.assertEqual(self.folded(173)["crease_vertices"], 0)
+        # 75 degrees (|cos| 0.26 <= 0.28) is one
+        self.assertEqual(self.folded(373)["crease_vertices"], GRID)
+        self.assertAlmostEqual(vt.CREASE_COS, 0.28)
+
+    def test_flat_grid_has_no_crease_vertices(self):
+        out = measure(block(normal=struct.pack("<I", 0x80000000 | 512 | 512 << 10)))[1]
+        self.assertEqual(out["crease_vertices"], 0)
+        nrm = out["tags"]["slot2:21"]
+        self.assertNotIn("facenormal_crease_corners", nrm)
+        self.assertEqual(nrm["facenormal_flat_good"], nrm["facenormal_flat_corners"])
+
     def test_positions_follow_the_surface(self):
         _, out = measure(block())
         self.assertLess(out["pos_edge_vs_random_median"], 0.5)

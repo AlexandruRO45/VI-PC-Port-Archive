@@ -28,7 +28,11 @@ Checks per tag (each one a count over vertices or triangle edges; no value leave
                   edge smoothness (mean |difference| over triangle edges / mean |difference| over random vertex
                   pairs; < 1 means the value follows the surface), unit length read as snorm8 xyz and as
                   10:10:10:2 snorm, and each NORMAL_CANDIDATES decoding against the face normals. Tag 0x21 is
-                  the octahedral normal of normal_0x21 (the mesh shaders' decode, chosen by bit 31).
+                  the octahedral normal of normal_0x21 (the mesh shaders' decode, chosen by bit 31). That decode
+                  is also scored separately on the sampled triangle corners at crease vertices (two of the vertex's
+                  faces meet at |cos| <= CREASE_COS, so no one unit normal can pass the 0.8 test on both) and on
+                  the other corners: facenormal_crease_* and facenormal_flat_* (corners, so a vertex counts once
+                  per sampled triangle it is in).
 
 Usage:
     python -I tools/vertex_types.py <archive.rpf|dir> [...] [--limit N] [--json out.json]
@@ -174,6 +178,24 @@ def positions(data, at, slots, n):
         x, y, z = (q >> 8) & 0xFFFFFF, (((q >> 32) & 0xFFFF) << 8) | (q & 0xFF), q >> 48
         out.append((bias[0] + scale[0] * x, bias[1] + scale[1] * y, bias[2] + scale[2] * z))
     return out, bias, scale
+
+
+# Two unit face normals with |cos| = d leave a best common normal (their bisector) at sqrt((1 + d) / 2) from
+# each, which passes the face-normal test's |cos| > 0.8 on both exactly when d > 2 * 0.8^2 - 1 = 0.28.
+CREASE_COS = 2 * 0.8 ** 2 - 1
+
+
+def crease_vertices(pos, tris, n, limit=CREASE_COS):
+    """Per vertex: True when two of its non-degenerate faces meet at |cos| <= limit, so no single unit normal can
+    agree with both under the face-normal test. Uses every triangle, not the sample."""
+    faces = [[] for _ in range(n)]
+    for a, b, c in tris:
+        fn = face_normal(pos[a], pos[b], pos[c])
+        if fn is not None:
+            for v in (a, b, c):
+                faces[v].append(fn)
+    return [any(abs(p[0] * q[0] + p[1] * q[1] + p[2] * q[2]) <= limit for i, p in enumerate(fs) for q in fs[i + 1:])
+            for fs in faces]
 
 
 def face_normal(a, b, c):
@@ -502,6 +524,9 @@ def measure_block(data, at, T, rng, found=None):
     k = struct.unpack_from("<I", data, at + 0x6C)[0]
     mpos = [(p[1], p[2], p[0]) if k == 1 else (p[2], p[1], p[0]) if k == 0 else p for p in pos]
     face_normals = [face_normal(mpos[a], mpos[b], mpos[c]) for a, b, c in stris]
+    crease = crease_vertices(mpos, tris, n)
+    add(T, "crease_vertices", sum(crease))
+    T.setdefault("crease_vertex_share", []).append(sum(crease) / n)
     t27 = T.setdefault("tag27", {})
     for key, val in tangent27_checks(data, at, slots, n, mpos, stris, face_normals).items():
         add(t27, key, val)
@@ -586,6 +611,18 @@ def measure_block(data, at, T, rng, found=None):
                         good += abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8
                 if tot:
                     tt.setdefault(f"facenormal_{name}", []).append(good / tot)
+            # the shaders' decode again, split by whether the scored corner's vertex sits on a crease (ASSET-280)
+            if tag == 0x21:
+                for (a, b, c), fn in zip(stris, face_normals):
+                    if fn is None:
+                        continue
+                    for v in (a, b, c):
+                        nv = normal_0x21(struct.unpack_from("<I", raw, 4 * v)[0])
+                        if nv is None:
+                            continue
+                        key = "crease" if crease[v] else "flat"
+                        add(tt, f"facenormal_{key}_corners")
+                        add(tt, f"facenormal_{key}_good", abs(nv[0] * fn[0] + nv[1] * fn[1] + nv[2] * fn[2]) > 0.8)
     # tag 0x21 tangent: against the first 0x28 (texture coordinate) stream of the block, if it has one
     s21 = [(i, off) for i, (tag, off) in sorted(slots.items()) if tag == 0x21 and i]
     s28 = [off for i, (tag, off) in sorted(slots.items()) if tag == 0x28 and i]
@@ -656,9 +693,12 @@ def iter_blocks(path, limit):
 
 
 def summarise(T):
-    out = {k: v for k, v in T.items() if k not in ("tags", "mapping_spread", "pos_edge_vs_random", "header_words")}
+    out = {k: v for k, v in T.items()
+           if k not in ("tags", "mapping_spread", "pos_edge_vs_random", "header_words", "crease_vertex_share")}
     pe = sorted(T.get("pos_edge_vs_random", []))
     out["pos_edge_vs_random_median"] = round(pe[len(pe) // 2], 4) if pe else None
+    cs = sorted(T.get("crease_vertex_share", []))
+    out["crease_vertex_share_median"] = round(cs[len(cs) // 2], 3) if cs else None
     out["header_words"] = {k: dict(sorted(v.items(), key=lambda kv: -kv[1])[:6]) for k, v in T.get("header_words", {}).items()}
     tags = {}
     for tag, tt in sorted(T.get("tags", {}).items()):
