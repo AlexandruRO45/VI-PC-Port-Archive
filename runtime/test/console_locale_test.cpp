@@ -24,6 +24,10 @@ void check_locale(const char* dll, const wchar_t* expected, LANGID language) {
         wchar_t locale[LOCALE_NAME_MAX_LENGTH]{};
         const int length = static_cast<int>(std::wcslen(expected)) + 1;
         check(fn && fn(locale, length) == length && std::wcscmp(locale, expected) == 0, name);
+        check(fn && fn(nullptr, 0) == length, "locale size query");
+        wchar_t small[1]{L'!'};
+        check(fn && fn(small, 1) == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER && small[0] == L'!',
+              "undersized locale buffer");
     }
     for (auto name : {"GetUserDefaultUILanguage", "GetSystemDefaultUILanguage"}) {
         auto fn = reinterpret_cast<decltype(&GetUserDefaultUILanguage)>(rt::shims::find(dll, name));
@@ -41,13 +45,6 @@ int main() {
     check_locale("api-ms-win-core-localization-l1-1-0.dll", L"fr-CA", 0x0c0c);
     check_locale("api-ms-win-core-localization-l1-2-0.dll", L"fr-CA", 0x0c0c);
     check_locale("api-ms-win-core-localization-l1-2-1.dll", L"fr-CA", 0x0c0c);
-
-    auto fn = reinterpret_cast<decltype(&GetUserDefaultLocaleName)>(
-        rt::shims::find("kernel32.dll", "GetUserDefaultLocaleName"));
-    wchar_t small[1]{L'!'};
-    check(fn && fn(small, 1) == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER && small[0] == L'!',
-          "undersized buffer");
-    check(fn && fn(nullptr, 0) == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER, "null buffer");
 
     constexpr wchar_t sort_name[] = L"de-DE_phoneb";
     const LCID sort_lcid = LocaleNameToLCID(sort_name, LOCALE_ALLOW_NEUTRAL_NAMES);

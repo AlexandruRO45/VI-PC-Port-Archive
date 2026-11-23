@@ -47,6 +47,7 @@ int WINAPI console_locale_name(LPWSTR buffer, int capacity) {
     }
     const auto locale = console_locale();
     const int length = static_cast<int>(std::wcslen(locale.name)) + 1;
+    if (capacity == 0) return length;
     if (!buffer || capacity < length) {
         SetLastError(ERROR_INSUFFICIENT_BUFFER);
         return 0;
