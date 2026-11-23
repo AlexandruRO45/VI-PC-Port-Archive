@@ -3,6 +3,7 @@
     python -I tests/test_world_archetypes.py
 """
 import contextlib
+import errno
 import importlib.util
 import io
 import json
@@ -14,6 +15,8 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -332,6 +335,69 @@ class CliTest(unittest.TestCase):
         self.assertIn("overwrite the input", self.cli_error([path, "--out", path]))
         with open(path, "rb") as f:
             self.assertEqual(f.read(), b"\x00" * 3000)
+
+    def test_partial_write_leaves_reports_and_directory_intact(self):
+        root = Path(self.tmp.name)
+        source = root / "source"
+        source.mkdir()
+        previous = root / "previous.json"
+        previous.write_bytes(b'{"previous":true}\n')
+
+        def fail_after_prefix(doc, stream, **kwargs):
+            stream.write('{"partial":')
+            raise OSError(errno.ENOSPC, "synthetic disk full")
+
+        for out in (previous, root / "new.json"):
+            with self.subTest(out=out), mock.patch.object(WA.json, "dump", side_effect=fail_after_prefix):
+                error = self.cli_error([str(source), "--out", str(out)])
+                self.assertIn(f"--out {out}: synthetic disk full", error)
+                self.assertEqual(set(root.iterdir()), {source, previous})
+                self.assertEqual(previous.read_bytes(), b'{"previous":true}\n')
+
+    def test_output_with_trailing_separator_does_not_publish_a_report(self):
+        root = Path(self.tmp.name)
+        source = root / "source"
+        source.mkdir()
+        for separator in filter(None, (os.sep, os.altsep)):
+            for exists in (False, True):
+                with self.subTest(separator=separator, exists=exists), tempfile.TemporaryDirectory(dir=root) as tmp:
+                    out = Path(tmp) / "report.json"
+                    if exists:
+                        out.write_bytes(b"previous")
+                    error = self.cli_error([str(source), "--out", str(out) + separator])
+                    self.assertIn("--out", error)
+                    if exists:
+                        self.assertEqual(out.read_bytes(), b"previous")
+                    else:
+                        self.assertFalse(out.exists())
+
+    def test_existing_nonregular_output_is_written_in_place(self):
+        root = Path(self.tmp.name)
+        source = root / "source"
+        source.mkdir()
+        out = root / "stream"
+        out.touch()
+        with (mock.patch.object(WA.os.path, "isfile", return_value=False),
+              mock.patch.object(WA.os, "replace", side_effect=AssertionError("replaced stream")),
+              redirect_stdout(io.StringIO())):
+            self.assertEqual(WA.main([str(source), "--out", str(out)]), 0)
+        self.assertEqual(json.loads(out.read_bytes())["summary"]["path"], str(source))
+
+    def test_existing_report_is_updated_with_the_cli_format(self):
+        root = Path(self.tmp.name)
+        source = root / "source"
+        source.mkdir()
+        out = root / "report.json"
+        out.write_bytes(b"previous")
+        mode = out.stat().st_mode
+        with redirect_stdout(io.StringIO()) as stdout:
+            self.assertEqual(WA.main([str(source), "--out", str(out)]), 0)
+        raw = out.read_bytes()
+        doc = json.loads(raw)
+        self.assertEqual(doc["summary"]["path"], str(source))
+        self.assertEqual(raw, json.dumps(doc, indent=1, sort_keys=True).encode("utf-8"))
+        self.assertEqual(json.loads(stdout.getvalue()), {"summary": doc["summary"]})
+        self.assertEqual(out.stat().st_mode, mode)
 
     def test_out_under_a_regular_file_or_naming_a_folder_is_one_error(self):
         path = os.path.join(self.tmp.name, "carved.bin")

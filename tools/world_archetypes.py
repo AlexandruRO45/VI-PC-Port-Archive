@@ -26,12 +26,14 @@ import os
 import statistics
 import struct
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
 import world_census as WC  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import world_index as WI  # noqa: E402
 
@@ -278,6 +280,11 @@ def run(path, start=None, limit=None, extents=False):
     return doc
 
 
+def _write_json(path, doc):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, indent=1, sort_keys=True)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path", help="RPF9 archive, one carved 0x7a file, or a folder of carved files")
@@ -295,6 +302,8 @@ def main(argv=None):
         ap.error("--out would overwrite the input %s" % a.path)
     if os.path.isdir(a.out):
         ap.error("--out %s is a folder, not a file" % a.out)
+    if a.out.endswith(os.sep) or (os.altsep and a.out.endswith(os.altsep)):
+        ap.error("--out %s ends in a directory separator" % a.out)
     out_dir = os.path.dirname(os.path.abspath(a.out))
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -303,8 +312,15 @@ def main(argv=None):
     doc = run(a.path, a.start, a.limit, a.check_extents)
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
+        dest = os.path.realpath(a.out)
+        if os.path.exists(dest) and not os.path.isfile(dest):
+            _write_json(dest, doc)  # Write through a pipe or device without replacing it.
+        else:
+            with tempfile.TemporaryDirectory(dir=os.path.dirname(dest)) as staging:
+                staged = os.path.join(staging, "report.json")
+                _write_json(staged, doc)
+                os.chmod(staged, published_mode(dest))
+                os.replace(staged, dest)
     except OSError as e:
         ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))
