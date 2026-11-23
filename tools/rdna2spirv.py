@@ -9624,6 +9624,8 @@ class Gen:
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv.get("f64_literal"):
+                lo, hi = self.cu(0), self.cu(sv["v"] & 0xFFFFFFFF)
             elif sv["k"] in ("imm", "fimm"):
                 bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
                         if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
