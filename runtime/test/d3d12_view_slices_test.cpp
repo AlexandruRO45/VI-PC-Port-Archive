@@ -8,6 +8,8 @@
 // The 4x depth array is also cleared through views that count their slices (slice 0 alone, slice 1 alone, slices
 // 1-3): its readback resolves each slice on its own, which is where D3D-417 showed (the layer's depth resolve of a
 // slice above 0 read slice 0 on the AMD driver, whatever the view had cleared).
+// D3D-739: on Intel Arc integrated graphics (Windows driver 101.8860), native D3D12 reads back zeros in the
+// six 4x D32 cases while the Vulkan layer matches the known clears. Only that host result is informational.
 // A range the host's debug layer refuses stays refused by the layer: a first slice past the array (with -1 too), no
 // slices, more slices than are left, and UINT_MAX - 1. Those are not run on the host.
 // No game data or shaders. Needs a Vulkan GPU; LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
@@ -115,15 +117,26 @@ std::string clear_through(copycmp::Run& run, const Case& c, UINT mip, UINT first
     reached = 0;
     std::string error;
     for (UINT i = 0; i < n && error.empty(); ++i) {
-        // One, in every format here, has a byte that is not zero in each texel; zero has none.
+        // For color formats here, one has a nonzero byte in each texel; for D32 check the actual depth.
         const size_t texel = size_t(row_bytes[i]) / placed[i].Footprint.Width;
         size_t ones = 0, texels = 0;
-        for (UINT row = 0; row < rows[i]; ++row)
+        for (UINT row = 0; row < rows[i] && error.empty(); ++row)
             for (UINT x = 0; x < placed[i].Footprint.Width; ++x, ++texels) {
                 const std::uint8_t* at =
                     bytes + placed[i].Offset + size_t(row) * placed[i].Footprint.RowPitch + x * texel;
-                ones += std::any_of(at, at + texel, [](std::uint8_t b) { return b != 0; });
+                if (c.depth) {
+                    float depth;
+                    std::memcpy(&depth, at, sizeof(depth));
+                    if (depth != 0.0f && depth != 1.0f) {
+                        error = "subresource " + std::to_string(i) + " contains depth other than zero or one";
+                        break;
+                    }
+                    ones += depth == 1.0f;
+                } else {
+                    ones += std::any_of(at, at + texel, [](std::uint8_t b) { return b != 0; });
+                }
             }
+        if (!error.empty()) break;
         if (ones == texels) reached |= 1u << i;
         else if (ones) error = "subresource " + std::to_string(i) + " is partly cleared";
     }
@@ -161,10 +174,12 @@ int main() {
         bool warp = false;
     };
     Host hosts[2];
+    bool intel_adapter = false;
     if (!copycmp::host_is_wine()) {
         VkPhysicalDeviceIDProperties id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
         VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &id};
         vk.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(vk.physical, &properties);
+        intel_adapter = properties.properties.vendorID == 0x8086;
         LUID luid{};
         std::memcpy(&luid, id.deviceLUID, sizeof(luid));
         if (!id.deviceLUIDValid || !copycmp::try_create_host(hosts[0].device, hosts[0].name, &luid))
@@ -191,7 +206,7 @@ int main() {
         {"RTV R8G8B8A8_UNORM of TYPELESS 4x", false, DXGI_FORMAT_R8G8B8A8_TYPELESS, rgba8, 4},
         {"DSV D32_FLOAT 4x", true, depth32, depth32, 4},
     };
-    unsigned failures = 0, cleared = 0, compared = 0, refused = 0;
+    unsigned failures = 0, cleared = 0, compared = 0, refused = 0, host_quirks = 0;
     struct Range { UINT first, count; };
     for (const Case& c : cases) {
         const UINT mips = c.samples > 1 ? 1 : 3;
@@ -203,7 +218,7 @@ int main() {
             const UINT end = range.count == UINT_MAX ? kSlices : first + range.count;
             std::uint32_t expected = 0;
             for (UINT slice = first; slice < end; ++slice) expected |= 1u << (mip + slice * mips);
-            const auto check = [&](ID3D12Device* device, bool is_ours, const char* who) {
+            const auto check = [&](ID3D12Device* device, bool is_ours, const char* who, bool allow_host_zero) {
                 copycmp::Run run;
                 std::uint32_t reached = 0;
                 std::string error = run.init(device, is_ours) ? "" : "no queue or list";
@@ -211,18 +226,28 @@ int main() {
                     run.begin();
                     error = clear_through(run, c, mip, first, range.count, reached);
                 }
-                if (error.empty() && reached == expected) return;
+                if (error.empty() && reached == expected) return true;
+                if (allow_host_zero && error.empty() && reached == 0) {
+                    ++host_quirks;
+                    std::printf("%s, first slice %u, ArraySize %d, on %s: host quirk: read back all zeros; "
+                                "the layer cleared expected slice.mip%s\n",
+                                c.name, first, int(range.count), who, slices_of(expected, mips).c_str());
+                    return false;
+                }
                 ++failures;
                 std::fprintf(stderr, "%s, mip %u, first slice %u, ArraySize %d, on %s: %s%s; expected slice.mip%s\n",
                              c.name, mip, first, int(range.count), who,
                              error.empty() ? "cleared slice.mip" : error.c_str(),
                              error.empty() ? slices_of(reached, mips).c_str() : "", slices_of(expected, mips).c_str());
+                return false;
             };
-            check(ours.p, true, "the layer");
+            const bool layer_matches = check(ours.p, true, "the layer", false);
             ++cleared;
             for (const Host& host : hosts) {
                 if (!host.device.p || (host.warp && c.depth && c.samples > 1)) continue;
-                check(host.device.p, false, host.name.c_str());
+                const bool allow_host_zero = layer_matches && !host.warp && intel_adapter &&
+                                             c.depth && c.view == depth32 && c.samples == 4;
+                check(host.device.p, false, host.name.c_str(), allow_host_zero);
                 ++compared;
             }
         }
@@ -244,7 +269,7 @@ int main() {
         }
     }
     if (hosts[0].device.p) std::printf("host reference: %s, and WARP\n", hosts[0].name.c_str());
-    std::printf("array views: %u clears on the layer, %u on the host; %u out-of-range views refused; %u failures\n",
-                cleared, compared, refused, failures);
+    std::printf("array views: %u clears on the layer, %u on the host; %u out-of-range views refused; "
+                "%u host quirks; %u failures\n", cleared, compared, refused, host_quirks, failures);
     return failures || vk.validation_errors() ? 1 : 0;
 }

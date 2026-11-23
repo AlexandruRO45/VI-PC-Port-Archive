@@ -290,8 +290,11 @@ What is implemented (all of it testable without the game):
   into a one-layer image that is then resolved, but a one-layer view resolved in a rendering scope gives layer 0
   for every layer (view type `2D` or `2D_ARRAY`, store `NONE` or `STORE`), and views of layers 1-3 resolved in one
   scope give layers 0-2. The render pass gives the right layer there; an RTX 3070 (610.74) does in every variant.
-  `d3d12_view_slices_test` reads a 4x D32 array back slice by slice. A depth-stencil source above layer 0 still
-  uses the rendering scope, because its two planes can be in different layouts, which the render pass's attachment
+  `d3d12_view_slices_test` reads a 4x D32 array back slice by slice. On Intel Arc integrated graphics under
+  Windows (driver 101.8860), native D3D12 read back zeros for all six 4x D32 cases, while the Vulkan layer
+  matched the expected clears (D3D-739). The test reports that exact host quirk only if the layer matches.
+  A depth-stencil source above layer 0 still uses the rendering scope, because its two planes can be in different
+  layouts, which the render pass's attachment
   description cannot say without the planes' layouts at recording; a 4x D24S8 or D32S8 array is still read back
   as its slice 0 on that driver (measured). The format is the depth
   format or the plane's own (`R32_FLOAT`, `R24_UNORM_X8_TYPELESS`, `X24_TYPELESS_G8_UINT`, and the D32S8 pair, untested).
