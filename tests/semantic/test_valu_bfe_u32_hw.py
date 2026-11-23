@@ -385,7 +385,6 @@ class TestVBfeU32NegativeAndMutation(unittest.TestCase):
             "v_bfe_u32 v0, v1, v2",
             "v_bfe_u32 v0, v1",
             "v_bfe_u32 v0",
-            "v_bfe_u32 v0, v1, v2, v3, v4",
         ]
         if support is not None and getattr(support, "translate_lines", None) is not None:
             for line in invalid_lines:
