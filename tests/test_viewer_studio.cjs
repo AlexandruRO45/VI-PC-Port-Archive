@@ -81,10 +81,10 @@ function renderModelList(name) {
     return group.children[0].innerHTML + group.children[1].children.at(-1).children[0].innerHTML;
 }
 
-function renderTextureGrid(name) {
+function renderTextureGrid(name, fields = {}) {
     const studio = loadStudio();
     studio.context.textures = Array.from({ length: 81 },
-        () => ({ name: name + '.png', format: 'PNG Image', size: 4, preview: '/textures/x.png' }));
+        () => ({ name: name + '.png', format: 'PNG Image', size: 4, preview: '/textures/x.png', ...fields }));
     studio.run('allTextures = textures; renderTexturesGrid();');
     const grid = studio.elements.get('textures-grid');
     grid.children.at(-1).onclick();
@@ -119,6 +119,16 @@ test('hostile model and texture file names render as text, not as elements or at
         assert.deepEqual(tagShape(hostile), tagShape(render('plain name')));
         assert.ok(visibleText(hostile).includes(HOSTILE), `${render.name} must still show the name`);
     }
+});
+
+test('both texture batches preserve literal format labels and preview URLs', () => {
+    const format = 'BC1 <sRGB> & linear';
+    const preview = '/textures/A "quoted" texture.png?mip=0&layer=1';
+    const cards = renderTextureGrid('plain name', { format, preview });
+    assert.deepEqual(tagShape(cards), tagShape(renderTextureGrid('plain name')));
+    assert.equal(visibleText(cards).split(format).length, 3);
+    assert.deepEqual([...cards.matchAll(/<img\b[^>]*\ssrc="([^"]*)"/g)].map(m => visibleText(m[1])),
+        [preview, preview]);
 });
 
 test('a texture preview that fails to load fires its error handler once, not in a loop', () => {

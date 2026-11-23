@@ -987,12 +987,12 @@ function textureCard(texture) {
   const name = escapeHtml(texture.name);
   card.innerHTML = `
     <span class="tex-preview">
-      <img src="${texture.preview}" alt="" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
+      <img src="${escapeHtml(texture.preview)}" alt="" loading="lazy" onerror="this.onerror=null; this.src=''; this.alt='DDS / Pre-converted'">
     </span>
     <span class="tex-info">
       <span class="tex-name" title="${name}">${name}</span>
       <span class="tex-meta">
-        <span>${texture.format}</span>
+        <span>${escapeHtml(texture.format)}</span>
         <span>${formatBytes(texture.size)}</span>
       </span>
     </span>
