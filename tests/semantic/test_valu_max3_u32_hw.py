@@ -301,5 +301,61 @@ class TestValuMax3U32SIMDDivergence(unittest.TestCase):
             else:
                 self.assertEqual(res[lane], 0)
 
+# ---------------------------------------------------------------------------
+# Stage 5: Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuMax3U32RegisterAliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation for v_max3_u32."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        interp = ValuMax3Interpreter()
+        interp.vgprs[0] = 50
+        interp.vgprs[1] = 100
+        interp.vgprs[2] = 75
+
+        inst = VOP3Instruction(
+            Opcode.V_MAX3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.VGPR, 2),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 100)
+        self.assertEqual(interp.vgprs[0], 100)
+        self.assertEqual(interp.vgprs[1], 100)
+        self.assertEqual(interp.vgprs[2], 75)
+
+    def test_inplace_all_aliased(self) -> None:
+        interp = ValuMax3Interpreter()
+        interp.vgprs[0] = 0xDEADBEEF
+
+        inst = VOP3Instruction(
+            Opcode.V_MAX3_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 0),
+        )
+        res = interp.step(inst)
+        self.assertEqual(res, 0xDEADBEEF)
+        self.assertEqual(interp.vgprs[0], 0xDEADBEEF)
+
+    def test_aliased_translated_execution(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "v_mov_b32 v0, 50",
+            "v_mov_b32 v1, 120",
+            "v_mov_b32 v2, 90",
+            "v_max3_u32 v0, v0, v1, v2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_max3_alias_{_TRANSLATE_ID}", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 120)
+
 if __name__ == "__main__":
     unittest.main()
