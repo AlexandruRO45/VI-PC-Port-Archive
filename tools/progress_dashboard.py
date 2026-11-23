@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEMPLATE = os.path.join(ROOT, "tools", "progress_dashboard.html")
@@ -977,14 +978,27 @@ def render_page(snap, history):
     return template.replace("/*__PROGRESS_LOGO__*/", logo_src()).replace("/*__PROGRESS_DATA__*/null", payload)
 
 
-def write_outputs(snap, out_dir):
+class ReportOutputCollision(ValueError):
+    pass
+
+
+def check_report_outputs(inputs, *outputs):
+    for option, source in inputs:
+        for output in outputs:
+            if same_report_path(source, output):
+                raise ReportOutputCollision(f"dashboard output {output} would overwrite {option} input {source}")
+
+
+def write_outputs(snap, out_dir, report_inputs=()):
     os.makedirs(os.path.join(out_dir, "snapshots"), exist_ok=True)
     hist_path = os.path.join(out_dir, "history.json")
     history = json.loads(read_utf8(hist_path)) if os.path.isfile(hist_path) else []
     new = not history or history[-1]["content_hash"] != snap["content_hash"][:16]
     if new:
         stamp = snap["generated_at"].replace("-", "").replace(":", "")
-        save_text(os.path.join(out_dir, "snapshots", f"progress_{stamp}.json"), dump_json(snap))
+        snapshot_path = os.path.join(out_dir, "snapshots", f"progress_{stamp}.json")
+        check_report_outputs(report_inputs, snapshot_path)
+        save_text(snapshot_path, dump_json(snap))
         history.append(summary_line(snap))
         save_text(hist_path, dump_json(history))
     save_text(os.path.join(out_dir, "progress.html"), render_page(snap, history))
@@ -1029,8 +1043,16 @@ def main(argv=None):
     if os.path.exists(out_dir) and not os.path.isdir(out_dir):
         print(f"--out {args.out} is not a directory", file=sys.stderr)
         return 2
+    report_inputs = [("--junit", path) for path in args.junit or []]
+    report_inputs.extend(("--gpu-log", spec.partition("=")[0]) for spec in args.gpu_log or [])
+    outputs = [os.path.join(out_dir, name) for name in ("progress.html", "history.json")]
+    if args.run_tests:
+        outputs.append(os.path.join(out_dir, "unit_results.json"))
     try:
+        check_report_outputs(report_inputs, *outputs)
         os.makedirs(out_dir, exist_ok=True)
+    except ReportOutputCollision as exc:
+        ap.error(str(exc))
     except OSError as exc:
         print(f"--out {args.out}: {exc.strerror or exc}", file=sys.stderr)
         return 2
@@ -1039,7 +1061,10 @@ def main(argv=None):
     except OSError as exc:
         print(f"error: {exc.filename or ''}: {exc.strerror or exc}", file=sys.stderr)
         return 2
-    new = write_outputs(snap, out_dir)
+    try:
+        new = write_outputs(snap, out_dir, report_inputs)
+    except ReportOutputCollision as exc:
+        ap.error(str(exc))
     n = len(snap["components"])
     print(f"{n} units, {len(snap['metrics'])} metrics -> {os.path.join(out_dir, 'progress.html')}"
           + ("" if new else " (no change since the last snapshot)"))

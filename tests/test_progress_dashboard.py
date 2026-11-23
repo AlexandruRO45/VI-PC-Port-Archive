@@ -441,6 +441,41 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_output_does_not_overwrite_an_explicit_report(self):
+        junit = b'<testsuite><testcase name="synthetic"/></testsuite>\n'
+        gpu = f"{'synthetic':20} ok\n1 of 1 pass, 0 skipped\n".encode("ascii")
+        cases = [
+            ("--junit", "progress.html", junit, "", []),
+            ("--gpu-log", "history.json", gpu, "=synthetic GPU", []),
+            ("--junit", "unit_results.json", junit, "", ["--run-tests", "--tests", r"^tests/test_report_paths\.py$"]),
+        ]
+        for option, filename, content, label, flags in cases:
+            with self.subTest(option=option, filename=filename), tempfile.TemporaryDirectory() as out:
+                source = Path(out, filename)
+                source.write_bytes(content)
+                run = subprocess.run([sys.executable, "-I", TOOL, "--out", out, *flags,
+                                      option, str(source) + label], capture_output=True, cwd=ROOT, timeout=120)
+                self.assertEqual(source.read_bytes(), content)
+                self.assertEqual(run.returncode, 2, run.stderr.decode("utf-8", "replace"))
+                self.assertIn(f"would overwrite {option} input".encode("ascii"), run.stderr)
+                self.assertEqual(sorted(os.listdir(out)), [filename])
+
+    def test_snapshot_does_not_overwrite_an_explicit_report(self):
+        with tempfile.TemporaryDirectory() as out:
+            now = pd.dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=pd.dt.timezone.utc)
+            source = Path(out, "snapshots", "progress_20260102T030405Z.json")
+            source.parent.mkdir()
+            content = b'<testsuite><testcase name="synthetic"/></testsuite>\n'
+            source.write_bytes(content)
+            err = io.StringIO()
+            with mock.patch.object(pd, "now_utc", return_value=now), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as stopped:
+                    pd.main(["--out", out, "--junit", str(source)])
+            self.assertEqual(stopped.exception.code, 2)
+            self.assertIn("would overwrite --junit input", err.getvalue())
+            self.assertEqual(source.read_bytes(), content)
+            self.assertEqual(sorted(os.listdir(out)), ["snapshots"])
+
     def test_nonpositive_test_options_are_argument_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
