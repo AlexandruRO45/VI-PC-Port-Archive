@@ -1345,8 +1345,10 @@ void run_checks(const std::filesystem::path& root) {
     // stays independent, and configure() releases the previous title's directory and its retained handle.
     {
         using SetDirectoryW = BOOL(WINAPI*)(LPCWSTR);
+        using SetDirectoryA = BOOL(WINAPI*)(LPCSTR);
         using GetDirectoryW = DWORD(WINAPI*)(DWORD, LPWSTR);
         const auto set_directory = resolve<SetDirectoryW>("kernel32.dll", "SetCurrentDirectoryW");
+        const auto set_directory_a = resolve<SetDirectoryA>("kernel32.dll", "SetCurrentDirectoryA");
         const auto get_directory = resolve<GetDirectoryW>("kernelbase.dll", "GetCurrentDirectoryW");
         check(set_directory && get_directory &&
                   resolve<SetDirectoryW>("api-ms-win-core-processenvironment-l1-1-0.dll", "SetCurrentDirectoryW") == set_directory &&
@@ -1354,9 +1356,19 @@ void run_checks(const std::filesystem::path& root) {
                   rt::shims::find("kernel32.dll", "SetCurrentDirectoryA") &&
                   rt::shims::find("api-ms-win-core-processenvironment-l1-1-0.dll", "GetCurrentDirectoryA"),
               "current-directory APIs resolve through kernel32/kernelbase and processenvironment");
-        if (set_directory && get_directory) {
+        if (set_directory && set_directory_a && get_directory) {
             wchar_t host_before[32768]{}, host_after[32768]{}, logical[32768]{};
             ::GetCurrentDirectoryW(32768, host_before);
+            // Each width gets an entirely fresh overlay, before any scratch write can create its root.
+            for (bool narrow : {false, true}) {
+                const auto fresh_overlay = root / (narrow ? "fresh-current-a" : "fresh-current-w");
+                rt::fs::configure(package, fresh_overlay);
+                check((narrow ? set_directory_a("T:\\") : set_directory(L"T:\\")) &&
+                          get_directory(32768, logical) == 3 && std::wstring(logical) == L"T:\\" &&
+                          std::filesystem::is_directory(fresh_overlay / ".gta6rt-temp"),
+                      "A/W directory APIs enter a fresh scratch root and return its exact length");
+                rt::fs::configure(package, overlay);
+            }
             write_path(package / "current" / "file.txt", "current");
             check(set_directory(L"G:\\current") && get_directory(32768, logical) &&
                       std::wstring(logical) == L"GAME:\\current", "G: directory reports the logical GAME: path");

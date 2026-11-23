@@ -115,6 +115,12 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   root. The file operations below continue to read the merged view and write only the overlay. An unsuccessful directory
   change preserves the previous directory. A successful absolute host directory change returns to host path handling.
   The runtime's own host current directory stays independent while a console directory is selected.
+  DOS device names and NT-style absolute host paths (`\??\C:\...`) keep their native meaning. Device names follow the
+  host's [RtlIsDosDeviceName_U](https://learn.microsoft.com/en-us/windows/win32/devnotes/rtlisdosdevicename_u) rule
+  (with native `GetFullPathNameW` classification if that export is absent), including the host's treatment of `NUL.txt`.
+  Console directory identities normalize final trailing dots/spaces and a single intermediate trailing dot; an
+  intermediate trailing space or repeated dots remain significant. These aliases cannot bypass directory locks.
+  A `..` that would leave the selected console drive is still refused with `ERROR_INVALID_NAME`, rather than clamped.
 - The current-directory shims are registered under `kernel32.dll`, `kernelbase.dll` and
   `api-ms-win-core-processenvironment-l1-1-0.dll`. Getters return the required size including the NUL for a short buffer,
   without changing its contents, and the length excluding the NUL when it fits. A retained directory handle and checks

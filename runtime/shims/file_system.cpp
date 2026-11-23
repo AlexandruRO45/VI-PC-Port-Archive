@@ -124,13 +124,35 @@ std::wstring current_console_directory() {
     return g_current_directory ? g_current_directory->path : std::wstring();
 }
 
+bool is_host_device(const std::wstring& path) {
+    // Use the host's own rule: for example, Windows 11 no longer treats NUL.txt as a device. This documented ntdll
+    // export also recognizes CONIN$/CONOUT$ and the permitted device-name suffixes without opening any device.
+    const DWORD previous_error = ::GetLastError();
+    using IsDosDeviceName = ULONG(NTAPI*)(PCWSTR);
+    static const auto is_device = reinterpret_cast<IsDosDeviceName>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlIsDosDeviceName_U"));
+    bool device = false;
+    if (is_device) {
+        device = is_device(path.c_str()) != 0;
+    } else {
+        // A host without that export can still classify its legacy DOS names through GetFullPathName. These
+        // expand to short \\.\device paths; a regular path that exceeds this buffer is not a device name.
+        wchar_t full[16]{};
+        const DWORD length = ::GetFullPathNameW(path.c_str(), 16, full, nullptr);
+        device = length > 0 && length < 16 && std::wcsncmp(full, L"\\\\.\\", 4) == 0;
+    }
+    ::SetLastError(previous_error);
+    return device;
+}
+
 std::wstring resolve_console_relative(const std::wstring& path) {
     // Empty names, drive-qualified names, UNC paths and device paths keep their existing interpretation.
     if (path.empty() || (path.size() >= 2 && path[1] == L':') ||
         (path.size() >= kGamePrefixLength && lower(path.substr(0, kGamePrefixLength)) == kGamePrefix) ||
-        (path.size() >= 2 && is_separator(path[0]) && is_separator(path[1]))) return path;
+        (path.size() >= 2 && is_separator(path[0]) && is_separator(path[1])) ||
+        path.compare(0, 4, L"\\??\\") == 0) return path;
     const std::wstring current = current_console_directory();
-    if (current.empty()) return path;
+    if (current.empty() || is_host_device(path)) return path;
     if (is_separator(path[0])) return current.substr(0, current.find(L':') + 1) + path;
     return current + L'\\' + path;
 }
@@ -185,7 +207,7 @@ Parsed parse_console(const std::wstring& name, std::vector<std::wstring>& parts,
     }
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
-    auto flush = [&]() -> bool {
+    auto flush = [&](bool final) -> bool {
         if (part.empty() || part == L".") {
             part.clear();
             return true;
@@ -196,6 +218,17 @@ Parsed parse_console(const std::wstring& name, std::vector<std::wstring>& parts,
         } else if (part.find(L':') != std::wstring::npos) {
             return false;
         } else {
+            // Match Win32 spelling before storing directory identity or deletion markers. Only the final
+            // component loses all trailing dots/spaces; an intermediate component loses a single trailing dot.
+            // Keep wildcard masks intact (for example, "*." has its own FindFirstFile matching semantics).
+            if (part.find_first_of(L"*?") == std::wstring::npos) {
+                if (final) {
+                    while (!part.empty() && (part.back() == L'.' || part.back() == L' ')) part.pop_back();
+                } else if (part.size() > 1 && part.back() == L'.' && part[part.size() - 2] != L'.') {
+                    part.pop_back();
+                }
+            }
+            if (part.empty()) return true;
             parts.push_back(part);
         }
         part.clear();
@@ -204,12 +237,12 @@ Parsed parse_console(const std::wstring& name, std::vector<std::wstring>& parts,
     for (size_t i = prefix_length; i < path.size(); ++i) {
         const wchar_t c = path[i];
         if (is_separator(c)) {
-            if (!flush()) return Parsed::Refused;
+            if (!flush(false)) return Parsed::Refused;
         } else {
             part.push_back(c);
         }
     }
-    if (!flush()) return Parsed::Refused;
+    if (!flush(true)) return Parsed::Refused;
     // The overlay's own folders are not part of the title's GAME: tree: hidden from its listings (internal_dir) and
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
@@ -221,6 +254,15 @@ std::filesystem::path join(const std::filesystem::path& root, const std::vector<
     std::filesystem::path p = root;
     for (const auto& part : parts) p /= part;
     return p;
+}
+
+std::filesystem::path join_directory(const std::filesystem::path& root, const std::vector<std::wstring>& parts) {
+    std::filesystem::path path = join(root, parts);
+    // A dot/space left after parsing was not a trimmable final component. Retain a separator when looking up that
+    // directory prefix; otherwise the host would trim it a second time as a standalone final name.
+    if (!parts.empty() && !parts.back().empty() && (parts.back().back() == L'.' || parts.back().back() == L' '))
+        path /= L"";
+    return path;
 }
 
 bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts) {
@@ -297,7 +339,7 @@ struct View {
     bool in_package = false;  // the package holds the name and it is not deleted
 };
 
-View view(const Roots& r, const std::vector<std::wstring>& parts) {
+View view(const Roots& r, const std::vector<std::wstring>& parts, bool directory_path = false) {
     View v;
     std::error_code ec;
     if (parts.empty()) {  // "GAME:" itself
@@ -306,14 +348,14 @@ View view(const Roots& r, const std::vector<std::wstring>& parts) {
         return v;
     }
     if (!r.overlay.empty()) {
-        const std::filesystem::path p = join(r.overlay, parts);
+        const std::filesystem::path p = directory_path ? join_directory(r.overlay, parts) : join(r.overlay, parts);
         if (std::filesystem::exists(p, ec)) {
             v.in_overlay = true;
             v.kind = std::filesystem::is_directory(p, ec) ? Kind::Directory : Kind::File;
         }
     }
     if (!r.game.empty() && !deleted(r.overlay, parts)) {
-        const std::filesystem::path p = join(r.game, parts);
+        const std::filesystem::path p = directory_path ? join_directory(r.game, parts) : join(r.game, parts);
         if (std::filesystem::exists(p, ec)) {
             v.in_package = true;
             if (v.kind == Kind::None) v.kind = std::filesystem::is_directory(p, ec) ? Kind::Directory : Kind::File;
@@ -689,12 +731,12 @@ BOOL WINAPI set_current_directory_w(LPCWSTR name) {
     std::vector<std::wstring> parent;
     for (size_t i = 0; i < parts.size(); ++i) {
         parent.push_back(parts[i]);
-        const Kind kind = view(r, parent).kind;
+        const Kind kind = view(r, parent, true).kind;
         if (kind == Kind::None) return fail_bool(i + 1 == parts.size() ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND);
         if (kind != Kind::Directory) return fail_bool(i + 1 == parts.size() ? ERROR_DIRECTORY : ERROR_PATH_NOT_FOUND);
     }
-    const View directory = view(r, parts);
-    const std::filesystem::path physical = join(directory.in_overlay ? r.overlay : r.game, parts);
+    const View directory = view(r, parts, true);
+    const std::filesystem::path physical = join_directory(directory.in_overlay ? r.overlay : r.game, parts);
     auto next = std::make_unique<CurrentDirectory>();
     // Like a native current directory, retain a directory handle without delete sharing until the next change.
     next->handle = ::CreateFileW(physical.c_str(), FILE_TRAVERSE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE,
