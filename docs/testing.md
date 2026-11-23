@@ -190,6 +190,11 @@ MSVC STL that xwin lays out rejects older Clang; versioned names go in with `-DC
 against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/xwin) downloads from Microsoft
 (running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
 
+A cross build configured without `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` has no Vulkan device (the xwin toolchain does
+not find the Vulkan headers by itself). In that build `LEONIDA_D3D12=vulkan` is ignored with one line naming the
+configure flag; without the line it used to fall back to the host's D3D12 device silently, which under Wine reads
+as a device failure (`E_INVALIDARG` on 12_0, `E_NOINTERFACE` on 11_0) rather than a build mistake.
+
 ```sh
 xwin --accept-license --sdk-version 10.0.26100 splat --use-winsysroot-style --preserve-ms-arch-notation \
      --output ~/.local/share/xwin-sdk

@@ -184,6 +184,19 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<void*>(vulkan));
         return result(method, S_OK);
     }
+#else
+    // The variable is only honored in a build with the Vulkan device. Without this branch a cross build
+    // configured without -DLEONIDA_VULKAN_HEADERS_FETCH=ON silently falls back to the host's D3D12 device:
+    // LEONIDA_D3D12=vulkan changes nothing and the run reads as a device failure instead of a build one
+    // (docs/testing.md, "The Windows runtime on Linux").
+    {
+        char backend[16] = {};
+        size_t backend_length = 0;
+        if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: LEONIDA_D3D12=vulkan ignored: this build has no Vulkan device. "
+                         "Reconfigure with -DLEONIDA_VULKAN_HEADERS_FETCH=ON (see docs/testing.md).\n");
+    }
 #endif
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
