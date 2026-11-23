@@ -291,6 +291,7 @@ public:
     // Validates shader-visible descriptor heaps and tracks bound heap identities/bases (docs/d3d12_vulkan.md §3.2/§3.4).
     void STDMETHODCALLTYPE SetDescriptorHeaps(UINT num, ID3D12DescriptorHeap* const* heaps) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::SetDescriptorHeaps");
+        if (list_.closed()) return check(false);
         if (type_ == D3D12_COMMAND_LIST_TYPE_COPY) return check(false);
         if (num > 2 || (num && !heaps)) return check(false);
 
@@ -433,12 +434,14 @@ public:
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
     void STDMETHODCALLTYPE OMSetRenderTargets(UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* targets, BOOL single_range,
                                               const D3D12_CPU_DESCRIPTOR_HANDLE* depth) override {
+        if (list_.closed()) return check(false);
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return check(false);
+        if (count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT || (count && !targets)) return check(false);
+        if (single_range && count && !targets[0].ptr) return check(false);
         render_targets_.fill({});
         render_target_count_ = count;
         draw_views_stale_ = true;
-        for (UINT i = 0; i < count && targets; ++i) {
+        for (UINT i = 0; i < count; ++i) {
             const SIZE_T handle = single_range ? targets[0].ptr + SIZE_T(i) * descriptor_size : targets[i].ptr;
             if (handle) render_targets_[i] = *reinterpret_cast<const leonida::TargetView*>(handle);
         }
