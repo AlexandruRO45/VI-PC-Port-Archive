@@ -37,6 +37,12 @@ struct Vertex {
     std::uint8_t r, g, b, a;
 };
 
+template<typename T>
+struct alignas(void*) StreamSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    T value;
+};
+
 D3D12_RESOURCE_DESC tex2d_desc(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -193,18 +199,182 @@ int main() {
     EXPECT(lib->StorePipeline(L"cs", cs_pso.p) == E_INVALIDARG);  // duplicate name
     EXPECT(SUCCEEDED(lib->StorePipeline(L"gfx", gfx_pso.p)));
 
-    Ref<ID3D12PipelineState> loaded_cs, loaded_gfx, loaded_any, wrong;
+    Ref<ID3D12PipelineState> loaded_cs, loaded_gfx, loaded_any, loaded_cs_stream, wrong;
+    EXPECT(lib->LoadComputePipeline(nullptr, &cs_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadComputePipeline(L"", &cs_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadComputePipeline(L"cs", nullptr, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadComputePipeline(L"missing", &cs_desc, __uuidof(ID3D12PipelineState), nullptr) == E_INVALIDARG);
+    EXPECT(lib->LoadComputePipeline(L"cs", &cs_desc, __uuidof(ID3D12PipelineState), nullptr) == E_POINTER);
     EXPECT(lib->LoadComputePipeline(L"missing", &cs_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
     EXPECT(lib->LoadComputePipeline(L"gfx", &cs_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
-    EXPECT(lib->LoadGraphicsPipeline(L"cs", &gfx_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
     EXPECT(SUCCEEDED(lib->LoadComputePipeline(L"cs", &cs_desc, IID_PPV_ARGS(&loaded_cs.p))) && loaded_cs.p);
+    {
+        Ref<ID3D12Fence> bad_iface;
+        EXPECT(lib->LoadComputePipeline(L"cs", &cs_desc, IID_PPV_ARGS(&bad_iface.p)) == E_NOINTERFACE && !bad_iface.p);
+    }
+
+    // Compute descriptor-key parity (matched against live WARP & RTX 5090 D3D12).
+    {
+        // Different root signature object with identical layout, or different Flags: still matches (S_OK).
+        Ref<ID3D12RootSignature> cs_rs_dup;
+        EXPECT(SUCCEEDED(
+            device->CreateRootSignature(0, cs_rs_blob.data(), cs_rs_blob.size(), IID_PPV_ARGS(&cs_rs_dup.p))));
+        D3D12_COMPUTE_PIPELINE_STATE_DESC same_layout = cs_desc;
+        same_layout.pRootSignature = cs_rs_dup.p;
+        same_layout.Flags = D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG;
+        Ref<ID3D12PipelineState> ok_dup;
+        EXPECT(SUCCEEDED(lib->LoadComputePipeline(L"cs", &same_layout, IID_PPV_ARGS(&ok_dup.p))) && ok_dup.p);
+
+        // Mismatched shader bytecode or root signature layout -> E_INVALIDARG.
+        const auto other_cs_prog = fssm_program({0x43532002, 0xbf810000});
+        const auto other_cs_dxbc = shader_container(other_cs_prog);
+        D3D12_COMPUTE_PIPELINE_STATE_DESC bad_cs = cs_desc;
+        bad_cs.CS = {other_cs_dxbc.data(), other_cs_dxbc.size()};
+        EXPECT(lib->LoadComputePipeline(L"cs", &bad_cs, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC bad_rs = cs_desc;
+        bad_rs.pRootSignature = gfx_rs.p;
+        EXPECT(lib->LoadComputePipeline(L"cs", &bad_rs, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    }
+
+    EXPECT(lib->LoadGraphicsPipeline(nullptr, &gfx_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadGraphicsPipeline(L"", &gfx_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadGraphicsPipeline(L"gfx", nullptr, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadGraphicsPipeline(L"missing", &gfx_desc, __uuidof(ID3D12PipelineState), nullptr) == E_INVALIDARG);
+    EXPECT(lib->LoadGraphicsPipeline(L"gfx", &gfx_desc, __uuidof(ID3D12PipelineState), nullptr) == E_POINTER);
+    EXPECT(lib->LoadGraphicsPipeline(L"missing", &gfx_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    EXPECT(lib->LoadGraphicsPipeline(L"cs", &gfx_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
     EXPECT(SUCCEEDED(lib->LoadGraphicsPipeline(L"gfx", &gfx_desc, IID_PPV_ARGS(&loaded_gfx.p))) && loaded_gfx.p);
 
-    std::uint32_t dummy_stream = 0;
-    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{sizeof(dummy_stream), &dummy_stream};
-    D3D12_PIPELINE_STATE_STREAM_DESC empty_stream{0, nullptr};
-    EXPECT(lib->LoadPipeline(L"gfx", &empty_stream, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
-    EXPECT(SUCCEEDED(lib->LoadPipeline(L"gfx", &stream_desc, IID_PPV_ARGS(&loaded_any.p))) && loaded_any.p);
+    // Graphics descriptor-key parity (matched against live WARP & RTX 5090 D3D12).
+    {
+        Ref<ID3D12RootSignature> gfx_rs_dup;
+        EXPECT(SUCCEEDED(
+            device->CreateRootSignature(0, gfx_rs_blob.data(), gfx_rs_blob.size(), IID_PPV_ARGS(&gfx_rs_dup.p))));
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC same_layout = gfx_desc;
+        same_layout.pRootSignature = gfx_rs_dup.p;
+        Ref<ID3D12PipelineState> ok_dup;
+        EXPECT(SUCCEEDED(lib->LoadGraphicsPipeline(L"gfx", &same_layout, IID_PPV_ARGS(&ok_dup.p))) && ok_dup.p);
+
+        const auto other_vs_dxbc = shader_container(fssm_program({0x56532002, 0xbf810000}));
+        const auto other_ps_dxbc = shader_container(fssm_program({0x50532002, 0xbf810000}));
+
+        auto bad_vs = gfx_desc;
+        bad_vs.VS = {other_vs_dxbc.data(), other_vs_dxbc.size()};
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_vs, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_ps = gfx_desc;
+        bad_ps.PS = {other_ps_dxbc.data(), other_ps_dxbc.size()};
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_ps, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_rs = gfx_desc;
+        bad_rs.pRootSignature = cs_rs.p;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_rs, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_rtv = gfx_desc;
+        bad_rtv.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_rtv, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_dsv = gfx_desc;
+        bad_dsv.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_dsv, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_blend = gfx_desc;
+        bad_blend.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_blend, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_rast = gfx_desc;
+        bad_rast.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_rast, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_topo = gfx_desc;
+        bad_topo.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &bad_topo, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        // Null pointer with non-zero count must return E_INVALIDARG without crashing.
+        auto null_il = gfx_desc;
+        null_il.InputLayout = {nullptr, 2};
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &null_il, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto null_so = gfx_desc;
+        null_so.StreamOutput.pSODeclaration = nullptr;
+        null_so.StreamOutput.NumEntries = 1;
+        EXPECT(lib->LoadGraphicsPipeline(L"gfx", &null_so, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+    }
+
+    // ID3D12PipelineLibrary1::LoadPipeline stream validation and descriptor-key parity.
+    {
+        std::uint32_t dummy_stream = 0;
+        D3D12_PIPELINE_STATE_STREAM_DESC bad_dummy{sizeof(dummy_stream), &dummy_stream};
+        D3D12_PIPELINE_STATE_STREAM_DESC empty_stream{0, nullptr};
+        EXPECT(lib->LoadPipeline(L"gfx", &empty_stream, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+        EXPECT(lib->LoadPipeline(L"gfx", &bad_dummy, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+        EXPECT(lib->LoadPipeline(nullptr, &bad_dummy, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+        EXPECT(lib->LoadPipeline(L"gfx", nullptr, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        struct GfxStream {
+            StreamSubobject<ID3D12RootSignature*> rs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, nullptr};
+            StreamSubobject<D3D12_SHADER_BYTECODE> vs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {}};
+            StreamSubobject<D3D12_SHADER_BYTECODE> ps{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {}};
+            StreamSubobject<D3D12_BLEND_DESC> blend{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, {}};
+            StreamSubobject<UINT> sample_mask{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, 0xFFFFFFFFu};
+            StreamSubobject<D3D12_RASTERIZER_DESC> rast{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, {}};
+            StreamSubobject<D3D12_DEPTH_STENCIL_DESC> ds{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, {}};
+            StreamSubobject<D3D12_INPUT_LAYOUT_DESC> il{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, {}};
+            StreamSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE> topo{
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE};
+            StreamSubobject<D3D12_RT_FORMAT_ARRAY> rtvs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, {}};
+            StreamSubobject<DXGI_SAMPLE_DESC> sample_desc{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, {1, 0}};
+        } gfx_stream;
+        gfx_stream.rs.value = gfx_desc.pRootSignature;
+        gfx_stream.vs.value = gfx_desc.VS;
+        gfx_stream.ps.value = gfx_desc.PS;
+        gfx_stream.blend.value = gfx_desc.BlendState;
+        gfx_stream.sample_mask.value = gfx_desc.SampleMask;
+        gfx_stream.rast.value = gfx_desc.RasterizerState;
+        gfx_stream.ds.value = gfx_desc.DepthStencilState;
+        gfx_stream.il.value = gfx_desc.InputLayout;
+        gfx_stream.topo.value = gfx_desc.PrimitiveTopologyType;
+        gfx_stream.rtvs.value.NumRenderTargets = gfx_desc.NumRenderTargets;
+        gfx_stream.rtvs.value.RTFormats[0] = gfx_desc.RTVFormats[0];
+        gfx_stream.sample_desc.value = gfx_desc.SampleDesc;
+
+        const D3D12_PIPELINE_STATE_STREAM_DESC gfx_stream_desc{sizeof(gfx_stream), &gfx_stream};
+        EXPECT(SUCCEEDED(lib->LoadPipeline(L"gfx", &gfx_stream_desc, IID_PPV_ARGS(&loaded_any.p))) && loaded_any.p);
+        EXPECT(lib->LoadPipeline(L"gfx", &gfx_stream_desc, __uuidof(ID3D12PipelineState), nullptr) == E_POINTER);
+        EXPECT(lib->LoadPipeline(L"missing", &gfx_stream_desc, __uuidof(ID3D12PipelineState), nullptr) == E_INVALIDARG);
+        EXPECT(lib->LoadPipeline(L"cs", &gfx_stream_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto bad_gfx_stream = gfx_stream;
+        bad_gfx_stream.rtvs.value.RTFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+        const D3D12_PIPELINE_STATE_STREAM_DESC bad_gfx_stream_desc{sizeof(bad_gfx_stream), &bad_gfx_stream};
+        EXPECT(lib->LoadPipeline(L"gfx", &bad_gfx_stream_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        auto null_il_stream = gfx_stream;
+        null_il_stream.il.value = {nullptr, 2};
+        const D3D12_PIPELINE_STATE_STREAM_DESC null_il_stream_desc{sizeof(null_il_stream), &null_il_stream};
+        EXPECT(lib->LoadPipeline(L"gfx", &null_il_stream_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        struct CsStream {
+            StreamSubobject<ID3D12RootSignature*> rs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, nullptr};
+            StreamSubobject<D3D12_SHADER_BYTECODE> cs{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, {}};
+        } cs_stream;
+        cs_stream.rs.value = cs_desc.pRootSignature;
+        cs_stream.cs.value = cs_desc.CS;
+        const D3D12_PIPELINE_STATE_STREAM_DESC cs_stream_desc{sizeof(cs_stream), &cs_stream};
+        EXPECT(SUCCEEDED(lib->LoadPipeline(L"cs", &cs_stream_desc, IID_PPV_ARGS(&loaded_cs_stream.p))) &&
+               loaded_cs_stream.p);
+        EXPECT(lib->LoadPipeline(L"gfx", &cs_stream_desc, IID_PPV_ARGS(&wrong.p)) == E_INVALIDARG && !wrong.p);
+
+        // PSO created via ID3D12Device2::CreatePipelineState also stores its cache key for StorePipeline/LoadPipeline.
+        Ref<ID3D12Device2> device2;
+        EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device2.p))) && device2.p);
+        Ref<ID3D12PipelineState> stream_pso, loaded_stream_pso;
+        EXPECT(SUCCEEDED(device2->CreatePipelineState(&cs_stream_desc, IID_PPV_ARGS(&stream_pso.p))) && stream_pso.p);
+        EXPECT(SUCCEEDED(lib->StorePipeline(L"cs_from_stream", stream_pso.p)));
+        EXPECT(SUCCEEDED(lib->LoadPipeline(L"cs_from_stream", &cs_stream_desc, IID_PPV_ARGS(&loaded_stream_pso.p))) &&
+               loaded_stream_pso.p);
+    }
 
     const SIZE_T blob_size = lib->GetSerializedSize();
     EXPECT(blob_size >= 16);

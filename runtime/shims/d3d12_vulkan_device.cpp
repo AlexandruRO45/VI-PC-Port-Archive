@@ -3104,6 +3104,7 @@ public:
 
     std::uintptr_t id() const { return reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this)); }
     void set_cache_key(leonida::cached_pso::Key key) { cache_key_ = std::move(key); }
+    const leonida::cached_pso::Key& cache_key() const { return cache_key_; }
 
     // A null pointer is accepted with S_OK, as by the PC runtime (measured on an RTX 3060 and WARP).
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** blob) override {
@@ -4025,26 +4026,28 @@ public:
 
     HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
                                                    REFIID riid, void** out) override {
-        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
-        *out = nullptr;
+        if (out) *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
-        return load_entry(name, false, true, riid, out);
+        if (has_invalid_graphics_pointers(*desc)) return E_INVALIDARG;
+        return load_entry(name, false, true, pipeline_key(*desc), riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC* desc,
                                                   REFIID riid, void** out) override {
-        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
-        *out = nullptr;
+        if (out) *out = nullptr;
         if (!name || !*name || !desc) return E_INVALIDARG;
-        return load_entry(name, true, false, riid, out);
+        return load_entry(name, true, false, pipeline_key(*desc), riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
                                            REFIID riid, void** out) override {
-        if (!out) return E_INVALIDARG;  // the host runtime's answer (not E_POINTER)
-        *out = nullptr;
-        if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream) return E_INVALIDARG;
-        return load_entry(name, false, false, riid, out);
+        if (out) *out = nullptr;
+        if (!name || !*name || !desc || !desc->SizeInBytes || !desc->pPipelineStateSubobjectStream)
+            return E_INVALIDARG;
+        PipelineStream stream;
+        if (const HRESULT hr = parse_pipeline_stream(*desc, stream); FAILED(hr)) return hr;
+        if (!stream.has_cs && has_invalid_graphics_pointers(stream.graphics)) return E_INVALIDARG;
+        return load_entry(name, stream.has_cs, !stream.has_cs, pipeline_key_for_stream(stream), riid, out);
     }
 
     SIZE_T STDMETHODCALLTYPE GetSerializedSize() override { return sizeof(Header); }
@@ -4057,8 +4060,26 @@ public:
         return S_OK;
     }
 
+    static leonida::cached_pso::Key pipeline_key_for_stream(const PipelineStream& stream) {
+        if (stream.has_cs) return pipeline_key(stream.compute);
+        if (!stream.ms.pShaderBytecode && !stream.as.pShaderBytecode) return pipeline_key(stream.graphics);
+        leonida::cached_pso::KeyBuilder key;
+        key.tag("mesh").text(pipeline_key(stream.graphics).c_str());
+        key_shader(key, "ms", stream.ms);
+        key_shader(key, "as", stream.as);
+        return leonida::sha256_hex(key.data());
+    }
+
 private:
-    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics, REFIID riid, void** out) {
+    static bool has_invalid_graphics_pointers(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+        if (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs) return true;
+        if (desc.StreamOutput.NumEntries > 0 && !desc.StreamOutput.pSODeclaration) return true;
+        if (desc.StreamOutput.NumStrides > 0 && !desc.StreamOutput.pBufferStrides) return true;
+        return false;
+    }
+
+    HRESULT load_entry(LPCWSTR name, bool require_compute, bool require_graphics,
+                       const leonida::cached_pso::Key& key, REFIID riid, void** out) {
         std::lock_guard lock(mutex_);
         const auto it = entries_.find(name);
         if (it == entries_.end()) return E_INVALIDARG;
@@ -4066,6 +4087,8 @@ private:
         if (!ps) return E_INVALIDARG;
         if (require_compute && !ps->compute()) return E_INVALIDARG;
         if (require_graphics && !ps->graphics()) return E_INVALIDARG;
+        if (ps->cache_key().empty() || ps->cache_key() != key) return E_INVALIDARG;
+        if (!out) return E_POINTER;
         return it->second->QueryInterface(riid, out);
     }
 
@@ -5875,6 +5898,7 @@ public:
             pipeline->Release();
             return d3d12_trace::result(method, hr);
         }
+        pipeline->set_cache_key(PipelineLibrary::pipeline_key_for_stream(stream));
         return d3d12_trace::result(method, hand_out(pipeline, riid, out));
     }
 
