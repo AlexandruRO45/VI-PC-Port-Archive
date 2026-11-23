@@ -96,6 +96,11 @@ void* user_object(HRESULT(WINAPI* query)(const GUID*, REFIID, void**)) {
 
 void CALLBACK on_state(void*, uint64_t, uint32_t) {}
 
+// A device change callback that counts its calls. Offline neither the device association nor the default audio
+// endpoint changes, so it must never run.
+std::atomic<int> g_device_callbacks{0};
+void CALLBACK count_device_change(void*, const void*) { g_device_callbacks.fetch_add(1); }
+
 }  // namespace
 
 int main() {
@@ -221,6 +226,53 @@ int main() {
               again.token != association.token && !at<Unregister>(device, 5)(device, association, false) &&
               at<Unregister>(device, 5)(device, again, true),
           "registering again hands out a new token; the unregistered one stays refused");
+    XTaskQueueRegistrationToken zero_token{0};
+    check(!at<Unregister>(device, 5)(device, zero_token, false) && !at<Unregister>(device, 8)(device, zero_token, true),
+          "token 0 is never a live token");
+    {
+        // The queue and context are optional: a registration with a manual queue and a context of its own is
+        // accepted, nothing is ever queued on that queue, and the callback never runs.
+        XTaskQueueHandle queue = nullptr;
+        int context = 0;
+        XTaskQueueRegistrationToken queued_association{}, queued_audio{};
+        const bool created = SUCCEEDED(
+            XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue));
+        const bool registered =
+            created &&
+            at<Register>(device, 4)(device, queue, &context, reinterpret_cast<void*>(&count_device_change),
+                                    &queued_association) == S_OK &&
+            at<Register>(device, 7)(device, queue, &context, reinterpret_cast<void*>(&count_device_change),
+                                    &queued_audio) == S_OK;
+        const bool nothing_queued = created && !XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0) &&
+                                    !XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
+        check(registered && nothing_queued && g_device_callbacks.load() == 0 && context == 0,
+              "a registration with its own queue and context: nothing is queued and the callback never runs");
+        check(at<Unregister>(device, 5)(device, queued_association, true) &&
+                  at<Unregister>(device, 8)(device, queued_audio, false),
+              "a registration with a queue and context unregisters like any other");
+        if (queue) XTaskQueueCloseHandle(queue);
+    }
+    {
+        // Taking tokens back from the middle of a registration's list, in a mixed order: 64 of each registration,
+        // interleaved; the device-association ones go back odd positions first, then even ones from the end, while
+        // the audio-endpoint ones stay live; then those go back from the end. Each succeeds once.
+        constexpr int kEach = 64;
+        std::vector<XTaskQueueRegistrationToken> associations(kEach), audios(kEach);
+        bool ok = true;
+        for (int i = 0; i < kEach; ++i)
+            ok = ok &&
+                 at<Register>(device, 4)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state),
+                                         &associations[i]) == S_OK &&
+                 at<Register>(device, 7)(device, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &audios[i]) ==
+                     S_OK;
+        for (int i = 1; i < kEach; i += 2) ok = ok && at<Unregister>(device, 5)(device, associations[i], false);
+        for (int i = kEach - 2; i >= 0; i -= 2) ok = ok && at<Unregister>(device, 5)(device, associations[i], true);
+        for (const XTaskQueueRegistrationToken& gone : associations)
+            ok = ok && !at<Unregister>(device, 5)(device, gone, false);
+        for (int i = kEach - 1; i >= 0; --i) ok = ok && at<Unregister>(device, 8)(device, audios[i], false);
+        for (const XTaskQueueRegistrationToken& gone : audios) ok = ok && !at<Unregister>(device, 8)(device, gone, false);
+        check(ok, "tokens taken back from the middle, in any order, each unregister once and leave the others live");
+    }
     {
         // Several threads register and unregister on both registrations at once: every token unregisters exactly
         // once, from its own slot.

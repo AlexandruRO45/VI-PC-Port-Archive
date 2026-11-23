@@ -460,11 +460,13 @@ HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* dev
 // 4: HRESULT XUserRegisterForDeviceAssociationChanged(XTaskQueueHandle queue, void* context,
 //        XUserDeviceAssociationChangedCallback* callback, XTaskQueueRegistrationToken* token)
 // 7: HRESULT XUserRegisterForDefaultAudioEndpointUtf16Changed(XTaskQueueHandle, void*, callback, token*)
-// Associations and endpoints never change offline: a token, no callback. Each of the two registrations keeps the
-// tokens it handed out, so its unregister slot can tell a live token from one it never issued (RT-391). The tokens
-// live in one vector per registration: its default constructor allocates nothing, so nothing runs or can fail when
-// the runtime loads. These calls run on the title's threads, so a failed allocation while registering refuses the
-// registration (E_OUTOFMEMORY, no token handed out) instead of throwing into the title.
+// Associations and endpoints never change offline: a token, no callback. The queue and context are optional
+// (_In_opt_) and not kept, since nothing is ever queued; callback and token are required (E_INVALIDARG). Each of
+// the two registrations keeps the tokens it handed out, so its unregister slot can tell a live token from one it
+// never issued (RT-391). The tokens live in one vector per registration: its default constructor allocates
+// nothing, so nothing runs or can fail when the runtime loads. These calls run on the title's threads, so a failed
+// allocation while registering refuses the registration (E_OUTOFMEMORY, no token handed out) instead of throwing
+// into the title.
 enum class DeviceRegistration { association, audio_endpoint };
 std::vector<uint64_t> g_device_tokens[2];   // guarded by g_streaming_mutex
 
@@ -482,10 +484,12 @@ HRESULT STDMETHODCALLTYPE device_register(void*, XTaskQueueHandle, void*, void* 
     return S_OK;
 }
 
-// 5, 8: bool ...Unregister...(XTaskQueueRegistrationToken token, bool wait): no callback is ever running, so `wait`
-// changes nothing. True removes a token the matching register slot handed out and has not taken back; a token
-// already unregistered, never issued, or issued by the other registration is false, and stays as it was.
-// Removing a token moves the last one into its place: it allocates nothing and can't throw.
+// 5: bool XUserUnregisterForDeviceAssociationChanged(XTaskQueueRegistrationToken token, bool wait)
+// 8: bool XUserUnregisterForDefaultAudioEndpointUtf16Changed(XTaskQueueRegistrationToken token, bool wait)
+// No callback is ever running, so `wait` changes nothing. True removes a token the matching register slot handed
+// out and has not taken back. A token already unregistered, never issued, or issued by the other registration or by
+// streaming is false, and nothing changes: the GDK reference gives "true if the callback successfully unregisters;
+// false otherwise". Removing a token moves the last one into its place: it allocates nothing and can't throw.
 template <DeviceRegistration Kind>
 bool STDMETHODCALLTYPE device_unregister(void*, XTaskQueueRegistrationToken token, bool) {
     std::lock_guard<std::mutex> lock(g_streaming_mutex);

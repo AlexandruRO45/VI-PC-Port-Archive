@@ -438,12 +438,6 @@ on the executable, the rest is not:
   are no clients, and the connection-state registration hands out a token that never fires. Every per-client slot
   answers `E_GAMESTREAMING_NOT_INITIALIZED` (0x89245400), which a caller reading a bool sees as false (low byte
   0).
-- **User devices:** every device belongs to the offline user, and the user has no audio endpoint of its own. The
-  device-association (slot 4) and default-audio-endpoint (slot 7) registrations each hand out a token that never
-  fires, since neither changes offline, and keep it until it is unregistered. The matching unregister slot (5, 8)
-  returns true once for a live token of its own registration, and false for one already unregistered, never
-  issued, or issued by the other registration or by streaming (RT-391). `wait` changes nothing, since no callback is
-  ever running.
 - **Not reached by the executable:** the parameter lists of `XGameUiShowMessageDialogAsync` and
   `XGameStreamingRegisterConnectionStateChanged` are the GDK reference's, and the executable has no caller to check
   them against. `tools/gdk_runtime_calls.py` finds no thunk for the message dialog and none for any
@@ -464,9 +458,25 @@ on the executable, the rest is not:
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
-  closes). Association and audio-endpoint registrations hand out tokens that never fire. The user has no audio
-  endpoint of its own (`ERROR_NOT_FOUND`). Finding a controller shows no UI and gives an all-zero device id, as
-  documented for desktop. `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
+  closes).
+- **Device change registrations (RT-391):**
+  - **Register:** `XUserRegisterForDeviceAssociationChanged` (slot 4) and
+    `XUserRegisterForDefaultAudioEndpointUtf16Changed` (slot 7) need a callback and a token pointer; without
+    either they return `E_INVALIDARG` and hand out nothing. The queue and context are optional and not kept: offline
+    neither the device association nor the default audio endpoint changes, so nothing is ever queued and the
+    callback is never called. Each registration hands out a token that is never 0 and never reused. The tokens
+    come from the counter that streaming's connection-state registration also uses, and each registration keeps
+    its own list of the tokens it handed out.
+  - **Unregister:** `XUserUnregisterForDeviceAssociationChanged` (slot 5) and
+    `XUserUnregisterForDefaultAudioEndpointUtf16Changed` (slot 8) take back a live token of their own registration
+    and return true. A token already unregistered, never handed out, or from the other registration or from
+    streaming returns false and changes nothing, following the GDK reference ("false otherwise"). `wait` changes
+    nothing, since no callback can be running.
+  - **Allocation failure:** a registration that fails to allocate returns `E_OUTOFMEMORY` and hands out no token.
+    Unregistering never allocates, and nothing throws into the title's thread.
+- **Audio endpoint:** the user has no audio endpoint of its own (`ERROR_NOT_FOUND`).
+- **Controller:** finding a controller shows no UI and gives an all-zero device id, as documented for desktop.
+  `APP_LOCAL_DEVICE_ID` is taken to be 32 bytes; no caller in the executable confirms it.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
