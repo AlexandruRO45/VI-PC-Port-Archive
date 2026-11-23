@@ -1,4 +1,4 @@
-"""Every text-mode file write in the Python tools names its line ending (BUILD-468).
+"""Check recognized Python text-write spellings for explicit line endings (BUILD-468).
 
 `open(path, "w")` with no `newline=` turns each "\\n" into "\\r\\n" on Windows, so the same JSON report, manifest or
 assembly listing is CRLF there and LF on Linux and macOS: the same input gives byte-different output per platform
@@ -8,6 +8,10 @@ the source with `ast` (standard library, no game data, no GPU) and fails for any
 `a`, `x`, `r+`), or any `Path.write_text`, under tools/, scripts/, make_game.py and runtime/test/shaders/ that has no
 `newline=` argument. `codecs.open` is left alone: it never translates line ends and takes no `newline=`. Pass `newline="\\n"` for LF output (or `newline=""` when the text carries its own line ends,
 like a csv writer).
+
+Coverage is syntactic: module-level `.open(file, mode)` calls are recognized only for the literal owner names in
+`MODULE_OPENS`. Other `.open` calls are assumed to use the `Path.open(mode)` signature. Import aliases and dynamic
+lookups such as `getattr(builtins, "open")` are not resolved.
 """
 import ast
 import os
