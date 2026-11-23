@@ -37,7 +37,13 @@ int main() {
     // Smaller advertised limits force both dispatch and descriptor-window splits on ordinary GPUs.
     limits.maxStorageBufferRange=static_cast<std::uint32_t>(std::max<VkDeviceSize>(256,limits.minStorageBufferOffsetAlignment));
     limits.maxComputeWorkGroupCount[0]=1;
-    VulkanContext context(d.device_proc,d.device,true,true);
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 driver_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(d.physical, &driver_properties);
+    const bool exclude_transfers_from_pipeline_statistics =
+        driver.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    VulkanContext context(d.device_proc, d.device, true, true, false, false,
+                          exclude_transfers_from_pipeline_statistics);
     context.set_occlusion_resolve_memory(memory);
     context.configure_predication(d.device_proc,memory,properties.limits.maxStorageBufferRange,d.family);
     VulkanQueue queue(context,d.queue,d.family);
