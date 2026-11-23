@@ -2386,27 +2386,32 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     skip = os.path.join(out, "pipeline_crashes.txt")
     drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
-    base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
+    base = [exe, spirv, cache]
+    job_args = ["--jobs", str(jobs)] if jobs else []
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
         # An older build takes any argument it doesn't know as the cache path, so it would write the cache into
         # pipeline_inflight.txt and exit 0. Run it as before: a module that kills it stops the stage.
         log("pipelines: this vk_pipeline_check has no --inflight-file; rebuild the runtime stage so a module that "
             "crashes the driver is skipped instead of stopping the stage")
-        run(base)
+        run(base + job_args)
         log("pipelines: done")
         return
-    base += ["--inflight-file", inflight]
     # Bound each checker invocation to a range that recovery can split further when concurrent heavy compiles
     # exceed available memory, without starting the entire corpus again (BUILD-1030).
     names = pipeline_names(spirv) if checker_supports(exe, "--start", "--count") else []
     crashed: "list[str]" = []
 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
-        selection = ["--start", str(start), "--count", str(count)] if count is not None else []
-        allowed = set(names[start:start + count]) if count is not None else None
-        for _ in range(PIPELINE_CRASH_RETRIES + 1):
+        options = ["--inflight-file", inflight]
+        positions = None
+        if count is not None:
+            options.extend(["--start", str(start), "--count", str(count)])
+            positions = {name: i for i, name in enumerate(names[start:start + count], start)}
+        workers = job_args
+        retries = 0
+        while retries <= PIPELINE_CRASH_RETRIES:
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
-            code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
+            code = run(base + workers + options + (["--skip-file", skip] if crashed else []), check=False)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
             # fail validation; setup failures return before writing it. Do not repeat setup for every batch.
             if code == 1 and not os.path.isfile(inflight):
@@ -2415,10 +2420,18 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             if code in (0, 1, 2) or interrupted(code):
                 return code
             suspects = list(dict.fromkeys(n for n in read_names(inflight)
-                                          if n not in crashed and (allowed is None or n in allowed)))
+                                          if n not in crashed and (positions is None or n in positions)))
             # Even the last in-flight module can be innocent after other heavy compiles in the batch.
-            if count is not None or len(suspects) > 1:
-                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, inflight)]
+            if positions is not None:
+                suspects = [n for n in suspects if crashes_alone(exe, spirv, cache, n, positions[n], inflight)]
+            elif len(suspects) > 1:
+                if workers == ["--jobs", "1"] or not checker_supports(exe, "--jobs"):
+                    fail(f"pipelines: vk_pipeline_check exited with {exit_label(code)} with several modules in flight. "
+                         f"Rebuild it with --start and --count support to check them individually. See {inflight}.")
+                log("pipelines: several modules were in flight and the checker cannot select a range. "
+                    "Retrying the full index with --jobs 1.")
+                workers = ["--jobs", "1"]
+                continue
             if not suspects:
                 if count is not None and count > 1:
                     # All suspects survived in fresh processes: do not blacklist them. Re-check the entire failed
@@ -2439,6 +2452,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
+            retries += 1
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
@@ -2515,17 +2529,12 @@ def pipeline_names(spirv: str) -> "list[str]":
     return sorted(index, key=lambda n: n.encode("utf-8"))
 
 
-def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | None = None) -> bool:
+def crashes_alone(exe: str, spirv: str, cache: str, name: str, position: int, inflight: str) -> bool:
     """Confirm a crash only when this probe's fresh report names the selected module as in flight."""
-    names = pipeline_names(spirv)
-    if name not in names:
-        return False
-    args = [exe, spirv, cache, "--jobs", "1", "--start", str(names.index(name)), "--count", "1"]
-    if inflight:
-        drop(inflight)
-        args += ["--inflight-file", inflight]
+    drop(inflight)
+    args = [exe, spirv, cache, "--jobs", "1", "--start", str(position), "--count", "1", "--inflight-file", inflight]
     code = run(args, check=False)
-    if code == 1 and inflight and not os.path.isfile(inflight):
+    if code == 1 and not os.path.isfile(inflight):
         fail(f"pipelines: checking {name} alone exited with 1 before writing its work report; "
              "check Vulkan initialization and report-file access in the output above")
     if interrupted(code) or code == 2:
@@ -2535,7 +2544,7 @@ def crashes_alone(exe: str, spirv: str, cache: str, name: str, inflight: str | N
     # The process may have died during setup or after finishing, rather than inside this module. The native
     # report is periodic for small modules, so a fast real crash can also leave no evidence: stop conservatively
     # in that case instead of blaming an innocent module or retrying more ranges with an unreliable checker.
-    if not inflight or name not in read_names(inflight):
+    if name not in read_names(inflight):
         fail(f"pipelines: checking {name} alone exited with {exit_label(code)} without a fresh report naming it "
              "as in flight; the diagnostic result is inconclusive, so no crash is attributed to this module. "
              "Check the checker output, available memory and report-file access before retrying")

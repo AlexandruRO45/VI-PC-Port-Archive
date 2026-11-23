@@ -348,8 +348,11 @@ that size. Which threads the game creates pipelines on is not known without its 
 Windows and POSIX. The ranges partition the same name-sorted index as `--start` / `--count`, including the final
 short range. Each finished process saves to the same `pipeline_cache.bin`, and the next loads that checkpoint.
 This bounds each invocation to a range that can be split further if concurrent heavy compiles exceed available
-memory. A work folder with at most 500 entries keeps the single invocation. An older checker without the range
-options keeps the older invocation; rebuild the runtime to get batching.
+memory. A work folder with at most 500 entries starts with a single invocation. A checker without range
+selection scans the whole index. If its in-flight report names several modules after a parallel run fails,
+the build retries the full index once with `--jobs 1`. If that option is unavailable or the single-worker
+report still names several modules, the build stops and preserves `pipeline_inflight.txt` for diagnosis.
+Rebuild the checker with `--start` and `--count` support to test those modules individually.
 
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
 is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in

@@ -43,6 +43,8 @@ def record(event):
     with (spirv / "calls.jsonl").open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(dict(event=event, pid=os.getpid(), selected=selected, active=active, args=args)) + "\n")
 record("started")
+if not config["range_support"] and ("--start" in args or "--count" in args):
+    sys.exit(2)
 if config.get("setup_error") or config.get("probe_setup_error") and count == 1 and option("--jobs") == "1":
     print("no Vulkan physical devices found", file=sys.stderr)
     sys.exit(config.get("setup_exit", 2))
@@ -61,9 +63,10 @@ if config.get("probe_crash_before_work") and count == 1 and option("--jobs") == 
                                   encoding="utf-8", newline="\n")
     sys.exit(70)
 crasher = config.get("crasher")
-if crasher in active or len(active) > config.get("max_batch", 1000000):
+parallel_failure = config.get("parallel_failure") and option("--jobs") != "1"
+if parallel_failure or crasher in active or len(active) > config.get("max_batch", 1000000):
     if inflight:
-        suspects = [crasher] if crasher in active else active[:config.get("suspects", 2)]
+        suspects = [crasher] if crasher in active and not parallel_failure else active[:config.get("suspects", 2)]
         Path(inflight).write_text("".join(n + "\tpipeline\n" for n in suspects), encoding="utf-8", newline="\n")
     sys.exit(70)
 # This stand-in's cache contains completed names so the test can detect lost checkpoints and repeated work.
@@ -95,8 +98,9 @@ class PipelineBatchesTest(unittest.TestCase):
         (self.spirv / "index.json").write_text(json.dumps({n: {} for n in reversed(names)}),
                                                 encoding="utf-8", newline="\n")
 
-    def invoke(self, control=None, range_support=True):
-        (self.spirv / "control.json").write_text(json.dumps(control or {}), encoding="utf-8", newline="\n")
+    def invoke(self, control=None, range_support=True, jobs=2):
+        config = dict(control or {}, range_support=range_support)
+        (self.spirv / "control.json").write_text(json.dumps(config), encoding="utf-8", newline="\n")
         def run(args, hint="", check=True, **kwargs):
             args = [str(a) for a in args]
             self.commands.append(args)
@@ -106,6 +110,8 @@ class PipelineBatchesTest(unittest.TestCase):
                 raise SystemExit(1)
             return done.returncode
         def supports(exe, *options):
+            if "--jobs" in options and config.get("no_job_option"):
+                return False
             return range_support or "--start" not in options
         logs, err = [], io.StringIO()
         # create=True keeps the regression runnable on the old implementation, which lacks this constant.
@@ -115,7 +121,7 @@ class PipelineBatchesTest(unittest.TestCase):
                 mock.patch.object(make_game, "run", side_effect=run), \
                 mock.patch.object(make_game, "log", side_effect=logs.append), contextlib.redirect_stderr(err):
             try:
-                make_game.pipelines(str(self.work), str(self.out), jobs=2)
+                make_game.pipelines(str(self.work), str(self.out), jobs=jobs)
             except SystemExit as exc:
                 return exc.code, logs, err.getvalue()
         return 0, logs, err.getvalue()
@@ -135,8 +141,12 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertTrue(all(r["args"][r["args"].index("--jobs") + 1] == "2" for r in completed))
 
     def test_collective_memory_crash_splits_without_skipping_healthy_modules(self):
-        code, logs, err = self.invoke({"max_batch": 2})
+        with mock.patch.object(make_game, "pipeline_names", wraps=make_game.pipeline_names) as read_index:
+            code, logs, err = self.invoke({"max_batch": 2})
         self.assertEqual(code, 0, err)
+        read_index.assert_called_once_with(str(self.spirv))
+        probes = [a for a in self.commands if a[a.index("--jobs") + 1] == "1"]
+        self.assertEqual([int(a[a.index("--start") + 1]) for a in probes], [0, 1, 3, 4])
         # Diagnostic one-module probes are also successful; the final bounded work must still cover every name.
         checked = {n for row in self.calls("completed") for n in row["active"]}
         self.assertEqual(checked, set(self.names))
@@ -223,6 +233,42 @@ class PipelineBatchesTest(unittest.TestCase):
         self.assertEqual(len(self.commands), 1)
         self.assertNotIn("--start", self.commands[0])
         self.assertNotIn("--count", self.commands[0])
+
+    def test_legacy_checker_retries_ambiguous_parallel_failure_with_one_worker(self):
+        code, _, err = self.invoke({"parallel_failure": True}, range_support=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([a[a.index("--jobs") + 1] for a in self.commands], ["2", "1"])
+        self.assertTrue(all("--start" not in a and "--count" not in a for a in self.commands))
+        self.assertEqual([row["active"] for row in self.calls("completed")], [self.names])
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+
+    def test_legacy_serial_failure_with_several_names_preserves_the_report(self):
+        code, _, err = self.invoke({"max_batch": 1}, range_support=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("--start", err)
+        self.assertIn("--count", err)
+        self.assertEqual(len(self.commands), 2)
+        self.assertTrue(all("--start" not in a and "--count" not in a for a in self.commands))
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+        report = (self.out / "pipeline_inflight.txt").read_text(encoding="utf-8")
+        self.assertEqual(report.splitlines(), [n + "\tpipeline" for n in self.names[:2]])
+
+    def test_legacy_checker_without_job_control_keeps_ambiguous_names_out_of_the_skip_file(self):
+        code, _, err = self.invoke({"max_batch": 1, "no_job_option": True}, range_support=False, jobs=None)
+        self.assertNotEqual(code, 0)
+        self.assertIn("pipeline_inflight.txt", err)
+        self.assertEqual(len(self.commands), 1)
+        self.assertNotIn("--jobs", self.commands[0])
+        self.assertFalse((self.out / "pipeline_crashes.txt").exists())
+
+    def test_legacy_serial_retry_skips_only_the_single_module_it_identifies(self):
+        code, _, err = self.invoke({"parallel_failure": True, "crasher": self.names[1]}, range_support=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn(self.names[1], err)
+        self.assertEqual([a[a.index("--jobs") + 1] for a in self.commands], ["2", "1", "1"])
+        self.assertTrue(all("--start" not in a and "--count" not in a for a in self.commands))
+        self.assertEqual((self.out / "pipeline_crashes.txt").read_text(encoding="utf-8"), self.names[1] + "\n")
+        self.assertEqual([row["active"] for row in self.calls("completed")], [self.names[:1] + self.names[2:]])
 
     def test_small_indices_keep_the_single_run(self):
         self.write_index(self.names[:2])
