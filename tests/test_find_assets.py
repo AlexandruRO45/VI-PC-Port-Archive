@@ -51,6 +51,16 @@ class TestFindAssets(unittest.TestCase):
             self.assertIn("cs_big.obj", output)
             self.assertNotIn("cs_alpha.obj", output)
 
+    def test_large_finite_min_size_does_not_overflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._create_tree(root)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = find_assets.main(["--work", str(root), "--min-size", "1e308"])
+            self.assertEqual(code, 0)
+            self.assertIn("Found 0 matching .obj models", out.getvalue())
+
     def test_invalid_cli_arguments_rejected(self) -> None:
         for bad_args in (
             ["--work", ".", "--top", "-1"],
