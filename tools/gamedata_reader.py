@@ -262,14 +262,26 @@ def documents(targets):
 
 
 def _json_value(value):
-    """Keep non-finite float values distinguishable in strict JSON."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    if isinstance(value, dict):
-        return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
-    return value
+    """Convert non-finite floats for strict JSON without copying unchanged containers."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+
+    is_dict = isinstance(value, dict)
+    if is_dict:
+        items = value.items()
+    elif isinstance(value, (list, tuple)):
+        items = enumerate(value)
+    else:
+        return value
+
+    updated = None
+    for key, item in items:
+        converted = _json_value(item)
+        if converted is not item:
+            if updated is None:
+                updated = value.copy() if is_dict else list(value)
+            updated[key] = converted
+    return value if updated is None else updated
 
 
 def run(targets, root_filter=None, out_dir=None, reader=None):

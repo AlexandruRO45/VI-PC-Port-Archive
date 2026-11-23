@@ -92,6 +92,18 @@ class Conventions(unittest.TestCase):
             self.assertEqual(R.parse_scalar(text), want, text)
             self.assertIs(type(R.parse_scalar(text)), type(want), text)
 
+    def test_json_export_only_copies_containers_with_nonfinite_values(self):
+        finite = {"positions": [(1.0, 2.0)]}
+        self.assertIs(R._json_value(finite), finite)
+
+        nonfinite = [float("inf")]
+        value = {"finite": finite, "nonfinite": nonfinite}
+        exported = R._json_value(value)
+
+        self.assertIs(exported["finite"], finite)
+        self.assertEqual(exported["nonfinite"], ["inf"])
+        self.assertEqual(value["nonfinite"], [float("inf")])
+
     def test_vector_array_must_be_whole(self):
         with self.assertRaises(ValueError):
             R.parse_content("vec3v_array", "1 2 3 4")
