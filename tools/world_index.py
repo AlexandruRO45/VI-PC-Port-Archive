@@ -797,6 +797,11 @@ def main(argv=None):
                ("--entities-out", a.entities_out))
     agg = ArchetypeCounts() if a.archetypes_out else None
     try:
+        # A 0-byte file is neither an RPF9 archive nor a carved 0x7a resource, and every other RPF9
+        # scanner (anim_index, rbf0_index, rpf9_carve, restofworld_index) refuses one. Scanning it
+        # wrote files:1, resources:0 and exited 0, which a build script reads as a valid empty world.
+        if os.path.isfile(a.path) and os.path.getsize(a.path) == 0:
+            raise ValueError(f"{a.path}: empty file")
         # Check the same inputs the directory scan will read, before the streaming report exists.
         directory_files = list(_directory_files(a.path)) if os.path.isdir(a.path) else None
         _check_report_paths(ap, reports, a.path, directory_files)
