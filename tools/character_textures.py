@@ -116,8 +116,9 @@ def _shader_id(value: object) -> str | None:
 
 
 def _texture_name(value: object) -> str:
-    text = _one_line(value)
-    return text or "-"
+    if value is None:
+        return "-"
+    return _one_line(value) or "-"
 
 
 def model_name(model: dict, path: str) -> str:

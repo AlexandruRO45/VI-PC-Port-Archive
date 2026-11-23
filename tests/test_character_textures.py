@@ -201,6 +201,24 @@ class CharacterTextureTests(unittest.TestCase):
                 self.assertEqual([(r["texture"], r["asset_key"]) for r in csv.DictReader(f)],
                                  [(name_hash, key) for key in [*keys, ""]] + [("-", "")])
 
+    def test_unnamed_texture_bindings_use_the_missing_value_marker(self):
+        refs = [{"Param": "C8E8C282"}, {"Name": None}, {"Name": "  "},
+                {"Name": "None"}, {"AssetKey": "FEDCBA9876543210"}]
+        expected = ["-", "-", "-", "None", "FEDCBA9876543210"]
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{"Textures": refs}]))
+            report_path = pathlib.Path(td) / "report.json"
+            csv_path = pathlib.Path(td) / "report.csv"
+            result = run_tool(path, "--json", report_path, "--csv", csv_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            with csv_path.open(encoding="utf-8", newline="") as f:
+                csv_textures = [row["texture"] for row in csv.DictReader(f)]
+            self.assertEqual([row[4] for row in table(result.stdout)], expected)
+            self.assertEqual([row["texture"] for row in report["rows"]], expected)
+            self.assertEqual(csv_textures, expected)
+
     def test_asset_key_requires_an_explicit_64_bit_identity(self):
         refs = [{"id64": "0xfedcba9876543210"}, {"AssetKey": 0}, {"asset_key": 2**64 - 1},
                 {"Id64": "12345678"}, {"Id64": 2**64}, {"Id64": True},
