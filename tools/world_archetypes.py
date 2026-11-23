@@ -78,6 +78,43 @@ def schema(b):
     return structs, blocks
 
 
+# Fixed-width readers for the member types WI._value and _value decode: type -> (struct, bytes read, values read).
+# A block of archetypes is every field of every instance, so ``_decode_block`` unpacks with these prebuilt Structs
+# instead of dispatching on the member type for each field of each instance.
+_READERS = {ty: (struct.Struct(fmt), width, 1) for ty, fmt, width in (
+    (0x10, "<b", 1), (0x11, "<B", 1), (0x12, "<h", 2), (0x13, "<H", 2), (0x14, "<i", 4), (0x15, "<I", 4),
+    (0x4A, "<I", 4), (0x21, "<f", 4), (0x08, "<Q", 8), (0x4F, "<Q", 8), (0x60, "<B", 1), (ENUM, "<I", 4))}
+_READERS.update({ty: (struct.Struct("<%df" % count), 4 * count, count) for ty, count in
+                 ((0x32, 3), (0x33, 3), (0x34, 4))})
+
+
+def _decode_block(out, b, off, size, ssize, members, kind):
+    """Append the rows of one block of ``size // ssize`` instances to ``out``; False, with ``out`` untouched, when an
+    instance reaches past the buffer.
+
+    The same rows, in the same key order, as reading each field with ``_value`` and dropping the ones without a
+    value (a member of a type no reader exists for gives none). A block whose last instance would need a field
+    beyond the buffer is left to the per-field path, which clips each field on its own.
+    """
+    plan, reach = [], 0
+    for key, h in FIELDS.items():
+        member = members.get(h)
+        reader = None if member is None else _READERS.get(member[1])
+        if reader is not None:
+            plan.append((key, reader[0].unpack_from, member[0], reader[2] > 1))
+            reach = max(reach, member[0] + reader[1])
+    if off + size - ssize + reach > len(b):
+        return False
+    for base in range(off, off + size, ssize):
+        row = {}
+        for key, unpack, at, vector in plan:
+            v = unpack(b, base + at)
+            row[key] = list(v) if vector else v[0]
+        row["kind"] = kind
+        out.append(row)
+    return True
+
+
 def _value(b, base, member):
     if member is not None and member[1] == ENUM:
         p = base + member[0]
@@ -97,6 +134,8 @@ def parse_archetypes(b):
             continue
         ssize, members = structs[name]
         if not ssize or size % ssize or off + size > len(b):
+            continue
+        if _decode_block(out, b, off, size, ssize, members, kind):
             continue
         for k in range(size // ssize):
             base = off + k * ssize
@@ -173,13 +212,67 @@ def world_box(entity, lo, hi, conjugate, use_scale):
     return out_lo, out_hi
 
 
-def _union_error(entities, defs, ref_lo, ref_hi, conjugate, use_scale):
-    lo, hi = [math.inf] * 3, [-math.inf] * 3
+def _union_bounds(entities, defs, conjugate, use_scale):
+    """((x, y, z) minimum, (x, y, z) maximum) of ``world_box`` over ``entities``.
+
+    ``world_box`` with its work done inline for every entity: one rotation matrix and one box, and no lists per
+    entity. The operations and their order are the same, so each bound is bit-identical to ``world_box``'s; the
+    ``sum()`` calls stay, because what they return depends on the Python version (compensated since 3.12).
+    """
+    inf = math.inf
+    lox = loy = loz = inf
+    hix = hiy = hiz = -inf
+    sqrt = math.sqrt
     for e in entities:
         d = defs[e["archetype"]]
-        a, b = world_box(e, d["bb_min"], d["bb_max"], conjugate, use_scale)
-        for i in range(3):
-            lo[i], hi[i] = min(lo[i], a[i]), max(hi[i], b[i])
+        lo, hi = d["bb_min"], d["bb_max"]
+        x, y, z, w = e.get("rotation") or (0.0, 0.0, 0.0, 1.0)
+        n = sqrt(x * x + y * y + z * z + w * w) or 1.0
+        x, y, z, w = x / n, y / n, z / n, w / n
+        if conjugate:
+            x, y, z = -x, -y, -z
+        xx, yy, zz = x * x, y * y, z * z
+        xy, xz, yz, xw, yw, zw = x * y, x * z, y * z, x * w, y * w, z * w
+        r00, r01, r02 = 1 - 2 * (yy + zz), 2 * (xy - zw), 2 * (xz + yw)
+        r10, r11, r12 = 2 * (xy + zw), 1 - 2 * (xx + zz), 2 * (yz - xw)
+        r20, r21, r22 = 2 * (xz - yw), 2 * (yz + xw), 1 - 2 * (xx + yy)
+        if use_scale:
+            sxy, sz = _scale(e, "scale_xy"), _scale(e, "scale_z")
+        else:
+            sxy = sz = 1.0
+        c0 = (lo[0] + hi[0]) * 0.5 * sxy
+        c1 = (lo[1] + hi[1]) * 0.5 * sxy
+        c2 = (lo[2] + hi[2]) * 0.5 * sz
+        e0 = (hi[0] - lo[0]) * 0.5 * abs(sxy)
+        e1 = (hi[1] - lo[1]) * 0.5 * abs(sxy)
+        e2 = (hi[2] - lo[2]) * 0.5 * abs(sz)
+        p = e.get("position") or (0.0, 0.0, 0.0)
+        wc = p[0] + sum((r00 * c0, r01 * c1, r02 * c2))
+        we = sum((abs(r00) * e0, abs(r01) * e1, abs(r02) * e2))
+        a, b = wc - we, wc + we
+        if a < lox:
+            lox = a
+        if b > hix:
+            hix = b
+        wc = p[1] + sum((r10 * c0, r11 * c1, r12 * c2))
+        we = sum((abs(r10) * e0, abs(r11) * e1, abs(r12) * e2))
+        a, b = wc - we, wc + we
+        if a < loy:
+            loy = a
+        if b > hiy:
+            hiy = b
+        wc = p[2] + sum((r20 * c0, r21 * c1, r22 * c2))
+        we = sum((abs(r20) * e0, abs(r21) * e1, abs(r22) * e2))
+        a, b = wc - we, wc + we
+        if a < loz:
+            loz = a
+        if b > hiz:
+            hiz = b
+    return (lox, loy, loz), (hix, hiy, hiz)
+
+
+def _union_error(entities, defs, ref_lo, ref_hi, conjugate, use_scale):
+    lo, hi = _union_bounds(entities, defs, conjugate, use_scale)
     err = max(max(abs(lo[i] - ref_lo[i]), abs(hi[i] - ref_hi[i])) for i in range(3))
     inside = all(ref_lo[i] - TOLERANCE <= lo[i] and hi[i] <= ref_hi[i] + TOLERANCE for i in range(3))
     return err, inside
