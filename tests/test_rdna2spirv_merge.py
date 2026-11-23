@@ -43,6 +43,14 @@ class MergeShardPartsTest(unittest.TestCase):
         self.marker(1, 2)
         self.assertEqual(R.merge_shard_parts(str(self.out)), {"a": {"r": 1}, "b": {"r": 2}})
 
+    def test_a_complete_set_of_empty_parts_is_refused(self):
+        # Every shard finished but translated nothing: index.json must not say the corpus is done.
+        self.part(0, {})
+        self.part(1, {})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        self.assertIn("holds no shaders", self.merge_error())
+
     def test_missing_part_is_refused(self):
         self.part(0, {"a": {}})
         self.marker(0, 3)
@@ -166,6 +174,17 @@ class MergeCliTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", str(TOOL), str(self.out), "--out", str(self.out), "--merge"],
                               capture_output=True, text=True, timeout=120)
 
+    def test_cli_refuses_a_complete_set_of_empty_parts(self):
+        self.part(0, {})
+        self.part(1, {})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("holds no shaders", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
     def test_cli_refuses_a_partial_set_and_writes_no_index(self):
         self.part(0, {"a": {}})
         self.marker(0, 2)
@@ -174,6 +193,17 @@ class MergeCliTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("ERROR: incomplete shard set", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((self.out / "index.json").exists())
+
+    def test_cli_removes_the_previous_index_when_the_merge_fails(self):
+        # The old index describes the previous corpus; after a failed merge the parts no longer match it.
+        (self.out / "index.json").write_text(json.dumps({"old": {}}), encoding="utf-8")
+        self.part(0, {"a": {}})
+        self.marker(0, 2)
+        self.marker(1, 2)
+        result = self.run_merge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("ERROR: incomplete shard set", result.stderr)
         self.assertFalse((self.out / "index.json").exists())
 
     def test_cli_merges_a_complete_set(self):
@@ -255,10 +285,11 @@ class ShardRoundTripTest(unittest.TestCase):
         self.assertTrue((self.out / "index.part1.json").is_file())
         self.assertTrue((self.out / "shard1.json").is_file())
 
+        # Both shards finished, but over an empty source they hold nothing: the merge refuses to publish {}.
         full = self.run_tool("--merge")
-        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
-        self.assertIn("merged 0 entries", full.stdout)
-        self.assertEqual(json.loads((self.out / "index.json").read_text(encoding="utf-8")), {})
+        self.assertEqual(full.returncode, 2, full.stdout + full.stderr)
+        self.assertIn("holds no shaders", full.stderr)
+        self.assertFalse((self.out / "index.json").exists())
 
 
 if __name__ == "__main__":
