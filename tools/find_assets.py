@@ -55,10 +55,9 @@ def scan_assets(work_dir: Path, category: str, min_kb: float, top_n: int) -> int
     pattern = CATEGORIES.get(category)
     matches = []
 
-       for obj_path in assets_dir.rglob("*"):
+    for obj_path in assets_dir.rglob("*"):
         if not obj_path.is_file() or obj_path.suffix.lower() != ".obj":
             continue
-
         try:
             size = obj_path.stat().st_size
         except OSError:
