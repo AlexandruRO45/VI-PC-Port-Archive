@@ -247,6 +247,20 @@ class GpuLog(unittest.TestCase):
         self.assertIn("want 0x00000007", rows[2][2])
         self.assertEqual(summary, (2, 3, 1))
 
+    def test_gpu_log_with_equals_in_path_or_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = os.path.join(tmp, "capture")
+            full = prefix + "=result.log"
+            for path, case in ((prefix, "prefix_case"), (full, "full_case")):
+                with open(path, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(f"{case:20} ok\n1 of 1 pass, 0 skipped\n")
+            col = pd.Collector()
+            with mock.patch.object(pd, "last_commit_time", return_value=None):
+                pd.collect_gpu(col, [full, full + "=gpu=driver", prefix + "=plain", os.path.join(tmp, "missing")])
+        self.assertEqual([(c["name"], c["group"]) for c in col.components],
+                         [("full_case", "capture=result"), ("full_case", "gpu=driver"), ("prefix_case", "plain")])
+        self.assertEqual([s["status"] for s in col.sources], ["ok", "ok", "ok", "missing"])
+
     def test_panel_groups_by_gpu_label(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = os.path.join(tmp, "check.txt")
