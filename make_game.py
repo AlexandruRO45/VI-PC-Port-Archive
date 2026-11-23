@@ -1533,7 +1533,8 @@ WAVE64_MODES = ("auto", "on", "off")
 # The translator's fallback flags make_game.py can forward, and the argparse attribute each one reads.
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
-                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"))
+                  ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
+                  ("--bias-minlod-grad", "bias_minlod_grad"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -1670,6 +1671,27 @@ def runtime_gpu_barycentric_fallback():
 def barycentric_fallback_override():
     """LEONIDA_BARY_FALLBACK=1/0 forces the same barycentric path as the GPU test runner; None leaves it automatic."""
     v = (os.environ.get("LEONIDA_BARY_FALLBACK") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def runtime_gpu_bias_minlod_grad():
+    """Whether the selected Vulkan GPU's driver drops MinLod from a Bias|MinLod sample (Intel's Windows driver, #7030),
+    or None when it can't be told."""
+    try:
+        v = runtime_gpu_info().get("bias_minlod_grad")
+        return v if isinstance(v, bool) else None
+    except (AttributeError, TypeError):
+        return None
+
+
+def bias_minlod_grad_override():
+    """LEONIDA_BIAS_MINLOD_GRAD=1/0 forces the Grad|MinLod form on or off, as the GPU test runner reads it; None leaves
+    it automatic."""
+    v = (os.environ.get("LEONIDA_BIAS_MINLOD_GRAD") or "").strip().lower()
     if v in ("1", "true", "yes", "on"):
         return True
     if v in ("0", "false", "no", "off"):
@@ -2682,6 +2704,10 @@ def main() -> int:
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
+    ap.add_argument("--bias-minlod-grad", action="store_true",
+                    help="sample image_sample_b_cl / _c_b_cl in pixel shaders as Grad|MinLod (derivatives scaled "
+                         "by 2^bias) instead of Bias|MinLod; on by itself on Intel's Windows driver, which drops "
+                         "that MinLod (#7030)")
     ap.add_argument("--f16-interp-fallback", action="store_true",
                     help="16-bit interpolation from decoded halves the vertex/mesh shader exports instead of "
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
@@ -2785,6 +2811,20 @@ def main() -> int:
                     a.bary_fallback = True
                 elif bary_fallback is None:
                     a.bary_fallback = keep_recorded_fallback("--bary-fallback", work)
+    if "shaders" in stages and not a.bias_minlod_grad:
+        override = bias_minlod_grad_override()
+        if override is not None:
+            log(f"shaders: LEONIDA_BIAS_MINLOD_GRAD={int(override)} "
+                + ("forces --bias-minlod-grad" if override else "keeps Bias|MinLod samples"))
+            a.bias_minlod_grad = override
+        else:
+            bias_grad = runtime_gpu_bias_minlod_grad()
+            if bias_grad is True:
+                log("shaders: Intel's Windows driver drops MinLod from a Bias|MinLod sample (#7030): translating "
+                    "with --bias-minlod-grad")
+                a.bias_minlod_grad = True
+            elif bias_grad is None:
+                a.bias_minlod_grad = keep_recorded_fallback("--bias-minlod-grad", work)
     if "shaders" in stages and not a.pc_tail_ubo:
         need_pc = 152 if a.mesh_compute else 144
         max_pc = runtime_gpu_max_push_constants()

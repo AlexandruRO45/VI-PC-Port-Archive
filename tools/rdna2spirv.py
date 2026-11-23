@@ -71,6 +71,12 @@ FMA_EXACT = False        # --fma exact: fused multiply-adds are emulated from si
 # maintenance8 outside gather. Implicit-LOD samples become Grad samples with the derivatives of the original
 # coordinate, so a per-pixel offset doesn't change the LOD. Gathers keep their Offset (shaderImageGatherExtended).
 TEXEL_OFFSET_FALLBACK = False
+# --bias-minlod-grad: a pixel-shader image_sample_b_cl / image_sample_c_b_cl (an implicit-LOD sample with both a bias
+# and a min-LOD clamp) becomes an explicit Grad|MinLod sample whose gradients are the coordinate's quad derivatives
+# times 2^bias. That is the same LOD (log2 of the scaled footprint is lambda + bias) and anisotropy, without the
+# Bias|MinLod operand pair, whose MinLod Intel's Windows driver drops (#7030: Arc 140V, 101.9175). Grad samples run
+# slower than implicit ones on some GPUs, so it is a fallback, not the default.
+BIAS_MINLOD_GRAD = False
 FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPreserve, for drivers without the property
 # --mesh-compute: mesh shaders become compute shaders (same workgroup size and code) for devices without
 # VK_EXT_mesh_shader. Instead of SetMeshOutputs and the mesh outputs, the epilogue writes the vertex and primitive
@@ -12812,6 +12818,10 @@ class Gen:
                 bias_lod = self.tmp()
                 self.emit(f"{bias_lod} = OpExtInst %float %glsl FMax {bias} {minlod}")
             grads_fb = None
+            grads_bm = None
+            if (BIAS_MINLOD_GRAD and implicit and minlod is not None and kind in ("_b", "_c_b")
+                    and not (off is not None and TEXEL_OFFSET_FALLBACK)):
+                grads_bm = self.bias_grads(uv, grad_width, ncoord, bias)
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 fb_lod = bias_lod if (not implicit and kind in ("_b", "_c_b")) else lod
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, fb_lod, bias,
@@ -12828,6 +12838,12 @@ class Gen:
                     masks.append("MinLod")
                     vals.append(minlod)
                 return f" {'|'.join(masks)} {' '.join(vals)}" if masks else ""
+
+            def grad_minlod(grads):
+                """Grad (0x4), Offset (0x10), MinLod (0x80) in SPIR-V mask order, for --bias-minlod-grad."""
+                if off is not None:
+                    return f" Grad|Offset|MinLod {grads[0]} {grads[1]} {off} {minlod}"
+                return f" Grad|MinLod {grads[0]} {grads[1]} {minlod}"
             if kind == "_d":
                 if minlod is not None:
                     self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad|MinLod {grads[0]} {grads[1]} {minlod}")
@@ -12836,6 +12852,8 @@ class Gen:
             elif grads_fb is not None and not kind.startswith("_c"):
                 self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv} Grad{'|MinLod' if minlod else ''} "
                           f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
+            elif grads_bm is not None and kind == "_b":
+                self.emit(f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{grad_minlod(grads_bm)}")
             elif kind == "":
                 self.emit(f"{res} = OpImageSampleImplicitLod %v4float {si} {uv}{opnd('', '')}" if self.stage == "ps" else
                           f"{res} = OpImageSampleExplicitLod %v4float {si} {uv}{opnd('Lod', lod_zero)}")
@@ -12850,6 +12868,8 @@ class Gen:
                     # _c / _c_b outside the PS have no derivatives (base LOD 0, or bias / max(bias, minlod) for _c_b)
                     d_lod = f[ncoord] if kind == "_c_l" else (bias_lod if kind == "_c_b" else lod_zero)
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{opnd('Lod', d_lod)}")
+                elif grads_bm is not None:
+                    self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref}{grad_minlod(grads_bm)}")
                 elif grads_fb is not None:
                     self.emit(f"{d} = OpImageSampleDrefExplicitLod %float {si} {uv} {ref} Grad{'|MinLod' if minlod else ''} "
                               f"{grads_fb[0]} {grads_fb[1]}{' ' + minlod if minlod else ''}")
@@ -13610,6 +13630,28 @@ class Gen:
         self.emit(f"{m2} = OpFMul %float {d2} {j}")
         self.emit(f"{r} = OpFAdd %float {s} {m2}")
         return r
+
+    def bias_grads(self, uv, grad_width, ncoord, bias):
+        """--bias-minlod-grad: the quad derivatives of the sample's spatial coordinates (the array layer has none),
+        scaled by 2^bias. Sampling with them as Grad gives the LOD an implicit sample with that bias would compute:
+        lambda = log2(max footprint), and scaling the footprint by 2^bias adds bias to it. The sampler's own LOD bias
+        and the min/max LOD clamps apply to Grad samples the same way."""
+        vf = {1: "%float", 2: "%v2float", 3: "%v3float"}[grad_width]
+        uvs = uv
+        if ncoord > grad_width:                           # 2D array / cube view: (u, v) of (u, v, layer)
+            uvs = self.tmp()
+            self.emit(f"{uvs} = OpVectorShuffle %v2float {uv} {uv} 0 1")
+        dx, dy, e, sdx, sdy = (self.tmp() for _ in range(5))
+        self.emit(f"{dx} = OpDPdx {vf} {uvs}")
+        self.emit(f"{dy} = OpDPdy {vf} {uvs}")
+        self.emit(f"{e} = OpExtInst %float %glsl Exp2 {bias}")
+        if grad_width == 1:
+            self.emit(f"{sdx} = OpFMul %float {dx} {e}")
+            self.emit(f"{sdy} = OpFMul %float {dy} {e}")
+        else:
+            self.emit(f"{sdx} = OpVectorTimesScalar {vf} {dx} {e}")
+            self.emit(f"{sdy} = OpVectorTimesScalar {vf} {dy} {e}")
+        return sdx, sdy
 
     def texel_offset_fold(self, img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias, s_op):
         """--texel-offset-fallback: return (uv + offset / size of the sampled level, implicit-LOD gradients or None).
@@ -17974,6 +18016,10 @@ def main():
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="image_sample*_o without VK_KHR_maintenance8 (e.g. NVIDIA Pascal): fold the texel offset into "
                          "the coordinate instead of the Offset operand")
+    ap.add_argument("--bias-minlod-grad", action="store_true",
+                    help="pixel-shader image_sample_b_cl / image_sample_c_b_cl become Grad|MinLod samples with the "
+                         "derivatives scaled by 2^bias, not Bias|MinLod, whose MinLod Intel's Windows driver drops "
+                         "(#7030)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
@@ -18027,8 +18073,9 @@ def main():
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, BIAS_MINLOD_GRAD
     PC_TAIL_UBO = a.pc_tail_ubo
+    BIAS_MINLOD_GRAD = a.bias_minlod_grad
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
     SHADER_CLOCK = a.shader_clock == "khr"

@@ -21,6 +21,31 @@ DEVICE_64 = "device: X (subgroup 32..64)\n"
 CONFIRMED = "compute subgroup size: 64\n"
 
 
+class BiasMinLodGradSelection(unittest.TestCase):
+    """#7030: --bias-minlod-grad follows LEONIDA_BIAS_MINLOD_GRAD, else vk_subgroup_info's bias_minlod_grad."""
+
+    def setUp(self):
+        rgt._BIAS_MINLOD_GRAD.clear()
+
+    def test_env_override_beats_the_probe(self):
+        proc = SimpleNamespace(stdout='{"bias_minlod_grad": true, "driver_id": 5}\n')
+        with patch.object(rgt.subprocess, "run", return_value=proc) as run:
+            with patch.dict(os.environ, {"LEONIDA_BIAS_MINLOD_GRAD": "0"}, clear=False):
+                self.assertIs(rgt.bias_minlod_grad(), False)
+            with patch.dict(os.environ, {"LEONIDA_BIAS_MINLOD_GRAD": "1"}, clear=False):
+                self.assertIs(rgt.bias_minlod_grad(), True)
+            run.assert_not_called()
+
+    def test_probe_decides_when_env_is_unset(self):
+        for out, want in (('{"bias_minlod_grad": true}\n', True), ('{"bias_minlod_grad": false}\n', False),
+                          ("not json\n", False)):
+            with self.subTest(out=out), patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("LEONIDA_BIAS_MINLOD_GRAD", None)
+                rgt._BIAS_MINLOD_GRAD.clear()
+                with patch.object(rgt.subprocess, "run", return_value=SimpleNamespace(stdout=out)):
+                    self.assertIs(rgt.bias_minlod_grad(), want)
+
+
 class BarycentricFallbackSelection(unittest.TestCase):
     def setUp(self):
         rgt._BARYCENTRIC_FALLBACK.clear()

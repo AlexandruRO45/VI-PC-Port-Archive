@@ -315,6 +315,18 @@ def bary_fallback() -> bool:
     return _device_barycentric_fallback() is True
 
 
+def bias_minlod_grad() -> bool:
+    """LEONIDA_BIAS_MINLOD_GRAD=1 (or 0): translate with --bias-minlod-grad, so ps_texture_b_cl samples with
+    Grad|MinLod instead of Bias|MinLod. Unset, it is on where tools/vk_subgroup_info.py reports Intel's Windows driver,
+    which drops that MinLod (#7030)."""
+    v = (os.environ.get("LEONIDA_BIAS_MINLOD_GRAD") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    return _device_bias_minlod_grad() is True
+
+
 def f16_interp_fallback() -> bool:
     """LEONIDA_F16_INTERP_FALLBACK=1 (or 0): translate with --f16-interp-fallback, so ps_interp_f16_high reads the f16
     halves its producer exports decoded instead of PerVertexKHR inputs. Unset, it is on where the device can't
@@ -329,6 +341,7 @@ def f16_interp_fallback() -> bool:
 
 _PER_VERTEX = []
 _BARYCENTRIC_FALLBACK = []
+_BIAS_MINLOD_GRAD = []
 
 
 def _device_per_vertex():
@@ -358,6 +371,20 @@ def _device_barycentric_fallback():
             pass
         _BARYCENTRIC_FALLBACK.append(answer)
     return _BARYCENTRIC_FALLBACK[0]
+
+
+def _device_bias_minlod_grad():
+    """bias_minlod_grad from tools/vk_subgroup_info.py (Intel's Windows driver, #7030), cached per suite."""
+    if not _BIAS_MINLOD_GRAD:
+        answer = None
+        try:
+            r = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "vk_subgroup_info.py")],
+                               capture_output=True, text=True, timeout=60)
+            answer = json.loads(r.stdout.strip().splitlines()[-1]).get("bias_minlod_grad")
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+        _BIAS_MINLOD_GRAD.append(answer)
+    return _BIAS_MINLOD_GRAD[0]
 
 
 def w64_emulated() -> bool:
@@ -911,6 +938,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--f16-interp-fallback")
         if TEXOFF_FALLBACK:   # image_sample*_o: offset folded into the coordinate, no VK_KHR_maintenance8
             cmd.append("--texel-offset-fallback")
+        if bias_minlod_grad():   # Bias|MinLod as Grad|MinLod: Intel's Windows driver drops that MinLod (#7030)
+            cmd.append("--bias-minlod-grad")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1

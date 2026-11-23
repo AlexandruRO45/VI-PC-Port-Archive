@@ -5,7 +5,8 @@ Standard library only (spirv-val is used when it is on PATH); no GPU, no LLVM, n
 GPU tests: ps_texture_cl and ps_texture_b_cl (two-mip texture, check.py GRADIENT_TESTS / CLAMP_TESTS). Here the shape
 of the SPIR-V: the clamp is the component after the coordinates and becomes MinLod (with Bias, with the compare, after
 Offset), outside the pixel stage the LOD is max(0, clamp), a16 packs the clamp with the coordinates, and the module
-declares MinLod and validates.
+declares MinLod and validates. Under --bias-minlod-grad (#7030), _b_cl and _c_b_cl in the PS are Grad|MinLod samples
+with the coordinate's derivatives scaled by 2^bias.
 """
 import os
 import re
@@ -14,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import support
 
@@ -123,6 +125,80 @@ class SampleCl(unittest.TestCase):
                         subprocess.run(["spirv-as", "--target-env", "vulkan1.2", a, "-o", b], check=True)
                         subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", b],
                                        check=True)
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val on PATH")
+    def test_bias_minlod_grad_modules_validate(self):
+        cases = [("image_sample_b_cl", "v[0:3]", "v[4:7]", 0xf, D2), ("image_sample_c_b_cl", "v9", "v[4:8]", 1, D2),
+                 ("image_sample_b_cl_o", "v[0:3]", "v[4:8]", 0xf, D2),
+                 ("image_sample_b_cl", "v[0:3]", "v[4:8]", 0xf, "dim:SQ_RSRC_IMG_2D_ARRAY")]
+        for op, dst, regs, dmask, dim in cases:
+            with self.subTest(op=op, dim=dim), mock.patch.object(support.rdna2spirv, "BIAS_MINLOD_GRAD", True):
+                spv = translate("ps_val", f"{op} {dst}, {regs}, {DESC} dmask:{dmask:#x} {dim}")
+                self.assertIn("Grad", samples(spv)[0])
+                with tempfile.TemporaryDirectory() as tmp:
+                    a, b = os.path.join(tmp, "m.spvasm"), os.path.join(tmp, "m.spv")
+                    with open(a, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(spv)
+                    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", a, "-o", b], check=True)
+                    subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", b],
+                                   check=True)
+
+
+class BiasMinLodGrad(unittest.TestCase):
+    """--bias-minlod-grad (#7030): Intel's Windows driver drops MinLod from an implicit Bias|MinLod sample, so a PS
+    _b_cl / _c_b_cl becomes Grad|MinLod with dPdx, dPdy of the coordinate times exp2(bias): the same LOD."""
+
+    def setUp(self):
+        patcher = mock.patch.object(support.rdna2spirv, "BIAS_MINLOD_GRAD", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_b_cl_is_grad_min_lod_scaled_by_exp2_of_the_bias(self):
+        spv = translate("ps_bcl", f"image_sample_b_cl v[0:3], v[4:7], {DESC} dmask:0xf {D2}")
+        (s,) = samples(spv)
+        self.assertRegex(s, r"= OpImageSampleExplicitLod %v4float %\w+ (%\w+) Grad\|MinLod (%\w+) (%\w+) (%\w+)$")
+        uv, gx, gy, minlod = re.search(r"%\w+ (%\w+) Grad\|MinLod (%\w+) (%\w+) (%\w+)$", s).groups()
+        self.assertEqual(source_vgpr(spv, minlod), 7)
+        self.assertNotIn("Bias", spv.split("OpFunction ")[-1].split("OpImageSample")[1])
+        e = re.search(r"^\s*(%\w+) = OpExtInst %float %glsl Exp2 (%\w+)$", spv, re.M)
+        self.assertIsNotNone(e)
+        self.assertEqual(source_vgpr(spv, e.group(2)), 4)          # the bias is the first address component
+        for g, d in ((gx, "OpDPdx"), (gy, "OpDPdy")):
+            m = re.search(rf"^\s*{re.escape(g)} = OpVectorTimesScalar %v2float (%\w+) {re.escape(e.group(1))}$",
+                          spv, re.M)
+            self.assertIsNotNone(m, g)
+            self.assertRegex(spv, rf"(?m)^\s*{re.escape(m.group(1))} = {d} %v2float {re.escape(uv)}$")
+
+    def test_c_b_cl_is_a_dref_grad_min_lod(self):
+        s = self.one("ps_cbcl", f"image_sample_c_b_cl v9, v[4:8], {DESC} dmask:0x1 {D2}")
+        self.assertRegex(s, r"= OpImageSampleDrefExplicitLod %float %\w+ %\w+ %\w+ Grad\|MinLod %\w+ %\w+ %\w+$")
+
+    def test_offset_sits_between_grad_and_min_lod(self):
+        s = self.one("ps_bclo", f"image_sample_b_cl_o v[0:3], v[4:8], {DESC} dmask:0xf {D2}")
+        self.assertRegex(s, r"= OpImageSampleExplicitLod %v4float %\w+ %\w+ Grad\|Offset\|MinLod %\w+ %\w+ %\w+ %\w+$")
+
+    def test_an_array_layer_has_no_derivative(self):
+        spv = translate("ps_bcla", f"image_sample_b_cl v[0:3], v[4:8], {DESC} dmask:0xf dim:SQ_RSRC_IMG_2D_ARRAY")
+        self.assertRegex(spv, r"(?m)= OpVectorShuffle %v2float (%\w+) \1 0 1$")
+        self.assertRegex(spv, r"(?m)= OpDPdx %v2float ")
+        self.assertNotRegex(spv, r"(?m)= OpDPdx %v3float ")
+
+    def test_other_forms_are_unchanged(self):
+        """Only Bias together with MinLod in the PS: no clamp, no bias, or no derivatives keep their usual form."""
+        cases = (("ps_b", "image_sample_b v[0:3], v[4:6]", r"ImplicitLod %v4float %\w+ %\w+ Bias %\w+$"),
+                 ("ps_cl", "image_sample_cl v[0:3], v[4:6]", r"ImplicitLod %v4float %\w+ %\w+ MinLod %\w+$"),
+                 ("vs_bcl", "image_sample_b_cl v[0:3], v[4:7]", r"ExplicitLod %v4float %\w+ %\w+ Lod %\w+$"))
+        for name, line, want in cases:
+            with self.subTest(shader=name):
+                self.assertRegex(self.one(name, f"{line}, {DESC} dmask:0xf {D2}"), want)
+
+    def one(self, name, line):
+        (s,) = samples(translate(name, line))
+        return s
+
+    def test_off_by_default(self):
+        with mock.patch.object(support.rdna2spirv, "BIAS_MINLOD_GRAD", False):
+            self.assertIn("Bias|MinLod", self.one("ps_bcl", f"image_sample_b_cl v[0:3], v[4:7], {DESC} dmask:0xf {D2}"))
 
 
 if __name__ == "__main__":

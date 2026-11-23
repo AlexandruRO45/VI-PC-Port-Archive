@@ -73,6 +73,21 @@ def barycentric_fallback():
         return False
 
 
+def bias_minlod_grad():
+    """LEONIDA_BIAS_MINLOD_GRAD=1/0, else tools/vk_subgroup_info.py's bias_minlod_grad (Intel's Windows driver, #7030)."""
+    v = (os.environ.get("LEONIDA_BIAS_MINLOD_GRAD") or "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    try:
+        r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "vk_subgroup_info.py")],
+                           capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout.strip().splitlines()[-1]).get("bias_minlod_grad") is True
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return False
+
+
 def asm_mattr(path):
     for ln in Path(path).read_text(encoding="utf-8").splitlines():
         s = ln.strip()
@@ -191,6 +206,8 @@ def translate_tests(work, names):
         cmd.append("--wave64-emulate")
     if barycentric_fallback():   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
+    if bias_minlod_grad():   # Bias|MinLod as Grad|MinLod: Intel's Windows driver drops that MinLod (#7030)
+        cmd.append("--bias-minlod-grad")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
         cmd += ["--fma", os.environ["LEONIDA_FMA"]]
     if os.environ.get("LEONIDA_F16_INTERP_FALLBACK") == "1":   # f16 interpolation without PerVertexKHR (MoltenVK)

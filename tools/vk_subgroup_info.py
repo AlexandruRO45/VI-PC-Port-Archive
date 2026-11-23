@@ -42,6 +42,13 @@ expected) in ps_bary, ps_persp_bary and ps_ij_computed, while the fallback passe
 The check keys on the PCI device ID and the driver ID, not on the driver version, so a fixed driver would still take
 the fallback (correct, one geometry-shader stage slower); LEONIDA_BARY_FALLBACK=0 turns it off.
 
+bias_minlod_grad is true for Intel's proprietary Windows driver (driver ID 5). #7030 found that driver 101.9175 on an
+Arc 140V (Xe2) drops the MinLod operand of an implicit-LOD sample that also has a Bias (ps_texture_b_cl reads mip 0
+where the clamp asks for mip 1), while MinLod alone, Bias alone and Grad|MinLod are right. There the shaders are
+translated with --bias-minlod-grad, which samples those with Grad|MinLod instead. The check keys on the driver ID, not
+on the driver version or the GPU, so a fixed driver still takes the Grad form (the same LOD, a slower sample);
+LEONIDA_BIAS_MINLOD_GRAD=0 turns it off.
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
@@ -67,6 +74,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
+VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS = 5
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
 # Navi 10, Navi 14, and Navi 12 PCI IDs from Linux amdgpu's chipset table.
@@ -190,6 +198,11 @@ def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool
     component, #5933)."""
     return (driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
             or gfx90c_amd_windows(vendor_id, device_id, driver_id))
+
+
+def bias_minlod_grad(driver_id: int) -> bool:
+    """Intel's Windows driver, which drops MinLod from an implicit-LOD Bias|MinLod sample (#7030)."""
+    return driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
 
 
 def physical_devices(vk, instance):
@@ -355,6 +368,7 @@ def query(*, stage_caps=False) -> dict:
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
             "barycentric_fallback": barycentric_fallback(vendor, device, driver),
+            "bias_minlod_grad": bias_minlod_grad(driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,

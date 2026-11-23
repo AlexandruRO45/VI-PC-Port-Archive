@@ -798,6 +798,7 @@ class QueryTest(unittest.TestCase):
                     "native64": want_native64,
                     "per_vertex_inputs": True,
                     "barycentric_fallback": False,
+                    "bias_minlod_grad": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -828,6 +829,19 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(driver_id=driver))
                 self.assertIs(res["barycentric_fallback"], want)
         self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, 6)
+
+    def test_bias_minlod_grad_is_intels_windows_driver(self):
+        """#7030: Intel's Windows driver (driver ID 5) drops MinLod from Bias|MinLod; ANV, RADV, AMD and NVIDIA keep
+        it. Literal IDs, so a changed constant fails here."""
+        for label, vendor, driver, want in (("intel_windows", 0x8086, 5, True), ("anv", 0x8086, 6, False),
+                                            ("amd_windows", 0x1002, 1, False), ("radv", 0x1002, 3, False),
+                                            ("nvidia", 0x10DE, 4, False)):
+            with self.subTest(case=label):
+                self.assertIs(vk_info.bias_minlod_grad(driver), want)
+                res, _vk = self._run_query(FakeDevice(name="Intel Arc 140V", vendor_id=vendor, device_id=0x64A0,
+                                                      driver_id=driver))
+                self.assertIs(res["bias_minlod_grad"], want)
+        self.assertEqual(vk_info.VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS, 5)
 
     def test_barycentric_fallback_rejects_an_intel_windows_fake(self):
         """Intel Windows uses its Windows driver ID, not ANV; the fake must carry Intel's vendor ID."""

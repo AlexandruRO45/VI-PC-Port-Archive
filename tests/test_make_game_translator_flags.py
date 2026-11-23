@@ -183,7 +183,8 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None):
+    def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
+                 bias_minlod_grad=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -196,6 +197,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=barycentric_fallback), \
+                mock.patch("make_game.runtime_gpu_bias_minlod_grad", return_value=bias_minlod_grad), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
@@ -255,6 +257,32 @@ class MainWiringTest(unittest.TestCase):
             with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
                 self.assertIs(make_game.runtime_gpu_barycentric_fallback(), want)
 
+    def test_bias_minlod_grad_follows_the_intel_windows_probe(self):
+        """#7030: on by itself where vk_subgroup_info reports Intel's Windows driver, off where it reports another
+        driver or can't tell (with no earlier translation that used it); asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(bias_minlod_grad=True), (("--bias-minlod-grad",),) * 2)
+        self.assertEqual(self.run_main(bias_minlod_grad=False), ((), ()))
+        self.assertEqual(self.run_main(bias_minlod_grad=None), ((), ()))
+        self.assertEqual(self.run_main("--bias-minlod-grad", bias_minlod_grad=False), (("--bias-minlod-grad",),) * 2)
+
+    def test_bias_minlod_grad_environment_override(self):
+        for value, probe, want in (("1", False, ("--bias-minlod-grad",)), ("0", True, ())):
+            with self.subTest(value=value, probe=probe), \
+                    mock.patch.dict(os.environ, {"LEONIDA_BIAS_MINLOD_GRAD": value}, clear=False):
+                self.assertEqual(self.run_main(bias_minlod_grad=probe), (want, want))
+        with mock.patch.dict(os.environ, {"LEONIDA_BIAS_MINLOD_GRAD": "0"}, clear=False):
+            self.assertEqual(self.run_main("--bias-minlod-grad"), (("--bias-minlod-grad",),) * 2)
+
+    def test_bias_minlod_grad_is_recorded_after_the_other_flags(self):
+        pre, _sh = self.run_main("--bary-fallback", "--pc-tail-ubo", bias_minlod_grad=True)
+        self.assertEqual(pre, ("--bary-fallback", "--pc-tail-ubo", "--bias-minlod-grad"))
+
+    def test_runtime_gpu_bias_minlod_grad_requires_a_boolean_probe_result(self):
+        for raw, want in (({"bias_minlod_grad": True}, True), ({"bias_minlod_grad": False}, False),
+                          ({}, None), ({"bias_minlod_grad": 1}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertIs(make_game.runtime_gpu_bias_minlod_grad(), want)
+
     def test_pc_tail_ubo_follows_the_device(self):
         """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with
         --mesh-compute), not where it fits or can't be read; asked for explicitly, it is on everywhere."""
@@ -311,6 +339,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
                 mock.patch("make_game.runtime_gpu_barycentric_fallback", return_value=None), \
+                mock.patch("make_game.runtime_gpu_bias_minlod_grad", return_value=None), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight"), \
                 mock.patch.object(make_game, "py", fake_py), \
