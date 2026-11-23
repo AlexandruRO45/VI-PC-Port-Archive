@@ -360,3 +360,22 @@ class TestSaluAndn2B64RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.sgpr[0], 0)
         self.assertEqual(state.sgpr[1], 0)
         self.assertEqual(scc, 0)
+
+
+class TestSaluAndn2B64ConditionCodes(unittest.TestCase):
+    """Test suite for condition codes, status flags, and SCC generation."""
+
+    def test_scc_set_when_result_nonzero(self):
+        sdst, scc = ref_andn2_b64(1, 0)
+        self.assertEqual(sdst, 1)
+        self.assertEqual(scc, 1)
+
+    def test_scc_cleared_when_result_zero(self):
+        sdst, scc = ref_andn2_b64(0x1234, 0x1234)
+        self.assertEqual(sdst, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_cleared_when_src0_is_zero(self):
+        sdst, scc = ref_andn2_b64(0, 0x5555555555555555)
+        self.assertEqual(sdst, 0)
+        self.assertEqual(scc, 0)
