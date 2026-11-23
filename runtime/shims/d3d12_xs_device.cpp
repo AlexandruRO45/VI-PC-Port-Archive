@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <new>
 #include <memory>
 #include <utility>
@@ -683,7 +684,64 @@ struct ChildProxy {
     void** real_vtable;
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
+    ChildKind kind = ChildKind::allocator;
+    ChildProxy* live_next = nullptr;  // protected by g_live_child_lock; no identity-tracking allocation
 };
+
+SRWLOCK g_live_child_lock = SRWLOCK_INIT;
+ChildProxy* g_live_children = nullptr;
+
+void register_live_child(ChildProxy* child) {
+    AcquireSRWLockExclusive(&g_live_child_lock);
+    child->live_next = g_live_children;
+    g_live_children = child;
+    ReleaseSRWLockExclusive(&g_live_child_lock);
+}
+
+void unregister_live_child(ChildProxy* child) {
+    AcquireSRWLockExclusive(&g_live_child_lock);
+    for (auto** at = &g_live_children; *at; at = &(*at)->live_next) {
+        if (*at != child) continue;
+        *at = child->live_next;
+        child->live_next = nullptr;
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_live_child_lock);
+}
+
+// Identity is the live allocation and its kind, not a candidate's first word. Hold the shared lock while a
+// reference is acquired so destruction cannot free the allocation; a zero count must never be resurrected.
+template <ChildKind K>
+ChildProxy* pin_live_child(const void* candidate) {
+    ChildProxy* pinned = nullptr;
+    AcquireSRWLockShared(&g_live_child_lock);
+    for (auto* child = g_live_children; child; child = child->live_next) {
+        if (child != candidate || child->kind != K) continue;
+        auto refs = child->refs.load(std::memory_order_relaxed);
+        while (refs && refs != (std::numeric_limits<unsigned long>::max)()) {
+            if (child->refs.compare_exchange_weak(refs, refs + 1, std::memory_order_relaxed)) {
+                pinned = child;
+                break;
+            }
+        }
+        break;
+    }
+    ReleaseSRWLockShared(&g_live_child_lock);
+    return pinned;
+}
+
+template <ChildKind K>
+bool is_live_child(const void* candidate) {
+    bool found = false;
+    AcquireSRWLockShared(&g_live_child_lock);
+    for (const auto* child = g_live_children; child; child = child->live_next) {
+        if (child != candidate || child->kind != K) continue;
+        found = child->refs.load(std::memory_order_relaxed) != 0;
+        break;
+    }
+    ReleaseSRWLockShared(&g_live_child_lock);
+    return found;
+}
 
 template <ChildKind K>
 struct ChildStats {
@@ -776,11 +834,18 @@ void reset_child_stats() {
 
 // Frees a proxy whose last reference is gone, with the real object and the device reference it held.
 void destroy_child(ChildProxy* self) {
+    unregister_live_child(self);  // no foreign Release callback runs under the registry lock
     IUnknown* real = self->real;
     DeviceProxy* device = self->device;
     delete self;
     if (real) real->Release();
     if (device) proxy_release(device);
+}
+
+unsigned long release_child_reference(ChildProxy* self) {
+    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (refs == 0) destroy_child(self);
+    return refs;
 }
 
 template <ChildKind K>
@@ -792,9 +857,7 @@ unsigned long child_add_ref(ChildProxy* self) {
 template <ChildKind K>
 unsigned long child_release(ChildProxy* self) {
     note_child_slot<K>(2);
-    const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (refs == 0) destroy_child(self);
-    return refs;
+    return release_child_reference(self);
 }
 
 // The interfaces the proxy answers: the base chain and the object's own interface.
@@ -878,7 +941,7 @@ void** get_child_vtable();
 
 template <ChildKind K>
 bool is_child_proxy(const void* object) {
-    return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
+    return is_live_child<K>(object);
 }
 
 // The real object behind a heap, queue or fence proxy, or null when `object` is none of them.
@@ -886,9 +949,8 @@ IUnknown* proxy_real_object(const void* object) {
     if (!object) return nullptr;
     void* const vtable = *reinterpret_cast<void* const*>(object);
     if (vtable == reinterpret_cast<void*>(get_heap_vtable())) return static_cast<const HeapProxy*>(object)->real;
-    if (vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::queue>()) ||
-        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::fence>()) ||
-        vtable == reinterpret_cast<void*>(get_child_vtable<ChildKind::allocator>()))
+    if (is_child_proxy<ChildKind::queue>(object) || is_child_proxy<ChildKind::fence>(object) ||
+        is_child_proxy<ChildKind::allocator>(object))
         return static_cast<const ChildProxy*>(object)->real;
     return nullptr;
 }
@@ -989,6 +1051,16 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
+        // A backend may reenter Release on the caller's last reference. Internal pins keep the forwarded
+        // queue and fence alive until it returns without changing the guest-visible AddRef/Release counters.
+        using Pin = std::unique_ptr<ChildProxy, decltype(&release_child_reference)>;
+        Pin queue_pin(nullptr, &release_child_reference), fence_pin(nullptr, &release_child_reference);
+        if constexpr (K == ChildKind::queue) {
+            queue_pin.reset(pin_live_child<ChildKind::queue>(self));
+            if (!queue_pin) return hr_to_u64(E_INVALIDARG);
+            if constexpr (Slot == kQueueSignal || Slot == kQueueWait)
+                fence_pin.reset(pin_live_child<ChildKind::fence>(reinterpret_cast<const void*>(a1)));
+        }
         if (Slot >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
@@ -1004,7 +1076,8 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
+        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait))
+            a1 = fence_pin ? reinterpret_cast<std::uint64_t>(fence_pin->real) : unwrap_object(a1);
 
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
         // pointer and stack arguments keep their positions, as in the device proxy.
@@ -1090,7 +1163,9 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
         proxy->slot_count = kAllocatorPublicSlots;
     }
     proxy->refs.store(1, std::memory_order_relaxed);
+    proxy->kind = K;
     proxy_add_ref(device);  // the object keeps its Xbox-ABI device alive for GetDevice
+    register_live_child(proxy);  // before QueryInterface publishes the output pointer
 
     const HRESULT hr = child_query_interface<K>(proxy, riid, out);
     if (FAILED(hr)) {
