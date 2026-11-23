@@ -290,6 +290,14 @@ fragment stage either: on an RX 6800 (RDNA2) with AMD's Windows driver 26.11.2 t
 be requested for pixel shaders (they run at the 64-wide default), and the tier C pixel fixtures are a `SKIP` too
 (2026-11-22, [d3d12_vulkan.md](d3d12_vulkan.md), "Subgroup size").
 
+Intel's Windows driver lists compute, task and mesh only, and it may run pixel shaders narrower than the 32 it
+reports. There the runner measures the live lanes per fragment subgroup with `ps_live_width` (TEST-433). Intel Arc
+Graphics (Meteor Lake Xe-LPG, driver 101.6314) has 16, with the usual 2x2 quad layout: every tier A and B word is exact
+there except the ones that read lane `L ^ 16` (`ds_bpermute`/`ds_swizzle` with lane ^ 16, `v_permlanex16`), which
+have no partner lane and are a `SKIP` of those words only (`NEEDS_LIVE_LANES` in `w64_graphics.py`). A real wave64
+pixel shader that uses them is not exact on such a GPU. Below 16 live lanes the tier A and B pixel fixtures are a
+`SKIP`.
+
 Build and run it on Linux with RADV, pinned to one GPU (`LEONIDA_VK_DEVICE`, see "Choosing the GPU"):
 
 ```sh

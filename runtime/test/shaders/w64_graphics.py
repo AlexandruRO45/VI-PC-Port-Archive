@@ -18,13 +18,13 @@ second device stand in for the missing size: W64G_SAVE_REF=<dir> stores each 64-
 it (or that has 64 as its only size: AMD GCN), and W64G_REF=<dir> compares every run of the other device with those
 files (equal for A and B, different for C).
 
-A device whose subgroups can be narrower than 32 (Intel: 8..32) and that could not be held to 32 or 64 skips the tier
-A and B pixel fixtures: its fragment stage may run fewer live lanes than 32 (Intel UHD 770 reports 32 but runs 16 live
-invocations), and tiers A and B assume 32 or 64 live lanes (TEST-433).
-A fixture
-listed in NEEDS_LIVE_LANES (it reads lanes beyond the first 16) runs where ps_live_width measures that many live lanes
-per fragment subgroup and skips, naming the width, where it is less. The measured width is not gl_SubgroupSize: the Intel UHD 770 reports 32 and
-runs 16 live lanes (lane ids 0..15), so a read of lane L ^ 16 returns garbage there.
+A device whose subgroups can be narrower than 32 (Intel: 8..32) cannot be held to 32 or 64 in the fragment stage when
+requiredSubgroupSizeStages leaves it out (Intel's Windows driver lists compute, task and mesh only). There the runner
+measures the live lanes per fragment subgroup with ps_live_width (TEST-433), which is not gl_SubgroupSize: an Intel
+iGPU reports 32 and runs 16 (lane ids 0..15). With 16 or more live lanes the tier A and B pixel fixtures are checked;
+the words listed in NEEDS_LIVE_LANES (they read lane L ^ 16, which a 16-lane subgroup does not have) are left out and
+reported as a SKIP of those words where the measured width is less than they need, and every other word must still be
+exact. Below 16 live lanes, or when the probe cannot run, the tier A and B pixel fixtures are a SKIP.
 
 The vs_w64_* fixtures (TEST-251) are vertex shaders: Vulkan cannot require a vertex subgroup size, so the two sizes
 come from RADV, which runs the VS stage as wave64 by default and as wave32 with RADV_PERFTEST=gewave32 (GFX10+).
@@ -266,15 +266,30 @@ def _draw_heap(tools, spirv, name, size, tmp):
 _device_min = [None]   # the smallest subgroup size vk_harness reported for the device
 
 
-# Pixel fixtures that read lanes beyond the first 16 (a half-wave exchange, lane L ^ 16), and how many live lanes per
-# fragment subgroup they need. Empty on purpose: every fixture here passes at 16 live lanes (Intel UHD 770). The
-# permute fixtures of TEST-319 (ps_w64_a_permlane, _a_swizzle, _a_bpermute) go in as {name: 32}.
-NEEDS_LIVE_LANES = {}
+# Words of the pixel fixtures that read lanes beyond the first 16 (a half-wave exchange, lane L ^ 16), and how many
+# live lanes per fragment subgroup each needs: name -> {word index: lanes}. From the .asm headers, and measured on
+# Intel Arc Graphics (Meteor Lake Xe-LPG, Windows 101.6314; 16 live lanes): these words, and only these, are wrong
+# there, every other word of every tier A and B pixel fixture is exact (TEST-433).
+NEEDS_LIVE_LANES = {
+    "ps_w64_a_bpermute": {2: 32},       # ds_bpermute from lane ^ 16, twice
+    "ps_w64_a_swizzle": {2: 32},        # ds_swizzle SWAP,16, twice
+    "ps_w64_a_permlane": {2: 32, 3: 32},  # v_permlanex16, twice each
+}
+
+_live_width = {}   # (tools, spirv) -> live_width() of this device
 
 
 def live_width(tools, spirv, tmp):
     """The most live invocations a fragment subgroup has on this device (ps_live_width.asm: popcount of EXEC over the
-    frame), or None when the probe could not run. Not gl_SubgroupSize: an Intel iGPU reports 32 and runs 16."""
+    frame), or None when the probe could not run. Not gl_SubgroupSize: an Intel iGPU reports 32 and runs 16. Measured
+    once per run."""
+    key = (tools, spirv)
+    if key not in _live_width:
+        _live_width[key] = _measure_live_width(tools, spirv, tmp)
+    return _live_width[key]
+
+
+def _measure_live_width(tools, spirv, tmp):
     raw = Path(tmp) / "live_width.raw"
     cmd = [os.path.join(tools, "vk_harness" + EXE), os.path.join(spirv, "vs_ids.spv"),
            os.path.join(spirv, "ps_live_width.spv"), str(raw)]
@@ -326,12 +341,13 @@ def draw(tools, spirv, name, size, tmp):
     return words, words_heap, applied
 
 
-def expected_problem(name, words, heap):
-    """'' when the words (and heap) are what the fixture's header derives, else the first discrepancy."""
+def expected_problem(name, words, heap, ignore=()):
+    """'' when the words (and heap) are what the fixture's header derives, else the first discrepancy. The word
+    indices in `ignore` are not compared."""
     tier, expect, _ = FIXTURES[name]
     wrong = []
     for i, w in enumerate(words):
-        want = expect(i)
+        want = tuple(None if k in ignore else v for k, v in enumerate(expect(i)))
         if any(g is not None and g != v for g, v in zip(want, w)):
             wrong.append((i, w, want))
     if wrong:
@@ -382,23 +398,23 @@ def check(tools, spirv, name):
             if size is None or applied:
                 runs[size] = (words, heap)
         compared = False
-        # Tiers A and B mean exact on 32 or 64 live lanes. A device whose subgroups can be narrower than 32 (Intel:
-        # 8..32) and that could not be held to 32 or 64 may run fewer live lanes than it reports (UHD 770: 16 live
-        # behind a reported 32): reads across them return garbage.
-        if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs \
-                and _device_min[0] is not None and _device_min[0] < 32:
-            return Skip(f"SKIP (the fragment stage may run fewer live lanes than 32 here ({_device_min[0]}..) "
-                        "and 32 or 64 could not be required: tiers A and B assume 32 or 64 live lanes)")
-        # A fixture that reads a lane beyond the quad or the first 16 (NEEDS_LIVE_LANES) is judged only where the
-        # measured live width is enough: the stage can report a subgroup size it does not fill (Intel: 32 reported,
-        # 16 live, so a read of lane L ^ 16 is undefined). A required size (64 or 32 applied) is the device saying
-        # the lanes are there, so then nothing is measured.
-        need = NEEDS_LIVE_LANES.get(name)
-        if need and 64 not in runs and 32 not in runs:
-            live = live_width(tools, spirv, tmp)
-            if live is not None and live < need:
-                return Skip(f"SKIP (the fragment stage has {live} live lanes per subgroup here, measured with "
-                            f"ps_live_width; this fixture needs {need})")
+        # Where neither 64 nor 32 could be required, the stage can report a subgroup size it does not fill (Intel: 32
+        # reported, 16 live, so a read of lane L ^ 16 is undefined): measure the live lanes. A device that may run
+        # narrower than 32 needs at least 16 for tiers A and B; the words a fixture lists in NEEDS_LIVE_LANES are left
+        # out where the width is less than they need. A required size (64 or 32 applied) is the device saying the
+        # lanes are there, so then nothing is measured.
+        unchecked = ()
+        if tier in ("A", "B") and name.startswith("ps_") and 64 not in runs and 32 not in runs:
+            narrow = _device_min[0] is not None and _device_min[0] < 32
+            needs = NEEDS_LIVE_LANES.get(name, {})
+            if narrow or needs:
+                live = live_width(tools, spirv, tmp)
+                if narrow and (live is None or live < 16):
+                    return Skip(f"SKIP (the fragment stage has {'an unmeasured number of' if live is None else live} "
+                                f"live lanes per subgroup here ({_device_min[0]}.., ps_live_width) and 32 or 64 could "
+                                "not be required: tiers A and B need at least 16)")
+                if live is not None:
+                    unchecked = tuple(sorted(k for k, n in needs.items() if live < n))
         if save and 64 in runs:
             Path(save).mkdir(parents=True, exist_ok=True)
             (Path(save) / (name + ".ref64.raw")).write_bytes(b"".join(struct.pack("<4I", *w) for w in runs[64][0]))
@@ -406,11 +422,15 @@ def check(tools, spirv, name):
             for size, (words, heap) in runs.items():
                 if size is None and len(runs) > 1:
                     continue                      # the default draw repeats one of the forced sizes
-                p = expected_problem(name, words, heap)
+                p = expected_problem(name, words, heap, ignore=unchecked)
                 if p:
                     return f"{size or 'default size'}: {p}"
             if 64 in runs and 32 in runs and comparable(name, *runs[64]) != comparable(name, *runs[32]):
                 return "the images at required subgroup size 64 and 32 differ"
+            if unchecked:
+                return Skip(f"SKIP {', '.join('r%d' % k for k in unchecked)} (read lane ^ 16; the fragment stage has "
+                            f"{live_width(tools, spirv, tmp)} live lanes per subgroup here, measured with "
+                            "ps_live_width): every other word is exact")
         elif 64 in runs and 32 in runs:
             if comparable(name, *runs[64]) != comparable(name, *runs[32]):
                 return "a word that must not depend on the partition differs between 64 and 32"

@@ -189,10 +189,10 @@ def test_live_lane_need_skips_on_a_narrow_stage_and_runs_on_a_wide_one(tmp_path,
     (tmp_path / (name + ".spv")).write_bytes(b"")
     words = [w64_graphics.FIXTURES[name][1](i) for i in range(64 * 64)]
     monkeypatch.setattr(w64_graphics, "draw", lambda tools, spirv, n, size, tmp: (words, None, False if size else None))
-    monkeypatch.setitem(w64_graphics.NEEDS_LIVE_LANES, name, 32)
+    monkeypatch.setitem(w64_graphics.NEEDS_LIVE_LANES, name, {0: 32})
     monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 16)
     skip = w64_graphics.check("tools", str(tmp_path), name)
-    assert isinstance(skip, w64_graphics.Skip) and "16 live lanes" in skip and "needs 32" in skip
+    assert isinstance(skip, w64_graphics.Skip) and "16 live lanes" in skip and "SKIP r0 " in skip
     monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: 32)
     assert w64_graphics.check("tools", str(tmp_path), name) == ""
     monkeypatch.setattr(w64_graphics, "live_width", lambda tools, spirv, tmp: None)   # probe could not run: judged
