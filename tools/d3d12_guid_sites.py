@@ -226,7 +226,7 @@ def movabs_pairs(img: Image) -> list[tuple[int, bytes]]:
             continue
         blob = img.data[s["raw"]:s["raw"] + s["rsize"]]
         imm: list[tuple[int, bytes]] = []
-        for i in range(len(blob) - 10):
+        for i in range(len(blob) - 9):  # a 10-byte movabs must fit entirely
             if blob[i] == 0x48 and 0xB8 <= blob[i + 1] <= 0xBF:
                 imm.append((s["va"] + i, blob[i + 2:i + 10]))
         for (rva1, first), (rva2, second) in zip(imm, imm[1:]):
@@ -245,7 +245,7 @@ def absolute_refs(img: Image) -> list[tuple[int, int]]:
     lo = img.image_base
     for s in img.initialized():
         blob = img.data[s["raw"]:s["raw"] + s["rsize"]]
-        for i in range(0, len(blob) - 8, 8):
+        for i in range(0, len(blob) - 7, 8):  # the last whole 8-byte slot too
             value = struct.unpack_from("<Q", blob, i)[0]
             if lo <= value < lo + 0x10000000:
                 target = value - lo
@@ -319,7 +319,7 @@ def scan(path: str, known: dict[str, uuid.UUID]) -> dict:
         if s["chars"] & 0x20000000:  # code sections are not queue descriptions
             continue
         blob = img.data[s["raw"]:s["raw"] + s["rsize"]]
-        for i in range(0, len(blob) - 16, 4):
+        for i in range(0, len(blob) - 15, 4):  # the last whole 16-byte window too
             if s["va"] + i in lea_targets and queue_desc_shaped(blob[i:i + 16]):
                 t, p, flags, node = struct.unpack_from("<IIII", blob, i)
                 descs.append({"rva": s["va"] + i, "type": t, "priority": p, "flags": flags, "node": node})

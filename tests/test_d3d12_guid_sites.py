@@ -159,6 +159,30 @@ class GuidSites(unittest.TestCase):
         self.assertEqual(len(r["queue_descs"]), 2)
         self.assertEqual(r["guid_candidates"][0]["value"], str(UNKNOWN))
 
+    def test_queue_desc_in_the_last_16_bytes_of_a_section(self):
+        # The window that ends exactly at the end of .rdata is a whole window and is scanned too.
+        rdata = b"\0" * 16 + struct.pack("<IIII", 6, 0, 0, 0)
+        image, _ = pe32plus(lea(0x2010, 0x1000), rdata)
+        r = sites.scan(self.write("t7.dll", image), KNOWN)
+        self.assertEqual([(d["rva"], d["type"]) for d in r["queue_descs"]], [(0x2010, 6)])
+
+    def test_absolute_pointer_in_the_last_8_bytes_of_a_section(self):
+        # A GUID at +0 and, as the last 8 bytes of .rdata, an absolute pointer to it (ImageBase + 0x2000).
+        rdata = UNKNOWN.bytes_le + struct.pack("<Q", 0x180000000 + 0x2000)
+        image, _ = pe32plus(b"\x90" * 7, rdata)
+        r = sites.scan(self.write("t8.dll", image), KNOWN)
+        self.assertEqual([(c["value"], c["refs"], c["rva"]) for c in r["guid_candidates"]],
+                         [(str(UNKNOWN), 1, 0x2000)])
+
+    def test_movabs_pair_that_ends_the_code_section(self):
+        # `mov rax, imm64` + `mov rdx, imm64` holding the two GUID halves, the second ending .text.
+        guid = UNKNOWN.bytes_le
+        text = b"\x48\xb8" + guid[:8] + b"\x48\xba" + guid[8:]
+        image, _ = pe32plus(text, b"\0" * 16)
+        r = sites.scan(self.write("t9.dll", image), KNOWN)
+        self.assertEqual([(c["value"], c["section"], c["rva"]) for c in r["guid_candidates"]],
+                         [(str(UNKNOWN), "movabs", 0x1000)])
+
     def test_guid_shaped_rejects_non_guids(self):
         self.assertFalse(sites.guid_shaped(b"\0" * 16))
         self.assertFalse(sites.guid_shaped(b"\x01" * 16))  # constant fill
