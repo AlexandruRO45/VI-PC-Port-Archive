@@ -33,7 +33,6 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import support
-import spirv_mini_interp as si
 
 MASK32: int = 0xFFFF_FFFF
 SIGN_BIT32: int = 0x8000_0000
