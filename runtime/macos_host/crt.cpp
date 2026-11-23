@@ -187,9 +187,44 @@ int32_t stdio_common_vfprintf(uint64_t, FILE* f, const char* fmt, void*, char* v
     return std::fwrite(s.data(), 1, s.size(), f) == s.size() ? static_cast<int32_t>(s.size()) : -1;
 }
 
+int32_t stdio_common_vsprintf(uint64_t, char* buf, uint64_t count, const char* fmt, void*, char* va) {
+    std::string s = ms_format(fmt, va);
+    if (buf && count) {
+        uint64_t n = s.size() < count ? s.size() : count - 1;
+        std::memcpy(buf, s.data(), n);
+        buf[n] = 0;
+    }
+    return static_cast<int32_t>(s.size());
+}
+int32_t stdio_common_vsprintf_s(uint64_t o, char* buf, uint64_t count, const char* fmt, void* l, char* va) {
+    int32_t n = stdio_common_vsprintf(o, buf, count, fmt, l, va);
+    if (static_cast<uint64_t>(n) < count) return n;
+    if (buf && count) buf[0] = 0;
+    return -1;
+}
+
 // ---- heap and strings: the host libc, wrapped so the thunks see plain signatures ----
 void* crt_malloc(uint64_t n) { return malloc(n); }
+void* crt_calloc(uint64_t n, uint64_t size) { return calloc(n, size); }
+void* crt_realloc(void* p, uint64_t n) { return realloc(p, n); }
 void crt_free(void* p) { free(p); }
+void crt_abort() { fail("guest called abort"); }
+int crt_strncmp(const char* a, const char* b, uint64_t n) { return std::strncmp(a, b, n); }
+int crt_wcsncmp(const char16_t* a, const char16_t* b, uint64_t n) {  // Windows wchar_t is 16-bit
+    for (; n; --n, ++a, ++b)
+        if (*a != *b || !*a) return *a < *b ? -1 : *a > *b;
+    return 0;
+}
+int crt_strcpy_s(char* d, uint64_t size, const char* s) {
+    uint64_t n = std::strlen(s);
+    if (!d || n >= size) return d && size ? (d[0] = 0, 34 /* ERANGE */) : 22 /* EINVAL */;
+    std::memcpy(d, s, n + 1);
+    return 0;
+}
+// No registry: every key is missing (ERROR_FILE_NOT_FOUND), as on a PC that never had it, rather than the unimplemented
+// policy's 0, which reads as success and leaves the caller with an empty value.
+int32_t reg_not_found() { return 2; }
+int32_t crt_atol(const char* s) { return static_cast<int32_t>(std::atol(s)); }  // Windows long is 32-bit
 int callnewh(uint64_t) { return 0; }  // no new handler: operator new reports the failure
 int crt_strcmp(const char* a, const char* b) { return std::strcmp(a, b); }
 uint64_t crt_strlen(const char* s) { return std::strlen(s); }
@@ -264,6 +299,14 @@ Exports crt_exports() {
         EXPORT_AS(IO, "setvbuf", crt_setvbuf),
         EXPORT_AS(HEAP, "_callnewh", callnewh), EXPORT_AS(HEAP, "_set_new_mode", return0_i),
         EXPORT_AS(HEAP, "free", crt_free), EXPORT_AS(HEAP, "malloc", crt_malloc),
+        EXPORT_AS("advapi32.dll", "RegOpenKeyW", reg_not_found), EXPORT_AS("advapi32.dll", "RegOpenKeyExW", reg_not_found),
+        EXPORT_AS("advapi32.dll", "RegQueryValueExW", reg_not_found), EXPORT_AS("advapi32.dll", "RegCloseKey", return0_i),
+        EXPORT_AS(HEAP, "calloc", crt_calloc), EXPORT_AS(HEAP, "realloc", crt_realloc),
+        EXPORT_AS(RT, "abort", crt_abort), EXPORT_AS("api-ms-win-crt-convert-l1-1-0.dll", "atol", crt_atol),
+        EXPORT_AS(STR, "strncmp", crt_strncmp), EXPORT_AS(STR, "wcsncmp", crt_wcsncmp),
+        EXPORT_AS(STR, "strcpy_s", crt_strcpy_s),
+        EXPORT_AS(IO, "__stdio_common_vsprintf", stdio_common_vsprintf),
+        EXPORT_AS(IO, "__stdio_common_vsprintf_s", stdio_common_vsprintf_s),
         EXPORT_AS(STR, "strcmp", crt_strcmp), EXPORT_AS(STR, "strlen", crt_strlen),
         EXPORT_AS("api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr", noop_p),
         EXPORT_AS("api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale", return0_i),

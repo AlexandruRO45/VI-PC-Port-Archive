@@ -113,6 +113,8 @@ HANDLE load_library(std::string name) {
     for (auto& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     if (auto slash = name.find_last_of("\\/"); slash != std::string::npos) name.erase(0, slash + 1);
     if (name.find('.') == std::string::npos) name += ".dll";
+    if (const char* dir = std::getenv("LEONIDA_DLL_DIR"))  // real PE DLLs supplied by the user win over host stand-ins
+        if (HANDLE h = load_module(std::string(dir) + "/" + name)) return h;
     if (!has_dll(name)) {
         if (HANDLE h = load_from_disk(original)) return h;
         set_last_error(126 /* ERROR_MOD_NOT_FOUND */);
@@ -349,6 +351,10 @@ HANDLE make_signal(Object::Kind kind, int64_t count, int64_t max, bool manual) {
 HANDLE CreateEventW(void*, int32_t manual, int32_t initial, const char16_t* name) {
     if (name) fail("CreateEventW: named events are not supported");
     return make_signal(Object::Event, initial ? 1 : 0, 1, manual);
+}
+HANDLE CreateEventA(void* sa, int32_t manual, int32_t initial, const char* name) {
+    if (name) fail("CreateEventA: named events are not supported");
+    return CreateEventW(sa, manual, initial, nullptr);
 }
 HANDLE CreateEventExW(void*, const char16_t* name, uint32_t flags, uint32_t) {
     if (name) fail("CreateEventExW: named events are not supported");
@@ -688,6 +694,7 @@ int OpenThreadToken(HANDLE, uint32_t, int32_t, HANDLE*) { return set_last_error(
 void* DecodePointer(void* p) { return p; }
 
 }  // namespace
+uint32_t wait_object(void* h, uint32_t ms) { return WaitForSingleObjectEx(h, ms, 0); }
 
 #define K(name) EXPORT("kernel32.dll", name)
 Exports kernel32_crt_exports() {
@@ -708,7 +715,7 @@ Exports kernel32_crt_exports() {
         K(GetConsoleMode), K(WriteConsoleW), K(OutputDebugStringA), K(OutputDebugStringW), K(HeapReAlloc),
         K(HeapSize), K(HeapQueryInformation), K(VirtualProtect), K(QueryPerformanceFrequency), K(GetTickCount64),
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
-        K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
+        K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventA), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
         EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),

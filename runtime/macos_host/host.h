@@ -126,6 +126,8 @@ Exports kernel32_file_exports();
 Exports d3d12_serialize_exports();
 Exports seh_exports();
 Exports kernel32_loader_exports();
+Exports threadpool_exports();
+uint32_t wait_object(void* h, uint32_t ms);  // WaitForSingleObject from host code
 
 }  // namespace host
 

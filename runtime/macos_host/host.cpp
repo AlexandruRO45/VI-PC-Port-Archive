@@ -546,7 +546,7 @@ int main(int argc, char** argv) {
             execv(self, argv);  // falls through on failure: the guest still runs, without AVX in CPUID
         }
     }
-    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports, &kernel32_loader_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports, &kernel32_loader_exports, &threadpool_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     char real[PATH_MAX];
