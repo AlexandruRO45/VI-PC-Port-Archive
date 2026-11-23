@@ -20,10 +20,12 @@
 
 #include <dxgi1_4.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <thread>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SPV
@@ -254,6 +256,96 @@ std::vector<std::vector<HRESULT>> host_cached_pso_cases(const std::vector<std::u
     return out;
 }
 
+// What both devices answer when CreateRootSignature is given bytes it already made a signature from, in this order:
+// the first object's reference count; whether the same buffer again, and equal bytes in another buffer, give that
+// object; its count then; whether the same description serialized as another version, and another description, give
+// it; the device references the five creates added; whether private data set through one handle reads through
+// another; what releasing the three handles returns; and, for the bytes created once more after the last release, the
+// count and whether the private data is still there. `blob`'s signatures must have no other holder.
+template<class Device>
+std::vector<int> root_identity_cases(Device* device, const std::vector<std::uint8_t>& blob,
+                                     const std::vector<std::uint8_t>& other_version,
+                                     const std::vector<std::uint8_t>& other) {
+    static constexpr GUID key{0x6d1f0c52, 0x8a3e, 0x4b77, {0x91, 0x0c, 0x2e, 0x5a, 0x7f, 0x34, 0xb8, 0x16}};
+    const auto create = [&](const std::vector<std::uint8_t>& bytes) {
+        ID3D12RootSignature* made = nullptr;
+        device->CreateRootSignature(0, bytes.data(), bytes.size(), IID_PPV_ARGS(&made));
+        return made;
+    };
+    const auto refs = [](IUnknown* object) {
+        object->AddRef();
+        return int(object->Release());
+    };
+    const auto has_data = [](ID3D12RootSignature* signature) {
+        UINT value = 0, size = sizeof(value);
+        return int(signature->GetPrivateData(key, &size, &value) == S_OK && value == 0x1234abcdu);
+    };
+    std::vector<int> out;
+    const int device_refs = refs(device);
+    ID3D12RootSignature* first = create(blob);
+    if (!first) return out;
+    out.push_back(refs(first));
+    const std::vector<std::uint8_t> copy = blob;
+    ID3D12RootSignature* again = create(blob);
+    ID3D12RootSignature* from_copy = create(copy);
+    ID3D12RootSignature* version = create(other_version);
+    ID3D12RootSignature* different = create(other);
+    if (again && from_copy && version && different) {
+        out.push_back(again == first);
+        out.push_back(from_copy == first);
+        out.push_back(refs(first));
+        out.push_back(version == first);
+        out.push_back(different == first);
+        out.push_back(refs(device) - device_refs);
+        const UINT value = 0x1234abcdu;
+        first->SetPrivateData(key, sizeof(value), &value);
+        out.push_back(has_data(from_copy));
+    }
+    if (different) different->Release();
+    if (version) version->Release();
+    if (again) out.push_back(int(again->Release()));
+    if (from_copy) out.push_back(int(from_copy->Release()));
+    out.push_back(int(first->Release()));
+    first = create(blob);
+    if (!first) return out;
+    out.push_back(refs(first));
+    out.push_back(has_data(first));
+    first->Release();
+    return out;
+}
+
+// The same cases on the PC runtime: the default adapter, then WARP. Empty when the host has no D3D12 device or is
+// Wine's (vkd3d makes an object per call), which the caller reports as a skip.
+std::vector<std::vector<int>> host_root_identity_cases(const std::vector<std::uint8_t>& blob,
+                                                       const std::vector<std::uint8_t>& other_version,
+                                                       const std::vector<std::uint8_t>& other) {
+    if (hostwine::host_is_wine()) return {};
+    using CreateDeviceFn = decltype(&::D3D12CreateDevice);
+    using FactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    std::vector<std::vector<int>> out;
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!d3d12 || !dxgi) return out;
+    const auto create_device =
+        reinterpret_cast<CreateDeviceFn>(reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")));
+    const auto create_factory =
+        reinterpret_cast<FactoryFn>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    if (!create_device || !create_factory) return out;
+    IDXGIFactory4* factory = nullptr;
+    if (FAILED(create_factory(IID_PPV_ARGS(&factory)))) return out;
+    IDXGIAdapter* warp = nullptr;
+    factory->EnumWarpAdapter(IID_PPV_ARGS(&warp));
+    for (IUnknown* adapter : {static_cast<IUnknown*>(nullptr), static_cast<IUnknown*>(warp)}) {
+        ID3D12Device* host = nullptr;
+        if (FAILED(create_device(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)))) continue;
+        out.push_back(root_identity_cases(host, blob, other_version, other));
+        host->Release();
+    }
+    if (warp) warp->Release();
+    factory->Release();
+    return out;
+}
+
 }  // namespace
 
 int main() {
@@ -343,6 +435,88 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
         Ref<ID3D12RootSignature> junk;
         EXPECT(device->CreateRootSignature(0, "junk", 4, IID_PPV_ARGS(&junk.p)) == E_INVALIDARG && !junk.p);
+
+        // The same description serialized as 1.1: other bytes, so another root signature object with the same layout.
+        D3D12_DESCRIPTOR_RANGE1 range_1_1{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0,
+                                          D3D12_DESCRIPTOR_RANGE_FLAG_NONE, 0};
+        D3D12_ROOT_PARAMETER1 params_1_1[3] = {};
+        params_1_1[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params_1_1[0].Constants = {0, 0, 2};
+        params_1_1[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params_1_1[1].Descriptor = {0, 0, D3D12_ROOT_DESCRIPTOR_FLAG_NONE};
+        params_1_1[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params_1_1[2].DescriptorTable = {1, &range_1_1};
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc_1_1{};
+        root_desc_1_1.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        root_desc_1_1.Desc_1_1 = {3, params_1_1, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        const auto root_blob_1_1 = serialize(root_desc_1_1);
+        EXPECT(!root_blob_1_1.empty() && root_blob_1_1 != root_blob);
+
+        // CreateRootSignature keeps one object per serialized signature, as the PC runtime does: the same bytes give
+        // the live object with one more reference, the last Release destroys it, and the same description in another
+        // version is another object. Measured on WARP and an RTX 3080 Ti (Windows 11 26200), which is what the layer
+        // is held to; the host this runs on is asked too, and an answer that differs is printed, not failed, as
+        // d3d12_close_parity_test does with WARP. The blobs are this block's own, so nothing else holds their
+        // signatures.
+        {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC one = root_desc, one_1_1 = root_desc_1_1, two = root_desc;
+            one.Desc_1_0.NumParameters = one_1_1.Desc_1_1.NumParameters = 1;
+            two.Desc_1_0.NumParameters = 2;
+            const auto one_blob = serialize(one), one_blob_1_1 = serialize(one_1_1), two_blob = serialize(two);
+            EXPECT(!one_blob.empty() && !one_blob_1_1.empty() && !two_blob.empty());
+            const std::vector<int> layer = root_identity_cases(device.p, one_blob, one_blob_1_1, two_blob);
+            const std::vector<int> expected = {1, 1, 1, 3, 0, 0, 3, 1, 2, 1, 0, 1, 0};
+            if (layer != expected) {
+                std::fprintf(stderr, "root signature identity: got");
+                for (const int value : layer) std::fprintf(stderr, " %d", value);
+                std::fprintf(stderr, ", want 1 1 1 3 0 0 3 1 2 1 0 1 0\n");
+            }
+            EXPECT(layer == expected);
+            const auto hosts = host_root_identity_cases(one_blob, one_blob_1_1, two_blob);
+            if (hosts.empty())
+                std::printf("SKIP: no host D3D12 reference (Wine, or no device) for the root signature identity "
+                            "comparison\n");
+            std::size_t same = 0;
+            for (const auto& host : hosts) {
+                same += host == expected;
+                if (host == expected) continue;
+                std::printf("root signature identity: a host adapter answers differently from the measured values:");
+                for (const int value : host) std::printf(" %d", value);
+                std::printf("\n");
+            }
+            if (!hosts.empty())
+                std::printf("root signature identity: %zu of %zu host adapter(s) gave the same %zu answers\n", same,
+                            hosts.size(), layer.size());
+
+            // Threads that create and release the same bytes meet a signature at every point of its life, also
+            // after its last Release and before it is gone: none may be handed that one. Afterwards the bytes make
+            // a fresh object with one reference.
+            std::atomic<int> failed{0};
+            std::vector<std::thread> threads;
+            for (int t = 0; t < 4; ++t)
+                threads.emplace_back([&] {
+                    for (int i = 0; i < 20000; ++i) {
+                        ID3D12RootSignature* made = nullptr;
+                        if (FAILED(device->CreateRootSignature(0, one_blob.data(), one_blob.size(),
+                                                               IID_PPV_ARGS(&made))) ||
+                            !made) {
+                            ++failed;
+                            continue;
+                        }
+                        ID3D12Device* owner = nullptr;
+                        if (FAILED(made->GetDevice(IID_PPV_ARGS(&owner)))) ++failed;
+                        if (owner) owner->Release();
+                        made->Release();
+                    }
+                });
+            for (std::thread& thread : threads) thread.join();
+            EXPECT(failed == 0);
+            Ref<ID3D12RootSignature> after;
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, one_blob.data(), one_blob.size(),
+                                                         IID_PPV_ARGS(&after.p))));
+            after->AddRef();
+            EXPECT(after->Release() == 1);
+        }
 
         // The PSO through slot 62, the Xbox call shape; an unknown program is refused.
         D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
@@ -572,12 +746,14 @@ int main() {
         ID3D12DescriptorHeap* heaps[] = {heap.p};
         list->SetDescriptorHeaps(1, heaps);
         // This root signature and PSO are released right after being set, as D3D12 allows: the list keeps them,
-        // so the arguments below still have a layout and ExecuteCommandLists still finds the pipeline.
+        // so the arguments below still have a layout and ExecuteCommandLists still finds the pipeline. It is made
+        // from the 1.1 bytes: root_blob's would give root.p itself, which this block does not own alone.
         ID3D12RootSignature* held_root = nullptr;
         {
             Ref<ID3D12RootSignature> own_root;
-            EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(),
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob_1_1.data(), root_blob_1_1.size(),
                                                          IID_PPV_ARGS(&own_root.p))));
+            EXPECT(own_root.p != root.p);
             D3D12_COMPUTE_PIPELINE_STATE_DESC own_desc = pso_desc;
             own_desc.pRootSignature = own_root.p;
             Ref<ID3D12PipelineState> own_pso;
@@ -603,13 +779,21 @@ int main() {
         list->SetComputeRoot32BitConstant(0, 100, 0);
         list->SetComputeRootUnorderedAccessView(1, va_b);
         list->Dispatch(1, 1, 1);
-        // Switching to a different root-signature object (root.p != held_root) resets the bound arguments to zero
-        // (clearing s0 = 100 to 0), whereas rebinding root.p afterwards keeps the arguments set on it (s1 = 5).
+        // Switching to a different root-signature object (root.p != held_root: other bytes) resets the bound
+        // arguments to zero (clearing s0 = 100 to 0), whereas rebinding root.p afterwards keeps the arguments set on
+        // it (s1 = 5). The rebind is through a second CreateRootSignature of root_blob's bytes from another buffer,
+        // which is root.p again on the PC runtime, so it is the signature already bound.
         list->SetComputeRootSignature(root.p);
         list->SetComputeRoot32BitConstant(0, 5, 1);  // offset 1 (s1 = 5); offset 0 (s0) stays 0 from the switch
         list->SetComputeRootUnorderedAccessView(1, va_c);
         list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
-        list->SetComputeRootSignature(root.p);
+        {
+            const std::vector<std::uint8_t> root_blob_copy = root_blob;
+            Ref<ID3D12RootSignature> root_again;
+            EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob_copy.data(), root_blob_copy.size(),
+                                                         IID_PPV_ARGS(&root_again.p))));
+            list->SetComputeRootSignature(root_again.p);
+        }
         list->Dispatch(1, 1, 1);
         D3D12_RESOURCE_BARRIER barriers[3] = {
             transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),

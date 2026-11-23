@@ -2724,13 +2724,31 @@ bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC&
 // on both Windows hardware D3D12 and WARP.
 constexpr UINT kKnownPipelineStateFlags = 0xFu;
 
+class RootSignature;
+
+// A device's live root signatures by content (RootSignature::content). The PC runtime keeps one object per serialized
+// signature: CreateRootSignature with bytes it already made a signature from returns that object with one more
+// reference, and the last Release destroys it (WARP and an RTX 3080 Ti, Windows 11 26200; d3d12_compute_test compares
+// with the host). So a title that sets a second signature made from the same bytes sets the one already bound, and
+// its root arguments stay. The entries own nothing: a signature takes its own out when it dies.
+struct RootSignatures {
+    std::mutex mutex;
+    std::map<std::string, RootSignature*> live;
+};
+
 class RootSignature final
     : public Child<RootSignature, ID3D12RootSignatureStubs, ID3D12Object, ID3D12DeviceChild, ID3D12RootSignature> {
 public:
     // {3e9b4a61-2d7c-4f18-b5a0-c71e8d92f036}
     static constexpr GUID kTag{0x3e9b4a61, 0x2d7c, 0x4f18, {0xb5, 0xa0, 0xc7, 0x1e, 0x8d, 0x92, 0xf0, 0x36}};
-    RootSignature(RootArgumentLayout layout, std::string content)
-        : layout_(std::move(layout)), content_(std::move(content)) {}
+    RootSignature(RootArgumentLayout layout, std::string content, std::shared_ptr<RootSignatures> siblings)
+        : layout_(std::move(layout)), content_(std::move(content)), siblings_(std::move(siblings)) {}
+    // The entry is another object's when CreateRootSignature met this one after its last Release (see there).
+    ~RootSignature() override {
+        std::lock_guard lock(siblings_->mutex);
+        const auto it = siblings_->live.find(content_);
+        if (it != siblings_->live.end() && it->second == this) siblings_->live.erase(it);
+    }
     const RootArgumentLayout& layout() const { return layout_; }
     // SHA-256 of the serialized root signature: a cached PSO matches root signatures with the same content.
     const std::string& content() const { return content_; }
@@ -2738,6 +2756,7 @@ public:
 private:
     RootArgumentLayout layout_;
     std::string content_;
+    std::shared_ptr<RootSignatures> siblings_;  // shared with the device, so it is there whenever this object dies
 };
 
 // The ID3DBlob GetCachedBlob returns.
@@ -5813,9 +5832,23 @@ public:
                                          compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
         }
         register_static_samplers(parsed.sig);
-        auto* signature = new RootSignature(
-            std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
-        signature->attach_device(identity());
+        // One object per serialized signature (RootSignatures). The reference for the caller is taken under the lock
+        // a dying signature needs to leave the map, so an entry is either alive or past its last Release: AddRef
+        // then returns 1, the object gets no caller (its destructor is waiting for this lock) and the entry is
+        // replaced. The lock is dropped before hand_out, whose Release can be a signature's last.
+        std::string content = leonida::sha256_hex({bytes, size});
+        RootSignature* signature = nullptr;
+        {
+            std::lock_guard lock(root_signatures_->mutex);
+            RootSignature*& live = root_signatures_->live[content];
+            if (live && live->AddRef() > 1) {
+                signature = live;
+            } else {
+                signature = new RootSignature(std::move(layout), std::move(content), root_signatures_);
+                signature->attach_device(identity());
+                live = signature;
+            }
+        }
         return hand_out(signature, riid, out);
     }
 
@@ -8320,6 +8353,7 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    const std::shared_ptr<RootSignatures> root_signatures_ = std::make_shared<RootSignatures>();
     std::atomic<bool> removed_{false};
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
