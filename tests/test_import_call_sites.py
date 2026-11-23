@@ -120,6 +120,25 @@ class ImportCallSitesTest(unittest.TestCase):
         self.assertEqual(len(import_call_sites.call_sites(self.data, dlls={"XMem.dll"})["imports"]), 3)
         self.assertEqual(import_call_sites.call_sites(self.data, dlls={"other.dll"})["imports"], {})
 
+    def test_a_call_through_a_linker_stub_counts_its_callers_not_the_stub(self):
+        # Two callers reach the thunk through one `jmp rel32` stub, as an incremental-link (or ILT) stub is used.
+        stub = TEXT_RVA + 0x180
+        callers = [(TEXT_RVA + 0x100, 0xE8, stub), (TEXT_RVA + 0x110, 0xE8, stub), (stub, 0xE9, THUNK_FOO)]
+        foo = import_call_sites.call_sites(build_image(callers))["imports"]["xmem.dll!XMemFoo"]
+        self.assertEqual(foo["call"], [TEXT_RVA + 0x100, TEXT_RVA + 0x110])
+        self.assertEqual(foo["jmp"], [])
+
+    def test_a_stub_chain_is_followed_to_the_thunk(self):
+        first, second = TEXT_RVA + 0x180, TEXT_RVA + 0x190
+        callers = [(TEXT_RVA + 0x100, 0xE8, first), (first, 0xE9, second), (second, 0xE9, THUNK_FOO)]
+        foo = import_call_sites.call_sites(build_image(callers))["imports"]["xmem.dll!XMemFoo"]
+        self.assertEqual(foo["call"], [TEXT_RVA + 0x100])
+        self.assertEqual(foo["jmp"], [])
+
+    def test_a_tail_jump_to_a_thunk_is_still_a_site(self):
+        foo = import_call_sites.call_sites(build_image([(TEXT_RVA + 0x120, 0xE9, THUNK_FOO)]))["imports"]
+        self.assertEqual(foo["xmem.dll!XMemFoo"]["jmp"], [TEXT_RVA + 0x120])
+
     def test_a_call_is_not_counted_for_a_different_thunk(self):
         data = build_image([(TEXT_RVA + 0x100, 0xE8, THUNK_BAR)])
         out = import_call_sites.call_sites(data)["imports"]

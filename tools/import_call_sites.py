@@ -4,11 +4,13 @@ Usage:
     python -I tools/import_call_sites.py <image> [--import DLL!NAME ...] [--dll DLL ...] [--json]
 
 An MSVC image calls an imported function through a thunk, `jmp qword [rip+disp32]` through the import's address-table
-slot, and reaches the thunk with `call rel32` (or `jmp rel32` as a tail call). This finds each wanted import's thunk,
-then every `E8`/`E9 rel32` in an executable section whose target is that thunk. Nothing is run and nothing is
-disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another instruction that happens to land on a
-thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
-slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
+slot, and reaches the thunk with `call rel32` (or `jmp rel32` as a tail call). A call can reach the thunk through the
+linker's `jmp rel32` stub as well; a stub is not a use of the import, so it is followed to the thunk and the sites
+that reach it are the ones counted. This finds each wanted import's thunk, then every `E8`/`E9 rel32` in an
+executable section that reaches it, directly or through such a stub. Nothing is run and nothing is disassembled, so
+this is a byte pattern: a stray `E8` or `E9` inside another instruction that happens to land on a thunk would be
+counted too, which is rare, and a call that goes through a register (`call rax` after a load of the slot) is not
+seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
 
 With no `--import` and no `--dll`, every import is listed. An import named `#N` is an ordinal import. Output is counts
 and RVAs only, no instruction bytes (docs/runtime_imports.md, "The retail executable (RT-5)").
@@ -86,14 +88,36 @@ def call_sites(data, wanted=None, dlls=None):
     out = {key: {"thunks": [], "call": [], "jmp": []} for key in slots.values()}
     for at, key in thunks.items():
         out[key]["thunks"].append(at)
+    # A `jmp rel32` to a thunk is a linker stub when another site reaches it: the stub is not a use of the import, so
+    # its jump is dropped and the sites that reach it are counted (a stub two callers share is two sites).
+    jmps = {}
+    for rva, blob in code:
+        for m in REL_BRANCH.finditer(blob):
+            s = m.start()
+            if s + 5 <= len(blob) and blob[s] == 0xE9:
+                jmps[rva + s] = rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0]
+    reached, sites = set(), []
     for rva, blob in code:
         for m in REL_BRANCH.finditer(blob):
             s = m.start()
             if s + 5 > len(blob):
                 continue
-            key = thunks.get(rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0])
+            target = rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0]
+            if target in jmps:
+                reached.add(target)
+                seen = {target}
+                while True:
+                    target = jmps[target]
+                    if target not in jmps or target in seen:
+                        break
+                    seen.add(target)
+            key = thunks.get(target)
             if key:
-                out[key]["call" if blob[s] == 0xE8 else "jmp"].append(rva + s)
+                sites.append((rva + s, blob[s], key))
+    for at, opcode, key in sites:
+        if opcode == 0xE9 and at in reached:
+            continue
+        out[key]["call" if opcode == 0xE8 else "jmp"].append(at)
     for entry in out.values():
         for field in entry.values():
             field.sort()
