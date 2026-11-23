@@ -492,6 +492,26 @@ def compare_exact(a, sample, ra, rb):
         print(label, "total", sum(counts.values()))
         for outcome, n in sorted(counts.items()):
             print(f"  {outcome}: {n}")
+    print_tier_breakdown(sample, rows)
+
+
+def print_tier_breakdown(sample, rows):
+    """By wave64_graphics tier, and tier C by reason code (a shader with several reasons counts under each).
+    Also for --exact: integer outputs bit-cast to float are denormals that the tolerance compare calls equal."""
+    if not any("tier" in s for s in sample):
+        return
+    by_tier, by_reason = {}, {}
+    for s, row in zip(sample, rows):
+        t = s.get("tier", "-")
+        by_tier.setdefault(t, {})[row["class"]] = by_tier.setdefault(t, {}).get(row["class"], 0) + 1
+        if t == "C":
+            for r in s.get("reasons") or ["(none)"]:
+                d = by_reason.setdefault(r, {})
+                d[row["class"]] = d.get(row["class"], 0) + 1
+    for t in sorted(by_tier):
+        print(f"  tier {t}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_tier[t].items())))
+    for r in sorted(by_reason):
+        print(f"    tier C reason {r}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_reason[r].items())))
 
 
 def cmd_compare(a):
@@ -522,20 +542,7 @@ def cmd_compare(a):
     for (c, sc), n in sorted(sub.items()):
         if sc:
             print(f"    {c} / {sc}: {n}")
-    # By wave64_graphics tier, and tier C by reason code (a shader with several reasons counts under each).
-    if any("tier" in s for s in sample):
-        by_tier, by_reason = {}, {}
-        for s, row in zip(sample, rows):
-            t = s.get("tier", "-")
-            by_tier.setdefault(t, {})[row["class"]] = by_tier.setdefault(t, {}).get(row["class"], 0) + 1
-            if t == "C":
-                for r in s.get("reasons") or ["(none)"]:
-                    d = by_reason.setdefault(r, {})
-                    d[row["class"]] = d.get(row["class"], 0) + 1
-        for t in sorted(by_tier):
-            print(f"  tier {t}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_tier[t].items())))
-        for r in sorted(by_reason):
-            print(f"    tier C reason {r}: " + ", ".join(f"{c} {n}" for c, n in sorted(by_reason[r].items())))
+    print_tier_breakdown(sample, rows)
 
 
 WARNING = ("warning (run): a few sampled shaders hang NVIDIA GPUs with the zeroed heap (VK_ERROR_DEVICE_LOST, a\n"

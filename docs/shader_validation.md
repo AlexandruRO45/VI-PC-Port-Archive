@@ -2296,6 +2296,13 @@ By tier (variant t; variant z in brackets):
   analysis proves that value uniform, but on 3 shaders it is not uniform across the two 32-lane halves.
 - **Tier A is exact:** 93 of 93 in both variants, which also shows that the 64-wide and the 32-wide pipelines are
   otherwise the same.
+- **The bit-exact compare gives the same counts.** The tolerance compare treats integer words that are bit-cast to
+  float as equal, because they are denormals. `compare --exact`, which now prints the same tier breakdown, finds the
+  same 24 draws in variant t (tier B 3, tier C 21) and the same 9 in variant z. No sampled shader differs only in such
+  words.
+- **The usable denominator is smaller than 240.** In variant t, 104 of the 240 tier C shaders write nothing but the
+  clear colour. Most of them read their inputs from the zeroed heap and discard, so they cannot show a difference.
+  Of the 136 that do write, 21 differ (15 %). Tier A has 31 such clear-only draws of 93, tier B has 1 of 27.
 - **The differences are the subgroup size, not noise.** All 24 shaders that differ in variant t, drawn again at 64, are
   bit-identical to the first draw at 64, and the same holds at 32. The 9 shaders that differ in variant z, drawn again
   at 64, match too. The second 64 draw against the second 32 draw reproduces the same 19 + 5 classes.
