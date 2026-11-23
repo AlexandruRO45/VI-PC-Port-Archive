@@ -155,7 +155,9 @@ static int cgroup_limits_are_read_up_the_tree() {
 
 static std::vector<size_t> drain(leonida::StartOrder& order, bool admit) {
     std::vector<size_t> started;
-    for (size_t k; order.next(k, [&](uint64_t) { return admit; });) started.push_back(k);
+    size_t k;
+    bool admitted;
+    while (order.next(k, admitted, [&](uint64_t) { return admit; })) started.push_back(k);
     return started;
 }
 
@@ -176,7 +178,87 @@ static int start_order_largest_first() {
 
     leonida::StartOrder empty(std::vector<uint64_t>{}, 100);
     size_t k = 99;
-    CHECK(!empty.next(k, [](uint64_t) { return true; }));
+    bool was_admitted = true;
+    CHECK(!empty.next(k, was_admitted, [](uint64_t) { return true; }));
+    return 0;
+}
+
+// Sizes 1000, 900, 800, 700 are large (threshold 100), 40..10 small; the budget holds the 1000-byte module alone.
+static const std::vector<uint64_t> kMixed{1000, 900, 800, 700, 40, 30, 20, 10};
+static constexpr uint64_t kMixedBudget = 1000 * leonida::kBytesPerSpirvByte;
+
+static int start_order_takes_the_gate_place_as_it_hands_out() {
+    // Four workers each take a module before any of them reaches its own work: one large module gets the gate's
+    // room, the other three take small work instead of queueing behind it.
+    LargeModuleGate gate(kMixedBudget, 4);
+    leonida::StartOrder order(kMixed, 100);
+    auto admit = [&](uint64_t bytes) { return gate.try_enter(leonida::large_module_estimate(bytes)); };
+    std::vector<size_t> got;
+    std::vector<bool> admissions;
+    for (int worker = 0; worker < 4; ++worker) {
+        size_t k;
+        bool admitted;
+        CHECK(order.next(k, admitted, admit));
+        got.push_back(k);
+        admissions.push_back(admitted);
+    }
+    CHECK((got == std::vector<size_t>{0, 4, 5, 6}));
+    CHECK((admissions == std::vector<bool>{true, false, false, false}));
+    CHECK(gate.inflight() == 1);
+    {
+        auto ticket = LargeModuleGate::Ticket::adopt(gate, leonida::large_module_estimate(kMixed[0]));
+        CHECK(ticket.held());
+    }   // the 1000-byte module is done
+    CHECK(gate.inflight() == 0);
+    size_t k;
+    bool admitted;
+    CHECK(order.next(k, admitted, admit) && k == 1 && admitted);   // the room is free again: the next large one
+    CHECK(gate.inflight() == 1);
+    CHECK(order.next(k, admitted, admit) && k == 7 && !admitted);   // 800 does not fit beside 900
+    CHECK(order.next(k, admitted, admit) && k == 2 && !admitted);   // no small one left: it waits at the gate
+    CHECK(gate.inflight() == 1);
+    LargeModuleGate::Ticket::adopt(gate, leonida::large_module_estimate(kMixed[1])).release();
+    CHECK(gate.inflight() == 0);
+    return 0;
+}
+
+static int threads_start_small_work_while_the_gate_is_full() {
+    // The same four workers as real threads: each takes one module, then all meet before working on it.
+    LargeModuleGate gate(kMixedBudget, 4);
+    leonida::StartOrder order(kMixed, 100);
+    auto admit = [&](uint64_t bytes) { return gate.try_enter(leonida::large_module_estimate(bytes)); };
+    std::vector<std::atomic<int>> seen(kMixed.size());
+    std::atomic<int> first_large{0}, first_small{0}, arrived{0};
+    std::atomic<bool> over{false};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t) {
+        threads.emplace_back([&] {
+            bool first = true;
+            size_t k;
+            bool admitted;
+            while (order.next(k, admitted, admit)) {
+                seen[k]++;
+                const bool large = kMixed[k] > 100;
+                LargeModuleGate::Ticket ticket;
+                if (admitted) ticket = LargeModuleGate::Ticket::adopt(gate, leonida::large_module_estimate(kMixed[k]));
+                if (first) {
+                    ++(large ? first_large : first_small);
+                    ++arrived;
+                    while (arrived.load() < 4) std::this_thread::yield();
+                    first = false;
+                }
+                if (large && !admitted) ticket = LargeModuleGate::Ticket(gate, leonida::large_module_estimate(kMixed[k]));
+                if (gate.inflight() > 1) over = true;   // no two of these large modules fit the budget together
+                std::this_thread::sleep_for(std::chrono::milliseconds(large ? 5 : 1));
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    CHECK(first_large.load() == 1);
+    CHECK(first_small.load() == 3);
+    for (const auto& s : seen) CHECK(s.load() == 1);
+    CHECK(!over);
+    CHECK(gate.inflight() == 0);
     return 0;
 }
 
@@ -188,7 +270,9 @@ static int start_order_hands_out_each_index_once_across_threads() {
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t)
         threads.emplace_back([&, t] {
-            for (size_t k; order.next(k, [&](uint64_t) { return t % 2 == 0; });) seen[k]++;
+            size_t k;
+            bool admitted;
+            while (order.next(k, admitted, [&](uint64_t) { return t % 2 == 0; })) seen[k]++;
         });
     for (auto& th : threads) th.join();
     for (const auto& s : seen) CHECK(s.load() == 1);
@@ -207,6 +291,8 @@ int main() {
     if (int r = estimate_and_memory_query()) return r;
     if (int r = start_order_largest_first()) return r;
     if (int r = start_order_hands_out_each_index_once_across_threads()) return r;
+    if (int r = start_order_takes_the_gate_place_as_it_hands_out()) return r;
+    if (int r = threads_start_small_work_while_the_gate_is_full()) return r;
     std::puts("large_module_gate: ok");
     return 0;
 }

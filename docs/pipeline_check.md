@@ -290,8 +290,9 @@ driver compiles one pipeline on one thread, so a range ends with its last long c
 ray-tracing compute module that comes up late compiles alone while the other threads have nothing left. On a
 full-corpus run (RTX 4080, NVIDIA 621.24, 24 jobs, 500-entry batches) one ran for more than 30 minutes that way,
 and batches took 19 to 27 minutes. Started first, it compiles alongside the small ones. The next large module
-starts only while the gate above would admit it; otherwise the largest small one starts, so no thread waits at the
-gate while small work is pending. Equal sizes keep index order. The run prints `modules start largest first (N
+starts only when the gate above admits it, and it takes its place in the gate as it is handed out, so two threads
+never both pick a large module for the same room; otherwise the largest small one starts, so no thread waits at the
+gate while small work is pending. A large module handed out once no small one is left waits at the gate. Equal sizes keep index order. The run prints `modules start largest first (N
 large)`. `--start` and `--count` still select the range in index order, and the counts, the cache and the
 `--isolate` bisection are unchanged.
 

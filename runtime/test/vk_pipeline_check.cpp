@@ -1455,8 +1455,10 @@ int main(int argc, char** argv) {
     }
     leonida::StartOrder start_order(work_bytes, large_module_bytes);
     std::fprintf(stderr, "modules start largest first (%zu large)\n", start_order.large_count());
-    auto admits_now = [&](uint64_t bytes) {
-        return large_exclusive || large_gate.admits(leonida::large_module_estimate(bytes));
+    // Within the memory budget a large module takes its place in the gate as it is handed out; the worker holds it
+    // from there. With --large-parallel 1 the exclusive lock below orders them instead.
+    auto admit_large = [&](uint64_t bytes) {
+        return large_exclusive || large_gate.try_enter(leonida::large_module_estimate(bytes));
     };
     std::atomic<uint32_t> total_pipes_done{0};
     // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
@@ -1585,7 +1587,14 @@ int main(int argc, char** argv) {
     };
 
     auto worker = [&] {
-        for (size_t k; start_order.next(k, admits_now);) {
+        size_t k;
+        bool admitted;
+        while (start_order.next(k, admitted, admit_large)) {
+            // Declared first so it is left last, after the module and its pipeline are gone, on every path out.
+            leonida::LargeModuleGate::Ticket large_ticket;
+            if (admitted && !large_exclusive)
+                large_ticket = leonida::LargeModuleGate::Ticket::adopt(large_gate,
+                                                                       leonida::large_module_estimate(work_bytes[k]));
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
@@ -1636,11 +1645,10 @@ int main(int argc, char** argv) {
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
-            leonida::LargeModuleGate::Ticket large_ticket;   // left after the module and its pipeline are gone
             if (large_exclusive) {
                 if (isolated) exclusive.lock();
                 else if (large_module_bytes) parallel.lock();
-            } else if (isolated) {
+            } else if (isolated && !large_ticket.held()) {   // handed out once no small module was left: wait here
                 large_ticket = leonida::LargeModuleGate::Ticket(large_gate,
                                                                 leonida::large_module_estimate(file_size));
             }

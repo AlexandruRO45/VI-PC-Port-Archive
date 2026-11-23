@@ -126,6 +126,14 @@ public:
         used_ += estimate;
         ++inflight_;
     }
+    // Takes a place when admits() would let it in now, in the same step; never waits.
+    bool try_enter(uint64_t estimate) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!admits_locked(estimate)) return false;
+        used_ += estimate;
+        ++inflight_;
+        return true;
+    }
     void leave(uint64_t estimate) {
         {
             std::lock_guard<std::mutex> g(mu_);
@@ -154,6 +162,14 @@ public:
         Ticket(const Ticket&) = delete;
         Ticket& operator=(const Ticket&) = delete;
         ~Ticket() { release(); }
+        // Holds a place already taken with try_enter().
+        static Ticket adopt(LargeModuleGate& gate, uint64_t estimate) {
+            Ticket t;
+            t.gate_ = &gate;
+            t.estimate_ = estimate;
+            return t;
+        }
+        bool held() const { return gate_ != nullptr; }
         void release() {
             if (!gate_) return;
             gate_->leave(estimate_);
@@ -181,9 +197,8 @@ private:
 
 // The order a range's modules start in: largest .spv first, so the longest driver compiles run alongside the small
 // ones instead of alone after them. A module counts as large above `large_bytes` (0: none is). The next large module
-// starts only when `admits` says the gate would let it in now, or when no small module is left; otherwise the
-// largest small module starts, so a thread never waits at the gate while small work is pending. Equal sizes keep
-// index order. Thread-safe.
+// starts when `admit` lets it in now, or when no small module is left; otherwise the largest small module starts,
+// so a thread never waits at the gate while small work is pending. Equal sizes keep index order. Thread-safe.
 class StartOrder {
 public:
     StartOrder(const std::vector<uint64_t>& sizes, uint64_t large_bytes) {
@@ -194,15 +209,23 @@ public:
         std::stable_sort(small_.begin(), small_.end(), larger);
     }
 
-    // The next index to start, or false when every module has started.
-    template <typename Admits>
-    bool next(size_t& index, Admits&& admits) {
+    // The next index to start, or false when every module has started. `admit(bytes)` is called under this object's
+    // lock for the next large module and decides in one step whether it starts now; with the gate it takes the
+    // module's place there (LargeModuleGate::try_enter), so two threads never both start into the same room.
+    // `admitted` is true only when `admit` said yes for the returned index. A large module handed out because no
+    // small one is left has `admitted` false, and its thread waits at the gate.
+    template <typename Admit>
+    bool next(size_t& index, bool& admitted, Admit&& admit) {
         std::lock_guard<std::mutex> g(mu_);
+        admitted = false;
         const bool large_left = large_next_ < large_.size();
         const bool small_left = small_next_ < small_.size();
-        if (large_left && (!small_left || admits(large_[large_next_].bytes))) {
-            index = large_[large_next_++].index;
-            return true;
+        if (large_left) {
+            admitted = admit(large_[large_next_].bytes);
+            if (admitted || !small_left) {
+                index = large_[large_next_++].index;
+                return true;
+            }
         }
         if (!small_left) return false;
         index = small_[small_next_++].index;
