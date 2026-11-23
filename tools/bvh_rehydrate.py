@@ -64,6 +64,7 @@ INVALID = 0xFFFFFFFF
 TRI0, TRI1, BOX16, BOX32 = 0, 1, 4, 5
 FLT_MAX = struct.unpack("<f", b"\xff\xff\x7f\x7f")[0]
 HALF_POS_INF, HALF_NEG_INF = 0x7C00, 0xFC00
+HALF_MAX = 65504.0
 HALF_MIN_NORMAL = 2.0 ** -14
 NAN32 = struct.unpack("<f", struct.pack("<I", 0x7FC00000))[0]
 LEAVES_PER_CHUNK, CHUNK_STRIDE = 2048, 1 << 17
@@ -124,6 +125,8 @@ def half_down(x):
     else:
         y = from_bits32(b & ~0x1FFF)
         y = 0.0 if y < HALF_MIN_NORMAL else y
+        if y > HALF_MAX and math.isfinite(x):    # a finite bound above the range floors to the largest half
+            y = HALF_MAX
     return float_to_half(y)
 
 
@@ -137,6 +140,8 @@ def half_up(x):
     else:
         y = from_bits32(b & ~0x1FFF)
         y = 0.0 if y > -HALF_MIN_NORMAL else y
+        if y < -HALF_MAX and math.isfinite(x):   # a finite bound below the range ceils to the smallest half
+            y = -HALF_MAX
     return float_to_half(y)
 
 

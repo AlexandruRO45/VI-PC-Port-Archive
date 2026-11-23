@@ -183,6 +183,29 @@ class TestBoxes(unittest.TestCase):
         self.assertEqual(R.half_down(-70000.0), R.HALF_NEG_INF)
         self.assertEqual(R.half_to_float(R.half_up(1e-6)), 2 ** -14)
 
+    def test_box16_bound_past_the_half_range_keeps_a_finite_value(self):
+        # half_down is the largest half not above x, so a finite bound above 65504 floors to 65504 (half_up of a
+        # finite bound below -65504 ceils to -65504); only an infinite bound, and the unused slots' HALF_POS_INF,
+        # stay infinite. The 16-bit store used to turn either side into an infinity, i.e. the empty box.
+        self.assertEqual(R.half_down(70000.0), 0x7BFF)
+        self.assertEqual(R.half_down(65536.0), 0x7BFF)
+        self.assertEqual(R.half_down(65520.0), 0x7BFF)
+        self.assertEqual(R.half_up(-70000.0), 0xFBFF)
+        self.assertEqual(R.half_up(-65536.0), 0xFBFF)
+        self.assertEqual(R.half_down(65504.0), 0x7BFF)
+        self.assertEqual(R.half_up(-65504.0), 0xFBFF)
+        self.assertEqual(R.half_down(float("inf")), R.HALF_POS_INF)
+        self.assertEqual(R.half_up(float("inf")), R.HALF_POS_INF)
+        self.assertEqual(R.half_down(float("-inf")), R.HALF_NEG_INF)
+        self.assertEqual(R.half_up(float("-inf")), R.HALF_NEG_INF)
+
+        # a leaf whose whole box is past the half range: its node keeps a finite minimum, not the empty box's inf
+        g = R.Geometry(struct.pack("<9f", 70000.0, 70000.0, 70000.0, 80000.0, 80000.0, 80000.0,
+                                   90000.0, 90000.0, 90000.0))
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)], root_wide=False)
+        self.assertEqual(struct.unpack_from("<6H", R.rehydrate(src, [g]), 0x200 + 16),
+                         (0x7BFF, 0x7BFF, 0x7BFF, R.HALF_POS_INF, R.HALF_POS_INF, R.HALF_POS_INF))
+
 
 class TestParentTableBounds(unittest.TestCase):
     def test_console_offset_to_parents_zero_keeps_the_header(self):
