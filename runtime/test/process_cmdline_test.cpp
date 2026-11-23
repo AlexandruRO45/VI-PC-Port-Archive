@@ -24,7 +24,7 @@ FILE* g_flush_stream = nullptr;
 constexpr char kBufferedText[] = "buffered C stream\n";
 
 bool buffer_stream() {
-    if (_wfopen_s(&g_flush_stream, g_flush_path, L"w") != 0 || !g_flush_stream) return false;
+    if (_wfopen_s(&g_flush_stream, g_flush_path, L"wb") != 0 || !g_flush_stream) return false;
     std::fputs(kBufferedText, g_flush_stream);
     return true;
 }
@@ -64,7 +64,7 @@ void check_normal_exit_flush(bool use_exit) {
     }
     char contents[32] = {};
     FILE* copy = nullptr;
-    if (_wfopen_s(&copy, path, L"r") == 0 && copy) {
+    if (_wfopen_s(&copy, path, L"rb") == 0 && copy) {
         std::fread(contents, 1, sizeof(contents) - 1, copy);
         std::fclose(copy);
     }
@@ -73,9 +73,9 @@ void check_normal_exit_flush(bool use_exit) {
     const int expected_code = use_exit ? 23 : 17;
     const bool contents_match = std::strcmp(contents, kBufferedText) == 0;
     if (code != expected_code || !flushed || !contents_match) {
-        std::fprintf(stderr, "FAIL %s: exit code %d (want %d), buffered stream %s, contents %s\n",
-                     use_exit ? "exit()" : "entry return", code, expected_code,
-                     flushed ? "was flushed" : "was not flushed before cleanup", contents_match ? "match" : "differ");
+        std::fprintf(stderr, "FAIL %s: exit code %d (want %d), stream size %lld (want %zu), contents %s\n",
+                     use_exit ? "exit()" : "entry return", code, expected_code, static_cast<long long>(size.QuadPart),
+                     sizeof(kBufferedText) - 1, contents_match ? "match" : "differ");
         ++failures;
     }
 }
