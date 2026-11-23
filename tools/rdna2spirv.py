@@ -1545,11 +1545,8 @@ class Gen:
             val = self.sdwa_dst(a, val)
         if a["k"] == "special" and a["t"] == "null":
             return                                    # result discarded
-        if self.wave64 and a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi"):
-            self.exec_half_write(1 if a["t"] == "exec_hi" else 0, val)
-            return
-        if a["k"] == "special" and a["t"] in ("exec_lo", "exec"):
-            self.set_exec(val)
+        if a["k"] == "special" and a["t"] in ("exec_lo", "exec_hi", "exec"):
+            self.exec_half_write(1 if (self.wave64 and a["t"] == "exec_hi") else 0, val)
             return
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
