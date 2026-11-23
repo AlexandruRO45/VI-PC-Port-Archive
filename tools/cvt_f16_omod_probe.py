@@ -18,13 +18,18 @@ unavailable or the GPU is not GFX10. Nothing here reads game files.
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 HI_SEED = 0xAAAA
 LO_SEED = 0x5555
@@ -366,12 +371,42 @@ def evaluate_results(modes: list[str], waves: list[int], meta, raw_results) -> d
 
 
 def write_report(path: str, doc: dict) -> bool:
-    """Write JSON report with LF line endings, creating parent folders."""
+    """Stage a complete JSON report with LF line endings; keep the previous file if publish fails."""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
-            f.write("\n")
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        destination = os.path.realpath(path)
+        parent = os.path.dirname(destination) or "."
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(doc, f, indent=1)
+                f.write("\n")
+            return True
+        if mode is not None:
+            # Retain the direct writer's permission check without truncating the report.
+            os.close(os.open(destination, os.O_WRONLY))
+
+        staged = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".cvt_f16_omod_probe-", suffix=".tmp",
+        )
+        try:
+            with staged:
+                json.dump(doc, staged, indent=1)
+                staged.write("\n")
+            if os.name != "nt":
+                os.chmod(staged.name, published_mode(destination))
+            replace_retry(staged.name, destination)
+        finally:
+            try:
+                os.unlink(staged.name)
+            except FileNotFoundError:
+                pass
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
         return False
