@@ -4,8 +4,11 @@
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
 Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+  python -I tools/probe_gfx1036_vcmp16.py
+
+The probe takes no options; it needs an RDNA2 GPU with a built runtime\\build\\vk_compute_test.exe.
 """
+import argparse
 import math
 import os
 import struct
@@ -367,4 +370,9 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
+    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()  # -h/--help; the probe takes no options
+    if not os.path.isfile(VK_COMPUTE_TEST):
+        print(f"{VK_COMPUTE_TEST} not found: it is the probe's GPU harness, so build runtime/ first (or run the "
+              f"probe where it was built)", file=sys.stderr)
+        sys.exit(2)
     main()
