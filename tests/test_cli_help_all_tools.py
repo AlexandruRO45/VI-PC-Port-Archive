@@ -10,6 +10,7 @@ import glob
 import importlib.util
 import os
 import subprocess
+import tempfile
 import sys
 import unittest
 
@@ -51,6 +52,25 @@ class CliHelpTests(unittest.TestCase):
 
     def test_every_cli_tool_answers_dash_dash_help(self):
         self.loop("--help")
+
+    def loop_from_tempdir(self, spelling):
+        paths = cli_tools()
+        self.assertGreater(len(paths), 40, "the CLI scan found almost nothing")
+        have_numpy = importlib.util.find_spec("numpy") is not None
+        with tempfile.TemporaryDirectory() as tmp:
+            for path in paths:
+                name = os.path.splitext(os.path.basename(path))[0]
+                if name in NUMERIC and not have_numpy:
+                    continue
+                with self.subTest(tool=name):
+                    proc = subprocess.run([sys.executable, "-I", path, spelling], capture_output=True,
+                                          text=True, timeout=TIMEOUT, errors="replace", cwd=tmp)
+                    self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertIn("usage:", proc.stdout.lower())
+
+    def test_help_works_from_an_unrelated_cwd(self):
+        self.loop_from_tempdir("--help")
 
     def test_every_cli_tool_answers_dash_h(self):
         self.loop("-h")
