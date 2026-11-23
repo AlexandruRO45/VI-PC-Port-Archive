@@ -641,5 +641,29 @@ class TestVMqsadU32U8ASTInterpreter(unittest.TestCase):
         self.assertEqual([state.vgprs[8 + k] for k in range(4)], [16, 20, 24, 28])
 
 
+class TestVMqsadU32U8SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and quad-lane windowing for v_mqsad_u32_u8."""
+
+    def test_quad_lane_divergence(self):
+        wave = WaveState(wave_size=32)
+        wave.exec_mask = 0x0000000F
+        for lane in range(32):
+            s0_64 = 0x0807060504030201
+            s1 = 0x01010101
+            s2_quad = [0, 0, 0, 0]
+            outs = ref_mqsad_u32_u8(s0_64, s1, s2_quad)
+            for k in range(4):
+                if (wave.exec_mask >> lane) & 1:
+                    wave.write_lane_u32(lane, 8 + k, outs[k])
+                else:
+                    wave.write_lane_u32(lane, 8 + k, 0)
+
+        for lane in range(32):
+            if lane < 4:
+                self.assertEqual([wave.vgprs[lane][8 + k] for k in range(4)], [6, 10, 14, 18])
+            else:
+                self.assertEqual([wave.vgprs[lane][8 + k] for k in range(4)], [0, 0, 0, 0])
+
+
 if __name__ == "__main__":
     unittest.main()
