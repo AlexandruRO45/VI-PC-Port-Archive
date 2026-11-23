@@ -33,6 +33,8 @@ Set-Alias -Name (Join-Path $PWD 'runtime\build\gta6rt.exe') -Value Write-Output
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
+    source_path = "runtime/src/pe_loader.cpp"
+
     def run_case(self, source_newer):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -43,7 +45,8 @@ class FirstLookRebuildTest(unittest.TestCase):
             (root / "tools" / "pe_inspect.py").write_text(PE_INSPECT_STUB, encoding="utf-8", newline="\n")
             (root / "fixture.exe").write_bytes(b"MZ")
             loader = root / "runtime" / "build" / "gta6rt.exe"
-            source = root / "runtime" / "src" / "pe_loader.cpp"
+            source = root / self.source_path
+            source.parent.mkdir(parents=True, exist_ok=True)
             loader.write_bytes(b"")
             source.write_text("// source\n", encoding="utf-8")
             now = time.time()
@@ -64,6 +67,16 @@ class FirstLookRebuildTest(unittest.TestCase):
     def test_an_up_to_date_loader_is_used_as_it_is(self):
         built, out = self.run_case(source_newer=False)
         self.assertFalse(built, out)
+
+    def test_a_loader_older_than_external_build_inputs_is_rebuilt(self):
+        for source in ("third_party/xtaskqueue/Include/XTaskQueue.h",
+                       "third_party/xtaskqueue/Source/Task/TaskQueue.cpp",
+                       "tools/gen_d3d12_stubs.py"):
+            with self.subTest(source=source):
+                self.source_path = source
+                built, out = self.run_case(source_newer=True)
+                self.assertTrue(built, out)
+                self.assertIn(Path(source).name + ": rebuilding it first", out)
 
 
 if __name__ == "__main__":

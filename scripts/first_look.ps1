@@ -27,7 +27,11 @@ if ($LASTEXITCODE -ne 0) { throw "pe_inspect failed" }
 $rt = Join-Path $root "runtime\build\gta6rt.exe"
 # A gta6rt.exe older than the runtime sources (a pull since the last build) would report the old shim table, so it
 # is rebuilt then too, not only when missing.
-$sources = @("runtime\src", "runtime\shims", "runtime\CMakeLists.txt") | ForEach-Object { Join-Path $root $_ } |
+$sources = @(
+    "runtime\src", "runtime\shims", "runtime\CMakeLists.txt",
+    "third_party\xtaskqueue\Include", "third_party\xtaskqueue\Source",
+    "tools\gen_d3d12_stubs.py"
+) | ForEach-Object { Join-Path $root $_ } |
     Where-Object { Test-Path $_ }
 $newest = $sources | Get-ChildItem -Recurse -File -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
