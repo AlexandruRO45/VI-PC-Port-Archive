@@ -1802,15 +1802,25 @@ inline ReplayResult prepare_texture_copy(const CopyTexture& copy, Prepared& p) {
     std::uint32_t w = box.right - box.left, h = box.bottom - box.top;
     const auto texture_z = upload ? copy.z : box.front, placed_z = upload ? box.front : copy.z;
     const auto depth = box.back - box.front;
-    if (!depth || !within(placed_z, depth, placed.depth) || !within(texture_z, depth, mip_depth) ||
+    if (!w || !h || !depth || !within(placed_z, depth, placed.depth) || !within(texture_z, depth, mip_depth) ||
         !within(placed_x, w, placed.width) || !within(placed_y, h, placed.height)) return ReplayResult::invalid_copy;
     if (texture_x >= mip.width || texture_y >= mip.height) return ReplayResult::invalid_copy;
+    if ((placed_x | placed_y | texture_x | texture_y) % format.block) return ReplayResult::invalid_copy;
     if (format.block > 1) {
+        // Block-compressed copies may pad the final partial block to the block-padded mip edge, but must not run past
+        // it or stop mid-block before the mip edge (VUID-vkCmdCopyBufferToImage-imageExtent-00207 / 00208 and
+        // VUID-vkCmdCopyImageToBuffer-imageExtent-00207 / 00208).
+        const auto padded = [b = std::uint64_t(format.block)](std::uint32_t size) {
+            return (std::uint64_t(size) + b - 1) / b * b;
+        };
+        if (w > padded(mip.width) - texture_x || h > padded(mip.height) - texture_y) return ReplayResult::invalid_copy;
+        if ((w % format.block && std::uint64_t(texture_x) + w != mip.width) ||
+            (h % format.block && std::uint64_t(texture_y) + h != mip.height))
+            return ReplayResult::invalid_copy;
         w = std::min(w, mip.width - texture_x);
         h = std::min(h, mip.height - texture_y);
     }
     if (!within(texture_x, w, mip.width) || !within(texture_y, h, mip.height)) return ReplayResult::invalid_copy;
-    if ((placed_x | placed_y | texture_x | texture_y) % format.block) return ReplayResult::invalid_copy;
     const auto slice_rows = (std::uint64_t(placed.height) + format.block - 1) / format.block;
     const std::uint64_t slice_pitch = slice_rows * placed.row_pitch;
     if (!slice_pitch || placed.offset > buffer.size || placed_z > (buffer.size - placed.offset) / slice_pitch)
