@@ -31,6 +31,7 @@ class AssetsDecoderTest(unittest.TestCase):
             with open(os.path.join(audio, name), "w"):
                 pass
         make_game.mark(os.path.join(audio, "ogg.done"), make_game.ogg_marker())
+        make_game.mark(os.path.join(audio, "xma.done"), "rpf9dump xma")
 
     def export(self, digest):
         """Run assets() with a fake exporter and the given decoder digest; returns the modes it exported."""

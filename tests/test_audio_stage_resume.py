@@ -179,6 +179,16 @@ class AudioStageResumeTest(unittest.TestCase):
         os.makedirs(os.path.join(self.audio, "xma"))
         self.assertIn("rpf9dump xma", self.run_stage())
 
+    def test_a_truncated_or_foreign_xma_marker_exports_again(self):
+        self.run_stage()
+        for text in ("", "rpf9dump xm", "something else finished\n"):
+            with self.subTest(text=text):
+                with open(os.path.join(self.audio, "xma.done"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                self.assertIn("rpf9dump xma", self.run_stage())
+                with open(os.path.join(self.audio, "xma.done"), encoding="utf-8") as f:
+                    self.assertEqual(f.read().strip(), "rpf9dump xma finished")
+
     def test_failed_decode_leaves_no_wav_and_is_retried(self):
         self.ffmpeg_ok = False
         self.run_stage()

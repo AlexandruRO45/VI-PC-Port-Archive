@@ -1692,7 +1692,7 @@ def assets(game: str, work: str, wav: bool, jobs: int) -> None:
         py("audio_wav.py", ogg, "--out", os.path.join(out, "audio", "wav"), "--jobs", str(jobs))
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
-    if not os.path.isfile(xma_done):
+    if read_shader_setting(xma_done) != "rpf9dump xma finished":
         log("assets: XMA2 streams")
         run([get_exporter(work), "xma", os.path.join(game, "audio.rpf"), out])
         mark(xma_done, "rpf9dump xma")
