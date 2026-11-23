@@ -16,7 +16,7 @@ from collections import Counter
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from amd_swizzle import _parity, equation, load  # noqa: E402
+from amd_swizzle import HEADER, _parity, equation, load  # noqa: E402
 from bc_feature import block_average, smoothness  # noqa: E402
 
 BPE = {"BC1": 8, "BC2": 16, "BC3": 16}
@@ -90,7 +90,10 @@ def main():
         ap.error(f"cannot read texture index {a.index}: {error}")
     if not isinstance(index, list):
         ap.error(f"{a.index}: texture index must contain a list")
-    nib, tab = load()
+    try:
+        nib, tab = load()
+    except OSError as error:
+        ap.error(f"cannot read swizzle header {error.filename or HEADER}: {error.strerror or error}")
     texs = [t for t in index if t["fmt_name"].startswith(a.fmt)
             and bc_bpe(t["fmt_name"]) is not None and t["w"] >= 256 and t["h"] >= 256]
     texs = texs[: a.n]
