@@ -1482,6 +1482,15 @@ void test_force_feedback(IGameInput* input) {
         timed->SetState(GameInputFeedbackRunning);
         rt::gameinput::poll();
         check(g_fake.runs == runs2 + 3, "force feedback: so does a stop and restart between two polls");
+        pulse.data.sineWave.envelope.sustainDuration = 10'000'000;
+        check(timed->SetParams(&pulse), "force feedback: SetParams with a 10 s wave played once");
+        rt::gameinput::poll();
+        pulse.data.sineWave.envelope.sustainDuration = 5'000'000;
+        pulse.data.sineWave.envelope.playCount = 2;
+        check(timed->SetParams(&pulse), "force feedback: SetParams with a 5 s wave played twice");
+        rt::gameinput::poll();
+        check(g_fake.runs == runs2 + 5 && g_fake.last_iterations == 2 && g_fake.last.periodic.length == 5000,
+              "force feedback: the same total length with a new play count runs the effect again with it");
         timed->Release();
         rt::gameinput::poll();
     }

@@ -800,6 +800,7 @@ private:
     int sdl_effect_ = -1;
     bool sdl_running_ = false;
     bool endless_ = true;    // GameInput gave no duration: re-run before the SDL length runs out
+    uint32_t iterations_ = 0;
     uint64_t run_at_ = 0, run_for_ = 0;
 };
 
@@ -2201,7 +2202,8 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     const uint32_t iterations = endless ? 0 : play_count(params);
     const uint64_t run_for = endless || iterations == 0 ? 0 : static_cast<uint64_t>(length_ms) * 1000ull * iterations;
     // SetParams' reference: a finite effect's timer is only refreshed by a new duration or a stop and restart.
-    const bool same_run = sdl_running_ && !endless_ && !endless && run_for == run_for_ && starts == started_;
+    const bool same_run = sdl_running_ && !endless_ && !endless && run_for == run_for_ &&
+                          iterations == iterations_ && starts == started_;
     if (!same_run && !haptics().run_effect(d->haptic, sdl_effect_, iterations)) {
         note_effect(d, sdl_effect_, false);
         return;
@@ -2212,6 +2214,7 @@ void ForceFeedbackEffect::sync(Device* d, uint64_t now, bool muted) {
     if (same_run) return;
     started_ = starts;
     endless_ = endless;
+    iterations_ = iterations;
     run_at_ = now;
     run_for_ = run_for;
 }
