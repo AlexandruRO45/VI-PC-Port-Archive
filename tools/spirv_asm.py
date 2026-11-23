@@ -276,6 +276,32 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
     # Only OpSwitch needs a value's result type, to choose the case literal width.
     track_switch_types = "OpSwitch" in text
     ext_imports: dict[int, dict[str, int]] = {}  # ext_set_id -> {name: opcode}
+    forward_int_types: dict[str, tuple] | None = None  # built on first need: result %name -> (width, signed)
+
+    def scan_int_types() -> dict[str, tuple]:
+        # An OpSwitch selector can be defined further down the text (a block that is laid out later). Map
+        # every result of an integer type to (width, signed) from the whole text, so its case literals get
+        # their real width instead of the 32-bit fallback (SHADER-1089). Lines that do not tokenize are left
+        # to the main loop, which reports them.
+        int_type_of: dict[str, tuple] = {}
+        result_type_of: dict[str, str] = {}
+        for n, line in enumerate(text.splitlines(), 1):
+            try:
+                t = _tokenize_line(line, n)
+            except SpirvAsmError:
+                continue
+            if len(t) < 4 or t[1] != "=":
+                continue
+            if t[2] == "OpTypeInt" and len(t) >= 5:
+                try:
+                    int_type_of[t[0]] = (_parse_int(t[3], n), _parse_int(t[4], n))
+                except SpirvAsmError:
+                    continue
+            else:
+                spec = INSTRUCTIONS.get(t[2])
+                if spec is not None and spec[1]:
+                    result_type_of[t[0]] = t[3]
+        return {r: int_type_of[ty] for r, ty in result_type_of.items() if ty in int_type_of}
 
     def get_id(tok: str, lineno: int) -> int:
         nonlocal next_id
@@ -507,6 +533,12 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
         elif opname == "OpSwitch" and arg_idx < len(toks):
             sel_id = get_id(toks[arg_idx], lineno)
             sel_ti = type_info.get(id_to_type.get(sel_id))
+            if sel_ti is None:
+                if forward_int_types is None:
+                    forward_int_types = scan_int_types()
+                fwd = forward_int_types.get(toks[arg_idx])
+                if fwd is not None:
+                    sel_ti = ("int", fwd[0], fwd[1])
             if sel_ti and sel_ti[0] == "int" and (sel_ti[1] <= 32 or sel_ti[1] == 64):
                 switch_type = (sel_ti[1], bool(sel_ti[2]))
 

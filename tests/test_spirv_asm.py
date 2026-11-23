@@ -535,5 +535,37 @@ class IntegerLiteralRangeTests(unittest.TestCase):
                     self.assertEqual(a[:2] + a[3:], b[:2] + b[3:])
 
 
+
+def _forward_switch(sel_type, literal):
+    """An OpSwitch whose selector is defined in a block laid out after the switch block (SHADER-1089)."""
+    return (_INT_HEAD + "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n"
+            f"%c = OpConstant %{sel_type} 5\n%f = OpFunction %void None %fn\n%l0 = OpLabel\nOpBranch %def\n"
+            f"%sw = OpLabel\nOpSelectionMerge %m None\nOpSwitch %k %m {literal} %l1\n%l1 = OpLabel\nOpBranch %m\n"
+            f"%def = OpLabel\n%k = OpCopyObject %{sel_type} %c\nOpBranch %sw\n"
+            "%m = OpLabel\nOpReturn\nOpFunctionEnd\n")
+
+
+class ForwardSwitchSelectorTests(unittest.TestCase):
+    """SHADER-1089: a selector defined further down still sets the case literal width (it was one word)."""
+
+    def literal(self, sel_type, literal):
+        return _literal_words(spirv_asm.assemble(_forward_switch(sel_type, literal)), 251, 2)[:-1]
+
+    def test_64_bit_selector_defined_later_gives_two_words(self):
+        self.assertEqual(self.literal("u64", "1"), [1, 0])
+        self.assertEqual(self.literal("u64", "0x100000001"), [1, 1])
+        self.assertEqual(self.literal("i64", "-1"), [0xFFFFFFFF, 0xFFFFFFFF])
+
+    def test_same_words_as_when_the_selector_comes_first(self):
+        for sel_type, literal in (("u64", "0x100000001"), ("i64", "-2"), ("u32", "7"), ("i16", "-1")):
+            with self.subTest(f"{sel_type} {literal}"):
+                self.assertEqual(self.literal(sel_type, literal),
+                                 _literal_words(spirv_asm.assemble(_switch(sel_type, literal)), 251, 2)[:-1])
+
+    def test_64_bit_literal_beyond_u64_is_still_refused(self):
+        with self.assertRaises(spirv_asm.SpirvAsmError):
+            spirv_asm.assemble(_forward_switch("u64", "0x10000000000000000"))
+
+
 if __name__ == "__main__":
     unittest.main()
