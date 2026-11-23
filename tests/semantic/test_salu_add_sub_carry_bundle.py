@@ -250,6 +250,20 @@ class TestSSubU32Oracle(unittest.TestCase):
         self.assertEqual(ref_s_sub_u32(0, 1), (0xFFFFFFFF, 1))
         self.assertEqual(ref_s_sub_u32(10, 20), (0xFFFFFFFF - 9, 1))
 
+class SSubU32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_sub_u32(self.src0, self.src1)
+
+
+class TestSSubU32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SSubU32Expr(1, 2)
+        self.assertEqual(expr.eval(), (0xFFFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
