@@ -458,6 +458,13 @@ Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
 
+std::string shim_import_name(const void* fn) {
+    if (!fn) return {};
+    for (const auto& [key, value] : table())
+        if (value == fn) return key;
+    return {};
+}
+
 void* find(const std::string& dll_lower, const std::string& name) {
     auto it = table().find(dll_lower + "!" + name);
     return it == table().end() ? nullptr : it->second;

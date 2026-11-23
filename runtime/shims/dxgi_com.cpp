@@ -1,4 +1,5 @@
 #include "dxgi_com.h"
+#include "boot_watchdog.h"
 #include "d3d12_stubs.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
@@ -304,6 +305,7 @@ public:
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
+        rt::boot_diag::progress();  // the hang watchdog (docs/boot.md) counts a real present as alive
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
         ++present_count_;

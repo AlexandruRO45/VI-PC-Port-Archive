@@ -1,6 +1,7 @@
 #include "xbox_present.h"
 
 #include "../src/vulkan_present.h"
+#include "boot_watchdog.h"
 
 #include <cerrno>
 #include <chrono>
@@ -103,6 +104,7 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
 
 HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                    const XboxPresentParameters* params) {
+    rt::boot_diag::progress();  // a frame was asked for: the hang watchdog (docs/boot.md) counts it as alive
     std::lock_guard serialise(present_mutex_);
     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
     if (pacer_.suspended()) return from_pacer(hr::invalid_state);

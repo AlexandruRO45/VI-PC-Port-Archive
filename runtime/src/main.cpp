@@ -30,6 +30,7 @@
 #include "code_hooks.h"
 #include "mods.h"
 #include "pe_loader.h"
+#include "../shims/boot_diag_install.h"
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
@@ -155,6 +156,19 @@ int wmain(int argc, wchar_t** argv) {
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        if (init || run) {
+            // Fault reports and the opt-in watchdog, first-chance log and breakpoints (docs/boot.md): before any image code.
+            rt::boot_diag::install(rt::boot_diag::settings_from_environment(),
+                                   [&](const std::string& module, uint8_t*& base, uint32_t& size) {
+                                       for (auto* m : loader.modules()) {
+                                           if (module.empty() ? m != &main_module : _stricmp(m->name.c_str(), module.c_str()) != 0) continue;
+                                           base = m->base;
+                                           size = m->size;
+                                           return true;
+                                       }
+                                       return false;
+                                   });
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

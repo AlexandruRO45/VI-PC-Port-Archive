@@ -53,6 +53,9 @@ void add_module_lookup(void* ctx, ModuleLookup fn);
 // "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
 // address in hex. Used by the startup trace (startup_trace.h).
 std::string module_offset(uint64_t address);
+// "dll!name" of the registry entry whose function is exactly `fn`, else "". Used by the boot diagnostics (boot_diag.h) to
+// name the import a call site reached.
+std::string shim_import_name(const void* fn);
 void remove_module_lookup(void* ctx);
 
 // The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.

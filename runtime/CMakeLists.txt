@@ -810,6 +810,14 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+
+    # Boot diagnostics (shims/boot_diag.h, boot_watchdog.h, boot_faults.h): thread dumps, fault reports, first-chance
+    # log and breakpoints on a synthetic image. No game files, no GPU.
+    add_executable(boot_diag_test test/boot_diag_test.cpp shims/registry.cpp)
+    target_compile_definitions(boot_diag_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(boot_diag_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
+    target_link_options(boot_diag_test PRIVATE /OPT:NOREF)
+    add_test(NAME boot_diag COMMAND boot_diag_test)
   endif()
 
   if(TARGET device_proxy_test)

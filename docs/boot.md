@@ -74,6 +74,8 @@ Useful switches:
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to a private folder instead of the package.
+* `LEONIDA_WATCHDOG=SEC`, `LEONIDA_THREAD_DUMP=N`, `LEONIDA_FAULTS=N`, `LEONIDA_FIRST_CHANCE=N`, `LEONIDA_BREAK=LIST`,
+  `LEONIDA_DIAG=0`: the boot diagnostics, see "Diagnosing a hang or a crash" below.
 
 ## 3. Triage order
 
@@ -107,6 +109,70 @@ option gives the same summary for a script. Share only the summary's **counts an
 If startup stops before the first D3D12 call, the combined command still prints the startup report. A missing
 or invalid requested trace is reported on stderr and sets exit code 2. In a partial JSON report that section
 is `null`; if neither input yields a report, stdout is empty.
+
+### Diagnosing a hang or a crash
+
+`gta6rt --init` and `--run` install the diagnostics before any image code runs (`runtime/shims/boot_diag*.h`,
+`boot_watchdog.h`, `boot_faults.h`). They only read and report; the process behaves as without them. Every report is
+a block of `[diag]` lines on stderr and, with `--trace`, one event (`fault`, `thread_dump`, `first_chance`,
+`break_hit`, `diag_setup`) with the same text. They answer three questions: which thread, which import, who called it.
+
+| Switch | What it does |
+|---|---|
+| (always on) | A fault report for each of the first 8 access violations, illegal instructions, divides by zero and the like, and for the one nobody handles (then every other thread is dumped). `LEONIDA_FAULTS=N` changes the 8; 0 turns the first-chance reports off. `LEONIDA_DIAG=0` turns everything off. |
+| `LEONIDA_FIRST_CHANCE=N` | Logs the first N other exceptions the game raises, a C++ throw with the decorated name of its first catchable type and the readable form (`std::runtime_error`). |
+| `LEONIDA_BREAK=1c4a0,client.dll+3f20` | Patches an int3 at image offsets (hex RVA, optional module name) and logs the registers and return address at each hit, 40 hits per offset, then runs on. A second thread passing the offset during the single step that puts the original instruction back is not seen. Patching code is the only thing the diagnostics change, and only when asked. |
+| `LEONIDA_WATCHDOG=SEC` | When no frame has been presented for SEC seconds, dumps every thread, up to three times, SEC seconds apart, then stays quiet until a frame comes. Without a present the clock runs from the start, so a game that hangs before its first frame is seen too. |
+| `LEONIDA_THREAD_DUMP=N` | One dump when frame N is presented, for a game that goes on presenting while a thread waits. |
+
+A frame is a `PresentX` or a DXGI `Present` (not a test present).
+
+Reading a fault report:
+
+```
+first-chance fault: access violation (0xc0000005) at 0x0 on thread 4412 "RenderThread"
+  call through a null pointer (target 0x0), called from client.dll+0x2210
+  thread started at client.dll+0x1c00
+  rax=0 rcx=260 ...
+  frames: 0x0 < client.dll+0x2210 < client.dll+0x1f00 < ...
+```
+
+* **Which thread.** The id, the name the game gave it (the old `0x406D1388` exception, read as the game raises it, or
+  `SetThreadDescription`) and where it started.
+* **Which import.** For the first frame inside a mapped image that is a return address, the call instruction before it
+  is decoded (`call rel32`, `call [rip+disp]`, through a `jmp [rip+disp]` thunk) and the address it reached is named:
+  a shim of the registry (`kernel32.dll!Foo`) or the host export with that exact address. "the fault is in host code;
+  image code client.dll+0x28e called ntdll.dll!RtlInitUnicodeString" is a bad argument passed to that import. "called
+  an address that is no known import" is an indirect call through a vtable or a function pointer.
+* **Who called it.** That frame, as module+RVA. For a call through a null pointer it is the return address at [rsp].
+* **The kind of fault.** A call through a null pointer, a null object plus a field offset (the offset is the address), a
+  jump to non-code, memory that is not mapped. A "null pointer plus offset 0x18" in a vtable-heavy engine is a field of an
+  object that was never created: look at who should have created it.
+* **Frames and the stack scan.** Frames come from the unwind data the loader registers (`RtlAddFunctionTable`); the
+  scan lists every slot of the first 16 KiB of the stack that holds an address in a mapped image right after a call
+  instruction and is not in the frames, which finds the callers a broken or missing unwind entry hides.
+
+A thread dump prints, per thread: running or waiting (the share of a 200 ms window the thread used the CPU: 30% or more
+is RUNNING, under 5% WAITING), the same four answers, and the frames. A RUNNING thread spins on something that never
+changes; the image code it is in is the loop. A WAITING thread's import is what it waits for; compare it across the
+dumps and with the other threads (one thread waiting for an event that another, also waiting, has to set).
+
+### What this does better than xvalkyrie
+
+Compared with `src/runtime/modules/watchdog.cpp` and `src/runtime/common/execute.cpp` at commit 53af7df77c10 (GPL-3.0),
+the idea is theirs, the code is new:
+
+* A thread is stopped only to copy its registers and stack. xvalkyrie builds strings and allocates while the thread is
+  suspended; a thread stopped inside the heap (a game that hangs in its allocator) would hang the dump too.
+* Running or waiting is measured, not left to the reader of three dumps.
+* The import a thread is in is named, and the caller is the first frame in an image, instead of a list of addresses.
+* A stack scan with a call-instruction check finds callers the unwind misses; both name the frames as module+RVA.
+* The dump waits for a frame from `PresentX` and DXGI alike, and the interval and count follow `LEONIDA_WATCHDOG`
+  instead of a fixed 5 s.
+* A fault report classifies the fault (null call, null object plus offset, fault in a host function) and a C++ throw
+  reports the type from the throw info.
+* Not done here, and measured nowhere yet: whether the game's own threads fault where the watchdog sees them; the
+  first real trace will say.
 
 ## 4. The open questions, and the trace signal for each
 
