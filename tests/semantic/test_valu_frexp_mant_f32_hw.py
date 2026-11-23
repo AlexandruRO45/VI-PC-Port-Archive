@@ -393,5 +393,60 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertTrue(c_inf.is_inf_or_nan)
 
 
+class TestBoundaryExtremes(unittest.TestCase):
+    def test_signed_zeros(self):
+        # +0.0 -> +0.0 (0x00000000)
+        self.assertEqual(ref_frexp_mant_f32(0x00000000), 0x00000000)
+        # -0.0 -> -0.0 (0x80000000)
+        self.assertEqual(ref_frexp_mant_f32(0x80000000), 0x80000000)
+
+        words_pos = run_ps_frexp_mant_f32([
+            "v_mov_b32 v1, 0x00000000",
+            "v_frexp_mant_f32 v0, v1",
+        ])
+        self.assertEqual(words_pos[0], 0x00000000)
+
+        words_neg = run_ps_frexp_mant_f32([
+            "v_mov_b32 v1, 0x80000000",
+            "v_frexp_mant_f32 v0, v1",
+        ])
+        self.assertEqual(words_neg[0], 0x80000000)
+
+    def test_infinities_pass_through(self):
+        # +inf (0x7F800000) passes through unchanged
+        self.assertEqual(ref_frexp_mant_f32(0x7F800000), 0x7F800000)
+        # -inf (0xFF800000) passes through unchanged
+        self.assertEqual(ref_frexp_mant_f32(0xFF800000), 0xFF800000)
+
+        words_inf = run_ps_frexp_mant_f32([
+            "v_mov_b32 v1, 0x7F800000",
+            "v_frexp_mant_f32 v0, v1",
+        ])
+        self.assertEqual(words_inf[0], 0x7F800000)
+
+    def test_nans_pass_through(self):
+        # qNaN (0x7FC00000) passes through
+        self.assertEqual(ref_frexp_mant_f32(0x7FC00000), 0x7FC00000)
+        # Custom NaN (0x7F800001) passes through
+        self.assertEqual(ref_frexp_mant_f32(0x7F800001), 0x7F800001)
+
+    def test_denormals_flushed_to_zero(self):
+        # Smallest positive subnormal: 0x00000001 -> flushed to +0.0
+        self.assertEqual(ref_frexp_mant_f32(0x00000001), 0x00000000)
+        # Largest positive subnormal: 0x007FFFFF -> flushed to +0.0
+        self.assertEqual(ref_frexp_mant_f32(0x007FFFFF), 0x00000000)
+        # Negative subnormal: 0x80000001 -> flushed to -0.0
+        self.assertEqual(ref_frexp_mant_f32(0x80000001), 0x80000000)
+
+    def test_float_min_max_extremes(self):
+        # Smallest normal positive float FLT_MIN (0x00800000) = 2^(-126):
+        # Fraction bits are 0 -> mantissa is exactly 0.5 (0x3F000000)
+        self.assertEqual(ref_frexp_mant_f32(0x00800000), 0x3F000000)
+
+        # Largest normal finite float FLT_MAX (0x7F7FFFFF):
+        # Fraction bits all 1s -> mantissa is 0x3F7FFFFF (1.0 - epsilon)
+        self.assertEqual(ref_frexp_mant_f32(0x7F7FFFFF), 0x3F7FFFFF)
+
+
 if __name__ == "__main__":
     unittest.main()
