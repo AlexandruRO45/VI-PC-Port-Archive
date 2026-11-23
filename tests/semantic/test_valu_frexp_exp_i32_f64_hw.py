@@ -490,5 +490,49 @@ class TestValuFrexpExpI32F64SIMD(unittest.TestCase):
         self.assertIn("OpSelect", spv)
 
 
+# ---------------------------------------------------------------------------
+# Stage 5: Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuFrexpExpI32F64RegisterAliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation for v_frexp_exp_i32_f64."""
+
+    def setUp(self) -> None:
+        self.state = ScalarMachineState()
+
+    def test_dst_aliases_src_low_word(self) -> None:
+        # dst v2, src v[2:3]
+        dst = Register(RegKind.VGPR, 2)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(32.0))
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        res_u32 = self.state.step(inst)
+        self.assertEqual(to_s32(res_u32), 6)
+        self.assertEqual(to_s32(self.state.vgprs[2]), 6)
+
+    def test_dst_aliases_src_high_word(self) -> None:
+        # dst v3, src v[2:3]
+        dst = Register(RegKind.VGPR, 3)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(64.0))
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        res_u32 = self.state.step(inst)
+        self.assertEqual(to_s32(res_u32), 7)
+        self.assertEqual(to_s32(self.state.vgprs[3]), 7)
+
+    def test_surrounding_registers_unmodified(self) -> None:
+        self.state.vgprs[0] = 0xAAAAAAAA
+        self.state.vgprs[1] = 0xBBBBBBBB
+        self.state.vgprs[4] = 0xCCCCCCCC
+        dst = Register(RegKind.VGPR, 1)
+        src = RegisterPair(RegKind.VGPR, 2)
+        self.state.write_f64(src, f64_to_bits(16.0))
+        inst = VOP1Instruction(Opcode.V_FREXP_EXP_I32_F64, dst, src)
+        self.state.step(inst)
+        self.assertEqual(self.state.vgprs[0], 0xAAAAAAAA)
+        self.assertEqual(to_s32(self.state.vgprs[1]), 5)
+        self.assertEqual(self.state.vgprs[4], 0xCCCCCCCC)
+
+
 if __name__ == "__main__":
     unittest.main()
