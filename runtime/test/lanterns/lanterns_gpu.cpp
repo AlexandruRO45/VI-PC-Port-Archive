@@ -90,7 +90,10 @@ bool load_shaders(const std::filesystem::path& dir, int stage, Shaders& out) {
     return true;
 }
 
-bool Gpu::create(const Scene& scene, const Shaders& shaders, DXGI_FORMAT target_format) {
+bool Gpu::create(const Scene& scene, const Shaders& shaders, DXGI_FORMAT target_format, UINT samples, UINT sample_mask) {
+    CHECK(samples == 1 || samples == 4);
+    samples_ = samples;
+    sample_mask_ = sample_mask;
     CHECK(target_format == DXGI_FORMAT_R32G32B32A32_FLOAT || target_format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
           (target_format == DXGI_FORMAT_R8G8B8A8_UNORM && !shaders.ps_gbuf.empty()));
     target_format_ = target_format;
@@ -158,7 +161,7 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.VS = gbuffer_ ? D3D12_SHADER_BYTECODE{shaders.vs_gbuf.data(), shaders.vs_gbuf.size()}
                        : D3D12_SHADER_BYTECODE{shaders.vs.data(), shaders.vs.size()};
     for (auto& target : desc.BlendState.RenderTarget) target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    desc.SampleMask = 0xffffffff;
+    desc.SampleMask = sample_mask_;
     desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     desc.RasterizerState.DepthClipEnable = TRUE;
@@ -171,7 +174,7 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
     desc.RTVFormats[2] = kGbufferDepthFormat;
     if (!gbuffer_) desc.RTVFormats[1] = desc.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     desc.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Count = samples_;
     for (int floor = 0; floor < 2; ++floor)
         for (int depth = 0; depth < 2; ++depth) {
             const auto& ps = gbuffer_    ? shaders.ps_gbuf
@@ -279,6 +282,12 @@ bool Gpu::create_resources(const Scene& scene) {
                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                          IID_PPV_ARGS(&gbuffer_depth_.p))));
     }
+    if (samples_ > 1) {   // stage 10: the frame is drawn into a multisampled target and resolved into target_
+        tex.SampleDesc.Count = samples_;
+        CHECK(SUCCEEDED(device_->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &tex,
+                                                         D3D12_RESOURCE_STATE_RESOLVE_SOURCE, nullptr,
+                                                         IID_PPV_ARGS(&msaa_target_.p))));
+    }
     tex.Format = DXGI_FORMAT_D32_FLOAT;
     tex.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     D3D12_CLEAR_VALUE depth_clear{};
@@ -298,7 +307,7 @@ bool Gpu::create_resources(const Scene& scene) {
     CHECK(SUCCEEDED(device_->CreateDescriptorHeap(&dsv_desc, IID_PPV_ARGS(&dsv_heap_.p))));
     rtv_ = {SIZE_T(heap_cpu(rtv_heap_.p))};
     dsv_ = {SIZE_T(heap_cpu(dsv_heap_.p))};
-    device_->CreateRenderTargetView(target_.p, nullptr, rtv_);
+    device_->CreateRenderTargetView(samples_ > 1 ? msaa_target_.p : target_.p, nullptr, rtv_);
     if (gbuffer_) {
         const UINT step = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         device_->CreateRenderTargetView(gbuffer_normal_.p, nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{rtv_.ptr + step});
@@ -404,8 +413,14 @@ bool Gpu::initialize(const Scene& scene) {
 bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_compute) {
     CHECK(SUCCEEDED(allocator_->Reset()));
     CHECK(SUCCEEDED(list_->Reset(allocator_.p, nullptr)));
-    std::vector<D3D12_RESOURCE_BARRIER> before = {
-        transition(target_.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)};
+    std::vector<D3D12_RESOURCE_BARRIER> before;
+    if (samples_ > 1) {
+        before.push_back(transition(target_.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RESOLVE_DEST));
+        before.push_back(transition(msaa_target_.p, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET));
+    } else {
+        before.push_back(transition(target_.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET));
+    }
     if (compute_)
         before.push_back(transition(particle_instances_.p, D3D12_RESOURCE_STATE_COMMON,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
@@ -454,8 +469,16 @@ bool Gpu::submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_c
         list_->DrawIndexedInstanced(geometry_.index_count[draw.mesh], UINT(draw.instances.size()),
                                     geometry_.first_index[draw.mesh], 0, 0);
     }
-    std::vector<D3D12_RESOURCE_BARRIER> to_copy = {
-        transition(target_.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    std::vector<D3D12_RESOURCE_BARRIER> to_copy;
+    if (samples_ > 1) {   // resolve the samples (D3D12: their average) into the single-sample target
+        const D3D12_RESOURCE_BARRIER resolve = transition(msaa_target_.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                          D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        list_->ResourceBarrier(1, &resolve);
+        list_->ResolveSubresource(target_.p, 0, msaa_target_.p, 0, target_format_);
+        to_copy.push_back(transition(target_.p, D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    } else {
+        to_copy.push_back(transition(target_.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE));
+    }
     if (gbuffer_)
         for (ID3D12Resource* r : {gbuffer_normal_.p, gbuffer_depth_.p})
             to_copy.push_back(transition(r, D3D12_RESOURCE_STATE_RENDER_TARGET,

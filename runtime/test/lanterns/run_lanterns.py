@@ -37,6 +37,8 @@ folder:
   stage 8: the shadowed frame; sheet: frame | the middle of its reference bounds / the control (map cleared to far) |
            the control's mask against its own all-lit reference (grey exact, yellow bounded, red outside)
   stage 9: the lit frame; sheet: frame | reference / the G-buffer albedo | mask / one light moved | frame
+  stage 10: the 4x resolve and the 1x render side by side; sheet: resolve | reference / 1x | mask (yellow: edge pixels
+            whose samples differ, grey: uncertain)
 """
 import argparse
 import array
@@ -85,6 +87,12 @@ PASS_LINES = {
         rf"from poisoned buffers, one light moved changed {N} of {N} predicted pixels",
         lambda a, b, p, q, s, t, per_tile, sets, tiles, moved, predicted: a == b and p == q and q >= 50000
         and s == t and per_tile < 128 and sets == tiles and moved == predicted and predicted >= 500),
+    10: (rf"Lanterns stage 10: PASS, 4x MSAA resolved by ResolveSubresource: {N} of {N} certain pixels exact at the "
+         rf"standard sample positions \({N} edge pixels blended exactly\), the 1x render differs on {N} of {N} predicted "
+         rf"edge pixels and nowhere else certain; {N} of {N} uncertain pixels are one of their enumerated averages; "
+         rf"SampleMask 1 << s isolated each sample \(at least {N} pixels only that sample's position explains\)",
+         lambda a, b, blended, changed, predicted, e_ok, e, distinct: a == b and blended >= 1000
+         and changed == predicted and predicted >= 1000 and e_ok == e and distinct > 0),
 }
 
 
@@ -323,6 +331,8 @@ PANELS = {
     9: {"main": [["stage9-frame.gpu"]],
         "sheet": [["stage9-frame.gpu", "stage9-frame.ref"], ["stage9-albedo.gpu", "stage9-frame:mask"],
                   ["stage9-moved.gpu", "stage9-frame.gpu"]]},
+    10: {"main": [["stage10-frame.gpu", "stage10-single.gpu"]],
+         "sheet": [["stage10-frame.gpu", "stage10-frame.ref"], ["stage10-single.gpu", "stage10-frame:mask"]]},
 }
 
 

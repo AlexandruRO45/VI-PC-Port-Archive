@@ -46,6 +46,7 @@ predicts, so a check that could not tell a right frame from a wrong one fails.
 | [6](#stage-6-compressed-textures-with-mip-chains) | BC1 and BC7 textures with full mip chains, trilinear and explicit-LOD sampling | Two mips down leaves the predicted pixels' bounds |
 | [8](#stage-8-a-shadow-map) | A D32 shadow map with PSO depth bias, sampled with 2x2 PCF | The map cleared to far changes the predicted pixels |
 | [9](#stage-9-deferred-lighting-with-tiled-light-culling) | A G-buffer of three render targets, then 256 point lights culled per 16x16 tile in LDS | One light moved changes the predicted pixels; culling off gives the same image |
+| [10](#stage-10-4x-msaa-resolved-with-resolvesubresource) | The frame drawn at 4x MSAA and resolved with `ResolveSubresource` | The 1x render differs on exactly the predicted edge pixels; `SampleMask` isolates each sample |
 
 ## Stage 1
 
@@ -266,6 +267,27 @@ contribution is an interval, because the rebuilt position is known only within t
 
 ```
 Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo 98144 of 98144 exact, RGB10A2 normal and R32F depth 52643 of 52643 probes), 75462 of 75462 single-colour pixels exact through tiled culling with LDS atomics (10.4 of 256 lights per tile, the exact set in 384 of 384 tiles), culling off gave the same image bit for bit from poisoned buffers, one light moved changed 1231 of 1231 predicted pixels
+```
+
+## Stage 10: 4x MSAA resolved with ResolveSubresource
+
+The stage-1 scene drawn into a 4x `R32G32B32A32_FLOAT` target (`SampleDesc.Count = 4` on the target, the depth buffer
+and the pipelines) and resolved into the single-sample target with `ResolveSubresource`.
+
+How the check works. `lanterns_msaa.h` rasterizes the reference once per sample at D3D12's standard 4x positions
+(coverage and depth at the sample, shading at the pixel centre, as a pixel shader run once per pixel interpolates) and
+averages the four. A pixel whose samples are all certain has one expected colour; for the others the reference
+enumerates every average their sample candidates can give.
+
+- Every certain pixel must be exact, including the edge pixels whose samples differ and blend.
+- Every uncertain pixel must be one of its enumerated averages.
+- Control: the same frame at 1x must differ from the resolve on exactly the predicted edge pixels and nowhere else
+  certain.
+- `SampleMask` set to `1 << s` in four more pipelines: each frame must match sample s's own reference, including
+  pixels that only that sample's position explains.
+
+```
+Lanterns stage 10: PASS, 4x MSAA resolved by ResolveSubresource: 97438 of 97438 certain pixels exact at the standard sample positions (1173 edge pixels blended exactly), the 1x render differs on 1068 of 1068 predicted edge pixels and nowhere else certain; 866 of 866 uncertain pixels are one of their enumerated averages; SampleMask 1 << s isolated each sample (at least 188 pixels only that sample's position explains)
 ```
 
 ## Build and run

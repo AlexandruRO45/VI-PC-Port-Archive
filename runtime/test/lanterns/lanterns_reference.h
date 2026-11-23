@@ -141,7 +141,8 @@ namespace detail {
 // on a width x height target (the frame by default; stage 8's shadow map is another).
 template <class Shade>
 std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, unsigned& degenerate_faces,
-                                             unsigned width = kWidth, unsigned height = kHeight) {
+                                             unsigned width = kWidth, unsigned height = kHeight, double sample_x = 0,
+                                             double sample_y = 0) {
     std::vector<std::vector<Fragment>> frags(std::size_t(width) * height);
     unsigned seq = 0, groups = 0;
     for (const Draw& draw : scene.draws) {
@@ -200,7 +201,9 @@ std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, un
                 const int y0 = std::max(0, int(std::floor(miny)) - 1), y1 = std::min(int(height) - 1, int(maxy) + 1);
                 for (int y = y0; y <= y1; ++y)
                     for (int x = x0; x <= x1; ++x) {
-                        const double px = x + 0.5, py = y + 0.5;
+                        // Coverage and depth at the sample (the pixel centre unless a sample offset is given);
+                        // the shading at the pixel centre, as a pixel shader run once per pixel interpolates.
+                        const double px = x + 0.5 + sample_x, py = y + 0.5 + sample_y;
                         double inside = 1e30;
                         unsigned near_count = 0, near_edge = 0;
                         for (unsigned k = 0; k < face.count; ++k) {
@@ -224,7 +227,7 @@ std::vector<std::vector<Fragment>> fragments(const Scene& scene, Shade shade, un
                             f.edge = {p.x, p.y, q.x, q.y};
                             f.side = cross(q.x - p.x, q.y - p.y, cx - p.x, cy - p.y) > 0 ? 1 : -1;
                         }
-                        shade(PixelSite{&draw, &inst, lit, px, py, world_at, mesh.vertices[face.v[0]].shade}, f);
+                        shade(PixelSite{&draw, &inst, lit, x + 0.5, y + 0.5, world_at, mesh.vertices[face.v[0]].shade}, f);
                         frags[std::size_t(y) * width + x].push_back(f);
                     }
             }
@@ -253,10 +256,11 @@ inline void checker_shade(const PixelSite& site, Fragment& f) {
 }  // namespace detail
 
 // The frame the stage-1 draws make, with the depth test on (LESS, cleared to 1) or off (submission order wins).
-inline Reference reference_frame(const Scene& scene, bool depth_test) {
+// sample_x, sample_y: the frame of one MSAA sample (coverage and depth there, shading at the pixel centre).
+inline Reference reference_frame(const Scene& scene, bool depth_test, double sample_x = 0, double sample_y = 0) {
     using namespace detail;
     Reference ref;
-    const auto frags = fragments(scene, checker_shade, ref.degenerate_faces);
+    const auto frags = fragments(scene, checker_shade, ref.degenerate_faces, kWidth, kHeight, sample_x, sample_y);
     ref.color.assign(frags.size(), Color{kClear[0], kClear[1], kClear[2], kClear[3]});
     ref.candidates.resize(frags.size());
     for (std::size_t i = 0; i < frags.size(); ++i) {

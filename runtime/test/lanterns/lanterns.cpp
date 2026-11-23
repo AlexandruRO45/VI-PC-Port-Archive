@@ -6,7 +6,7 @@
 // compute, and readbacks checked against a CPU reference. Content: abstract solids on a checkered floor and rising
 // points of light, colours from short binary fractions; no game data. How to build and run it: lanterns.cmake.
 //
-//   lanterns.exe --stage 1|3|5|6|8|9 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
+//   lanterns.exe --stage 1|3|5|6|8|9|10 --shaders <folder fssm_pack.py wrote> --out <folder for the frame dumps>
 //
 // Stage 1: five DrawIndexedInstanced (hexagonal prisms, cubes, octahedra, pyramids, the floor) into a 384x256
 // R32G32B32A32_FLOAT target with a D32_FLOAT depth buffer. Vertex, index and instance buffers live in DEFAULT heaps,
@@ -50,6 +50,10 @@
 // with 256 point lights in integers (lanterns_deferred.h). Controls: culling off must give the same image bit for bit;
 // one light moved must change exactly the pixels the reference predicts.
 //
+// Stage 10: 4x MSAA. The stage-1 scene into a 4-sample target and depth buffer, ResolveSubresource to 1x; the CPU
+// rasterizes each standard sample position and averages (lanterns_msaa.h). Control: the 1x render must differ from the
+// resolve exactly on the edge pixels the reference predicts.
+//
 // On success the guest prints one line starting "Lanterns stage N: PASS" and exits 0; run_lanterns.py checks that
 // line, the exit code and the device line.
 #include "lanterns_edges_gpu.h"
@@ -62,6 +66,7 @@
 #include "lanterns_scene.h"
 #include "lanterns_shadow.h"
 #include "lanterns_deferred_gpu.h"
+#include "lanterns_msaa.h"
 #include "lanterns_textures_gpu.h"
 
 #include <algorithm>
@@ -661,6 +666,131 @@ int stage9(const std::filesystem::path& shader_dir, const std::filesystem::path&
     return 0;
 }
 
+// Stage 10: 4x MSAA with ResolveSubresource (see the top of this file).
+int stage10(const std::filesystem::path& shader_dir, const std::filesystem::path& out_dir) {
+    lanterns::Shaders shaders;
+    if (!lanterns::load_shaders(shader_dir, 1, shaders)) return 1;
+    const lanterns::Scene scene = lanterns::stage1();
+    std::vector<Color> resolved, single;
+    std::array<std::vector<Color>, 4> isolated;   // drawn with SampleMask 1 << s
+    {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R32G32B32A32_FLOAT, 4) || !gpu.submit_frame(scene, true, 0) ||
+            !gpu.finish_frame(resolved) || !gpu.idle())
+            return 1;
+    }
+    for (unsigned s = 0; s < 4; ++s) {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders, DXGI_FORMAT_R32G32B32A32_FLOAT, 4, 1u << s) || !gpu.submit_frame(scene, true, 0) ||
+            !gpu.finish_frame(isolated[s]) || !gpu.idle())
+            return 1;
+    }
+    {
+        lanterns::Gpu gpu;
+        if (!gpu.create(scene, shaders) || !gpu.submit_frame(scene, true, 0) || !gpu.finish_frame(single) || !gpu.idle())
+            return 1;
+    }
+    const lanterns::MsaaReference ref = lanterns::msaa_reference(scene);
+    const lanterns::Reference ref1 = lanterns::reference_frame(scene, true);
+    const lanterns::Comparison c = lanterns::compare_textured(resolved, ref.resolved), c1 = lanterns::compare(single, ref1);
+    unsigned blended = 0, blended_exact = 0, expected = 0, changed = 0, still = 0, kept = 0;
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        if (ref.blended[i]) ++blended, blended_exact += lanterns::detail::same(resolved[i], ref.resolved.bounds[i].lo);
+        if (!ref.resolved.certain[i] || !ref1.candidates[i].empty()) continue;
+        if (!lanterns::detail::same(ref.resolved.bounds[i].lo, ref1.color[i])) {
+            ++expected;
+            changed += !lanterns::detail::same(resolved[i], single[i]);
+        } else {
+            ++still;
+            kept += lanterns::detail::same(resolved[i], single[i]);
+        }
+    }
+    std::printf("lanterns: 4x resolved frame: %u of %u certain pixels exact (%u of %u edge pixels whose samples differ, "
+                "averaged exactly), %u of %u uncertain within bounds\n", c.certain_exact, c.certain, blended_exact,
+                blended, c.uncertain_plausible, c.uncertain);
+    if (!c.pass()) report("4x resolved frame", c);
+    std::printf("lanterns: control, the same frame at 1x: %u of %u certain pixels exact; %u of %u predicted edge pixels "
+                "differ from the resolve, %u of %u predicted equal pixels equal\n", c1.certain_exact, c1.certain, changed,
+                expected, kept, still);
+    if (!c1.pass()) report("1x frame", c1);
+    // Uncertain pixels: the resolve must be one of the averages their samples' candidates can make, exactly.
+    unsigned enumerated = 0, enumerated_ok = 0, too_many = 0;
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        if (ref.resolved.certain[i]) continue;
+        if (ref.averages[i].empty()) {
+            ++too_many;
+            continue;
+        }
+        ++enumerated;
+        for (const Color& a : ref.averages[i])
+            if (lanterns::detail::same(resolved[i], a)) {
+                ++enumerated_ok;
+                break;
+            }
+    }
+    // One sample at a time: certain pixels exact, uncertain ones one of their candidates; "distinct" counts the certain
+    // pixels where this sample's prediction differs from every other sample's (what a wrong mask bit to position
+    // mapping, or an ignored mask, gets wrong).
+    std::array<unsigned, 4> iso_certain{}, iso_exact{}, iso_uncertain{}, iso_plausible{}, distinct{}, distinct_ok{};
+    std::array<lanterns::Reference, 4> masked;
+    for (unsigned s = 0; s < 4; ++s) masked[s] = lanterns::masked_resolve(ref.per_sample[s]);
+    for (unsigned s = 0; s < 4; ++s)
+        for (std::size_t i = 0; i < resolved.size(); ++i) {
+            const auto& m = masked[s];
+            if (!m.candidates[i].empty()) {
+                ++iso_uncertain[s];
+                for (const Color& cand : m.candidates[i])
+                    if (lanterns::detail::same(isolated[s][i], cand)) {
+                        ++iso_plausible[s];
+                        break;
+                    }
+                continue;
+            }
+            ++iso_certain[s];
+            const bool ok = lanterns::detail::same(isolated[s][i], m.color[i]);
+            iso_exact[s] += ok;
+            bool unique = true;
+            for (unsigned o = 0; o < 4 && unique; ++o)
+                if (o != s) unique = !masked[o].candidates[i].empty() ? false : !lanterns::detail::same(masked[o].color[i], m.color[i]);
+            distinct[s] += unique, distinct_ok[s] += unique && ok;
+        }
+    bool isolated_ok = true;
+    unsigned min_distinct = ~0u;
+    for (unsigned s = 0; s < 4; ++s) {
+        std::printf("lanterns: SampleMask 0x%x: %u of %u certain pixels exact (%u of %u where only this sample's position "
+                    "gives that colour), %u of %u uncertain one of their candidates\n", 1u << s, iso_exact[s],
+                    iso_certain[s], distinct_ok[s], distinct[s], iso_plausible[s], iso_uncertain[s]);
+        isolated_ok = isolated_ok && iso_exact[s] == iso_certain[s] && iso_plausible[s] == iso_uncertain[s] &&
+                      distinct_ok[s] == distinct[s];
+        min_distinct = std::min(min_distinct, distinct[s]);
+    }
+    std::printf("lanterns: uncertain pixels: %u of %u equal one of their enumerated 4-sample averages exactly (%u with "
+                "too many combinations, bounds only)\n", enumerated_ok, enumerated, too_many);
+    lanterns::Reference shown;
+    shown.color.resize(resolved.size());
+    shown.candidates.resize(resolved.size());
+    std::vector<std::uint8_t> states(resolved.size());
+    for (std::size_t i = 0; i < resolved.size(); ++i) {
+        for (int k = 0; k < 4; ++k)
+            shown.color[i][k] = (ref.resolved.bounds[i].lo[k] + ref.resolved.bounds[i].hi[k]) / 2;
+        states[i] = !lanterns::within(resolved[i], ref.resolved.bounds[i]) ? 2 : ref.blended[i] ? 1
+                    : ref.resolved.certain[i] ? 0 : 3;
+    }
+    if (!dump(out_dir, "stage10-frame", resolved, shown, &states) || !dump(out_dir, "stage10-single", single, shown, &states))
+        return 1;
+    if (!c.pass() || !c1.pass() || blended < 500 || blended_exact != blended || expected < 500 || changed != expected ||
+        kept != still || enumerated_ok != enumerated || too_many || !isolated_ok || min_distinct < 50) {
+        std::fprintf(stderr, "lanterns: stage 10 FAILED\n");
+        return 1;
+    }
+    std::printf("Lanterns stage 10: PASS, 4x MSAA resolved by ResolveSubresource: %u of %u certain pixels exact at the "
+                "standard sample positions (%u edge pixels blended exactly), the 1x render differs on %u of %u predicted "
+                "edge pixels and nowhere else certain; %u of %u uncertain pixels are one of their enumerated averages; SampleMask "
+                "1 << s isolated each sample (at least %u pixels only that sample's position explains)\n", c.certain_exact,
+                c.certain, blended, changed, expected, enumerated_ok, enumerated, min_distinct);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -683,8 +813,9 @@ int main(int argc, char** argv) {
     case 6: return stage6(shader_dir, out_dir);
     case 8: return stage8(shader_dir, out_dir);
     case 9: return stage9(shader_dir, out_dir);
+    case 10: return stage10(shader_dir, out_dir);
     default:
-        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
+        std::fprintf(stderr, "usage: lanterns --stage 1|3|5|6|8|9|10 --shaders <folder fssm_pack.py wrote> --out <folder>\n");
         return 2;
     }
 }

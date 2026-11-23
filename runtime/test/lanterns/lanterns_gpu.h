@@ -53,8 +53,11 @@ public:
     // buffers (and the particles' first state, when the shaders include the compute shader).
     // target_format: R32G32B32A32_FLOAT (the other stages) or R16G16B16A16_FLOAT (stage 5's HDR target, which the post-process
     // reads; finish_frame returns its pixels widened to float).
+    // samples: 1, or 4 (stage 10: a 4x target and depth buffer, resolved with ResolveSubresource into target()).
+    // sample_mask: the scene pipelines' SampleMask (stage 10 isolates one sample with 1 << s).
     bool create(const Scene& scene, const Shaders& shaders,
-                DXGI_FORMAT target_format = DXGI_FORMAT_R32G32B32A32_FLOAT);
+                DXGI_FORMAT target_format = DXGI_FORMAT_R32G32B32A32_FLOAT, UINT samples = 1,
+                UINT sample_mask = 0xffffffffu);
     // Records and submits one frame on the direct queue. With wait_compute != 0 the queue first waits for the
     // compute fence to reach that value (which may be signalled by a submission made after this one).
     bool submit_frame(const Scene& scene, bool depth_test, std::uint64_t wait_compute = 0);
@@ -97,7 +100,8 @@ private:
     Ref<ID3D12PipelineState> pso_[2][2];   // [floor][depth test]
     Ref<ID3D12PipelineState> pso_w64_[2];  // [depth test]: the wave64 pair, for the draws marked wave64
     Ref<ID3D12PipelineState> compute_pso_;
-    Ref<ID3D12Resource> shadow_map_, gbuffer_normal_, gbuffer_depth_;
+    Ref<ID3D12Resource> shadow_map_, gbuffer_normal_, gbuffer_depth_, msaa_target_;
+    UINT samples_ = 1, sample_mask_ = 0xffffffffu;
     bool gbuffer_ = false, gbuffer_written_ = false;
     std::vector<std::uint8_t> vs_;
     Ref<ID3D12PipelineState> shadow_pso_;
