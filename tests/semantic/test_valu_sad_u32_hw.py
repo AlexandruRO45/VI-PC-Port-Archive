@@ -307,5 +307,22 @@ class TestSadBoundaryAndExtremes(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
-if __name__ == '__main__':
+class TestSadNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: negative controls, syntax rejection, and mutation detection for v_sad_u32."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_sad_bad_nop", ["v_sad_u32 v0, v1, v2", "s_endpgm"])
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_sad_bad_op", ["v_sad_u32_nonexistent v0, v1, v2, v3", "s_endpgm"])
+
+    def test_mutation_detection_signed_difference(self):
+        # Oracle catches mutation if signed subtraction is used instead of unsigned absolute diff
+        signed_oracle = lambda a, b, c: ((a - b) + c) & MASK32
+        self.assertNotEqual(v_sad_u32_oracle(10, 50, 0), signed_oracle(10, 50, 0))
+
+
+if __name__ == "__main__":
     unittest.main()
