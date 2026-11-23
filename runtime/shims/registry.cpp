@@ -70,7 +70,7 @@ std::vector<Lookup> g_lookups;
 //                            dxgi1_3 and dxgi1_6 pages). Not the whole DXGI* prefix: only these names were verified.
 //  xgameruntime.dll          GDK reference, gaming/gdk/docs/reference/system/<family>/functions/<name>. These families
 //                            return HRESULT except the functions in kNotHResult, which the same pages show as
-//                            void/bool/int: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*.
+//                            void/bool/int/size_t: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*.
 //                            XGameStreaming* follows the same rule, including the unregister prefix exception.
 //                            XGameStreamingIsTouchInputEnabled keeps S_OK and writes false in its fallback.
 //                            XGameRuntimeInitialize, XGameEventWrite, XSystemGetXboxLiveSandboxId,
@@ -94,6 +94,7 @@ const char* const kNotHResult[] = {
     "XStoreProductsQueryHasMorePages", "XStoreUnregisterGameLicenseChanged", "XStoreUnregisterPackageLicenseLost",
     "XGameSaveCloseContainer", "XGameSaveCloseProvider", "XGameSaveCloseUpdate",
     "XGameStreamingIsStreaming", "XGameStreamingGetClientCount", "XGameStreamingGetConnectionState",
+    "XGameStreamingGetServerLocationNameSize", "XGameStreamingGetTouchBundleVersionNameSize",
     "XGameStreamingUninitialize", "XGameStreamingHideTouchControls", "XGameStreamingHideTouchControlsOnClient",
     "XGameStreamingShowTouchControlLayout", "XGameStreamingShowTouchControlLayoutOnClient",
     "XPackageCloseInstallationMonitorHandle", "XPackageCloseMountHandle", "XPackageGetInstallationProgress",

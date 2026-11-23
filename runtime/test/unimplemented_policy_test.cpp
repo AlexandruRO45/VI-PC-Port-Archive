@@ -254,11 +254,20 @@ void test_classification() {
         check(cls("xgameruntime.dll", name) == ReturnClass::HResult, std::string(name) + " returns HRESULT");
     for (const char* name : {"XGameStreamingIsStreaming", "XGameStreamingGetClientCount",
                              "XGameStreamingGetConnectionState",
+                             "XGameStreamingGetServerLocationNameSize", "XGameStreamingGetTouchBundleVersionNameSize",
                              "XGameStreamingHideTouchControls", "XGameStreamingHideTouchControlsOnClient",
                              "XGameStreamingShowTouchControlLayout", "XGameStreamingShowTouchControlLayoutOnClient",
                              "XGameStreamingUninitialize", "XGameStreamingUnregisterClientPropertiesChanged",
                              "XGameStreamingUnregisterConnectionStateChanged", "XGameStreamingUnregisterFuture"})
         check(cls("xgameruntime.dll", name) == ReturnClass::Other, std::string(name) + " is not HRESULT");
+
+    rt::shims::set_unimplemented_policy(UnimplementedPolicy::Fail);
+    for (const char* name : {"XGameStreamingGetServerLocationNameSize", "XGameStreamingGetTouchBundleVersionNameSize"}) {
+        using SizeFn = size_t (*)(uint64_t);
+        auto fn = reinterpret_cast<SizeFn>(rt::shims::make_unimplemented_thunk("xgameruntime.dll", name));
+        check(fn(0) == 0, std::string(name) + " returns zero under fail policy");
+    }
+    rt::shims::set_unimplemented_policy(UnimplementedPolicy::Log);
 
     bool valid = true;
     check(rt::shims::parse_unimplemented_policy("fail", &valid) == UnimplementedPolicy::Fail && valid, "parse fail");
