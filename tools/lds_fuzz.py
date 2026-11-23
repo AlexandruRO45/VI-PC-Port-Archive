@@ -55,6 +55,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
+import vk_compute_batch  # noqa: E402
 from compute_fixture import compute_header, find_test_program, unpinned_subgroup  # noqa: E402
 
 THREADS = 64                          # the default group size
@@ -810,7 +811,8 @@ def translate(progs, work, emulate, pc_tail=False):
     return json.loads(index.read_text(encoding="utf-8")) if index.exists() else {}
 
 
-def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
+def gpu_job(p, spv, build, index_entry, emulate, dump, pc_tail=False):
+    """vk_compute_test and the job (arguments, environment) that runs one translated program."""
     exe = os.path.join(build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
     if not os.path.isfile(exe):
         sys.exit(f"vk_compute_test not found in {build} or its RelWithDebInfo/Release folder; "
@@ -818,15 +820,38 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
     env = dict(os.environ, VKC_OUT_WORDS=str(p.out_words), VKC_DUMP=str(dump))
     if pc_tail:
         env["LEONIDA_PC_TAIL_UBO"] = "1"
-    args = [exe, str(spv), "1", "dump"]
+    args = [str(spv), "1", "dump"]
     if p.wave == 64 and not emulate:
         args.append("--require-wave64")
     elif p.wave == 32 or emulate:
         env["VKC_SUBGROUP_SIZE"] = "32"
     if index_entry.get("subgroup_size") and not emulate:
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
-    r = subprocess.run(args, capture_output=True, text=True, env=env)
+    return exe, vk_compute_batch.Job(tuple(args), env)
+
+
+def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
+    exe, job = gpu_job(p, spv, build, index_entry, emulate, dump, pc_tail)
+    r = subprocess.run([exe, *job.args], capture_output=True, text=True, env=job.env)
     return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def gpu_outcomes(ready, work, index, a, pc_tail=False):
+    """(exit code, output) of each program in ready, in order. --batch-size programs share one vk_compute_test
+    process and Vulkan device (tools/vk_compute_batch.py); --batch-size 1, or a vk_compute_test built before
+    --batch, runs each in its own process (run_gpu), as the results always came."""
+    size = getattr(a, "batch_size", 1)
+    exe = os.path.join(a.build, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+    if size > 1 and ready and os.path.isfile(exe) and vk_compute_batch.supports_batch(exe):
+        jobs = [gpu_job(p, work / "spirv" / (p.name + ".spv"), a.build, index[p.name], a.emulate,
+                        work / (p.name + ".bin"), pc_tail)[1] for p in ready]
+        for r in vk_compute_batch.run_jobs(exe, jobs, size):
+            yield r.returncode, r.output.strip()
+        return
+    for p in ready:
+        spv, dump = work / "spirv" / (p.name + ".spv"), work / (p.name + ".bin")
+        yield (run_gpu(p, spv, a.build, index[p.name], a.emulate, dump, pc_tail=True)
+               if pc_tail else run_gpu(p, spv, a.build, index[p.name], a.emulate, dump))
 
 
 def show_cmd(p, no_exec, opts):
@@ -859,6 +884,10 @@ def run_translator(progs, a, work, tally):
         return 2
     failed = hyp_only = untranslated = errors = 0
     skipped = len(progs) - len(todo)
+    ready = [p for p in todo if p.name in index and (work / "spirv" / (p.name + ".spv")).is_file()]
+    for p in ready:
+        (work / (p.name + ".bin")).unlink(missing_ok=True)
+    outcomes = gpu_outcomes(ready, work, index, a, pc_tail)
     for p in todo:
         spv = work / "spirv" / (p.name + ".spv")
         if p.name not in index or not spv.is_file():
@@ -867,9 +896,7 @@ def run_translator(progs, a, work, tally):
             tally.setdefault("translator", {})[p.name] = "not translated"
             continue
         dump = work / (p.name + ".bin")
-        dump.unlink(missing_ok=True)
-        rc, msg = (run_gpu(p, spv, a.build, index[p.name], a.emulate, dump, pc_tail=True)
-                   if pc_tail else run_gpu(p, spv, a.build, index[p.name], a.emulate, dump))
+        rc, msg = next(outcomes)
         if rc == 77:
             skipped += 1
             print(f"SKIP {p.name}: {msg.splitlines()[-1] if msg else 'unsupported'}")
@@ -1099,6 +1126,9 @@ def main():
                          "(128-byte push constants; also set by LEONIDA_PC_TAIL_UBO=1)")
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"))
     ap.add_argument("--work", default=None, help="keep each run's generated .asm and SPIR-V in a new subfolder here")
+    ap.add_argument("--batch-size", type=int, default=vk_compute_batch.DEFAULT_BATCH_SIZE,
+                    help="programs per vk_compute_test process, which opens the Vulkan device once for all of them "
+                         f"(default {vk_compute_batch.DEFAULT_BATCH_SIZE}; 1 = one process per program, as before)")
     ap.add_argument("--model-only", action="store_true")
     ap.add_argument("--show", default=None, metavar="SEED:INDEX[:WAVE]")
     ap.add_argument("--max-report", type=int, default=12)

@@ -78,6 +78,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 import mc_command  # noqa: E402
+import vk_compute_batch  # noqa: E402
 
 M32 = 0xFFFFFFFF
 M64 = (1 << 64) - 1
@@ -1343,11 +1344,37 @@ def run_gpu(exe, spv, prog, work, emulate):
     dump = os.path.join(work, "dump.bin")
     if os.path.exists(dump):
         os.remove(dump)                 # never compare a stale dump
-    env = gpu_env(prog, emulate, dump)
-    try:
-        r = subprocess.run([exe, spv, "1", "dump"], capture_output=True, text=True, env=env, timeout=GPU_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
+    job = vk_compute_batch.Job((spv, "1", "dump"), gpu_env(prog, emulate, dump))
+    return gpu_words(prog, vk_compute_batch.run_single(exe, job, GPU_TIMEOUT), dump)
+
+
+def gpu_results(exe, ready, work, emulate, batch_size):
+    """The words of each (program, spv) in ready, in order, or the HarnessError / Unpinned its run ended with.
+    batch_size programs share one vk_compute_test process and Vulkan device (tools/vk_compute_batch.py); 1, or a
+    vk_compute_test built before --batch, runs each in its own process (run_gpu), as the results always came."""
+    if batch_size > 1 and ready and vk_compute_batch.supports_batch(exe):
+        dumps = [os.path.join(work, f"dump_{p.name}.bin") for p, _ in ready]
+        for dump in dumps:
+            if os.path.exists(dump):
+                os.remove(dump)         # never compare a stale dump
+        jobs = [vk_compute_batch.Job((spv, "1", "dump"), gpu_env(p, emulate, dump)) for (p, spv), dump in zip(ready, dumps)]
+        for (p, _), dump, r in zip(ready, dumps, vk_compute_batch.run_jobs(exe, jobs, batch_size, GPU_TIMEOUT)):
+            try:
+                yield gpu_words(p, r, dump)
+            except (HarnessError, Unpinned) as e:
+                yield e
+        return
+    for p, spv in ready:
+        try:
+            yield run_gpu(exe, spv, p, work, emulate)
+        except (HarnessError, Unpinned) as e:
+            yield e
+
+
+def gpu_words(prog, r, dump):
+    """The dump of one finished run (a vk_compute_batch.Result) as words, or the HarnessError / Unpinned it is."""
+    if r.timed_out:
+        raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s")
     import compute_fixture
     lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
     if lanes:
@@ -1459,6 +1486,9 @@ def main():
     ap.add_argument("--no-w32-hi-lanes", action="store_true", help="wave32 lane selects stay below 32")
     ap.add_argument("--exe", default=os.path.join(ROOT, "runtime", "build", "vk_compute_test" +
                                                   (".exe" if os.name == "nt" else "")))
+    ap.add_argument("--batch-size", type=_at_least_one, default=vk_compute_batch.DEFAULT_BATCH_SIZE,
+                    help="programs per vk_compute_test process, which opens the Vulkan device once for all of them "
+                         f"(default {vk_compute_batch.DEFAULT_BATCH_SIZE}; 1 = one process per program, as before)")
     ap.add_argument("--keep", help="copy failing programs (.asm) here")
     ap.add_argument("--minimize", action="store_true", help="reduce each failing program")
     ap.add_argument("--permlane-fetch-inactive", action="store_true",
@@ -1678,10 +1708,15 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
             if mode == "emulate" and 64 not in waves:
                 continue
             spdir, log = translate(work, mode == "emulate")
+
+            def selected(p):
+                return not (mode == "emulate" and p.wave != 64) and \
+                    not (mode == "native" and p.wave == 64 and not args.w64_native)
+            ready = [(p, os.path.join(spdir, p.name + ".spv")) for p in progs if selected(p)]
+            ready = [(p, spv) for p, spv in ready if os.path.exists(spv)]
+            results = gpu_results(args.exe, ready, work, mode == "emulate", args.batch_size)
             for p in progs:
-                if mode == "emulate" and p.wave != 64:
-                    continue
-                if mode == "native" and p.wave == 64 and not args.w64_native:
+                if not selected(p):
                     continue
                 key = f"wave{p.wave} {mode}"
                 st = stats.setdefault(key, {"programs": 0, "match": 0, "mismatch": 0, "hyp_only": 0,
@@ -1693,7 +1728,10 @@ def run_translator(args, mc, progs, waves, modes, stats, fails):
                     fails.append((p, mode, "not translated", None))
                     continue
                 try:
-                    bad, hyp = compare(p, run_gpu(args.exe, spv, p, work, mode == "emulate"))
+                    got = next(results)
+                    if isinstance(got, Exception):
+                        raise got
+                    bad, hyp = compare(p, got)
                 except HarnessError as e:
                     # One program that hangs or crashes the harness used to end the run with a traceback and
                     # lose every result before it. It is reported like the other failures and the run goes on.
