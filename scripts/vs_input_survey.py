@@ -124,7 +124,7 @@ def _survey(dxbc_dir):
     names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
     markers, vgprs, families = Counter(), Counter(), Counter()
     missing = empty = 0
-    observed_mbcnt = False
+    observed_ngg = False
     for n in names:
         path = os.path.join(dxbc_dir, "disasm", n + ".s")
         if not os.path.isfile(path):
@@ -134,8 +134,13 @@ def _survey(dxbc_dir):
             text = f.read()
         insns = shader_ir.parse_file(path)["insns"]
         empty += not insns
-        # The historical marker count also includes mentions in comments.
-        observed_mbcnt = observed_mbcnt or any(MBCNT.fullmatch(ins["op"]) for ins in insns)
+        # Keep the textual counters for the report, but base the verdict on decoded code.
+        observed_ngg = observed_ngg or any(
+            ins["op"] == "s_sendmsg"
+            or MBCNT.fullmatch(ins["op"])
+            or (ins["op"] == "exp" and ins["args"] and ins["args"][0].get("t") == "prim")
+            for ins in insns
+        )
         _, read_v = read_before_write(insns)
         for r in read_v:
             if r < 16:
@@ -156,7 +161,7 @@ def _survey(dxbc_dir):
     report = {"vertex_shaders": len(names), "missing_listings": missing, "markers": dict(markers),
               "input_vgprs_read": dict(sorted(vgprs.items(), key=lambda kv: int(kv[0][1:]))),
               "families": dict(families)}
-    return report, empty, observed_mbcnt
+    return report, empty, observed_ngg
 
 
 def main():
@@ -169,7 +174,7 @@ def main():
         print(f"vs_input_survey: error: --json would overwrite the input {index_path}", file=sys.stderr)
         return 2
     try:
-        r, empty, observed_mbcnt = _survey(a.dxbc)
+        r, empty, observed_ngg = _survey(a.dxbc)
     except (OSError, ValueError) as e:  # missing or non-folder <dxbc>, unreadable, non-UTF-8 or malformed index.json
         print(f"vs_input_survey: error: cannot read {index_path}: {e}", file=sys.stderr)
         return 2
@@ -179,7 +184,7 @@ def main():
     print(f"exports: pos0 {m.get('exp pos0', 0)}, param {m.get('exp param', 0)}; fetch call {m.get('fetch call', 0)}")
     print("input VGPRs read before written (v0..v15):", r["input_vgprs_read"])
     print("families:", r["families"])
-    if m.get("exp prim") or m.get("s_sendmsg") or observed_mbcnt:
+    if observed_ngg:
         print("layout: NGG markers present: check the VS input layout")
     elif not r["vertex_shaders"]:
         print("layout: unknown (no vertex shader entries)")
