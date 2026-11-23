@@ -17,7 +17,6 @@ from urllib.parse import unquote
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-FENCE = re.compile(r"```.*?```", re.S)
 LINK = re.compile(r"!?\[[^\]]*\]\((?:<([^>]+)>|([^)\s]+))(?:\s+\"[^\"]*\")?\)")
 HTML = re.compile(r'(?:href|src)\s*=\s*"([^"]+)"')
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$", re.M)
@@ -25,8 +24,29 @@ EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
 
 
 def strip_fences(text):
-    """Drop fenced code blocks: headings and links inside them are not rendered."""
-    return FENCE.sub("", text)
+    """Drop fenced code blocks: headings and links inside them are not rendered.
+
+    Track fences line by line. A run of at least three leading backticks opens a block;
+    it closes only on a run at least as long. Regex-pairing arbitrary ``` runs mis-matches
+    as soon as a page has many fences and silently removes real headings after them.
+    """
+    kept = []
+    opening = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        run = len(stripped) - len(stripped.lstrip("`"))
+        if run >= 3:
+            # A closing fence carries no info string; a line like ```python inside a
+            # block is code, not a delimiter.
+            closing = stripped.rstrip() == "`" * run
+            if opening == 0:
+                opening = run
+            elif closing and run >= opening:
+                opening = 0
+            continue
+        if opening == 0:
+            kept.append(line)
+    return "".join(kept)
 
 
 def slug(heading):
@@ -128,6 +148,15 @@ class SlugTest(unittest.TestCase):
             with open(page, "w", encoding="utf-8") as f:
                 f.write("# Same\n\n# Same\n")
             self.assertEqual(anchors(page), {"same", "same-1"})
+
+    def test_fence_with_info_string_inside_a_block_is_not_a_closer(self):
+        # A closing fence has no info string. Regex-pairing arbitrary ``` runs pairs
+        # the opening fence with the ```python line and hides the heading after it.
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("```sh\necho hi\n```python\nprint('x')\n```\n\n# Real heading\n")
+            self.assertEqual(anchors(page), {"real-heading"})
 
 
 class RepositoryLinksTest(unittest.TestCase):
