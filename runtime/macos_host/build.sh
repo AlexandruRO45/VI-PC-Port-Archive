@@ -15,7 +15,7 @@ mkdir -p "$OUT"
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest_fixed.exe"
 VKH=${VKH:-/opt/homebrew/opt/vulkan-headers/include}
 MVK=${MVK:-$HOME/.local/share/moltenvk/MoltenVK/MoltenVK/dynamic/dylib/macOS}  # universal MoltenVK release
-/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp kernel32_crt.cpp kernel32_file.cpp d3d12_serialize.cpp seh.cpp kernel32_loader.cpp threadpool.cpp crt.cpp eh.cpp illegal.cpp vulkan.cpp \
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra -I"$VKH" host.cpp kernel32.cpp kernel32_crt.cpp kernel32_file.cpp d3d12_serialize.cpp seh.cpp kernel32_loader.cpp threadpool.cpp crt_lib.cpp crt.cpp eh.cpp illegal.cpp vulkan.cpp \
   window.mm -framework Cocoa -framework QuartzCore -Wl,-rpath,"$MVK" -o "$OUT/macos_host"
 /usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall illegal_probe.cpp illegal.cpp -o "$OUT/illegal_probe"  # run it: all ok
 
@@ -43,3 +43,5 @@ $CL /c guest/cpuid_probe.c /Fo"$OUT/cpuid_probe.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/cpuid_probe.obj" /out:"$OUT/cpuid_probe.exe"
 $CL /c guest/pool_probe.c /Fo"$OUT/pool_probe.obj"  # run it: exit code 0
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/pool_probe.obj" /out:"$OUT/pool_probe.exe"
+$CL /c guest/crt_probe.c /Fo"$OUT/crt_probe.obj"  # run it: exit code 0
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/crt_probe.obj" /out:"$OUT/crt_probe.exe"

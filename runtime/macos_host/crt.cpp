@@ -106,7 +106,7 @@ int crt_remove(const char* path) { return std::remove(to_host_path(path).c_str()
 
 // printf over an MS va_list: a char* walking 8-byte slots. Each conversion is re-issued to the host snprintf with
 // host length modifiers, since Windows `l` is 32-bit and I64/I32/I are MS-only.
-std::string ms_format(const char* fmt, char* va) {
+std::string ms_format(const char* fmt, char* va, bool wide_fmt = false) {  // wide_fmt: %s is wchar_t*
     auto next = [&va]() { uint64_t v; std::memcpy(&v, va, 8); va += 8; return v; };
     std::string out;
     char buf[512];
@@ -124,9 +124,9 @@ std::string ms_format(const char* fmt, char* va) {
         field();
         if (*fmt == '.') { spec.push_back(*fmt++); field(); }
         int bits = 32;  // integer width
-        bool wide = false;
+        bool wide = wide_fmt;
         for (;;) {
-            if (*fmt == 'h') { ++fmt; if (*fmt == 'h') ++fmt; }  // promoted to int anyway
+            if (*fmt == 'h') { ++fmt; wide = false; if (*fmt == 'h') ++fmt; }  // promoted to int anyway
             else if (*fmt == 'l') { ++fmt; if (*fmt == 'l') { ++fmt; bits = 64; } else wide = true; }
             else if (*fmt == 'L') ++fmt;
             else if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { ++fmt; bits = 64; }
@@ -170,7 +170,7 @@ std::string ms_format(const char* fmt, char* va) {
                 const void* p = reinterpret_cast<const void*>(next());
                 std::string narrow;
                 if (!p) narrow = "(null)";
-                else if (wide || conv == 'S')  // ponytail: UTF-16 to ASCII only
+                else if (wide != (conv == 'S'))  // %S is the other width; ponytail: UTF-16 to ASCII only
                     for (auto* w = static_cast<const char16_t*>(p); *w; ++w) narrow.push_back(static_cast<char>(*w));
                 else narrow = static_cast<const char*>(p);
                 spec.push_back('s');
@@ -201,6 +201,46 @@ int32_t stdio_common_vsprintf_s(uint64_t o, char* buf, uint64_t count, const cha
     if (static_cast<uint64_t>(n) < count) return n;
     if (buf && count) buf[0] = 0;
     return -1;
+}
+
+// The wide forms: the format and the output are UTF-16. ponytail: ASCII formats.
+std::string narrow_fmt(const char16_t* f) {
+    std::string n;
+    for (; *f; ++f) n.push_back(static_cast<char>(*f));
+    return n;
+}
+int32_t put_wide(const std::string& s, char16_t* buf, uint64_t count) {  // truncates like vsnprintf
+    if (buf && count) {
+        uint64_t n = s.size() < count ? s.size() : count - 1;
+        for (uint64_t i = 0; i < n; ++i) buf[i] = static_cast<unsigned char>(s[i]);
+        buf[n] = 0;
+    }
+    return static_cast<int32_t>(s.size());
+}
+int32_t stdio_common_vswprintf(uint64_t, char16_t* buf, uint64_t count, const char16_t* fmt, void*, char* va) {
+    return put_wide(ms_format(narrow_fmt(fmt).c_str(), va, true), buf, count);
+}
+int32_t stdio_common_vswprintf_s(uint64_t, char16_t* buf, uint64_t count, const char16_t* fmt, void*, char* va) {
+    std::string s = ms_format(narrow_fmt(fmt).c_str(), va, true);
+    if (s.size() < count) return put_wide(s, buf, count);
+    if (buf && count) buf[0] = 0;
+    return -1;
+}
+int32_t stdio_common_vsnwprintf_s(uint64_t, char16_t* buf, uint64_t size, uint64_t max, const char16_t* fmt, void*,
+                                  char* va) {
+    std::string s = ms_format(narrow_fmt(fmt).c_str(), va, true);
+    bool cut = s.size() >= size || (max != ~0ull && s.size() > max);  // max ~0 is _TRUNCATE
+    if (max != ~0ull && s.size() > max) s.resize(max);
+    if (s.size() >= size) {
+        if (max != ~0ull) return buf && size ? (buf[0] = 0, -1) : -1;
+        s.resize(size ? size - 1 : 0);
+    }
+    put_wide(s, buf, size);
+    return cut ? -1 : static_cast<int32_t>(s.size());
+}
+int32_t stdio_common_vfwprintf(uint64_t, FILE* f, const char16_t* fmt, void*, char* va) {
+    std::string s = ms_format(narrow_fmt(fmt).c_str(), va, true);
+    return std::fwrite(s.data(), 1, s.size(), f) == s.size() ? static_cast<int32_t>(s.size()) : -1;
 }
 
 // ---- heap and strings: the host libc, wrapped so the thunks see plain signatures ----
@@ -307,6 +347,10 @@ Exports crt_exports() {
         EXPORT_AS(STR, "strcpy_s", crt_strcpy_s),
         EXPORT_AS(IO, "__stdio_common_vsprintf", stdio_common_vsprintf),
         EXPORT_AS(IO, "__stdio_common_vsprintf_s", stdio_common_vsprintf_s),
+        EXPORT_AS(IO, "__stdio_common_vswprintf", stdio_common_vswprintf),
+        EXPORT_AS(IO, "__stdio_common_vswprintf_s", stdio_common_vswprintf_s),
+        EXPORT_AS(IO, "__stdio_common_vsnwprintf_s", stdio_common_vsnwprintf_s),
+        EXPORT_AS(IO, "__stdio_common_vfwprintf", stdio_common_vfwprintf),
         EXPORT_AS(STR, "strcmp", crt_strcmp), EXPORT_AS(STR, "strlen", crt_strlen),
         EXPORT_AS("api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr", noop_p),
         EXPORT_AS("api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale", return0_i),

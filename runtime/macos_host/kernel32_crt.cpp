@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <thread>
 #include <condition_variable>
 #include <cctype>
 #include <cstdio>
@@ -141,8 +142,10 @@ HANDLE GetModuleHandleA(const char* name) { return GetModuleHandleW(name ? widen
 void* GetProcAddress(HANDLE module, const char* name) {
     void* fn = nullptr;
     if (is_module(module)) fn = module_export(module, name);
-    else if (module && reinterpret_cast<uintptr_t>(name) >= 0x10000)
-        fn = find_export(static_cast<HostDll*>(module)->name + "!" + name);
+    else if (module)  // an ordinal is a pointer below 0x10000, registered as "#n"
+        fn = find_export(static_cast<HostDll*>(module)->name + "!" +
+                         (reinterpret_cast<uintptr_t>(name) < 0x10000
+                              ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : std::string(name)));
     if (!fn) set_last_error(127 /* ERROR_PROC_NOT_FOUND */);
     return fn;
 }
@@ -688,6 +691,62 @@ int32_t D3D12GetDebugInterface(const void*, void** out) {
     return static_cast<int32_t>(0x80004002);  // E_NOINTERFACE
 }
 
+// Mutexes as binary semaphores. ponytail: no owner and no recursion, a thread taking one twice waits for itself.
+HANDLE CreateMutexA(void*, int32_t owned, const char*) { return make_signal(Object::Semaphore, owned ? 0 : 1, 1, false); }
+int ReleaseMutex(HANDLE h) { return ReleaseSemaphore(h, 1, nullptr); }
+void InitializeCriticalSection(void* cs) { InitializeCriticalSectionAndSpinCount(cs, 0); }
+// Scheduling hints the host leaves to macOS. Threads start as created (CreateThread ignores CREATE_SUSPENDED), so
+// ResumeThread reports the one suspension Windows would have counted.
+int set_ok() { return 1; }
+int32_t thread_priority(HANDLE) { return 0; }  // THREAD_PRIORITY_NORMAL
+uint32_t resume_thread(HANDLE) { return 1; }
+uint32_t suspend_thread(HANDLE) { return 0; }
+int GetThreadGroupAffinity(HANDLE, uint8_t* out) {  // GROUP_AFFINITY: Mask, Group, Reserved[3]
+    uint64_t mask = (1ull << std::min<uint32_t>(std::thread::hardware_concurrency(), 63)) - 1;
+    std::memset(out, 0, 16);
+    std::memcpy(out, &mask, 8);
+    return 1;
+}
+int SetThreadGroupAffinity(HANDLE h, const uint8_t*, uint8_t* previous) { return previous ? GetThreadGroupAffinity(h, previous) : 1; }
+uint32_t GetProcessId(HANDLE) { return static_cast<uint32_t>(getpid()); }
+// No suspend or constrained-mode events on a Mac: the registration succeeds and never calls back.
+uint32_t register_app_notification(void*, void*, void** out) { return *out = reinterpret_cast<void*>(1), 0; }
+void unregister_app_notification(void*) {}
+uint32_t random_device() { return arc4random(); }  // msvcp140 std::_Random_device
+
+// GameInput.dll (GameInputCreate, ordinal 1): a title gets an IGameInput that never sees a device. The game calls the
+// vtable directly with its own gs, so these stay leaf functions. gta6rt's SDL3 shim, when built, is found first.
+namespace gi {
+constexpr int32_t kNotFound = static_cast<int32_t>(0x838A0003), kNoDevice = static_cast<int32_t>(0x838A0002),
+                  kNotImpl = static_cast<int32_t>(0x80004001), kNoInterface = static_cast<int32_t>(0x80004002);
+std::atomic<uint64_t> g_token{0};
+MSABI int32_t query(void*, const void*, void** out) { return *out = nullptr, kNoInterface; }
+MSABI uint32_t ref(void*) { return 1; }  // one static object, never freed
+MSABI uint64_t timestamp(void*) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000; }
+MSABI int32_t reading(void*, uint64_t, void*, void** out) { return *out = nullptr, kNotFound; }
+MSABI int32_t reading4(void*, void*, uint64_t, void*, void** out) { return *out = nullptr, kNotFound; }
+MSABI int32_t temporal(void*, uint64_t, void*, void** out) { return *out = nullptr, kNotImpl; }
+MSABI int32_t reg5(void*, void*, uint64_t, uint64_t, void*, void*, uint64_t* t) { return *t = ++g_token, 0; }
+MSABI int32_t reg_dev(void*, void*, uint64_t, uint64_t, uint64_t, void*, void*, uint64_t* t) { return *t = ++g_token, 0; }
+MSABI int32_t reg3(void*, void*, void*, void*, uint64_t* t) { return *t = ++g_token, 0; }
+MSABI void stop(void*, uint64_t) {}
+MSABI bool unreg(void*, uint64_t, uint64_t) { return true; }
+MSABI int32_t create(void*, void** out) { return *out = nullptr, kNotImpl; }
+MSABI int32_t aggregate(void*, uint64_t, void** out) { return *out = nullptr, kNotImpl; }
+MSABI int32_t find(void*, const void*, void** out) { return *out = nullptr, kNoDevice; }
+MSABI int32_t oem(void*, uint64_t, uint64_t, uint64_t, uint64_t) { return 0; }
+MSABI void focus(void*, uint64_t) {}
+// IGameInput order (shims/gameinput_abi.h): IUnknown, timestamp, current/next/previous/temporal reading, reading,
+// device, guide and keyboard-layout callbacks, stop, unregister, dispatcher, aggregate, four finds, OEM, focus.
+void* const kVtbl[] = {(void*)query,  (void*)ref,       (void*)ref,      (void*)timestamp, (void*)reading,
+                       (void*)reading4, (void*)reading4, (void*)temporal, (void*)reg5,      (void*)reg_dev,
+                       (void*)reg3,   (void*)reg3,      (void*)stop,     (void*)unreg,     (void*)create,
+                       (void*)aggregate, (void*)find,   (void*)find,     (void*)find,      (void*)find,
+                       (void*)oem,    (void*)focus};
+struct { void* const* vtbl = kVtbl; } g_input;
+}  // namespace gi
+int32_t GameInputCreate(void** out) { return *out = &gi::g_input, 0; }
+
 // advapi32: there are no Windows security tokens here, so no privilege is ever held.
 int OpenProcessToken(HANDLE, uint32_t, HANDLE*) { return set_last_error(5 /* ERROR_ACCESS_DENIED */), 0; }
 int OpenThreadToken(HANDLE, uint32_t, int32_t, HANDLE*) { return set_last_error(1008 /* ERROR_NO_TOKEN */), 0; }
@@ -717,7 +776,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventA), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

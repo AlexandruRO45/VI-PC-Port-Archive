@@ -13,6 +13,7 @@
 #include <strings.h>
 
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -223,6 +224,16 @@ void on_fault(int sig, siginfo_t* info, void* uc) {
                  ss.__rcx, ss.__rdx, ss.__rsi, ss.__rdi, ss.__rbp);
     std::fprintf(stderr, "host:   r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n", ss.__r8,
                  ss.__r9, ss.__r10, ss.__r11, ss.__r12, ss.__r13, ss.__r14, ss.__r15);
+    // The first words each pointer register points at, when readable: the object a failed check was looking at.
+    const char* names[] = {"rbx", "rcx", "rsi", "rdi"};
+    uint64_t regs[] = {ss.__rbx, ss.__rcx, ss.__rsi, ss.__rdi};
+    for (int r = 0; r < 4; ++r) {
+        uint64_t w[4];
+        mach_vm_size_t got = 0;
+        if (regs[r] >= 0x10000 && mach_vm_read_overwrite(mach_task_self(), regs[r], sizeof w,
+                                                         reinterpret_cast<mach_vm_address_t>(w), &got) == KERN_SUCCESS)
+            std::fprintf(stderr, "host:   [%s] %016llx %016llx %016llx %016llx\n", names[r], w[0], w[1], w[2], w[3]);
+    }
     Dl_info dl;
     for (uint64_t pc : {rip, *reinterpret_cast<uint64_t*>(ss.__rsp)})
         if (pc && dladdr(reinterpret_cast<void*>(pc), &dl) && dl.dli_sname)
@@ -546,7 +557,7 @@ int main(int argc, char** argv) {
             execv(self, argv);  // falls through on failure: the guest still runs, without AVX in CPUID
         }
     }
-    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports, &kernel32_loader_exports, &threadpool_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports, &vulkan_exports, &user32_exports, &kernel32_crt_exports, &kernel32_file_exports, &d3d12_serialize_exports, &seh_exports, &kernel32_loader_exports, &threadpool_exports, &crt_lib_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     char real[PATH_MAX];
