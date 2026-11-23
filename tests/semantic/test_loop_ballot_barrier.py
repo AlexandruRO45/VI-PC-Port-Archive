@@ -69,7 +69,7 @@ def _parse_spv(asm):
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
-    helpers = {}     # %fn -> ([params], [(res, op, args), ...]): single-block functions %main calls
+    helpers = {}     # %fn -> ([params], [(res, op, args), ...]): the functions %main calls, their labels included
     cur = None
     in_main = False
     helper = None
@@ -96,10 +96,11 @@ def _parse_spv(asm):
             cur = None
             continue
         if helper is not None:
-            # --wave64-emulate outlines the per-round exchange setup (%x_pre_*_fn, #2089) into single-block helpers
+            # --wave64-emulate outlines the per-round exchange setup (%x_pre_*_fn, #2089) into helpers. Since
+            # SHADER-708 a helper has more than one block: only the invocation that owns a word clears it.
             if op == "OpFunctionParameter":
                 helpers[helper][0].append(res)
-            elif op != "OpLabel":
+            else:
                 helpers[helper][1].append((res, op, args))
             continue
 
@@ -151,13 +152,18 @@ def _parse_spv(asm):
         if cur is not None:
             blocks[cur].append((res, op, args))
 
-    # Expand each call of a single-block helper inline (fresh result ids per call); OpReturnValue becomes a copy into
-    # the call's result, so the lockstep interpreter only ever runs %main.
+    # Expand each call of a helper inline (fresh result ids and labels per call), so the lockstep interpreter only
+    # ever runs %main. The helper's first block continues the caller's block; its other blocks become blocks of
+    # %main; a return is a copy into the call's result (OpReturnValue) and a branch to a new block that holds what
+    # followed the call. A helper of one block stays in the caller's block, as before.
     seq = 0
+    expanded = {}
+    moved = {}       # a caller's label -> the label of the block its terminator ended up in
     for lbl, insns in blocks.items():
         if not any(op == "OpFunctionCall" for _, op, _ in insns):
+            expanded[lbl] = insns
             continue
-        out = []
+        cur_lbl, out = lbl, []
         for res, op, args in insns:
             if op != "OpFunctionCall":
                 out.append((res, op, args))
@@ -165,18 +171,42 @@ def _parse_spv(asm):
             seq += 1
             params, body = helpers[args[1]]
             assert len(params) == len(args) - 2, f"OpFunctionCall {args[1]}: argument count"
+            labels = [fres for fres, fop, _ in body if fop == "OpLabel"]
+            single = len(labels) == 1
             ids = dict(zip(params, args[2:]))
+            ids[labels[0]] = cur_lbl                    # a phi of the helper that names its entry block
+            for inner in labels[1:]:
+                ids[inner] = f"%call{seq}_{inner[1:]}"
+            after = f"%call{seq}_ret"
             for fres, fop, fargs in body:
                 fargs = [ids.get(x, x) for x in fargs]
-                if fop == "OpReturnValue":
-                    out.append((res, "OpCopyObject", [args[0], fargs[0]]))
-                    break
-                if fop == "OpReturn":
-                    break
+                if fop == "OpLabel":
+                    if fres != labels[0]:
+                        expanded[cur_lbl] = out
+                        cur_lbl, out = ids[fres], []
+                    continue
+                if fop in ("OpReturnValue", "OpReturn"):
+                    if fop == "OpReturnValue":
+                        out.append((res, "OpCopyObject", [args[0], fargs[0]]))
+                    if single:
+                        break
+                    out.append((None, "OpBranch", [after]))
+                    continue
                 if fres:
                     ids[fres] = f"%call{seq}_{fres[1:]}"
                 out.append((ids.get(fres) if fres else None, fop, fargs))
-        blocks[lbl] = out
+            if not single:
+                expanded[cur_lbl] = out
+                cur_lbl, out = after, []
+        expanded[cur_lbl] = out
+        if cur_lbl != lbl:
+            moved[lbl] = cur_lbl
+    # A phi of %main that names a split block as its predecessor is reached from that block's last part.
+    for lbl, insns in expanded.items():
+        for k, (res, op, args) in enumerate(insns):
+            if op == "OpPhi" and not res.startswith("%call"):
+                insns[k] = (res, op, [moved.get(a, a) if j % 2 == 0 and j else a for j, a in enumerate(args)])
+    blocks = expanded
 
     def make_zero(ty_id):
         ty = types.get(ty_id)
