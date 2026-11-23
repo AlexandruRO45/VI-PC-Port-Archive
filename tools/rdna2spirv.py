@@ -2331,7 +2331,8 @@ class Gen:
         exchange can tear: two lanes swapping into one element at once can leave one's low dword with the other's high
         dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same element
         between them could be seen half done. --int64-atomics makes swap one 64-bit OpAtomicExchange instead, which
-        cannot tear (SHADER-868; needs shaderBufferInt64Atomics). Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
+        cannot tear (SHADER-868; needs shaderBufferInt64Atomics).
+        Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
         covers the whole 8-byte element all or nothing (fixed_fmt=62) and addresses with (addr & 7) != 0 are dropped
         (memory untouched, active glc returns (0, 0), inactive preserves vdata)."""
         vd = a[0]
