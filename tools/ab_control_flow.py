@@ -27,6 +27,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
 # Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
@@ -178,13 +179,18 @@ OpStore %o0 %t
 OpReturn
 OpFunctionEnd
 """
-    src, dst = os.path.join(out_dir, "test_vs.spvasm"), os.path.join(out_dir, "test_vs.spv")
     os.makedirs(out_dir, exist_ok=True)
-    with open(src, "w", encoding="utf-8", newline="\n") as f:
-        f.write(asm)
-    runner(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
-    runner(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)
-    return dst
+    with tempfile.TemporaryDirectory(prefix=".test-vs-", dir=out_dir) as staging:
+        src = os.path.join(staging, "test_vs.spvasm")
+        dst = os.path.join(staging, "test_vs.spv")
+        with open(src, "w", encoding="utf-8", newline="\n") as f:
+            f.write(asm)
+        runner(["spirv-as", "--target-env", "vulkan1.2", src, "-o", dst], check=True)
+        runner(["spirv-val", "--target-env", "vulkan1.2", dst], check=True)
+        # A failed build must leave the previous validated fixture in place.
+        for path in (src, dst):
+            os.replace(path, os.path.join(out_dir, os.path.basename(path)))
+    return os.path.join(out_dir, "test_vs.spv")
 
 
 def positive_int(text):
@@ -300,13 +306,7 @@ def main(argv=None):
     try:
         vs = test_vertex_shader(a.out)
     except (OSError, subprocess.CalledProcessError) as e:
-        # Remove only what this run created: its own files and the folders it made, and only while they are
-        # empty, so output another process wrote beside them survives.
-        for path in (os.path.join(a.out, "test_vs.spvasm"), os.path.join(a.out, "test_vs.spv")):
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        # The build cleans its staging folder. Remove newly created output folders only while empty.
         for path, existed in ((new, new_existed), (a.out, out_existed)):
             if not existed:
                 try:

@@ -454,7 +454,7 @@ class CliBadInputTest(unittest.TestCase):
                                              path=os.path.join(tmp, "empty-path")), "spirv-as")
             self.assertEqual(os.listdir(out), [])
 
-    def test_assembler_failure_preserves_concurrent_output(self):
+    def test_vertex_build_failure_preserves_existing_and_concurrent_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "spirv").mkdir()
@@ -465,26 +465,38 @@ class CliBadInputTest(unittest.TestCase):
             names = root / "names.txt"
             names.write_text("one\n", encoding="utf-8")
 
-            for preexisting in (True, False):
-                with self.subTest(preexisting=preexisting):
-                    out = root / ("existing" if preexisting else "fresh")
-                    if preexisting:
-                        out.mkdir()
-                    sibling = out / "other-job.txt"
+            for failed_tool in ("spirv-as", "spirv-val"):
+                for preexisting in (True, False):
+                    with self.subTest(failed_tool=failed_tool, preexisting=preexisting):
+                        self.check_failed_vertex_build(root, names, failed_tool, preexisting)
 
-                    def fail_assembler(command, **kwargs):
-                        self.assertEqual(command[0], "spirv-as")
-                        out.mkdir(exist_ok=True)
-                        sibling.write_bytes(b"other job")
-                        raise subprocess.CalledProcessError(1, command)
+    def check_failed_vertex_build(self, root, names, failed_tool, preexisting):
+        out = root / f"{failed_tool}-{preexisting}"
+        previous = {"test_vs.spvasm": b"earlier assembly", "test_vs.spv": b"earlier result"} if preexisting else {}
+        if preexisting:
+            out.mkdir()
+            for name, contents in previous.items():
+                (out / name).write_bytes(contents)
 
-                    with patch.object(AB.subprocess, "run", side_effect=fail_assembler), \
-                            contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
-                            self.assertRaises(SystemExit) as raised:
-                        AB.main([tmp, tmp, str(out), "--names", str(names)])
-                    self.assertEqual(raised.exception.code, 2)
-                    self.assertTrue(sibling.is_file(), "cleanup deleted concurrent output")
-                    self.assertEqual(sibling.read_bytes(), b"other job")
+        sibling = out / "other-job.txt"
+
+        def run_tool(command, **kwargs):
+            if command[0] == "spirv-as":
+                Path(command[-1]).write_bytes(b"new assembly result")
+            if command[0] == failed_tool:
+                sibling.write_bytes(b"other job")
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with (patch.object(AB.subprocess, "run", side_effect=run_tool),
+              contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()),
+              self.assertRaises(SystemExit) as raised):
+            AB.main([str(root), str(root), str(out), "--names", str(names)])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual({p.name for p in out.iterdir()}, {*previous, sibling.name})
+        self.assertEqual(sibling.read_bytes(), b"other job")
+        for name, contents in previous.items():
+            self.assertEqual((out / name).read_bytes(), contents)
 
     def test_bad_index_shape_and_stale_names_leave_no_output(self):
         with tempfile.TemporaryDirectory() as tmp:
