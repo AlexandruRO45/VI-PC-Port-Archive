@@ -8,6 +8,7 @@
 // so the swapchain checks confirm the colour there. No shaders or game data.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails the test.
 #include "vk_test_device.h"
+#include "xbox_present_readback_size.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 
@@ -349,7 +350,10 @@ int main() {
             VkFormat format = VK_FORMAT_UNDEFINED;
             if (!presenter->read_back(pixels, &size, &format)) return false;
             const VkExtent2D current = presenter->extent();
-            if (size.width != current.width || size.height != current.height) return false;
+            if (current.width == 0 || current.height == 0 ||
+                !xbox_present_readback_size_matches(pixels.size(), size.width, size.height,
+                                                    current.width, current.height))
+                return false;
             const bool bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
             for (std::size_t i = 0; i < pixels.size(); i += 4) {
                 const int r = pixels[i + (bgra ? 2 : 0)], g = pixels[i + 1], b = pixels[i + (bgra ? 0 : 2)];
