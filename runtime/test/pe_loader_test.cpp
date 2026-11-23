@@ -479,6 +479,91 @@ uint32_t unwind_lookup_mismatches(const rt::Module& m) {
     return bad;
 }
 
+// A PE32+ DLL whose SectionAlignment (and FileAlignment) is 0x200, below the page size: the headers, a code section
+// and a data section share the first page. Windows maps such an image with one protection for every page (measured on
+// Windows 11 with a DLL linked /ALIGN:512 /FILEALIGN:512: header, code and data pages all PAGE_EXECUTE_WRITECOPY), so
+// its code runs and its data is writable. Built here byte by byte; the code is position independent, and an empty
+// relocation block lets it load anywhere.
+std::vector<uint8_t> low_alignment_image() {
+    constexpr uint32_t align = 0x200, text_rva = 0x200, data_rva = 0x400, reloc_rva = 0x600, size_of_image = 0x800;
+    std::vector<uint8_t> image(size_of_image, 0);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(image.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = 0x40;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(image.data() + dos->e_lfanew);
+    nt->Signature = IMAGE_NT_SIGNATURE;
+    nt->FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt->FileHeader.NumberOfSections = 3;
+    nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt->FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL;
+    auto& oh = nt->OptionalHeader;
+    oh.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    oh.ImageBase = 0x7ff654320000ull;
+    oh.SectionAlignment = align;
+    oh.FileAlignment = align;
+    oh.MajorOperatingSystemVersion = oh.MajorSubsystemVersion = 6;
+    oh.SizeOfImage = size_of_image;
+    oh.SizeOfHeaders = align;
+    oh.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI;
+    oh.DllCharacteristics = IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE | IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    oh.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC] = {reloc_rva, 12};
+    auto* sec = IMAGE_FIRST_SECTION(nt);
+    const auto section = [&](IMAGE_SECTION_HEADER& s, const char* name, uint32_t rva, DWORD flags) {
+        std::memcpy(s.Name, name, std::strlen(name));
+        s.Misc.VirtualSize = align;
+        s.VirtualAddress = rva;
+        s.SizeOfRawData = align;
+        s.PointerToRawData = rva;  // FileAlignment == SectionAlignment: the file is laid out as the image
+        s.Characteristics = flags;
+    };
+    section(sec[0], ".text", text_rva, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
+    section(sec[1], ".data", data_rva, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
+    section(sec[2], ".reloc", reloc_rva,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
+    const uint8_t code[] = {0xB8, 0x2A, 0x00, 0x00, 0x00, 0xC3};  // mov eax, 42; ret
+    std::memcpy(image.data() + text_rva, code, sizeof code);
+    const uint32_t value = 7;
+    std::memcpy(image.data() + data_rva, &value, sizeof value);
+    const uint32_t block[3] = {text_rva, 12, 0};  // one block of two IMAGE_REL_BASED_ABSOLUTE (padding) entries
+    std::memcpy(image.data() + reloc_rva, block, sizeof block);
+    return image;
+}
+
+bool executable(DWORD protect) {
+    return (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+bool writable(DWORD protect) {
+    return (protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+void test_low_section_alignment(const fs::path& temp_dir) {
+    std::printf("\n-- image with SectionAlignment below the page size --\n");
+    const fs::path path = temp_dir / "low_alignment.dll";
+    const auto image = low_alignment_image();
+    write_file(path, image.data(), image.size());
+    rt::Loader loader(temp_dir);
+    rt::Module& m = loader.load(path);
+    MEMORY_BASIC_INFORMATION code{}, data{};
+    check(VirtualQuery(m.base + 0x200, &code, sizeof code) != 0, "low alignment: the code page can be queried");
+    check(VirtualQuery(m.base + 0x400, &data, sizeof data) != 0, "low alignment: the data page can be queried");
+    std::printf("     code page protect %#lx, data page protect %#lx\n", code.Protect, data.Protect);
+    const bool runs = executable(code.Protect);
+    check(runs, "low alignment: code that shares a page with data stays executable (Windows: one protection)");
+    check(writable(data.Protect), "low alignment: data that shares a page with code stays writable");
+    if (runs) {
+        using Fn = int(__cdecl*)();
+        check(reinterpret_cast<Fn>(m.base + 0x200)() == 42, "low alignment: the code runs and returns 42");
+    }
+    if (writable(data.Protect)) {
+        auto* value = reinterpret_cast<volatile uint32_t*>(m.base + 0x400);
+        check(*value == 7, "low alignment: the data section holds its initial value");
+        *value = 8;
+        check(*value == 8, "low alignment: the data section can be written");
+    }
+}
+
 // Calls the fixture's fault probe with a null pointer: -1 means the image handled it, -2 that the fault escaped to
 // here. Without registration the dispatcher can't unwind the image's frame, so the fault escapes or the process dies
 // on a corrupt unwind, which ctest reports as a failure too. Kept apart because __try can't share a function with
@@ -714,6 +799,7 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        test_low_section_alignment(temp.path);
         test_inherited_reservation();
         test_optional_package();
         test_optional_package_unwind();

@@ -1664,6 +1664,18 @@ void Loader::bind_imports(Module& m) {
 void Loader::protect_sections(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     DWORD old;
+    // VirtualProtect works on whole pages. With a SectionAlignment below the page size the headers and sections share
+    // pages, and protecting them one by one would leave each shared page with the last section's protection (code
+    // made non-executable by a data section after it). Windows maps such an image with one protection for every page
+    // (PAGE_EXECUTE_WRITECOPY, measured on Windows 11 with a DLL linked /ALIGN:512 /FILEALIGN:512); this mapping is
+    // private memory, so PAGE_EXECUTE_READWRITE.
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    if (nt->OptionalHeader.SectionAlignment < system.dwPageSize) {
+        VirtualProtect(m.base, m.size, PAGE_EXECUTE_READWRITE, &old);
+        FlushInstructionCache(GetCurrentProcess(), m.base, m.size);
+        return;
+    }
     VirtualProtect(m.base, nt->OptionalHeader.SizeOfHeaders, PAGE_READONLY, &old);
     auto* sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
