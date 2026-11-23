@@ -340,5 +340,28 @@ class TestSSendMsgOrderedPsDoneReference(unittest.TestCase):
         self.assertIn("OpExecutionMode", spv)
 
 
+class TestSSendMsgOrderedPsDoneExecution(unittest.TestCase):
+    def test_sendmsg_mrt0_dataflow(self):
+        lines = [
+            "v_mov_b32 v0, 0x100",
+            "v_mov_b32 v1, 0x200",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "v_mov_b32 v2, 0x300",
+            "v_mov_b32 v3, 0x400",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v2", "v3"))
+        self.assertEqual(words, [0x100, 0x200, 0x300, 0x400])
+
+    def test_sendmsg_with_vector_math(self):
+        lines = [
+            "v_mov_b32 v0, 15",
+            "v_add_nc_u32 v0, v0, 25",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "v_add_nc_u32 v0, v0, 60",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [100, 100, 100, 100])
+
+
 if __name__ == "__main__":
     unittest.main()
