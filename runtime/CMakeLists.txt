@@ -1390,6 +1390,13 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME bindless_sizing COMMAND bindless_sizing_test)
   endif()
+  # CPU-only: BindlessSet's pending-write queue and free-index search through a fake Vulkan device, against the
+  # former std::unordered_map queue and byte loop, with a short benchmark (--bench for a longer one).
+  add_executable(bindless_queue_test test/bindless_queue_test.cpp)
+  target_link_libraries(bindless_queue_test PRIVATE Vulkan::Headers)
+  if(BUILD_TESTING)
+    add_test(NAME bindless_queue COMMAND bindless_queue_test)
+  endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
   target_link_libraries(vulkan13_features_test PRIVATE Vulkan::Headers)
