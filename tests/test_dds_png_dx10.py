@@ -81,6 +81,16 @@ class SingleChannelTests(unittest.TestCase):
             with self.assertRaises(dds.DdsError):
                 dds.decode_dds(_dx10(2, 2, dxgi, bytes(n)))
 
+    def test_r16_unorm_alpha_mode(self):
+        # The override only touches the alpha channel, and R16_UNORM's is opaque in every mode, so the decoded
+        # pixel is identical for unknown, straight, premultiplied and opaque headers.
+        px = struct.pack("<HH", 65535, 257)
+        want = bytes([255, 0, 0, 255, 1, 0, 0, 255])
+        for mode in (0, 1, 2, 3):
+            with self.subTest(alpha_mode=mode):
+                _, _, rgba = dds.decode_dds(_dx10(2, 1, 56, px, alpha_mode=mode))
+                self.assertEqual(rgba, want)
+
 
 if __name__ == "__main__":
     unittest.main()
