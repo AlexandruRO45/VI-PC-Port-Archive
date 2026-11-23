@@ -73,7 +73,7 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
 6. **What to confirm.** `checklist.md` (`tools/exe_checklist.py`) gathers every `ASSUMPTION`, `UNVERIFIED` and
    `VERIFY` note of the runtime and the docs, with file and line. Notes in a shim whose class the exe calls are
    marked **called** and come first: those are the ones its first boot reaches, such as the `XStoreGameLicense`
-   sizes.
+   sizes. A `--root` that is not a directory is refused with exit 2, so a mistyped path can't pass as an empty list.
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.

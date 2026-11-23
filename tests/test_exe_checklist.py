@@ -100,6 +100,19 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_a_root_that_is_not_a_directory_is_exit_2(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(ec.main(["--root", os.path.join(self.root, "missing")]), 2)
+        self.assertIn("not a directory", stderr.getvalue())
+
+    def test_an_out_in_a_missing_folder_is_one_error_line(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(ec.main(["--root", self.root, "--out", os.path.join(self.root, "missing", "out.md")]), 2)
+        self.assertEqual(len(stderr.getvalue().strip().splitlines()), 1)
+        self.assertIn("ERROR:", stderr.getvalue())
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)
