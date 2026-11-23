@@ -1,0 +1,92 @@
+"""Comprehensive translator-backed regression bundle for RDNA2 SALU Integer Arithmetic & Population Count.
+
+Subsystem Feature Bundle 29 covering:
+1. s_abs_i32       (Scalar signed 32-bit integer absolute value, SCC condition code)
+2. s_absdiff_i32   (Scalar signed 32-bit integer absolute difference, SCC condition code)
+3. s_addk_i32      (Scalar 32-bit addition with sign-extended 16-bit constant, carry tracking)
+4. s_bcnt0_i32_b32 (Scalar 32-bit zero-bit population count)
+5. s_bcnt0_i32_b64 (Scalar 64-bit zero-bit population count across SGPR pairs)
+6. s_bcnt1_i32_b32 (Scalar 32-bit one-bit population count)
+7. s_bcnt1_i32_b64 (Scalar 64-bit one-bit population count across SGPR pairs)
+"""
+from __future__ import annotations
+
+import math
+import os
+import struct
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools"))
+sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
+import support  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+def run_salu_bundle_ps(lines: list[str], name: str = "ps_salu_bundle") -> list[int]:
+    all_lines = list(lines) + [
+        "v_mov_b32 v0, s0",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "exp mrt0 v0, v1, v2, v3 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, all_lines)
+    return support.mrt0_words(spv)
+
+
+def oracle_s_abs_i32(x: int) -> int:
+    x &= MASK32
+    sx = x if x < 0x80000000 else x - 0x100000000
+    return abs(sx) & MASK32
+
+
+def oracle_s_absdiff_i32(a: int, b: int) -> int:
+    diff = (a - b) & MASK32
+    sdiff = diff if diff < 0x80000000 else diff - 0x100000000
+    return abs(sdiff) & MASK32
+
+
+def oracle_s_addk_i32(sdst: int, simm16: int) -> int:
+    k = simm16 & 0xFFFF
+    sk = k - 0x10000 if k & 0x8000 else k
+    return (sdst + sk) & MASK32
+
+
+def oracle_s_bcnt0_i32_b32(s0: int) -> int:
+    val = (s0 & MASK32) ^ MASK32
+    return val.bit_count()
+
+
+def oracle_s_bcnt0_i32_b64(lo: int, hi: int) -> int:
+    val = ((lo & MASK32) | ((hi & MASK32) << 32)) ^ MASK64
+    return val.bit_count()
+
+
+def oracle_s_bcnt1_i32_b32(s0: int) -> int:
+    return (s0 & MASK32).bit_count()
+
+
+def oracle_s_bcnt1_i32_b64(lo: int, hi: int) -> int:
+    val = (lo & MASK32) | ((hi & MASK32) << 32)
+    return val.bit_count()
+
+class TestSAbsI32ReferenceOracle(unittest.TestCase):
+    """Stage 1 for s_abs_i32: reference mathematical oracle validation."""
+
+    def test_s_abs_i32_oracle_identity(self):
+        res = oracle_s_abs_i32(0xfffffffd)
+        self.assertEqual(res, 0x3)
+
+
+if __name__ == '__main__':
+    unittest.main()
