@@ -451,5 +451,21 @@ class TestMadI32I24StatusFlags(unittest.TestCase):
         self.assertEqual(wave.exec_mask, orig_mask)
 
 
+# ==============================================================================
+# IEEE 754 Bit-Pattern Boundary Extremes as Integer Values
+# ==============================================================================
+
+class TestMadI32I24BitPatternBoundaries(unittest.TestCase):
+    def test_float_patterns_as_integers(self):
+        # v_mad_i32_i24 operates on raw bits without IEEE floating point interpretation
+        # Float +0.0: 0x00000000
+        # Float -0.0: 0x80000000 -> lower 24 bits: 0x000000
+        self.assertEqual(ref_mad_i32_i24(0x8000_0000, 10, 5), 5)
+        # Float 1.0f: 0x3F800000 -> bit 23 is 1 -> sign extended is negative (-0x800000)
+        s0_val = sign_extend_i24(0x3F80_0000)
+        self.assertEqual(s0_val, -8388608)
+        self.assertEqual(ref_mad_i32_i24(0x3F80_0000, 2, 0), 0xFF00_0000)
+
+
 if __name__ == '__main__':
     unittest.main()
