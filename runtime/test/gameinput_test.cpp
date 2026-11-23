@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1108,6 +1109,27 @@ void test_aggregate_device(IGameInput* input) {
         check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
               "CreateAggregateDevice returns existing aggregate instance for the same kind");
         if (agg2) agg2->Release();
+
+        // Every kind CreateAggregateDevice accepts is its own device with its own id, also the kinds above bit 15
+        // (arcade stick, flight stick, gamepad, racing wheel), and FindDeviceFromId returns each one by that id.
+        const uint32_t kinds[] = {GameInputKindKeyboard,   GameInputKindMouse,      GameInputKindGamepad,
+                                  GameInputKindArcadeStick, GameInputKindFlightStick, GameInputKindRacingWheel};
+        IGameInputDevice* aggs[std::size(kinds)] = {};
+        for (size_t i = 0; i < std::size(kinds); ++i)
+            check(input->CreateAggregateDevice(kinds[i], &aggs[i]) == S_OK && aggs[i] != nullptr,
+                  "CreateAggregateDevice creates an aggregate device for each allowed kind");
+        for (size_t i = 0; i < std::size(kinds); ++i) {
+            if (!aggs[i]) continue;
+            check(aggs[i]->GetDeviceInfo()->supportedInput == kinds[i], "each aggregate reports its own kind");
+            check(found_is(input, aggs[i]), "FindDeviceFromId returns the aggregate of that kind");
+            for (size_t j = i + 1; j < std::size(kinds); ++j)
+                if (aggs[j])
+                    check(std::memcmp(&aggs[i]->GetDeviceInfo()->deviceId, &aggs[j]->GetDeviceInfo()->deviceId,
+                                      sizeof(AppLocalDeviceId)) != 0,
+                          "aggregates of different kinds have different device ids");
+        }
+        for (IGameInputDevice* d : aggs)
+            if (d) d->Release();
 
         // Reading test with no connected pad
         IGameInputReading* r = nullptr;

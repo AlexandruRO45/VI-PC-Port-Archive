@@ -2488,8 +2488,10 @@ public:
         agg->info.displayName = &agg->display_name;
 
         std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
-        agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
-        agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+        // The whole 32-bit kind, little-endian, in the four bytes after the tag: the arcade stick, flight stick, gamepad
+        // and racing wheel kinds are bits 16-19, so the low 16 bits alone gave all four the same id.
+        for (int byte = 0; byte < 4; ++byte)
+            agg->info.deviceId.value[28 + byte] = static_cast<uint8_t>((kind >> (8 * byte)) & 0xff);
 
         g().devices.push_back(agg);
         agg->AddRef();
