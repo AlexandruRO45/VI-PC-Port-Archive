@@ -979,7 +979,7 @@ class FmaFusedChecks(unittest.TestCase):
     """cs_fma_fused: strict single-rounded words under --fma khr, fused-or-split f32 under --fma glsl (Mesa RADV)."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]
 
-    def run_fma(self, words, *, khr_index=False, fma_mode=None, code=0, raw_out=None):
+    def run_fma(self, words, *, khr_index=False, fma_mode=None, env_fma=None, code=0, raw_out=None):
         out = raw_out if raw_out is not None else "out[0..7] = " + " ".join(map(str, words)) + "\n"
         with tempfile.TemporaryDirectory() as tmp:
             if khr_index or fma_mode:
@@ -990,6 +990,8 @@ class FmaFusedChecks(unittest.TestCase):
                     json.dumps({"cs_fma_fused": meta}), encoding="utf-8")
             with patch.dict(check.os.environ, {}, clear=False):
                 check.os.environ.pop("LEONIDA_FMA", None)
+                if env_fma:
+                    check.os.environ["LEONIDA_FMA"] = env_fma
                 with patch.object(check, "run", return_value=(code, out)) as run:
                     res = check.fma_fused_test("tools", tmp)
                 self.assertEqual(run.call_args.kwargs["env"]["VKC_SGPRS"], check.FMA_FUSED_ENV["VKC_SGPRS"])
@@ -1020,6 +1022,13 @@ class FmaFusedChecks(unittest.TestCase):
         problem = self.run_fma(self.RADV_SPLIT, fma_mode="exact")
         self.assertIn("word 0", problem)
         self.assertNotIn("LEONIDA_FMA=khr", check.judge_fma_fused(self.RADV_SPLIT, khr=True)[1])
+
+    def test_older_index_still_honors_exact_env(self):
+        # An index written before the fma field existed can only be judged strictly via the environment.
+        self.assertEqual(self.run_fma(check.FMA_FUSED, env_fma="exact"), "")
+        problem = self.run_fma(self.RADV_SPLIT, env_fma="exact")
+        self.assertIn("word 0", problem)
+        self.assertIn("--fma exact", problem)
 
     def test_wrong_f16_or_garbage_f32_fails_under_both_modes(self):
         bad_f16 = check.FMA_FUSED[:7] + [0x00007352]
