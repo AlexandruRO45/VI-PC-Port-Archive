@@ -515,7 +515,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Install MoltenVK, the Vulkan headers and loader, llvm-mc, SPIRV-Tools and glslang
         run: |
-          brew install llvm molten-vk vulkan-headers vulkan-loader vulkan-tools spirv-tools glslang ninja
+          brew install llvm molten-vk vulkan-headers vulkan-loader vulkan-tools vulkan-validationlayers spirv-tools glslang ninja
           LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc"  # keg-only: not on PATH
           echo "LLVM_MC=$LLVM_MC" >> "$GITHUB_ENV"
           "$LLVM_MC" --version | grep 'LLVM version'
@@ -549,6 +549,17 @@ jobs:
           sed -n '/The following tests FAILED:/,$p' "$RUNNER_TEMP/ctest.log" |
             sed -nE 's/^[[:space:]]+[0-9]+ - ([^ ]+) .*/\1/p' > "$RUNNER_TEMP/failed.txt"
           python3 -I scripts/ci_expected_failures.py "$RUNNER_TEMP/failed.txt" "$status" "$EXPECTED_FAILURES"
+      - name: Prove synchronization validation is active on MoltenVK
+        if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
+        shell: bash
+        run: |
+          export LEONIDA_VULKAN_LOADER="$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib"
+          export VK_DRIVER_FILES="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          layers="$(brew --prefix vulkan-validationlayers)"
+          export VK_LAYER_PATH="$layers/share/vulkan/explicit_layer.d"
+          export DYLD_FALLBACK_LIBRARY_PATH="$layers/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
+          # Run directly: CTest treats the self-test's skip (77) as a successful step.
+          LEONIDA_VK_VALIDATION=1 runtime/build/vk_sync_validation_selftest
       - name: GPU tests on MoltenVK
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}  # also after a runtime test failure
         shell: bash
