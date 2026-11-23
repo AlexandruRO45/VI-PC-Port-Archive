@@ -520,15 +520,35 @@ class ParsingTests(unittest.TestCase):
                 self.assertTrue(all(o >= split for o in right))
                 self.assertEqual(left + right, [off1, off2])
 
-        # memoryview inputs work identically to bytes/bytearray.
+        # memoryview inputs work identically to bytes/bytearray (contiguous byte, typed, 2D, empty, and strided).
         self.assertEqual(list(smh_groom.scan_offsets(memoryview(raw), chunk=73)), [off1, off2])
+
+        padded = raw + bytes((-len(raw)) % 4)
+        for fmt in ("B", "h", "I"):
+            with self.subTest(memoryview_fmt=fmt):
+                self.assertEqual(list(smh_groom.scan_offsets(memoryview(padded).cast(fmt), chunk=73)), [off1, off2])
+        self.assertEqual(
+            list(smh_groom.scan_offsets(memoryview(padded).cast("B", shape=(2, len(padded) // 2)), chunk=73)),
+            [off1, off2],
+        )
+        self.assertEqual(list(smh_groom.scan_offsets(memoryview(b"").cast("I"))), [])
+
+        strided_buf = bytearray(2 * len(raw))
+        strided_buf[::2] = raw
+        strided_view = memoryview(strided_buf)[::2]
+        self.assertEqual(list(smh_groom.scan_offsets(strided_view, chunk=73)), [off1, off2])
+
+        strided_u32_buf = bytearray(2 * len(padded))
+        mv_u32 = memoryview(strided_u32_buf).cast("I")
+        mv_u32[::2] = memoryview(padded).cast("I")
+        self.assertEqual(list(smh_groom.scan_offsets(mv_u32[::2], chunk=73)), [off1, off2])
 
         # A resource at a misaligned offset is never yielded, even when chunk alignment places it at block offset 0.
         misaligned = b"9FPR" + b"\xAB" * 0x40 + res1
         self.assertEqual(list(smh_groom.scan_offsets(misaligned, chunk=0x44)), [])
 
         # Non-positive chunk sizes are rejected with GroomError.
-        for bad_chunk in (0, -16):
+        for bad_chunk in (0, -16, False):
             with self.subTest(bad_chunk=bad_chunk):
                 with self.assertRaises(smh_groom.GroomError):
                     list(smh_groom.scan_offsets(raw, chunk=bad_chunk))

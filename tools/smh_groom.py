@@ -200,8 +200,15 @@ def scan_offsets(
     chunk: int = 64 << 20,
 ) -> Iterator[int]:
     """Yield the byte offset of every groom LOD resource in ``src`` (16-aligned zero prefix + zlib page)."""
-    if chunk <= 0:
+    if isinstance(chunk, bool) or chunk <= 0:
         raise GroomError(f"scan chunk size must be positive, got {chunk}")
+    if isinstance(src, memoryview):
+        if src.nbytes == 0:
+            return
+        if src.c_contiguous and 0 not in src.strides:
+            src = src.cast("B")
+        elif not (src.ndim == 1 and src.itemsize == 1):
+            src = src.tobytes()
     size = len(src)
     stop = size if stop is None else min(stop, size)
     first = (max(start, 0) + 15) & -16
@@ -221,8 +228,11 @@ def scan_offsets(
             off = base + at
             if off & 15:
                 continue
+            comp = src[off + 16:min(off + 16 + 4096, size)]
+            if isinstance(comp, memoryview) and not comp.c_contiguous:
+                comp = comp.tobytes()
             try:
-                head = zlib.decompressobj().decompress(src[off + 16:min(off + 16 + 4096, size)], 4096)
+                head = zlib.decompressobj().decompress(comp, 4096)
             except zlib.error:
                 continue
             if system_page_is_groom(head):
