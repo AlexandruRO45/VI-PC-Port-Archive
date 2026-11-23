@@ -120,6 +120,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/library_loader.cpp
     shims/process.cpp
     shims/dstorage.cpp
+    shims/acphal.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
   # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file

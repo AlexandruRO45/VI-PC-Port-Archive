@@ -219,6 +219,10 @@ public:
         if (list_.queries_open()) invalid_ = true;
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
+        // Retail Xbox command lists contain console-only bookkeeping calls that the PC recorder cannot model yet.
+        // Keep the recorded commands submit-able in the diagnostic boot path so one unsupported side call does not
+        // discard the entire frame. The strict D3D12 behavior remains the default.
+        if (invalid_ && std::getenv("LEONIDA_LENIENT_CLOSE")) invalid_ = false;
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
 

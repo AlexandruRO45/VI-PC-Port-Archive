@@ -754,6 +754,13 @@ public:
             if (error) *error = why;
             return false;
         };
+        // Load the primary index first: it establishes the root directory and
+        // resets the lookup tables before optional indexes are appended.
+        try {
+            if (!load_index(dir, "", fail)) return false;
+        } catch (...) {
+            return fail("index.json could not be read");
+        }
         const auto ignore = [](const std::string&) { return false; };
         for (const char* folder : {"fspx", "bvh", "library"}) {
             try {
