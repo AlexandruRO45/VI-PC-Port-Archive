@@ -1314,9 +1314,16 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
         with open(sources_file, "w", encoding="utf-8", newline="\n") as f:
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
-    verify_translation_completeness(dxbc, spirv)
+    # A few shaders missing from the index still fail the stage, but only after the steps below: they don't depend
+    # on the missing ones, and a run stopped here left fspx/ and bvh/ out without saying so.
+    short = translation_shortfall(dxbc, spirv)
+    if short:
+        log("shaders: some carved shaders are not in the translation index; the remaining steps run, then the "
+            "stage fails")
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    if short:
+        fail(short)
     log("shaders: done")
 
 
@@ -1886,7 +1893,14 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
 
 
 def verify_translation_completeness(dxbc: str, spirv: str) -> None:
-    """Every carved shader must be in the merged translation index before the stage may call itself done.
+    """fail() with translation_shortfall()'s message, if any."""
+    short = translation_shortfall(dxbc, spirv)
+    if short:
+        fail(short)
+
+
+def translation_shortfall(dxbc: str, spirv: str) -> str:
+    """'' when every carved shader is in the merged translation index, else the message the stage fails with.
 
     rdna2spirv.py drops a shader that is refused or whose module fails spirv-val (the module never reaches the
     final path) and still exits 0, and nothing later in the build compares the counts: the merge already refuses
@@ -1899,16 +1913,17 @@ def verify_translation_completeness(dxbc: str, spirv: str) -> None:
         with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
             index = json.load(f)
     except (OSError, ValueError):
-        return
+        return ""
     if not isinstance(carved, list) or not isinstance(index, dict):
         fail("shaders: the carve index is not a list or the translation index is not an object; "
              "run the shaders stage again")
     if not index:
-        return   # an empty index is #3328's to refuse or translate again, not a partial one to compare
+        return ""   # an empty index is #3328's to refuse or translate again, not a partial one to compare
     if len(index) != len(carved):
-        fail(f"shaders: the translation index holds {len(index)} of the {len(carved)} carved shaders "
-             f"({len(carved) - len(index)} were refused or failed spirv-val, listed in this stage's output): "
-             "a port built from it would lack them. Fix the translator for that class and translate again")
+        return (f"shaders: the translation index holds {len(index)} of the {len(carved)} carved shaders "
+                f"({len(carved) - len(index)} were refused or failed spirv-val, listed in this stage's output): "
+                "a port built from it would lack them. Fix the translator for that class and translate again")
+    return ""
 
 # ---------------------------------------------------------------- assets
 # Beside each model, texture and pool manifest.json: the decoder_digest() that made it.

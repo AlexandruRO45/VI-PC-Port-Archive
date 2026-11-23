@@ -105,5 +105,58 @@ class TranslationCompletenessTests(unittest.TestCase):
             self.assertEqual(err, "")
 
 
+class ShadersStageOrderTests(unittest.TestCase):
+    """A short index still fails the stage, but after native_hashes, fspx, bvh, library and exe ran (A48, #8851)."""
+
+    # the steps after the check on this base, in call order (newer bases add native_pso_hashes, library and exe)
+    LATER = tuple(n for n in ("native_pso_hashes", "fspx_shaders", "bvh_shaders", "library_shaders", "exe_shaders")
+                  if hasattr(make_game, n))
+
+    def run_stage(self, carved_count, index_names):
+        from unittest import mock
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        game, work = os.path.join(tmp.name, "game"), os.path.join(tmp.name, "work")
+        dxbc, spirv = os.path.join(work, "shaders", "dxbc"), os.path.join(work, "shaders", "spirv")
+        os.makedirs(dxbc)
+        os.makedirs(spirv)
+        with open(os.path.join(dxbc, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"name": f"s{i}"} for i in range(carved_count)], f)
+        with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({name: {} for name in index_names}, f)
+        settings = {"translation_sources.sha256": "d", "wave64_emulate.txt": "off", "translator_flags.txt": ""}
+        calls = []
+        later = {name: mock.Mock(side_effect=lambda *a, _n=name, **k: calls.append(_n)) for name in self.LATER}
+        err = io.StringIO()
+        with mock.patch.multiple(make_game, **later,
+                                 llvm_mc_signature=mock.Mock(return_value="sig"),
+                                 unpacked_shader_stems=mock.Mock(return_value=set()),
+                                 disassembly_status=mock.Mock(return_value=(True, False, set())),
+                                 translation_sources_digest=mock.Mock(return_value="d"),
+                                 read_shader_setting=lambda p, default="": settings.get(os.path.basename(p), default),
+                                 requested_shader_mode=mock.Mock(return_value="off"),
+                                 translator_flags_setting=mock.Mock(return_value=""),
+                                 translated_index_is_empty=mock.Mock(return_value=False),
+                                 translate=mock.Mock(side_effect=AssertionError("translate must not run")),
+                                 log=mock.Mock()), contextlib.redirect_stderr(err):
+            try:
+                make_game.shaders(game, work, 1)
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue(), calls
+
+    def test_a_short_index_runs_every_later_step_then_fails_with_the_counts(self):
+        code, err, calls = self.run_stage(5, ["s0", "s1", "s2"])
+        self.assertEqual(calls, list(self.LATER))
+        self.assertEqual(code, 1)
+        self.assertIn("3 of the 5", err)
+
+    def test_a_complete_index_runs_every_later_step_and_passes(self):
+        code, err, calls = self.run_stage(2, ["s0", "s1"])
+        self.assertEqual(calls, list(self.LATER))
+        self.assertEqual(code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
