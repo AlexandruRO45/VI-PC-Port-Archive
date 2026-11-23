@@ -114,6 +114,176 @@ def first_adat_bank(m, start, end):
     return None
 
 
+_NATIVE = []
+
+
+class _NativeScan:
+    """The optional Rust candidate scan of `tools/rpf9_carve_native` (built with Cargo, see its README.md).
+
+    `next` finds what `_next_hit` finds (the same header search, Bink 2 check and inflate, with zlib's
+    accept/reject rules), and `all_zero` / `entropy` replace the gap checks. None from any of them means
+    "refused": the caller runs the Python code for that step, so the output does not depend on the library.
+    """
+
+    def __init__(self, lib, ctypes, buffer_type, m):
+        self._c = ctypes
+        self._lib = lib
+        self._view = buffer_type()
+        api = ctypes.pythonapi
+        if api.PyObject_GetBuffer(m, ctypes.byref(self._view), 0) != 0:   # PyBUF_SIMPLE: contiguous bytes
+            raise OSError("the mapping has no buffer")
+        self._held = True
+        self._buf, self._size = self._view.buf, self._view.len
+        if self._view.itemsize != 1 or self._size != len(m):
+            self.close()
+            raise OSError("unexpected buffer layout")
+        self._ctx = lib.rpf9_ctx_new()
+        if not self._ctx:
+            self.close()
+            raise OSError("no scan context")
+        self._res = (ctypes.c_uint64 * 4)()
+        self._counts = (ctypes.c_uint64 * 256)()
+        self._order = (ctypes.c_uint8 * 256)()
+
+    def close(self):
+        """Release the mmap's buffer (the mmap cannot close while it is held) and the scan context."""
+        if self._held:
+            if getattr(self, "_ctx", None):
+                self._lib.rpf9_ctx_free(self._ctx)
+                self._ctx = None
+            self._c.pythonapi.PyBuffer_Release(self._c.byref(self._view))
+            self._held = False
+
+    def next(self, pos, end, last, small_ok):
+        """(offset, stored size, inflated bytes or None for Bink 2), False for no header left, None to refuse."""
+        r = self._res
+        kind = self._lib.rpf9_next(self._ctx, self._buf, self._size, pos, end, last, 1 if small_ok else 0, r)
+        if kind == 0:
+            return False
+        if kind == 1:
+            return r[0], r[1], self._c.string_at(r[3], r[2])
+        if kind == 2:
+            return r[0], r[1], None
+        return None
+
+    def all_zero(self, a, b):
+        z = self._lib.rpf9_all_zero(self._buf, self._size, a, b)
+        return None if z < 0 else z == 1
+
+    def entropy(self, a, b):
+        """`entropy(m[a:b])` from native byte counts, summed in Counter's (first-seen) order: the same float."""
+        k = self._lib.rpf9_byte_counts(self._buf, self._size, a, b, self._counts, self._order)
+        if k < 0:
+            return None
+        if a == b:
+            return 0.0
+        n, counts = b - a, self._counts
+        return -sum(c / n * math.log2(c / n) for c in (counts[v] for v in self._order[:k]))
+
+
+def _native_lib():
+    """(library, ctypes, Py_buffer type) of `rpf9_carve_native`, or None: not built, fails to load, or
+    LEONIDA_RPF9_CARVE_NATIVE=0. The pure-Python scan below is the reference either way."""
+    if not _NATIVE:
+        found = None
+        if os.environ.get("LEONIDA_RPF9_CARVE_NATIVE", "1") != "0":
+            name = {"win32": "rpf9_carve_native.dll",
+                    "darwin": "librpf9_carve_native.dylib"}.get(sys.platform, "librpf9_carve_native.so")
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "rpf9_carve_native", "target", "release", name)
+            if os.path.isfile(path):
+                try:
+                    import ctypes
+
+                    class PyBuffer(ctypes.Structure):
+                        """CPython's Py_buffer: the bytes of the read-only mmap without a copy."""
+                        _fields_ = [("buf", ctypes.c_void_p), ("obj", ctypes.c_void_p), ("len", ctypes.c_ssize_t),
+                                    ("itemsize", ctypes.c_ssize_t), ("readonly", ctypes.c_int),
+                                    ("ndim", ctypes.c_int), ("format", ctypes.c_char_p),
+                                    ("shape", ctypes.c_void_p), ("strides", ctypes.c_void_p),
+                                    ("suboffsets", ctypes.c_void_p), ("internal", ctypes.c_void_p)]
+
+                    lib = ctypes.CDLL(path)
+                    lib.rpf9_abi.argtypes, lib.rpf9_abi.restype = (), ctypes.c_uint32
+                    if lib.rpf9_abi() == 1:
+                        sz, vp = ctypes.c_size_t, ctypes.c_void_p
+                        lib.rpf9_ctx_new.argtypes, lib.rpf9_ctx_new.restype = (), vp
+                        lib.rpf9_ctx_free.argtypes, lib.rpf9_ctx_free.restype = (vp,), None
+                        lib.rpf9_next.argtypes = (vp, vp, sz, sz, sz, sz, ctypes.c_int, vp)
+                        lib.rpf9_next.restype = ctypes.c_int
+                        lib.rpf9_all_zero.argtypes = (vp, sz, sz, sz)
+                        lib.rpf9_all_zero.restype = ctypes.c_int
+                        lib.rpf9_byte_counts.argtypes = (vp, sz, sz, sz, vp, vp)
+                        lib.rpf9_byte_counts.restype = ctypes.c_int
+                        api = ctypes.pythonapi
+                        api.PyObject_GetBuffer.argtypes = (ctypes.py_object, ctypes.POINTER(PyBuffer), ctypes.c_int)
+                        api.PyObject_GetBuffer.restype = ctypes.c_int
+                        api.PyBuffer_Release.argtypes = (ctypes.POINTER(PyBuffer),)
+                        api.PyBuffer_Release.restype = None
+                        found = lib, ctypes, PyBuffer
+                except (ImportError, OSError, AttributeError):
+                    found = None
+        _NATIVE.append(found)
+    return _NATIVE[0]
+
+
+def _native_scan(m):
+    """A `_NativeScan` over the mmap `m`, or None to run the pure-Python scan."""
+    native = _native_lib()
+    if native is None:
+        return None
+    try:
+        return _NativeScan(*native, m)
+    except (OSError, AttributeError, TypeError, ValueError, BufferError):
+        return None
+
+
+def _next_hit(m, pos, end, last, system_pages):
+    """The pure-Python reference of the scan: from `pos`, the next stream the carve keeps.
+
+    (offset, stored size, inflated bytes) for a zlib stream, (offset, size, None) for a Bink 2 video, or False
+    when no header is left before `end`.
+    """
+    while pos < end:
+        mt = ZHDR.search(m, pos, end)
+        if not mt:
+            return False
+        s = mt.start()
+        if m[s:s + 3] == b"KB2":
+            if s + 0x1C > end:   # header cut off by the end of the file or of --limit's window: not a video
+                pos = s + 1
+                continue
+            blen = struct.unpack_from("<I", m, s + 4)[0] + 8
+            w, h = struct.unpack_from("<II", m, s + 0x14)
+            if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
+                pos = s + 1
+                continue
+            return s, blen, None
+        d = zlib.decompressobj()
+        try:
+            chunks, p = [], s
+            # Inflate only inside the scan window (all of the file without --limit): a stream that runs past
+            # its end is left out, so readable + zero + unread add up to the span, as in story_index (#712).
+            while not d.eof and p < end:
+                chunk = m[p:min(p + (1 << 20), end)]
+                if not chunk:
+                    break
+                chunks.append(d.decompress(chunk))
+                p += len(chunk)   # the slice can be short at EOF; advancing by 1 MiB overran it
+                if d.unused_data or d.eof:
+                    break
+            out = b"".join(chunks) + d.flush()
+        except zlib.error:
+            pos = s + 1
+            continue
+        adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
+        if not d.eof or len(out) < system_pages.minimum_size(adjacent):
+            pos = s + 1
+            continue
+        return s, p - s - len(d.unused_data), out
+    return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("archive")
@@ -172,84 +342,71 @@ def main(argv=None) -> int:
         unread_ranges = []
         system_pages = ModelSystemPages()
 
+        native = _native_scan(m)
+
         def account(a, b):
             """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
             nonlocal zero, unread
-            if all_zero(m, a, b):
+            zero_gap = native.all_zero(a, b) if native else None
+            if zero_gap is None:
+                zero_gap = all_zero(m, a, b)
+            if zero_gap:
                 zero += b - a
                 return
             unread += b - a
-            sample = m[a:min(b, a + ENTROPY_SAMPLE)]
-            unread_ranges.append({"off": a, "size": b - a, "entropy": round(entropy(sample), 3),
-                                  "sampled": len(sample)})
+            sampled = min(b, a + ENTROPY_SAMPLE) - a
+            bits = native.entropy(a, a + sampled) if native else None
+            if bits is None:
+                bits = entropy(m[a:a + sampled])
+            unread_ranges.append({"off": a, "size": b - a, "entropy": round(bits, 3), "sampled": sampled})
 
         t0 = time.time()
-        while pos < end:
-            mt = ZHDR.search(m, pos, end)
-            if not mt:
-                break
-            s = mt.start()
-            if m[s:s + 3] == b"KB2":
-                if s + 0x1C > end:   # header cut off by the end of the file or of --limit's window: not a video
-                    pos = s + 1
+        try:
+            while pos < end:
+                hit = native.next(pos, end, last, system_pages.remaining == 1) if native else None
+                if hit is None:
+                    hit = _next_hit(m, pos, end, last, system_pages)
+                if hit is False:
+                    break
+                s, used, out = hit
+                if out is None:   # Bink 2 video
+                    blen = used
+                    w, h = struct.unpack_from("<II", m, s + 0x14)
+                    account(last, s)
+                    rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
+                                 "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "",
+                                 "head": m[s:s + 16].hex()})
+                    if not a.index_only:
+                        out_file = os.path.join(a.out, f"{s:012x}.bk2")
+                        try:
+                            with open(out_file, "wb") as f:
+                                f.write(m[s:s + blen])
+                        except OSError as e:
+                            sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
+                    last = pos = s + blen
+                    system_pages.reset()
                     continue
-                blen = struct.unpack_from("<I", m, s + 4)[0] + 8
-                w, h = struct.unpack_from("<II", m, s + 0x14)
-                if not (64 <= blen <= end - s and 16 <= w <= 8192 and 16 <= h <= 8192):
-                    pos = s + 1
-                    continue
+                adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
+                system_pages.accept(out, adjacent=adjacent,
+                                    root_framed=(s & 0xFFF) == 0x10 and s >= 16 and m[s - 16:s] == b"\0" * 16)
                 account(last, s)
-                rows.append({"off": s, "stored": blen, "size": blen, "type": "bink2", "w": w, "h": h,
-                             "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
+                rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
+                             "head": out[:16].hex()})
                 if not a.index_only:
-                    out_file = os.path.join(a.out, f"{s:012x}.bk2")
+                    out_file = os.path.join(a.out, f"{s:012x}.bin")
                     try:
                         with open(out_file, "wb") as f:
-                            f.write(m[s:s + blen])
+                            f.write(out)
                     except OSError as e:
                         sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
-                last = pos = s + blen
-                system_pages.reset()
-                continue
-            d = zlib.decompressobj()
-            try:
-                chunks, p = [], s
-                # Inflate only inside the scan window (all of the file without --limit): a stream that runs past
-                # its end is left out, so readable + zero + unread add up to the span, as in story_index (#712).
-                while not d.eof and p < end:
-                    chunk = m[p:min(p + (1 << 20), end)]
-                    if not chunk:
-                        break
-                    chunks.append(d.decompress(chunk))
-                    p += len(chunk)   # the slice can be short at EOF; advancing by 1 MiB overran it
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
-            except zlib.error:
-                pos = s + 1
-                continue
-            adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
-            if not d.eof or len(out) < system_pages.minimum_size(adjacent):
-                pos = s + 1
-                continue
-            used = p - s - len(d.unused_data)
-            system_pages.accept(out, adjacent=adjacent,
-                                root_framed=(s & 0xFFF) == 0x10 and s >= 16 and m[s - 16:s] == b"\0" * 16)
-            account(last, s)
-            rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
-                         "head": out[:16].hex()})
-            if not a.index_only:
-                out_file = os.path.join(a.out, f"{s:012x}.bin")
-                try:
-                    with open(out_file, "wb") as f:
-                        f.write(out)
-                except OSError as e:
-                    sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
-            last = pos = s + used
-            if len(rows) % 2000 == 0:
-                done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
-                print(f"[{done:6.1%}] {len(rows)} files, {time.time() - t0:.0f}s", flush=True)
-        account(last, end)
+                last = pos = s + used
+                if len(rows) % 2000 == 0:
+                    done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
+                    print(f"[{done:6.1%}] {len(rows)} files, {time.time() - t0:.0f}s", flush=True)
+            account(last, end)
+        finally:
+            if native:
+                native.close()
     total = sum(r["stored"] for r in rows)
     bink = sum(r["stored"] for r in rows if r.get("type") == "bink2")
     span = end - base
