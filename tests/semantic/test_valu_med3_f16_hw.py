@@ -391,5 +391,47 @@ class TestVMed3F16SIMD(unittest.TestCase):
         for i in range(32, 64):
             self.assertEqual(results[i], 0x11114000)
 
+# Append register aliasing tests
+class TestVMed3F16Aliasing(unittest.TestCase):
+    """Commit 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = ScalarVALUInterpreter()
+
+    def test_dst_aliases_src0(self) -> None:
+        # v0 = 0xCAFE3C00 (1.0 in low half), v1 = 2.0, v2 = 3.0
+        self.rf.set_vgpr(VGPR(0), 0xCAFE3C00)
+        self.rf.set_vgpr(VGPR(1), 0x00004000)
+        self.rf.set_vgpr(VGPR(2), 0x00004200)
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(0), src1=VGPR(1), src2=VGPR(2),
+            op_sel=(0, 0, 0, 0)
+        )
+        res = self.interp.execute(self.rf, inst)
+        self.assertEqual(res, 0xCAFE4000)
+
+    def test_dst_aliases_src1_and_src2(self) -> None:
+        self.rf.set_vgpr(VGPR(0), 0x00003C00)  # 1.0
+        self.rf.set_vgpr(VGPR(1), 0xBEEF4200)  # 3.0
+
+        inst = VMed3F16Instruction(
+            dst=VGPR(1), src0=VGPR(0), src1=VGPR(1), src2=VGPR(1),
+            op_sel=(0, 0, 0, 0)
+        )
+        res = self.interp.execute(self.rf, inst)
+        # median of 1.0, 3.0, 3.0 is 3.0 (0x4200)
+        self.assertEqual(res, 0xBEEF4200)
+
+    def test_all_operands_aliased(self) -> None:
+        self.rf.set_vgpr(VGPR(0), 0x99994000)  # 2.0
+        inst = VMed3F16Instruction(
+            dst=VGPR(0), src0=VGPR(0), src1=VGPR(0), src2=VGPR(0),
+            op_sel=(0, 0, 0, 0)
+        )
+        res = self.interp.execute(self.rf, inst)
+        self.assertEqual(res, 0x99994000)
+
 if __name__ == "__main__":
     unittest.main()
