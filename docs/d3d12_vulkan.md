@@ -1265,10 +1265,11 @@ and any validation error fails them.
   - 3 non-normalized samplers, which must be `CreateSampler`'s S# with `FORCE_UNNORMALIZED` set;
   - the `D3D12_OPTIONS17` answer;
   - the 22 written-or-refused cases behind the table in section 3.2, compared with the host's PC runtime when
-    there is one.
-- `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
     there is one. A host that reports no non-normalized samplers is compared only on the 3 cases without the
     flag. The other 19 are then checked against their recorded answers only.
+- `xbox_present_test`: `PresentX` and the frame events (section 4.5, "what is implemented"), checked on swapchain pixels.
+- `vk_present_compose_test`: the plane composition pass of section 4.5 headless on any Vulkan device (no window,
+  swapchain or Windows shim, so it is built on every platform): both HDR10 to SDR tone maps against a double-precision model.
 - `d3d12_subgroup_test`: subgroup size control through D3D12 PSOs, on the PSOs of the device proxy.
   - **Shaders:** `cs_w64x_readlane` (a `v_readlane` across both halves of a wave64) translated natively and with
     `--wave64-emulate`, and `cs_wqm_w32`, built by `test/shaders/build.py` (needs `llvm-mc`: `LLVM_MC`).
@@ -3073,7 +3074,8 @@ queue they came on (one `VkQueue` behind all of them).
   where the layer ignores it (it uses 203 nits unless HDR10 is active); the HDR value itself has not been read on real HDR
   hardware here. 1000, 2500 and 6000 convert to 80, 200 and 480 (arithmetic only).
 
-  *HDR10 content on an SDR output*: tone mapped, no longer clipped. After step 2, the luminance Y of the Rec.709 value
+  *HDR10 content on an SDR output*: tone mapped, no longer clipped. By default (the shoulder; the BT.2390 EETF below is
+  the other choice), after step 2, the luminance Y of the Rec.709 value
   (0.2126 R + 0.7152 G + 0.0722 B, 1.0 = SDR white) goes through a shoulder: identity up to a knee at 0.8 of SDR white
   (162 nits at 203), and above it extended Reinhard (Reinhard, Stark, Shirley, Ferwerda, "Photographic Tone Reproduction for
   Digital Images", SIGGRAPH 2002, eq. 4) applied to the excess: with `t = 1 - knee`, `u = (Y - knee) / t`,
@@ -3084,8 +3086,32 @@ queue they came on (one `VkQueue` behind all of them).
   (SDR white) comes out at 0.90 of white at peak 1000 (byte 243), 300 nits at 250. Per-channel values above 1 after the
   scaling (saturated highlights) are still clipped; there is no gamut mapping and no dither. Microsoft's Advanced Color
   document lists tone mapping choices, among them a scaled Reinhard (`x / (1 + x)`) and the BT.2390 EETF, as simple options
-  (https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range). The BT.2390 EETF itself is not done
-  (its constants were not checked against the Recommendation here).
+  (https://learn.microsoft.com/en-us/windows/win32/direct3darticles/high-dynamic-range).
+
+  *HDR10 content on an SDR output, BT.2390 EETF* (selectable: `XboxPresentation::set_tone_map`, or the environment
+  variable `LEONIDA_TONE_MAP=bt2390` (or `bt.2390` or `eetf`, any case; `shoulder` or unset is the default, other values
+  are logged once and ignored) read when the object is made; `PresentPlanes::tone_map` in the presenter). The reference
+  EETF that Microsoft's page and libplacebo call the BT.2390 EETF is defined today in Report ITU-R BT.2408-9 (03/2026),
+  Annex 5, "Displaying PQ – calculating the EETF" (https://www.itu.int/pub/R-REP-BT.2408); Report ITU-R BT.2390-12
+  (03/2025) no longer has it (both PDFs were read for this). In the PQ domain, with the mastering black LB = 0, the
+  mastering white LW = the content peak (`set_hdr_peak_nits`, at least SDR white), and the target Lmin = 0,
+  Lmax = SDR white: step 1 `E1 = PQ^-1(L) / PQ^-1(LW)` and `maxLum = PQ^-1(Lmax) / PQ^-1(LW)`; step 2
+  `KS = 1.5 maxLum - 0.5`; step 3 `E2 = E1` below KS, else the Hermite spline of step 4,
+  `P = (2T^3 - 3T^2 + 1) KS + (T^3 - 2T^2 + T)(1 - KS) + (-2T^3 + 3T^2) maxLum` with `T = (E1 - KS) / (1 - KS)`; step 5
+  `E4 = E2 PQ^-1(LW)`. No display black level is known, so `b = minLum = 0` and step 3's black lift `b (1 - E2)^4` does
+  nothing. Content above LW is taken as LW. Of the annex's five application spaces the presenter uses maxRGB, on linear
+  Rec.709: `M = max(R, G, B)` goes through the EETF and the colour is scaled by `M2 / M`. The annex's Table A5-1 lists
+  maxRGB and R'G'B' as the two that do not produce colours outside the target colour volume, and maxRGB keeps the
+  chromaticity, so unlike the shoulder no channel ends above 1.0 and a saturated highlight keeps its hue and saturation
+  instead of being clipped per channel (it gives up lightness for that). The curve is the identity below KS: at peak 1000
+  and SDR white 203, KS = 0.6586, the roll-off starts at 87.8 nits, and 150, 203, 300 and 500 nits come out at 0.666,
+  0.783, 0.899 and 0.980 of SDR white (sRGB bytes 213, 229, 243 and 253); the peak maps to exactly 1.0. So SDR-range
+  content in an HDR10 plane comes out dimmer than with the shoulder (203 nits: byte 229 against 243), in exchange for
+  highlight detail up to the peak that the shoulder compresses into its last few levels; that is why the shoulder stays
+  the default. With LB = Lmin = 0 this is libplacebo's `bt2390` with its knee offset at 0.5 (its default is 1.0;
+  src/tone_mapping.c, https://github.com/haasn/libplacebo, read for this): the two give the same values in double
+  precision. Not done for either curve: gamut mapping (an HDR10 colour outside Rec.709 is clipped at 0 per channel before
+  the tone map) and dither.
 
   *HDR metadata*: not sent. The presenter never calls `vkSetHdrMetadataEXT`. Microsoft's page for
   `IDXGISwapChain4::SetHDRMetaData` (https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgiswapchain4-sethdrmetadata,
@@ -3113,6 +3139,20 @@ queue they came on (one `VkQueue` behind all of them).
   in #2069** (native ST.2084 swapchain within 1 code, GameDVR plane drop, tearing); **not verified on AMD**: the
   author's Radeon 880M and RTX 5070 Laptop (desktop without HDR enabled) list no ST.2084 surface, where the test logs
   that case as skipped and checks the 10-bit codes only where the surface has the format.
+  *Verified* by `vk_present_compose_test` too, which runs the compose pass headless (no window, swapchain or Windows shim,
+  so it is built on every platform, MoltenVK included) against a double-precision model written from the definitions
+  above: HDR10 grey ramps (27 steps from 0 to 10 000 nits; peaks 600, 1000 and 4000 at SDR white 203, and SDR white 100 at
+  peak 1000) and 20 saturated Rec.709 highlights (largest channel 1.5 to 4 times SDR white), point filtered from 16-bit
+  PQ codes, through both tone maps, within half an 8-bit level of the encoded value. The model's EETF gives the values
+  above, is the identity below KS, joins it with value KS and slope 1, is non-decreasing and maps LW (and anything above)
+  to SDR white, for six peak and white pairs; its shoulder gives the bytes 243 and 250 above. On the highlights the EETF
+  leaves no channel above 1.0 and keeps the channel ratios; the shoulder clips all 20. **Measured on an Apple M4
+  (MoltenVK 1.4.2, macOS 15.6.1)**: worst 0.00049 on every ramp and on the highlights (0.12 of an 8-bit level, the
+  RGBA16F target's precision near 1.0), channel ratios within 0.0006, and with `LEONIDA_VK_VALIDATION=1`
+  (synchronization validation on) no message from the pass; the one message, at `vkCreateDevice`
+  (`VK_KHR_portability_subset` is not enabled by `vk_test_device.h`), comes with every test run through the loader on
+  MoltenVK. Each of three mutations of the shader (KS = 1.4 maxLum - 0.4, the mode ignored, the EETF on luminance
+  instead of maxRGB) fails it.
 - *`ImmediateThresholdPercent`* (hypothesis from the FramePacing text, item 7 above; not measured on the console):
   a frame is due at the vblank after the origin that handed out its token. One that is presented later than that
   is late, and when the scan would not be further down the screen than the threshold percentage (late time modulo the
@@ -3142,7 +3182,7 @@ queue they came on (one `VkQueue` behind all of them).
   state every 50 ms and gives up, so `SuspendX` never waits on it); resume allows presents again, but waits fail until
   `SetFrameIntervalX` and `ScheduleFrameEventX` are called again, as the samples do. Tokens keep counting. Calling
   `SetFrameIntervalX` again outside suspend keeps the origin event armed and re-bases the vblank grid on that moment.
-- *Not done*: the BT.2390 tone map and gamut mapping for HDR10 on an SDR swapchain (a Reinhard shoulder only), scRGB, limited-range
+- *Not done*: gamut mapping for HDR10 on an SDR swapchain (with either tone map, a colour outside Rec.709 is clipped at 0 per channel), scRGB, limited-range
   and YCbCr colour spaces, `ResourceCount` above 1 (refused with `DXGI_ERROR_UNSUPPORTED` before either path, logged once, since only resource 0 would be read; found in review by @Flyander), extended descriptors (`pExtendedDescs`) and `ViewCount`, capturing a
   second (GameDVR) output, resolving multisampled planes, a mutable-format swapchain (an sRGB/UNORM
   alternation recreates the swapchain; `VK_KHR_swapchain_mutable_format` is not enabled on the device), a host-vblank clock (the timer drifts from the

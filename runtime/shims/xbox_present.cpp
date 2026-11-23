@@ -44,6 +44,21 @@ XboxPresentation::XboxPresentation(std::unique_ptr<WindowPresenter> presenter, l
     } else if (env == ERANGE) {
         std::fprintf(stderr, "[rt] present: LEONIDA_SDR_EOTF is too long to be srgb, gamma22 or 2.2: piecewise sRGB used\n");
     }
+    // LEONIDA_TONE_MAP=bt2390 (or bt.2390 or eetf, any case) tone maps HDR10 planes onto an SDR output with the BT.2390
+    // EETF instead of the luminance shoulder; "shoulder" or unset keeps the default; anything else is logged and ignored.
+    char tone[32] = {};
+    std::size_t tone_length = 0;
+    const errno_t tone_env = getenv_s(&tone_length, tone, "LEONIDA_TONE_MAP");
+    if (tone_env == 0 && tone_length > 1) {
+        if (!_stricmp(tone, "bt2390") || !_stricmp(tone, "bt.2390") || !_stricmp(tone, "eetf"))
+            tone_map_ = leonida::PresentPlanes::ToneMap::bt2390;
+        else if (_stricmp(tone, "shoulder") != 0)
+            std::fprintf(stderr, "[rt] present: LEONIDA_TONE_MAP=%s is not shoulder, bt2390, bt.2390 or eetf: the shoulder "
+                                 "is used\n", tone);
+    } else if (tone_env == ERANGE) {
+        std::fprintf(stderr, "[rt] present: LEONIDA_TONE_MAP is too long to be shoulder, bt2390, bt.2390 or eetf: the "
+                             "shoulder is used\n");
+    }
     display_white_thread_ = std::thread([this] { display_white_worker(); });
 }
 
@@ -205,6 +220,7 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
         composed.sdr_white_nits = effective_sdr_white_nits();
         composed.sdr_eotf = sdr_eotf_;
         composed.hdr_peak_nits = hdr_peak_nits_;
+        composed.tone_map = tone_map_;
         for (UINT i = 0; i < composed.count; ++i) {
             const XboxPresentPlaneParameters& p = planes[i];
             ID3D12Resource* source = p.ppResources[0];

@@ -12,8 +12,9 @@
 // it is weighted (SDR: the EOTF, 1.0 = SDR white, Rec.709; HDR10: PQ to nits, Rec.2020). The filtered plane is converted to
 // the working space of the output (HDR10 output: linear Rec.2020 nits, SDR white = sdr_white nits; SDR output: linear
 // Rec.709, 1.0 = SDR white), plane 1 is blended over plane 0 there, and the sum is encoded once (PQ, or the inverse of
-// the SDR EOTF). HDR10 plane -> SDR output: a luminance shoulder (identity below 0.8 of SDR white, extended Reinhard above, peak at
-// hdr_peak nits mapped to 1.0), then clipped per channel (no gamut mapping).
+// the SDR EOTF). HDR10 plane -> SDR output: tone_map 0 is a luminance shoulder (identity below 0.8 of SDR white, extended
+// Reinhard above, peak at hdr_peak nits mapped to 1.0), then clipped per channel; tone_map 1 is the BT.2390 EETF (Report
+// ITU-R BT.2408-9 Annex 5) applied to max(R, G, B), whose result has no channel above 1.0. There is no gamut mapping.
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 
@@ -42,7 +43,8 @@ layout(push_constant) uniform Push {
     uint width, height;
     uint sdr_eotf;    // 0: piecewise sRGB, 1: gamma 2.2
     float hdr_peak;   // nits of the HDR10 content's peak, the tone mapper's white point
-    uint pad0, pad1, pad2;
+    uint tone_map;    // HDR10 -> SDR: 0 luminance shoulder, 1 BT.2390 EETF on maxRGB (PresentPlanes::ToneMap)
+    uint pad1, pad2;
 } pc;
 
 vec3 srgb_encode(vec3 c) {
@@ -70,6 +72,9 @@ vec3 nits_to_pq(vec3 nits) {
     vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
+
+float pq_to_nits(float e) { return pq_to_nits(vec3(e)).x; }
+float nits_to_pq(float nits) { return nits_to_pq(vec3(nits)).x; }
 
 // One texel as linear premultiplied colour (plane space) and its alpha. Premultiplied data is divided by alpha for the
 // decode (the curve applies to the colour, not to colour times alpha) and multiplied again after.
@@ -110,7 +115,7 @@ vec3 bt2020_to_bt709(vec3 v) {
 // 2002, eq. 4) on the excess, scaled to be continuous in value and slope at the knee and to map the content peak to 1.0:
 // with t = 1 - knee, u = (Y - knee) / t, w = (Lw - knee) / t: Yd = knee + t u (1 + u / w^2) / (1 + u). The colour is scaled
 // by Yd / Y. `v`: linear Rec.709, 1.0 = SDR white; Lw = hdr_peak / sdr_white (at least 1).
-vec3 tone_map(vec3 v) {
+vec3 tone_map_shoulder(vec3 v) {
     const float knee = 0.8;
     float y = dot(v, vec3(0.2126, 0.7152, 0.0722));
     if (y <= knee) return v;
@@ -119,6 +124,33 @@ vec3 tone_map(vec3 v) {
     float u = (y - knee) / t;
     return v * ((knee + t * u * (1.0 + u / (w * w)) / (1.0 + u)) / y);
 }
+
+// The BT.2390 EETF, as Report ITU-R BT.2408-9 (03/2026) Annex 5 defines it, in the PQ domain. Source: mastering black
+// LB = 0, white LW = hdr_peak nits (at least SDR white); target: Lmin = 0 (no display black level is known, so the black
+// lift b (1 - E2)^4 of step 3 is 0), Lmax = SDR white. Step 1: E1 = PQ^-1(L) / PQ^-1(LW), maxLum = PQ^-1(Lmax) / PQ^-1(LW);
+// step 2: KS = 1.5 maxLum - 0.5; step 3: E2 = E1 below KS, else the Hermite spline P[E1] with
+// T = (E1 - KS) / (1 - KS), P = (2T^3 - 3T^2 + 1) KS + (T^3 - 2T^2 + T)(1 - KS) + (-2T^3 + 3T^2) maxLum (step 4);
+// step 5: E4 = E2 PQ^-1(LW). It is applied to M = max(R, G, B) and the colour scaled by M2 / M (the annex's "maxRGB"
+// option, which its Table A5-1 lists as not producing colours outside the target volume): no channel ends above 1.0,
+// so a saturated highlight keeps its chromaticity instead of being clipped per channel. Content above LW is taken as LW.
+// `v`: linear Rec.709, 1.0 = SDR white, no channel negative.
+vec3 tone_map_bt2390(vec3 v) {
+    float m = max(max(v.r, v.g), v.b);
+    float pw = nits_to_pq(max(pc.hdr_peak, pc.sdr_white));
+    float max_lum = nits_to_pq(pc.sdr_white) / pw;
+    float ks = 1.5 * max_lum - 0.5;
+    if (!(m > 0.0)) return v;
+    float e1 = min(nits_to_pq(m * pc.sdr_white) / pw, 1.0);
+    if (e1 < ks) return v;  // the 1:1 part, untouched
+    float e2 = e1;          // KS >= 1 (peak at or below SDR white): only the clamp to LW above
+    if (ks < 1.0) {
+        float t = (e1 - ks) / (1.0 - ks), t2 = t * t, t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) + (-2.0 * t3 + 3.0 * t2) * max_lum;
+    }
+    return v * (pq_to_nits(e2 * pw) / pc.sdr_white / m);
+}
+
+vec3 tone_map(vec3 v) { return pc.tone_map == 1u ? tone_map_bt2390(v) : tone_map_shoulder(v); }
 
 // A linear premultiplied colour of alpha `a` from the plane's space to the output's working space. Both conversions are
 // linear except the tone map, which needs the unassociated colour.

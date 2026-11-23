@@ -163,6 +163,10 @@ public:
     void set_sdr_eotf(leonida::PresentPlanes::SdrEotf eotf) { sdr_eotf_ = eotf; }
     // Peak of HDR10 content in nits, the white point of the tone map onto an SDR output (default 1000; no metadata is read).
     void set_hdr_peak_nits(float nits) { hdr_peak_nits_ = nits > 0.0f ? nits : 1000.0f; }
+    // How HDR10 planes are tone mapped onto an SDR output: the luminance shoulder (default) or the BT.2390 EETF on maxRGB.
+    // The environment variable LEONIDA_TONE_MAP=bt2390 (or bt.2390 or eetf; any case; "shoulder" is the default; other
+    // values are logged once and ignored) chooses when the object is made.
+    void set_tone_map(leonida::PresentPlanes::ToneMap tone_map) { tone_map_ = tone_map; }
 
     leonida::FramePacer& pacer() { return pacer_; }
     WindowPresenter& presenter() { return *presenter_; }
@@ -183,6 +187,7 @@ private:
     std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits
     std::atomic<leonida::PresentPlanes::SdrEotf> sdr_eotf_{leonida::PresentPlanes::SdrEotf::srgb};
     std::atomic<float> hdr_peak_nits_{1000.0f};
+    std::atomic<leonida::PresentPlanes::ToneMap> tone_map_{leonida::PresentPlanes::ToneMap::shoulder};
     // The last good Windows SDR white level (nits, 0: none yet), refreshed by display_white_thread_ about once a second while
     // an HDR10 swapchain is in use (white_wanted_); a failed query keeps the previous value.
     std::atomic<float> display_white_{0.0f};

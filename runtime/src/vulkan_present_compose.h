@@ -23,7 +23,8 @@ struct PresentComposePush {
     float sdr_white;
     std::uint32_t width, height, sdr_eotf;  // sdr_eotf: PresentPlanes::SdrEotf
     float hdr_peak;
-    std::uint32_t pad[3];
+    std::uint32_t tone_map;  // PresentPlanes::ToneMap
+    std::uint32_t pad[2];
 };
 static_assert(sizeof(PresentComposePush) == 112);
 

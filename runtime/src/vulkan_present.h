@@ -76,6 +76,11 @@ struct PresentPlanes {
     enum class SdrEotf : std::uint32_t { srgb = 0, gamma22 = 1 };
     SdrEotf sdr_eotf = SdrEotf::srgb;
     float hdr_peak_nits = 1000.0f;  // peak of the HDR10 content: the white point of the tone map on an SDR output
+    // How HDR10 planes are tone mapped onto an SDR output (docs section 4.5): a shoulder on luminance (default: identity
+    // up to 0.8 of SDR white, extended Reinhard above, then clipped per channel), or the BT.2390 EETF of Report ITU-R
+    // BT.2408-9 Annex 5 on max(R, G, B) (identity below its knee start, no channel clipped).
+    enum class ToneMap : std::uint32_t { shoulder = 0, bt2390 = 1 };
+    ToneMap tone_map = ToneMap::shoulder;
 };
 
 namespace detail {
@@ -250,7 +255,8 @@ public:
     // destination rectangle of the window, plane 1 blended over plane 0, composed by a compute pass into an RGBA16F image
     // that is then copied to the swapchain image. Colour spaces are converted to the swapchain's: when a plane is HDR10 and
     // the surface lists an HDR10 (ST.2084) format the swapchain uses it (hdr_active()), else the HDR10 planes are
-    // tone mapped to SDR (shoulder above 0.8 of SDR white, then clipped). Planes are filtered and blended in linear light. The swapchain
+    // tone mapped to SDR (PresentPlanes::tone_map: the shoulder above 0.8 of SDR white, then clipped, or the BT.2390 EETF on
+    // maxRGB). Planes are filtered and blended in linear light. The swapchain
     // is always UNORM here; sRGB-format sources are
     // encoded again by the pass. Sources must be single-sample, sampled (no DENY_SHADER_RESOURCE) float/UNORM/sRGB
     // colour textures; others are refused (VK_ERROR_FORMAT_NOT_SUPPORTED). Rectangles outside their range give
@@ -259,6 +265,8 @@ public:
         if (planes.count < 1 || planes.count > 2) return VK_ERROR_UNKNOWN;
         if (!(planes.sdr_white_nits > 0.0f) || !std::isfinite(planes.sdr_white_nits)) return VK_ERROR_UNKNOWN;
         if (!(planes.hdr_peak_nits > 0.0f) || !std::isfinite(planes.hdr_peak_nits)) return VK_ERROR_UNKNOWN;
+        if (planes.tone_map != PresentPlanes::ToneMap::shoulder && planes.tone_map != PresentPlanes::ToneMap::bt2390)
+            return VK_ERROR_UNKNOWN;
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
             ResourceBinding binding;
@@ -839,6 +847,7 @@ private:
         push.sdr_white = planes.sdr_white_nits;
         push.sdr_eotf = std::uint32_t(planes.sdr_eotf);
         push.hdr_peak = planes.hdr_peak_nits;
+        push.tone_map = std::uint32_t(planes.tone_map);
         push.width = extent_.width;
         push.height = extent_.height;
         composer_->record(commands, slot, frame.views[0], read_layout[0], frame.views[1] ? frame.views[1] : frame.views[0],
