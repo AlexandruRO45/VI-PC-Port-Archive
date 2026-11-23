@@ -36,8 +36,14 @@ def model_ds_permute(wave, addrs, exec_mask, offset=0, threads=None):
     - inactive destination lanes keep SENTINEL | lane
     - lanes >= threads do not execute (initial EXEC bit is 0)
     """
+    if isinstance(wave, bool) or wave not in (32, 64):
+        raise ValueError(f"unsupported wave size {wave!r}; expected 32 or 64")
     if threads is None:
         threads = wave
+    if isinstance(threads, bool) or not isinstance(threads, int) or not (0 <= threads <= wave):
+        raise ValueError(f"threads must be an int in [0, {wave}], got {threads!r}")
+    if len(addrs) < wave:
+        raise ValueError(f"addrs must have at least {wave} entries, got {len(addrs)}")
     live_mask = ((1 << threads) - 1) & exec_mask
     out = [SENTINEL | l for l in range(wave)]
     for base in range(0, wave, 32):
@@ -156,18 +162,25 @@ def self_test():
 
 def parse_waves(text):
     """Parse --waves comma-separated list into [32|64, ...], or raise ValueError."""
-    tokens = [t.strip() for t in text.split(",") if t.strip()]
-    if not tokens:
+    if not text or not text.strip():
         raise ValueError("--waves must not be empty")
+    raw_tokens = text.split(",")
     waves = []
-    for tok in tokens:
-        try:
-            w = int(tok)
-        except ValueError:
-            raise ValueError(f"invalid wave size {tok!r}; expected 32 or 64") from None
-        if w not in (32, 64):
-            raise ValueError(f"unsupported wave size {w}; expected 32 or 64")
-        waves.append(w)
+    for raw in raw_tokens:
+        tok = raw.strip()
+        if not tok:
+            raise ValueError(f"empty wave size in {text!r}; expected 32 or 64")
+        if tok not in ("32", "64"):
+            try:
+                w = int(tok)
+            except ValueError:
+                raise ValueError(f"invalid wave size {tok!r}; expected 32 or 64") from None
+            if w not in (32, 64):
+                raise ValueError(f"unsupported wave size {w}; expected 32 or 64")
+            raise ValueError(f"invalid wave size {tok!r}; expected 32 or 64")
+        w = int(tok)
+        if w not in waves:
+            waves.append(w)
     return waves
 
 
@@ -203,6 +216,7 @@ def write_json_report(path, data):
     try:
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             json.dump(data, f, indent=2)
+            f.write("\n")
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
     return None
@@ -238,12 +252,16 @@ def main(argv=None):
         return 77
     out = {"arch": oracle.arch, "waves": {}}
     mismatches = 0
-    for wave in waves:
-        res = probe_wave(oracle, asm, wave)
-        out["waves"][str(wave)] = res
-        if res["cases_ok"] != res["cases_total"]:
-            mismatches += 1
-        print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
+    try:
+        for wave in waves:
+            res = probe_wave(oracle, asm, wave)
+            out["waves"][str(wave)] = res
+            if res["cases_ok"] != res["cases_total"]:
+                mismatches += 1
+            print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.json_out is not None:
         err = write_json_report(args.json_out, out)
         if err:

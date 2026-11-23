@@ -48,7 +48,7 @@ class DsPermuteProbeTests(unittest.TestCase):
     def test_invalid_waves_rejected_before_open_oracle(self):
         pkg, asm_mod, runner_mod, open_oracle = _fake_hw_oracle()
         with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod, "hw_oracle.runner": runner_mod}):
-            for bad in ("", " , ", "abc", "32,abc", "16", "128"):
+            for bad in ("", " , ", "abc", "32,abc", "16", "128", "32,", ",32", "32,,64", "+32", "032", "0064"):
                 with self.subTest(waves=bad):
                     stderr = io.StringIO()
                     with mock.patch.object(sys, "stderr", stderr):
@@ -56,6 +56,36 @@ class DsPermuteProbeTests(unittest.TestCase):
                     self.assertEqual(rc, 2)
                     self.assertIn("error:", stderr.getvalue())
                     open_oracle.assert_not_called()
+        self.assertEqual(ds_permute_probe.parse_waves("32, 32"), [32])
+        self.assertEqual(ds_permute_probe.parse_waves("64, 32, 64"), [64, 32])
+
+    def test_model_ds_permute_validates_inputs(self):
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(16, [0] * 16, 0xFFFF)
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(True, [0] * 32, 0xFFFFFFFF)
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(32, [0] * 31, 0xFFFFFFFF)
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(32, [0] * 32, 0xFFFFFFFF, threads=-1)
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(32, [0] * 32, 0xFFFFFFFF, threads=33)
+        with self.assertRaises(ValueError):
+            ds_permute_probe.model_ds_permute(32, [0] * 32, 0xFFFFFFFF, threads=True)
+
+    def test_main_catches_harness_runtime_error_with_exit_2(self):
+        oracle = types.SimpleNamespace(arch="gfx1030")
+        pkg, asm_mod, runner_mod, _ = _fake_hw_oracle(open_side_effect=lambda: oracle)
+        with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod,
+                                           "hw_oracle.runner": runner_mod}), \
+             mock.patch.object(ds_permute_probe, "probe_wave",
+                               side_effect=RuntimeError("rot_plus1_offset4_lowbits wave32: harness failed")):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                rc = ds_permute_probe.main(["--waves", "32"])
+        self.assertEqual(rc, 2)
+        self.assertIn("error: rot_plus1_offset4_lowbits wave32: harness failed", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_invalid_json_paths_rejected_before_open_oracle(self):
         pkg, asm_mod, runner_mod, open_oracle = _fake_hw_oracle()
@@ -108,6 +138,7 @@ class DsPermuteProbeTests(unittest.TestCase):
             with open(out_path, "rb") as f:
                 raw = f.read()
             self.assertNotIn(b"\r\n", raw)
+            self.assertTrue(raw.endswith(b"\n"))
             self.assertEqual(json.loads(raw.decode("utf-8")), payload)
 
     def test_write_json_report_and_main_catch_oserror_cleanly(self):
