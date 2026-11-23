@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""Discover development tools in this Leonida checkout."""
+"""Use development tools from this Leonida checkout."""
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+BOOT_TRACE = "tools/boot_trace.py"
 TOOLS = (
     (
         "boot-trace",
-        "tools/boot_trace.py",
+        BOOT_TRACE,
         ("Python 3", "Startup JSONL from gta6rt --trace or stderr from gta6rt --trace-d3d12"),
     ),
     (
@@ -47,12 +50,33 @@ def discover() -> dict:
     }
 
 
+def boot_trace(args: list[str]) -> int:
+    producer = ROOT / BOOT_TRACE
+    if not producer.is_file():
+        print(f"error: {BOOT_TRACE} is missing; use a complete Leonida checkout", file=sys.stderr)
+        return 2
+    try:
+        return subprocess.run(
+            [sys.executable, "-I", str(producer), *args],
+            cwd=Path.cwd(),
+        ).returncode
+    except OSError as exc:
+        print(f"error: could not run {BOOT_TRACE}: {exc}", file=sys.stderr)
+        return 2
+
+
 def main() -> int:
+    # The producer owns its arguments and help. Forward before argparse handles them.
+    argv = sys.argv[1:]
+    if argv[:1] == ["boot-trace"]:
+        return boot_trace(argv[1:])
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     inventory = commands.add_parser("discover", help="list producer scripts and their requirements")
     inventory.add_argument("--json", action="store_true", help="write a JSON inventory to stdout")
-    args = parser.parse_args()
+    commands.add_parser("boot-trace", help="summarize startup and D3D12 boot traces")
+    args = parser.parse_args(argv)
 
     result = discover()
     if args.json:
