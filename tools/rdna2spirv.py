@@ -6388,13 +6388,20 @@ class Gen:
                 raise Unsupported("gs sendmsg " + t)
             return
         if op == "s_sendmsg" and a and "MSG_GS_ALLOC_REQ" in a[0].get("t", "") and self.stage == "ms":
-            # SHADER-766: only invocation 0 stores the workgroup counts to avoid SharedMemoryDataRace-RaceOnStore.
-            # The counts are uniform (from SGPR m0), and all invocations synchronize at the post-alloc barrier.
+            # SHADER-766: one store per wave, from its lowest active lane, to avoid SharedMemoryDataRace-RaceOnStore.
+            # The guard is the lane's exec bit, not local_index == 0: a wave that sends with exec set (ms_wave_info_s3
+            # sends only from wave 1) must still reach %ms_counts. The counts are uniform (SGPR m0), and all
+            # invocations synchronize at the post-alloc barrier.
             m = self.tmp()
             self.emit(f"{m} = OpLoad %uint %m0")
-            li = self.local_index()
-            is_lead = self.tmp()
-            self.emit(f"{is_lead} = OpIEqual %bool {li} {self.cu(0)}")
+            self.uses_subgroup = self.uses_ballot = True
+            act, bal, lsb, lane, is_first, is_lead = (self.tmp() for _ in range(6))
+            self.emit(f"{act} = OpLoad %bool %active")
+            self.emit(f"{bal} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {act}")
+            self.emit(f"{lsb} = OpGroupNonUniformBallotFindLSB %uint {self.cu(3)} {bal}")
+            self.emit(f"{lane} = OpLoad %uint %sg_lane")
+            self.emit(f"{is_first} = OpIEqual %bool {lane} {lsb}")
+            self.emit(f"{is_lead} = OpLogicalAnd %bool {act} {is_first}")
             do_lbl, end_lbl = self.tmp() + "_alloc_do", self.tmp() + "_alloc_end"
             self.emit(f"OpSelectionMerge {end_lbl} None")
             self.emit(f"OpBranchConditional {is_lead} {do_lbl} {end_lbl}")
