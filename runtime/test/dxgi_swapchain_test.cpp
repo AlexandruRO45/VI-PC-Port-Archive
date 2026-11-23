@@ -32,13 +32,28 @@ unsigned& validation_errors() {
     return count;
 }
 
+unsigned& known_validation_errors() {
+    static unsigned count = 0;
+    return count;
+}
+
+// The validation layer built with Vulkan SDK 1.4.363 (Windows) reports VUID-VkSwapchainCreateInfoKHR-flags-parameter
+// (0xa4ba1dd3) for a vkCreateSwapchainKHR whose flags are 0; see the note in vk_test_device.h for the standalone
+// measurement. Counted apart so the test skips only when it is the sole validation error.
+bool known_validation_error(const VkDebugUtilsMessengerCallbackDataEXT* data) {
+    return data && data->messageIdNumber == 0xa4ba1dd3;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
                                              VkDebugUtilsMessageTypeFlagsEXT types,
                                              const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) &&
-        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT))
+        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT)) {
         ++validation_errors();
-    std::fprintf(stderr, "validation: %s\n", data && data->pMessage ? data->pMessage : "(no message)");
+        if (known_validation_error(data)) ++known_validation_errors();
+    }
+    std::fprintf(stderr, "validation%s: %s\n", known_validation_error(data) ? " (known check)" : "",
+                 data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }
 
@@ -1939,9 +1954,15 @@ int main() {
     if (messenger && destroy_dbg) destroy_dbg(instance, messenger, nullptr);
     destroy_inst(instance, nullptr);
 
-    if (validation_errors() != 0) {
-        std::fprintf(stderr, "FAIL: %u Vulkan validation errors\n", validation_errors());
+    if (validation_errors() != known_validation_errors()) {
+        std::fprintf(stderr, "FAIL: %u Vulkan validation errors (%u known validation-layer checks)\n",
+                     validation_errors(), known_validation_errors());
         return 1;
+    }
+    if (known_validation_errors()) {
+        std::fprintf(stderr, "%u known validation-layer checks (the swapchain creation messages); skipped\n",
+                     known_validation_errors());
+        return 77;
     }
     std::printf("device: %s (validation %s)\n", chosen.deviceName, val_active ? "on" : "off");
     std::printf("dxgi_swapchain_test: PASS (CreateSwapChain, CreateSwapChainForHwnd, CreateSwapChainForCoreWindow, occlusion status, "

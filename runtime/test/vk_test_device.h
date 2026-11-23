@@ -40,6 +40,17 @@ inline bool known_srgb_swapchain_storage_error(const VkDebugUtilsMessengerCallba
     return data && data->pMessage && data->messageIdNumber == 0xc036022f;
 }
 
+// The validation layer built with Vulkan SDK 1.4.363 (Windows) reports VUID-VkSwapchainCreateInfoKHR-flags-parameter
+// for a vkCreateSwapchainKHR whose flags are 0: "pCreateInfo->flags has VkSwapchainCreateFlagBitsKHR values
+// (VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR) that require the extensions VK_KHR_swapchain_mutable_format". Measured
+// on Windows 11 26100 with an RTX 5060 (driver 32.0.16.2124) using a standalone program that shares nothing with the
+// presenter: one message per creation, printed `flags` 0 for the plain case, and the same message for the case that
+// really passes VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR, so the bit is not read from this code's struct. Counted
+// separately so a test can skip only when it is the sole validation error.
+inline bool known_swapchain_flags_error(const VkDebugUtilsMessengerCallbackDataEXT* data) {
+    return data && data->messageIdNumber == 0xa4ba1dd3;
+}
+
 // Only validation-type errors fail a test. General messages come from the loader and the layers around the
 // application: a third-party implicit layer that fails to load (an overlay or capture tool, for example) reports a
 // general error that says nothing about this code, so it is printed but not counted.
@@ -48,13 +59,13 @@ inline VKAPI_ATTR VkBool32 VKAPI_CALL on_validation(VkDebugUtilsMessageSeverityF
                                                     const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
     const bool validation = (types & VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT) != 0;
     const bool known = (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation &&
-                       known_srgb_swapchain_storage_error(data);
+                       (known_srgb_swapchain_storage_error(data) || known_swapchain_flags_error(data));
     if ((severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) && validation) {
         ++validation_error_count();
         if (known) ++known_validation_error_count();
     }
     std::fprintf(stderr, "%s%s: %s\n", validation ? "validation" : "vulkan (not counted)",
-                 known ? " (known sRGB swapchain check)" : "",
+                 known ? " (known validation-layer check)" : "",
                  data && data->pMessage ? data->pMessage : "(no message)");
     return VK_FALSE;
 }

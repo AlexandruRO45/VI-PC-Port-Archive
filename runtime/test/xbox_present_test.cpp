@@ -1344,12 +1344,13 @@ int main() {
     const unsigned validation_errors = d.validation_errors();
     const unsigned known_errors = d.known_validation_errors();
     if (validation_errors != known_errors) {
-        std::fprintf(stderr, "%u validation errors (%u known sRGB swapchain checks)\n", validation_errors,
+        std::fprintf(stderr, "%u validation errors (%u known validation-layer checks)\n", validation_errors,
                      known_errors);
         return 1;
     }
     if (known_errors) {
-        std::fprintf(stderr, "%u known sRGB swapchain STORAGE validation errors; skipped\n", known_errors);
+        std::fprintf(stderr, "%u known validation-layer checks (sRGB swapchain STORAGE, swapchain creation); skipped\n",
+                     known_errors);
         return 77;
     }
     std::printf("xbox_present_test: all cases pass\n");

@@ -628,9 +628,17 @@ int main() {
     DestroyWindow(window);
     UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
 
-    if (d.validation_errors()) {
-        std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+    const unsigned validation_errors = d.validation_errors();
+    const unsigned known_errors = d.known_validation_errors();
+    if (validation_errors != known_errors) {
+        std::fprintf(stderr, "%u validation errors (%u known validation-layer checks)\n", validation_errors,
+                     known_errors);
         return 1;
+    }
+    if (known_errors) {
+        std::fprintf(stderr, "%u known validation-layer checks (the swapchain creation messages); skipped\n",
+                     known_errors);
+        return 77;
     }
     std::printf("M0: 70 frames cleared and presented through the Xbox-ABI proxy on Vulkan, swapchain recreated on "
                 "resize, colour confirmed in the presented images%s\n", screen_checked ? " and on screen" : "");
