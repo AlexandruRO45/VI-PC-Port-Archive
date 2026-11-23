@@ -134,6 +134,34 @@ class SlugTest(unittest.TestCase):
             self.assertEqual(anchors(page), {"same", "same-1"})
 
 
+class ReferenceDefinitionTest(unittest.TestCase):
+    def test_links_include_reference_definitions(self):
+        text = (
+            "[plain]: notes.md\n"
+            "[angle]: <other.md#a-heading> \"a title\"\n"
+            "   [indented]: three/spaces.md\n"
+            "```\n"
+            "[in a fence]: not-a-link.md\n"
+            "```\n"
+            "[inline](page.md)\n"
+        )
+        self.assertEqual(links(text), ["page.md", "notes.md", "other.md#a-heading", "three/spaces.md"])
+
+    def test_the_checker_flags_a_broken_reference_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            def write(name, text):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            write("other.md", "## Heading one\n")
+            write("good.md", "[one][o]\n\n[o]: other.md#heading-one\n")
+            write("bad.md", "[missing][m]\n[bad anchor][a]\n\n[m]: nope.md\n[a]: other.md#nope\n")
+            files = [os.path.join(tmp, name) for name in ("bad.md", "good.md", "other.md")]
+            self.assertEqual(sorted(broken_links(tmp, files)), [
+                ("bad.md", "nope.md", "missing file"),
+                ("bad.md", "other.md#nope", "anchor not found"),
+            ])
+
+
 class RepositoryLinksTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "requires Git")
     def test_flags_broken_link_in_tracked_unicode_filename(self):
