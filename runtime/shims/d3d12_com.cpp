@@ -1162,7 +1162,9 @@ private:
     }
 
     void record_dispatch(UINT x, UINT y, UINT z) {
-        if (!compute_pipeline_ || !compute_.layout) return check(false);
+        // D3D12 permits a Dispatch without a compute PSO: it executes no shader and must not invalidate Close().
+        if (!compute_pipeline_) return;
+        if (!compute_.layout) return check(false);
         check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
     }
 
@@ -1179,9 +1181,11 @@ private:
         return draw_views_;
     }
 
-    // A draw needs a graphics pipeline, a graphics root signature and a topology.
+    // A draw without a graphics PSO is a no-op, as the D3D12 runtime substitutes a no-op pipeline state for it
+    // (D3D-482); with a PSO it requires a root signature and topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        if (!graphics_pipeline_) return;
+        if (!graphics_.layout || !topology_) return check(false);
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
