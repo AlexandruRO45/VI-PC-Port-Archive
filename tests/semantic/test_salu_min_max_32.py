@@ -181,9 +181,10 @@ class SaluMinMax32Tests(unittest.TestCase):
                     self.assertNotIn("SMax", spv)
 
         # Propagated sgpr_imm from s_min_u32 / s_max_u32 eliminates runtime SMEM bounds branches.
-        for op, a_tok, b_tok in (
-            ("s_min_u32", "64", "200"),
-            ("s_max_u32", "16", "64"),
+        mem = {off: 0xA000 + off for off in range(0, 512, 4)}
+        for op, a_tok, b_tok, want_off in (
+            ("s_min_u32", "64", "200", 64),
+            ("s_max_u32", "16", "64", 64),
         ):
             with self.subTest(op=op, check="smem_const_prop"):
                 buf_spv = translate_salu([
@@ -200,6 +201,8 @@ class SaluMinMax32Tests(unittest.TestCase):
                 self.assertNotIn("OpSelectionMerge", buf_spv)
                 self.assertNotIn("OpBranchConditional", buf_spv)
                 self.assertNotIn("OpPhi", buf_spv)
+                out = support.mrt0_words(buf_spv, memory=mem, push_constants=[0, 0, 256, 0])
+                self.assertEqual(out[0], 0xA000 + want_off)
 
         # Multi-step chain through s_min_i32 -> s_max_i32 -> s_add_u32 with constant propagation.
         chain_spv = translate_salu([
