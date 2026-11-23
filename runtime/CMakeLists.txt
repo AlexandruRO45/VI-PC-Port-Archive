@@ -1531,6 +1531,29 @@ if(TARGET Vulkan::Headers)
 
     # Typed RTV clears and draws of every TYPELESS color family against the host on the same adapter and WARP
     # (D3D-275). The draws need glslangValidator for their GLSL stand-ins of translated shaders.
+    # Seeded random graphics state (blend, depth-stencil, rasterizer) on the layer and on WARP, every byte of the
+    # targets compared. Needs glslangValidator for its two GLSL stand-ins.
+    if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      add_executable(d3d12_pso_fuzz_test test/d3d12_pso_fuzz_test.cpp)
+      target_link_libraries(d3d12_pso_fuzz_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_pso_fuzz_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_pso_fuzz_test PRIVATE /W4 /permissive- /utf-8)
+      foreach(pair "vs_pso.vert;LEONIDA_PSO_VS_SPV;pso_vs.spv" "ps_pso.frag;LEONIDA_PSO_PS_SPV;pso_ps.spv")
+        list(GET pair 0 shader)
+        list(GET pair 1 definition)
+        list(GET pair 2 name)
+        set(binary ${CMAKE_CURRENT_BINARY_DIR}/generated/${name})
+        add_custom_command(OUTPUT ${binary}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${binary}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${shader}
+          COMMENT "Compiling the PSO fuzz test shader ${shader}" VERBATIM)
+        target_sources(d3d12_pso_fuzz_test PRIVATE ${binary})
+        target_compile_definitions(d3d12_pso_fuzz_test PRIVATE ${definition}="${binary}")
+      endforeach()
+      add_test(NAME d3d12_pso_fuzz COMMAND d3d12_pso_fuzz_test)
+      set_tests_properties(d3d12_pso_fuzz PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
     add_executable(d3d12_typeless_families_test test/d3d12_typeless_families_test.cpp)
     target_link_libraries(d3d12_typeless_families_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_typeless_families_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
