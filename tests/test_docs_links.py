@@ -108,7 +108,7 @@ def broken_links(root, files):
             destination = os.path.normpath(os.path.join(os.path.dirname(path), target))
             if not os.path.exists(destination):
                 problems.append((os.path.relpath(path, root), link, "missing file"))
-            elif anchor and os.path.isfile(destination) and anchor not in anchors_of(destination):
+            elif anchor and os.path.isfile(destination) and unquote(anchor) not in anchors_of(destination):
                 problems.append((os.path.relpath(path, root), link, "anchor not found"))
     return problems
 
@@ -170,6 +170,18 @@ class RepositoryLinksTest(unittest.TestCase):
             self.assertEqual(problems, [
                 ("bad.md", "nope.md", "missing file"),
                 ("bad.md", "other.md#nope", "anchor not found"),
+            ])
+
+    def test_percent_encoded_cross_file_fragments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            intro = os.path.join(tmp, "intro.md")
+            guide = os.path.join(tmp, "guide.md")
+            with open(guide, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Café\n")
+            with open(intro, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[Valid](guide.md#caf%C3%A9)\n[Missing](guide.md#caf%C3%A9-missing)\n")
+            self.assertEqual(broken_links(tmp, [intro, guide]), [
+                ("intro.md", "guide.md#caf%C3%A9-missing", "anchor not found"),
             ])
 
 
