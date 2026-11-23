@@ -123,22 +123,24 @@ def run(command, timeout, cwd=None, env=None):
         stop_and_say(command, env)
     with tempfile.TemporaryFile() as output:
         group = {"start_new_session": True} if os.name != "nt" else {}
-        process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output,
-                                   stderr=subprocess.STDOUT, **group)
         try:
-            code = process.wait(timeout=timeout)
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as stopped:
-            kill_group(process)
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, **group)
             try:
-                process.wait(timeout=TIMEOUT)
-            except subprocess.TimeoutExpired:
-                pass  # a process SIGKILL does not end (stuck in the kernel) is left, not waited for
-            if isinstance(stopped, KeyboardInterrupt):
-                raise
-            code = None
-        else:
-            kill_group(process)  # a helper the program left running does not outlive its test (wineserver has its own session)
-        if fresh_display:
-            stop_and_say(command, env)
+                code = process.wait(timeout=timeout)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as stopped:
+                kill_group(process)
+                try:
+                    process.wait(timeout=TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    pass  # a process SIGKILL does not end (stuck in the kernel) is left, not waited for
+                if isinstance(stopped, KeyboardInterrupt):
+                    raise
+                code = None
+            else:
+                kill_group(process)  # a helper the program left running does not outlive its test (wineserver has its own session)
+        finally:
+            if fresh_display:  # also on Ctrl-C: the prefix's wineserver has its own session and would outlive the run
+                stop_and_say(command, env)
         output.seek(0)
         return code, output.read().decode("utf-8", "replace")

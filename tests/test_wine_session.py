@@ -204,6 +204,28 @@ class RunTest(Dummies):
             runner.wait()
 
 
+    def test_ctrl_c_under_xvfb_run_still_stops_the_prefix_after_the_run(self):
+        # The prefix's wineserver has a session of its own, so the group kill does not reach it: the stop after the
+        # run must happen on Ctrl-C too, not only on a normal exit.
+        stops = []
+        program = self.script(self.bin / "sleeps.py", "import time\ntime.sleep(60)\n")
+        real_wait = subprocess.Popen.wait
+        interrupted = []
+
+        def wait(process, timeout=None):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return real_wait(process, timeout=timeout)
+
+        with mock.patch.object(session, "starts_x_server", return_value=True), \
+                mock.patch.object(session, "stop_and_say", side_effect=lambda command, env: stops.append(command)), \
+                mock.patch.object(subprocess.Popen, "wait", wait):
+            with self.assertRaises(KeyboardInterrupt):
+                session.run([program], timeout=60)
+        self.assertEqual(len(stops), 2, "the prefix is stopped before the run and again after the interrupt")
+
+
 class CheckTinyFrameTest(Dummies):
     """check_tiny_frame.py stops the prefix before a run only when its runner starts its own X server."""
 
