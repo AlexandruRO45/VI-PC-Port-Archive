@@ -82,6 +82,9 @@ PASSED = [
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
     ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
     ("mz_not_pe.txt", pe_header(0x80)[:-4] + b"NE\0\0"),
+    # "PS\0\x09" at the start is the cache magic: a PSD's "8BPS" and a header one byte off are not it.
+    ("photo.psd", b"8BPS" + bytes(20)),
+    ("ps_note.txt", b"PS\0\x08 is one byte away from the cache magic\n"),
 ]
 
 
