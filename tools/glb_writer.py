@@ -361,6 +361,8 @@ def parse_obj(
 
         elif cmd == "s" and len(parts) > 1:
             value = parts[1].split("#", 1)[0]
+            if value == "on":
+                value = "1"
             try:
                 group = 0 if value == "off" else int(value)
             except ValueError:
