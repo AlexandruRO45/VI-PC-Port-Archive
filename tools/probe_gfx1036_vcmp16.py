@@ -4,10 +4,16 @@
   - SGPR high halves, f16 abs/neg/ordered-vs-unordered NaN.
 
 Usage:
-  powershell -File C:\\Leonida-worktrees\\with-gpu-lock.ps1 "cd C:\\Leonida-worktrees\\w4-cmp16-opsel; python scripts/probe_gfx1036_vcmp16.py"
+  python -I tools/probe_gfx1036_vcmp16.py
+
+Needs a native RDNA2 GPU (the probe asks for LEONIDA_VK_DEVICE=radeon), a built
+runtime/build/vk_compute_test (cmake --build runtime/build --target vk_compute_test) and spirv-as on
+PATH. No game files. The probes want the GPU to themselves, so run it alone.
 """
+import argparse
 import math
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -21,7 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from support import STUB_DXBC, rdna2spirv
 import spirv_mini_interp as si
 
-VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test.exe")
+VK_COMPUTE_TEST = os.path.join(ROOT, "runtime", "build", "vk_compute_test" + (".exe" if os.name == "nt" else ""))
 
 # Half-precision bit constants
 H_ZERO = 0x0000      # +0.0
@@ -333,7 +339,19 @@ def test_f16_nan_and_modifiers(wave_size=32):
     print(f"[{name}] ALL NaN & MODIFIER TESTS PASSED on gfx1036 silicon!")
 
 
-def main():
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
+                                 epilog="Needs an RDNA2 GPU, a built runtime/build/vk_compute_test and spirv-as "
+                                        "on PATH; no game files. Run it alone: it wants the GPU to itself.")
+    ap.parse_args(argv)
+    # The probe writes a temporary module per case, so a missing tool would stop it a dozen tracebacks deep.
+    if not shutil.which("spirv-as"):
+        print("ERROR: spirv-as is not on PATH (SPIRV-Tools, or the Vulkan SDK's bin)", file=sys.stderr)
+        return 2
+    if not os.path.isfile(VK_COMPUTE_TEST):
+        print(f"ERROR: no {VK_COMPUTE_TEST}: build it with "
+              "cmake --build runtime/build --target vk_compute_test", file=sys.stderr)
+        return 2
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
@@ -367,4 +385,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())
