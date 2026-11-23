@@ -287,7 +287,7 @@ def verify_manifest(
     completed_files = 0
     completed_bytes = 0
     bytes_verified = 0
-    t0 = time.time()
+    t0 = time.monotonic()
 
     def hash_worker(rel: str, abs_p: str, size: int, expected_hash: str) -> tuple[str, int, str, Optional[str]]:
         try:
@@ -309,7 +309,7 @@ def verify_manifest(
             if status == "UNREADABLE" and err_msg:
                 unreadable_map[rel] = err_msg
 
-        elapsed = max(time.time() - t0, 1e-6)
+        elapsed = max(time.monotonic() - t0, 1e-6)
         rate_mib = (completed_bytes / elapsed) / (1024 * 1024)
         pct = (
             completed_bytes / total_manifest_bytes
@@ -367,7 +367,7 @@ def verify_manifest(
 
     problem_count = len(missing) + len(size_mismatch) + len(hash_mismatch) + len(unreadable)
     passed = (problem_count == 0) and (not strict or len(untracked) == 0)
-    elapsed_total = time.time() - t0
+    elapsed_total = time.monotonic() - t0
 
     return ManifestReport(
         passed=passed,

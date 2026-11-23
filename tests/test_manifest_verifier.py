@@ -463,6 +463,26 @@ class TestManifestVerifier(unittest.TestCase):
         mv.print_report(report_strict, out=out)
         self.assertIn("1 problem(s)", out.getvalue())
 
+    def test_verification_time_ignores_wall_clock_adjustment(self) -> None:
+        self.write_manifest(self.manifest_path, {"alpha.bin": self.payloads["alpha.bin"]})
+        progress = io.StringIO()
+        events = []
+        with (
+            patch.object(mv.time, "time", side_effect=[100, 99, 98]),
+            patch.object(mv.time, "monotonic", side_effect=[10, 10.25, 10.5]),
+        ):
+            report = mv.verify_manifest(
+                self.game_dir, self.manifest_path, jobs=1,
+                progress_callback=events.append, progress_stream=progress,
+            )
+
+        self.assertEqual(
+            (report.to_dict()["elapsed_seconds"], events[0].rate_mib, events[0].pct),
+            (0.5, 1.0, 1.0),
+        )
+        self.assertTrue(report.passed)
+        self.assertEqual(progress.getvalue().splitlines(), ["[100.0%] 1/1 files       1 MiB/s"])
+
     def test_progress_reporting_callback_and_stream(self) -> None:
         progress_events: list[mv.ProgressInfo] = []
         stream = io.StringIO()
