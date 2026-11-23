@@ -22,15 +22,18 @@ NO_WINDOW = 0x08000000
 TOOLS = [
     {"key": "python", "label": "Python 3.12+", "required": True, "why": "Runs the build scripts",
      "get": ("installer", "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"),
+     "signer": "O=Python Software Foundation",
      "locate": ("file", "python.exe")},
     {"key": "dotnet", "label": ".NET 8 SDK", "required": True, "why": "Exports the game's assets",
-     "get": ("installer", "https://aka.ms/dotnet/8.0/dotnet-sdk-win-x64.exe"), "locate": ("file", "dotnet.exe")},
+     "get": ("installer", "https://aka.ms/dotnet/8.0/dotnet-sdk-win-x64.exe"), "locate": ("file", "dotnet.exe"),
+     "signer": "O=Microsoft Corporation"},
     {"key": "vulkan", "label": "Vulkan SDK", "required": True, "why": "spirv-as / spirv-val, pipeline checker",
      "get": ("installer", "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"),
      "locate": ("dir", "the Vulkan SDK folder (the one with Bin\\spirv-val.exe)")},
     {"key": "git", "label": "Git", "required": True, "why": "Updates and the rpf9-explorer submodule",
-     "get": ("installer", "github:git-for-windows/git:Git-*-64-bit.exe"), "locate": ("file", "git.exe")},
-    {"key": "vs", "label": "Visual Studio C++ + Windows SDK", "required": True,
+     "get": ("installer", "github:git-for-windows/git:Git-*-64-bit.exe"), "locate": ("file", "git.exe"),
+     "signer": "O=Johannes Schindelin"},
+    {"key": "vs", "label": "Visual Studio C++ + Windows SDK", "required": True, "signer": "O=Microsoft Corporation",
      "why": "C++ tools + Windows SDK 10.0.26100+",
      "get": ("installer", "https://aka.ms/vs/17/release/vs_community.exe",
              ["--add", "Microsoft.VisualStudio.Workload.NativeDesktop", "--add",
@@ -228,6 +231,24 @@ class _SEI(ctypes.Structure):
                 ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int), ("hInstApp", ctypes.c_void_p),
                 ("lpIDList", ctypes.c_void_p), ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
                 ("dwHotKey", ctypes.c_ulong), ("hIcon", ctypes.c_void_p), ("hProcess", ctypes.c_void_p)]
+
+
+def verify_signature(path, signer=None):
+    """Refuse an installer whose Authenticode signature isn't valid, or (when signer is given, e.g.
+    "O=Microsoft Corporation") is from someone else. Raises with the reason."""
+    env = dict(os.environ, LEONIDA_SIG_PATH=path)
+    rc, out = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                   "$s = Get-AuthenticodeSignature -LiteralPath $env:LEONIDA_SIG_PATH; "
+                   "Write-Output ($s.Status.ToString() + '|' + $s.SignerCertificate.Subject)"], env=env, timeout=60)
+    line = out.strip().splitlines()[-1] if out.strip() else ""
+    status, _, subject = line.partition("|")
+    if rc != 0 or not status:
+        raise RuntimeError("Couldn't check the installer's signature")
+    if status != "Valid":
+        raise RuntimeError(f"The installer's signature isn't valid ({status}), so it wasn't run")
+    if signer and signer.lower() not in subject.lower():
+        org = next((p.strip()[2:] for p in subject.split(",") if p.strip().startswith("O=")), subject)
+        raise RuntimeError(f"The installer is signed by {org}, not {signer[2:]}, so it wasn't run")
 
 
 def run_installer(path, args=()):

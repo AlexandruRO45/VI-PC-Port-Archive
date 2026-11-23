@@ -1,7 +1,7 @@
 """Leonida Launcher UI kit: tokens, type, and the few controls every page uses.
 
-Direction (from the live rockstargames.com/VI styles): deep navy base, flat surfaces, cream uppercase condensed
-headings, a soft pastel-pink primary button with dark ink, white medium-weight text. Colour belongs to the one hero
+Direction: deep navy base, flat surfaces, cream uppercase condensed headings, a soft pastel-pink primary
+button with dark ink, white medium-weight text. Colour belongs to the one hero
 image; the chrome stays quiet. Rules: spacing only from SP; two families (Big Shoulders Display for headings,
 Segoe UI for everything else); one accent per screen (pink); no gradients, glows, skew or italics in the chrome.
 

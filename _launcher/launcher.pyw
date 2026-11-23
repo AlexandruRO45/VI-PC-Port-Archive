@@ -48,7 +48,7 @@ def load_settings():
     d = {"game": "", "out": os.path.join(os.path.expanduser("~"), "Documents", "Leonida"), "work": "",
          "stages": {s: True for s in STAGES}, "wav": False,
          "jobs": max(1, min(6, (os.cpu_count() or 2) // 2)),
-         "auto_check": True, "auto_update": True, "interval_min": 30}
+         "auto_check": True, "auto_update": False, "interval_min": 30}
     try:
         with open(SETTINGS, encoding="utf-8") as f:
             d.update(json.load(f))
@@ -142,7 +142,9 @@ def looks_like_game(d):
         names = os.listdir(d)
     except OSError:
         return False
-    return "MicrosoftGame.Config" in names and any(n.lower().endswith(".rpf") for n in names)
+    # isfile, not a name match: the file system decides how MicrosoftGame.Config may be spelled
+    return (os.path.isfile(os.path.join(d, "MicrosoftGame.Config"))
+            and any(n.lower().endswith(".rpf") for n in names))
 
 
 S = kit.SP  # spacing scale
@@ -303,7 +305,7 @@ class App(tk.Tk):
         self.hero_img, self.hero_size, self.hero_src = None, (0, 0), None
         self.hero.bind("<Configure>", self.draw_hero)
         h = self.hero
-        self.hero_eyebrow = h.create_text(0, 0, text=kit.spaced("For Grand Theft Auto VI"), anchor="w",
+        self.hero_eyebrow = h.create_text(0, 0, text=kit.spaced("PC build launcher"), anchor="w",
                                           font=kit.T["section"], fill=CREAM)
         self.hero_title = h.create_text(0, 0, text="LEONIDA", anchor="w", font=kit.T["hero"], fill=INK)
         self.home_build = Button(h, "Build the game", lambda: (self.show("build"), self.start_build()),
@@ -402,8 +404,8 @@ class App(tk.Tk):
             val.config(text="—", fg=INK)
             det.config(text="Not checked yet")
         elif u.get("nogit"):
-            val.config(text="ZIP copy", fg=WARN)
-            det.config(text="Connect it in Updates")
+            val.config(text={"zip": "ZIP copy", "nogit": "No Git"}.get(u["nogit"], "Unknown"), fg=WARN)
+            det.config(text="See Updates")
         elif u.get("error"):
             val.config(text="Offline", fg=WARN)
             det.config(text="Couldn't reach GitHub")
@@ -760,6 +762,7 @@ class App(tk.Tk):
                 else:
                     self.q.put(("tstate", key, "installing",
                                 "The installer is open. Follow its steps and allow the Windows prompt."))
+                    toolbox.verify_signature(path, t.get("signer"))
                     args = t["get"][2] if len(t["get"]) > 2 else ()
                     code = toolbox.run_installer(path, args)
                     if code not in (0, 3010, 1641):
@@ -1003,10 +1006,10 @@ class App(tk.Tk):
 
         kit.section(body, "Settings").pack(anchor="w", pady=(0, px(S["s"])))
         self.auto_check_var = tk.BooleanVar(value=self.s.get("auto_check", True))
-        self.auto_upd_var = tk.BooleanVar(value=self.s.get("auto_update", True))
+        self.auto_upd_var = tk.BooleanVar(value=self.s.get("auto_update", False))
         Check(body, "Check for updates automatically", self.auto_check_var,
               command=self.save_upd_opts).pack(anchor="w", pady=px(S["xs"]))
-        Check(body, "Install updates automatically when no build is running", self.auto_upd_var,
+        Check(body, "Install updates automatically (clean main only, never during a build)", self.auto_upd_var,
               command=self.save_upd_opts).pack(anchor="w", pady=px(S["xs"]))
         ir = tk.Frame(body, bg=NAVY)
         ir.pack(anchor="w", pady=(px(S["s"]), px(S["xl"])))
@@ -1036,13 +1039,31 @@ class App(tk.Tk):
     def git(self, *args, timeout=120):
         return run(["git", "-C", ROOT, *args], env=self.env, timeout=timeout)
 
+    def checkout_kind(self):
+        """What ROOT is: 'git' (the top of a clone, worktree or submodule; there .git may be a file), 'zip' (not a
+        checkout at all), 'nogit' (a checkout, but Git isn't installed) or 'broken' (git can't read it)."""
+        if not os.path.exists(os.path.join(ROOT, ".git")):
+            return "zip"
+        if not which("git", self.env):
+            return "nogit"
+        rc, out = self.git("rev-parse", "--show-toplevel")
+        lines = out.strip().splitlines()
+        if rc != 0 or not lines:
+            return "broken"
+        try:
+            same = os.path.samefile(lines[-1], ROOT)  # handles 8.3 names, slashes and case
+        except OSError:
+            same = False
+        return "git" if same else "broken"
+
     def check_updates(self, auto=False):
         self.upd_head.config(text="Checking…", fg=INK_SOFT)
 
         def work():
             info = {"when": time.strftime("%H:%M")}
-            if not os.path.isdir(os.path.join(ROOT, ".git")):
-                info["nogit"] = True
+            kind = self.checkout_kind()
+            if kind != "git":
+                info["nogit"] = kind
                 self.q.put(("upd", info, auto))
                 return
             rc, out = self.git("fetch", "--quiet", "origin")
@@ -1051,66 +1072,107 @@ class App(tk.Tk):
             else:
                 _, head = self.git("rev-parse", "HEAD")
                 _, branch = self.git("rev-parse", "--abbrev-ref", "HEAD")
-                _, up = self.git("rev-parse", "@{u}")
+                urc, up = self.git("rev-parse", "--abbrev-ref", "@{u}")
                 _, cnt = self.git("rev-list", "--count", "HEAD..@{u}")
                 _, ahead = self.git("rev-list", "--count", "@{u}..HEAD")
                 _, log = self.git("log", "--format=%h  %ad  %s", "--date=format:%b %d %H:%M", "-n", "40",
                                   "HEAD..@{u}")
                 _, cur = self.git("log", "-1", "--format=%h  %ad  %s", "--date=format:%b %d %H:%M")
                 _, dirty = self.git("status", "--porcelain", "--untracked-files=no")
-                info.update(head=head.strip(), branch=branch.strip(), upstream=up.strip(), current=cur.strip(),
+                info.update(head=head.strip(), branch=branch.strip(), upstream=up.strip() if urc == 0 else "",
+                            current=cur.strip(),
                             behind=int(cnt.strip() or 0) if cnt.strip().isdigit() else 0,
                             ahead=int(ahead.strip()) if ahead.strip().isdigit() else 0,
-                            log=log.strip(), dirty=dirty.strip())
+                            log=log.strip() if urc == 0 else "", dirty=dirty.strip())
             self.q.put(("upd", info, auto))
 
         threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def auto_ok(info):
+        """Automatic installs only touch a clean main that tracks origin/main."""
+        return info.get("branch") == "main" and info.get("upstream") == "origin/main" and not info.get("dirty")
 
     def on_upd(self, info, auto):
         self.update_info = info
         self.next_check = time.time() + 60 * self.s.get("interval_min", 30)
         self.commits.delete("1.0", "end")
         self.rail_version.config(text=f"Version {info.get('head', '')[:7]}" if info.get("head") else "")
-        if info.get("nogit"):
-            self.upd_head.config(text="Not connected to GitHub", fg=WARN)
-            self.upd_sub.config(text="This copy came as a ZIP. Update now connects it to "
-                                     f"{REPO_URL} so it can update itself (needs Git).")
-            self.upd_btn.set_enabled(self.proc is None)
-            if auto and self.s.get("auto_update") and self.proc is None and which("git", self.env):
-                self.do_update(silent=True)
+        kind = info.get("nogit")
+        if kind:
+            self.upd_btn.set_text("Connect to GitHub" if kind == "zip" else "Update now")
+            self.upd_btn.set_enabled(kind == "zip" and self.proc is None and bool(which("git", self.env)))
+            if kind == "zip":
+                self.upd_head.config(text="Not connected to GitHub", fg=WARN)
+                self.upd_sub.config(text="This copy isn't a git checkout (a ZIP download). Connect to GitHub turns "
+                                         f"this folder into a checkout of {REPO_URL} so it can update"
+                                         + (" (needs Git)." if not which("git", self.env) else "."))
+            elif kind == "nogit":
+                self.upd_head.config(text="Git isn't installed", fg=WARN)
+                self.upd_sub.config(text="Updates need Git. Get it on the Tools page.")
+            else:
+                self.upd_head.config(text="Couldn't read this checkout", fg=WARN)
+                self.upd_sub.config(text="git rev-parse failed in this folder, so updates are off.")
             self.refresh_home()
             return
+        self.upd_btn.set_text("Update now")
         if info.get("error"):
             self.upd_head.config(text="Couldn't check", fg=WARN)
             self.upd_sub.config(text=info["error"])
+            self.upd_btn.set_enabled(False)
+        elif not info.get("upstream"):
+            self.upd_head.config(text="No tracking branch", fg=WARN)
+            self.upd_sub.config(text=f"Branch {info['branch']} doesn't track a branch on GitHub, so there is "
+                                     "nothing to update from.")
             self.upd_btn.set_enabled(False)
         else:
             behind = info["behind"]
             self.upd_head.config(text=(f"{behind} update{'s' if behind != 1 else ''} available" if behind
                                        else "Up to date"), fg=INK)
-            sub = f"Installed {info['current']}\nBranch {info['branch']}  ·  checked at {info['when']}"
+            sub = (f"Installed {info['current']}\nBranch {info['branch']} (tracks {info['upstream']})  ·  "
+                   f"checked at {info['when']}")
             if info.get("dirty"):
-                sub += "\nThis folder has local edits; updating keeps them if they don't clash."
+                sub += "\nThis folder has local edits. Updating asks before setting them aside."
             if info.get("ahead"):
                 sub += f"\nThis folder has {info['ahead']} commit(s) GitHub doesn't."
+            if self.s.get("auto_update") and behind and not self.auto_ok(info):
+                sub += "\nAutomatic install only runs on a clean main that tracks origin/main."
             self.upd_sub.config(text=sub)
             self.commits.insert("end", info["log"] or "Nothing new.")
             self.upd_btn.set_enabled(bool(behind) and self.proc is None)
-            if behind and auto and self.s.get("auto_update") and self.proc is None:
+            if behind and auto and self.s.get("auto_update") and self.proc is None and self.auto_ok(info):
                 self.do_update(silent=True)
         self.refresh_home()
 
     def do_update(self, silent=False):
+        """silent: an automatic install. It never converts a ZIP copy, never sets local edits aside and only
+        runs on a clean main tracking origin/main; the button asks first in those cases."""
         if self.proc:
             if not silent:
                 messagebox.showinfo("Leonida", "Finish or stop the build before updating.", parent=self)
             return
+        info = self.update_info
+        connect = info.get("nogit") == "zip"
+        stash = False
+        if connect:
+            if silent or not messagebox.askyesno(
+                    "Leonida", f"Connect this folder to {REPO_URL}?\n\nThis runs git init here, fetches main and "
+                    "makes this folder a checkout of it. Files you changed show up as local edits.", parent=self):
+                return
+        elif silent and not self.auto_ok(info):
+            return
+        elif info.get("dirty"):
+            if not messagebox.askyesno(
+                    "Leonida", "This folder has local edits.\n\nSet them aside, update, then put them back "
+                    "(git pull --autostash)? If they clash with the update, git keeps them in the stash.",
+                    parent=self):
+                return
+            stash = True
         self.upd_head.config(text="Updating…", fg=INK_SOFT)
         self.upd_btn.set_enabled(False)
 
         def work():
-            if not os.path.isdir(os.path.join(ROOT, ".git")):
-                # A ZIP download: make it a clone of the repo in place, keeping the files that are here.
+            if connect:
                 out = ""
                 for step in (("init", "-q", "-b", "main"), ("remote", "add", "origin", REPO_URL),
                              ("fetch", "-q", "origin", "main"), ("reset", "-q", "origin/main"),
@@ -1120,7 +1182,7 @@ class App(tk.Tk):
                     if rc != 0:
                         self.q.put(("updated", rc, out, silent))
                         return
-            rc, out = self.git("pull", "--ff-only", "--autostash", timeout=600)
+            rc, out = self.git("pull", "--ff-only", *(["--autostash"] if stash else []), timeout=600)
             if rc == 0:
                 rc2, out2 = self.git("submodule", "update", "--init", "--recursive", timeout=600)
                 out += out2
@@ -1164,10 +1226,17 @@ class App(tk.Tk):
             messagebox.showinfo("Leonida", "That folder doesn't exist yet.", parent=self)
 
     def ensure_git_exclude(self):
-        """Keep the personal shortcut out of git (the launcher itself is tracked in the fork)."""
-        p = os.path.join(ROOT, ".git", "info", "exclude")
-        if not os.path.isdir(os.path.dirname(os.path.dirname(p))):
+        """Keep the personal desktop shortcut out of git. Works in worktrees and submodules too, where .git is a
+        file: git itself says where info/exclude is."""
+        if not os.path.exists(os.path.join(ROOT, ".git")) or not which("git", self.env):
             return
+        rc, out = self.git("rev-parse", "--git-path", "info/exclude")
+        lines = out.strip().splitlines()
+        if rc != 0 or not lines:
+            return
+        p = lines[-1]
+        if not os.path.isabs(p):
+            p = os.path.join(ROOT, p)
         try:
             os.makedirs(os.path.dirname(p), exist_ok=True)
             cur = open(p, encoding="utf-8").read() if os.path.exists(p) else ""
