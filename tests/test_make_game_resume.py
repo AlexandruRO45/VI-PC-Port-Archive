@@ -40,14 +40,24 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
-            def wait(self):
-                if self.i in crash:
-                    return 1
-                with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"index": self.i, "count": self.n}, f)
-                with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
-                    json.dump({"tag": tag, "n": self.n}, f)
-                return 0
+            def _finish(self):
+                if getattr(self, "_code", None) is None:
+                    if self.i in crash:
+                        self._code = 1
+                    else:
+                        with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
+                            json.dump({"index": self.i, "count": self.n}, f)
+                        with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
+                            json.dump({"tag": tag, "n": self.n}, f)
+                        self._code = 0
+                return self._code
+
+            def poll(self):
+                # translate() now reaps shards with poll(), so the fake must finish (and write its markers) here.
+                return self._finish()
+
+            def wait(self, timeout=None):
+                return self._finish()
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
                 mock.patch.object(make_game, "py") as py, \
                 mock.patch.object(make_game, "translator_digest", return_value=digest), \
