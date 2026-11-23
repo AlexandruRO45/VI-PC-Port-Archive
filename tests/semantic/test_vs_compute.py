@@ -6,8 +6,11 @@ memory, and run on the CPU as one 64-invocation workgroup (test_wave64_emulate_o
 expected values are the ISA's for one 64-lane wave of `count` vertices: the hardware leaves the lanes past the last
 vertex out of EXEC. The exports go to the --vs-compute output buffer (rdna2spirv.vs_compute_layout).
 """
+import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -102,6 +105,16 @@ class VsComputeTests(unittest.TestCase):
             # v0 is the vertex in the draw (x * 64 + i), so the store went to vertex 64 + i's record
             self.assertEqual(mem.get(0x1000 + 16 * (64 + i)), 16)
 
+    def test_partial_wave_writes_every_slot_of_the_wave(self):
+        """40 vertices: lanes 40..63 are inactive but still store their slot; their exports were never written, so
+        the slots hold the null outputs (all zero words), and lanes 0..39 hold their own exports."""
+        spv, gen = translate_vsc("vs_w64_c_bcnt_export", BCNT)
+        stride = gen.vsc_layout["vertex_stride"]
+        mem = run(spv, 40)
+        for i in range(64):
+            base = OUT + i * stride
+            self.assertEqual([mem.get(base + 4 * k) for k in range(stride // 4)], [0] * (stride // 4), f"slot {i}")
+
     def test_refuses_a_wave32_vertex_shader(self):
         with self.assertRaises(rdna2spirv.Unsupported):
             lines = [("v_mov_b32_e32 v5, 0", 4), ("exp pos0 v5, v5, v5, v5 done", 8), ("s_endpgm", 4)]
@@ -116,6 +129,64 @@ class VsComputeTests(unittest.TestCase):
                     rdna2spirv.translate(path)
             finally:
                 rdna2spirv.VS_COMPUTE_PASS = prev
+
+
+@unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs spirv-as and spirv-val")
+class VsComputeCliTests(unittest.TestCase):
+    """rdna2spirv.py --vs-compute as make_game.py would run it: the module next to the VS and its index entry."""
+
+    def translate_dir(self, td, programs):
+        disasm, out = os.path.join(td, "disasm"), os.path.join(td, "spirv")
+        os.mkdir(disasm)
+        for name, insns in programs.items():
+            lines = [f"; {name}  synthetic", "; mattr: +wavefrontsize64,-wavefrontsize32"]
+            lines += [f"\t{t:52s} ; encoding: [{','.join(['0x00'] * n)}]" for t, n in insns]
+            with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        tool = os.path.join(os.path.dirname(rdna2spirv.__file__), "rdna2spirv.py")
+        r = subprocess.run([sys.executable, "-I", tool, disasm, "--out", out, "--vs-compute"], capture_output=True,
+                           text=True)
+        self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+        with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+            return out, json.load(f)
+
+    def test_tier_c_vs_gets_a_validated_module_and_its_own_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, index = self.translate_dir(td, {"vs_w64_c_bcnt_export": BCNT})
+            e = index["vs_w64_c_bcnt_export"]
+            self.assertEqual(e.get("wave64_graphics"), "C")
+            self.assertEqual(e.get("subgroup_size"), 64)                       # the VS itself is unchanged
+            vc = e["vs_compute"]
+            self.assertTrue(os.path.isfile(os.path.join(out, vc["module"])))
+            self.assertEqual((vc["stage"], vc["local_size"], vc["subgroup_size"], vc["wave64_exchange"]),
+                             ("cs", [64, 1, 1], None, "workgroup"))
+            self.assertGreater(vc["lds_bytes"], 0)                              # the emulation's %x_buf
+            self.assertIn("PhysicalStorageBufferAddresses", vc["capabilities"])
+            self.assertNotIn("GroupNonUniform", vc["capabilities"])
+            self.assertEqual((vc["vertex_stride"], vc["params"], vc["push_constant_bytes"]), (32, {"0": 16}, 156))
+            v = subprocess.run(["spirv-val", "--target-env", "vulkan1.3", os.path.join(out, vc["module"])],
+                               capture_output=True, text=True)
+            self.assertEqual(v.returncode, 0, v.stderr)
+
+    def test_refusal_is_recorded_and_writes_no_module(self):
+        """build_vs_compute on a VS the compute pass refuses (wave32 here): vs_compute_error, no module written, and
+        VS_COMPUTE_PASS is off again for the next shader."""
+        wave32 = [("v_mov_b32_e32 v5, 0", 4), ("exp pos0 v5, v5, v5, v5 done", 8), ("s_endpgm", 4)]
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "vs_w32.s")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("; mattr: -wavefrontsize64,+wavefrontsize32\n" +
+                        "\n".join(f"\t{t:52s} ; encoding: [{','.join(['0x00'] * n)}]" for t, n in wave32) + "\n")
+
+            class Args:
+                out, assembler, no_validate, no_asm = td, "spirv-as", False, False
+
+            m = {}
+            rdna2spirv.build_vs_compute(path, "vs_w32", Args, m)
+            self.assertIn("vs_compute_error", m)
+            self.assertNotIn("vs_compute", m)
+            self.assertFalse(os.path.exists(os.path.join(td, "vs_w32.vs_compute.spv")))
+            self.assertFalse(rdna2spirv.VS_COMPUTE_PASS)
 
 
 if __name__ == "__main__":
