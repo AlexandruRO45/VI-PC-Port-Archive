@@ -253,5 +253,118 @@ class TestSOrB64AST(unittest.TestCase):
         with self.assertRaises(TypeError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class ScalarHardwareState:
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+    exec_mask: int = ALL64
+    scc: int = 0
+    vcc: int = 0
+
+    def get_sgpr_pair(self, index: int) -> int:
+        if index % 2 != 0 or index > 104:
+            raise ValueError(f"Invalid SGPR pair index: {index}")
+        lo = self.sgprs[index] & MASK32
+        hi = self.sgprs[index + 1] & MASK32
+        return (hi << 32) | lo
+
+    def set_sgpr_pair(self, index: int, val: int) -> None:
+        if index % 2 != 0 or index > 104:
+            raise ValueError(f"Invalid SGPR pair index: {index}")
+        self.sgprs[index] = val & MASK32
+        self.sgprs[index + 1] = (val >> 32) & MASK32
+
+    def read_operand(self, op: RegOperand) -> int:
+        if op.kind == RegisterKind.SGPR:
+            return self.get_sgpr_pair(op.index)
+        elif op.kind == RegisterKind.EXEC:
+            return self.exec_mask
+        elif op.kind == RegisterKind.VCC:
+            return self.vcc
+        elif op.kind == RegisterKind.LITERAL64:
+            return op.index & MASK64
+        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
+
+    def write_destination(self, op: RegOperand, val: int) -> None:
+        val_u64 = val & MASK64
+        if op.kind == RegisterKind.SGPR:
+            self.set_sgpr_pair(op.index, val_u64)
+        elif op.kind == RegisterKind.EXEC:
+            self.exec_mask = val_u64
+        elif op.kind == RegisterKind.VCC:
+            self.vcc = val_u64
+        else:
+            raise NotImplementedError(f"Unsupported destination kind: {op.kind}")
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter executing s_or_b64."""
+
+    @staticmethod
+    def step(instr: SOrB64Instruction, state: ScalarHardwareState) -> None:
+        instr.validate()
+        s0_val = state.read_operand(instr.src0)
+        s1_val = state.read_operand(instr.src1)
+
+        d, scc = s_or_b64_oracle(s0_val, s1_val)
+        state.write_destination(instr.dst, d)
+        state.scc = scc
+
+
+class TestSOrB64ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter execution."""
+
+    def setUp(self):
+        self.state = ScalarHardwareState()
+
+    def test_interpreter_step_basic(self):
+        self.state.set_sgpr_pair(2, 0x00FF_0000_00FF_0000)
+        self.state.set_sgpr_pair(4, 0x0000_00FF_0000_00FF)
+        self.state.scc = 0
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+
+        expected = 0x00FF_00FF_00FF_00FF
+        self.assertEqual(self.state.get_sgpr_pair(6), expected)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_interpreter_step_zero_output(self):
+        self.state.set_sgpr_pair(2, 0)
+        self.state.set_sgpr_pair(4, 0)
+        self.state.scc = 1
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+
+        self.assertEqual(self.state.get_sgpr_pair(6), 0)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_interpreter_step_with_vcc_and_exec(self):
+        self.state.exec_mask = 0x5555_5555_5555_5555
+        self.state.vcc = 0xAAAA_AAAA_AAAA_AAAA
+
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.VCC, size_bits=64),
+            src0=RegOperand(RegisterKind.EXEC, size_bits=64),
+            src1=RegOperand(RegisterKind.VCC, size_bits=64)
+        )
+        ScalarInterpreter.step(instr, self.state)
+
+        # 0x5555... | 0xAAAA... = ALL64
+        self.assertEqual(self.state.vcc, ALL64)
+        self.assertEqual(self.state.scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
