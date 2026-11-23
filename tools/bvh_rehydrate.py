@@ -299,6 +299,8 @@ def write_leaves(src, dst, hdr, geometries, frame):
             j = g.triangle(prim1)
             fourth = frame.apply(g.vertex(j[0] if order & 0x20 else j[1] if order & 0x80 else j[2]))
         a, b = order & 3, (order >> 2) & 3
+        if a > 2 or b > 2 or a == b:
+            raise ValueError("invalid leaf vertex order 0x%02x" % order)
         slots = [None, None, None, fourth]
         for which, value in zip((a, b, (a ^ 3) - b), tri):
             slots[SLOT_OF_ORDER[which]] = value
@@ -377,6 +379,8 @@ def write_box_groups(src, dst, hdr, start, count, wide):
         value_at = base + 4 * (n + total_children)
         for t, word in enumerate(words):
             kids, mask = word >> 24, word & 0xFFFFFF
+            if kids > 4:
+                raise ValueError("box node at 0x%x has %d children (max 4)" % (base + t * node_size, kids))
             children = list(struct.unpack_from("<%dI" % kids, src, child_at)) + [INVALID] * (4 - kids)
             child_at += 4 * kids
             comps = []

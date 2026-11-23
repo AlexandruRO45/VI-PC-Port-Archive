@@ -231,6 +231,16 @@ class TestErrorsAndCli(unittest.TestCase):
         bad[-12:] = level_table([(100, 128)])
         with self.assertRaisesRegex(ValueError, "out of order"):
             R.rehydrate(bytes(bad), [QUADS])
+        # Invalid vertex-order bytes (e.g. 0x00 -> IndexError, 0x05 -> TypeError) must raise ValueError, not crash.
+        for bad_order in (0x00, 0x05, 0x03, 0x0C):
+            bad_leaf, _, _ = build([(0, 0x01, 0, None, bad_order)])
+            with self.assertRaisesRegex(ValueError, "vertex order"):
+                R.rehydrate(bad_leaf, [QUADS])
+        # A box node declaring more than 4 children must raise ValueError.
+        bad_kids = bytearray(src)
+        struct.pack_into("<I", bad_kids, 0x200, 5 << 24)
+        with self.assertRaisesRegex(ValueError, "children"):
+            R.rehydrate(bytes(bad_kids), [QUADS])
 
     def test_header_offset(self):
         src, _, _ = build([(0, 0x01, 0, None, 0x09)])
