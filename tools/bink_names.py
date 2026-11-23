@@ -268,14 +268,22 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
     if n_names < n_streams:
         raise ValueError(f"the lists name {n_names} movies but the source has {n_streams} streams")
     slack = n_names - n_streams          # entries that can be skipped in total
+    no_alignment = "no alignment within --max-skip; the lists do not match this source"
+    if slack > (n_streams + 1) * max_skip:
+        raise ValueError(no_alignment)
     neg = float("-inf")
     score = [dict() for _ in range(n_streams)]
     back = [dict() for _ in range(n_streams)]
-    for i in range(min(slack, max_skip) + 1):
+    first_min = max(0, slack - n_streams * max_skip)
+    for i in range(first_min, min(slack, max_skip) + 1):
         score[0][i] = scorer.unary(names[i], streams[0]) - skip_cost * i
     for j in range(1, n_streams):
         prev = score[j - 1]
-        for i in range(j, j + slack + 1):
+        # i - j skips have to fit in j + 1 gaps before this match. The remaining
+        # skips have to fit in n_streams - j gaps, including the trailing gap.
+        min_skips = max(0, slack - (n_streams - j) * max_skip)
+        max_skips = min(slack, (j + 1) * max_skip)
+        for i in range(j + min_skips, j + max_skips + 1):
             best, arg = neg, None
             for p in range(max(j - 1, i - 1 - max_skip), i):
                 if p not in prev:
@@ -286,9 +294,9 @@ def align(names, streams, scorer, skip_cost=SKIP_COST, max_skip=MAX_SKIP):
             if arg is not None:
                 score[j][i] = best + scorer.unary(names[i], streams[j])
                 back[j][i] = arg
-    last = {i: value for i, value in score[-1].items() if n_names - 1 - i <= max_skip}
+    last = score[-1]
     if not last:
-        raise ValueError("no alignment within --max-skip; the lists do not match this source")
+        raise ValueError(no_alignment)
     i = max(last, key=lambda k: last[k] - skip_cost * (n_names - 1 - k))
     path = []
     for j in range(n_streams - 1, -1, -1):

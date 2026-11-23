@@ -125,6 +125,24 @@ class TestAlign(unittest.TestCase):
         self.assertEqual([row["path"] for row in rows], [names[1]])
         self.assertEqual(unmatched, [names[0], names[2]])
 
+    def test_impossible_skip_budget_does_not_score_partial_pairs(self):
+        names = [f"f/{i}.bk2" for i in range(10)]
+        streams = [stream(i) for i in range(4)]
+        scorer = mock.Mock()
+        scorer.unary.return_value = 0.0
+        with self.assertRaisesRegex(ValueError, "no alignment within --max-skip"):
+            names_mod.align(names, streams, scorer, max_skip=1)
+        scorer.unary.assert_not_called()
+
+    def test_tight_skip_budget_scores_only_the_feasible_path(self):
+        names = [f"f/{i}.bk2" for i in range(9)]
+        streams = [stream(i) for i in range(4)]
+        scorer = mock.Mock()
+        scorer.unary.return_value = 0.0
+        self.assertEqual(names_mod.align(names, streams, scorer, max_skip=1),
+                         [(1, 0), (3, 1), (5, 2), (7, 3)])
+        self.assertEqual(scorer.unary.call_count, len(streams))
+
     def test_family_siblings_share_shape(self):
         # x_01/x_02 share a shape, y does not exist in the archive
         names = ["f/x_01.bk2", "f/x_02.bk2", "f/y.bk2", "f/z.bk2"]
