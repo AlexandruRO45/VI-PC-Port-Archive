@@ -401,7 +401,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
         with open(os.path.join(dxbc_dir, "disasm.done"), "w", encoding="utf-8") as f:
             f.write("test llvm-mc 21\n")
         with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8") as f:
-            f.write("{}")
+            f.write('{"shader": {}}')   # a bare {} is an empty merge and is translated again (translated_index_is_empty)
         with open(os.path.join(spirv_dir, "wave64_emulate.txt"), "w", encoding="utf-8") as f:
             f.write("off\n")
         with open(os.path.join(spirv_dir, "translation_sources.sha256"), "w", encoding="utf-8") as f:
@@ -504,6 +504,7 @@ class StageResumptionAndStepIsolationTest(unittest.TestCase):
             src.touch()
             (dest / "sample").mkdir(parents=True)
             (dest / "sample" / "first.dds").write_bytes(b"completed sibling")
+            (dest / "sample" / make_game.DECODER_RECORD).write_text(make_game.decoder_digest(), encoding="utf-8")
         (pack_dest / "sample" / "second.dds").mkdir()
 
         valid = json.dumps({"Count": 2, "Textures": [{"File": "first.dds"}, {"File": None}]})
