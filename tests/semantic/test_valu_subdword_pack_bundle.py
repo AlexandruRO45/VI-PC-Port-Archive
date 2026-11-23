@@ -219,6 +219,19 @@ class TestPermLane16Aliasing(unittest.TestCase):
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
         self.assertIn("OpGroupNonUniformShuffle", spv)
 
+class TestPermLane16Selectors(unittest.TestCase):
+    def test_distinct_sgprs(self):
+        code = [
+            "v_mov_b32_e32 v1, 200",
+            "s_mov_b32 s10, 0x00000000",
+            "s_mov_b32 s11, 0x11111111",
+            "v_permlane16_b32 v2, v1, s10, s11",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_p16_sgprs", code, fssm=saveexec_run.fssm())
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
