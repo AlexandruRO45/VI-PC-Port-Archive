@@ -221,13 +221,13 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     SetLastError(ERROR_SUCCESS);
     void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
                                            PAGE_READWRITE);
-    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "unsupported large-page allocation is rejected before host allocation");
+    check(large_page != nullptr && VirtualFree(large_page, 0, MEM_RELEASE),
+          "large-page mode falls back to ordinary committed pages");
 
     SetLastError(ERROR_SUCCESS);
     void* const attributed = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT, 1, PAGE_READWRITE);
-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
-          "nonzero XMem allocation attributes are rejected before host allocation");
+    check(attributed != nullptr && VirtualFree(attributed, 0, MEM_RELEASE),
+          "nonzero XMem allocation attributes are accepted and recorded");
 }
 
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
