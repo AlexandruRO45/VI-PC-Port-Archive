@@ -176,8 +176,8 @@ Do not adopt:
 - SCARAB's "RDNA2 / gfx10.3" wording for the encoding.
 - SCARAB's VOP1/VOP2/SOP1 mnemonic tables (verified wrong on assembled gfx1013 words).
 - SCARAB's claim that the remaining boundary mismatch is only "stream alignment"; the
-  length model has named gaps that cause it (`s_setreg_imm32_b32`, present in 68/100
-  sampled shaders, VOP3 literals, MIMG NSA).
+  length model has named gaps that cause it (`s_setreg_imm32_b32`, present in 16,039 of the
+  26,503 disassembled shaders (60.5%; 68/100 in the first sample), VOP3 literals, MIMG NSA).
 - SCARAB's scan-for-`XBCH` unwrap in place of Leonida's XDAT tag lookup.
 
 ## 5. Licence note
