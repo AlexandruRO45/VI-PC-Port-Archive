@@ -201,6 +201,9 @@ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D
 
 // The property flags of the Vulkan memory type behind a resource created by such a device, or 0. For tests.
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource);
+// Whether a texture created by such a device is backed as simultaneous-access (its image kept in GENERAL); false for
+// buffers and other resources. For tests.
+bool vulkan_simultaneous_access(ID3D12Resource* resource);
 
 // Whether the requested colour format has an integer numeric class.
 bool color_resolve_format_is_integer(DXGI_FORMAT format);

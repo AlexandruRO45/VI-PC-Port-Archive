@@ -6217,6 +6217,30 @@ int main() {
             xbox_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);  // the Xbox tiled layout word
             EXPECT(SUCCEEDED(device->CreateReservedResource(&xbox_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&xbox_tiled.p))));
+            // ALLOW_CROSS_ADAPTER enables ALLOW_SIMULTANEOUS_ACCESS's behaviour (D3D12_RESOURCE_FLAGS): a reserved
+            // texture with it alone is backed as simultaneous-access, as one with ALLOW_SIMULTANEOUS_ACCESS is, while
+            // GetDesc reports only the application's flags. A depth texture, where the runtime refuses simultaneous
+            // access, and a buffer, which has no layouts, are not (D3D-468).
+            {
+                const auto make = [&](D3D12_RESOURCE_DESC desc, UINT flags, Ref<ID3D12Resource>& out) {
+                    desc.Flags = D3D12_RESOURCE_FLAGS(flags);
+                    return SUCCEEDED(device->CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                    IID_PPV_ARGS(&out.p)));
+                };
+                constexpr UINT cross = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+                Ref<ID3D12Resource> cross_texture, simultaneous_texture, cross_depth, cross_buffer;
+                EXPECT(make(tiled_desc, cross, cross_texture));
+                EXPECT(rt::d3d12::vulkan_simultaneous_access(cross_texture.p));
+                EXPECT(UINT(cross_texture->GetDesc().Flags) == cross);
+                EXPECT(make(tiled_desc, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS, simultaneous_texture));
+                EXPECT(rt::d3d12::vulkan_simultaneous_access(simultaneous_texture.p));
+                EXPECT(!rt::d3d12::vulkan_simultaneous_access(tiled.p));
+                EXPECT(make(reserved_desc(T2, size, size, 1, 1, DXGI_FORMAT_D32_FLOAT),
+                            cross | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, cross_depth));
+                EXPECT(!rt::d3d12::vulkan_simultaneous_access(cross_depth.p));
+                EXPECT(make(tiled_buffer_desc, cross, cross_buffer));
+                EXPECT(!rt::d3d12::vulkan_simultaneous_access(cross_buffer.p));
+            }
             {
                 Ref<ID3D12Device4> device4;
                 Ref<ID3D12Device10> device10;

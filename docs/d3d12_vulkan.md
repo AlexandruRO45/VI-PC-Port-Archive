@@ -1868,8 +1868,10 @@ The trace will enumerate them.
     `StandardSwizzle64KBSupported` as FALSE), and `GetHeapProperties` on a reserved resource is `E_INVALIDARG`.
     `ALLOW_CROSS_ADAPTER`, which a committed resource only takes on a shared cross-adapter heap, is taken on a
     reserved buffer or texture wherever the description is taken without it, and `GetDesc` reports it (D3D-468,
-    the same on an RX 9060 XT with AMD 26.10.44 and on WARP); the layer has one adapter, so it backs the resource
-    without the flag.
+    the same on an RX 9060 XT with AMD 26.10.44 and on WARP). The layer has one adapter, so it backs the resource
+    without the flag and a later attempt to share it across adapters still fails; a texture keeps the
+    `ALLOW_SIMULTANEOUS_ACCESS` behaviour the flag enables (its image stays in `GENERAL`), except a depth-stencil or
+    multisampled one, where simultaneous access is refused.
     The description, initial-state and clear-value rules are a committed resource's on a default heap, and a null
     output is `E_UNEXPECTED` after them (`compare_placed_reserved`, RTX 3060 / 610.88).
     `CheckFeatureSupport` still reports `TiledResourcesTier` as not supported, so a game that checks it creates

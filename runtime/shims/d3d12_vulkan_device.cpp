@@ -1490,6 +1490,7 @@ public:
     bool rgb96() const { return rgb96_; }                        // a 96-bit texture in an RGBA32 image
     std::uint64_t image_address() const { return image_address_; }  // what a T# names the texture by
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
+    bool simultaneous_access() const { return image_ && binding_.simultaneous_access; }
     const DeviceState& device_state() const { return device_; }
 
     // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
@@ -7023,9 +7024,17 @@ private:
         // ALLOW_CROSS_ADAPTER: a committed resource needs a SHARED | SHARED_CROSS_ADAPTER heap for it, but the host
         // creates a reserved buffer or texture with it wherever it creates the same description without it, and
         // GetDesc reports the flag (D3D-468; d3d12_vulkan_device_test's "reserved: ... ALLOW_CROSS_ADAPTER" cases,
-        // the same on an RX 9060 XT / AMD 26.10.44 and on WARP). A reserved resource has no heap to share and this
-        // layer has one adapter, so the flag changes nothing here: the description is checked and backed without it.
+        // the same on an RX 9060 XT / AMD 26.10.44 and on WARP). The description is checked and backed without it:
+        // a reserved resource has no heap to share, and this layer has one adapter, so a later attempt to share the
+        // resource with another adapter still fails. What the flag does keep is ALLOW_SIMULTANEOUS_ACCESS's
+        // behaviour, which D3D12_RESOURCE_FLAGS documents it as enabling: a texture is backed as simultaneous-access
+        // (its image stays in GENERAL, as for that flag). Not on depth-stencil or multisampled textures, where the
+        // runtime refuses simultaneous access; buffers have no layouts, so nothing changes for them.
         backing.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        if ((desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) &&
+            desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && desc->SampleDesc.Count <= 1)
+            backing.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
         const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
         if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (desc->Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR) return E_INVALIDARG;
@@ -7221,6 +7230,11 @@ VkImage vulkan_image(ID3D12Resource* resource) {
 VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->memory_flags() : 0;
+}
+
+bool vulkan_simultaneous_access(ID3D12Resource* resource) {
+    const Resource* r = Resource::from<Resource>(resource);
+    return r && r->simultaneous_access();
 }
 
 VkBuffer vulkan_buffer(ID3D12Resource* resource) {
