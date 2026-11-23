@@ -191,6 +191,41 @@ Under both table models all 25,471 graphics PSOs fit 32 dwords (15 dwords with t
 order. The record does not carry that order, so it would have to come from SS or from the shader's reads, which
 is not measured.
 
+## Code blob: decoded as RDNA2
+
+`tools/psocache_code.py` runs the repository's decoder (`tools/rdna2_decode.py`, `gfx1013`) over every shader-index
+entry, from byte 36 of the entry through its last `s_endpgm`, and counts what decodes. Measured on the retail
+cache (1.0.2.1, carved from `shaders.rpf` with `psocache_extract.py`):
+
+| Measure | Value |
+|---|---:|
+| shader-index entries | 21,522 |
+| entries with no `s_endpgm` | 1 |
+| entries that decode with no invalid word | 19,825 (92.1%) |
+| entries with at least one invalid word | 1,696 |
+| program bytes decoded | 233,217,624 |
+| instructions decoded | 42,839,688 |
+| invalid words | 4,840 (0.011% of decoded words) |
+| `s_endpgm` reached on an instruction boundary | 26,091 |
+
+The encoding mix is that of compiled shaders: 27,965,504 `v_`, 13,675,381 `s_`, 580,072 `buffer_`, 426,724
+`image_`, 80,739 `exp`, 63,670 `ds_`, 41,427 `tbuffer_` and 6,171 `global_` instructions. The 26,091 decoded
+`s_endpgm` agree with the 26,092 found by the byte search above. So the code blob is raw RDNA2 machine code
+(measured), not a container or a compressed stream.
+
+**Entry header.** Each entry starts with 36 bytes that are not code. Decoding from byte 0 rejects a word at
+byte 32 in 21,497 of 21,522 entries; that word is zero there, and the words at bytes 8 and 20 vary like hash
+values. Byte 36 is the first offset in {36, 40, 48, 64} from which the 19,825 clean entries decode with no
+invalid word. The u32 at byte 32 of the header equals the entry size in 185 entries only, so it is not a size
+field in general. The header's fields are not decoded.
+
+**The 4,840 invalid words.** They fall in three groups, none shown to be a decoder gap: 2,717 words whose top six
+bits are `111111` (no RDNA2 encoding; 2,602 follow a `v_cmp_gt_f32_e32` and 113 a `v_cmpx_gt_f32_e32`), 1,031
+zero words (792 after a `v_mac_f32_e32`, 76 after an `s_endpgm`) and 1,092 words in the scalar range with opcodes
+that RDNA2 does not define (SOP1 139, 239, 255, 121; SOPC 36, 39, 53, 90, 108). The decoder consumes a VOPC
+literal correctly (checked by hand on `v_cmp_gt_f32_e32 vcc, lit, v0`), so the first group is not a missed
+literal. They read as data embedded in the code stream, which is a hypothesis.
+
 ## What remains unknown
 
 - The meaning of the two header strings, the 0x48 value and the six 0x41 second-dword values. The SRV/CBV/UAV/sampler
@@ -200,8 +235,8 @@ is not measured.
 - The encoding of the w3 key and w4 count, and the 15,068 records with extra slots.
 - The 0x43 16-byte value was not matched against any hash in the package.
 - The 30,909 meta entries that are not chunk lists.
-- Whether the code blob is raw RDNA2. The evidence is the two marker words and the `s_code_end` filler; no
-  disassembly or translation was run on this blob.
+- The fields of the 36-byte entry header in front of each program, and the 4,840 words in 1,696 entries that do
+  not decode (see "Code blob: decoded as RDNA2"). Whether the programs translate with `rdna2spirv.py` was not run.
 
 ## Checking and carving a copy
 
