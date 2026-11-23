@@ -39,8 +39,18 @@ class ResumeShardsTest(unittest.TestCase):
                 self.i = int(args[args.index("--shard") + 1].split("/")[0])
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
+                self.returncode = None
 
-            def wait(self):
+            def poll(self):
+                """The shard runs to completion the first time it is polled; later polls return its exit code."""
+                if self.returncode is None:
+                    self.returncode = self.run()
+                return self.returncode
+
+            def wait(self, timeout=None):
+                return self.poll()
+
+            def run(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
