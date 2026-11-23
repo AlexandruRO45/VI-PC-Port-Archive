@@ -144,5 +144,48 @@ class TestCeilReferenceOracle(unittest.TestCase):
                 self.assertEqual(words[0], expected)
 
 
+class Vop1Opcode:
+    """Symbolic AST opcode descriptor for VOP1 1-source instructions."""
+
+    def __init__(self, mnemonic: str, dst: str, src0: str) -> None:
+        self.mnemonic = mnemonic
+        self.dst = dst
+        self.src0 = src0
+
+    def emit_assembly(self) -> str:
+        return f"{self.mnemonic} {self.dst}, {self.src0}"
+
+
+class TestCeilASTAndTypes(unittest.TestCase):
+    """Commit 2: symbolic AST opcode definitions and typed expressions for v_ceil_f32."""
+
+    def test_ast_emission_and_translation(self):
+        op = Vop1Opcode("v_ceil_f32", "v0", "v1")
+        self.assertEqual(op.emit_assembly(), "v_ceil_f32 v0, v1")
+        lines = [
+            "v_mov_b32 v1, 0x40133333",  # 2.3
+            op.emit_assembly(),
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        spv = support.translate_lines("ps_ceil_ast", lines + ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("Ceil", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x40400000)  # 3.0
+
+    def test_ast_e64_input_absolute_modifier(self):
+        # | -1.5 | = 1.5 -> ceil = 2.0
+        lines = [
+            "v_mov_b32 v1, 0xBFC00000",
+            "v_ceil_f32_e64 v0, |v1|",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+        ]
+        words = run_ceil_ps(lines, "ps_ceil_ast_abs")
+        self.assertEqual(words[0], 0x40000000)
+
+
 if __name__ == '__main__':
     unittest.main()
