@@ -434,5 +434,29 @@ class TestVMax3F16ConditionCodes(unittest.TestCase):
         self.assertTrue(flags.is_nan)
 
 
+class TestVMax3F16IEEE754(unittest.TestCase):
+    """IEEE 754 raw bit pattern preservation and subnormal/NaN behavior."""
+
+    def test_ieee754_subnormals(self):
+        # Smallest positive subnormal: 0x0001
+        # Largest positive subnormal: 0x03FF
+        # Negative zero: 0x8000
+        res = ref_max3_f16(0x0001, 0x03FF, 0x8000)
+        self.assertEqual(res, 0x03FF)
+
+    def test_ieee754_infinities(self):
+        pos_inf = 0x7C00
+        neg_inf = 0xFC00
+        norm = 0x7BFF  # max normal float16 (65504)
+        self.assertEqual(ref_max3_f16(pos_inf, norm, 0x0000), pos_inf)
+        self.assertEqual(ref_max3_f16(neg_inf, 0xBC00, 0xC000), 0xBC00)
+
+    def test_ieee754_hw_translator_nans(self):
+        # NaN operand skipped when non-NaN present
+        qnan = 0x7E00
+        hw_res = run_hw_max3_f16(qnan, 0x3C00, 0x3800, old_dst=0xAAAA0000)
+        self.assertEqual(hw_res, 0xAAAA3C00)
+
+
 if __name__ == "__main__":
     unittest.main()
