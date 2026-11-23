@@ -480,6 +480,17 @@ class TestCli(unittest.TestCase):
             path = write(os.path.join(tmp, "words.json"), json.dumps(["a_word", 2]))
             self.assertEqual(A.read_words(path), ["a_word", "2"])
 
+    def test_out_cannot_overwrite_input_using_report_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bank = os.path.join(tmp, "test.awc")
+            write(bank, make_bank(["wave_01"]))
+            words = os.path.join(tmp, "words.txt")
+            write(words, "wave_01\n")
+            with self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    A.main([bank, "--words", words, "--out", bank])
+            self.assertNotEqual(cm.exception.code, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

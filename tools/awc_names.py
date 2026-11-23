@@ -46,6 +46,12 @@ import re
 import struct
 import sys
 
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+from report_paths import same_report_path  # noqa: E402
+
 M32 = 0xFFFFFFFF
 M29 = 0x1FFFFFFF
 DIALOGUE = re.compile(r"^[a-z0-9_]+au_[a-z]{4}_\d\d$")
@@ -394,14 +400,22 @@ def main(argv=None) -> int:
         if not os.path.exists(path):
             print(f"awc_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and os.path.exists(a.out):
+    if a.out:
+        if os.path.isdir(a.out):
+            ap.error(f"--out {a.out} is a directory")
+        out_dir = os.path.dirname(os.path.abspath(a.out))
+        if out_dir and not os.path.exists(out_dir):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError as error:
+                ap.error(f"--out cannot create parent directory: {error}")
         protected = inputs.copy()
         for sources, suffix in ((a.banks, ".awc"), (a.conversations, "")):
             for source in sources:
                 if os.path.isdir(source):
                     protected.extend(full for full in _files(source)
                                      if full.lower().endswith(suffix) and os.path.isfile(full))
-        if any(os.path.samefile(p, a.out) for p in protected):
+        if any(same_report_path(p, a.out) for p in protected):
             ap.error("--out must not overwrite an input")
 
     words = []
