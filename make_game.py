@@ -1466,10 +1466,15 @@ def bvh_report(programs: "tuple[list[str], list[str]]", binary: str = BVH_DLL) -
     extracted, missing = programs
     log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {binary} programs translated")
     if missing:
-        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
-            f"{'it' if len(missing) == 1 else 'them'}, so that compute pipeline is refused (E_INVALIDARG) and the "
-            "builder's constructor, which creates all of them, gives up there. When the step runs, rdna2spirv.py "
-            "prints the instruction each one stops at (docs/embedded_shaders.md, section 4)")
+        them = "it" if len(missing) == 1 else "them"
+        if binary == BVH_DLL:
+            effect = ("so that compute pipeline is refused (E_INVALIDARG) and the builder's constructor, which "
+                      "creates all of them, gives up there")
+        else:
+            effect = "so a pipeline that uses one is refused (E_INVALIDARG)"
+        log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for {them}, {effect}. "
+            "When the step runs, rdna2spirv.py prints the instruction each one stops at "
+            "(docs/embedded_shaders.md, section 4)")
 
 
 def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
