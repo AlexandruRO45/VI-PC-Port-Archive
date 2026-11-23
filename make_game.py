@@ -277,7 +277,13 @@ XDG_USER_DIRS = ("XDG_DOWNLOAD_DIR", "XDG_DESKTOP_DIR", "XDG_DOCUMENTS_DIR")
 
 
 def xdg_user_dirs() -> list:
-    """POSIX: Downloads, Desktop and Documents as $XDG_CONFIG_HOME/user-dirs.dirs (default ~/.config) names them.
+    """POSIX: Downloads, Desktop and Documents as xdg_user_dir_map() names them, in that order."""
+    found = xdg_user_dir_map()
+    return [found[k] for k in XDG_USER_DIRS if k in found]
+
+
+def xdg_user_dir_map() -> dict:
+    """{XDG_<NAME>_DIR: folder} for XDG_USER_DIRS, as $XDG_CONFIG_HOME/user-dirs.dirs (default ~/.config) names them.
     Each line is XDG_<NAME>_DIR="$HOME/<path>" or an absolute path, shell-quoted, and the last line for a name wins;
     one set to $HOME itself means the folder is turned off. Empty when the file is missing or unreadable; a line it
     can't use is left out."""
@@ -289,7 +295,7 @@ def xdg_user_dirs() -> list:
         with open(os.path.join(config, "user-dirs.dirs"), encoding="utf-8", errors="replace") as f:
             lines = f.read().splitlines()
     except OSError:
-        return []
+        return {}
     found = {}
     for line in lines:
         m = re.match(r'\s*(XDG_[A-Z]+_DIR)\s*=\s*"((?:[^"\\]|\\.)*)"\s*$', line)
@@ -303,8 +309,7 @@ def xdg_user_dirs() -> list:
         else:
             continue
         found[m.group(1)] = os.path.normpath(path)   # a shell sources the file: the last line for a name wins
-    found = {k: p for k, p in found.items() if p != os.path.normpath(home)}
-    return [found[k] for k in XDG_USER_DIRS if k in found]
+    return {k: p for k, p in found.items() if p != os.path.normpath(home)}
 
 
 def known_folders() -> list:
@@ -489,10 +494,18 @@ def icloud_documents() -> bool:
 
 def default_out() -> str:
     """Documents/Leonida, except on a Mac whose Documents iCloud syncs: the port and its work folder (hundreds of
-    GB made from the game) must stay on this computer, so they go to ~/Leonida there."""
+    GB made from the game) must stay on this computer, so they go to ~/Leonida there. On Linux, Documents is the
+    folder xdg-user-dirs names (~/Dokumente, ~/Документы...), unless ~/Documents/Leonida already holds a build,
+    which is resumed where it is."""
+    home = os.path.expanduser("~")
     if icloud_documents():
-        return os.path.join(os.path.expanduser("~"), "Leonida")
-    return os.path.join(os.path.expanduser("~"), "Documents", "Leonida")
+        return os.path.join(home, "Leonida")
+    out = os.path.join(home, "Documents", "Leonida")
+    if sys.platform.startswith("linux") and not os.path.isdir(out):
+        documents = xdg_user_dir_map().get("XDG_DOCUMENTS_DIR")
+        if documents:
+            return os.path.join(documents, "Leonida")
+    return out
 
 
 def icloud_default_notes() -> list:

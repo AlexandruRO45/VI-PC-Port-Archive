@@ -866,17 +866,23 @@ class PathAndGameSelectionTest(PreflightTestBase):
             self.assert_fails(make_game.choose_game,
                               match="More than one copy found: choose one with --game.")
 
-    def default_out_in(self, platform, icloud_documents, earlier_build=False, call=None):
+    def default_out_in(self, platform, icloud_documents, earlier_build=False, call=None, user_dirs=None):
         """default_out() (or `call`) with a temporary home folder; icloud_documents makes the folder macOS keeps in
         iCloud Drive when Desktop & Documents sync is on (~/Library/Mobile Documents/com~apple~CloudDocs/Documents),
-        earlier_build a ~/Documents/Leonida from before the change."""
+        earlier_build a ~/Documents/Leonida from before the change, user_dirs the text of ~/.config/user-dirs.dirs."""
         with tempfile.TemporaryDirectory() as home:
             if icloud_documents:
                 os.makedirs(os.path.join(home, "Library", "Mobile Documents", "com~apple~CloudDocs", "Documents"))
             if earlier_build:
                 os.makedirs(os.path.join(home, "Documents", "Leonida", "work"))
             with mock.patch.object(make_game.os.path, "expanduser", lambda p: home + p[1:] if p.startswith("~") else p), \
-                    mock.patch.object(make_game.sys, "platform", platform):
+                    mock.patch.object(make_game.sys, "platform", platform), \
+                    mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}):
+                if user_dirs is not None:
+                    os.makedirs(os.path.join(home, ".config"))
+                    with open(os.path.join(home, ".config", "user-dirs.dirs"), "w", encoding="utf-8",
+                              newline="\n") as f:
+                        f.write(user_dirs)
                 if call:
                     return [note.replace(home, "~") for note in call()]
                 return os.path.relpath(make_game.default_out(), home)
@@ -894,6 +900,22 @@ class PathAndGameSelectionTest(PreflightTestBase):
     def test_default_out_matches_documents_folder(self):
         for platform in ("win32", "linux", "darwin"):
             self.assertEqual(self.default_out_in(platform, False), os.path.join("Documents", "Leonida"), platform)
+
+    def test_default_out_follows_the_xdg_documents_folder_on_linux(self):
+        # A German Linux account: xdg-user-dirs named Documents ~/Dokumente, and ~/Documents does not exist, so the
+        # build made a stray ~/Documents next to the real one.
+        german = 'XDG_DOCUMENTS_DIR="$HOME/Dokumente"\nXDG_DOWNLOAD_DIR="$HOME/Downloads"\n'
+        self.assertEqual(self.default_out_in("linux", False, user_dirs=german), os.path.join("Dokumente", "Leonida"))
+        # An earlier build in ~/Documents/Leonida is resumed where it is, not started again in the new folder.
+        self.assertEqual(self.default_out_in("linux", False, earlier_build=True, user_dirs=german),
+                         os.path.join("Documents", "Leonida"))
+        # Turned off ($HOME) or no Documents line: the usual folder.
+        for text in ('XDG_DOCUMENTS_DIR="$HOME"\n', 'XDG_DESKTOP_DIR="$HOME/Bureau"\n'):
+            self.assertEqual(self.default_out_in("linux", False, user_dirs=text), os.path.join("Documents", "Leonida"))
+        # Only Linux reads it: Windows has its own Documents, a Mac has no xdg-user-dirs.
+        for platform in ("win32", "darwin"):
+            self.assertEqual(self.default_out_in(platform, False, user_dirs=german),
+                             os.path.join("Documents", "Leonida"), platform)
 
     def test_default_out_leaves_icloud_synced_documents_on_a_mac(self):
         # Before: with iCloud Desktop & Documents sync on, ~/Documents/Leonida (and its work folder, hundreds of GB
