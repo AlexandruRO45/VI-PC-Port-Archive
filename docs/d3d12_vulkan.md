@@ -1228,8 +1228,8 @@ and any validation error fails them.
     `VK_LOADER_DRIVERS_SELECT` picks; the layer's own D24 path (the D3D12 tests above) is used only on a GPU without
     D24 depth-attachment support, so run those with the AMD driver selected (the Radeon 880M, RADV).
 - `d3d12_translated_draw_test`: milestone M1.5 (D3D-53), the same path with translator output.
-  - **Shaders:** `test/shaders/vs_m15.asm` and `ps_m15.asm` are hand-written RDNA2 (gfx1013). The build assembles them
-    with `llvm-mc` and translates them with `tools/rdna2spirv.py` through `test/shaders/build.py`. `build.py` also writes
+  - **Shaders:** `runtime/test/shaders/vs_m15.asm` and `ps_m15.asm` are hand-written RDNA2 (gfx1013). The build assembles them
+    with `llvm-mc` and translates them with `tools/rdna2spirv.py` through `runtime/test/shaders/build.py`. `build.py` also writes
     each one's synthetic FSSM program (`; fssm-at` / `; fssm-data` in the header) to `fssm/` and the translator puts its
     SHA-256 in `spirv/index.json`, so the layer's lookup is the one the game uses; the test loads that index as it is.
     An unknown program is refused.
@@ -1271,7 +1271,7 @@ and any validation error fails them.
     flag. The other 19 are then checked against their recorded answers only.
 - `d3d12_subgroup_test`: subgroup size control through D3D12 PSOs, on the PSOs of the device proxy.
   - **Shaders:** `cs_w64x_readlane` (a `v_readlane` across both halves of a wave64) translated natively and with
-    `--wave64-emulate`, and `cs_wqm_w32`, built by `test/shaders/build.py` (needs `llvm-mc`: `LLVM_MC`).
+    `--wave64-emulate`, and `cs_wqm_w32`, built by `runtime/test/shaders/build.py` (needs `llvm-mc`: `LLVM_MC`).
   - **Check:** each is dispatched through a PSO found by FSSM hash and the eight words it stores are compared. The
     PSO's request (`pipeline_subgroup_requests`) must equal the decision function's. The native wave64 shader
     must be exact where the device can give 64 (AMD: required size 64 plus full subgroups) and is reported, not

@@ -518,7 +518,7 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   EXEC is saved in `s10` and restored, so a partial wave keeps its missing lanes off), and the LDS size in the
   kernel descriptor and metadata (`.amdhsa_group_segment_fixed_size`; without it the group gets no LDS). Results go
   out with `global_store_b32` through the output pointer.
-- **GFX11 spellings** (`hw_oracle/asm.py`, checked by assembling every mnemonic with AMD clang for gfx1030 and
+- **GFX11 spellings** (`tools/hw_oracle/asm.py`, checked by assembling every mnemonic with AMD clang for gfx1030 and
   gfx1150): `ds_read_*` is `ds_load_*`, `ds_write_*` is `ds_store_*`, `ds_read2[st64]_b32` is
   `ds_load_2addr[_stride64]_b32`, `ds_write2[st64]_b32` is `ds_store_2addr[_stride64]_b32`, `ds_wrxchg_rtn_b32` is
   `ds_storexchg_rtn_b32`. The assembler still takes the old names on gfx1150 except `ds_cmpst_rtn_b32`.
@@ -530,7 +530,7 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   `ds_cmpstore_b32`; gfx1036's `ds_cmpst` does the opposite), and with `--perturb cmpst_swap` 275 of 1,000 wave32
   programs mismatch there. The model keeps the GFX10 order. Nothing else the generator emits is missing on GFX11, so
   no other program is skipped for its semantics; an assembler rejection is counted as `rejected`, never as a pass.
-- **GFX12** (`hw_oracle/asm.py` `sync_lines`): there is no `s_barrier` (a workgroup barrier is
+- **GFX12** (`tools/hw_oracle/asm.py` `sync_lines`): there is no `s_barrier` (a workgroup barrier is
   `s_barrier_signal -1` then `s_barrier_wait -1`), and the LDS wait is `s_wait_dscnt 0` instead of the legacy
   `s_waitcnt lgkmcnt(0)`. **A wave64 `ds_bpermute_b32` reaches all 64 lanes on GFX12**, while RDNA2 (and gfx1150)
   keep each 32-lane half separate: with every lane asking for lane `(l + 32) mod 64`, the RX 9070 XT returns lane
@@ -769,7 +769,7 @@ python -m pytest tests/test_image_fuzz_hw.py
   write are compared too. A texture that was not 256-byte aligned would make every word `0xBAADF00D`; the run reports
   that as an error instead of reading from a wrong base. The same texels, sizes (8 to 64 per side) and 15 masks as the
   translator run; a seed names the same textures for both.
-- **The T# per family** (`hw_oracle/tsharp.py`, exact words in `tests/test_image_fuzz_hw.py`). Facts from Mesa's AMD
+- **The T# per family** (`tools/hw_oracle/tsharp.py`, exact words in `tests/test_image_fuzz_hw.py`). Facts from Mesa's AMD
   register database and `ac_descriptors.c` and LLVM's `SIDefines.h` (MIT / Apache-2.0; own code, see
   [related_projects.md](related_projects.md)). GFX10 and GFX11 differ here, and GFX12 is a third layout that is not
   built (`--oracle hw` on gfx12xx exits 77 with that reason):
@@ -822,7 +822,7 @@ Negative control (`--oracle hw --programs 180 --seed 1 --negative-control`): the
 180 cases; the seven wrong models are caught by the same counts as on gfx1150 (`unorm_256` 30, `swap_rb` 144,
 `sint_unsigned` 30, `alpha_zero` 16, `dmask_in_place` 132, `no_sentinels` 168, `transpose` 166), and a kernel built
 with the next format's `FORMAT` code is caught on every format (24 to 30 of 30 cases each). So the GFX10 T# words of
-`hw_oracle/tsharp.py` and the texel-fetch model hold on RDNA2 for these formats; `--oracle translator,hw` was not run
+`tools/hw_oracle/tsharp.py` and the texel-fetch model hold on RDNA2 for these formats; `--oracle translator,hw` was not run
 there. The Linux libdrm backend of #1265 (`tools/hw_oracle/drm.py`) now runs these cases too: `--oracle hw
 --programs 120 --seed 1` on the same gfx1036 iGPU matched on 120 of 120 cases (60 per wave), four of them 64x64 and
 therefore 16,384 words, with no rejections (Linux 7.3.5-zen1-1-zen, libdrm 2.4.134, AMD clang 23.1.5). It copies
