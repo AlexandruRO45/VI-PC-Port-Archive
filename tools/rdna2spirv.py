@@ -6133,6 +6133,73 @@ class Gen:
         # f16 destination under default MODE (denorm16_64=3): omod ignored by silicon, clamp kept.
         return self.clamp_mods(v, mods, allow_omod=False)
 
+    def validate_unary_f32(self, ins, op):
+        """Validate operands, encoding form, and modifiers for unary f32 VOP1/VOP3 ops."""
+        raw_op = ins["op"]
+        mods = ins["mods"]
+        a = ins["args"]
+        orig_args = (self.cur_ins or ins)["args"]
+        if len(a) != 2 or len(orig_args) != 2:
+            raise Unsupported(f"{op} arity")
+        dst, src0 = orig_args
+        if dst.get("k") != "vgpr" or dst.get("n", 1) != 1:
+            raise Unsupported(f"{op} destination")
+        if dst.get("neg") or dst.get("abs") or dst.get("sext"):
+            raise Unsupported(f"{op} destination modifier")
+        if src0.get("n", 1) != 1:
+            raise Unsupported(f"{op} 64-bit source")
+        if src0.get("sext"):
+            raise Unsupported(f"{op} sext modifier")
+        if raw_op.endswith("_e32"):
+            if src0.get("neg") or src0.get("abs"):
+                raise Unsupported(f"{op} input modifier on _e32")
+            if mods:
+                raise Unsupported(f"{op} modifier on _e32")
+        elif raw_op.endswith("_dpp"):
+            if self.non_dpp_mods(raw_op, mods):
+                raise Unsupported(f"{op} modifier on _dpp")
+        elif raw_op.endswith("_sdwa"):
+            seen_clamp = False
+            seen_omod = False
+            seen_sdwa = set()
+            for m in mods:
+                if m == "clamp":
+                    if seen_clamp:
+                        raise Unsupported(f"{op} duplicate clamp")
+                    seen_clamp = True
+                elif m in ("mul:2", "mul:4", "div:2"):
+                    if seen_omod:
+                        raise Unsupported(f"{op} duplicate omod")
+                    seen_omod = True
+                elif ":" in m:
+                    k, v = m.split(":", 1)
+                    if k in ("dst_sel", "src0_sel"):
+                        if k in seen_sdwa or v not in self.SDWA_SEL:
+                            raise Unsupported(f"{op} SDWA {k}")
+                        seen_sdwa.add(k)
+                    elif k == "dst_unused":
+                        if k in seen_sdwa or v not in ("UNUSED_PAD", "UNUSED_SEXT", "UNUSED_PRESERVE"):
+                            raise Unsupported(f"{op} SDWA dst_unused")
+                        seen_sdwa.add(k)
+                    else:
+                        raise Unsupported(f"{op} modifier {m}")
+                else:
+                    raise Unsupported(f"{op} modifier {m}")
+        else:
+            seen_clamp = False
+            seen_omod = False
+            for m in mods:
+                if m == "clamp":
+                    if seen_clamp:
+                        raise Unsupported(f"{op} duplicate clamp")
+                    seen_clamp = True
+                elif m in ("mul:2", "mul:4", "div:2"):
+                    if seen_omod:
+                        raise Unsupported(f"{op} duplicate omod")
+                    seen_omod = True
+                else:
+                    raise Unsupported(f"{op} modifier {m}")
+
     def flush_f32(self, f):
         """v_mad_f32, v_mac_f32, v_mad_legacy_f32 and default-mode v_mul_legacy_f32 flush f32 denormals:
         a subnormal operand or result
@@ -7251,6 +7318,7 @@ class Gen:
             self.emit(f"{r} = OpBitwiseOr %uint {halves[0]} {hi}")
             self.dst(a[0], r)
         elif op in ("v_sin_f32", "v_cos_f32"):
+            self.validate_unary_f32(ins, op)
             # RDNA takes the angle in turns: reduce in turns, then sin/cos(x * 2*pi).
             x = self.src_f(a[1])
             t = self.turn_angle(x)
@@ -7259,6 +7327,7 @@ class Gen:
             r = self.trig_exact_zero(op, x, r)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op == "v_rndne_f32":
+            self.validate_unary_f32(ins, op)
             x = self.src_f(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpExtInst %float %glsl RoundEven {x}")
@@ -10771,6 +10840,7 @@ class Gen:
             self.emit_fma(r, x, y, z)
             self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
         elif op in F1:
+            self.validate_unary_f32(ins, op)
             x = self.src_f(a[1])
             r = self.tmp()
             if F1[op] == "rcp":
