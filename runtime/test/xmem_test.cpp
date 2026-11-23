@@ -257,10 +257,10 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
             check(VirtualQuery(region, &info, sizeof(info)) && info.State == MEM_COMMIT &&
                       info.RegionSize == 2 * kPage4m && info.Protect == PAGE_READWRITE,
                   "a 4 MiB-page region is rounded up to two writable pages");
-            auto* const bytes = static_cast<volatile uint8_t*>(region);
-            bytes[0] = 0x41;
-            bytes[2 * kPage4m - 1] = 0x42;
-            check(bytes[0] == 0x41 && bytes[2 * kPage4m - 1] == 0x42, "the 4 MiB pages are writable");
+            auto* const pages4m = static_cast<volatile uint8_t*>(region);
+            pages4m[0] = 0x41;
+            pages4m[2 * kPage4m - 1] = 0x42;
+            check(pages4m[0] == 0x41 && pages4m[2 * kPage4m - 1] == 0x42, "the 4 MiB pages are writable");
             check(VirtualFree(region, 0, MEM_RELEASE), "release the 4 MiB-page region");
         }
 
