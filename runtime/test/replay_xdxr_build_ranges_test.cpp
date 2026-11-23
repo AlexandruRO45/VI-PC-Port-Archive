@@ -77,6 +77,10 @@ int main() {
     build.src_va = src_base + src_offset;
     run(build, success, "a fresh build ignores an unused source address");
     build.update = true;
+    buffers.insert(src_base, src_offset + layout.size, src);
+    run(build, unsupported, "refit requires ALLOW_UPDATE even with valid spans");
+    buffers.erase(src_base, src);
+    build.build_flags = VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
     run(build, unsupported, "out-of-place refit rejects an unregistered source");
     buffers.insert(src_base, src_offset + layout.size - 1, src);
     run(build, unsupported, "out-of-place refit rejects a short source");
@@ -88,6 +92,18 @@ int main() {
     run(build, success, "refit accepts an explicitly in-place source");
     build.src_va = 0;
     run(build, success, "refit accepts an implicit in-place source");
+
+    build.update = false;
+    build.build_flags = VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
+    build.triangles.front().vertex_count = 12;
+    XdxrLayout full_boxes;
+    if (!layout.compute(4, false, true) || !full_boxes.compute(4, false) ||
+        layout.size >= full_boxes.size) return 1;
+    buffers.insert(scratch_base, scratch_offset + layout.scratch, scratch);
+    buffers.insert(dst_base, dst_offset + layout.size, dst);
+    run(build, success, "BOX16 accepts the smaller exact destination span");
+    build.build_flags = 0;
+    run(build, unsupported, "BOX32 requires more space than the BOX16 span");
 
     build = {};
     build.is_tlas = true;
