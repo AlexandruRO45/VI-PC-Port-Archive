@@ -839,6 +839,14 @@ class FmaFusedSuite(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
 
+    def test_check_py_run_flags_empty_stdout(self):
+        import check
+        with patch("subprocess.run") as m_run:
+            m_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="device: mock_gpu\n")
+            code, out = check.run("dummy_tool", "arg")
+            self.assertEqual(code, 0)
+            self.assertIn("(empty stdout)", out)
+
 
 if __name__ == "__main__":
     unittest.main()

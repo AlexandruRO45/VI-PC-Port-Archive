@@ -678,5 +678,7 @@ static int run(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     // GPU-assisted validation reports what the shader did when the queue finishes, after the words were judged.
-    return leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
+    const int rc = leonida::vk_test::OptInValidation::exit_status(run(argc, argv));
+    std::fflush(stdout);
+    return rc;
 }

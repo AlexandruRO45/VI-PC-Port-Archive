@@ -658,6 +658,8 @@ def run(*cmd, env=None, cwd=None):
             if missing:
                 sys.exit(not_found_message(tools, missing))
         return 1, start_failure(cmd[0], e)
+    if not r.stdout and r.stderr and r.returncode == 0:
+        return r.returncode, r.stderr + "\n(empty stdout)"
     return r.returncode, r.stdout + r.stderr
 
 
