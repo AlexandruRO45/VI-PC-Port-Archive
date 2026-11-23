@@ -385,9 +385,9 @@ def reference(lines):
 # ---- the translator side -----------------------------------------------------------------------------------
 
 def translated(lines, name="ps_vint"):
-    """Translate and execute; returns the four exported words, or raises Skip."""
+    """Return four exported words; raise Skip for unsupported code, RuntimeError for interpreter failures."""
     import rdna2spirv
-    from spirv_mini_interp import run_fragment
+    from spirv_mini_interp import UnsupportedConstruct, run_fragment
     with tempfile.TemporaryDirectory(prefix="vint-diff-") as tmp:
         dis = os.path.join(tmp, "disasm")
         os.mkdir(dis)
@@ -408,8 +408,10 @@ def translated(lines, name="ps_vint"):
             raise Skip(f"translator unsupported: {e}") from None
         try:
             out = run_fragment(spvasm)
-        except Exception as e:  # noqa: BLE001 - an interpreter gap is a counted skip, never a pass
+        except UnsupportedConstruct as e:
             raise Skip(f"mini_interp: {type(e).__name__}: {str(e)[:80]}") from None
+        except Exception as e:  # noqa: BLE001 - invalid modules and interpreter bugs must fail the run
+            raise RuntimeError(f"mini_interp: {type(e).__name__}: {e}") from e
     return [w & M32 for w in out["%out_mrt0"]]
 
 
