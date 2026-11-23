@@ -1,8 +1,11 @@
 """Run the SHADER-605 direct OpImageWrite probe with the supplied vk_store_test binary."""
 
 import argparse
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 
 
@@ -52,6 +55,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("harness", type=Path)
     args = parser.parse_args()
+    if not args.harness.is_file():
+        print(f"probe_signed_zero: harness {args.harness} is not a file (build vk_store_test first)", file=sys.stderr)
+        return 2
+    # Same folder variable runtime/test/shaders/build.py reads for spirv-as/spirv-val.
+    tools = os.environ.get("LEONIDA_SPIRV_TOOLS")
+    path = tools + os.pathsep + os.environ.get("PATH", "") if tools else None
+    missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t, path=path)]
+    if missing:
+        print(f"probe_signed_zero: {' and '.join(missing)} not found; put the SPIRV-Tools on PATH or set "
+              "LEONIDA_SPIRV_TOOLS to their folder", file=sys.stderr)
+        return 2
+    if path:
+        os.environ["PATH"] = path
     results = []
     with tempfile.TemporaryDirectory() as scratch:
         for image_format in ("Unknown", "Rgba32f"):
@@ -59,8 +75,11 @@ def main():
             source = Path(scratch) / f"{image_format}.spvasm"
             binary = source.with_suffix(".spv")
             source.write_text(MODULE.format(image_format=image_format), encoding="utf-8", newline="\n")
-            subprocess.run(["spirv-as", "--target-env", "vulkan1.2", source, "-o", binary], check=True)
-            subprocess.run(["spirv-val", "--target-env", "vulkan1.2", binary], check=True)
+            for step, cmd in (("assemble", ["spirv-as", "--target-env", "vulkan1.2", source, "-o", binary]),
+                              ("validate", ["spirv-val", "--target-env", "vulkan1.2", binary])):
+                if subprocess.run(cmd).returncode:
+                    print(f"probe_signed_zero: the {image_format} module failed to {step}", file=sys.stderr)
+                    return 2
             results.append(subprocess.run([args.harness.resolve(), binary, "signed-zero"]).returncode)
     if any(code not in (0, 77) for code in results):
         return 1
