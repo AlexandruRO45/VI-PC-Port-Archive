@@ -606,6 +606,16 @@ int main() {
         constexpr DWORD kNotFound = ERROR_WINHTTP_HEADER_NOT_FOUND;
         constexpr DWORD kExists = ERROR_WINHTTP_HEADER_ALREADY_EXISTS;
 
+        // The Windows 11 25H2 host stores only the first line when the count ends at its CRLF.
+        constexpr wchar_t block[] = L"X-Test-First: 1\r\nX-Test-Second: 2\r\n";
+        constexpr DWORD first_length = ARRAYSIZE(L"X-Test-First: 1\r\n") - 1;
+        check(add_headers(other, block, first_length, kAdd) != FALSE &&
+                  fails(other, L"X-Test-First: 1", kAddIfNew, kExists),
+              "the first header inside the explicit length is already present");
+        check(adds(other, L"X-Test-Second: 2", kAddIfNew), "the second header beyond the explicit length is still new");
+        check(adds(request, block, kAdd) && fails(request, L"X-Test-Second: 2", kAddIfNew, kExists),
+              "adding the full header block stores the second header on a separate request");
+
         check(fails(request, L"X-Missing: 1", kReplace, kNotFound),
               "WINHTTP_ADDREQ_FLAG_REPLACE of a missing header fails with ERROR_WINHTTP_HEADER_NOT_FOUND");
         check(adds(request, L"X-Dup: 1", kAdd) && fails(request, L"x-dup: 2", kAddIfNew, kExists) &&
