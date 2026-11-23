@@ -331,6 +331,18 @@ class ReaderParity(unittest.TestCase):
             self.check(d)
             self.check(d, {"CThing": handled})
 
+    def test_type_handler_replacing_el_attrib(self):
+        def add_attr(el, reader):
+            el.attrib = {**el.attrib, "units": "meters"}
+            return 7
+
+        def strip_attr(el, reader):
+            el.attrib = {"type": "Distance"}
+            return 7
+
+        self.check(b'<R><Item type="Distance"/></R>', {"Distance": add_attr})
+        self.check(b'<R><Item type="Distance" extra="1"/></R>', {"Distance": strip_attr})
+
 
 class MemoryParity(unittest.TestCase):
     """The fast paths keep no state between calls and allocate no more than the plain conversion."""

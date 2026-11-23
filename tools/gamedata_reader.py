@@ -180,6 +180,7 @@ class Reader:
         active = self._active_type_elements
         in_handler = bool(active) and id(el) in active
         value = self._convert(el, use_type_handler)
+        attrib = el.attrib
         if attrib.keys() <= BASE_CONVENTION_KEYS:
             return value  # every attribute is one a convention consumes: nothing extra to keep
         return self.with_attributes(attrib, value, count_stats=not in_handler)
