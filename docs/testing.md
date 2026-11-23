@@ -10,14 +10,6 @@ This page collects the setup steps and the problems testers have run into so far
 
 [claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
-## Tested Configurations
-
-*Note: For detailed logs, crash reports, and ongoing discussions, please refer to [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).*
-
-| GPU | Driver | OS | Results & Notes |
-| --- | --- | --- | --- |
-| **AMD Radeon RX 6600** (RDNA2, Device ID: 0x73ff) | AMD Proprietary 26.10.1 | Windows 10 (Build 19045) | ✅ **97% passed** (155/169). Native wave64 support confirmed (subgroup sizes 32..64, default 64).<br>⚠️ `d3d12_sparse_queue_family_contract` crashes with access violation (exit code `0xC0000005`).<br>⚠️ `d3d12_conservative_raster` fails (driver lacks `VK_EXT_conservative_rasterization`). |
-
 ## What you need
 
 - **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
@@ -360,24 +352,6 @@ only for `check.py`, the shaders read the tail from push constants the programs 
 (`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
 constants, so those tests skip.
 
-## GPUs with 128 bytes of push constants (AMD RDNA2 iGPUs on Windows, some Intel Arc drivers)
-
-The translated shaders take 144 bytes of push constants: s0..s31, then the heap base and the code base. A device whose
-`maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
-`vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
-AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
-
-To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
-`run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
-and the heap base and code base move to a uniform block at set 1 (`docs/design.md`, "Push-constant tail as a uniform
-block"), which `vk_compute_test`, `vk_store_test`, `vk_harness`, `vk_texture_test`, `vk_sampler_test` and
-`vk_bindless_test` bind (`runtime/test/vk_pc_tail.h`). If you set it
-only for `check.py`, the shaders read the tail from push constants the programs no longer declare. `--mesh-compute`
-(`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
-constants, so those tests skip.
-
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
@@ -669,3 +643,16 @@ Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/iss
 range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
 lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
 from your entry.
+
+The CPU, GPU, VRAM and RAM fields come from `tools/pc_checker.py`, which compares this PC with the Xbox Series X
+reference specs (or `--profile 2` for the community 1080p Low estimate). Run it in text mode; the default form opens a
+window:
+
+```powershell
+python -I tools/pc_checker.py --cli --check    # spec lines, then exit 0 good, 1 weak, 2 unknown
+python -I tools/pc_checker.py --cli --check --json
+```
+
+`--cpu`, `--gpu` and `--ram` override the detected values when a VM or a remote session hides them. Its scores are
+rough estimates made for this tool, not benchmarks, so put the detected model names in the #166 entry, not the score.
+`python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked.
