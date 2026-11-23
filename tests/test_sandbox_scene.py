@@ -127,11 +127,11 @@ class TestCliErrors(unittest.TestCase):
             f.write(json.dumps({"archetype": 123, "position": [0, 0, 0],
                                 "rotation": [0, 0, 0, 1], "lod_level": 0}) + "\n")
 
-    def _run(self, entities, out):
+    def _run(self, entities, out, *extra):
         err = io.StringIO()
         with redirect_stderr(err):
             rc = sandbox_scene.main(["--entities", entities, "--models", self.models,
-                                     "--center", "0", "0", "--out", out])
+                                     "--center", "0", "0", "--out", out, *extra])
         return rc, err.getvalue()
 
     def test_out_directory_is_one_error_line(self):
@@ -169,6 +169,25 @@ class TestCliErrors(unittest.TestCase):
                                      "--center", "0", "0", "--out", out])
         self.assertEqual(rc, 0)
         self.assertEqual(err.getvalue(), "")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(4), b"LSB1")
+
+    def test_negative_tex_size_is_a_usage_error(self):
+        # downscale_rgba rejects it, texture_bytes swallowed that, and every texture was dropped with exit 0
+        out = os.path.join(self.tmp.name, "o.bin")
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            sandbox_scene.main(["--entities", self.entities, "--models", self.models,
+                                "--center", "0", "0", "--out", out, "--tex-size", "-1"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--tex-size must be non-negative", err.getvalue())
+        self.assertFalse(os.path.exists(out))
+
+    def test_zero_tex_size_keeps_full_size(self):
+        out = os.path.join(self.tmp.name, "o.bin")
+        rc, err = self._run(self.entities, out, "--tex-size", "0")
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
         with open(out, "rb") as f:
             self.assertEqual(f.read(4), b"LSB1")
 

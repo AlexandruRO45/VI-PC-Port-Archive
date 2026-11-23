@@ -177,6 +177,8 @@ def main(argv=None):
         ap.error("--radius must be finite and non-negative")
     if args.max_props < 0:
         ap.error("--max-props must be non-negative")
+    if args.tex_size < 0:
+        ap.error("--tex-size must be non-negative")
     if os.path.isdir(args.out):
         print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
         return 2
