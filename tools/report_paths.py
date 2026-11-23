@@ -56,7 +56,7 @@ def _resolved_key(path):
 
 
 def same_name_on_folding_volume(first, second):
-    """True when two names that differ only by case are one file on the volume that holds them.
+    """True when two names that differ only by case or accent spelling are one file on the volume that holds them.
 
     os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
     mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
