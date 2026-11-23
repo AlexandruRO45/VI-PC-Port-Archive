@@ -76,6 +76,12 @@ Esc quit. `--center` is in RAGE world metres; without it the densest 50 m cell o
 | window | about 90 frames per second with a `vkQueueWaitIdle` per frame; a 60-frame windowed run ends on the same pixels as the headless render |
 | walk / drive | eye at 1.70 m / 1.20 m over the roof the camera starts above |
 
+Render dimensions and `--frames` must be positive integers; camera values must be
+finite, `--fov` must be between 0 and 180 degrees (exclusive), and `--mode` must be
+`fly`, `walk` or `drive`. Invalid options exit 2 before scene loading or Vulkan.
+Dimensions exceeding the selected GPU's image, framebuffer or viewport limits
+also exit 2 before render-target allocation.
+
 ## 6. Limits and next
 
 * One pair, one forward pass. The world's own material shaders pull vertices (`SV_VertexID` only) and write the

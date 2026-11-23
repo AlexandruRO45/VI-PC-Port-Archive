@@ -27,12 +27,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -51,6 +54,25 @@ static PFN_vkGetInstanceProcAddr gipa;
     } while (0)
 
 namespace {
+
+bool positive_integer(const char* text, uint32_t& value) {
+    if (*text == '+') ++text;
+    uint32_t parsed = 0;
+    const auto [end, error] = std::from_chars(text, text + std::strlen(text), parsed);
+    if (error != std::errc{} || *end || !parsed || parsed > uint32_t(std::numeric_limits<int32_t>::max()))
+        return false;
+    value = parsed;
+    return true;
+}
+
+bool finite_float(const char* text, float& value) {
+    char* end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(text, &end);
+    if (end == text || *end || errno == ERANGE || !std::isfinite(parsed)) return false;
+    value = parsed;
+    return true;
+}
 
 struct Texture { uint32_t w, h; std::vector<uint8_t> rgba; };
 struct Mesh { uint32_t first_vertex, vertex_count, first_index, index_count; };
@@ -228,28 +250,45 @@ int main(int argc, char** argv) {
                              "[--cam x y z yaw pitch] [--fov deg]\n");
         return 2;
     }
-    Scene scene;
-    if (!load_scene(argv[1], scene)) { std::fprintf(stderr, "bad scene file %s\n", argv[1]); return 2; }
     uint32_t W = 1280, H = 720;
     const char* out_path = nullptr;
     bool window = false;
     int frames = 0;   // --frames N: window test run, shown without activation, quits after N frames
     Camera cam{};
-    cam.pos[0] = scene.center[0] - 40; cam.pos[1] = scene.center[1] - 40; cam.pos[2] = scene.center[2] + 25;
+    bool camera_given = false;
     cam.yaw = 0.785398f; cam.pitch = -0.35f;
+    auto invalid = [](const char* option) {
+        std::fprintf(stderr, "%s requires a valid value (positive integer size/frames, finite camera, 0 < fov < 180, mode fly|walk|drive)\n", option);
+        return 2;
+    };
     for (int i = 4; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--out") && i + 1 < argc) out_path = argv[++i];
         else if (!std::strcmp(argv[i], "--window")) window = true;
-        else if (!std::strcmp(argv[i], "--frames") && i + 1 < argc) frames = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--mode") && i + 1 < argc) {
+        else if (!std::strcmp(argv[i], "--frames")) {
+            uint32_t count = 0;
+            if (i + 1 >= argc || !positive_integer(argv[++i], count)) return invalid("--frames");
+            frames = int(count);
+        }
+        else if (!std::strcmp(argv[i], "--mode")) {
+            if (i + 1 >= argc) return invalid("--mode");
             const char* m = argv[++i];
+            if (std::strcmp(m, "fly") && std::strcmp(m, "walk") && std::strcmp(m, "drive")) return invalid("--mode");
             cam.mode = !std::strcmp(m, "walk") ? 1 : !std::strcmp(m, "drive") ? 2 : 0;
         }
-        else if (!std::strcmp(argv[i], "--size") && i + 2 < argc) { W = std::atoi(argv[++i]); H = std::atoi(argv[++i]); }
-        else if (!std::strcmp(argv[i], "--fov") && i + 1 < argc) cam.fov = float(std::atof(argv[++i]));
-        else if (!std::strcmp(argv[i], "--cam") && i + 5 < argc) {
-            for (int k = 0; k < 3; ++k) cam.pos[k] = float(std::atof(argv[++i]));
-            cam.yaw = float(std::atof(argv[++i])) * 3.14159265f / 180; cam.pitch = float(std::atof(argv[++i])) * 3.14159265f / 180;
+        else if (!std::strcmp(argv[i], "--size")) {
+            if (i + 2 >= argc || !positive_integer(argv[++i], W) || !positive_integer(argv[++i], H)) return invalid("--size");
+        }
+        else if (!std::strcmp(argv[i], "--fov")) {
+            if (i + 1 >= argc || !finite_float(argv[++i], cam.fov) || cam.fov <= 0 || cam.fov >= 180 ||
+                !std::isfinite(1.f / std::tan(cam.fov * 3.14159265f / 360.f))) return invalid("--fov");
+        }
+        else if (!std::strcmp(argv[i], "--cam")) {
+            if (i + 5 >= argc) return invalid("--cam");
+            for (int k = 0; k < 3; ++k)
+                if (!finite_float(argv[++i], cam.pos[k])) return invalid("--cam");
+            if (!finite_float(argv[++i], cam.yaw) || !finite_float(argv[++i], cam.pitch)) return invalid("--cam");
+            cam.yaw *= 3.14159265f / 180; cam.pitch *= 3.14159265f / 180;
+            camera_given = true;
         } else { std::fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
     }
 #ifndef _WIN32
@@ -257,6 +296,11 @@ int main(int argc, char** argv) {
 #endif
     if (window && frames && !out_path) { std::fprintf(stderr, "--frames needs --out\n"); return 2; }
     if (!out_path && !window) { std::fprintf(stderr, "give --out or --window\n"); return 2; }
+    Scene scene;
+    if (!load_scene(argv[1], scene)) { std::fprintf(stderr, "bad scene file %s\n", argv[1]); return 2; }
+    if (!camera_given) {
+        cam.pos[0] = scene.center[0] - 40; cam.pos[1] = scene.center[1] - 40; cam.pos[2] = scene.center[2] + 25;
+    }
     std::fprintf(stderr, "scene: %zu draws, %zu meshes, %zu textures, %zu triangles\n", scene.draws.size(),
                  scene.meshes.size(), scene.textures.size(), scene.indices.size() / 3);
 
@@ -287,6 +331,12 @@ int main(int argc, char** argv) {
     constexpr uint32_t push_words = 36, push_bytes = push_words * 4;
     if (props.limits.maxPushConstantsSize < push_bytes) { std::fprintf(stderr, "unsupported: push constants\n"); return 77; }
     std::fprintf(stderr, "device: %s\n", props.deviceName);
+    if (W > props.limits.maxImageDimension2D || H > props.limits.maxImageDimension2D ||
+        W > props.limits.maxFramebufferWidth || H > props.limits.maxFramebufferHeight ||
+        W > props.limits.maxViewportDimensions[0] || H > props.limits.maxViewportDimensions[1]) {
+        std::fprintf(stderr, "--size exceeds the selected device's render-target limits\n");
+        return 2;
+    }
     uint32_t qn = 0; vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn); vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
     uint32_t qi = 0;
