@@ -5212,13 +5212,42 @@ public:
     // host refuses on their arguments are answered as the host does (d3d12_shared_handle_test) and a call that
     // would succeed on the host stays E_NOTIMPL. Docs:
     // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle
+    // Whether an object was created with its sharing flag: only fences, heaps and committed resources can be.
+    static bool created_shared(ID3D12DeviceChild* object) {
+        ID3D12Fence1* fence = nullptr;
+        if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&fence)))) {
+            const bool shared = (fence->GetCreationFlags() & D3D12_FENCE_FLAG_SHARED) != 0;
+            fence->Release();
+            return shared;
+        }
+        ID3D12Heap* heap = nullptr;
+        if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&heap)))) {
+            const bool shared = (heap->GetDesc().Flags & D3D12_HEAP_FLAG_SHARED) != 0;
+            heap->Release();
+            return shared;
+        }
+        ID3D12Resource* resource = nullptr;
+        if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&resource)))) {
+            D3D12_HEAP_PROPERTIES props{};
+            D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
+            const bool shared = SUCCEEDED(resource->GetHeapProperties(&props, &flags)) &&
+                                (flags & D3D12_HEAP_FLAG_SHARED);
+            resource->Release();
+            return shared;
+        }
+        return false;
+    }
+
     HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild* object, const SECURITY_ATTRIBUTES*, DWORD,
                                                  LPCWSTR, HANDLE* handle) override {
         constexpr auto method = "ID3D12Device::CreateSharedHandle";
         if (handle) *handle = nullptr;
         // The page names DXGI_ERROR_INVALID_CALL for an invalid parameter; the host runtime answers E_INVALIDARG
-        // for a null object, a null output and an object not created shared, on WARP, NVIDIA and Intel.
+        // for a null object, a null output and an object not created shared (a fence without
+        // D3D12_FENCE_FLAG_SHARED, a heap or committed resource without D3D12_HEAP_FLAG_SHARED, any other object),
+        // on WARP, NVIDIA and Intel. An object created shared is a call the host accepts, so it stays E_NOTIMPL.
         if (!object || !handle) return d3d12_trace::result(method, E_INVALIDARG);
+        if (!created_shared(object)) return d3d12_trace::result(method, E_INVALIDARG);
         log_once("CreateSharedHandle (shared objects are not supported)", 0);
         return d3d12_trace::result(method, E_NOTIMPL);
     }
