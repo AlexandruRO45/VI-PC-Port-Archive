@@ -143,6 +143,23 @@ class Workflows(unittest.TestCase):
                                      f"{where}: the key isn't checked by scripts/check_apt_key.py right after")
         self.assertGreaterEqual(fetched, 2, "expected the WineHQ and apt.llvm.org key downloads")
 
+    def test_no_apt_source_is_downloaded(self):
+        # A deb822 .sources (or .list) file chooses its own trust: an inline Signed-By key or Trusted: yes would
+        # bypass a pinned key. Sources are written in the workflow, naming the pinned keyring.
+        folder = os.path.join(ROOT, ".github", "workflows")
+        for name in sorted(os.listdir(folder)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                text = f.read()
+            # A command may continue on the next line with a backslash; judge each logical line.
+            for n, line in enumerate(text.replace("\\\n", " ").splitlines()):
+                code = line.split("#")[0]
+                if re.search(r"\b(curl|wget)\b", code):
+                    with self.subTest(where=f"{name}:{n + 1}"):
+                        self.assertNotRegex(code, r"sources\.list|\.sources\b|\.list\b",
+                                            f"{name}: an apt source is downloaded instead of written")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -328,8 +328,12 @@ jobs:
             wget -q -O "$key" https://dl.winehq.org/wine-builds/winehq.key
             python3 -I scripts/check_apt_key.py "$key" D43F640145369C51D786DDEA76F1A20FF987672F
             sudo install -m 644 "$key" /etc/apt/keyrings/winehq-archive.key
-            sudo wget -q -NP /etc/apt/sources.list.d/ \
-              "https://dl.winehq.org/wine-builds/ubuntu/dists/$(. /etc/os-release && echo "$VERSION_CODENAME")/winehq-$(. /etc/os-release && echo "$VERSION_CODENAME").sources"
+            # The source is written here, not downloaded: a fetched .sources stanza chooses its own trust (an inline
+            # Signed-By key, or Trusted: yes), which would bypass the pinned key above.
+            codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+            printf '%s\n' 'Types: deb' 'URIs: https://dl.winehq.org/wine-builds/ubuntu' "Suites: $codename" \
+              'Components: main' 'Architectures: amd64 i386' 'Signed-By: /etc/apt/keyrings/winehq-archive.key' |
+              sudo tee /etc/apt/sources.list.d/winehq.sources > /dev/null
             pkgs+=(winehq-stable)
           else
             pkgs+=(wine wine64)
