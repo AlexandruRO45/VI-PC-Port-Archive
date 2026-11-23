@@ -676,6 +676,18 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             raise UnsupportedConstruct(f"signed comparison of a {t[0]}")
         return signed(val(x), t[1] if t else 32)
 
+    def signed_operand(x):
+        """An integer operand as signed at its own width: one value, or one per component of a vector (the width
+        is the element type's, as SPIR-V requires the comparison's operands to have the same type)."""
+        t = types.t.get(id_type.get(x))
+        if t is not None and t[0] == "vec":
+            t = types.t.get(t[1])
+        if t is not None and t[0] != "int":
+            raise UnsupportedConstruct(f"signed comparison of a {t[0]}")
+        bits = t[1] if t else 32
+        v = val(x)
+        return tuple(signed(c, bits) for c in v) if isinstance(v, (tuple, list)) else signed(v, bits)
+
     labels = {res: idx for idx, (res, op, _, _) in enumerate(body) if op == "OpLabel" and res}
     # Every function's first body index and parameter ids. The first OpFunction was consumed by the header parse;
     # later ones are in the body. Execution starts at %main (the entry point the translator names).
@@ -989,22 +1001,25 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op == "OpIAddCarry":
             x, y = val(a[1]) & MASK, val(a[2]) & MASK
             values[res] = ((x + y) & MASK, (x + y) >> 32)
-        elif op == "OpIEqual":
-            values[res] = val(a[1]) == val(a[2])
-        elif op == "OpINotEqual":
-            values[res] = val(a[1]) != val(a[2])
-        elif op in ("OpSLessThan", "OpSLessThanEqual", "OpSGreaterThan", "OpSGreaterThanEqual"):
-            x, y = sval(a[1]), sval(a[2])
-            values[res] = {"OpSLessThan": x < y, "OpSLessThanEqual": x <= y,
-                           "OpSGreaterThan": x > y, "OpSGreaterThanEqual": x >= y}[op]
-        elif op == "OpULessThan":
-            values[res] = val(a[1]) < val(a[2])
-        elif op == "OpULessThanEqual":
-            values[res] = val(a[1]) <= val(a[2])
-        elif op == "OpUGreaterThan":
-            values[res] = val(a[1]) > val(a[2])
-        elif op == "OpUGreaterThanEqual":
-            values[res] = val(a[1]) >= val(a[2])
+        elif op in ("OpIEqual", "OpINotEqual", "OpSLessThan", "OpSLessThanEqual", "OpSGreaterThan",
+                    "OpSGreaterThanEqual", "OpULessThan", "OpULessThanEqual", "OpUGreaterThan",
+                    "OpUGreaterThanEqual"):
+            # SPIR-V: with vector operands the result is a bool vector with one predicate per component (OpIEqual:
+            # "Result Type must be a vector of bool ..."), so the operands are compared component by component,
+            # never as Python tuples (that is one bool for the whole vector, and a lexicographic order).
+            x = signed_operand(a[1]) if op.startswith("OpS") else val(a[1])
+            y = signed_operand(a[2]) if op.startswith("OpS") else val(a[2])
+            fn = {"OpIEqual": lambda p, q: p == q, "OpINotEqual": lambda p, q: p != q,
+                  "OpSLessThan": lambda p, q: p < q, "OpSLessThanEqual": lambda p, q: p <= q,
+                  "OpSGreaterThan": lambda p, q: p > q, "OpSGreaterThanEqual": lambda p, q: p >= q,
+                  "OpULessThan": lambda p, q: p < q, "OpULessThanEqual": lambda p, q: p <= q,
+                  "OpUGreaterThan": lambda p, q: p > q, "OpUGreaterThanEqual": lambda p, q: p >= q}[op]
+            if isinstance(x, (tuple, list)) or isinstance(y, (tuple, list)):
+                if not (isinstance(x, (tuple, list)) and isinstance(y, (tuple, list))) or len(x) != len(y):
+                    raise UnsupportedConstruct(f"{op} on vector operands of different sizes")
+                values[res] = tuple(fn(p, q) for p, q in zip(x, y))
+            else:
+                values[res] = fn(x, y)
         elif op == "OpControlBarrier":
             # <execution scope> <memory scope> <semantics>: run_workgroup's invocations meet here (each has finished
             # every earlier instruction, and with shared Workgroup memory sees the others' writes). run_fragment
@@ -1183,14 +1198,19 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             elif name in ("Sin", "Cos"):
                 values[res] = f32(math.sin(args[0]) if name == "Sin" else math.cos(args[0]))
             elif name == "FAbs":
-                magnitude = abs(args[0])
-                values[res] = magnitude if types.t[a[0]] == ("float", 64) else f32(magnitude)
+                # GLSL.std.450 FAbs takes a vector too: the absolute value of each component (as FMax below).
+                def fabs1(v):
+                    return abs(v) if types.t[a[0]] == ("float", 64) else f32(abs(v))
+                values[res] = (tuple(fabs1(v) for v in args[0]) if isinstance(args[0], (tuple, list))
+                               else fabs1(args[0]))
             elif name == "FSign":
                 # GLSL.std.450: 1.0 if x > 0, 0.0 if x = 0 (keeping the zero's sign), -1.0 if x < 0
-                x = args[0]
-                if math.isnan(x):
-                    raise UnsupportedConstruct("GLSL.std.450 FSign of a NaN (result not specified)")
-                values[res] = 1.0 if x > 0 else -1.0 if x < 0 else x
+                def fsign1(x):
+                    if math.isnan(x):
+                        raise UnsupportedConstruct("GLSL.std.450 FSign of a NaN (result not specified)")
+                    return 1.0 if x > 0 else -1.0 if x < 0 else x
+                values[res] = (tuple(fsign1(v) for v in args[0]) if isinstance(args[0], (tuple, list))
+                               else fsign1(args[0]))
             elif name == "SAbs":
                 # Two's complement: the most negative value is its own absolute value (as on the hardware).
                 values[res] = abs(signed(args[0], bits)) & wmask(a[0])
@@ -1203,9 +1223,9 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                     v = _nmin_nmax("NMax", xs[0], xs[1])
                     result = v if name == "FMax" else _nmin_nmax("NMin", v, xs[2])
                     return result if types.t[a[0]] == ("float", 64) else f32(result)
-                # Vector operands (v_pk_* clamp) are component-wise.
-                values[res] = (tuple(fmax_clamp(*c) for c in zip(*args)) if isinstance(args[0], tuple)
-                               else fmax_clamp(*args))
+                # Vector operands (v_pk_* clamp) are component-wise (a constant composite is a list).
+                values[res] = (tuple(fmax_clamp(*c) for c in zip(*args))
+                               if isinstance(args[0], (tuple, list)) else fmax_clamp(*args))
             elif name in ("RoundEven", "Floor", "Ceil", "Trunc"):
                 # round() breaks ties to even. An integral result keeps the operand's sign (IEEE 754
                 # roundToIntegral), so RoundEven(-0.4), Ceil(-0.5) and Trunc(-0.5) are -0.0, not +0.0.
@@ -1215,36 +1235,40 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 def integral(v):
                     result = math.copysign(float(fn(v)), v) if math.isfinite(v) else v
                     return result if types.t[a[0]] == ("float", 64) else f32(result)
-                values[res] = tuple(integral(v) for v in x) if isinstance(x, tuple) else integral(x)
+                values[res] = tuple(integral(v) for v in x) if isinstance(x, (tuple, list)) else integral(x)
             elif name in ("Exp2", "Log2", "Sqrt", "InverseSqrt"):
                 # Correctly rounded here; Vulkan allows a few ULP of error (tests compare exact results only for
                 # inputs whose result is exact). GLSL.std.450 leaves Log2 of x <= 0, Sqrt of x < 0 and
-                # InverseSqrt of x <= 0 undefined; those raise.
-                x = args[0]
-                if math.isnan(x):
-                    values[res] = x
-                elif name == "Exp2":
+                # InverseSqrt of x <= 0 undefined; those raise. A vector operand is evaluated component by
+                # component (one undefined component makes the whole result undefined, as for FClamp below).
+                def transcendental(x):
+                    if math.isnan(x):
+                        return x
+                    if name == "Exp2":
+                        if math.isinf(x):
+                            return math.inf if x > 0 else 0.0
+                        return f32(2.0 ** x) if x < 1024.0 else math.inf
+                    if (name == "Sqrt" and x < 0.0) or (name != "Sqrt" and x <= 0.0):
+                        raise UnsupportedConstruct(f"GLSL.std.450 {name} of {x!r} (undefined)")
                     if math.isinf(x):
-                        values[res] = math.inf if x > 0 else 0.0
-                    else:
-                        values[res] = f32(2.0 ** x) if x < 1024.0 else math.inf
-                elif (name == "Sqrt" and x < 0.0) or (name != "Sqrt" and x <= 0.0):
-                    raise UnsupportedConstruct(f"GLSL.std.450 {name} of {x!r} (undefined)")
-                elif math.isinf(x):
-                    values[res] = {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
-                elif name == "Log2":
-                    values[res] = f32(math.log2(x))
-                elif name == "Sqrt":
-                    values[res] = f32(math.sqrt(x))         # sqrt(-0.0) is -0.0
-                else:
-                    values[res] = f32(1.0 / math.sqrt(x))
+                        return {"Log2": math.inf, "Sqrt": math.inf, "InverseSqrt": 0.0}[name]
+                    if name == "Log2":
+                        return f32(math.log2(x))
+                    if name == "Sqrt":
+                        return f32(math.sqrt(x))                # sqrt(-0.0) is -0.0
+                    return f32(1.0 / math.sqrt(x))
+                values[res] = (tuple(transcendental(v) for v in args[0])
+                               if isinstance(args[0], (tuple, list)) else transcendental(args[0]))
             elif name == "FMin":
-                if any(math.isnan(x) for x in args):
+                # GLSL.std.450 FMin of a NaN is undefined; a vector operand is compared component by component.
+                operands = [v if isinstance(v, (tuple, list)) else (v,) for v in args]
+                if any(math.isnan(c) for v in operands for c in v):
                     raise UnsupportedConstruct(f"GLSL.std.450 {name} of NaN (undefined)")
-                values[res] = f32(_nmin_nmax("NMin", *args))
+                values[res] = (tuple(f32(_nmin_nmax("NMin", p, q)) for p, q in zip(*operands))
+                               if isinstance(args[0], (tuple, list)) else f32(_nmin_nmax("NMin", *args)))
             elif name in ("NMin", "NMax"):
                 x, y = args
-                if isinstance(x, tuple):
+                if isinstance(x, (tuple, list)):
                     values[res] = tuple(_nmin_nmax(name, p, q) for p, q in zip(x, y))
                 else:
                     values[res] = _nmin_nmax(name, x, y)

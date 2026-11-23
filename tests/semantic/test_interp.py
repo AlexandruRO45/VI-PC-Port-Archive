@@ -137,6 +137,47 @@ OpStore %f32_control %control
         self.assertEqual(run_word("%res = OpSelect %uint %t %c1 %c2\n"), 1)
         self.assertEqual(run_word("%res = OpSelect %uint %f %c1 %c2\n"), 2)
 
+    def test_vector_float_ext_inst_is_component_wise(self):
+        # GLSL.std.450 defines FAbs, FSign, FMin, Sqrt, Exp2, Log2 and InverseSqrt for a vector as the operation on
+        # each component (FMax/FClamp/NMin/NMax already did that). A vector operand used to reach abs(),
+        # math.isnan() or math.sqrt() with a tuple -- a TypeError from a valid module -- and a constant composite
+        # (a list) did the same on FMax. The result is extracted component by component and compared as its word.
+        text = HEADER.replace("%f1 = OpConstant %float 1",
+                              "%f1 = OpConstant %float 1\n%f4 = OpConstant %float 4\n"
+                              "%f9 = OpConstant %float 9\n%f16 = OpConstant %float 16\n"
+                              "%fm3 = OpConstant %float -3\n%f8 = OpConstant %float 8")
+
+        def component(name, a, b, i):
+            body = (f"%va = OpCompositeConstruct %v2float {a[0]} {a[1]}\n"
+                    + (f"%vb = OpCompositeConstruct %v2float {b[0]} {b[1]}\n" if b else "")
+                    + f"%r = OpExtInst %v2float %glsl {name} %va" + (" %vb" if b else "") + "\n"
+                    + f"%e = OpCompositeExtract %float %r {i}\n%w = OpBitcast %uint %e\n")
+            return si.run_fragment(text + body + "OpStore %out %w\n" + FOOTER)["%out"][0]
+
+        cases = (
+            ("FAbs", ("%fm3", "%f2p5"), None, (0x40400000, 0x40200000)),      # 3, 2.5
+            ("FSign", ("%fm3", "%f1"), None, (0xBF800000, 0x3F800000)),       # -1, 1
+            ("FMin", ("%f2", "%fm3"), ("%f1", "%f1"), (0x3F800000, 0xC0400000)),   # 1, -3
+            ("Sqrt", ("%f4", "%f9"), None, (0x40000000, 0x40400000)),         # 2, 3
+            ("Exp2", ("%f1", "%f2"), None, (0x40000000, 0x40800000)),         # 2, 4
+            ("Log2", ("%f2", "%f8"), None, (0x3F800000, 0x40400000)),         # 1, 3
+            ("InverseSqrt", ("%f4", "%f16"), None, (0x3F000000, 0x3E800000)),   # 0.5, 0.25
+        )
+        for name, a, b, want in cases:
+            for i in (0, 1):
+                with self.subTest(name=name, i=i):
+                    self.assertEqual(component(name, a, b, i), want[i])
+        # A constant composite is a list in the interpreter, not a tuple: FMax of two of them is component-wise too.
+        with_const = text.replace("%main = OpFunction",
+                                  "%cva = OpConstantComposite %v2float %f1 %fm3\n"
+                                  "%cvb = OpConstantComposite %v2float %f4 %f1\n%main = OpFunction")
+        for i, want in ((0, 0x40800000), (1, 0x3F800000)):                    # max(1, 4), max(-3, 1)
+            body = ("%r = OpExtInst %v2float %glsl FMax %cva %cvb\n"
+                    f"%e = OpCompositeExtract %float %r {i}\n%w = OpBitcast %uint %e\n")
+            with self.subTest(name="FMax", const_composite=i):
+                self.assertEqual(si.run_fragment(with_const + body + "OpStore %out %w\n" + FOOTER)["%out"][0],
+                                 want)
+
     def test_signed_unsigned_min_max(self):
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl SMax %cFF %c1\n"), 1)        # -1 vs 1 signed
         self.assertEqual(run_word("%res = OpExtInst %uint %glsl UMin %cFF %c1\n"), 1)        # 2^32-1 vs 1 unsigned
@@ -535,6 +576,40 @@ OpStore %f32_control %control
         body = ("%x = OpIAdd %ulong %L80 %L80\n%b = OpSGreaterThan %bool %x %L1\n"   # a result id keeps its width
                 "%res = OpSelect %uint %b %c1 %c0\n")
         self.assertEqual(si.run_fragment(header + body + "OpStore %out %res\n" + FOOTER)["%out"][0], 1)
+
+    def test_vector_integer_comparisons_are_component_wise(self):
+        # SPIR-V OpIEqual / OpINotEqual / Op[US]LessThan...: with vector operands Result Type is a bool vector
+        # with one predicate per component. The interpreter returned one Python bool for the whole vector (tuple
+        # equality, or lexicographic tuple ordering for the ordered forms), so extracting a component of a valid
+        # module raised TypeError, and a comparison like (4, 1) < (2, 8) was one False instead of (false, true).
+        text = HEADER.replace("%main = OpFunction",
+                              "%v2uint = OpTypeVector %uint 2\n%v2bool = OpTypeVector %bool 2\n"
+                              "%v4uint = OpTypeVector %uint 4\n%v4bool = OpTypeVector %bool 4\n"
+                              "%main = OpFunction")
+
+        def component(op, a, b, i):
+            vec = "%v4" if len(a) == 4 else "%v2"
+            body = (f"%va = OpCompositeConstruct {vec}uint {' '.join(a)}\n"
+                    f"%vb = OpCompositeConstruct {vec}uint {' '.join(b)}\n"
+                    f"%c = {op} {vec}bool %va %vb\n"
+                    f"%p = OpCompositeExtract %bool %c {i}\n"
+                    "%res = OpSelect %uint %p %c1 %c0\n")
+            return si.run_fragment(text + body + "OpStore %out %res\n" + FOOTER)["%out"][0]
+
+        cases = (
+            ("OpIEqual", ("%c4", "%c1"), ("%c4", "%c8"), (1, 0)),
+            ("OpINotEqual", ("%c4", "%c1"), ("%c4", "%c1"), (0, 0)),
+            ("OpULessThan", ("%c4", "%c1"), ("%c2", "%c8"), (0, 1)),        # tuple order would be one False
+            ("OpUGreaterThan", ("%c4", "%c1"), ("%c2", "%c8"), (1, 0)),
+            ("OpSLessThan", ("%cFF", "%c1"), ("%c1", "%c8"), (1, 1)),       # signed -1 < 1; unsigned would be (0, 1)
+            ("OpSGreaterThan", ("%cFF", "%c1"), ("%c1", "%c8"), (0, 0)),
+            ("OpIEqual", ("%c4", "%c1", "%c2", "%c8"), ("%c4", "%c8", "%c2", "%c1"), (1, 0, 1, 0)),
+        )
+        for op, a, b, want in cases:
+            for i in range(len(a)):
+                with self.subTest(op=op, a=a, b=b, i=i):
+                    self.assertEqual(component(op, a, b, i), want[i])
+
     def test_add_carry(self):
         # 0xFFFFFFFF + 2 = 1, carry 1; 1 + 2 = 3, carry 0
         self.assertEqual(run_word("%s = OpIAddCarry %umul %cFF %c2\n"
