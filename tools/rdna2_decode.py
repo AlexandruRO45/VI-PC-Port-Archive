@@ -17,6 +17,7 @@ import os
 import struct
 import sys
 from collections.abc import Iterator
+from functools import lru_cache
 from io import StringIO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +25,28 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import rdna2_isa_tables as T  # noqa: E402
+
+_U32 = struct.Struct("<I").unpack_from
+
+# Per-table-entry facts derived from an opcode spec (source-operand count, whether it has an offset operand), computed
+# once per entry. The key is the spec's identity and the value keeps the spec alive, so an id is never reused for
+# another spec; the tables are constants, so this holds a few hundred entries (and is cleared at 4096 if a caller
+# feeds in throwaway specs).
+_SPEC_INFO: dict[int, tuple] = {}
+_SPEC_INFO_MAX = 4096
+_SRC_INDEX = {"SRC0": 0, "SRC1": 1, "SRC2": 2}
+
+
+def _spec_info(spec) -> tuple:
+    """`(spec, nsrc, has_offset)` for one opcode spec."""
+    info = _SPEC_INFO.get(id(spec))
+    if info is None or info[0] is not spec:
+        if len(_SPEC_INFO) >= _SPEC_INFO_MAX:
+            _SPEC_INFO.clear()
+        nsrc = sum(1 for fn, _, _ in spec if fn in ("SRC0", "SRC1", "SRC2"))
+        has_offset = any(fn in ("OFFSET", "SOFFSET") for fn, _, _ in spec)
+        info = _SPEC_INFO[id(spec)] = (spec, nsrc, has_offset)
+    return info
 
 with open(os.path.join(HERE, "gfx10_formats.json"), encoding="utf-8") as _f:
     _GFX10_FORMATS = {int(k): v for k, v in json.load(_f).items()}
@@ -81,6 +104,15 @@ _MIMG_DIMS = {
 
 _MIMG_DIM_COORDS = {0: 1, 1: 2, 2: 3, 3: 3, 4: 2, 5: 3, 6: 3, 7: 4}
 _MIMG_GRAD_COORDS = {0: 1, 1: 2, 2: 3, 3: 2, 4: 1, 5: 2, 6: 2, 7: 2}
+
+# Text of an inline float constant, by value (the first matching code wins, as in a scan of _INLINE_FLOAT_STR).
+_FLOAT_TEXT: dict = {}
+for _code, _txt in _INLINE_FLOAT_STR.items():
+    _FLOAT_TEXT.setdefault(_INLINE_FLOAT[_code], _txt)
+del _code, _txt
+
+# "0x%02x" for every byte value, for the `; encoding: [...]` comment.
+_BYTE_TEXT = tuple(f"0x{b:02x}" for b in range(256))
 
 _SDWA_SELS = {
     0: "BYTE_0",
@@ -200,13 +232,17 @@ def _sreg(code: int, n: int) -> dict:
 
 
 def _vreg(reg: int, n: int = 1) -> dict:
-    return {"k": "vgpr", "r": reg & 0xFF, "n": max(1, n), "neg": False, "abs": False}
+    return {"k": "vgpr", "r": reg & 0xFF, "n": n if n > 1 else 1, "neg": False, "abs": False}
 
 
-def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False) -> dict:
+def _src(code: int, n: int, lit: int | None, neg: bool = False, absm: bool = False) -> dict:
     """Decode a 9-bit RDNA2 source operand (0..511)."""
-    if code <= 127:
+    if code <= 105 and n <= 1:
+        op = {"k": "sgpr", "r": code, "n": 1, "neg": False, "abs": False}
+    elif code <= 127:
         op = _sreg(code, n)
+    elif 256 <= code <= 511:
+        op = {"k": "vgpr", "r": code - 256, "n": n if n > 1 else 1, "neg": False, "abs": False}
     elif 128 <= code <= 192:
         op = {"k": "imm", "v": code - 128}
     elif 193 <= code <= 208:
@@ -223,19 +259,14 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
         op = {"k": "special", "t": "src_lds_direct", "neg": False, "abs": False}
     elif code == 255:
         op = {"k": "imm", "v": 0 if lit is None else lit}
-    elif 256 <= code <= 511:
-        op = _vreg(code - 256, n)
     else:
         op = {"k": "raw", "t": f"src_{code}"}
 
     if absm:
         op["abs"] = True
     if neg:
-        if op["k"] in ("imm", "fimm"):
-            # Preserve neg modifier on constants (same semantics as shader_ir.operand("neg(...)")).
-            op["neg"] = True
-        else:
-            op["neg"] = True
+        # A neg modifier is kept on constants too (same semantics as shader_ir.operand("neg(...)")).
+        op["neg"] = True
     return op
 
 
@@ -351,6 +382,7 @@ def _format_ds_swizzle(offset16: int) -> str:
     return f"offset:{offset16}"
 
 
+@lru_cache(maxsize=4096)
 def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     """Number of address VGPRs for an MIMG instruction."""
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
@@ -391,6 +423,7 @@ def _mimg_addr_count(name: str, dim: int, a16: bool) -> int:
     return fixed32 + packable
 
 
+@lru_cache(maxsize=8192)
 def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     if name in ("image_bvh_intersect_ray", "image_bvh64_intersect_ray"):
         return 4
@@ -412,23 +445,34 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     return n + (1 if tfe else 0)
 
 
+def _finish(code: bytes, pc: int, op: str, args: list, mods: list, nbytes: int) -> tuple[dict, int]:
+    return {
+        "op": op,
+        "args": args,
+        "mods": mods,
+        "enc": code[pc:pc + nbytes].hex(),
+        "pc": pc,
+    }, nbytes
+
+
+@lru_cache(maxsize=2048)
+def _vop3_op_name(opc: int, name: str) -> str:
+    """Mnemonic of a VOP3 opcode: `_e64` is added to those that also have a 32-bit VOPC/VOP2/VOP1 form (0..511)."""
+    # Matches llvm-mc.
+    has_e32 = (opc < 0x100 and opc in T.VOPC) or (0x100 <= opc < 0x140 and (opc - 0x100) in T.VOP2) or \
+              (0x180 <= opc < 0x200 and (opc - 0x180) in T.VOP1)
+    op_name = (name + "_e64") if (has_e32 and not name.startswith(("v_mad_", "v_fma_"))) else name
+    if opc == 0x100 + 0x06 or opc == 0x100 + 0x1F:
+        op_name = name + "_e64"
+    return op_name
+
+
 def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | None, int]:
     """Decode one RDNA2 instruction at byte offset `pc`. Returns (ins_dict_or_None, byte_length)."""
     if pc + 4 > len(code):
         return None, len(code) - pc
-    w0 = struct.unpack_from("<I", code, pc)[0]
-
-    def need(nbytes: int) -> bool:
-        return pc + nbytes <= len(code)
-
-    def finish(op: str, args: list, mods: list, nbytes: int) -> tuple[dict, int]:
-        return {
-            "op": op,
-            "args": args,
-            "mods": mods,
-            "enc": code[pc:pc + nbytes].hex(),
-            "pc": pc,
-        }, nbytes
+    w0 = _U32(code, pc)[0]
+    wv = 1 if wave32 else 2  # width of a spec register count of -1 (one wave's lane mask)
 
     # ---- 1. Bit 31 == 0: VOP1 / VOPC / VOP2 (plus DPP16 / DPP8 / SDWA / literal) ----
     if (w0 >> 31) == 0:
@@ -447,9 +491,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             name, spec = entry
             mods = []
             if is_dpp16 or is_dpp8 or is_sdwa:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                w1 = struct.unpack_from("<I", code, pc + 4)[0]
+                w1 = _U32(code, pc + 4)[0]
                 nbytes = 8
                 src0_reg = w1 & 0xFF
                 if is_dpp16:
@@ -501,28 +545,28 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     mods.append(f"src0_sel:{_SDWA_SELS.get(src0_sel, 'DWORD')}")
                 args = []
                 for fn, nr, _ in spec:
-                    w = _width(nr, wave32)
+                    w = nr if nr != -1 else wv
                     if fn == "VDST":
                         args.append(_vreg(vdst, w))
                     elif fn == "SRC0":
                         args.append(s0)
-                return finish(op_name, args, mods, nbytes)
+                return _finish(code, pc, op_name, args, mods, nbytes)
             lit = None
             nbytes = 4
             if src0 == 255:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                lit = struct.unpack_from("<I", code, pc + 4)[0]
+                lit = _U32(code, pc + 4)[0]
                 nbytes = 8
             op_name = name if not spec or name in ("v_nop", "v_clrexcp", "v_pipeflush", "v_readfirstlane_b32") else name + "_e32"
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "VDST":
                     args.append(_sreg(vdst & 0x7F, 1) if name == "v_readfirstlane_b32" else _vreg(vdst, w))
                 elif fn == "SRC0":
                     args.append(_src(src0, w, lit))
-            return finish(op_name, args, mods, nbytes)
+            return _finish(code, pc, op_name, args, mods, nbytes)
 
         if hi7 == 0x3E:  # VOPC
             opc = (w0 >> 17) & 0xFF
@@ -533,9 +577,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             name, spec = entry
             mods = []
             if is_sdwa:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                w1 = struct.unpack_from("<I", code, pc + 4)[0]
+                w1 = _U32(code, pc + 4)[0]
                 src0_reg = w1 & 0xFF
                 sdst = (w1 >> 8) & 0x7F
                 sd = bool((w1 >> 15) & 1)
@@ -561,17 +605,17 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 mods.append(f"src1_sel:{_SDWA_SELS.get(src1_sel, 'DWORD')}")
                 dst_op = _sreg(sdst, 1 if wave32 else 2) if sd else _vcc_operand(wave32)
                 args = [dst_op, s0, s1] if not name.startswith("v_cmpx_") else [s0, s1]
-                return finish(name + "_sdwa", args, mods, 8)
+                return _finish(code, pc, name + "_sdwa", args, mods, 8)
             lit = None
             nbytes = 4
             if src0 == 255:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                lit = struct.unpack_from("<I", code, pc + 4)[0]
+                lit = _U32(code, pc + 4)[0]
                 nbytes = 8
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "VCC":
                     if not name.startswith("v_cmpx_"):
                         args.append(_vcc_operand(wave32))
@@ -579,7 +623,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     args.append(_src(src0, w, lit))
                 elif fn == "VSRC1":
                     args.append(_vreg(vsrc1, w))
-            return finish(name + "_e32", args, mods, nbytes)
+            return _finish(code, pc, name + "_e32", args, mods, nbytes)
 
         # VOP2
         opc = (w0 >> 25) & 0x3F
@@ -591,9 +635,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         mods = []
         if is_dpp16 or is_dpp8 or is_sdwa:
-            if not need(8):
+            if not pc + 8 <= len(code):
                 return None, 4
-            w1 = struct.unpack_from("<I", code, pc + 4)[0]
+            w1 = _U32(code, pc + 4)[0]
             src0_reg = w1 & 0xFF
             if is_dpp16:
                 op_name = name + "_dpp"
@@ -659,7 +703,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 mods.append(f"src1_sel:{_SDWA_SELS.get(src1_sel, 'DWORD')}")
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "VDST":
                     args.append(_vreg(vdst, w))
                 elif fn == "VCC":
@@ -668,20 +712,20 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     args.append(s0)
                 elif fn == "VSRC1":
                     args.append(s1)
-            return finish(op_name, args, mods, 8)
+            return _finish(code, pc, op_name, args, mods, 8)
 
         has_lit = (src0 == 255) or (opc in _VOP2_MANDATORY_LITERAL)
         lit = None
         nbytes = 4
         if has_lit:
-            if not need(8):
+            if not pc + 8 <= len(code):
                 return None, 4
-            lit = struct.unpack_from("<I", code, pc + 4)[0]
+            lit = _U32(code, pc + 4)[0]
             nbytes = 8
         op_name = name if opc in _VOP2_MANDATORY_LITERAL else name + "_e32"
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDST":
                 args.append(_vreg(vdst, w))
             elif fn == "VCC":
@@ -692,7 +736,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 args.append(_vreg(vsrc1, w))
             elif fn in ("SIMM32", "LITERAL"):
                 args.append({"k": "imm", "v": 0 if lit is None else lit})
-        return finish(op_name, args, mods, nbytes)
+        return _finish(code, pc, op_name, args, mods, nbytes)
 
     # ---- 2. Bits [31:30] == 0b10: SOP1 / SOPC / SOPP / SOPK / SOP2 ----
     if (w0 >> 30) == 0b10:
@@ -708,18 +752,18 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             lit = None
             nbytes = 4
             if ssrc0 == 255:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                lit = struct.unpack_from("<I", code, pc + 4)[0]
+                lit = _U32(code, pc + 4)[0]
                 nbytes = 8
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "SDST":
                     args.append(_sreg(sdst, w))
                 elif fn == "SSRC0":
                     args.append(_src(ssrc0, w, lit))
-            return finish(name, args, [], nbytes)
+            return _finish(code, pc, name, args, [], nbytes)
 
         if hi9 == 0x17E:  # SOPC
             opc = (w0 >> 16) & 0x7F
@@ -732,18 +776,18 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             lit = None
             nbytes = 4
             if ssrc0 == 255 or ssrc1 == 255:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                lit = struct.unpack_from("<I", code, pc + 4)[0]
+                lit = _U32(code, pc + 4)[0]
                 nbytes = 8
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "SSRC0":
                     args.append(_src(ssrc0, w, lit))
                 elif fn == "SSRC1":
                     args.append(_src(ssrc1, w, lit))
-            return finish(name, args, [], nbytes)
+            return _finish(code, pc, name, args, [], nbytes)
 
         if hi9 == 0x17F:  # SOPP
             opc = (w0 >> 16) & 0x7F
@@ -753,19 +797,19 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 return None, 4
             name, spec = entry
             if name in _SOPP_NO_OPERAND:
-                return finish(name, [], [], 4)
+                return _finish(code, pc, name, [], [], 4)
             if name == "s_waitcnt":
-                return finish(name, _format_waitcnt(simm16), [], 4)
+                return _finish(code, pc, name, _format_waitcnt(simm16), [], 4)
             if name == "s_waitcnt_vscnt":
                 # s_waitcnt_vscnt is SOPK, not SOPP; kept defensive.
-                return finish(name, [{"k": "imm", "v": simm16}], [], 4)
+                return _finish(code, pc, name, [{"k": "imm", "v": simm16}], [], 4)
             if name == "s_sendmsg" or name == "s_sendmsghalt":
-                return finish(name, [{"k": "special", "t": _format_sendmsg(simm16)}], [], 4)
+                return _finish(code, pc, name, [{"k": "special", "t": _format_sendmsg(simm16)}], [], 4)
             if name in _SOPP_BRANCHES:
-                return finish(name, [{"k": "imm", "v": _s16(simm16)}], [], 4)
+                return _finish(code, pc, name, [{"k": "imm", "v": _s16(simm16)}], [], 4)
             if name == "s_clause":
-                return finish(name, [{"k": "imm", "v": simm16}], [], 4)
-            return finish(name, [{"k": "imm", "v": simm16}], [], 4)
+                return _finish(code, pc, name, [{"k": "imm", "v": simm16}], [], 4)
+            return _finish(code, pc, name, [{"k": "imm", "v": simm16}], [], 4)
 
         if (w0 >> 28) == 0xB:  # SOPK
             opc = (w0 >> 23) & 0x1F
@@ -778,25 +822,25 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             lit = None
             nbytes = 4
             if opc in _SOPK_MANDATORY_LITERAL:
-                if not need(8):
+                if not pc + 8 <= len(code):
                     return None, 4
-                lit = struct.unpack_from("<I", code, pc + 4)[0]
+                lit = _U32(code, pc + 4)[0]
                 nbytes = 8
             if name in ("s_setreg_b32", "s_getreg_b32"):
                 hw = {"k": "special", "t": _format_hwreg(simm16)}
                 reg = _sreg(sdst, 1)
                 args = [hw, reg] if name == "s_setreg_b32" else [reg, hw]
-                return finish(name, args, [], 4)
+                return _finish(code, pc, name, args, [], 4)
             if name == "s_setreg_imm32_b32":
-                return finish(name, [{"k": "special", "t": _format_hwreg(simm16)},
+                return _finish(code, pc, name, [{"k": "special", "t": _format_hwreg(simm16)},
                                      {"k": "imm", "v": 0 if lit is None else lit}], [], nbytes)
             if name in ("s_waitcnt_vscnt", "s_waitcnt_vmcnt", "s_waitcnt_expcnt", "s_waitcnt_lgkmcnt"):
-                return finish(name, [_sreg(sdst, 1), {"k": "imm", "v": simm16}], [], 4)
+                return _finish(code, pc, name, [_sreg(sdst, 1), {"k": "imm", "v": simm16}], [], 4)
             if name == "s_call_b64":
-                return finish(name, [_sreg(sdst, 2), {"k": "imm", "v": _s16(simm16)}], [], 4)
+                return _finish(code, pc, name, [_sreg(sdst, 2), {"k": "imm", "v": _s16(simm16)}], [], 4)
             args = []
             for fn, nr, _ in spec:
-                w = _width(nr, wave32)
+                w = nr if nr != -1 else wv
                 if fn == "SDST":
                     args.append(_sreg(sdst, w))
                 elif fn == "SIMM16":
@@ -805,7 +849,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                                                    "s_cmpk_lt_i32", "s_cmpk_le_i32", "s_addk_i32",
                                                    "s_mulk_i32") else simm16
                     args.append({"k": "imm", "v": val})
-            return finish(name, args, [], nbytes)
+            return _finish(code, pc, name, args, [], nbytes)
 
         # SOP2
         opc = (w0 >> 23) & 0x7F
@@ -819,20 +863,20 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         lit = None
         nbytes = 4
         if ssrc0 == 255 or ssrc1 == 255:
-            if not need(8):
+            if not pc + 8 <= len(code):
                 return None, 4
-            lit = struct.unpack_from("<I", code, pc + 4)[0]
+            lit = _U32(code, pc + 4)[0]
             nbytes = 8
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "SDST":
                 args.append(_sreg(sdst, w))
             elif fn == "SSRC0":
                 args.append(_src(ssrc0, w, lit))
             elif fn == "SSRC1":
                 args.append(_src(ssrc1, w, lit))
-        return finish(name, args, [], nbytes)
+        return _finish(code, pc, name, args, [], nbytes)
 
     # ---- 3. Bits [31:26] == 0b11xxxx ----
     hi6 = w0 >> 26
@@ -852,12 +896,12 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             args = [_vreg(vdst, 1), {"k": "interp", "t": p}, {"k": "attr", "a": attr, "c": (w0 >> 8) & 3}]
         else:
             args = [_vreg(vdst, 1), _vreg(vsrc, 1), {"k": "attr", "a": attr, "c": (w0 >> 8) & 3}]
-        return finish(name, args, [], 4)
+        return _finish(code, pc, name, args, [], 4)
 
     # All remaining encodings are at least 64 bits.
-    if not need(8):
+    if not pc + 8 <= len(code):
         return None, 4
-    w1 = struct.unpack_from("<I", code, pc + 4)[0]
+    w1 = _U32(code, pc + 4)[0]
 
     if hi6 == 0x33:  # VOP3P (64-bit, +literal)
         opc = (w0 >> 16) & 0x7F
@@ -878,42 +922,39 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         lit = None
         nbytes = 8
-        nsrc = sum(1 for fn, _, _ in spec if fn in ("SRC0", "SRC1", "SRC2"))
+        nsrc = _spec_info(spec)[1]
         srcs_codes = [src0, src1, src2][:nsrc]
         if 255 in srcs_codes:
-            if not need(12):
+            if not pc + 12 <= len(code):
                 return None, 4
-            lit = struct.unpack_from("<I", code, pc + 8)[0]
+            lit = _U32(code, pc + 8)[0]
             nbytes = 12
         is_mix = name.startswith("v_fma_mix")
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDST":
                 args.append(_vreg(vdst, w))
-            elif fn in ("SRC0", "SRC1", "SRC2"):
-                idx = int(fn[-1])
+            elif fn in _SRC_INDEX:
+                idx = _SRC_INDEX[fn]
                 args.append(_src(srcs_codes[idx], w, lit,
-                                 neg=is_mix and bool(neg_lo & (1 << idx)),
-                                 absm=is_mix and bool(neg_hi & (1 << idx))))
+                                 is_mix and neg_lo & (1 << idx),
+                                 is_mix and neg_hi & (1 << idx)))
         mods = []
-        sel_bits = [(op_sel >> i) & 1 for i in range(nsrc)]
-        selhi_bits = [(op_sel_hi >> i) & 1 for i in range(nsrc)]
-        neglo_bits = [(neg_lo >> i) & 1 for i in range(nsrc)]
-        neghi_bits = [(neg_hi >> i) & 1 for i in range(nsrc)]
+        # Only the bits of the nsrc real sources count; each modifier list is built only when one of them is set.
+        src_mask = (1 << nsrc) - 1
         # v_fma_mix* uses op_sel/op_sel_hi with default [0,...]; standard packed ops default op_sel_hi to [1,...].
-        if any(sel_bits):
-            mods.append(f"op_sel:[{','.join(str(b) for b in sel_bits)}]")
-        default_hi = [0] * nsrc if is_mix else [1] * nsrc
-        if selhi_bits != default_hi:
-            mods.append(f"op_sel_hi:[{','.join(str(b) for b in selhi_bits)}]")
-        if not is_mix and any(neglo_bits):
-            mods.append(f"neg_lo:[{','.join(str(b) for b in neglo_bits)}]")
-        if not is_mix and any(neghi_bits):
-            mods.append(f"neg_hi:[{','.join(str(b) for b in neghi_bits)}]")
+        if op_sel & src_mask:
+            mods.append(f"op_sel:[{','.join(str((op_sel >> i) & 1) for i in range(nsrc))}]")
+        if (op_sel_hi & src_mask) != (0 if is_mix else src_mask):
+            mods.append(f"op_sel_hi:[{','.join(str((op_sel_hi >> i) & 1) for i in range(nsrc))}]")
+        if not is_mix and neg_lo & src_mask:
+            mods.append(f"neg_lo:[{','.join(str((neg_lo >> i) & 1) for i in range(nsrc))}]")
+        if not is_mix and neg_hi & src_mask:
+            mods.append(f"neg_hi:[{','.join(str((neg_hi >> i) & 1) for i in range(nsrc))}]")
         if clamp:
             mods.append("clamp")
-        return finish(name, args, mods, nbytes)
+        return _finish(code, pc, name, args, mods, nbytes)
 
     if hi6 == 0x35:  # VOP3 / VOP3B (64-bit, +literal)
         opc = (w0 >> 16) & 0x3FF
@@ -934,26 +975,20 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
-        nsrc = sum(1 for fn, _, _ in spec if fn in ("SRC0", "SRC1", "SRC2"))
-        srcs_codes = [src0, src1, src2][:nsrc]
+        nsrc = _spec_info(spec)[1]
         lit = None
         nbytes = 8
-        if 255 in srcs_codes:
-            if not need(12):
+        if (src0 == 255 and nsrc > 0) or (src1 == 255 and nsrc > 1) or (src2 == 255 and nsrc > 2):
+            if not pc + 12 <= len(code):
                 return None, 4
-            lit = struct.unpack_from("<I", code, pc + 8)[0]
+            lit = _U32(code, pc + 8)[0]
             nbytes = 12
-        # Add _e64 suffix for opcodes that also have a 32-bit VOPC/VOP2/VOP1 form (0..511), matching llvm-mc.
-        has_e32 = (opc < 0x100 and opc in T.VOPC) or (0x100 <= opc < 0x140 and (opc - 0x100) in T.VOP2) or \
-                  (0x180 <= opc < 0x200 and (opc - 0x180) in T.VOP1)
-        op_name = (name + "_e64") if (has_e32 and not name.startswith(("v_mad_", "v_fma_"))) else name
-        if opc == 0x100 + 0x06 or opc == 0x100 + 0x1F:
-            op_name = name + "_e64"
+        op_name = _vop3_op_name(opc, name)
         args = []
         mods = []
         is_interp_vop3 = opc in (0x200, 0x201, 0x202, 0x342, 0x343, 0x35A)
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDST":
                 if opc < 0x100:  # VOPC promoted to VOP3: VDST field actually holds SDST (7-bit)
                     if not name.startswith("v_cmpx_"):
@@ -970,15 +1005,15 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     if opc in (0x342, 0x343, 0x35A) and ((src0 >> 8) & 1):
                         mods.append("high")
                 else:
-                    args.append(_src(src0, w, lit, neg=bool(neg & 1), absm=bool(abs_bits & 1)))
+                    args.append(_src(src0, w, lit, neg & 1, abs_bits & 1))
             elif fn == "SRC1":
                 if opc == 0x202:  # v_interp_mov_f32_e64: param selector p10/p20/p0
                     p = {0: "p10", 1: "p20", 2: "p0"}.get(src1 & 3, f"p{src1}")
                     args.append({"k": "interp", "t": p})
                 else:
-                    args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
+                    args.append(_src(src1, w, lit, neg & 2, abs_bits & 2))
             elif fn == "SRC2":
-                args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
+                args.append(_src(src2, w, lit, neg & 4, abs_bits & 4))
         if op_sel:
             # op_sel prints [s0,s1,...,dst] (nsrc + 1 bits, or nsrc for VOPC).
             nbits = nsrc if opc < 0x100 else (nsrc + 1)
@@ -990,7 +1025,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("clamp")
         if omod in _OMOD_MODS:
             mods.append(_OMOD_MODS[omod])
-        return finish(op_name, args, mods, nbytes)
+        return _finish(code, pc, op_name, args, mods, nbytes)
 
     if hi6 == 0x36:  # DS (64-bit)
         opc = (w0 >> 18) & 0xFF
@@ -1007,7 +1042,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDST":
                 args.append(_vreg(vdst, w))
             elif fn == "ADDR":
@@ -1031,7 +1066,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 mods.append(f"offset:{off16}")
         if gds:
             mods.append("gds")
-        return finish(name, args, mods, 8)
+        return _finish(code, pc, name, args, mods, 8)
 
     if hi6 == 0x37:  # FLAT / SCRATCH / GLOBAL (64-bit)
         seg = (w0 >> 14) & 3
@@ -1045,7 +1080,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         data = (w1 >> 8) & 0xFF
         saddr = (w1 >> 16) & 0x7F
         vdst = (w1 >> 24) & 0xFF
-        tbl = {0: T.FLAT, 1: T.SCRATCH, 2: T.GLOBAL}.get(seg)
+        tbl = (T.FLAT, T.SCRATCH, T.GLOBAL, None)[seg]
         if tbl is None or opc not in tbl:
             return None, 4
         name, spec = tbl[opc]
@@ -1054,7 +1089,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         saddr_off = saddr in (0x7D, 0x7F)  # GFX10 null (125) or legacy 127 => off (64-bit vaddr)
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDST":
                 if is_atomic and not glc:
                     continue
@@ -1081,7 +1116,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("dlc")
         if lds:
             mods.append("lds")
-        return finish(name, args, mods, 8)
+        return _finish(code, pc, name, args, mods, 8)
 
     if hi6 == 0x38:  # MUBUF (64-bit)
         opc = (w0 >> 18) & 0xFF
@@ -1103,7 +1138,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDATA":
                 args.append(_vreg(vdata, w))
             elif fn == "VADDR":
@@ -1132,7 +1167,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("lds")
         if tfe:
             mods.append("tfe")
-        return finish(name, args, mods, 8)
+        return _finish(code, pc, name, args, mods, 8)
 
     if hi6 == 0x3A:  # MTBUF (64-bit)
         opc = ((w0 >> 16) & 0x7) | (((w1 >> 21) & 1) << 3)
@@ -1154,7 +1189,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         name, spec = entry
         args = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "VDATA":
                 args.append(_vreg(vdata, w))
             elif fn == "VADDR":
@@ -1187,7 +1222,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("dlc")
         if tfe:
             mods.append("tfe")
-        return finish(name, args, mods, 8)
+        return _finish(code, pc, name, args, mods, 8)
 
     if hi6 == 0x3C:  # MIMG (64-bit + up to 3 NSA dwords)
         nsa_dwords = (w0 >> 1) & 3
@@ -1212,7 +1247,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             return None, 4
         name, spec = entry
         nbytes = 8 + 4 * nsa_dwords
-        if not need(nbytes):
+        if not pc + nbytes <= len(code):
             return None, 4
         n_addr = _mimg_addr_count(name, dim, bool(a16))
         if nsa_dwords:
@@ -1223,7 +1258,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         else:
             vaddr_op = _vreg(vaddr0, n_addr)
         n_data = _mimg_data_count(name, dmask, bool(d16), bool(tfe))
-        rsrc_w = 4 if (r128 or name.startswith("image_bvh")) else 8
+        is_bvh = name.startswith("image_bvh")
+        rsrc_w = 4 if (r128 or is_bvh) else 8
         args = []
         for fn, nr, _ in spec:
             if fn == "VDATA":
@@ -1235,9 +1271,9 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn == "SSAMP":
                 args.append(_sreg(ssamp, 4))
         mods = []
-        if dmask and not name.startswith("image_bvh"):
+        if dmask and not is_bvh:
             mods.append(f"dmask:0x{dmask:x}")
-        if not name.startswith("image_bvh"):
+        if not is_bvh:
             mods.append(f"dim:{_MIMG_DIMS.get(dim, 'SQ_RSRC_IMG_2D')}")
             if unorm:
                 mods.append("unorm")
@@ -1245,7 +1281,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("glc")
         if slc:
             mods.append("slc")
-        if r128 and not name.startswith("image_bvh"):
+        if r128 and not is_bvh:
             mods.append("r128")
         if tfe:
             mods.append("tfe")
@@ -1257,7 +1293,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("d16")
         if dlc:
             mods.append("dlc")
-        return finish(name, args, mods, nbytes)
+        return _finish(code, pc, name, args, mods, nbytes)
 
     if hi6 == 0x3D:  # SMEM (64-bit)
         sbase = (w0 & 0x3F) * 2
@@ -1275,7 +1311,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         args = []
         mods = []
         for fn, nr, _ in spec:
-            w = _width(nr, wave32)
+            w = nr if nr != -1 else wv
             if fn == "SDATA":
                 args.append(_sreg(sdata, w))
             elif fn == "SBASE":
@@ -1283,7 +1319,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             elif fn in ("OFFSET", "SOFFSET"):
                 pass
         # SMEM offset operands: soff != 125 (null) => register offset (+ optional offset:IMM); else immediate (or null if 0).
-        if any(fn in ("OFFSET", "SOFFSET") for fn, _, _ in spec):
+        if _spec_info(spec)[2]:
             imm_val = off21 if is_buf else _s21(off21)
             if soff == 125:  # null => immediate offset (or null when 0)
                 if imm_val == 0:
@@ -1300,7 +1336,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("glc")
         if dlc:
             mods.append("dlc")
-        return finish(name, args, mods, 8)
+        return _finish(code, pc, name, args, mods, 8)
 
     if hi6 == 0x3E:  # EXP (64-bit)
         en = w0 & 0xF
@@ -1344,7 +1380,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
             mods.append("compr")
         if vm:
             mods.append("vm")
-        return finish("exp", args, mods, 8)
+        return _finish(code, pc, "exp", args, mods, 8)
 
     return None, 4
 
@@ -1368,7 +1404,12 @@ def _format_operand(a: dict, hex_imm: bool = False) -> str:
         s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
-        s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
+        try:
+            s = _FLOAT_TEXT.get(v)
+        except TypeError:  # unhashable value: no inline constant equals it
+            s = None
+        if s is None:
+            s = repr(v)
     else:
         s = str(a)
 
@@ -1391,16 +1432,20 @@ def format_insn(ins: dict) -> str:
     mods = ins["mods"]
     hex_imm = op == "s_ttracedata_imm"
     if op == "exp" and args:
-        head = f"{op} {_format_operand(args[0], hex_imm)} " + ", ".join(
-            _format_operand(x, hex_imm) for x in args[1:])
+        if hex_imm:
+            head = f"{op} {_format_operand(args[0], True)} " + ", ".join(_format_operand(x, True) for x in args[1:])
+        else:
+            head = f"{op} {_format_operand(args[0])} " + ", ".join(map(_format_operand, args[1:]))
     elif args:
-        head = f"{op} " + ", ".join(_format_operand(x, hex_imm) for x in args)
+        if hex_imm:
+            head = f"{op} " + ", ".join(_format_operand(x, True) for x in args)
+        else:
+            head = f"{op} " + ", ".join(map(_format_operand, args))
     else:
         head = op
     if mods:
         head += " " + " ".join(mods)
-    enc_bytes = bytes.fromhex(ins["enc"])
-    enc_str = ",".join(f"0x{b:02x}" for b in enc_bytes)
+    enc_str = ",".join(map(_BYTE_TEXT.__getitem__, bytes.fromhex(ins["enc"])))
     return f"\t{head:<40s}; encoding: [{enc_str}]"
 
 
