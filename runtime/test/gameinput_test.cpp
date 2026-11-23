@@ -491,19 +491,39 @@ void test_motion(IGameInput* input) {
           "motion: motionInfo carries the shim's maxima (magnetometer unavailable)");
     check(pi->motionInfo == nullptr, "motion: the plain pad's motionInfo is null");
 
-    // Before the first sensor sample arrives, SDL answers reads with zeros and the shim reports no motion at all.
+    // A sensor-capable pad has no motion until both sensors have delivered a sample.
     IGameInputReading* r = nullptr;
     GameInputMotionState unused{};
     check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(&unused),
           "motion: before the first sample, GetMotionState is false even on a sensor pad");
     if (r) r->Release();
 
+    const float zeros[3] = {};
+    check(SDL_SendJoystickVirtualSensorData(gyro_pad.js, SDL_SENSOR_GYRO, SDL_GetTicksNS(), zeros, 3),
+          "motion: the virtual pad accepts a zero gyro-only sample");
+    // Button changes publish sensor state immediately, without waiting for the motion cadence.
+    SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    bool got = false;
+    motion_state(input, mdev, &got);
+    check(!got, "motion: a gyro sample without an accelerometer sample is incomplete");
+
+    check(SDL_SendJoystickVirtualSensorData(gyro_pad.js, SDL_SENSOR_ACCEL, SDL_GetTicksNS(), zeros, 3),
+          "motion: the virtual pad accepts a zero accelerometer sample");
+    SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    rt::gameinput::poll();
+    const GameInputMotionState zero = motion_state(input, mdev, &got);
+    check(got && zero.accelerationX == 0.0f && zero.accelerationY == 0.0f && zero.accelerationZ == 0.0f &&
+              zero.angularVelocityX == 0.0f && zero.angularVelocityY == 0.0f && zero.angularVelocityZ == 0.0f &&
+              zero.accelerometerAccuracy == GameInputMotionAccuracyHigh &&
+              zero.gyroscopeAccuracy == GameInputMotionAccuracyHigh,
+          "motion: the first all-zero sensor pair is a valid high-accuracy sample");
+
     // 9.80665 m/s^2 is half of the 2 g maximum; 17.4533 rad/s is half of 2000 deg/s. A reading with the sample needs
     // either a gamepad change or the ~8 ms motion cadence, so the test waits out the window before polling.
     send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 17.4533f, 0.0f, 0.0f);
     Sleep(12);
     rt::gameinput::poll();
-    bool got = false;
     const GameInputMotionState ms = motion_state(input, mdev, &got);
     check(got, "motion: GetMotionState true on a motion reading");
     check(approx(ms.accelerationZ, 0.5f) && approx(ms.angularVelocityX, 0.5f),
@@ -534,14 +554,20 @@ void test_motion(IGameInput* input) {
     check(sat.accelerationX == 1.0f && sat.accelerationY == -1.0f && sat.angularVelocityZ == -1.0f,
           "motion: out-of-range sensor values clamp to the +-1 fraction range");
 
+    send_motion(gyro_pad, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    const GameInputMotionState stopped = motion_state(input, mdev, &got);
+    check(got && stopped.accelerationX == 0.0f && stopped.accelerationY == 0.0f && stopped.accelerationZ == 0.0f &&
+              stopped.angularVelocityX == 0.0f && stopped.angularVelocityY == 0.0f && stopped.angularVelocityZ == 0.0f,
+          "motion: returning to all zeros replaces the previous active sample");
+
     // The cadence: with the buttons idle, a changed gyro yields a new reading only once per ~8 ms window, not one
     // per poll, so the history still spans the half second it is documented for.
-    send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 0.0f, 0.0f, 0.0f);
-    rt::gameinput::poll();
     IGameInputReading* first = nullptr;
     check(input->GetCurrentReading(GameInputKindMotion, mdev, &first) == S_OK && first,
           "motion: a reading exists after a sensor update");
-    send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 34.9066f, 0.0f, 0.0f);  // gravity stays: zero accel means "no sample"
+    send_motion(gyro_pad, 0.0f, 0.0f, 0.0f, 34.9066f, 0.0f, 0.0f);
     rt::gameinput::poll();
     IGameInputReading* none = nullptr;
     check(input->GetNextReading(first, GameInputKindMotion, mdev, &none) == GAMEINPUT_E_READING_NOT_FOUND && !none,
@@ -553,11 +579,38 @@ void test_motion(IGameInput* input) {
           "motion: after the window the latest sensor state is in a new reading");
     if (next) {
         GameInputMotionState later{};
-        check(next->GetMotionState(&later) && approx(later.angularVelocityX, 1.0f),
-              "motion: the new reading carries the newest gyro sample");
+        check(next->GetMotionState(&later) && later.accelerationX == 0.0f && later.accelerationY == 0.0f &&
+                  later.accelerationZ == 0.0f && approx(later.angularVelocityX, 1.0f),
+              "motion: the cadence publishes zero acceleration with the newest gyro sample");
         next->Release();
     }
     if (first) first->Release();
+
+    // The device object survives replugging, but each connection needs fresh samples from both sensors.
+    detach(gyro_pad);
+    rt::gameinput::poll();
+    attach(gyro_pad, "Leonida virtual gyro pad", 0x054C, 0x0CE6, false, true);
+    rt::gameinput::poll();
+    r = current(input, mdev);
+    check(r && device_of(r) == mdev && !r->GetMotionState(&unused),
+          "motion: reconnect reuses the device object without its previous sensor readiness");
+    if (r) r->Release();
+
+    const float accel[3] = {0.0f, 0.0f, 9.80665f};
+    check(SDL_SendJoystickVirtualSensorData(gyro_pad.js, SDL_SENSOR_ACCEL, SDL_GetTicksNS(), accel, 3),
+          "motion: the virtual pad accepts an accelerometer-only sample");
+    SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+    rt::gameinput::poll();
+    motion_state(input, mdev, &got);
+    check(!got, "motion: an accelerometer sample without a gyro sample is incomplete");
+
+    send_motion(gyro_pad, 0.0f, 0.0f, 0.0f, 17.4533f, 0.0f, 0.0f);
+    SDL_SetJoystickVirtualButton(gyro_pad.js, SDL_GAMEPAD_BUTTON_SOUTH, false);
+    rt::gameinput::poll();
+    const GameInputMotionState rotating = motion_state(input, mdev, &got);
+    check(got && rotating.accelerationX == 0.0f && rotating.accelerationY == 0.0f && rotating.accelerationZ == 0.0f &&
+              approx(rotating.angularVelocityX, 0.5f),
+          "motion: zero acceleration with a nonzero gyro remains a valid motion sample");
 
     detach(gyro_pad);
     detach(plain);

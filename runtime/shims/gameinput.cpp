@@ -78,7 +78,6 @@ constexpr size_t kHistoryCap = 512;       // readings per pad, whatever the poll
 // DualSense's accelerometer and gyro can express (VERIFY: against the game and a real pad, docs/gameinput.md).
 constexpr float kMaxAcceleration = 19.6133f;     // 2 g in m/s^2
 constexpr float kMaxAngularVelocity = 34.9066f;  // 2000 deg/s in rad/s
-constexpr float kMotionSensorRate = 250.0f;      // requested sample rate; the device clamps to what it has
 constexpr uint64_t kMotionReadingUs = 8'000;     // a motion pad streams readings at ~125 Hz so the history stays sane
 
 uint64_t now_us() {
@@ -517,6 +516,7 @@ public:
     SDL_JoystickID id = 0;
     int player = -1;
     bool is_dualsense = false, has_rumble = false, has_trigger_rumble = false, has_motion = false;
+    bool accel_seen = false, gyro_seen = false;  // first SDL samples on this connection
     bool has_trigger_output = false;  // the pad backs trigger motors: rumble, DualSense effects or haptic motors
     void* haptic = nullptr;           // SDL_Haptic behind the joystick, when SDL has one for this pad
     uint32_t ff_features = 0;         // the SDL_HAPTIC_* bits it reports: which effect kinds it can play
@@ -1054,14 +1054,11 @@ Snapshot read_pad(Device* d) {
     s.guide = down(SDL_GAMEPAD_BUTTON_GUIDE);
 
     // Motion, normalised against the maxima motionInfo reports (the ABI's fraction convention). Sensors were enabled
-    // when the pad was opened; a pad whose sensor read fails just reports no motion this poll. SDL answers reads
-    // with zeros before the device's first sample arrives, and gravity makes a real accelerometer never read
-    // exactly zero, so all-zero accel means "no sample yet" and the reading carries no motion at all.
-    if (d->has_motion) {
+    // when the pad was opened. SDL's initial sensor cache contains zeros, which are also valid measured values.
+    if (d->accel_seen && d->gyro_seen) {
         float accel[3], gyro[3];
         if (SDL_GetGamepadSensorData(p, SDL_SENSOR_ACCEL, accel, 3) &&
-            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3) &&
-            (accel[0] != 0.0f || accel[1] != 0.0f || accel[2] != 0.0f)) {
+            SDL_GetGamepadSensorData(p, SDL_SENSOR_GYRO, gyro, 3)) {
             s.has_motion = true;
             s.motion.accelerationX = norm(accel[0], kMaxAcceleration);
             s.motion.accelerationY = norm(accel[1], kMaxAcceleration);
@@ -1339,9 +1336,11 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
     // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
     d->has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
+    d->accel_seen = d->gyro_seen = false;
     if (d->has_motion) {
-        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
-        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
+        SDL_SetEventEnabled(SDL_EVENT_GAMEPAD_SENSOR_UPDATE, true);
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, true);
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, true);
     }
     d->has_trigger_output = d->has_trigger_rumble ||
                             (d->is_dualsense && s.config.ds_triggers != rt::gameinput::DsTriggerMode::Off);
@@ -1857,7 +1856,7 @@ bool init_sdl() {
 #ifdef SDL_HINT_JOYSTICK_GAMEINPUT
     SDL_SetHint(SDL_HINT_JOYSTICK_GAMEINPUT, "0");
 #endif
-    SDL_SetGamepadEventsEnabled(false);  // the shim reads state directly; nothing drains an event queue
+    SDL_SetGamepadEventsEnabled(false);  // open_pad enables sensor events while waiting for initial samples
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[rt] gameinput: SDL gamepad init failed: %s; no controllers\n", SDL_GetError());
         s.sdl_failed = true;
@@ -1869,6 +1868,32 @@ bool init_sdl() {
     std::fprintf(stderr, "[rt] gameinput: SDL %d.%d.%d gamepads\n", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v),
                  SDL_VERSIONNUM_MICRO(v));
     return true;
+}
+
+void observe_motion_samples(const std::vector<Device*>& connected) {
+    constexpr auto type = SDL_EVENT_GAMEPAD_SENSOR_UPDATE;
+    if (!SDL_EventEnabled(type)) return;
+    constexpr int batch_size = 16;
+    SDL_Event events[batch_size];
+    int count;
+    do {
+        count = SDL_PeepEvents(events, batch_size, SDL_GETEVENT, type, type);
+        for (int i = 0; i < count; ++i) {
+            const auto& sample = events[i].gsensor;
+            for (Device* d : connected) {
+                if (d->id != sample.which || !d->has_motion) continue;
+                if (sample.sensor == SDL_SENSOR_ACCEL) d->accel_seen = true;
+                if (sample.sensor == SDL_SENSOR_GYRO) d->gyro_seen = true;
+                break;
+            }
+        }
+    } while (count == batch_size);
+    // Subsequent polls read the sensor cache directly. A new connection enables events again.
+    if (std::none_of(connected.begin(), connected.end(), [](const Device* d) {
+            return d->has_motion && !(d->accel_seen && d->gyro_seen);
+        })) {
+        SDL_SetEventEnabled(type, false);
+    }
 }
 
 void poll_once() {
@@ -1906,6 +1931,7 @@ void poll_once() {
         std::lock_guard lock(s.mu);
         connected = s.connected;
     }
+    observe_motion_samples(connected);
     for (Device* d : connected) {
         Snapshot snap = read_pad(d);
         read_raw(d, &snap);

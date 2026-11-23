@@ -228,16 +228,16 @@ Pads whose SDL gamepad reports both a gyroscope and an accelerometer (a DualSens
 `GameInputKindMotion` in `supportedInput` and a `motionInfo` (`GameInputMotionInfo`, Microsoft's v0 layout); `IGameInputReading::GetMotionState`
 returns a `GameInputMotionState` on their readings, and `GetCurrentReading`/`GetNextReading` answer a
 `GameInputKindMotion` query for such a pad and return `GAMEINPUT_E_READING_NOT_FOUND` for a pad without sensors. The
-sensors are enabled when the pad is opened, at SDL's requested rate, and every poll reads the latest sample.
+sensors are enabled when the pad is opened, and every poll reads the latest sample.
 
 - The state carries **signed fractions of the maxima `motionInfo` reports** (1.0 = full magnitude), which is the
   convention Microsoft documents for `GameInputMotionState`. SDL delivers accel in m/s² (gravity included) and gyro
   in rad/s, so the shim divides by the maxima. The maxima are this shim's choice — SDL does not expose a sensor
   range — and are 2 g (19.6133 m/s²) and 2000 deg/s (34.9066 rad/s), a DualSense's accelerometer and gyro ranges
   (VERIFY against the game and a real pad).
-- A pad at rest sits at about 0.5 on the gravity axis and 0.0 on all gyro axes. SDL answers sensor reads with zeros
-  before the device's first sample arrives; since a real accelerometer never reads exactly zero (gravity), all-zero
-  accel means "no sample yet" and the reading carries no motion at all — `GetMotionState` returns false.
+- A pad at rest sits at about 0.5 on the gravity axis and 0.0 on all gyro axes. After each connection,
+  `GetMotionState` returns false until SDL reports a sample from both the accelerometer and the gyroscope.
+  Once both have reported, zero is a valid reading on every axis, including zero acceleration during free fall.
 - SDL's gamepad API has no compass and the shim synthesises no orientation quaternion, so the magnetic-field and
   orientation members are zero with `GameInputMotionAccuracyUnknown`.
 - A pad with sensors streams a reading every ~8 ms (~125 Hz) even when nothing else changes, so motion is not stuck
@@ -450,9 +450,9 @@ rests on a transcription rather than on a side-by-side compile.
   (an id each, `FindDeviceFromId` and device-filtered readings per pad, replugging one, two and all three, and the
   first twin's id equal to the single-pad id). Motion runs on a virtual pad with sensors (`nsensors` in the
   virtual-joystick description, fed with `SDL_SendJoystickVirtualSensorData`): the kind and `motionInfo` on a sensor
-  pad and not on a plain one, no motion before the first sample, normalisation against the `motionInfo` maxima, the
-  accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on a pad without sensors is
-  `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
+  pad and not on a plain one, both sensors reporting after each connection, zero and nonzero samples, normalisation
+  against the `motionInfo` maxima, the accuracy values, the ±1 clamp, the ~8 ms cadence, and that a motion query on
+  a pad without sensors is `GAMEINPUT_E_READING_NOT_FOUND`. The keyboard pad is
   driven through `rt::gameinput::set_keyboard_source` and `set_cursor_source` with fake keys, focus and cursor: every
   binding, two keys at once, each WASD direction, opposite keys cancelling, diagonals, the mouse moving the right
   stick, clamping and decaying to 0, the mouse-button triggers, no input out of focus, release of buttons, sticks and
