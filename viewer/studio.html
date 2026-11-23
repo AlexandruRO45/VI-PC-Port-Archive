@@ -455,7 +455,16 @@ main { flex: 1; position: relative; overflow: hidden; display: flex; }
 
 <script>
 
-let currentLang = localStorage.getItem('leonida_lang') || 'ru';
+// Site storage can be blocked (the getter throws) or disabled (localStorage is null); the Studio still starts.
+function loadLanguage() {
+  try { return localStorage.getItem('leonida_lang') || 'ru'; } catch { return 'ru'; }
+}
+
+function saveLanguage(lang) {
+  try { localStorage.setItem('leonida_lang', lang); } catch {}
+}
+
+let currentLang = loadLanguage();
 
 const I18N = {
   ru: {
@@ -532,7 +541,7 @@ const I18N = {
 
 function setLanguage(lang) {
   currentLang = lang;
-  localStorage.setItem('leonida_lang', lang);
+  saveLanguage(lang);
   document.getElementById('lang-btn-ru').classList.toggle('active', lang === 'ru');
   document.getElementById('lang-btn-eu').classList.toggle('active', lang === 'eu');
   applyTranslations();

@@ -31,7 +31,7 @@ function fakeElement() {
 class Vector3 { set() { return this; } sub() { return this; } }
 class Disposable { disposed = false; dispose() { this.disposed = true; } }
 
-function loadStudio() {
+function loadStudio(storage = { value: { getItem: () => null, setItem() {} } }) {
     const elements = new Map(), loads = [], alerts = [];
     const document = {
         getElementById: id => elements.get(id) ?? elements.set(id, fakeElement()).get(id),
@@ -39,7 +39,7 @@ function loadStudio() {
         querySelectorAll: () => [],
     };
     const context = vm.createContext({
-        document, URLSearchParams, localStorage: { getItem: () => null, setItem() {} }, window: {}, setTimeout() {},
+        document, URLSearchParams, window: {}, setTimeout() {},
         alert: message => alerts.push(message), console: { error() {} },
         THREE: {
             MeshStandardMaterial: Disposable, MeshNormalMaterial: Disposable, Vector3,
@@ -47,6 +47,8 @@ function loadStudio() {
             GLTFLoader: class { load(url, onLoad, onProgress, onError) { loads.push({ url, onLoad, onError }); } },
         },
     });
+    // Defined from inside the context: node:vm does not call a getter set on the object passed to createContext.
+    vm.runInContext(`(storage) => Object.defineProperty(globalThis, 'localStorage', storage)`, context)(storage);
     vm.runInContext(script, context);
     vm.runInContext(`
         scene = { objects: new Set(), add(o) { this.objects.add(o); }, remove(o) { this.objects.delete(o); } };
@@ -297,4 +299,17 @@ test('half-float coordinates follow the selected mip and late reads cannot repla
     pending[1].resolve({ok: false});
     await older;
     assert.equal(output.textContent, 'R = -2.5');
+});
+
+test('blocked or disabled site storage still starts the Studio in Russian', () => {
+    let reads = 0;
+    const blocked = { get() { reads++; throw Object.assign(new Error('storage is blocked'), { name: 'SecurityError' }); } };
+    for (const storage of [blocked, { value: null }]) {
+        const studio = loadStudio(storage);
+        assert.equal(typeof studio.run('window.onload'), 'function');
+        assert.equal(studio.run('currentLang'), 'ru');
+        studio.run(`setLanguage('eu');`);
+        assert.equal(studio.run('currentLang'), 'eu');
+    }
+    assert.ok(reads > 0, 'the blocked getter must be reached');
 });
