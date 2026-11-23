@@ -34,12 +34,15 @@ loader that maps the game's executable and resolves its imports to shims. Nothin
   contract table in `docs/design.md` with how it was confirmed (a GPU test, a Mesa/LLVM reference, or a count over
   the corpus).
 - **REA may read the package, but nothing it reads may be published**: analysing the user's own copy with REA
-  (instruction listings, byte reads, recovered types, database annotations) is allowed, and stays on this machine.
-  No game bytes, extracted assets, shaders or REA dumps may appear in commits, issues, pull requests or test
-  fixtures, except the short excerpts below.
+  (instruction listings, byte reads, recovered types, database annotations) is allowed, and stays on this machine:
+  no AI service, telemetry, cloud log or remote debugging service gets the package or a listing made from it, and a
+  private upload is still a transfer. No game bytes, extracted assets, shaders or REA dumps may appear in commits,
+  issues, pull requests or test fixtures, except the short excerpts below.
 - **Short excerpts are fine**: a few header bytes, one instruction sequence, one line of an REA listing - enough to
   explain a format - belong in `docs/` and code comments, never as a file, a corpus extract or a whole dump, and
-  never out of the executable.
+  never out of the executable. Its identity is the exception: its name, size and SHA-256 may be stated, as
+  `docs/embedded_shaders.md` and `docs/runtime_imports.md` already do, because that names the copy a measurement was
+  made on rather than anything read out of it.
 
 ## Claim before you start
 

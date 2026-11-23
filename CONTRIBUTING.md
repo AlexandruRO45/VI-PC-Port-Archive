@@ -8,12 +8,15 @@ Thanks for helping. A few rules keep the project safe to host:
 - **No keys, decryption or protection workarounds**, and no links to where to get them. The tools only read files
   that are already plain on disk.
 - **REA may read the package, but nothing it reads may be published.** Analysing the game package on your own
-  machine with REA (instruction listings, byte reads, recovered types, database annotations) is allowed. No game
-  bytes, extracted assets, shaders or REA dumps may appear in commits, issues, pull requests or test fixtures; keep
-  them out of the repository and out of anything you post, except the short excerpts below.
+  machine with REA (instruction listings, byte reads, recovered types, database annotations) is allowed, and it
+  stays on that machine: no AI service, telemetry, cloud log or remote debugging service gets the package or a
+  listing made from it, and a private upload is still a transfer. No game bytes, extracted assets, shaders or REA
+  dumps may appear in commits, issues, pull requests or test fixtures; keep them out of the repository and out of
+  anything you post, except the short excerpts below.
 - Short excerpts needed to explain a format (a few header bytes, one instruction sequence, one line of an REA
   listing) are fine in docs and comments, but not from the executable, and never a whole listing, dump or database
-  export.
+  export. The executable's name, size and SHA-256 may be stated: that names the copy a measurement was made on, not
+  content read out of it.
 
 ## Before you start
 
