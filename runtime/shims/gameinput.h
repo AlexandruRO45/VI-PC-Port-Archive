@@ -123,6 +123,9 @@ void set_cursor_source(CursorPosFn cursor_pos);
 using WheelSourceFn = bool (*)(int64_t* x, int64_t* y);
 void set_wheel_source(WheelSourceFn source);
 bool raw_mouse_started();
+// Test seams: -1 restores automatic raw detection; force an SDL initialization failure.
+void set_test_raw_mode(int mode);
+void set_test_sdl_failure(bool fail);
 
 // Raw HID (RT-175, docs/gameinput.md "Raw HID"). One report a HID report descriptor declares: its kind
 // (GameInputRawDeviceReportKind: 0 input, 1 output, 2 feature), its report id (0 when the descriptor declares none)

@@ -1620,8 +1620,9 @@ void test_keyboard_mouse(IGameInput* input) {
     rt::gameinput::set_cursor_source(fake_cursor);
     for (bool& k : g_keys) k = false;
     g_focus = true;
-    g_cursor_x = 100;
-    g_cursor_y = 100;
+    rt::gameinput::set_test_raw_mode(0);
+    g_cursor_x = 10000;
+    g_cursor_y = 20000;
 
     set_env("LEONIDA_KEYBOARD_MOUSE", nullptr);
     rt::gameinput::reload_config();
@@ -1655,8 +1656,8 @@ void test_keyboard_mouse(IGameInput* input) {
               static_cast<const GameInputKeyboardInfo*>(ki->keyboardInfo)->maxSimultaneousKeys == 16,
           "keyboard/mouse: keyboard info (16 keys at once, no gamepad info)");
     if (const auto* kinfo = static_cast<const GameInputKeyboardInfo*>(ki->keyboardInfo)) {
-        wchar_t klid[KL_NAMELENGTH] = {};
-        const uint32_t layout = GetKeyboardLayoutNameW(klid) ? uint32_t(std::wcstoul(klid, nullptr, 16)) : 0;
+        const HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+        const uint32_t layout = uint32_t(reinterpret_cast<uintptr_t>(hkl) & 0xffffffffu);
         check(kinfo->layout == layout && layout != 0, "keyboard/mouse: layout is the active KLID");
         const int function_keys = GetKeyboardType(2);
         check(kinfo->keyCount > 0 && kinfo->keyCount < 255 &&
@@ -1773,6 +1774,20 @@ void test_keyboard_mouse(IGameInput* input) {
         r->Release();
     } else check(false, "keyboard/mouse: reading with missing wheel source");
 
+    // Registration completes after a far-away screen position was sampled.
+    rt::gameinput::set_test_raw_mode(1);
+    g_cursor_x = 0; g_cursor_y = 0;
+    rt::gameinput::poll();
+    if (input->GetCurrentReading(GameInputKindMouse, mse, &r) == S_OK && r) {
+        GameInputMouseState m{};
+        check(r->GetMouseState(&m) && m.positionX == 0 && m.positionY == 0,
+              "keyboard/mouse: raw registration rebases the cursor");
+        r->Release();
+    } else check(false, "keyboard/mouse: reading after raw registration");
+    g_cursor_x = 100; g_cursor_y = 100;
+    rt::gameinput::set_test_raw_mode(0);
+    rt::gameinput::poll();
+
     // The mouse: buttons, and motion summed from the cursor's movement.
     g_cursor_x = 105;
     g_cursor_y = 97;
@@ -1836,6 +1851,7 @@ void test_keyboard_mouse(IGameInput* input) {
     rt::gameinput::set_wheel_source(nullptr);
     rt::gameinput::set_keyboard_source(nullptr, nullptr);
     rt::gameinput::set_cursor_source(nullptr);
+    rt::gameinput::set_test_raw_mode(-1);
 }
 
 int main() {
@@ -2354,6 +2370,33 @@ int main() {
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
+    // Exercise the failed-initialization poll path independently of SDL gamepads.
+    rt::gameinput::set_test_sdl_failure(true);
+    rt::gameinput::set_keyboard_source(fake_key_down, fake_focus);
+    rt::gameinput::set_cursor_source(fake_cursor);
+    g_focus = true; g_keys['A'] = true; g_cursor_x = 0; g_cursor_y = 0;
+    set_env("LEONIDA_KEYBOARD_MOUSE", "1");
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    IGameInputReading* failed_read = nullptr;
+    check(input->GetCurrentReading(GameInputKindKeyboard, nullptr, &failed_read) == S_OK &&
+              failed_read && failed_read->GetKeyCount() > 0, "SDL failure: keyboard polls");
+    if (failed_read) failed_read->Release();
+    g_cursor_x = 7;
+    rt::gameinput::poll();
+    failed_read = nullptr;
+    const bool got_mouse = input->GetCurrentReading(GameInputKindMouse, nullptr, &failed_read) == S_OK && failed_read;
+    GameInputMouseState failed_mouse{};
+    check(got_mouse && failed_read->GetMouseState(&failed_mouse) && failed_mouse.positionX == 7,
+          "SDL failure: mouse polls");
+    if (failed_read) failed_read->Release();
+    g_keys['A'] = false;
+    set_env("LEONIDA_KEYBOARD_MOUSE", nullptr);
+    rt::gameinput::reload_config();
+    rt::gameinput::poll();
+    rt::gameinput::set_keyboard_source(nullptr, nullptr);
+    rt::gameinput::set_cursor_source(nullptr);
+    rt::gameinput::set_test_sdl_failure(false);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

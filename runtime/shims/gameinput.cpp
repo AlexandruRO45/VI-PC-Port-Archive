@@ -1753,8 +1753,8 @@ void start_raw_mouse() {
     if (!g_raw_started.exchange(true)) std::thread(raw_mouse_thread).detach();
 }
 
-bool system_cursor_pos(int* x, int* y) {
-    if (g_raw_ready) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
+bool system_cursor_pos_with_mode(int* x, int* y, bool raw) {
+    if (raw) {  // the edgeless total; it wraps only after ±2^31 counts, and the poll uses differences
         *x = static_cast<int>(g_raw_x.load());
         *y = static_cast<int>(g_raw_y.load());
         return true;
@@ -1765,6 +1765,10 @@ bool system_cursor_pos(int* x, int* y) {
     *y = p.y;
     return true;
 }
+
+bool system_cursor_pos(int* x, int* y) { return system_cursor_pos_with_mode(x, y, g_raw_ready.load()); }
+std::atomic<int> g_test_raw_mode{-1};
+std::atomic<bool> g_test_sdl_failure{false};
 
 bool system_wheel(int64_t* x, int64_t* y) {
     *x = g_raw_wheel_x.load();
@@ -1925,7 +1929,8 @@ void update_keyboard_pad() {
 // codePoint is MapVirtualKey's unshifted character (upper case for letters), not ToUnicode's shifted one.
 struct KbmPoll {
     int cursor_x = 0, cursor_y = 0;
-    bool have_cursor = false;  // false after focus loss, so the first poll after it moves nothing
+    bool have_cursor = false, cursor_raw = false;
+    rt::gameinput::CursorPosFn cursor_source = nullptr;
     int64_t position_x = 0, position_y = 0;
     int64_t wheel_source_x = 0, wheel_source_y = 0, wheel_x = 0, wheel_y = 0;
     int64_t remainder_x = 0, remainder_y = 0;
@@ -1965,11 +1970,10 @@ Device* kbm_device(int which) {
         // The active layout's identifier (KLID, e.g. 0x0000040E), the keys the reading can report, and the function
         // keys Windows counts for this keyboard. Layout id and key count after @justr4mzi's #2426. VERIFY what the
         // console reports for a USB keyboard.
-        uint32_t layout = 0;
-        wchar_t klid[KL_NAMELENGTH] = {};
-        if (GetKeyboardLayoutNameW(klid)) layout = static_cast<uint32_t>(std::wcstoul(klid, nullptr, 16));
+        const HKL hkl = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), nullptr));
+        const uint32_t layout = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(hkl) & 0xffffffffu);
         uint32_t keys = 0;
-        for (int vk = 1; vk < 255; ++vk) keys += reportable_key(vk) && MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX) != 0;
+        for (int vk = 1; vk < 255; ++vk) keys += reportable_key(vk) && MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, hkl) != 0;
         const int function_keys = GetKeyboardType(2);
         d->keyboard_info = {GameInputUnknownKeyboard, layout, keys, function_keys > 0 ? uint32_t(function_keys) : 12u,
                             kMaxKeys, 0, 0, &d->native_language};
@@ -2075,12 +2079,17 @@ void update_keyboard_mouse(uint64_t now) {
         if (key_down(VK_XBUTTON2)) buttons |= GameInputMouseButton5;
         mouse.mouse.buttons = buttons;
         int x = 0, y = 0;
-        const bool have = g_cursor_pos.load()(&x, &y);
-        if (have && g_kbm.have_cursor) {
+        const auto source = g_cursor_pos.load();
+        const int test_mode = g_test_raw_mode.load();
+        const bool raw = test_mode >= 0 ? test_mode != 0 : source == system_cursor_pos && g_raw_ready.load();
+        const bool have = source == system_cursor_pos ? system_cursor_pos_with_mode(&x, &y, raw) : source(&x, &y);
+        if (have && g_kbm.have_cursor && source == g_kbm.cursor_source && raw == g_kbm.cursor_raw) {
             g_kbm.position_x += x - g_kbm.cursor_x;
             g_kbm.position_y += y - g_kbm.cursor_y;
         }
         g_kbm.have_cursor = have;
+        g_kbm.cursor_source = source;
+        g_kbm.cursor_raw = raw;
         g_kbm.cursor_x = x;
         g_kbm.cursor_y = y;
     } else {
@@ -2122,6 +2131,7 @@ void update_keyboard_mouse(uint64_t now) {
 
 bool init_sdl() {
     State& s = g();
+    if (g_test_sdl_failure.load()) return false;
     if (s.sdl_ready) return true;
     if (s.sdl_failed) return false;
     // No window: keep reading pads when another application has focus.
@@ -2873,6 +2883,8 @@ void set_keyboard_source(KeyDownFn key_down, HasFocusFn has_focus) {
 }
 
 void set_wheel_source(WheelSourceFn source) { g_wheel_source = source ? source : system_wheel; }
+void set_test_raw_mode(int mode) { g_test_raw_mode = mode; }
+void set_test_sdl_failure(bool fail) { g_test_sdl_failure = fail; }
 bool raw_mouse_started() { return g_raw_started.load(); }
 void set_cursor_source(CursorPosFn cursor_pos) { g_cursor_pos = cursor_pos ? cursor_pos : system_cursor_pos; }
 
