@@ -15,7 +15,8 @@ The header has no key: what earlier reports called a 64-bit key at +0x60 is the 
 
 The +0x28 table (32-byte records) is reported raw as `q28_records`: the hash in its first u32 matches a +0x38
 hash on most pages, its +0x10 pointer resolves in the resource or is null (`target` null), and its +0x1c word
-behaves as flags. The +0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`.
+behaves as flags. When the table starts past the streams read for q38, the following streams are read for it
+too, up to the next directory stream; they are listed as `q28_continuations`, not as part of the resource. The +0x08 and +0x18 words are not decoded and are exported as `field_08` and `count_or_size`.
 The +0x30 and +0x40 tables are reported by offset only; their internal layout is not decoded here.
 
 Each page also carries a `resource`: the directory stream plus the continuations that reach the q38 table and its
@@ -170,8 +171,8 @@ def _q28(data, q28, count):
     """Parse the +0x28 table raw. Unresolved words keep their measured names.
 
     A record whose pointer is null is kept with `target` None: its other words are set, and the records after
-    it are ordinary ones (3,672 such records on 3,511 of 22,823 `anim.rpf` pages). A table that ends past the
-    streams read for q38 is not read, and says so instead of looking like a page without one.
+    it are ordinary ones (3,781 such records on 3,607 of 22,823 `anim.rpf` pages). A table that ends past the
+    streams read is not read, and says so instead of looking like a page without one.
     """
     if not count:
         return [], ""
@@ -193,11 +194,12 @@ def _q28(data, q28, count):
     return out, ""
 
 
-def parse_page(base, continuations):
+def parse_page(base, continuations, q28_continuations=()):
     """Parse one 0DRP page plus its continuation stream payloads.
 
     Returns (page_dict, complete). A page is complete when the q38 table and every q38 entry fit in the
     concatenated resource. An unparsable pointer is reported and does not keep the page waiting.
+    `q28_continuations` are streams after those, read only for a q28 table that starts past them.
     """
     if not is_page(base):
         return None, True
@@ -218,6 +220,8 @@ def parse_page(base, continuations):
         "q38_records": [],
         "q28_records": [],
         "continuations": [{"offset": s[0], "stored": s[1], "inflated": len(s[2])} for s in continuations],
+        "q28_continuations": [{"offset": s[0], "stored": s[1], "inflated": len(s[2])}
+                              for s in q28_continuations],
         "span": 0,
         "payload_at_0x60": False,
         "complete": True,
@@ -251,6 +255,8 @@ def parse_page(base, continuations):
         enriched.append(item)
     page["q38_records"] = enriched
     q28 = page["tables"]["q28"]
+    if q28_continuations:
+        data += b"".join(s[2] for s in q28_continuations)
     page["q28_records"], page["q28_error"] = _q28(data, q28, page["counts"][0] or 0)
     return page, True
 
@@ -277,21 +283,35 @@ def resource_of(page):
 
 
 def index_streams(streams, progress=None):
-    """Consume a stream sequence and return page records. At most one page waits for a continuation."""
+    """Consume a stream sequence and return page records. At most one page waits for a continuation.
+
+    A page whose q38 table and records are complete but whose q28 table starts past those streams waits
+    for the following streams as well, until the q28 table fits, the next directory stream starts, or
+    MAX_CONTINUATIONS streams were read for it.
+    """
     pages = []
     waiting = None
+    q28_waiting = None
     streams_seen = 0
 
     def add(page):
         page["resource"] = resource_of(page)
         pages.append(page)
 
+    def done(page, base, cont):
+        """Report a page whose q38 is complete, or keep it for the streams its q28 table needs."""
+        if page["q28_error"] == Q28_UNREAD:
+            return (page, base, cont, [])
+        add(page)
+        return None
+
     def start(offset, stored, data):
+        nonlocal q28_waiting
         page, complete = parse_page(data, [])
         page["offset"] = offset
         page["stored"] = stored
         if complete:
-            add(page)
+            q28_waiting = done(page, data, [])
             return None
         return (page, data, [])
 
@@ -299,6 +319,21 @@ def index_streams(streams, progress=None):
         streams_seen += 1
         if progress and streams_seen % 2000 == 0:
             progress(streams_seen, len(pages))
+        if q28_waiting is not None:
+            page, base, cont, extra = q28_waiting
+            if is_page(data):
+                add(page)   # the q28 table stays unread; this stream is the next directory
+                q28_waiting = None
+            else:
+                extra.append((offset, stored, data))
+                again, _ = parse_page(base, cont, extra)
+                again["offset"], again["stored"] = page["offset"], page["stored"]
+                if again["q28_error"] != Q28_UNREAD or len(extra) >= MAX_CONTINUATIONS:
+                    add(again)
+                    q28_waiting = None
+                else:
+                    q28_waiting = (again, base, cont, extra)
+                continue
         if waiting is not None:
             page, base, cont = waiting
             cont.append((offset, stored, data))
@@ -306,7 +341,7 @@ def index_streams(streams, progress=None):
             page["offset"] = waiting[0]["offset"]
             page["stored"] = waiting[0]["stored"]
             if complete:
-                add(page)
+                q28_waiting = done(page, base, cont)
                 waiting = None
                 continue
             if is_page(data):
@@ -329,6 +364,8 @@ def index_streams(streams, progress=None):
             continue
         if is_page(data):
             waiting = start(offset, stored, data)
+    if q28_waiting is not None:
+        add(q28_waiting[0])
     if waiting is not None:
         page = waiting[0]
         page["complete"] = False
@@ -350,6 +387,7 @@ def summarise(pages, mode, source):
         "q28_declared": sum(p["counts"][0] or 0 for p in pages),
         "q28_null_targets": sum(1 for p in pages for r in p["q28_records"] if r["target"] is None),
         "q28_tables_unread": sum(1 for p in pages if p.get("q28_error") == Q28_UNREAD),
+        "q28_continuation_pages": sum(1 for p in pages if p.get("q28_continuations")),
         "pages_with_continuations": sum(1 for p in pages if p["continuations"]),
         "span_bytes": sum(p["span"] for p in pages),
         "payload_at_0x60": sum(1 for p in pages if p["payload_at_0x60"]),

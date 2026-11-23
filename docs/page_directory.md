@@ -65,30 +65,38 @@ the report's `summary` or counted over its `pages`):
 | `+0x20` | 1-3, 89 | 1-6 | 1-5, 13-41 |
 | `n28` / `n30` / `n38` / `u16@0x4e` | 2-182 / 0-38 / 2-186 / 0-1,077 | 2-12 / 0-4 / 2-6 / 0-602 | 25-103 / 11-57 / 7-79 / 0-1,382 |
 | `q28` records declared (`sum n28`) | 60,901 | 108,890 | 1,015,222 |
-| `q28` records read | 60,897 | 106,202 | 952,850 |
-| `q28` records with a null pointer | 0 | 0 | 3,672 (on 3,511 pages) |
-| pages whose `q28` table ends past the streams read | 1 | 225 | 1,355 |
+| `q28` records read | 60,901 | 108,890 | 1,015,222 |
+| `q28` records with a null pointer | 0 | 0 | 3,781 (on 3,607 pages) |
+| pages whose `q28` table is in the stream after the resource (read from it) | 1 | 225 | 1,355 |
 
 The stream and page totals agree with the other whole-archive readers: 90,295 streams and 9,603 directory pages in
 `docs/navmesh.md`, 130,470 streams in `docs/animation.md`. What the samples said about the layout holds on all
 48,194 pages: version 122, the first payload at +0x60 (one `data.rpf` exception), `q38` tables 16-byte aligned,
 `q28` tables 8-byte aligned, no overlap between `q38` records, at most one continuation stream, and a `q28`
-`hash_a` that matches a `q38` hash on every page where both tables were read (15,767, 9,378 and 21,468 pages).
+`hash_a` that matches a `q38` hash on every page (15,768, 9,603 and 22,823 pages; each has both tables).
 
 What the samples did not show:
 
 - **Header ranges are wider.** `+0x20` reaches 6 in `navmeshes.rpf` (1: 1 page, 2: 779, 3: 7,650, 4: 932, 5: 22,
   6: 219) and 41 in `anim.rpf` (1: 1,883, 2: 7,571, 3: 9,241, 4: 2,022, 5: 70, 13-41: 2,036); `n30` reaches 57 and
   `u16@0x4e` 1,382, both in `anim.rpf`.
-- **A `q28` pointer can be null.** 3,672 `anim.rpf` records on 3,511 pages have a zero pointer with `hash_a`,
-  `count_or_size` and the flags set; 116,277 ordinary records follow them in the same tables. The tool used to stop
+- **A `q28` pointer can be null.** 3,781 `anim.rpf` records on 3,607 pages have a zero pointer with `hash_a`,
+  `count_or_size` and the flags set; 120,151 ordinary records follow them in the same tables. The tool used to stop
   a table at the first one. It now keeps the record with `target` null and reads on; a pointer with any other
   non-`0x50000000` value still ends the table with `q28_error`. `data.rpf` and `navmeshes.rpf` have none.
-- **A `q28` table can lie past the resource's `q38` boundary.** The tool reads only the continuation streams the
-  `q38` table and its records need. On 1,355 `anim.rpf`, 225 `navmeshes.rpf` and 1 `data.rpf` pages the `q28`
-  table ends beyond those streams. Such a page reports no `q28` records and names the reason in `q28_error`
-  (`q28_tables_unread` in the summary) instead of looking like a page without the table. Whether the next stream
-  holds the table was not followed up.
+- **A `q28` table can lie past the resource's `q38` boundary, in the next stream.** The resource is the
+  directory stream plus the continuations the `q38` table and its records need. On 1,355 `anim.rpf`, 225
+  `navmeshes.rpf` and 1 `data.rpf` pages the `q28` table starts at or after the end of those streams. In all
+  1,581 cases the **one** stream after the resource holds the whole table; none needs a second one, and none of
+  those streams is a directory page. The table starts at that stream's first byte on 355, 43 and 1 pages and
+  further in on the others (at most 30,312 bytes in `anim.rpf`, 1,728 in `navmeshes.rpf`); no table straddles the
+  boundary and none overlaps a `q38` record. What is read there is a well-formed table: every one of the 62,372,
+  2,688 and 4 records has a `0x50000000` pointer or a null one (109 null, all in `anim.rpf`), every pointer lands
+  inside the bytes read (807, 377 and 1 in the resource, the rest in that stream), and each of the 1,581 pages has
+  a `hash_a` equal to one of its own `q38` hashes. The tool now reads that stream for the table and lists it as
+  `q28_continuations` (`q28_continuation_pages` in the summary); it is not added to `continuations` or to the
+  resource, so every `q38` and resource count above is unchanged. `q28_tables_unread` is 0 in all three archives.
+  Whether the runtime treats that stream as part of the resource is not measured.
 - **The navmesh type hashes are not on every page.** `0xde5f1345` is in 8,412 of the 9,603 pages (every page of the
   first 64 MiB has it); the most common hash, `0x0bcb00e4`, is in 9,585 records.
 
@@ -157,7 +165,7 @@ used as a name or asset id. Names still require the TOC.
 
 ## Pointer arithmetic
 
-Every measured `q38` pointer, and every `q28` pointer that is not null (3,672 `anim.rpf` records have a zero
+Every measured `q38` pointer, and every `q28` pointer that is not null (3,781 `anim.rpf` records have a zero
 pointer, see *Whole-archive pass*), is a zero-extended 32-bit value in a 64-bit field:
 
 ```text
@@ -319,7 +327,7 @@ These comparisons establish equality of field values. Their role at runtime and 
 | +0x00 | 4 | measured | `hash_a`; at least one record on every page matches a `q38` hash |
 | +0x04 | 4 | unresolved | `hash_b`; no match to a `q38` hash observed |
 | +0x08 | 8 | unresolved | `field_08`; observed `0`, `0x100`, `0x200`, `0x300`, `0x30c`, `0x400`, `0x424`, ...; not a measured byte range |
-| +0x10 | 8 | measured | self-pointer, or zero on 3,672 `anim.rpf` records; 60,862 of 60,897 `data.rpf` targets resolve in the first stream |
+| +0x10 | 8 | measured | self-pointer, or zero on 3,781 `anim.rpf` records; 60,863 of 60,901 `data.rpf` targets resolve in the first stream |
 | +0x18 | 4 | unresolved | `count_or_size`; small values, not consistently the linked `q38` size |
 | +0x1c | 4 | measured | flags; only high 16 bits are set, observed `0x10000`-`0x6b0000` |
 
@@ -337,8 +345,8 @@ The table points at hash-table-like records of 16 bytes, `{u32 hash, u32 0, u32 
 dictionaries. The exact meaning of `field_08`, `count_or_size` and `hash_b` is not decoded, so the tool exports
 them under those names and does not use them for boundaries.
 
-Counts: 60,897 records in `data.rpf`, 13,090 in the navmesh slice, 511,435 in the animation slice (106,202 and
-952,850 over the whole archives). `hash_a`
+Counts: 60,897 records in `data.rpf`, 13,090 in the navmesh slice, 511,435 in the animation slice (108,890 and
+1,015,222 over the whole archives, every declared record). `hash_a`
 matched a `q38` hash on 15,767/15,767 `data.rpf` pages, 1,103/1,103 navmesh pages and 11,558/11,558 animation
 pages where both tables were present.
 
@@ -480,12 +488,14 @@ Validation on the package used here:
 | `navmeshes.rpf` full | 90,295 | 9,603 | 54,898 | 9,603 | 2,170 | 2.8 min |
 | `anim.rpf` full | 130,470 | 22,823 | 527,439 | 22,823 | 11,760 | 2.5 min |
 
-The summary also counts the `q28` side: `q28_declared` (the sum of `n28`), `q28_records` (read), `q28_null_targets`
-and `q28_tables_unread`.
+The summary also counts the `q28` side: `q28_declared` (the sum of `n28`), `q28_records` (read), `q28_null_targets`,
+`q28_continuation_pages` (the table was read from the stream after the resource) and `q28_tables_unread`.
 
 The synthetic test builds its own RPF9 header and pages. It covers an in-page resource, a payload in the next
 stream, a `q38` table that itself straddles the stream boundary, the carved-directory mode, the CSV shape, a
-`q28` record with a null pointer in the middle of a table, and a `q28` table past the streams read.
+`q28` record with a null pointer in the middle of a table, a `q28` table in the stream after the resource (also
+after a `q38` continuation, and straddling two streams), and a `q28` table left unread because the archive ends or
+the next stream is a directory page.
 
 ## No-sharing rule
 

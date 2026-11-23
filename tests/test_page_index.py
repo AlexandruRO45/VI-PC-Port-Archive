@@ -157,24 +157,86 @@ class PageIndexTest(unittest.TestCase):
         self.assertEqual(page_index.parse_page(bytes(page), [])[0]["q28_error"], "")
 
     def test_q28_table_past_the_streams_read_is_named(self):
-        # q38 and its record fit in the directory stream, so no continuation is read; the q28 table is after it.
+        # q38 and its record fit in the directory stream, so no continuation is read for them; the q28 table
+        # is after it, and nothing follows but the archive end or the next directory, which is never read as
+        # a q28 table.
         page = header(0x100, q28=0x100, q38=0xC0, counts=(2, 0, 1, 0))
         put_q38(page, 0xC0, [(0x5678, 0x20, 0x60)])
+        second = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(second, 0xC0, [(0x9abc, 0x10, 0x60)])
+        for name, streams in (("archive end", [page]), ("next directory", [page, second])):
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                arc = os.path.join(tmp, "late.rpf")
+                out = os.path.join(tmp, "pages.json")
+                offsets = make_rpf(arc, streams)
+                run_tool(arc, out)
+                with open(out, encoding="utf-8") as f:
+                    doc = json.load(f)
+                page_doc = doc["pages"][0]
+                self.assertTrue(page_doc["complete"])
+                self.assertEqual(page_doc["continuations"], [])
+                self.assertEqual(page_doc["q28_continuations"], [])
+                self.assertEqual(page_doc["q28_records"], [])
+                self.assertEqual(page_doc["q28_error"], page_index.Q28_UNREAD)
+                self.assertEqual(doc["summary"]["q28_declared"], 2)
+                self.assertEqual(doc["summary"]["q28_records"], 0)
+                self.assertEqual(doc["summary"]["q28_tables_unread"], 1)
+                self.assertEqual(doc["summary"]["q28_continuation_pages"], 0)
+                self.assertEqual([p["offset"] for p in doc["pages"]], offsets)
+
+    def test_q28_table_in_the_next_stream_is_read(self):
+        # The q38 table and its record end in the directory stream; the q28 table starts in the stream after
+        # it. That stream is read for the q28 table only: it is listed apart and is not part of the resource.
+        page = header(0x100, q28=0x100, q38=0xC0, counts=(2, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x5678, 0x20, 0x60)])
+        cont = bytearray(0x80)
+        struct.pack_into("<IIQQII", cont, 0x00, 0x5678, 0x1, 0x300, BASE + 0x60, 0x10, 0x30000)
+        struct.pack_into("<IIQQII", cont, 0x20, 0x4444, 0x2, 0x0, 0, 0x4, 0x10000)
+        after = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
+        put_q38(after, 0xC0, [(0x9abc, 0x10, 0x60)])
         with tempfile.TemporaryDirectory() as tmp:
-            arc = os.path.join(tmp, "late.rpf")
+            arc = os.path.join(tmp, "q28next.rpf")
             out = os.path.join(tmp, "pages.json")
-            make_rpf(arc, [page, b"\xcc" * 0x100])
+            offsets = make_rpf(arc, [page, bytes(cont), after])
             run_tool(arc, out)
             with open(out, encoding="utf-8") as f:
                 doc = json.load(f)
-        page_doc = doc["pages"][0]
-        self.assertTrue(page_doc["complete"])
-        self.assertEqual(page_doc["continuations"], [])
-        self.assertEqual(page_doc["q28_records"], [])
-        self.assertEqual(page_doc["q28_error"], page_index.Q28_UNREAD)
-        self.assertEqual(doc["summary"]["q28_declared"], 2)
-        self.assertEqual(doc["summary"]["q28_records"], 0)
-        self.assertEqual(doc["summary"]["q28_tables_unread"], 1)
+        first, second = doc["pages"]
+        self.assertEqual(first["q28_error"], "")
+        self.assertEqual([(r["hash_a"], r["target"]) for r in first["q28_records"]],
+                         [(0x5678, 0x60), (0x4444, None)])
+        self.assertEqual(first["continuations"], [])
+        self.assertEqual([c["offset"] for c in first["q28_continuations"]], [offsets[1]])
+        self.assertEqual(first["q28_continuations"][0]["inflated"], 0x80)
+        self.assertEqual([s["offset"] for s in first["resource"]["streams"]], [offsets[0]])
+        self.assertEqual(first["span"], 0x80)
+        self.assertEqual(second["offset"], offsets[2])
+        self.assertEqual(doc["summary"]["q28_tables_unread"], 0)
+        self.assertEqual(doc["summary"]["q28_continuation_pages"], 1)
+        self.assertEqual(doc["summary"]["q28_records"], 2)
+
+    def test_q28_table_after_a_q38_continuation(self):
+        # q38's record needs the first continuation; the q28 table starts in the second one and straddles
+        # into the third. The two streams read for q28 come after the one read for q38.
+        page = header(0x100, q28=0x1F0, q38=0xC0, counts=(2, 0, 1, 0))
+        put_q38(page, 0xC0, [(0x5678, 0x40, 0x100)])
+        cont = b"\xbb" * 0x80
+        table = struct.pack("<IIQQII", 0x5678, 0, 0, BASE + 0x100, 1, 0x10000) * 2
+        q28a = bytes(0x70) + table[:0x10]
+        q28b = table[0x10:] + bytes(0x10)
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "q28late.rpf")
+            out = os.path.join(tmp, "pages.json")
+            offsets = make_rpf(arc, [page, cont, q28a, q28b])
+            run_tool(arc, out)
+            with open(out, encoding="utf-8") as f:
+                doc = json.load(f)
+        (page_doc,) = doc["pages"]
+        self.assertEqual([c["offset"] for c in page_doc["continuations"]], [offsets[1]])
+        self.assertEqual([c["offset"] for c in page_doc["q28_continuations"]], offsets[2:])
+        self.assertEqual(page_doc["q28_error"], "")
+        self.assertEqual(len(page_doc["q28_records"]), 2)
+        self.assertEqual(doc["summary"]["resource_streams"], {"2": 1})
 
     def test_continuation_stream_is_appended(self):
         page = header(0x100, q38=0xC0, counts=(0, 0, 1, 0))
