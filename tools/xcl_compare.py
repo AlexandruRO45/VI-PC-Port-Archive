@@ -463,6 +463,8 @@ def main():
     ap.add_argument("--out", help="report path (default: <work>/report.json)")
     ap.add_argument("--gui", action="store_true", help="show the checks live in a window")
     args = ap.parse_args()
+    if args.out and os.path.isdir(args.out):   # checked before the two title runs, which take minutes
+        ap.error(f"--out is a folder, not a report file: {args.out}")
     if sys.platform != "win32":
         raise SystemExit("Windows only: both runtimes run Windows executables")
     if args.gui:
