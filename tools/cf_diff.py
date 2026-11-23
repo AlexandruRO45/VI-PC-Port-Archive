@@ -20,7 +20,7 @@ Shapes (each nests, up to --depth):
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
   fif       v_cmp_<cc>_f32 / v_cmp_class_f32 -> s_and_saveexec -> [s_cbranch_execz] -> body -> s_or exec
   fcmpx     s_mov save, exec -> v_cmpx_<cc>_f32 / v_cmpx_class_f32 -> [s_cbranch_execz] -> body -> s_mov exec
-            (both compare a per-lane f32 built in v12 from a data VGPR: +-1.0..1.875, +-0, +-inf or a NaN, never a
+            (both compare a per-lane f32 built in v12 from a data VGPR: +-1.0..1.75, +-0, +-inf or a NaN, never a
             denormal, against a float constant, one of those specials or a class mask in v13; all 16 conditions,
             so NaNs exercise the ordered, unordered and n forms)
   wrelse    s_and_saveexec -> then -> s_andn2_wrexec D, save (EXEC = save & ~EXEC: the else lanes) ->
@@ -120,7 +120,7 @@ class Gen:
         the operand is a float constant or special (as a literal), or a 10-bit class mask."""
         r = self.r
         if r.random() < 0.25:
-            return ("class", r.randrange(1, 1024), r.choice(DATA))
+            return ("class", r.randrange(0, 1024), r.choice(DATA))        # 0: no class, always false
         return (r.choice(FCCS), r.choice(FCONSTS), r.choice(DATA))
 
     def half(self):
@@ -310,18 +310,19 @@ class Emitter:
         return f"s_{logic}_{self.b()} {dst}, {self.vcc()}, {self.exec_()}"
 
     def fvalue(self, src):
-        """v12 = a per-lane f32 from data VGPR `src`: bits 0-2 pick a mantissa (1.0..1.875), bits 4-5 swap in a
-        quiet NaN, +inf or +0, bit 3 sets the sign (so -inf, -0 and negative NaNs occur too). Never a denormal, so
-        the compare does not depend on the denorm mode. Clobbers VCC and v13."""
-        self.ins(f"v_and_b32 v12, 7, v{src}")
-        self.ins("v_lshlrev_b32 v12, 20, v12")
+        """v12 = a per-lane f32 from data VGPR `src`: bits 0-1 pick a mantissa (1.0, 1.25, 1.5, 1.75), bits 2-3 swap
+        in a quiet NaN, +inf or +0, bit 4 sets the sign (so -inf, -0 and negative NaNs occur too). The bits are low
+        enough that one 32-lane wave of v8 (9 ^ lane) holds every combination. Never a denormal, so the compare does
+        not depend on the denorm mode. Clobbers VCC and v13."""
+        self.ins(f"v_and_b32 v12, 3, v{src}")
+        self.ins("v_lshlrev_b32 v12, 21, v12")
         self.ins("v_or_b32 v12, 0x3f800000, v12")
-        self.ins(f"v_and_b32 v13, 48, v{src}")
-        for sel, special in ((16, "0x7fc00000"), (32, "0x7f800000"), (48, "0")):
+        self.ins(f"v_and_b32 v13, 12, v{src}")
+        for sel, special in ((4, "0x7fc00000"), (8, "0x7f800000"), (12, "0")):
             self.ins(f"v_cmp_ne_u32_e32 {self.vcc()}, {sel}, v13")
             self.ins(f"v_cndmask_b32_e32 v12, {special}, v12, {self.vcc()}")
-        self.ins(f"v_and_b32 v13, 8, v{src}")
-        self.ins("v_lshlrev_b32 v13, 28, v13")
+        self.ins(f"v_and_b32 v13, 16, v{src}")
+        self.ins("v_lshlrev_b32 v13, 27, v13")
         self.ins("v_xor_b32 v12, v12, v13")
 
     def fcompare(self, fc, cmpx):

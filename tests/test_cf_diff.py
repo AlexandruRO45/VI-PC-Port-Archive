@@ -205,8 +205,9 @@ def test_wrexec_cases_catch_a_swapped_complement(case, wave, monkeypatch):
     assert status == "mismatch"
 
 
-# Float compares into EXEC. v1 = lane & 7 gives normals only; v3 = lane * 5 & 15 adds -1.x (bit 3); v8 = 9 ^ lane
-# reaches bits 4-5 too, so its lanes hold NaNs, +-inf and +-0 as well (see Emitter.fvalue).
+# Float compares into EXEC (values from Emitter.fvalue). v1 = lane & 7 gives normals and NaNs (bit 2); v3 =
+# lane * 5 & 15 adds +inf and +0 (bits 2-3); v8 = 9 ^ lane reaches bit 4 too, so even in wave32 its lanes hold every
+# value: +-normals, NaNs, +-inf and +-0.
 FCMP_CASES = {
     f"{mn} {cc} {k} on v{v}": [(mn, (cc, k, v), skip, [("probe", 11), ("op", "v_add_nc_u32 v9, 1, v9")])]
     for mn, cc, k, v, skip in (
@@ -215,7 +216,7 @@ FCMP_CASES = {
         ("fif", "neq", "0x7f800000", 8, False), ("fif", "lg", "-4.0", 3, True),
         ("fcmpx", "nlg", "0", 8, True), ("fcmpx", "ge", "0xff800000", 8, False),
         ("fcmpx", "ngt", "-1.0", 8, True), ("fcmpx", "tru", "2.0", 1, False), ("fcmpx", "f", "0.5", 1, True),
-        ("fif", "class", 0x003, 8, True), ("fcmpx", "class", 0x22C, 8, False),
+        ("fif", "class", 0x003, 8, True), ("fcmpx", "class", 0x22C, 8, False), ("fif", "class", 0, 8, False),
         ("fcmpx", "class", 0x160, 8, True))
 }
 
@@ -244,12 +245,26 @@ def test_float_cases_catch_an_ordered_unordered_swap(case, monkeypatch):
 
 
 @pytest.mark.parametrize("case", sorted(c for c in FCMP_CASES if "class" in c and "0x3 " not in c
-                                        and " 3 on" not in c))
+                                        and " 3 on" not in c and " 0 on" not in c))
 def test_class_cases_catch_a_sign_slip(case, monkeypatch):
     """The class cases are sensitive: with the sign ignored (every value classed as positive) they mismatch."""
     real = cf_ref._fclass
     monkeypatch.setattr(cf_ref, "_fclass", lambda x, mask: real(x & 0x7FFFFFFF, mask))
     assert cf_diff.run_case("ps_fcmp", FCMP_CASES[case], 32)[0] == "mismatch"
+
+
+def test_fvalue_covers_every_class_in_one_wave32():
+    """Emitter.fvalue of v8 = 9 ^ lane gives wave32 every kind of operand: +-normal, NaN, +-inf and +-0."""
+    lines = cf_diff.build([("fif", ("class", 0, 8), False, [])], 32)     # fvalue(v8), then a compare nothing uses
+    with tempfile.TemporaryDirectory() as t:
+        os.mkdir(os.path.join(t, "disasm"))
+        p = os.path.join(t, "disasm", "ps_v.s")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(cf_diff.listing_text(lines, "ps_v"))
+        m = cf_ref.WaveMachine(cf_ref.parse_file(p), wave=32)
+        m.run()
+    seen = {next(b for b in range(10) if cf_ref._fclass(m._vgpr(12, lane), 1 << b)) for lane in range(32)}
+    assert {1, 2, 3, 5, 6, 8, 9} <= seen, seen      # qNaN, -inf, -normal, -0, +0, +normal, +inf
 
 
 @pytest.mark.parametrize("bits, cc, k, want", [
