@@ -119,23 +119,45 @@ def build(root: str) -> dict:
     }
 
 
+def same_path(first: str, second: str) -> bool:
+    """True when writing first would replace second (same file, or a case/symlink alias of it)."""
+    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("docs", help="a clone of xodus-gaming/xgameruntime-docs")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                   "gdk_runtime_classes.json"))
     a = ap.parse_args(argv)
+    if os.path.isdir(a.out):
+        ap.error(f"--out {a.out} is a folder, not a file")
+    if os.path.isdir(a.docs):
+        for dirpath, _dirs, files in os.walk(a.docs):
+            for name in files:
+                if same_path(a.out, os.path.join(dirpath, name)):
+                    ap.error(f"--out {a.out} would overwrite the docs input {os.path.join(dirpath, name)}")
     try:
         table = build(a.docs)
     except OSError as e:
-        print(f"cannot read the docs: {e}", file=sys.stderr)
-        return 1
+        print(f"ERROR: cannot read the docs {a.docs}: {e.strerror or e}", file=sys.stderr)
+        return 2
     problems = check(table["classes"], table["interfaces"])
     for p in problems:
         print(f"warning: {p}", file=sys.stderr)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(table, f, indent=1, sort_keys=True)
-        f.write("\n")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(table, f, indent=1, sort_keys=True)
+            f.write("\n")
+    except OSError as e:
+        print(f"ERROR: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(f"{len(table['classes'])} classes, {len(table['interfaces'])} interfaces -> {a.out}")
     return 0
 
