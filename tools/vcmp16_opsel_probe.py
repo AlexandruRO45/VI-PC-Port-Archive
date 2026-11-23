@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(HERE, "hw_oracle"))
 # VOP3 opcode byte (word 0 bits [23:16]) of v_cmp_<op>_e64, from llvm-mc 21.1.8 -mcpu=gfx1036.
 OPCODES = {("lt", "f16"): 0xC9, ("eq", "f16"): 0xCA, ("gt", "f16"): 0xCC,
            ("lt", "u16"): 0xA9, ("eq", "u16"): 0xAA, ("gt", "u16"): 0xAC,
-           ("lt", "i16"): 0x89, ("gt", "i16"): 0x8C}
+           ("lt", "i16"): 0x89, ("eq", "i16"): 0x8A, ("gt", "i16"): 0x8C}
 SDST = 10                 # s10 (s[10:11] in wave64); lane 0 is bit 0 either way
 SRC0, SRC1 = 0x101, 0x102  # v1, v2
 OPSEL_SRC0, OPSEL_SRC1 = 1 << 11, 1 << 12
@@ -95,6 +95,13 @@ def rows():
     for opsel in ((1, 0), (1, 1)):
         for op in ("lt", "gt"):
             out.append((f"i16B_{op}_opsel{opsel[0]}{opsel[1]}", op, "i16", (pack(0x8000, 9), pack(3, 7)), opsel, False))
+    # eq only splits the hypotheses where a half is equal: 5 == 5 gives 1 with op_sel on src1 and 0 on the low
+    # halves, and 0x8000 as src0's high half (32768, or -32768 in i16) gives the opposite way. The rows above
+    # compare halves that all differ, so their four encodings answer a row's question identically.
+    for kind in ("u16", "i16"):
+        for opsel in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            out.append((f"{kind}_eqB_opsel{opsel[0]}{opsel[1]}", "eq", kind,
+                        (pack(0x8000, 5), pack(5, 5)), opsel, False))
     return out
 
 
