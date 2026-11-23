@@ -660,3 +660,37 @@ Use the template at the top of [#166](https://github.com/ItsNotRexed/Leonida/iss
 range, OS, the commit you built, the tool versions and the counts each script printed. Post counts and pass/fail
 lines only, never shaders or logs from the game. A failure that isn't in the table above gets its own issue, linked
 from your entry.
+
+## Explicit-LOD array and cube gather GPU test
+
+`check_gather_dims.py` exercises `image_gather4_l` and `image_gather4_l_o` on 2D arrays and cube arrays.
+It needs #7097's translator support and a Vulkan GPU supported by `vk_texture_test`. No game files are used.
+
+```powershell
+cmake -S runtime -B runtime/build
+cmake --build runtime/build --config Release --target vk_texture_test
+python -I scripts/check_gather_dims.py --harness runtime/build/Release/vk_texture_test.exe
+python -I tests/test_gather_dims_checker.py
+```
+
+The runner generates hand-written instruction listings, translates them, and assembles the resulting SPIR-V
+with the repository's Python assembler. LLVM is not required. Add `--spirv-val <path-to-spirv-val>` to validate
+every generated module; otherwise the summary explicitly says validation was not run. This does not exercise
+the binary RDNA decoder or establish native Xbox hardware equivalence.
+
+The full matrix has 192 draws, each comparing all 4,096 RGBA32F pixels (all four gather taps) against a CPU
+oracle. It covers:
+
+- Four array coordinates: negative, two nearest-even ties (2.5 and 3.5), and above the last layer.
+- Faces 0 and 5 of both cubes, including the second cube's 8-based face encoding.
+- Explicit LOD 0 and 1, f32 and packed a16 addresses, and offsets (0,0) and (+1,-1).
+- Red and green texel gradients plus a distinct blue value per layer and mip.
+
+The harness's opt-in `--array-mips` mode adds a 4x4 mip to its existing 8x8, 12-layer array. Mip 0 is unchanged;
+mip 1's RGB channels have an additional 7/255, so ignoring LOD cannot accidentally pass. The fixed sampling
+coordinates stay away from cube seams. Expectations test the translator's documented array/cube view contract;
+seam adjacency and d16 result conversion are outside this test (the latter has separate coverage in #6264).
+
+Each GPU process has a 30-second timeout. Missing Vulkan support returns 77. Any failed draw, malformed readback,
+nonfinite pixel or mismatched tap fails the run. `--limit N` is for diagnosing a subset and always labels the
+result partial. The checker unit tests include wrong-mip, final-pixel, NaN and truncated-readback controls.

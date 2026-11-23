@@ -8,6 +8,8 @@
 //   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
 //   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
+//   --array-mips: give the 12-layer array at binding 3 two mips (8x8 and 4x4). Mip 1 adds 7/255 to RGB;
+//   used by scripts/check_gather_dims.py for explicit-LOD array/cube gather GPU readback.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
 //   translator's view of a cube array); every pixel must be the texel a cube sample of its direction reads.
 //   vk_texture_test dref [out.raw]: ps_sample_c_lz against an 8x8 D32 texture at index 1 (texel x holds depth
@@ -88,6 +90,7 @@ int main(int argc, char** argv) {
     const uint32_t W = 64, H = 64, TW = 8;
     const bool signed_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-sint") == 0;
     const bool uint_mips = argc == 10 && std::strcmp(argv[9], "--two-mip-uint") == 0;
+    const bool array_mips = argc == 10 && std::strcmp(argv[9], "--array-mips") == 0;
     const bool two_mip = signed_mips || uint_mips || (argc == 10 && std::strcmp(argv[9], "--two-mip") == 0);
     // With vs_ids spanning UV [0,1] over the viewport, adjacent fragments differ by two base texels.
     const uint32_t texture_side = two_mip ? 2 * W : TW;
@@ -111,7 +114,7 @@ int main(int argc, char** argv) {
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (!fetch && (argc == 9 || two_mip)) {
+    if (!fetch && (argc == 9 || two_mip || array_mips)) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
@@ -143,7 +146,7 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b|fetch-uint|fetch-sint|fetch-miss] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint|--array-mips]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -379,19 +382,29 @@ int main(int argc, char** argv) {
             }
     }
     const uint32_t CUBE_LAYERS = 12;
-    std::vector<uint32_t> cubes(CUBE_LAYERS * TW * TW);
+    const uint32_t array_levels = array_mips ? 2 : 1;
+    std::vector<uint32_t> cubes(CUBE_LAYERS * (TW * TW + (array_mips ? TW * TW / 4 : 0)));
     for (uint32_t y = 0; y < TW; y++)
         for (uint32_t x = 0; x < TW; x++) {
             for (uint32_t l = 0; l < CUBE_LAYERS; l++)
                 cubes[(l * TW + y) * TW + x] = (x * 32u) | ((y * 32u) << 8) | ((l * 20u) << 16) | (255u << 24);
         }
+    if (array_mips) {
+        // Distinguish every mip and layer; keep the existing mip-zero cube pattern unchanged.
+        const uint32_t side = TW / 2, base = CUBE_LAYERS * TW * TW;
+        for (uint32_t l = 0; l < CUBE_LAYERS; ++l)
+            for (uint32_t y = 0; y < side; ++y)
+                for (uint32_t x = 0; x < side; ++x)
+                    cubes[base + (l * side + y) * side + x] =
+                        (x * 32u + 7u) | ((y * 32u + 7u) << 8) | ((l * 20u + 7u) << 16) | (255u << 24);
+    }
     const VkFormat tfmt[4] = {VK_FORMAT_R8G8B8A8_UNORM, sampled_format,
                               VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
     VkImage timg[4]; VkImageView tview[4];
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[0], &timg[0], &tview[0]));
     CHECK(make_tex(texture_side, texture_side, levels, 1, VK_IMAGE_VIEW_TYPE_2D, tfmt[1], &timg[1], &tview[1]));
     CHECK(make_tex(1, 1, 1, 1, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[2], &timg[2], &tview[2]));
-    CHECK(make_tex(TW, TW, 1, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
+    CHECK(make_tex(TW, TW, array_levels, CUBE_LAYERS, VK_IMAGE_VIEW_TYPE_2D_ARRAY, tfmt[3], &timg[3], &tview[3]));
     VkBuffer up; VkDeviceMemory upm; void* upp;
     const VkDeviceSize texture_offset = 256;
     const VkDeviceSize texture_bytes = texels.size() * sizeof(uint32_t);
@@ -403,7 +416,7 @@ int main(int argc, char** argv) {
     VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
     sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sci.maxLod = float(levels - 1);
+    sci.maxLod = float(std::max(levels, array_levels) - 1);
     sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VkSamplerCreateInfo sci1 = sci;            // index 1: the S# the shader names
     if (two_mip) {
@@ -530,7 +543,7 @@ int main(int argc, char** argv) {
     for (int t = 0; t < 4; t++) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; ib.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; ib.image = timg[t];
-        const uint32_t mip_levels = t == 1 ? levels : 1;
+        const uint32_t mip_levels = t == 1 ? levels : t == 3 ? array_levels : 1;
         ib.subresourceRange = {aspect_of(tfmt[t]), 0, mip_levels, 0, up_layers[t]}; ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &ib);
