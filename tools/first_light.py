@@ -589,6 +589,24 @@ def find_harness(explicit: str | None) -> str:
     executable = "vk_harness.exe" if os.name == "nt" else "vk_harness"
     build = os.path.join(ROOT, "runtime", "build")
     build_dirs = (os.path.join(build, "linux"), os.path.join(build, "windows"), build)
+    # The default Linux harness may be older than the source tree after a checkout.
+    # Explicit paths remain under the caller's control.
+    if os.name != "nt" and not explicit and not os.environ.get("LEONIDA_VK_HARNESS"):
+        cmake = shutil.which("cmake")
+        if not cmake:
+            raise SystemExit("cmake is required to refresh the default Linux vk_harness")
+        try:
+            result = subprocess.run(
+                [cmake, "--build", os.path.join(build, "linux"), "--target", "vk_harness"],
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            raise SystemExit(f"could not rebuild the default Linux vk_harness: {exc}") from exc
+        if result.returncode:
+            detail = (result.stdout or "") + (result.stderr or "")
+            raise SystemExit(
+                f"could not rebuild the default Linux vk_harness (exit {result.returncode}):\n{detail.strip()}"
+            )
     for candidate in (
         explicit,
         os.environ.get("LEONIDA_VK_HARNESS"),
