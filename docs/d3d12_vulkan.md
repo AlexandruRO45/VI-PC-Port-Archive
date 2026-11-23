@@ -2998,7 +2998,10 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   can replace it). `SetFrameIntervalX` takes the interval as a period in microseconds and the latency, and starts
   the vblank grid. `ScheduleFrameEventX` arms the origin event, delayed by an offset inside the frame.
   `WaitFrameEventX` returns at the next origin with the next token (1, 2, 3, ...; 0 is the null token) and does not
-  return while `latency` presented frames are still waiting for their vblank. A frame presented before the origin event
+  return while `latency` presented frames are still waiting for their vblank. The pacer can share its token source
+  with the device: the retail sink hands it the device's (`device_frame_tokens`), so a token a title gets from
+  `WaitFrameEventX` (device slot 80) is one `PresentX` accepts, while a token that was never issued is still refused.
+  A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
   blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
@@ -3020,8 +3023,9 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `PresentX` at queue **30 and 32**, and the device calls at **48** (`CreateCommandQueueX`), **73**
   (`CreateCommandListX`), **78** (`SetFrameIntervalX`), **79** (`ScheduleFrameEventX`) and **80** (`WaitFrameEventX`);
   these are third-party observations, not Microsoft documentation. The device proxy routes those five slots itself:
-  queue and list creation go to the existing create paths, and the frame events are a per-device token counter that
-  returns `S_OK` and, for `WaitFrameEventX`, a fresh non-zero token without blocking.
+  queue and list creation go to the existing create paths, and the frame events are a per-device token source that
+  returns `S_OK` and, for `WaitFrameEventX`, a fresh non-zero token without blocking. The source is shared with the
+  presentation pacer when the retail sink is attached, so device-side waits and `PresentX` number one sequence.
   `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT`, `LEONIDA_XS_WAIT_EVENT_SLOT`,
   `LEONIDA_XS_QUEUE_X_SLOT` and `LEONIDA_XS_LIST_X_SLOT` move one route each (3..127; anything else is logged once and
   ignored). The queue proxy refuses every slot past the

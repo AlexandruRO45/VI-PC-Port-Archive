@@ -31,6 +31,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "presentx_capture.h"
+#include "../src/frame_pacer.h"     // leonida::FrameTokenSource: the tokens slots 78/79/80 and PresentX share
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -82,13 +83,14 @@ struct DeviceProxy {
     ResourceByVaProvider resource_provider;  // slot 70: a buffer by console VA; null leaves slot 70 on the null view
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
-    // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. Tokens were never measured;
-    // they start at 1 and only have to be fresh and non-zero for the boot sequence. Waiting returns at once: there is
-    // no vblank source until a presenter exists, and a bounded zero wait cannot stall the first frame.
+    // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. The token source is shared with
+    // the presentation pacer when one is attached (the sink is given it through device_frame_tokens), so a token a
+    // title got from WaitFrameEventX is one its PresentX accepts. Without a presenter the wait still returns at once
+    // with a fresh non-zero token: there is no vblank source behind the device before one exists.
     std::atomic<std::uint32_t> frame_interval_us{0};
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
-    std::atomic<std::uint64_t> frame_next_token{1};
+    std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
     // The real presenter, once a factory has made one for the Xbox slots (d3d12_xs.cpp on the Vulkan backend).
     // `presentation_mutex` guards creation and the explicit window; `presentation_failed_ms` throttles a retry after
     // a factory returned null (no visible game window yet), and `presentation_window` is the optional caller window.
@@ -115,7 +117,7 @@ XboxPresentationSink* device_presentation(DeviceProxy* self) {
     const ULONGLONG failed_at = self->presentation_failed_ms.load(std::memory_order_relaxed);
     if (failed_at && now - failed_at < 1000) return nullptr;
     XboxPresentationSink* sink =
-        factory(self->real, self->presentation_window.load(std::memory_order_relaxed));
+        factory(self->real, self, self->presentation_window.load(std::memory_order_relaxed));
     if (!sink) {
         self->presentation_failed_ms.store(now, std::memory_order_relaxed);
         if (!self->presentation_logged.exchange(true, std::memory_order_relaxed))
@@ -1729,17 +1731,13 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
         if (first_call(logged))
             std::fprintf(stderr, "[rt] d3d12_xs: slot 80 WaitFrameEventX returned 0x%08lx; handing out a token (boot)\n",
                          static_cast<unsigned long>(hr));
-        std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-        if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-        *token = value;
+        *token = self->frame_tokens->issue();
         return S_OK;
     }
     (void)event;
     (void)timeout_ms;
     (void)flags;
-    std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
-    if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
-    *token = value;
+    *token = self->frame_tokens->issue();
     return S_OK;
 }
 
@@ -3294,6 +3292,11 @@ unsigned device_proxy_slot_count(const void* device) {
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
+}
+
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device) {
+    if (!is_device_proxy(device)) return nullptr;
+    return static_cast<const DeviceProxy*>(device)->frame_tokens;
 }
 
 bool device_slot_overridden(unsigned slot) {

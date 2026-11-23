@@ -196,14 +196,17 @@ private:
     std::unique_ptr<rt::d3d12::XboxPresentation> presentation_;
 };
 
-rt::d3d12_xs::XboxPresentationSink* create_retail_presentation(ID3D12Device* real, std::uint64_t window_word) {
+rt::d3d12_xs::XboxPresentationSink* create_retail_presentation(ID3D12Device* real, void* device_proxy,
+                                                              std::uint64_t window_word) {
     HWND window = window_word ? reinterpret_cast<HWND>(static_cast<std::uintptr_t>(window_word)) : game_window();
     if (!window) return nullptr;
     auto presenter = rt::d3d12::create_window_presenter(real, window);
     if (!presenter) return nullptr;
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX attached to window %p (Vulkan swapchain + frame pace)\n",
                  static_cast<void*>(window));
-    return new RetailPresentation(std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter)));
+    // The pacer shares the device's token source: a token from WaitFrameEventX (device slot 80) is one PresentX takes.
+    return new RetailPresentation(std::make_unique<rt::d3d12::XboxPresentation>(
+        std::move(presenter), nullptr, rt::d3d12_xs::device_frame_tokens(device_proxy)));
 }
 #endif  // LEONIDA_VULKAN_DEVICE
 

@@ -93,11 +93,13 @@ private:
     std::unique_ptr<rt::d3d12::XboxPresentation> presentation_;
 };
 
-rt::d3d12_xs::XboxPresentationSink* test_factory(ID3D12Device* real, std::uint64_t) {
+rt::d3d12_xs::XboxPresentationSink* test_factory(ID3D12Device* real, void* device_proxy, std::uint64_t) {
     auto presenter = rt::d3d12::create_window_presenter(real, g_window);
     if (!presenter) return nullptr;
     presenter->enable_capture();
-    auto presentation = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+    // Share the device's frame tokens, as the retail factory does, so a device-side WaitFrameEventX token presents.
+    auto presentation = std::make_unique<rt::d3d12::XboxPresentation>(
+        std::move(presenter), nullptr, rt::d3d12_xs::device_frame_tokens(device_proxy));
     g_presentation = presentation.get();
     return new TestPresentation(std::move(presentation));
 }

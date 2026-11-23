@@ -33,8 +33,9 @@
 //             in the console call (public HLE; the PC six-argument form differs).
 //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. They answer through the registered
 //             XboxPresentationSink when there is one (the Vulkan retail path below); otherwise a per-device token
-//             state machine answers them before the PC vtable is indexed and WaitFrameEventX returns at once with a
-//             fresh non-zero token. Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the
+//             source answers them before the PC vtable is indexed and WaitFrameEventX returns at once with a fresh
+//             non-zero token. The token source is shared with the sink's frame pacer, so a token from slot 80 is one
+//             PresentX accepts. Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the
 //             beyond-table refusal.
 //   slot 86   CreatePipelineState(desc, riid, out) -> PC ID3D12Device2::CreatePipelineState (PC slot 47).
 //   slot 101  CreateStateObject(desc, riid, out) -> PC ID3D12Device5::CreateStateObject (PC slot 62, displaced on
@@ -93,6 +94,11 @@
 #include "xbox_present_types.h"
 
 #include <cstdint>
+#include <memory>
+
+namespace leonida {
+class FrameTokenSource;
+}
 
 namespace rt::d3d12_xs {
 
@@ -155,6 +161,11 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// The device's frame-token counter, shared with the presentation pacer when one is attached: device slot 80
+// (WaitFrameEventX) hands out its tokens and PresentX checks them, so a title that waits through the device and
+// presents through its XboxPresentation never sees a token the pacer did not issue. Null for a non-proxy.
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
+
 // The real presentation behind the retail title's Xbox slots. The device proxy does not link the Vulkan presenter
 // itself: whichever module owns the presentation (d3d12_xs.cpp on the Vulkan backend) registers a factory once, and
 // a device asks it for a sink the first time an Xbox presentation slot is called. The factory gets the layer's
@@ -179,8 +190,11 @@ public:
     virtual HRESULT PresentX(std::uint32_t plane_count, const rt::d3d12::XboxPresentPlaneParameters* planes,
                              const rt::d3d12::XboxPresentParameters* params) = 0;
 };
-// The factory returns a sink owned by the device proxy (delete on device release), or null.
-using XboxPresentationFactory = XboxPresentationSink* (*)(ID3D12Device* real, std::uint64_t window);
+// The factory returns a sink owned by the device proxy (delete on device release), or null. `device_proxy` is the
+// Xbox-ABI device the sink belongs to, so a factory that also drives leonida::FramePacer can share the device's
+// frame-token source through device_frame_tokens instead of numbering tokens on its own.
+using XboxPresentationFactory = XboxPresentationSink* (*)(ID3D12Device* real, void* device_proxy,
+                                                          std::uint64_t window);
 // Process-wide; call before the first Xbox presentation slot. A null factory restores the stand-ins.
 void set_xbox_presentation_factory(XboxPresentationFactory factory);
 // Optional window for this device's factory (an HWND as std::uint64_t); null lets the factory discover it.
