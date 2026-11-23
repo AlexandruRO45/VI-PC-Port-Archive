@@ -274,6 +274,15 @@ class OnHardware(unittest.TestCase):
         self.assertEqual(w32["buffer_f32"][255], 0x3F800000)
 
 
+class WaveArgumentTests(unittest.TestCase):
+    def test_nonnumeric_unicode_digit_is_a_usage_error(self):
+        error = io.StringIO()
+        with redirect_stderr(error), self.assertRaises(SystemExit) as result:
+            run_main(FakeOracle(), "--waves", "\N{SUPERSCRIPT TWO}")
+        self.assertEqual(result.exception.code, 2)
+        self.assertIn("unknown", error.getvalue())
+
+
 class ReportPathTests(unittest.TestCase):
     """--json names a file; its folder is created and a write failure is one line, not a traceback."""
 

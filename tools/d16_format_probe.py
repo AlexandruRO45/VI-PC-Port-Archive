@@ -297,10 +297,11 @@ def main(argv=None):
     if a.self_test:
         return self_test()
     fmts = [f for f in a.formats.split(",") if f]
-    waves = [int(w) for w in a.waves.split(",") if w.strip().isdigit()]
-    bad = [f for f in fmts if f not in FORMATS] + [w for w in a.waves.split(",") if w and w not in ("32", "64")]
-    if bad or not fmts or not waves:
+    wave_tokens = [w for w in a.waves.split(",") if w]
+    bad = [f for f in fmts if f not in FORMATS] + [w for w in wave_tokens if w not in ("32", "64")]
+    if bad or not fmts or not wave_tokens:
         ap.error("unknown or empty: " + ", ".join(bad or ["--formats/--waves"]))
+    waves = [int(w) for w in wave_tokens]
     if a.json and os.path.isdir(a.json):
         ap.error(f"--json {a.json} is a folder, not a file")
     from hw_oracle import asm, runner
