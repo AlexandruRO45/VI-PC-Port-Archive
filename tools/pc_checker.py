@@ -914,9 +914,15 @@ def run_gui():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        # tkinter may be installed without an available display (SSH, WSL,
+        # headless Linux). Let the CLI entry point use its text fallback.
+        return False
     App(root)
     root.mainloop()
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -968,7 +974,9 @@ def main():
             print("tkinter isn't available; using text mode.\n")
         run_cli(args)
     else:
-        run_gui()
+        if not run_gui():
+            print("No graphical display available; using text mode.\n")
+            run_cli(args)
 
 
 if __name__ == "__main__":
