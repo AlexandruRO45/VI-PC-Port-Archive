@@ -67,5 +67,49 @@ class VMulU32U24OracleTests(unittest.TestCase):
         # 0xFFFFFF * 0xFFFFFF = 0xFFFFFE000001 -> low 32 bits is 0xFE000001
         self.assertEqual(oracle_mul_u32_u24(0xFFFFFF, 0xFFFFFF), 0xFE000001)
 
+class RegKind(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: RegKind
+    index: int = 0
+    raw_val: int = 0
+
+
+@dataclass(frozen=True)
+class ValuInstructionAST:
+    mnemonic: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand | None = None
+
+
+class WavefrontSimdState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask: int = (1 << lane_count) - 1
+        self.vgprs = [[0] * 64 for _ in range(lane_count)]
+
+    def set_vgpr(self, lane: int, reg_idx: int, val: int):
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+    def get_vgpr(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+class VMulU32U24AstInterpreterTests(unittest.TestCase):
+    def test_mul_u24_ast_construction(self):
+        ast = ValuInstructionAST("v_mul_u32_u24", Operand(RegKind.VGPR, 2), Operand(RegKind.VGPR, 0), Operand(RegKind.VGPR, 1))
+        self.assertEqual(ast.mnemonic, "v_mul_u32_u24")
+        self.assertEqual(ast.dst.index, 2)
+
+    def test_mul_u24_scalar_execution(self):
+        res = oracle_mul_u32_u24(30, 40)
+        self.assertEqual(res, 1200)
+
 if __name__ == "__main__":
     unittest.main()
