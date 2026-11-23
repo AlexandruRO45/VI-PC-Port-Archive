@@ -739,6 +739,46 @@ def _repack_glb_with_mutated_doc(glb_path: str, out_path: str, mutate_fn) -> Non
 
 
 class SkinnedJointRemappingTests(unittest.TestCase):
+    def test_mixed_explicit_binds_and_singular_or_cyclic_hierarchies(self):
+        part = pa.MeshPart("part", [(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        explicit = list(pa._identity_mat4_col())
+        explicit[12] = 8  # Authored bind-shape correction, distinct from the default pose.
+        parent = pa.SkeletonJoint("root", translation=(2, 0, 0), inverse_bind_matrix=explicit)
+        child = pa.SkeletonJoint("child", parent=0, translation=(1, 0, 0))
+        rig = pa.SkeletonSpec("rig", [parent, child], coord_space="y-up")
+        raw, _ = pa.build_assembled_glb([part], skeleton=rig)
+        doc, binary, _ = glb_skinning.parse_glb(raw)
+        rows = pa._read_glb_accessor(doc, binary, doc["skins"][0]["inverseBindMatrices"])
+        self.assertEqual(rows[0], tuple(explicit))
+        self.assertEqual(rows[1][12], -3)
+        parent.scale = (0, 1, 1)
+        with self.assertRaisesRegex(pa.PedAssembleError, "child.*singular"):
+            pa.build_assembled_glb([part], skeleton=rig)
+        child.inverse_bind_matrix = pa._identity_mat4_col()
+        pa.build_assembled_glb([part], skeleton=rig)  # Both IBMs are supplied.
+        parent.parent = 1
+        with self.assertRaisesRegex(pa.PedAssembleError, "cycle"):
+            pa.build_assembled_glb([part], skeleton=rig)
+
+    def test_implicit_inverse_binds_preserve_the_rest_pose(self):
+        # A child comes first in the palette. Its rotated nonuniformly scaled parent
+        # makes the world bind differ from both the local bind and its translation.
+        half = math.sqrt(0.5)
+        skel = pa.SkeletonSpec("rig", [
+            pa.SkeletonJoint("tip", parent=1, translation=(1, -2, 3), rotation=(half, 0, 0, half)),
+            pa.SkeletonJoint("root", translation=(3, 4, 5), rotation=(0, 0, half, half),
+                             scale=(2, 3, 0.5)),
+        ])
+        part = pa.MeshPart("sleeve", [(0, 0, 0), (2, 3, 4), (0, 2, 1)], [(0, 1, 2)],
+                           joints_0=[(0, 1, 0, 0)] * 3, weights_0=[(0.75, 0.25, 0, 0)] * 3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "bind.glb")
+            pa.write_assembled_glb(path, [part], skeleton=skel, standing_offset=0.75)
+            actual = _evaluate_glb_skinned_vertices(path, {})["sleeve"]
+        for vertex, (x, y, z) in zip(actual, part.positions):
+            for got, expected in zip(vertex, (x, z + 0.75, -y)):
+                self.assertAlmostEqual(got, expected, places=5)
+
     def _joint_dict(self, name: str, parent: int, translation: tuple[float, float, float]) -> dict:
         tx, ty, tz = translation
         ibm = [

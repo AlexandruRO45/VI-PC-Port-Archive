@@ -1091,6 +1091,15 @@ INSTANCING_EXTENSION = "EXT_mesh_gpu_instancing"
 INSTANCING_MODES = ("gpu", "nodes")
 
 
+def mat_mul(a, b):
+    """Column-major 4x4 product ``a * b``."""
+    out = [0.0] * 16
+    for column in range(4):
+        for row in range(4):
+            out[column * 4 + row] = sum(a[k * 4 + row] * b[column * 4 + k] for k in range(4))
+    return out
+
+
 def _quat_matrix(q) -> list[list[float]]:
     x, y, z, w = (float(v) for v in q)
     return [

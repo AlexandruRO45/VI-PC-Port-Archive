@@ -188,7 +188,7 @@ class SkeletonJoint:
     translation: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rotation: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
     scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    # 16 column-major floats in glTF Y-up (or RAGE Z-up if skeleton.coord_space == "z-up")
+    # Column-major in skeleton.coord_space. Omission derives the inverse of the joint's world bind transform.
     inverse_bind_matrix: tuple[float, ...] | None = None
 
 
@@ -1836,6 +1836,52 @@ def remap_part_joints(
     return new_j0, new_j1
 
 
+def _inverse_joint_trs(node):
+    """Invert a glTF local TRS, including nonuniform and negative scale."""
+    scale = node.get("scale", (1, 1, 1))
+    if 0 in scale:
+        return None
+    rotation = glb_writer._quat_matrix(node.get("rotation", (0, 0, 0, 1)))
+    t = node.get("translation", (0, 0, 0))
+    inverse = list(_identity_mat4_col())
+    for row in range(3):
+        for col in range(3):
+            inverse[4 * col + row] = rotation[col][row] / scale[row]
+        inverse[12 + row] = -sum(inverse[4 * col + row] * t[col] for col in range(3))
+    return inverse
+
+
+def _pack_inverse_binds(skeleton, nodes, base, roots):
+    """Write each joint in palette order, independent of its position in the tree."""
+    matrices = [None] * len(skeleton.joints)
+    # The standing-space wrapper places the entire character. It is outside the bind pose.
+    stack = [(root, _identity_mat4_col()) for root in roots]
+    while stack:
+        index, parent_inverse = stack.pop()
+        node = nodes[index]
+        slot = index - base
+        local_inverse = _inverse_joint_trs(node)
+        world_inverse = (glb_writer.mat_mul(local_inverse, parent_inverse)
+                         if local_inverse is not None and parent_inverse is not None else None)
+        ibm = skeleton.joints[slot].inverse_bind_matrix
+        if ibm is None:
+            if world_inverse is None:
+                raise PedAssembleError(f"{node['name']}: cannot derive an inverse bind from a singular transform")
+            ibm = world_inverse
+        elif skeleton.coord_space == "z-up":
+            ibm = rage_to_yup_mat4_col(ibm)
+        if len(ibm) != 16 or not all(math.isfinite(v) for v in ibm):
+            raise PedAssembleError(f"{node['name']}: expected a finite inverse bind matrix")
+        try:
+            matrices[slot] = struct.pack("<16f", *ibm)
+        except OverflowError as exc:
+            raise PedAssembleError(f"{node['name']}: inverse bind matrix exceeds float32") from exc
+        stack.extend((child, world_inverse) for child in node.get("children", ()))
+    if None in matrices:
+        raise PedAssembleError(f"{skeleton.name}: cycle in joint parents")
+    return b"".join(matrices)
+
+
 def build_assembled_glb(
     parts: list[MeshPart],
     *,
@@ -2006,7 +2052,6 @@ def build_assembled_glb(
     if skeleton is not None and skeleton.joints:
         joint_node_indices: list[int] = []
         root_joint_nodes: list[int] = []
-        ibm_floats: list[float] = []
         base_idx = len(nodes)
         skel_zup = skeleton.coord_space == "z-up"
 
@@ -2014,21 +2059,19 @@ def build_assembled_glb(
             t = rage_to_yup_vec3(j.translation) if skel_zup else j.translation
             r = rage_to_yup_quat(j.rotation) if skel_zup else j.rotation
             s = (j.scale[0], j.scale[2], j.scale[1]) if skel_zup else j.scale
+            length = math.hypot(*r)
+            if not length or not math.isfinite(length) or not all(math.isfinite(v) for v in (*s, *t)):
+                raise PedAssembleError(f"{j.name}: invalid bind transform")
+            r = tuple(v / length for v in r)
             jnode: dict = {"name": j.name}
-            if any(abs(v) > 1e-7 for v in t):
-                jnode["translation"] = [round(v, 7) for v in t]
-            if any(abs(v - d0) > 1e-7 for v, d0 in zip(r, (0.0, 0.0, 0.0, 1.0))):
-                jnode["rotation"] = [round(v, 7) for v in r]
-            if any(abs(v - 1.0) > 1e-6 for v in s):
-                jnode["scale"] = [round(v, 7) for v in s]
+            if any(t):
+                jnode["translation"] = list(t)
+            if tuple(r) != (0.0, 0.0, 0.0, 1.0):
+                jnode["rotation"] = list(r)
+            if tuple(s) != (1.0, 1.0, 1.0):
+                jnode["scale"] = list(s)
             nodes.append(jnode)
             joint_node_indices.append(base_idx + ji)
-
-            if j.inverse_bind_matrix is not None:
-                ibm = rage_to_yup_mat4_col(j.inverse_bind_matrix) if skel_zup else j.inverse_bind_matrix
-            else:
-                ibm = _identity_mat4_col()
-            ibm_floats.extend(ibm)
 
         for ji, j in enumerate(skeleton.joints):
             nidx = joint_node_indices[ji]
@@ -2045,7 +2088,7 @@ def build_assembled_glb(
         nodes.append(rig_root_node)
         scene_nodes.append(rig_root_idx)
 
-        ibm_bytes = struct.pack(f"<{len(ibm_floats)}f", *ibm_floats)
+        ibm_bytes = _pack_inverse_binds(skeleton, nodes, base_idx, root_joint_nodes)
         ibm_bv = _append_bv(bin_buf, buffer_views, ibm_bytes, target=None)
         ibm_acc = _append_accessor(accessors, ibm_bv, COMPONENT_FLOAT, len(skeleton.joints), "MAT4")
 

@@ -73,6 +73,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from glb_writer import mat_mul  # noqa: E402
 
 try:  # optional: the stdlib path below is the fallback and is covered by the tests
     import numpy as _np
@@ -131,15 +132,6 @@ def joaat32(name: str) -> int:
     value = (value + (value << 3)) & 0xFFFFFFFF
     value ^= value >> 11
     return (value + (value << 15)) & 0xFFFFFFFF
-
-
-def mat_mul(a, b):
-    """Column-major 4x4 product ``a * b``."""
-    out = [0.0] * 16
-    for column in range(4):
-        for row in range(4):
-            out[column * 4 + row] = sum(a[k * 4 + row] * b[column * 4 + k] for k in range(4))
-    return out
 
 
 def invert_affine(m):
