@@ -22,6 +22,7 @@
 #include "../src/vulkan_memory.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
+#include "../src/compile_stack.h"
 #include "../src/conservative_raster.h"
 #include "../src/shader_library.h"
 #include "../src/spirv_f16_halves.h"
@@ -3273,8 +3274,11 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        // The driver compiles here, on the title's thread: with_compile_stack gives it a known stack (compile_stack.h).
+        if (leonida::with_compile_stack([&] {
+                return vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                                   &pipeline_.pipeline);
+            }) != VK_SUCCESS)
             return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
@@ -3379,8 +3383,11 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+        // Built on the thread that replays the list (variant): with_compile_stack gives the compiler a known stack.
+        if (leonida::with_compile_stack([&] {
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+                                                                     &info, nullptr, &pipeline);
+            }) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
