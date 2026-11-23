@@ -33,7 +33,7 @@ constexpr Result RESULT_FAIL_FEATURE_ALREADY_EXISTS = RESULT_FAIL | 3;
 constexpr Result RESULT_FAIL_FEATURE_NOT_FOUND = RESULT_FAIL | 4;
 constexpr Result RESULT_FAIL_INVALID_PARAMETER = RESULT_FAIL | 5;
 constexpr Result RESULT_FAIL_NOT_INITIALIZED = RESULT_FAIL | 7;
-constexpr Result RESULT_FAIL_OUT_OF_DATE = RESULT_FAIL | 8;  // an older driver: the deprecated GetParameters fallback
+constexpr Result RESULT_FAIL_OUT_OF_DATE = RESULT_FAIL | 12;  // an older driver: the deprecated GetParameters fallback
 
 constexpr Version SDK_VERSION = 0x15;  // NVSDK_NGX_Version_API of the 310.6 release (NVNGX version 1.5.0)
 constexpr EngineType ENGINE_CUSTOM = 0;
@@ -91,16 +91,32 @@ struct Parameter {
     virtual void Reset() = 0;
 };
 
-// Where the NGX Core looks for feature dlls beyond the application folder (guide section 5.1).
+// Where the NGX Core looks for feature dlls beyond the application folder (guide section 5.1), plus the
+// logging block the Core reads whenever the caller declares an SDK version that knows it (0x14+; 0x15 is
+// passed). The layout matches the shipped struct exactly: 16-byte path list (pointer + length + pad),
+// the opaque internal slot, and the inline 16-byte logging record. A shorter record ends the process at
+// init with 0xc0000005 (the Core dereferences/reads past the shorter object — observed), which is why the
+// logging record is inlined bytes, not a pointer the zeroing would hide behind.
 struct PathListInfo {
     const wchar_t* const* path;
     unsigned int length;
 };
+typedef void(__cdecl* AppLogCallback)(const char* message, int logging_level, Feature source);
+struct LoggingInfo {
+    AppLogCallback callback;      // app-side sink; null keeps the Core's defaults
+    int minimum_level;            // 0 off / 1 on / 2 verbose
+    bool disable_other_sinks;     // true requires a non-null callback
+};
 struct FeatureCommonInfo {
     PathListInfo pathList;
-    void* internal;  // engine-managed
-    void* logging;   // NGX_LoggingInfo, may be null
+    void* internal;          // engine-managed
+    LoggingInfo logging;
 };
+
+// The Core reads these records by the shipped layout; a mismatch is a silent ABI break, so pin the sizes.
+static_assert(sizeof(PathListInfo) == 16, "PathListInfo must match the shipped 16-byte record");
+static_assert(sizeof(LoggingInfo) == 16, "LoggingInfo must match the shipped 16-byte record");
+static_assert(sizeof(FeatureCommonInfo) == 40, "FeatureCommonInfo must total the shipped 40-byte record");
 
 typedef struct Handle Handle;  // opaque, from CreateFeature, consumed by Evaluate/Release
 

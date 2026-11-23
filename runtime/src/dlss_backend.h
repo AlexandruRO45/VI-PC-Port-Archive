@@ -69,6 +69,15 @@ float effective_mv_scale(float mv_scale);
 // hint should be set at all: the driver's OTA default stays untouched for PRESET_DEFAULT.
 const char* preset_key(nvngx::PerfQualityValue quality);
 
+// The parameter-bag assembly, also driven by the tests (a mock nvngx::Parameter records the calls): the
+// guide's create sequence (5.3, via the shipped NGX_D3D12_CREATE_DLSS_EXT helper) and the eval sequence
+// (5.4, via NGX_D3D12_EVALUATE_DLSS_EXT). The preset hint goes into the bag before CreateFeature (guide
+// 3.12: presets are selected per scaling-ratio slot on the create parameters) and is refreshed per eval.
+void fill_create_params(nvngx::Parameter* params, const Description& desc, unsigned int creation_node_mask,
+                        nvngx::PerfQualityValue quality, int flags);
+void fill_eval_params(nvngx::Parameter* params, const FfxDescription& fx, int preset,
+                      nvngx::PerfQualityValue quality);
+
 // Process-level: loads the NGX Core by name (LEONIDA_NGX_DLL overrides), inits on device, checks capability.
 bool init(ID3D12Device* device, const wchar_t* data_path);
 bool initiated();

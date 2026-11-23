@@ -154,14 +154,13 @@ const char* preset_key(nvngx::PerfQualityValue quality) {
     return nvngx::PRESET_KEY_QUALITY;
 }
 
-Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12Device* device,
-               unsigned int creation_node_mask) {
-    (void)device;
-    if (!core().enabled) return Feature{};
-    nvngx::Parameter* params = nullptr;
-    if (core().allocate(&params) != nvngx::RESULT_SUCCESS || !params) return Feature{};
-    const nvngx::PerfQualityValue quality = pick_quality(desc.upscale_ratio);
-    const int flags = create_flags(desc);
+// The create parameter bag, in the shipped helper's exact key and type order (NGX_D3D12_CREATE_DLSS_EXT):
+// node masks as unsigned, sizes as unsigned, quality and flags as int. The preset hint rides the same bag
+// so it is on it before CreateFeature — the guide's 3.12 example Sets it on the create parameters, and the
+// slot pick is read at creation when the network preset is baked into the feature. PRESET_DEFAULT (0)
+// leaves the key unset, which keeps the driver's OTA default in place.
+void fill_create_params(nvngx::Parameter* params, const Description& desc, unsigned int creation_node_mask,
+                        nvngx::PerfQualityValue quality, int flags) {
     params->Set(nvngx::CREATION_NODE_MASK, creation_node_mask);
     params->Set(nvngx::VISIBILITY_NODE_MASK, creation_node_mask);
     params->Set(nvngx::WIDTH, desc.render_width);
@@ -171,6 +170,41 @@ Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12D
     params->Set(nvngx::PERF_QUALITY_VALUE, static_cast<int>(quality));
     params->Set(nvngx::DLSS_CREATE_FLAGS, flags);
     params->Set(nvngx::DLSS_ENABLE_OUTPUT_SUBRECTS, 0);
+    if (desc.preset != nvngx::PRESET_DEFAULT)
+        params->Set(preset_key(quality), desc.preset);
+}
+
+// The eval parameter bag, in the shipped helper's exact key and type order (NGX_D3D12_EVALUATE_DLSS_EXT):
+// resources, jitter floats, the deprecated sharpness (set 0), reset as int, the MV scale with the helper's
+// 0-means-1.0 rule, then the optional resources. The preset hint is refreshed identically, so a bag reused
+// across frames keeps describing the selected slot whatever the NGX side reads at which call.
+void fill_eval_params(nvngx::Parameter* params, const FfxDescription& fx, int preset,
+                      nvngx::PerfQualityValue quality) {
+    params->Set(nvngx::COLOR, fx.color);
+    params->Set(nvngx::OUTPUT, fx.output);
+    if (fx.depth) params->Set(nvngx::DEPTH, fx.depth);
+    if (fx.motion_vectors) params->Set(nvngx::MOTION_VECTORS, fx.motion_vectors);
+    params->Set(nvngx::JITTER_OFFSET_X, fx.jitter_x);
+    params->Set(nvngx::JITTER_OFFSET_Y, fx.jitter_y);
+    params->Set(nvngx::SHARPNESS, fx.sharpness);
+    params->Set(nvngx::RESET, fx.reset ? 1 : 0);
+    params->Set(nvngx::MV_SCALE_X, effective_mv_scale(fx.mv_scale_x));
+    params->Set(nvngx::MV_SCALE_Y, effective_mv_scale(fx.mv_scale_y));
+    if (preset != nvngx::PRESET_DEFAULT)
+        params->Set(preset_key(quality), preset);
+    if (fx.exposure) params->Set(nvngx::EXPOSURE_TEXTURE, fx.exposure);
+    if (fx.transparency_mask) params->Set(nvngx::TRANSPARENCY_MASK, fx.transparency_mask);
+}
+
+Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12Device* device,
+               unsigned int creation_node_mask) {
+    (void)device;
+    if (!core().enabled) return Feature{};
+    nvngx::Parameter* params = nullptr;
+    if (core().allocate(&params) != nvngx::RESULT_SUCCESS || !params) return Feature{};
+    const nvngx::PerfQualityValue quality = pick_quality(desc.upscale_ratio);
+    const int flags = create_flags(desc);
+    fill_create_params(params, desc, creation_node_mask, quality, flags);
     Feature f;
     f.params = params;
     nvngx::Handle* handle = nullptr;
@@ -184,20 +218,7 @@ Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12D
 
 bool eval_from_ffx(Feature& f, ID3D12GraphicsCommandList* list, const FfxDescription& fx) {
     if (!f.ngx || !f.params) return false;
-    f.params->Set(nvngx::COLOR, fx.color);
-    f.params->Set(nvngx::OUTPUT, fx.output);
-    if (fx.depth) f.params->Set(nvngx::DEPTH, fx.depth);
-    if (fx.motion_vectors) f.params->Set(nvngx::MOTION_VECTORS, fx.motion_vectors);
-    f.params->Set(nvngx::JITTER_OFFSET_X, fx.jitter_x);
-    f.params->Set(nvngx::JITTER_OFFSET_Y, fx.jitter_y);
-    f.params->Set(nvngx::MV_SCALE_X, effective_mv_scale(fx.mv_scale_x));
-    f.params->Set(nvngx::MV_SCALE_Y, effective_mv_scale(fx.mv_scale_y));
-    f.params->Set(nvngx::SHARPNESS, fx.sharpness);
-    f.params->Set(nvngx::RESET, fx.reset ? 1 : 0);
-    if (f.preset != nvngx::PRESET_DEFAULT)
-        f.params->Set(preset_key(f.quality), f.preset);  // per-slot hint; OTA default if unset
-    if (fx.exposure) f.params->Set(nvngx::EXPOSURE_TEXTURE, fx.exposure);
-    if (fx.transparency_mask) f.params->Set(nvngx::TRANSPARENCY_MASK, fx.transparency_mask);
+    fill_eval_params(f.params, fx, f.preset, f.quality);
     return core().evaluate(list, f.ngx, f.params, nullptr) == nvngx::RESULT_SUCCESS;
 }
 
