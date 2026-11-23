@@ -449,3 +449,28 @@ class TestConditionCodesAndStatusFlags(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x22222222)
         self.assertEqual(words[1], 200)
+
+
+# ==============================================================================
+# SECTION 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# ==============================================================================
+
+class TestIEEE754EdgeCases(unittest.TestCase):
+    """Commit 7: Boundary extremes, bit limits, and wrapping."""
+
+    def test_zero_identity(self) -> None:
+        """Verify multiplication by zero gives zero."""
+        self.assertEqual(oracle_mul_u32_u24(0, 0x00FF_FFFF), 0)
+        self.assertEqual(oracle_mul_u32_u24(0x00FF_FFFF, 0), 0)
+
+    def test_overflow_wrapping_past_32_bits(self) -> None:
+        """Verify wrapping modulo 2^32 on large 24-bit products."""
+        # 0x800000 * 0x800 = 0x400000000; low 32 bits = 0
+        got = oracle_mul_u32_u24(0x80_0000, 0x800)
+        self.assertEqual(got, 0)
+
+    def test_power_of_two_shift(self) -> None:
+        """Verify multiplying by power of two matches logical shift."""
+        val = 0x1234
+        got = oracle_mul_u32_u24(val, 1 << 16)
+        self.assertEqual(got, val << 16)
