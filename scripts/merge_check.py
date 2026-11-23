@@ -173,13 +173,31 @@ def parse_pair(text):
     return int(number.lstrip("#")), ref
 
 
+def at_least_one(text):
+    """--depth and --min-length: 0 or less is a silent lie rather than a setting.
+
+    `--depth 0` passes `git log -n0`, which lists no commit, so no earlier merge is found and a PR that was merged
+    before reads `clean` - the doubled-text case this script exists for. `--min-length 0` (or less) counts every
+    short line (`}`, `|`, `end`) as a duplicate line, so ordinary code is reported as a block that is already there.
+    """
+    try:
+        value = int(text, 10)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("pairs", nargs="+", type=parse_pair, metavar="PR=REF")
     ap.add_argument("--main", default="origin/main", help="the branch the round merges into (default origin/main)")
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
-    ap.add_argument("--min-length", type=int, default=40, help="shortest stripped line counted as a duplicate (40)")
-    ap.add_argument("--depth", type=int, default=5000, help="first-parent commits searched for earlier merges (5000)")
+    ap.add_argument("--min-length", type=at_least_one, default=40,
+                    help="shortest stripped line counted as a duplicate (40, at least 1)")
+    ap.add_argument("--depth", type=at_least_one, default=5000,
+                    help="first-parent commits searched for earlier merges (5000, at least 1)")
     ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
     args = ap.parse_args(argv)
     try:
