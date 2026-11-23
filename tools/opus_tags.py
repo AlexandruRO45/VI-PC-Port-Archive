@@ -121,6 +121,8 @@ def load_names(path, source=None):
     ambiguous = collections.defaultdict(set)
     with open(path, encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
+        if source and "source" not in (reader.fieldnames or ()):
+            raise ValueError(f"{path}: --source requires a 'source' column in the names CSV header")
         for row in reader:
             if source and row.get("source") != source:
                 continue

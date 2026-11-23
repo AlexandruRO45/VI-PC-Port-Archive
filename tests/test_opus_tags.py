@@ -346,6 +346,37 @@ class TestFolder(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1)
 
+    def test_cli_source_filter_requires_source_column(self):
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in Path(self.opus).rglob("*.ogg")}
+        header = "bank,stream_id,name\n"
+        for contents in ("", header, header + "bank_02,1fffffff,door_slam_03\n"):
+            with self.subTest(contents=contents):
+                Path(self.names).write_text(contents, encoding="utf-8", newline="\n")
+                r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "story"],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertEqual(r.stdout, "")
+                self.assertEqual(len(r.stderr.splitlines()), 1)
+                self.assertIn(self.names, r.stderr)
+                self.assertIn("--source requires a 'source' column", r.stderr)
+                for path, original in before.items():
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), original)
+
+    def test_cli_source_filter_can_match_no_rows(self):
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names, "--source", "absent"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "")
+        self.assertRegex(r.stdout, r"(?m)^without a name\s+3$")
+        self.assertNotIn("tagged", r.stdout)
+
+    def test_cli_names_without_source_can_be_used_without_a_filter(self):
+        write_csv(self.names, NAMES[1:], [{"bank": "bank_02", "stream_id": "1fffffff", "name": "door_slam_03"}])
+        r = subprocess.run([sys.executable, "-I", TOOL, self.opus, "--names", self.names],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.tags("story", "bank_02", "1FFFFFFF.ogg"), ["TITLE=door_slam_03"])
+
     def test_cli_reads_utf8_bom_in_names_and_dialogue(self):
         for path in map(Path, (self.names, self.dialogue)):
             path.write_bytes(codecs.BOM_UTF8 + path.read_bytes())
