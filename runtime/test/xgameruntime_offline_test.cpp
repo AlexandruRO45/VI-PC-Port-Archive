@@ -154,8 +154,9 @@ int main() {
     uint32_t pre_width = 99, pre_height = 99;
     char pre_location[8] = "present", pre_session[8] = "present";
     size_t pre_used = 99;
+    XTaskQueueRegistrationToken token{};
     auto check_uninitialized = [&]() {
-        check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, nullptr, nullptr) == not_initialized, "properties registration requires initialization");
+        check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == not_initialized, "properties registration requires initialization");
         check(at<Dimensions>(streaming, 8)(streaming, 0, &pre_width, &pre_height) == not_initialized, "dimensions require initialization");
         check(at<Location>(streaming, 16)(streaming, sizeof(pre_location), pre_location) == not_initialized, "location requires initialization");
         check(at<Session>(streaming, 32)(streaming, 0, sizeof(pre_session), pre_session, &pre_used) == not_initialized, "session requires initialization");
@@ -165,7 +166,6 @@ int main() {
     check(!at<Bool>(streaming, 5)(streaming), "XGameStreamingIsStreaming is false");
     check(at<Count>(streaming, 9)(streaming) == 0, "no streaming clients");
     check(at<Count>(streaming, 11)(streaming) == 0, "the connection state is the first enumerator");
-    XTaskQueueRegistrationToken token{};
     check(at<Register>(streaming, 12)(streaming, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == S_OK &&
               token.token != 0 && at<Bool>(streaming, 13)(streaming),
           "connection-state registration hands out a token; unregistering is never pending");
