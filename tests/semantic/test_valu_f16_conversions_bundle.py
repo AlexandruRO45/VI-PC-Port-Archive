@@ -419,6 +419,17 @@ class TestVCvtI16F16SIMD(unittest.TestCase):
         # Positive saturation: +40000.0 -> 32767 (0x7FFF)
         self.assertEqual(ref_v_cvt_i16_f16(float_to_f16_bits(40000.0)), 0x7FFF)
 
+class TestVCvtI16F16Translator(unittest.TestCase):
+    def test_translator_cvt_i16_f16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0xd140",  # -42.0h
+            "v_cvt_i16_f16_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_i16_f16")
+        for l in range(32):
+            self.assertEqual(results[l] & 0xFFFF, 0xFFD6)
+
 
 if __name__ == "__main__":
     unittest.main()
