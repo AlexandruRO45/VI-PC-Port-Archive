@@ -14,16 +14,17 @@ import sys
 
 def judge(failed: list[str], status: int, expected: list[str]) -> tuple[int, list[str]]:
     """(exit status, GitHub Actions workflow commands to print)."""
+    if status != 0 and not failed:
+        return 1, [f"::error::the test runner exited with {status} without naming a failed test"]
+
     unexpected = [name for name in failed if name not in expected]
     lines = [f"::error::{name} failed" for name in unexpected]
-    if status != 0 and not failed:
-        lines.append(f"::error::the test runner exited with {status} without naming a failed test")
     for name in expected:
         if name in failed:
             lines.append(f"::warning::{name} failed, as expected until its fix is merged")
         else:
             lines.append(f"::notice::{name} passed: drop it from the expected failures")
-    return (1 if unexpected or (status != 0 and not failed) else 0), lines
+    return (1 if unexpected else 0), lines
 
 
 def main(argv: list[str]) -> int:
