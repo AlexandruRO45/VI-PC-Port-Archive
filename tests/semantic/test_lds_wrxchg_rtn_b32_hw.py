@@ -583,5 +583,91 @@ class TestDSWrxchgRtnB32BoundaryExtremes(unittest.TestCase):
                 self.assertEqual(new, ~bits & MASK32)
 
 
+class TestDSWrxchgRtnB32NegativeAndMutation(unittest.TestCase):
+    """Commit 8: Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_offset(self) -> None:
+        with self.assertRaises(ValueError):
+            OffsetImmediate(-1)
+        with self.assertRaises(ValueError):
+            OffsetImmediate(0x10000)
+
+    def test_syntax_rejection_invalid_vgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            VGPR(256)
+
+    def test_mutation_detection_dropped_offset(self) -> None:
+        class DroppedOffsetMutant(ScalarDSInterpreter):
+            def execute(self, state: ScalarThreadState, inst: DSWrxchgInstruction) -> Tuple[int, int]:
+                no_off = DSWrxchgInstruction(
+                    opcode=inst.opcode,
+                    vdst=inst.vdst,
+                    vaddr=inst.vaddr,
+                    vdata=inst.vdata,
+                    offset=OffsetImmediate(0),
+                )
+                return super().execute(state, no_off)
+
+        lds = LDSMemory(num_dwords=1024)
+        lds.write_dword(0x10, 0x11111111)
+        lds.write_dword(0x20, 0x22222222)
+        state = ScalarThreadState(lds)
+        state.rf.set_vgpr(VGPR(1), 0x10)
+        state.rf.set_vgpr(VGPR(2), 0x99999999)
+
+        inst = DSWrxchgInstruction(
+            opcode=DSOpcode.DS_WRXCHG_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vdata=VGPR(2),
+            offset=OffsetImmediate(0x10),
+        )
+        DroppedOffsetMutant().execute(state, inst)
+        self.assertEqual(lds.read_dword(0x10), 0x99999999)
+        self.assertEqual(lds.read_dword(0x20), 0x22222222)
+
+
+class TestDSWrxchgRtnB32TranslatorIntegration(unittest.TestCase):
+    """Hardware translator integration: tools/rdna2spirv.py and spirv_mini_interp."""
+
+    TABLE = (  # (M, D)
+        (0xFFFFFFFF, 0x0F0F0F0F),
+        (0x12345678, 0x9ABCDEF0),
+        (0xAAAAAAAA, 0x55555555),
+        (0x00000000, 0xFFFFFFFF),
+        (0x80000001, 0x80000000),
+    )
+
+    def test_translator_one_operation_table(self) -> None:
+        for m, d in self.TABLE:
+            with self.subTest(m=hex(m), d=hex(d)):
+                rtns, fin = L.run_chain([("ds_wrxchg_rtn_b32", 0x40, 0, (d,))], {0x40: m})
+                self.assertEqual(rtns, [m])
+                self.assertEqual(fin, {0x40: d})
+
+    def test_translator_offset_addressing(self) -> None:
+        init = {0x40: 0xFFFFFFFF, 0x54: 0x12345678}
+        rtns, fin = L.run_chain([("ds_wrxchg_rtn_b32", 0x40, 0x14, (0xCAFEBABE,))], init)
+        self.assertEqual(rtns, [0x12345678])
+        self.assertEqual(fin, {0x54: 0xCAFEBABE})
+
+    def test_translator_chain_sequential_swaps(self) -> None:
+        # Sequential swaps on the same dword: each returns what the previous wrote
+        ops = [
+            ("ds_wrxchg_rtn_b32", 0x40, 0, (0x11111111,)),
+            ("ds_wrxchg_rtn_b32", 0x40, 0, (0x22222222,)),
+            ("ds_wrxchg_rtn_b32", 0x40, 0, (0x33333333,)),
+        ]
+        rtns, fin = L.run_chain(ops, {0x40: 0x00000000})
+        self.assertEqual(rtns, [0x00000000, 0x11111111, 0x22222222])
+        self.assertEqual(fin, {0x40: 0x33333333})
+
+    def test_translator_rejects_malformed_syntax(self) -> None:
+        with self.assertRaises(rdna2spirv.Unsupported):
+            support.translate_lines("bad_syntax", ["ds_wrxchg_rtn_b32 v1, v2"])
+
+
 if __name__ == "__main__":
     unittest.main()
