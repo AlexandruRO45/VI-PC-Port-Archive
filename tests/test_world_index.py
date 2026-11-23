@@ -641,6 +641,43 @@ class WorldIndexTest(unittest.TestCase):
         with open(entities, "rb") as f:
             self.assertEqual(f.read(), b"previous report")
 
+    def test_partial_index_write_keeps_previous_index(self):
+        source = os.path.join(self.dir, "resource.bin")
+        with open(source, "wb") as f:
+            f.write(make_resource())
+        index = os.path.join(self.dir, "world_index.json")
+        self.assertEqual(WI.main([source, "--out", index]), 0)
+        self.assertEqual(os.stat(index).st_mode, os.stat(source).st_mode)
+        if os.name == "posix":
+            os.chmod(index, 0o640)
+        previous_mode = os.stat(index).st_mode
+        with open(index, "rb") as f:
+            previous = f.read()
+
+        def fail_after_write(doc, f, **options):
+            self.assertEqual(doc["summary"]["resources"], 1)
+            f.write('{\n "resources": [')
+            f.flush()
+            raise OSError(errno.ENOSPC, "injected disk full")
+
+        err = io.StringIO()
+        with mock.patch.object(WI.json, "dump", side_effect=fail_after_write), contextlib.redirect_stderr(err):
+            self.assertEqual(WI.main([source, "--out", index]), 2)
+        self.assertRegex(err.getvalue(), r"\AERROR: .*injected disk full\n\Z")
+        with open(index, "rb") as f:
+            self.assertEqual(f.read(), previous)
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "world_index.json"])
+
+        with open(source, "wb") as f:
+            f.write(make_resource(map_file=False))
+        self.assertEqual(WI.main([source, "--out", index]), 0)
+        with open(index, "rb") as f:
+            replaced = f.read()
+        self.assertEqual(json.loads(replaced)["resources"][0]["kind"], "meta")
+        self.assertNotIn(b"\r", replaced)
+        self.assertEqual(os.stat(index).st_mode, previous_mode)
+        self.assertCountEqual(os.listdir(self.dir), ["resource.bin", "world_index.json"])
+
     def test_success_replaces_existing_placement_report(self):
         source = os.path.join(self.dir, "resource.bin")
         with open(source, "wb") as f:

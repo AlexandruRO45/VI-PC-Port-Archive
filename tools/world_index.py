@@ -38,7 +38,12 @@ import sys
 import tempfile
 import unicodedata
 import zlib
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from file_mode import published_mode  # noqa: E402
 
 SIGNATURE = b"0DRP"
 VERSION = 0x7A
@@ -895,9 +900,7 @@ def _write_reports(a, rows, stats, agg):
     summary["entities"] = sum(r.get("entities") or 0 for r in rows)
     summary["versions"] = sorted({r["version"] for r in rows})
     doc = {"summary": summary, "resources": rows}
-    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-    with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
+    _write_index(a.out, doc)
     if a.csv:
         cols = ["source", "offset", "size", "signature", "version", "kind", "structs", "enums", "blocks",
                 "root_objects", "entities", "entity_size", "archetypes", "map_name", "map_name64", "parent",
@@ -921,6 +924,30 @@ def _write_reports(a, rows, stats, agg):
             json.dump(agg.to_json(), f, indent=1, sort_keys=True, allow_nan=False)
         summary["archetype_file"] = agg.to_json()["summary"]
     return summary
+
+
+def _write_index(path, doc):
+    """Replace the index only after the staged JSON has been written and closed."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    destination = _resolve_report_path(path)
+    if os.path.exists(destination) and not os.access(destination, os.W_OK):
+        raise PermissionError(f"index is not writable: {path}")
+    parent = os.path.dirname(destination)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=parent,
+                                         prefix=".world-index-", suffix=".tmp", delete=False) as f:
+            staged = f.name
+            json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+    except BaseException:
+        if staged is not None:
+            with suppress(OSError):
+                if os.name == "nt":
+                    os.chmod(staged, stat.S_IWRITE)
+                os.unlink(staged)
+        raise
 
 
 if __name__ == "__main__":
