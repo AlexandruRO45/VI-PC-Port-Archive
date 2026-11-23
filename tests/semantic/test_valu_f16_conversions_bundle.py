@@ -405,6 +405,20 @@ class TestVCvtI16F16AST(unittest.TestCase):
         self.assertEqual(expr.eval(0xC000), 0xFFFE)  # -2
         self.assertEqual(expr.eval(0x4000), 2)
 
+class TestVCvtI16F16SIMD(unittest.TestCase):
+    def test_simd_lane_divergence(self) -> None:
+        for l in range(32):
+            val = float((l - 16) * 10)
+            f16 = float_to_f16_bits(val)
+            expected = int(val) & MASK16
+            self.assertEqual(ref_v_cvt_i16_f16(f16), expected)
+
+    def test_simd_saturation_extremes(self) -> None:
+        # Negative saturation: -40000.0 -> -32768 (0x8000)
+        self.assertEqual(ref_v_cvt_i16_f16(float_to_f16_bits(-40000.0)), 0x8000)
+        # Positive saturation: +40000.0 -> 32767 (0x7FFF)
+        self.assertEqual(ref_v_cvt_i16_f16(float_to_f16_bits(40000.0)), 0x7FFF)
+
 
 if __name__ == "__main__":
     unittest.main()
