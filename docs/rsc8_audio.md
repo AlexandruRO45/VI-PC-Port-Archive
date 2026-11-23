@@ -372,7 +372,8 @@ python -I tools/rsc8_audio.py <package>\audio.rpf --summary-only
 # split a large archive with --start/--limit and add the summaries)
 python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf --summary-only --curves
 
-# Optional per-clip structural JSON/CSV export to a local work directory
+# Optional per-clip structural JSON/CSV export to a local work directory. A report path that is a directory, or
+# that names the source or a bank or clip of a scanned folder, is refused before the scan starts.
 python -I tools/rsc8_audio.py <package>\pack\shared_minigame000\shared_minigame000.rpf <work>\rsc8.csv
 ```
 

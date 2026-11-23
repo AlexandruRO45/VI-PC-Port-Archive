@@ -589,6 +589,122 @@ class AwcAndArchiveScanTest(unittest.TestCase):
             self.assertEqual(rows[0]["version"], "8001")
             self.assertEqual(rows[0]["valid"], "True")
 
+    @staticmethod
+    def _scan_folder(tmp):
+        """A folder to scan: a bank, a clip, a bank two folders down and a truncated bank; {path: bytes}."""
+        clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
+        bank = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])
+        os.makedirs(os.path.join(tmp, "sub", "deep"))
+        inputs = {
+            os.path.join(tmp, "a.awc"): bank,
+            os.path.join(tmp, "clip.rsc8"): build_synthetic_rsc8(stream_hash=0x11112222, frames=61),
+            os.path.join(tmp, "sub", "deep", "nested.awc"): bank,
+            # Not a bank, but the scan opens it (and names it on stderr), so it is an input like the others.
+            os.path.join(tmp, "truncated.awc"): bank[:20],
+        }
+        for path, data in inputs.items():
+            with open(path, "wb") as f:
+                f.write(data)
+        return inputs
+
+    @staticmethod
+    def _tree(root):
+        return sorted(os.path.join(folder, name) for folder, dirs, files in os.walk(root) for name in dirs + files)
+
+    def _assert_refused(self, source, out, message, inputs, root):
+        """The CLI ends with one usage error before it reads or writes anything."""
+        tree = self._tree(root)
+        result = subprocess.run([sys.executable, "-I", TOOL, source, out, "--quiet"], capture_output=True, text=True)
+        for path, data in inputs.items():
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), data, f"{path} changed with output {out}")
+        self.assertEqual(self._tree(root), tree, out)
+        self.assertEqual(result.returncode, 2, (out, result.stderr))
+        self.assertNotIn("Traceback", result.stderr)
+        # A scan puts a line about the truncated bank on stderr and ends by printing its summary; with one
+        # line after the usage text and nothing on stdout, neither happened.
+        errors = [line for line in result.stderr.splitlines() if not line.startswith(("usage:", " "))]
+        self.assertEqual(len(errors), 1, result.stderr)
+        self.assertIn("error: " + message, errors[0])
+        self.assertEqual(result.stdout, "")
+
+    def test_cli_refuses_output_naming_a_scanned_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._scan_folder(tmp)
+            outs = list(inputs)
+            # Other spellings of the first bank's path.
+            outs.append(os.path.join(tmp, "sub", "..", "a.awc"))
+            outs.append(os.path.join(tmp, "sub", "deep", "..", "..", ".", "a.awc"))
+            if os.path.exists(os.path.join(tmp, "A.AWC")):   # the volume ignores letter case
+                outs.append(os.path.join(tmp, "A.AWC"))
+                outs.append(os.path.join(tmp, "SUB", "Deep", "NESTED.awc"))
+            if os.name == "nt":   # Windows drops a trailing dot or space from a file name
+                outs += [os.path.join(tmp, "a.awc."), os.path.join(tmp, "a.awc ")]
+            for out in outs:
+                with self.subTest(out=out):
+                    self._assert_refused(tmp, out, "output must not overwrite the input file", inputs, tmp)
+
+    def test_cli_refuses_output_hard_linked_to_a_scanned_file(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as elsewhere:
+            inputs = self._scan_folder(tmp)
+            link = os.path.join(elsewhere, "report.json")
+            try:
+                os.link(os.path.join(tmp, "a.awc"), link)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"no hard links here: {e}")
+            inputs[link] = inputs[os.path.join(tmp, "a.awc")]
+            self._assert_refused(tmp, link, "output must not overwrite the input file", inputs, tmp)
+
+    def test_cli_refuses_output_directory_before_scanning(self):
+        # The report is renamed over the output path after the scan, so a directory used to fail only then.
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._scan_folder(tmp)
+            bank = os.path.join(tmp, "a.awc")
+            for source, out in ((tmp, tmp), (tmp, os.path.join(tmp, "sub")), (tmp, os.path.join(tmp, "sub", "")),
+                                (bank, tmp), (bank, os.path.join(tmp, "sub", "deep"))):
+                with self.subTest(source=source, out=out):
+                    self._assert_refused(source, out, "output must be a file, not a directory", inputs, tmp)
+
+    def test_cli_refuses_other_spellings_of_a_source_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._scan_folder(tmp)
+            for name in ("a.awc", "clip.rsc8"):
+                source = os.path.join(tmp, name)
+                outs = [source, os.path.join(tmp, "sub", "..", name)]
+                if os.path.exists(os.path.join(tmp, name.upper())):
+                    outs.append(os.path.join(tmp, name.upper()))
+                for out in outs:
+                    with self.subTest(source=source, out=out):
+                        self._assert_refused(source, out, "output must not overwrite the source file", inputs, tmp)
+
+    def test_cli_writes_a_report_inside_the_scanned_directory(self):
+        # A report next to the banks is fine: the scan reads `.awc` and `.rsc8` names only, so a second run
+        # neither refuses the report it replaces nor counts it as an input.
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._scan_folder(tmp)
+            outs = (os.path.join(tmp, "report.json"), os.path.join(tmp, "sub", "deep", "report.csv"),
+                    os.path.join(tmp, "new", "folder", "report.json"))
+            for run in range(2):
+                for out in outs:
+                    with self.subTest(run=run, out=out):
+                        result = subprocess.run([sys.executable, "-I", TOOL, tmp, out, "--quiet"],
+                                                capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        summary = json.loads(result.stdout)
+                        self.assertEqual((summary["adat_banks"], summary["rsc8_standalone"]), (2, 1))
+                        self.assertEqual(summary["invalid_files"], 1)   # the truncated bank, not a report
+                        with open(out, encoding="utf-8", newline="") as f:
+                            if out.endswith(".csv"):
+                                self.assertEqual(len(list(csv.DictReader(f))), 3)
+                            else:
+                                self.assertEqual(len(json.load(f)["records"]), 3)
+            for path, data in inputs.items():
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), data, path)
+            # Only the three reports were added; the temporary file each one is written to is gone.
+            added = sorted(set(self._tree(tmp)) - set(inputs))
+            self.assertEqual([p for p in added if os.path.isfile(p)], sorted(outs))
+
     def test_cli_rejects_output_aliasing_source(self):
         clip = build_synthetic_rsc8(stream_hash=0x20112233, frames=90)
         original = build_synthetic_awc([{"id": 0x00112233, "rsc8": clip, "samples": 48000}])

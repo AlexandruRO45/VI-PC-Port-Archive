@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_clips  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 RSC8_MAGIC = b"RSC8"
 RSC8_VERSION = 8001
@@ -109,6 +110,10 @@ CSV_COLUMNS = [
     "prop_count",
     "valid",
 ]
+
+
+class ReportOverInput(ValueError):
+    """The report path names a file the scan reads; main() ends with it as a usage error."""
 
 
 def _u16(buf, off):
@@ -1547,8 +1552,12 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
     return records, summary
 
 
-def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False):
-    """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
+def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False, out=None):
+    """Scan a directory of `.awc` banks and/or standalone `.rsc8` files.
+
+    `out` is the report the caller writes afterwards: if it names one of the files found, ReportOverInput is
+    raised before the first of them is read.
+    """
     t0 = time.time()
     summary = _new_summary("directory", path)
     records = []
@@ -1562,6 +1571,12 @@ def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=Fa
                     continue
                 files.append(fp)
     files.sort()
+    # The report is renamed over `out` once the scan is done, which would replace a bank or clip with the report
+    # about it. Checked on the list that is read below, so no file the scan opens can be left out.
+    if out:
+        for fp in files:
+            if same_report_path(out, fp):
+                raise ReportOverInput(f"output must not overwrite the input file {fp}")
 
     for fp in files:
         if max_banks is not None and summary["adat_banks"] >= max_banks:
@@ -1745,14 +1760,13 @@ def main(argv=None):
     if not os.path.exists(args.source):
         print(f"{args.source}: path not found", file=sys.stderr)
         return 2
-    if args.out and os.path.isfile(args.source):
-        try:
-            overwrites_source = os.path.samefile(args.source, args.out)
-        except FileNotFoundError:
-            overwrites_source = False
-        except OSError as e:
-            ap.error(f"cannot compare source and output paths: {e}")
-        if overwrites_source:
+    if args.out:
+        # Refused before anything is scanned: the report is written to a temporary file and renamed over `out`
+        # at the end, so a directory would fail only after the whole scan and an input would be replaced by the
+        # report. A directory source checks the files it finds the same way (scan_dir()).
+        if os.path.isdir(args.out):
+            ap.error(f"output must be a file, not a directory: {args.out}")
+        if os.path.isfile(args.source) and same_report_path(args.out, args.source):
             ap.error("output must not overwrite the source file")
     collect = (not args.summary_only) and (args.out is not None)
     if os.path.isdir(args.source):
@@ -1765,7 +1779,10 @@ def main(argv=None):
                 deep=not args.no_deep,
                 collect_records=collect,
                 curves=args.curves,
+                out=args.out,
             )
+        except ReportOverInput as e:
+            ap.error(str(e))
         except (OSError, ValueError) as e:
             print(f"{args.source}: {e}", file=sys.stderr)
             return 2
