@@ -66,6 +66,7 @@ CAUGHT = [
     ("bank2.json", b"AWC\x00" + bytes(12), "AWC audio bank"),
     ("script.lol", b"YSC\x00" + bytes(12), "YSC compiled script"),
     ("anim.bin", b"MoVE" + (19).to_bytes(4, "little") + bytes(8), "MoVE animation container"),
+    ("cache.bin", b"PS\x00\x09" + bytes(12), "PSO cache"),
     ("bones.dat", b"SKEL_" + b"SKEL_Head\x00" + bytes(8), "SKEL_ bone table"),
     ("script2.lol", b"SCRP" + bytes(12), "SCRP compiled script"),
 ]
