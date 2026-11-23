@@ -202,6 +202,7 @@ bool drive_root(const std::wstring& path, const std::vector<std::wstring>& parts
 struct Target {
     std::filesystem::path path;
     DWORD error = 0;  // non-zero: the caller fails with this error and does not touch the host
+    bool copied_up = false;
 };
 
 Target fail(DWORD error) {
@@ -431,6 +432,8 @@ Target write_target(const std::wstring& path, bool copy_up) {
             const DWORD error = ::GetLastError();
             std::filesystem::remove(tmp, ec);
             if (!std::filesystem::exists(t.path, ec)) t.error = error;
+        } else {
+            t.copied_up = true;
         }
     }
     return t;
@@ -1203,7 +1206,10 @@ BOOL WINAPI create_hard_link_w(LPCWSTR link, LPCWSTR existing, LPSECURITY_ATTRIB
     if (!copy_destination(link, true, destination, error)) return fail_bool(error);
     const Target writable_source = write_target(existing, true);
     if (writable_source.error) return fail_bool(writable_source.error);
-    return ::CreateHardLinkW(destination.c_str(), writable_source.path.c_str(), security);
+    if (::CreateHardLinkW(destination.c_str(), writable_source.path.c_str(), security)) return TRUE;
+    const DWORD link_error = ::GetLastError();
+    if (writable_source.copied_up) ::DeleteFileW(writable_source.path.c_str());
+    return fail_bool(link_error);
 }
 
 BOOL WINAPI create_hard_link_a(LPCSTR link, LPCSTR existing, LPSECURITY_ATTRIBUTES security) {

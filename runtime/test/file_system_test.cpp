@@ -247,9 +247,20 @@ void run_checks(const std::filesystem::path& root) {
         write_path(package / "data" / "link-source.txt", "link bytes");
         check(link != nullptr, "CreateHardLinkW resolves");
         if (link) {
+            write_path(package / "data" / "link-fail-source.txt", "failure bytes");
+            const std::wstring invalid_destination = L"GAME:\\data\\" + std::wstring(300, L'x');
+            check(!link(invalid_destination.c_str(), L"GAME:\\data\\link-fail-source.txt", nullptr),
+                  "native hard link failure is reported");
+            check(!std::filesystem::exists(overlay / "data" / "link-fail-source.txt"),
+                  "failed hard link removes its copy-up");
             check(link(L"GAME:\\data\\link-dest.txt", L"GAME:\\data\\link-source.txt", nullptr), "hard link copies package source up");
             check(read_path(overlay / "data" / "link-dest.txt") == "link bytes", "link reads package bytes");
             write_path(overlay / "data" / "link-dest.txt", "changed");
+            HANDLE source_handle = create_w(L"GAME:\\data\\link-source.txt", GENERIC_READ, FILE_SHARE_READ,
+                                            nullptr, OPEN_EXISTING, 0, nullptr);
+            check(source_handle != INVALID_HANDLE_VALUE && read_handle(source_handle) == "changed",
+                  "guest source sees edits through the hard link");
+            if (source_handle != INVALID_HANDLE_VALUE) ::CloseHandle(source_handle);
             check(read_path(package / "data" / "link-source.txt") == "link bytes", "package source stays unchanged");
             check(!link((root / "outside.txt").c_str(), L"GAME:\\data\\link-source.txt", nullptr), "guest source cannot link outside overlay");
         }
