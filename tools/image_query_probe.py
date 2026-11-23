@@ -34,10 +34,15 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 TYPE_2D, TYPE_2D_ARRAY = 9, 10                      # SQ_RSRC_IMG_* in T# WORD3 [31:28]
 DIMS = {TYPE_2D: "SQ_RSRC_IMG_2D", TYPE_2D_ARRAY: "SQ_RSRC_IMG_2D_ARRAY"}
@@ -307,8 +312,24 @@ def main(argv=None):
     if a.json:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(report, f, indent=1)
+            # Write to temporary file and replace atomically so a mid-write failure keeps the previous complete report.
+            text = json.dumps(report, indent=1) + "\n"
+            staged = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", delete=False,
+                dir=os.path.dirname(os.path.abspath(a.json)),
+                prefix=".image_query_probe-", suffix=".tmp",
+            )
+            try:
+                with staged:
+                    staged.write(text)
+                if os.name != "nt":
+                    os.chmod(staged.name, published_mode(a.json))
+                replace_retry(staged.name, a.json)
+            finally:
+                try:
+                    os.unlink(staged.name)
+                except FileNotFoundError:
+                    pass
         except OSError as exc:
             print(f"cannot write {a.json}: {exc.strerror or exc}", file=sys.stderr)
             return 2  # not 1: that would read as a result off the rules; the summary above has the result

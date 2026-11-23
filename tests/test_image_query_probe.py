@@ -4,6 +4,7 @@ The last class runs on the hardware when the oracle tools are present and the GP
 Standard library only."""
 import io
 import math
+import os
 import sys
 import tempfile
 import unittest
@@ -159,6 +160,29 @@ class Comparison(unittest.TestCase):
                 out, error = io.StringIO(), io.StringIO()
                 with redirect_stdout(out), redirect_stderr(error):
                     self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 2)
+                self.assertRegex(out.getvalue(), summary)
+                self.assertIn(str(report), error.getvalue())
+                self.assertIn("cannot write", error.getvalue())
+
+    def test_a_report_that_cannot_be_written_with_replace_retry_still_shows_the_result_and_exits_2(self):
+        # Test that the atomic write pattern works correctly with replace_retry
+        for oracle, summary in ((FakeOracle(), r"follow the rules, 0 do not"),
+                                (FakeOracle(depth_2d=1), r"follow the rules, [1-9]\d* do not")):
+            with self.subTest(summary=summary), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(runner, "open_oracle", return_value=oracle):
+                # Create a file that will cause an OSError when trying to write
+                report = Path(tmp) / "report.json"
+                report.touch()
+                # Make the directory read-only so writing fails  
+                report.parent.chmod(0o444)
+                
+                out, error = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(error):
+                    self.assertEqual(pr.main(["--waves", "32", "--json", str(report)]), 2)
+                    
+                # Restore permissions
+                report.parent.chmod(0o755)
+                
                 self.assertRegex(out.getvalue(), summary)
                 self.assertIn(str(report), error.getvalue())
                 self.assertIn("cannot write", error.getvalue())
