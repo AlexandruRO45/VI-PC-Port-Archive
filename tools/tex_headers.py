@@ -900,6 +900,18 @@ def main():
         ap.error(f"no index.json for {', '.join(missing)} in {a.carve}")
     if not archs:
         ap.error(f"no carved archive (a folder with index.json) in {a.carve}")
+    if a.archives and len(archs) > 1:
+        seen = {}
+        for arch in archs:
+            archive_dir = os.path.join(a.carve, arch)
+            try:
+                info = os.stat(archive_dir)
+            except OSError as e:
+                ap.error(f"cannot inspect archive directory {archive_dir}: {e.strerror or e}")
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen:
+                ap.error(f"--archives selects the same directory twice: {seen[identity]!r} and {arch!r}")
+            seen[identity] = arch
     path = a.out or os.path.join(a.carve, "textures_index.json")
     if os.path.isdir(path):
         ap.error(f"{path} is a directory, not a .json file")
