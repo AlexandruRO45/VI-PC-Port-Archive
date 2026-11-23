@@ -84,6 +84,7 @@ class ToolStartupTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
                 self.assertNotIn("Traceback", proc.stderr)
                 self.assertIn("usage:", proc.stdout.lower())
+                self.assertIn(name, proc.stdout.lower())
 
     def test_the_two_fixed_tools_are_in_the_scan(self):
         names = {os.path.splitext(os.path.basename(path))[0] for path in sibling_importers()}
