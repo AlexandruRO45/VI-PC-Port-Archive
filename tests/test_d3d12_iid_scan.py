@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -279,6 +280,17 @@ class IidScan(unittest.TestCase):
         self.assertIn("--json would overwrite", p.stderr)
         with open(self.header, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}\n'
+        path = os.path.join(self.tmp.name, "keep.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(scan, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                scan.write_json_report(path, {"header": "h", "iids": 0, "images": []})
+        with open(path, encoding="utf-8") as f:
+            self.assertEqual(f.read(), previous)
 
 
 if __name__ == "__main__":
