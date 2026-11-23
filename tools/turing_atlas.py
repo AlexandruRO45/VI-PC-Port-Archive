@@ -111,6 +111,10 @@ OpReturn
 """,
 }
 
+# spirv-val's default Vulkan rules reject the Offset operand on a non-gather sample
+# (VUID-RuntimeSpirv-Offset-10213); maintenance8 is what makes it legal, so ask for it explicitly.
+VAL_ARGS = {"maintenance8_offset": ["--allow-offset-texture-operand"]}
+
 
 def run(cmd, **kw):
     try:
@@ -226,7 +230,7 @@ def validate_cases():
             if ra is None or ra.returncode != 0:
                 out[name] = {"assemble": False, "stderr": (ra.stderr if ra else "missing")[:300]}
                 continue
-            rv = run(["spirv-val", "--target-env", "vulkan1.4", spv])
+            rv = run(["spirv-val", "--target-env", "vulkan1.4", *VAL_ARGS.get(name, []), spv])
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
                          "stderr": ((rv.stderr if rv else "") or "")[:300]}
