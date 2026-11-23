@@ -821,14 +821,13 @@ geometry from the BIN chunk. Standard library only; no game files.
 2. **Done:** the pin is `e293917` (was `917e9b9`, originally `48557ea`).
 3. **Done:** all ten `MODEL_ARCHIVES` were re-counted and read-back decoded at `e293917` (**382,781
    models**, **0 decode failures**; table above, `levels.rpf` geometry from a full export).
-4. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
-   texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
-5. Keep issue #29 in sync with the `e293917` counts.
-3. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
+4. **Done:** `tools/rpf9dump models` was re-run over the model-bearing archives at `e293917`;
    the six non-`levels.rpf` archives total 39,454 rows (+3,203, almost all recovered fragments).
    `levels.rpf` has the same 343,327 rows in a full export (50,731 fragments, 2,509,947,536
    triangles).
-4. Keep the README and issue #29 in sync with the new counts.
+5. Investigate the 71 remaining unrecovered fragment candidates in `levels.rpf` (and the 1
+   texture-dictionary candidate in `textures.rpf`) if further upstream recovery is wanted.
+6. Keep the README and issue #29 in sync with the `e293917` counts.
 
 ### Predict model offsets for placements
 
