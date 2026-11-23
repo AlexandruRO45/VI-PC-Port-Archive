@@ -408,8 +408,8 @@ HRESULT commit(XGameSaveUpdate* u) {
         }
     for (const auto& [name, op] : u->ops)
         if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
-    if (u->has_display_name && !write_file(dir / L".display", u->display_name.data(), u->display_name.size()))
-        return E_GS_OUT_OF_LOCAL_STORAGE;
+    // The display name is cosmetic; the blobs are already committed, so ignore a write failure.
+    if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }
 

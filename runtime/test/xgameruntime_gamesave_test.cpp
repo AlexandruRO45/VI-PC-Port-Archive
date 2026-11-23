@@ -388,7 +388,13 @@ int main() {
     check(locked != INVALID_HANDLE_VALUE, "lock display destination");
     Handle display_update = nullptr;
     check(at<Create>(save, 23)(save, failure_container, "display", &display_update) == S_OK, "create display update");
-    check(at<Submit>(save, 27)(save, display_update) == E_GS_OUT_OF_LOCAL_STORAGE, "locked display reports storage error");
+    check(at<Write>(save, 25)(save, display_update, "a", reinterpret_cast<const uint8_t*>("new"), 3) == S_OK,
+          "stage blob with locked display");
+    check(at<Submit>(save, 27)(save, display_update) == S_OK, "locked display does not fail committed blobs");
+    std::ifstream committed_blob(failure_dir / L"a", std::ios::binary);
+    const std::string committed_contents((std::istreambuf_iterator<char>(committed_blob)), {});
+    check(committed_contents == "new" && std::filesystem::exists(failure_dir / L"b"),
+          "locked display leaves committed and existing blobs intact");
     if (locked != INVALID_HANDLE_VALUE) CloseHandle(locked);
     at<Close>(save, 24)(save, display_update);
     at<Close>(save, 17)(save, failure_container);
