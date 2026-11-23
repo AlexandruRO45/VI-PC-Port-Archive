@@ -11861,7 +11861,6 @@ class Gen:
                 self.emit(f"{goff} = OpCompositeConstruct %v2int {parts[0]} {parts[1]}")
                 f = f[1:]
                 op = op[:-2]
-                self.uses_img_offset = True
             if op == "image_gather4_l":
                 # Gather at an explicit LOD: Vulkan gathers have no Lod operand without an AMD extension, so fetch
                 # the 2x2 footprint at mip round(lod) (clamped to the mip range) in gather order
@@ -11970,7 +11969,11 @@ class Gen:
                 else:
                     self.emit(f"{uv} = OpCompositeConstruct %v2float {f[0]} {f[1]}")
                 component = self.cu(dmask.bit_length() - 1)
-                offset = f" Offset {goff}" if goff is not None else ""
+                offset = ""
+                if goff is not None:
+                    # Only image_gather4_lz_o emits OpImageGather Offset; image_gather4_l_o adds goff in OpImageFetch.
+                    self.uses_img_offset = True
+                    offset = f" Offset {goff}"
 
                 def gather(image, cls, ty):
                     sampled = sampled_image(image, cls)
@@ -12020,7 +12023,6 @@ class Gen:
                 kind = kind[:-3]
                 if kind not in ("", "_b", "_c", "_c_b", "_d"):
                     raise Unsupported(op)
-                self.uses_minlod = True
             # Address order after the offset: bias, z-compare, gradients, coordinates, LOD, clamp.
             bias = None
             if kind in ("_b", "_c_b"):
@@ -12084,6 +12086,9 @@ class Gen:
             if off is not None and kind not in ("", "_lz", "_l", "_b", "_c_lz", "_c", "_c_b"):
                 raise Unsupported(op)
             implicit = kind in ("", "_b", "_c", "_c_b") and self.stage == "ps"
+            if minlod is not None and (implicit or kind == "_d"):
+                # Non-pixel non-gradient _cl lowers to explicit FMax + Lod without a MinLod operand.
+                self.uses_minlod = True
             grads_fb = None
             if off is not None and TEXEL_OFFSET_FALLBACK:
                 uv, grads_fb = self.texel_offset_fold(img, si, uv, off, n_off, ncoord, kind, implicit, lod, bias,

@@ -20,7 +20,7 @@ import support
 DESC = "s[8:15], s[16:19]"
 D2 = "dim:SQ_RSRC_IMG_2D"
 PRO = ["v_mov_b32 v4, 1.0", "v_mov_b32 v5, 0.5", "v_mov_b32 v6, 0.25", "v_mov_b32 v7, 0.75", "v_mov_b32 v8, 0.125",
-       "v_mov_b32 v9, 0"]
+       "v_mov_b32 v9, 0", "v_mov_b32 v10, 0.5"]
 CS_FSSM = bytearray(0x148)
 struct.pack_into("<4I", CS_FSSM, 0x138, 0x8088, 32, 1, 1)
 CS_FSSM = bytes(CS_FSSM)
@@ -99,8 +99,27 @@ class SampleCl(unittest.TestCase):
                 self.assertNotIn("MinLod", s)
 
     def test_module_declares_min_lod(self):
-        self.assertIn("OpCapability MinLod", translate("ps_cl", f"image_sample_cl v[0:3], v[4:6], {DESC} dmask:0xf {D2}"))
-        self.assertNotIn("OpCapability MinLod", translate("ps_noc", f"image_sample v[0:3], v[4:5], {DESC} dmask:0xf {D2}"))
+        for name, line in (("ps_cl", f"image_sample_cl v[0:3], v[4:6], {DESC} dmask:0xf {D2}"),
+                           ("ps_ccl", f"image_sample_c_cl v9, v[4:7], {DESC} dmask:0x1 {D2}"),
+                           ("vs_dcl", f"image_sample_d_cl v[0:3], v[4:10], {DESC} dmask:0xf {D2}"),
+                           ("cs_dcl", f"image_sample_d_cl v[0:3], v[4:10], {DESC} dmask:0xf {D2}")):
+            with self.subTest(shader=name):
+                spv = translate(name, line)
+                meta = support.rdna2spirv.shader_meta(support.rdna2spirv.translate.last_gen, spv)
+                self.assertIn("OpCapability MinLod", spv)
+                self.assertIn("shaderResourceMinLod", meta["features"])
+
+        for name, line in (("ps_noc", f"image_sample v[0:3], v[4:5], {DESC} dmask:0xf {D2}"),
+                           ("vs_cl", f"image_sample_cl v[0:3], v[4:6], {DESC} dmask:0xf {D2}"),
+                           ("cs_cl", f"image_sample_cl v[0:3], v[4:6], {DESC} dmask:0xf {D2}"),
+                           ("vs_ccl", f"image_sample_c_cl v9, v[4:7], {DESC} dmask:0x1 {D2}"),
+                           ("cs_ccl", f"image_sample_c_cl v9, v[4:7], {DESC} dmask:0x1 {D2}"),
+                           ("vs_clo", f"image_sample_cl_o v[0:3], v[4:7], {DESC} dmask:0xf {D2}")):
+            with self.subTest(shader=name):
+                spv = translate(name, line)
+                meta = support.rdna2spirv.shader_meta(support.rdna2spirv.translate.last_gen, spv)
+                self.assertNotIn("OpCapability MinLod", spv)
+                self.assertNotIn("shaderResourceMinLod", meta["features"])
 
     def test_forms_with_no_clamp_variant_stay_refused(self):
         for op, regs in (("image_sample_l_cl", "v[4:7]"), ("image_sample_lz_cl", "v[4:6]")):
@@ -111,10 +130,10 @@ class SampleCl(unittest.TestCase):
     def test_modules_validate(self):
         cases = [("image_sample_cl", "v[0:3]", "v[4:6]", 0xf), ("image_sample_b_cl", "v[0:3]", "v[4:7]", 0xf),
                  ("image_sample_c_cl", "v9", "v[4:7]", 1), ("image_sample_c_b_cl", "v9", "v[4:8]", 1),
-                 ("image_sample_cl_o", "v[0:3]", "v[4:7]", 0xf)]
+                 ("image_sample_cl_o", "v[0:3]", "v[4:7]", 0xf), ("image_sample_d_cl", "v[0:3]", "v[4:10]", 0xf)]
         for op, dst, regs, dmask in cases:
-            for name in ("ps_val", "vs_val"):
-                if name == "vs_val" and "_b_" in op:
+            for name in ("ps_val", "vs_val", "cs_val"):
+                if name != "ps_val" and "_b_" in op:
                     continue          # no bias without derivatives
                 with self.subTest(op=op, shader=name):
                     spv = translate(name, f"{op} {dst}, {regs}, {DESC} dmask:{dmask:#x} {D2}")
@@ -123,8 +142,10 @@ class SampleCl(unittest.TestCase):
                         with open(a, "w", encoding="utf-8", newline="\n") as f:
                             f.write(spv)
                         subprocess.run(["spirv-as", "--target-env", "vulkan1.2", a, "-o", b], check=True)
-                        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand", b],
-                                       check=True)
+                        cmd = ["spirv-val", "--target-env", "vulkan1.2"]
+                        if op.endswith("_o"):
+                            cmd.append("--allow-offset-texture-operand")
+                        subprocess.run([*cmd, b], check=True)
 
 
 if __name__ == "__main__":
