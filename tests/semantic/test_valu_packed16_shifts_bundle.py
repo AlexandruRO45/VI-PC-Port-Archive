@@ -152,6 +152,33 @@ class ScalarInterpreter:
             state.write_vgpr(instr.dst.index, res)
         return res
 
+class SIMDWavefront:
+    def __init__(self, wave_size: int = 32, exec_mask: int | None = None) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.mask_limit = (1 << wave_size) - 1
+        self.exec_mask = self.mask_limit if exec_mask is None else (exec_mask & self.mask_limit)
+
+    def execute(
+        self,
+        op_fn: Callable[..., int],
+        s0_lanes: list[int],
+        s1_lanes: list[int],
+        s2_lanes: list[int] | None = None,
+        orig_dst: list[int] | None = None,
+    ) -> list[int]:
+        res: list[int] = [0] * self.wave_size
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                if s2_lanes is not None:
+                    res[lane] = op_fn(s0_lanes[lane], s1_lanes[lane], s2_lanes[lane]) & MASK32
+                else:
+                    res[lane] = op_fn(s0_lanes[lane], s1_lanes[lane]) & MASK32
+            else:
+                res[lane] = orig_dst[lane] if orig_dst is not None else 0
+        return res
+
 def ref_v_pk_ashrrev_i16(s0: int, s1: int) -> int:
     """Arithmetic right shift reversed on packed 16-bit integers.
     s0: shift count (each half masked to 15).
@@ -227,6 +254,46 @@ class TestVPkAshrrevI16ASTAndInterpreter(unittest.TestCase):
         )
         res = ScalarInterpreter().step(inst, state)
         self.assertEqual(res, pack16(u16(-5), 10))
+
+class TestVPkAshrrevI16SIMDAndEdgeCases(unittest.TestCase):
+    def test_simd_divergence_exec_mask(self) -> None:
+        simd = SIMDWavefront(wave_size=32, exec_mask=0x55555555)
+        s0_lanes = [pack16(i & 15, (i + 1) & 15) for i in range(32)]
+        s1_lanes = [pack16(u16(-16), 32) for _ in range(32)]
+        orig_dst = [0xDEADBEEF] * 32
+        res = simd.execute(ref_v_pk_ashrrev_i16, s0_lanes, s1_lanes, orig_dst=orig_dst)
+        for i in range(32):
+            if i % 2 == 0:
+                expected = ref_v_pk_ashrrev_i16(s0_lanes[i], s1_lanes[i])
+                self.assertEqual(res[i], expected)
+            else:
+                self.assertEqual(res[i], 0xDEADBEEF)
+
+    def test_boundary_sign_bits(self) -> None:
+        # Check all combinations of boundary sign bits (-32768, -1, 0, 32767)
+        vals = [0x8000, 0xFFFF, 0x0000, 0x7FFF]
+        for v in vals:
+            packed_val = pack16(v, v)
+            res = ref_v_pk_ashrrev_i16(pack16(1, 1), packed_val)
+            exp_lo = (i16(v) >> 1) & MASK16
+            exp_hi = (i16(v) >> 1) & MASK16
+            self.assertEqual(res, pack16(exp_lo, exp_hi))
+
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xFFFFFFFFFFFFFFFF
+        state.write_vgpr(1, pack16(2, 2))
+        state.write_vgpr(2, pack16(4, 4))
+        inst = ASTInstruction(
+            Opcode.V_PK_ASHRREV_I16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(1),
+            ASTOperand.vgpr(2),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xFFFFFFFFFFFFFFFF)
 
 if __name__ == "__main__":
     unittest.main()
