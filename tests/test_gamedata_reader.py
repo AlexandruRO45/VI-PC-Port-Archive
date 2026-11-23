@@ -329,6 +329,25 @@ class Run(unittest.TestCase):
         with open(os.path.join(out, next(f for f in files if f.startswith("CSyntheticRoot"))), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["label"], "synthetic_name")
 
+    def test_exports_namespaced_roots_using_local_filenames(self):
+        targets = []
+        for index in (1, 2):
+            folder = os.path.join(self.tmp.name, str(index))
+            os.mkdir(folder)
+            path = os.path.join(folder, "same.xml")
+            with open(path, "wb") as f:
+                f.write(f'<n:Root xmlns:n="https://example.test/{index}"><x value="{index}"/></n:Root>'.encode("ascii"))
+            targets.append(path)
+        out = os.path.join(self.tmp.name, "json")
+        summary = R.run(targets, out_dir=out)
+
+        self.assertEqual(summary["per_root_documents"], {
+            "{https://example.test/1}Root": 1, "{https://example.test/2}Root": 1})
+        self.assertEqual(sorted(os.listdir(out)), ["Root_same.xml.json", "Root_same.xml_2.json"])
+        for index, filename in enumerate(("Root_same.xml.json", "Root_same.xml_2.json"), 1):
+            with open(os.path.join(out, filename), encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"x": index})
+
     def test_exports_all_documents_with_the_same_basename(self):
         targets = []
         for index in range(1, 4):

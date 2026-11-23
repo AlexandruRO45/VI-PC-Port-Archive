@@ -280,7 +280,9 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
             name = doc.get("offset_hex") or doc.get("name") or str(n)
-            stem = f"{tag}_{name}"
+            # Expanded XML names include a namespace URI, which may contain path separators.
+            local_tag = tag.rsplit("}", 1)[-1]
+            stem = f"{local_tag}_{name}"
             filename = f"{stem}.json"
             suffix = 2
             # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
