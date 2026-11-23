@@ -784,6 +784,24 @@ class GlbInspectTests(unittest.TestCase):
                     "interpolation (expected 4)" in issue
                     for issue in issues), issues)
 
+    def test_animation_unused_sampler_skips_output_count_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "unused.glb")
+            out = os.path.join(folder, "report.json")
+            gltf = animated_gltf()
+            # No channel references the sampler, so its output width is
+            # unknown: four scalar outputs for two LINEAR keys stays valid.
+            gltf["animations"][0]["channels"] = []
+            gltf["accessors"][3].update(type="SCALAR", count=4)
+            with open(path, "wb") as handle:
+                handle.write(glb(gltf, triangle_bin()))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                animation = json.load(handle)["animations"][0]
+            self.assertEqual(animation["issues"], [])
+            self.assertEqual(animation["samplers"][0]["output_count"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()

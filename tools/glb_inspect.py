@@ -365,7 +365,9 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         sampler_index = sampler["index"]
         interpolation = sampler["interpolation"]
         frames = input_count * (3 if interpolation == "CUBICSPLINE" else 1)
-        for width in sorted(values_per_key.get(sampler_index, {1})):
+        # Only channels supply an expected output width; a sampler that no
+        # channel references keeps its count unchecked.
+        for width in sorted(values_per_key.get(sampler_index, ())):
             expected = frames * width
             if output_count != expected:
                 issues.append(
