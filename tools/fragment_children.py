@@ -49,6 +49,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # -I keeps the script directory off sys.path
+import pool_workers  # noqa: E402
 import skin_streams as ss  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -319,7 +320,7 @@ def scan_archive(path, start=0, end=None, jobs=1, records=None, log=None):
         return total
     ranges = split_ranges(start, end, jobs)
     work = [(path, lo, hi, f"{records}.{i}" if records else None) for i, (lo, hi) in enumerate(ranges)]
-    with multiprocessing.Pool(len(work)) as pool:
+    with multiprocessing.Pool(pool_workers.process_workers(len(work))) as pool:
         for part in pool.imap_unordered(worker, work):
             merge(total, part)
     if records:   # join the per-range files in range order

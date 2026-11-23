@@ -31,10 +31,12 @@ import anim_clips  # noqa: E402
 import anim_glb  # noqa: E402
 import awc_opus  # noqa: E402
 import awc_shorts  # noqa: E402
+import fragment_children  # noqa: E402
 import pool_workers  # noqa: E402
 import world_build  # noqa: E402
 import world_lights_paths  # noqa: E402
 from test_anim_clips import two_sequence_dictionary, write_rpf  # noqa: E402
+from test_fragment_children import archive, fragment  # noqa: E402
 from test_anim_glb import joaat32, part_resource, skeleton_resource, write_archive  # noqa: E402
 
 WINDOWS_LIMIT = 61
@@ -153,6 +155,19 @@ class ToolPoolSizeTest(unittest.TestCase):
                 self.assertEqual(many["counts"], one["counts"])
                 self.assertEqual(SIZES.pop(), size)
 
+
+    def test_fragment_children(self):
+        # 124 pages so that --jobs 62 still splits into 62 ranges (> 61) and the cap is exercised.
+        blob = archive(fragment(), fragment(drawables=3))
+        blob += bytes(124 * 4096 - len(blob))
+        path = self.path("fragments.rpf")
+        with open(path, "wb") as f:
+            f.write(blob)
+        one = fragment_children.scan_archive(path, jobs=1)
+        with mock.patch.object(multiprocessing, "Pool", RecordingPool):
+            for jobs, size in ((2, 2), (62, 61), (200, 61)):
+                self.assertEqual(fragment_children.scan_archive(path, jobs=jobs), one)
+                self.assertEqual(SIZES.pop(), size)
 
     def test_anim_glb_coverage(self):
         packs, anim = self.path("packs.rpf"), self.path("anim.rpf")
