@@ -157,6 +157,11 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
+    // LEONIDA_DRED=1 enabled device-lost diagnostics (vulkan_breadcrumbs.h): VK_AMD_buffer_marker for the
+    // breadcrumbs, and VK_EXT_device_fault with its deviceFault feature for the fault addresses, each when the GPU
+    // has it.
+    bool buffer_marker = false;
+    bool device_fault = false;
     // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.

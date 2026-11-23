@@ -3273,8 +3273,27 @@ inline void close_labels(VkCommandBuffer command_buffer, const ReplayFunctions& 
 // `open_labels` counts the debug labels begun and not yet ended in this command buffer: an EndEvent with none open
 // is dropped (Vulkan requires a matching begin), and the caller ends what is still open before it ends the buffer
 // (close_labels). Without it, the list's own events are balanced at its end.
+// LEONIDA_DRED per-operation breadcrumbs (vulkan_breadcrumbs.h): after the command at positions[k], write
+// first + k into `buffer` at `offset`, at BOTTOM_OF_PIPE. Written between commands, where no rendering scope is open.
+struct OpMarkers {
+    PFN_vkCmdWriteBufferMarkerAMD write = nullptr;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::uint32_t first = 0;
+    const std::uint32_t* positions = nullptr;
+    std::size_t count = 0;
+};
+
 inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, const ReplayFunctions& vk,
-                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr) {
+                 LayoutTracker* tracker = nullptr, std::uint32_t* open_labels = nullptr,
+                 const OpMarkers* op_markers = nullptr) {
+    std::size_t next_op = 0;
+    // The ops whose command is before `end` are finished recording: their progress markers go in now.
+    const auto mark_ops_before = [&](std::size_t end) {
+        for (; next_op < op_markers->count && op_markers->positions[next_op] < end; ++next_op)
+            op_markers->write(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, op_markers->buffer,
+                              op_markers->offset, op_markers->first + static_cast<std::uint32_t>(next_op));
+    };
     std::uint32_t own_labels = 0;
     std::uint32_t& labels = open_labels ? *open_labels : own_labels;
     const auto commands = prepared.list->commands();
@@ -3293,6 +3312,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
     };
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
+        if (op_markers) mark_ops_before(i);
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
         if (next_query < prepared.queries.size() && prepared.queries[next_query].command == i) {
@@ -4045,6 +4065,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.end_rendering(command_buffer);
         }
     }
+    if (op_markers) mark_ops_before(commands.size());
     // Predication does not carry over to the next command list.
     if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
     if (!open_labels) close_labels(command_buffer, vk, own_labels);

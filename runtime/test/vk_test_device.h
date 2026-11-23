@@ -119,6 +119,8 @@ public:
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
+    bool request_buffer_marker = false;  // set before create(): enable VK_AMD_buffer_marker where the GPU has it
+    bool buffer_marker = false;          // VK_AMD_buffer_marker is enabled
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
@@ -165,6 +167,7 @@ public:
     }
 
     unsigned validation_errors() const { return validation_error_count(); }
+    const VkPhysicalDeviceMemoryProperties& memory_properties() const { return memory_; }
     unsigned known_validation_errors() const { return known_validation_error_count(); }
 
     // presentation: also enable VK_KHR_surface + VK_KHR_win32_surface and VK_KHR_swapchain (Windows only).
@@ -565,6 +568,13 @@ public:
         if (host_image_copy) device_extensions.push_back(host_image_copy_name);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
+        if (request_buffer_marker &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
+            })) {
+            device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+            buffer_marker = true;
+        }
 #if defined(VK_KHR_swapchain_maintenance1)
         VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_m1{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR};
