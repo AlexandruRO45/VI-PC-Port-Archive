@@ -433,5 +433,22 @@ class TestSMulHiI32TranslatorIntegration(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0xFFFFFFFF)
 
+class TestSMulHiI32Validation(unittest.TestCase):
+    def test_commutativity(self) -> None:
+        rng = random.Random(4242)
+        for _ in range(50):
+            a = rng.randint(0, MASK32)
+            b = rng.randint(0, MASK32)
+            self.assertEqual(ref_s_mul_hi_i32(a, b), ref_s_mul_hi_i32(b, a))
+
+    def test_sign_property(self) -> None:
+        # If both a and b are positive, high half must be non-negative (>= 0 and < 0x40000000)
+        rng = random.Random(9999)
+        for _ in range(50):
+            a = rng.randint(1, 0x7FFFFFFF)
+            b = rng.randint(1, 0x7FFFFFFF)
+            hi = ref_s_mul_hi_i32(a, b)
+            self.assertLessEqual(hi, 0x3FFFFFFF)
+
 if __name__ == "__main__":
     unittest.main()
