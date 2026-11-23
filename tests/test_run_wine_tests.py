@@ -661,6 +661,33 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("not the output of ctest", err)
 
+    def test_malformed_command_and_property_rows_are_rejected_before_launch(self):
+        for fields in (
+            {"command": "D:/win/root/artifact/ok.py"},
+            {"command": [42]},
+            {"command": [self.command("ok.py")[0], "embedded\0null"]},
+            {"properties": {"TIMEOUT": 10}},
+            {"properties": [{"name": "TIMEOUT"}]},
+            {"properties": [{"name": ["TIMEOUT"], "value": 10}]},
+            {"name": []},
+        ):
+            with self.subTest(fields=fields):
+                good = ctest_entry("ok", self.command("ok.py"))
+                with mock.patch.object(rwt, "DriveMap") as drive, \
+                        mock.patch.object(rwt, "run_test", return_value=("pass", "")) as launch:
+                    code, _, err = self.run_main([good, good | fields])
+                self.assertEqual(code, 2)
+                self.assertIn("not the output of ctest", err)
+                drive.assert_not_called()
+                launch.assert_not_called()
+
+    def test_an_unbuilt_test_without_a_command_is_valid_inventory(self):
+        code, out, err = self.run_main([{"name": "unbuilt"}], "--require", "unbuilt")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] unbuilt", out)
+        self.assertIn("no command", out)
+        self.assertEqual(err, "")
+
     def test_an_explicit_empty_tests_list_is_accepted(self):
         code, out, _ = self.run_main_json({"tests": []})
         self.assertEqual(code, 0)
@@ -798,10 +825,10 @@ class MainTest(unittest.TestCase):
     def test_a_runner_error_in_one_test_fails_that_test_and_not_the_others(self):
         real = rwt.run_test
 
-        def flaky(test, args, wine):
+        def flaky(test, args, wine, **kwargs):
             if test["name"] == "boom":
                 raise RuntimeError("synthetic")
-            return real(test, args, wine)
+            return real(test, args, wine, **kwargs)
 
         entries = [ctest_entry("boom", self.command("ok.py")), ctest_entry("fine", self.command("bad.py"))]
         with mock.patch.object(rwt, "run_test", flaky):
