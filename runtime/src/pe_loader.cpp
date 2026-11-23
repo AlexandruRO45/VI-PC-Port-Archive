@@ -14,6 +14,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "../shims/shims.h"
@@ -59,7 +60,22 @@ std::string path_utf8(const std::filesystem::path& path) {
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
-    return {std::istreambuf_iterator<char>(f), {}};
+
+    f.seekg(0, std::ios::end);
+    const std::streamoff size = f.tellg();
+    std::vector<uint8_t> bytes;
+    if (size < 0 || std::cmp_greater(size, bytes.max_size()) || !f.seekg(0))
+        throw std::runtime_error("cannot read " + path_utf8(p));
+
+    bytes.resize(static_cast<size_t>(size));
+    constexpr size_t chunk_size = size_t{16} << 20;
+    for (size_t offset = 0; offset < bytes.size();) {
+        const size_t chunk = std::min(bytes.size() - offset, chunk_size);
+        if (!f.read(reinterpret_cast<char*>(bytes.data() + offset), static_cast<std::streamsize>(chunk)))
+            throw std::runtime_error("cannot read " + path_utf8(p));
+        offset += chunk;
+    }
+    return bytes;
 }
 
 template <class T>
