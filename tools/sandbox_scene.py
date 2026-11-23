@@ -23,6 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dds_png  # noqa: E402
 import glb_writer  # noqa: E402
+import report_paths  # noqa: E402
 import world_build  # noqa: E402
 
 DIFFUSE_TEX = "C8E8C282"   # joaat("DiffuseTex"), the albedo Param of a material texture reference
@@ -74,6 +75,12 @@ def texture_bytes(dds_path, max_size):
 
 
 def build(args):
+    if report_paths.same_report_path(args.entities, args.out):
+        # The packed scene would replace the entity rows the run reads (same file, a case-only name,
+        # a symlink or a hard link); the rows are the user's world_index.py --entities-out file.
+        print(f"ERROR: --out {args.out} names the --entities input {args.entities}; refusing to overwrite it",
+              file=sys.stderr)
+        raise SystemExit(2)
     rows, counts = world_build.load_placements(args.entities)
     entries = []
     for path in world_build.discover_model_manifests(args.models):
