@@ -2000,6 +2000,9 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
                 # rpf9dump keeps the files it finds, so another decoder's output is removed first. The exporter is
                 # built before that: a build that fails leaves the old export in place.
                 get_exporter(work)
+                if _linked(folder):
+                    fail(f"Asset folder {folder} is a symlink or junction: the assets stage removes and recreates "
+                         f"folders when the decoder changes, so it cannot be a link")
                 log(f"assets: no matching decoder fingerprint for {mode} from {rel}: exporting again")
                 shutil.rmtree(folder)
             elif os.path.isfile(os.path.join(folder, "manifest.json")):
@@ -2042,6 +2045,9 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         # same decoder record as the model and texture exports above.
         record = os.path.join(pool_dir, DECODER_RECORD)
         if os.path.isdir(pool_dir) and read_shader_setting(record) != decoder:
+            if _linked(pool_dir):
+                fail(f"Texture pool folder {pool_dir} is a symlink or junction: the assets stage removes and "
+                     f"recreates folders when the decoder changes, so it cannot be a link")
             log(f"assets: no matching decoder fingerprint for texture pool {os.path.relpath(p, game)}: exporting again")
             shutil.rmtree(pool_dir)
         pool_jobs.append((p, name, root, pool_dir, record))
