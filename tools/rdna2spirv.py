@@ -677,7 +677,7 @@ class Gen:
         # An f32 operand reads as a zero of its sign when it is denormal: the game's MODE flushes f32 denormals
         # (denorm_mode_32 = 0), measured on gfx1036 for 0x00000001, 0x807fffff and the integer inline constants 1 and
         # 64 used as f32 operands (@Sanonymous01, SHADER-298). The f16 operands widen to normal f32 values.
-        return [self.f16_in(src, sb[i]) if hb[i] else self.flush_f32(self.src_f(src)) for i, src in enumerate(a[1:4])]
+        return [self.f16_in(src, sb[i]) if hb[i] else self.src_f_flushed(src) for i, src in enumerate(a[1:4])]
 
     def f16_bits(self, f, rtz=False, exact_tiny=False, is_z=None):
         """f32 ``f`` -> f16 bits in the low 16 bits of a %uint, computed with integer ops only (SHADER-56).
@@ -5882,6 +5882,20 @@ class Gen:
             self.emit(f"{word} = OpCompositeExtract %uint {pair} {i}")
             self.dst({"k": "vgpr", "r": d["r"] + i, "n": 1}, word)
 
+    def src_f_flushed(self, a):
+        """flush_f32(src_f(a)), worked out here when a is an inline constant or a literal: its bits are known, so a
+        denormal one is the signed zero it reads as and any other one (normal, zero, inf, NaN) is unchanged. That is
+        what flush_f32 gives at run time, without its FAbs, compare and select (6.3% of the flushes on a corpus
+        sample read such a constant: v_mad_f32 v0, v1, 0.5, v2 and the like). An operand with a source modifier or
+        an SDWA select still goes through flush_f32."""
+        k = a["k"]
+        if k not in ("imm", "fimm") or a.get("abs") or a.get("neg") or "sdwa_sel" in a or a.get("sext"):
+            return self.flush_f32(self.src_f(a))
+        bits = (a["v"] if k == "imm" else struct.unpack("<I", struct.pack("<f", a["v"]))[0]) & 0xFFFFFFFF
+        if not bits & 0x7F800000:
+            bits &= 0x80000000
+        return self.tof(self.cu(bits))
+
     def flush_f32_mods(self, v, mods):
         """Flush a subnormal sum before output modifiers and flush again after them (SHADER-340, RDNA1 gfx1010)."""
         v = self.flush_f32(v)
@@ -6817,7 +6831,7 @@ class Gen:
                     t = self.tmp()
                     self.emit(f"{t} = OpFNegate %float {b1}")
                     b1 = t
-                acc = self.flush_f32(self.src_f(a[3]))
+                acc = self.src_f_flushed(a[3])
                 if nlo[2]:
                     t = self.tmp()
                     self.emit(f"{t} = OpFNegate %float {acc}")
@@ -6829,7 +6843,7 @@ class Gen:
                 a1 = self.f16_in(a[1], 1)
                 b0 = self.f16_in(a[2], 0)
                 b1 = self.f16_in(a[2], 1)
-                acc = self.flush_f32(self.src_f(a[0]))
+                acc = self.src_f_flushed(a[0])
             p0, p1, s, r = (self.tmp() for _ in range(4))
             self.emit(f"{p0} = OpFMul %float {a0} {b0}")
             self.emit(f"{p1} = OpFMul %float {a1} {b1}")
@@ -8750,7 +8764,7 @@ class Gen:
             # The inferred game's f32 denorm mode is flush-in/flush-out. Unlike an IEEE multiply, the legacy
             # zero override gives +0 even when a negative subnormal operand becomes -0 after input flushing.
             # Flush the product before omod: otherwise FLT_MIN * 0.5 mul:2 becomes FLT_MIN, not zero.
-            x, y = (self.flush_f32(self.src_f(t)) for t in a[1:3])
+            x, y = (self.src_f_flushed(t) for t in a[1:3])
             m, zx, zy, either, r = (self.tmp() for _ in range(5))
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
@@ -8770,7 +8784,7 @@ class Gen:
             # v_mac_legacy_f32 is the GFX10.1 VOP2 form with D as the addend, as v_mac_f32 is to v_mad_f32 (LLVM
             # VOP2Instructions.td: V_MAC_LEGACY_F32 is VOP_F32_F32_F32 with $src2 tied to $vdst).
             srcs = (a[1], a[2], a[0]) if op == "v_mac_legacy_f32" else a[1:4]
-            x, y, z = (self.flush_f32(self.src_f(t)) for t in srcs)
+            x, y, z = (self.src_f_flushed(t) for t in srcs)
             m, zx, zy, either, sel, r = (self.tmp() for _ in range(6))
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{zx} = OpFOrdEqual %bool {x} %f0")
@@ -9432,11 +9446,7 @@ class Gen:
             # Unfused: the product is rounded before the add. v_mac_f32 is the VOP2 form with D as the addend
             # (LLVM SIInstrInfo.cpp getNewFMAInst: V_MAC_F32 -> V_MAD_F32_e64, V_FMAC_F32 -> V_FMA_F32_e64).
             # Neither supports f32 denormals (flush_f32): operands, the rounded product and the sum flush.
-            if op == "v_mac_f32":
-                x, y, z = self.src_f(a[1]), self.src_f(a[2]), self.src_f(a[0])
-            else:
-                x, y, z = (self.src_f(t) for t in a[1:4])
-            x, y, z = self.flush_f32(x), self.flush_f32(y), self.flush_f32(z)
+            x, y, z = (self.src_f_flushed(t) for t in ((a[1], a[2], a[0]) if op == "v_mac_f32" else a[1:4]))
             m, r = self.tmp(), self.tmp()
             self.emit(f"{m} = OpFMul %float {x} {y}")
             self.emit(f"{r} = OpFAdd %float {self.flush_f32(m)} {z}")
