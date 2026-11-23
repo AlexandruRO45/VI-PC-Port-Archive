@@ -844,3 +844,53 @@ class TestXnorB32ASTAndScalar(unittest.TestCase):
             "v_xnor_b32 v0, v0, v1",
         ])
         self.assertEqual(val_inplace, 0xFFFF0000)
+
+
+# ------------------------------------------------------------------------------
+# v_xnor_b32 SIMD Divergence & Multi-Lane Properties
+# ------------------------------------------------------------------------------
+
+def step_xnor_simd(wave: SIMDWaveLogic, insn: VXnorB32Instruction):
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.vgprs[insn.src0.index][lane]
+            s1 = wave.vgprs[insn.src1.index][lane]
+            wave.vgprs[insn.dst.index][lane] = ref_xnor_b32(s0, s1)
+
+
+class TestXnorB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_divergence_hardware(self):
+        wave = SIMDWaveLogic(wave_size=32)
+        for i in range(32):
+            wave.vgprs[1][i] = 1 << i
+            wave.vgprs[2][i] = ~(1 << i) & MASK32
+            wave.vgprs[0][i] = 0
+
+        insn = VXnorB32Instruction(
+            dst=RegisterOperand(OperandType.VGPR, 0),
+            src0=RegisterOperand(OperandType.VGPR, 1),
+            src1=RegisterOperand(OperandType.VGPR, 2),
+        )
+        step_xnor_simd(wave, insn)
+
+        val_hw, _ = run_shader("ps_xnor_simd_hw", [
+            "v_mov_b32 v1, 0x8",
+            "v_mov_b32 v2, 0xFFFFFFF7",
+            "v_xnor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(wave.vgprs[0][3], val_hw)
+        self.assertEqual(val_hw, 0)
+
+    def test_algebraic_properties_hardware(self):
+        # Commutativity: xnor(a, b) == xnor(b, a)
+        val_ab, _ = run_shader("ps_xnor_comm_ab", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_xnor_b32 v0, v1, v2",
+        ])
+        val_ba, _ = run_shader("ps_xnor_comm_ba", [
+            "v_mov_b32 v1, 0x12345678",
+            "v_mov_b32 v2, 0x9ABCDEF0",
+            "v_xnor_b32 v0, v2, v1",
+        ])
+        self.assertEqual(val_ab, val_ba)
