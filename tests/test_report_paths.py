@@ -94,6 +94,17 @@ class SamePathTests(unittest.TestCase):
                 self.assertTrue(report_paths.same_report_path(self.p("new.json"), self.p(spelling)))
                 self.assertEqual(report_paths.path_key(self.p("new.json")), report_paths.path_key(self.p(spelling)))
 
+    def test_windows_trims_only_the_last_component(self):
+        # The file system does not strip a trailing space in a directory component: `d \x.json` cannot be opened.
+        if sys.platform != "win32":
+            self.skipTest("only Windows drops trailing spaces and dots")
+        self.assertFalse(report_paths.same_report_path(self.p("d", "new.json"), self.p("d ", "new.json")))
+
+    def test_other_platforms_keep_a_trailing_space_in_a_new_name(self):
+        if sys.platform == "win32":
+            self.skipTest("Windows drops the trailing space")
+        self.assertFalse(report_paths.same_report_path(self.p("new.json"), self.p("new.json ")))
+
 
 class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
