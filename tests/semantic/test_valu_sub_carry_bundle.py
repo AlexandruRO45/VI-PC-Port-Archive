@@ -886,5 +886,47 @@ class VSubrevF16AstInterpreterTests(unittest.TestCase):
         self.assertEqual(out[0] & 0xFFFF, 0x4200)
 
 
+class VSubrevF16SimdBoundaryTests(unittest.TestCase):
+    """IEEE 754 half-precision extremes and clamp saturation for v_subrev_f16."""
+
+    def test_half_precision_extremes_translator(self):
+        # S0 = +Inf (0x7C00), S1 = 0: 0 - (+Inf) = -Inf (0xFC00)
+        out_pos = run_prog([
+            "v_mov_b32 v0, 0x7C00",
+            "v_mov_b32 v1, 0x0000",
+            "v_subrev_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out_pos[0] & 0xFFFF, 0xFC00)
+
+        # S0 = -Inf (0xFC00), S1 = 0: 0 - (-Inf) = +Inf (0x7C00)
+        out_neg = run_prog([
+            "v_mov_b32 v0, 0xFC00",
+            "v_mov_b32 v1, 0x0000",
+            "v_subrev_f16 v2, v0, v1",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out_neg[0] & 0xFFFF, 0x7C00)
+
+    def test_clamp_saturation_translator(self):
+        # S0 = 1.0 (0x3C00), S1 = 4.0 (0x4400): 4.0 - 1.0 = 3.0 -> clamp to 1.0 (0x3C00)
+        out_sat_high = run_prog([
+            "v_mov_b32 v0, 0x3C00",
+            "v_mov_b32 v1, 0x4400",
+            "v_subrev_f16 v2, v0, v1 clamp",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out_sat_high[0] & 0xFFFF, 0x3C00)
+
+        # S0 = 4.0 (0x4400), S1 = 1.0 (0x3C00): 1.0 - 4.0 = -3.0 -> clamp to 0.0 (0x0000)
+        out_sat_low = run_prog([
+            "v_mov_b32 v0, 0x4400",
+            "v_mov_b32 v1, 0x3C00",
+            "v_subrev_f16 v2, v0, v1 clamp",
+            "v_mov_b32 v0, v2",
+        ])
+        self.assertEqual(out_sat_low[0] & 0xFFFF, 0x0000)
+
+
 if __name__ == "__main__":
     unittest.main()
