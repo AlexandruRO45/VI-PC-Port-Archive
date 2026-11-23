@@ -14,7 +14,17 @@ import world_names
 def archive_path(value):
     if not isinstance(value, str) or not value.strip():
         raise ValueError("expected a source archive path")
-    return os.path.normcase(os.path.abspath(value))
+    return os.path.abspath(value)
+
+
+def same_archive(first, second):
+    """Compare source paths, with a lexical fallback for offline reports."""
+    if first == second:
+        return True
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return os.path.normcase(first) == os.path.normcase(second)
 
 
 def verify(predictions, manifests):
@@ -28,7 +38,7 @@ def verify(predictions, manifests):
     paths = dict.fromkeys(os.path.normcase(os.path.realpath(path)) for path in manifests)
     for path in paths:
         export = report_rows(path, "Items")
-        if archive_path(export.get("src")) != archive:
+        if not same_archive(archive, archive_path(export.get("src"))):
             raise ValueError(f"{path}: different source archive from predictions")
         scan = export.get("Scan")
         if not isinstance(scan, dict):

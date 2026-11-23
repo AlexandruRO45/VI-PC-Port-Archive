@@ -849,7 +849,8 @@ model identity and run `world_build.py --placements` with the exported geometry.
 Save the lookup JSON and run
 `python -I tools/world_drawable_verify.py lookup.json first/models/manifest.json second/models/manifest.json`
 to verify single-offset predictions. Supply completed normal model manifests from the
-same source archive. The verifier reads cached JSON only. It uses the world builder's
+same source archive. The verifier reads cached JSON and can use filesystem metadata to
+match different paths to the same archive without opening it. It uses the world builder's
 name hashes and counts each identity and its placements once. A matching offset and both
 hashes confirm an observation, including dictionary children sharing an offset. The local
 report counts repeat exact observations and lists other offsets for the same identity.

@@ -1,5 +1,6 @@
 """Synthetic export windows and keyed model observations."""
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -45,6 +46,24 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(result["rows"][0]["other_identity_offsets"], [12])
         full = self.write("full", dict(export, Scan={}))
         self.assertEqual(verifier.verify(predictions, [full])["identities"]["missing_evidence"], 2)
+
+    def test_accepts_a_hard_link_to_the_same_archive(self):
+        source = self.root / "source.bin"
+        alias = self.root / "alias.bin"
+        source.touch()
+        try:
+            os.link(source, alias)
+        except OSError as exc:
+            self.skipTest(f"hard links unavailable: {exc}")
+
+        name = "example"
+        candidate = {"archetype": f"{world_names.joaat(name):x}", "key": f"{world_names.hash64(name):x}",
+                     "offsets": [10], "status": "candidate", "placements": 1}
+        predictions = self.write("lookup", {"archive": str(source), "candidates": [candidate]})
+        manifest = self.write("manifest", {"src": str(alias), "Scan": {},
+                                           "Items": [{"Name": f"{name}.#dr", "Offset": 10}]})
+
+        self.assertEqual(verifier.verify(predictions, [manifest])["identities"], {"confirmed": 1})
 
     def test_reject_unrelated_archive_and_bad_bounds(self):
         predictions = self.write("lookup", {"archive": "source.rpf", "candidates": []})
