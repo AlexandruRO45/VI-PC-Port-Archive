@@ -86,6 +86,17 @@ class TestPackB32F16LowHalf(unittest.TestCase):
         res = run_ps_pack(0xFFFF, 0xFFFF, name="ps_pack_low_ones")
         self.assertEqual(res, 0xFFFF_FFFF)
 
+class TestPackB32F16HighHalf(unittest.TestCase):
+    def test_op_sel_high_halves(self):
+        # Select high half from src0, low from src1: op_sel:[1, 0]
+        res = run_ps_pack(0x1234_5678, 0xABCD_EF01, op_sel="[1,0,0]", name="ps_pack_opsel_10")
+        self.assertEqual(res, 0xEF01_1234)
+
+    def test_op_sel_both_high(self):
+        # Select high half from both: op_sel:[1, 1]
+        res = run_ps_pack(0x1234_5678, 0xABCD_EF01, op_sel="[1,1,0]", name="ps_pack_opsel_11")
+        self.assertEqual(res, 0xABCD_1234)
+
 
 if __name__ == "__main__":
     unittest.main()
