@@ -12,7 +12,10 @@ def is_table_separator(line: str) -> bool:
     stripped = line.strip()
     if "|" not in stripped:
         return False
-    cells = stripped.strip("|").split("|")
+    # Strip at most one outer pipe per side so repeated outer pipes like `||---|`, `|---||`, or `||---||`
+    # leave an empty outer cell and are rejected.
+    inner = stripped.removeprefix("|").removesuffix("|")
+    cells = inner.split("|")
     return bool(cells) and all(
         (c := cell.strip()) and set(c) <= set("-:") and "-" in c
         for cell in cells
@@ -48,9 +51,12 @@ class DocsTableRowsTest(unittest.TestCase):
         # Previously `set("") <= set("-:")` was True, missing orphan rows at EOF or before >=2 blank lines.
         self.assertEqual(find_orphan_table_rows(["# Title", "", "| orphan | row |"]), [3])
         self.assertEqual(find_orphan_table_rows(["# Title", "", "| orphan | row |", "", "", "Next"]), [3])
-        # A thematic break without pipes or an empty-cell row is not a table separator.
+        # A thematic break without pipes, an empty-cell row, or repeated outer pipes is not a table separator.
         self.assertEqual(find_orphan_table_rows(["| orphan | row |", "---"]), [1])
         self.assertEqual(find_orphan_table_rows(["| orphan | row |", "|  |  |"]), [1])
+        self.assertEqual(find_orphan_table_rows(["| orphan |", "||---|"]), [1])
+        self.assertEqual(find_orphan_table_rows(["| orphan |", "|---||"]), [1])
+        self.assertEqual(find_orphan_table_rows(["intro", "|| orphan ||", "||---||"]), [2])
 
     def test_no_duplicate_rows_in_one_table(self):
         for path in DOCS:
