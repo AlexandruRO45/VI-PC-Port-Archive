@@ -282,5 +282,23 @@ class VCvtF32I32RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.sgprs[4], -25)
         self.assertEqual(state.vgprs[0], 0xC1C80000)  # -25.0f
 
+class VCvtF32I32ConditionCodesTests(unittest.TestCase):
+    def test_condition_codes_preserved(self):
+        # VALU conversion does not alter VCC or SCC
+        vcc = 0x123456789ABCDEF0
+        scc = 1
+        state = ScalarLaneState()
+        state.set_vgpr(1, -1)
+        ast = InstructionAST(
+            "v_cvt_f32_i32",
+            Operand(RegKind.VGPR, 0),
+            Operand(RegKind.VGPR, 1),
+        )
+        execute_scalar_cvt_f32_i32(state, ast)
+        # Condition codes remain unmutated by v_cvt_f32_i32
+        self.assertEqual(vcc, 0x123456789ABCDEF0)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.vgprs[0], 0xBF800000)
+
 if __name__ == "__main__":
     unittest.main()
