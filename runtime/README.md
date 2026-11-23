@@ -215,6 +215,10 @@ emulator declines and the exception goes on to the next handler, as the real ins
 instruction is one emulator function and one line in `kTable`; `cpu_ud_emulate_test` drives the dispatcher with a
 synthetic `CONTEXT`, so it runs on any CPU.
 
+`CLWB` (`66 [REX] 0F AE /6`, memory operand) is a no-op that skips the instruction; `cpu_ud_emulate_clwb_test` checks its
+length for many addressing forms (SIB, disp8/disp32, RIP-relative, REX) and that CLFLUSH, CLFLUSHOPT and XSAVEOPT are
+passed on.
+
 ## Tests
 
 For a Visual Studio build, pass CTest the same configuration you built above.

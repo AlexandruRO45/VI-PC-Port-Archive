@@ -41,6 +41,9 @@ LONG emulate(EXCEPTION_POINTERS* info);
 // True when the host CPU implements CLZERO (CPUID 8000_0008h EBX bit 0).
 bool host_has_clzero();
 
+// True when the host CPU implements CLWB (CPUID 7.0 EBX bit 24).
+bool host_has_clwb();
+
 // Installs the vectored handler, first in line, once per process. Without `force` it does so only when the host CPU
 // lacks an instruction the table emulates, since a CPU that has them executes them natively. Returns whether the
 // handler is installed.
