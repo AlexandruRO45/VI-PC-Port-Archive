@@ -220,5 +220,33 @@ class TestSTtraceDataImmReference(unittest.TestCase):
         self.assertEqual(words, [0x11, 0x22, 0x33, 0x44])
 
 
+class TestSTtraceDataImmBoundaries(unittest.TestCase):
+    def test_zero_and_small_immediates(self):
+        lines = [
+            "s_ttracedata_imm 0",
+            "s_ttracedata_imm 1",
+            "v_mov_b32 v0, 0x123",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x123, 0x123, 0x123, 0x123])
+
+    def test_max_positive_imm16(self):
+        lines = [
+            "s_ttracedata_imm 0x7FFF",
+            "v_mov_b32 v0, 0x456",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x456, 0x456, 0x456, 0x456])
+
+    def test_negative_imm16(self):
+        lines = [
+            "s_ttracedata_imm -1",
+            "s_ttracedata_imm -32768",
+            "v_mov_b32 v0, 0x789",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x789, 0x789, 0x789, 0x789])
+
+
 if __name__ == "__main__":
     unittest.main()
