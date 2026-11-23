@@ -256,3 +256,51 @@ class TestQuadmaskB32NegativeAndTranslator(unittest.TestCase):
             "v_mov_b32 v0, s0",
         ])
         self.assertIn("OpBitwiseOr", spv)
+
+
+# ------------------------------------------------------------------------------
+# s_quadmask_b64 Reference Oracle & Architectural Model
+# ------------------------------------------------------------------------------
+
+def ref_quadmask_b64(s0: int) -> int:
+    s0 = s0 & 0xFFFF_FFFF_FFFF_FFFF
+    res = 0
+    for i in range(16):
+        if (s0 >> (4 * i)) & 0xF:
+            res |= (1 << i)
+    return res
+
+
+class TestQuadmaskB64Oracle(unittest.TestCase):
+    def test_oracle_matches_hardware(self):
+        vectors = [
+            0x12,
+            0xF0F0_F0F0_F0F0_F0F0,
+            0x0000_0000_0000_0001,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0x0000_0000_0000_0000,
+        ]
+        for idx, val in enumerate(vectors):
+            lo = val & MASK32
+            hi = (val >> 32) & MASK32
+            val_hw, _ = run_shader_words(f"ps_qm64_oracle_{idx}", [
+                f"s_mov_b32 s2, {hex(lo)}",
+                f"s_mov_b32 s3, {hex(hi)}",
+                "s_quadmask_b64 s[0:1], s[2:3]",
+                "v_mov_b32 v0, s0",
+            ])
+            self.assertEqual(val_hw, ref_quadmask_b64(val))
+
+    def test_oracle_quad_boundaries_hardware(self):
+        for i in range(16):
+            val = 1 << (4 * i)
+            lo = val & MASK32
+            hi = (val >> 32) & MASK32
+            val_hw, _ = run_shader_words(f"ps_qm64_nibble_{i}", [
+                f"s_mov_b32 s2, {hex(lo)}",
+                f"s_mov_b32 s3, {hex(hi)}",
+                "s_quadmask_b64 s[0:1], s[2:3]",
+                "v_mov_b32 v0, s0",
+            ])
+            self.assertEqual(val_hw, 1 << i)
