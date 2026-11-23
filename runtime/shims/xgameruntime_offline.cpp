@@ -535,8 +535,14 @@ const GUID kAccessibilityInterfaces[] = {
     {0xd722b373, 0x8c4d, 0x4692, {0x9e, 0x51, 0xd6, 0xad, 0x9b, 0x37, 0xaa, 0x7d}},   // IXAccessibilityImpl2
 };
 
-// 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. ASSUMPTION: the signature and
-// that Off is 0 (GDK reference, not re-checked for this file).
+// What the shipping executable reaches (`tools/gdk_runtime_calls.py` over game_scarlett_master.exe): it imports a
+// thunk for 9 of this class's 10 slots - 8-13, 15, 16 and 21, the speech family - so the closed-caption slots (3, 4),
+// high contrast (5), speech-to-text (6, 7, 17-20) and CloseStreamHandle (14) are never called from it, and the shim's
+// answers there are unreachable rather than measured.
+
+// 5: HRESULT XHighContrastGetMode(XHighContrastMode* mode): Off, the first enumerator. The shipping executable never
+// reaches this slot (see the coverage note above), so Off = 0 is the GDK reference's first enumerator rather than a
+// measurement, and nothing in this title can contradict it.
 HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
     if (!mode) return E_POINTER;
     *mode = 0;
@@ -547,7 +553,9 @@ HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
 HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
 
 // 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
-// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
+// callback runs zero times. The argument order is measured from the one call site (RVA 0x5a7605a): `rcx` holds the
+// interface pointer (the object + 0x90), `rdx` a code address (RVA 0x3e41c00, the callback) and nothing is loaded
+// into `r8` for a context, so (self, callback, context) is the order the title calls with, not the GDK reference's.
 HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
     return callback ? S_OK : E_INVALIDARG;
 }

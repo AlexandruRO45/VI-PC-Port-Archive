@@ -443,8 +443,12 @@ on the executable, the rest is not:
   are not in the docs' layout.
 - **`XLauncherImpl`** (`IXLauncherImpl`, slots 3-5): `XLaunchUri`, `XDisplayAcquireTimeoutDeferral` (null handle)
   and `XDisplayCloseTimeoutDeferralHandle` fail with `E_FAIL`; nothing is launched.
-- **ASSUMPTION:** the parameter lists of the speech calls and `XHighContrastGetMode` (Off is 0), from the GDK
-  reference; only the argument counts were measured, from `tools/gdk_runtime_calls.py` on the executable.
+- **Speech and high contrast:** `XSpeechSynthesizerEnumerateInstalledVoices`'s argument order is measured, not
+  assumed: at its one call site (RVA `0x5a7605a`) `rcx` is the interface pointer, `rdx` a code address (RVA
+  `0x3e41c00`, the callback), and nothing is loaded into `r8`. `XHighContrastGetMode` (slot 5) is never reached by
+  the executable, which imports thunks for slots 8-13, 15, 16 and 21 only, so its `Off` = 0 stays the GDK
+  reference's first enumerator. The other speech parameter lists are still from the reference; only their argument
+  counts were measured (`tools/gdk_runtime_calls.py`).
 - **HDR:** `XDisplayTryEnableHdrMode` answers Disabled, because the host output is SDR. With `LEONIDA_HDR=1` it
   answers Enabled with the documented default tone-map luminances (0.01, 1000, 1000 nits).
 - **Devices:** every device belongs to the offline user (`XUserFindForDevice` hands out an `XUserHandle` the title
