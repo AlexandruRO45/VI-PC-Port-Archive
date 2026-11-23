@@ -311,5 +311,107 @@ class TestDSMskorB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.lds.read_dword(0x40), 0x12AA5678)
 
 
+class SIMDWaveState:
+    """Wavefront state for SIMD execution (Wave32 or Wave64)."""
+
+    def __init__(
+        self,
+        wave_size: int = 32,
+        exec_mask: int = 0xFFFFFFFF,
+        lds: Optional[LDSMemory] = None,
+    ) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError("wave_size must be 32 or 64")
+        self.wave_size: int = wave_size
+        self.exec_mask: int = exec_mask & ((1 << wave_size) - 1) if wave_size == 64 else exec_mask & MASK32
+        self.lds: LDSMemory = lds or LDSMemory()
+        self.lanes: List[RegisterFile] = [RegisterFile() for _ in range(wave_size)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool((self.exec_mask >> lane_id) & 1)
+
+
+class SIMDDSInterpreter:
+    """SIMD interpreter executing LDS operations with EXEC masking."""
+
+    def execute(
+        self, wave: SIMDWaveState, inst: DSMskorInstruction
+    ) -> List[Tuple[int, Optional[int], int]]:
+        """Returns list of (lane_id, old_val, new_val) for executed active lanes."""
+        results = []
+        for lane_id in range(wave.wave_size):
+            if not wave.is_lane_active(lane_id):
+                continue
+            rf = wave.lanes[lane_id]
+            addr = rf.get_vgpr(inst.vaddr)
+            mask = rf.get_vgpr(inst.vmask)
+            data = rf.get_vgpr(inst.vdata)
+            eff_addr = (addr + inst.offset.value) & MASK32
+
+            if inst.opcode == DSOpcode.DS_MSKOR_RTN_B32:
+                old_val = wave.lds.atomic_mskor(eff_addr, mask, data)
+                new_val = wave.lds.read_dword(eff_addr)
+                assert inst.vdst is not None
+                rf.set_vgpr(inst.vdst, old_val)
+                results.append((lane_id, old_val, new_val))
+            else:
+                old_val = wave.lds.atomic_mskor(eff_addr, mask, data)
+                new_val = wave.lds.read_dword(eff_addr)
+                results.append((lane_id, None, new_val))
+        return results
+
+
+class TestDSMskorB32SIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_full_wave32(self) -> None:
+        lds = LDSMemory(num_dwords=1024)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0xFFFFFFFF, lds=lds)
+        for l in range(32):
+            lds.write_dword(l * 4, 0x12345678)
+            wave.lanes[l].set_vgpr(VGPR(1), l * 4)
+            wave.lanes[l].set_vgpr(VGPR(2), 0x000000FF)
+            wave.lanes[l].set_vgpr(VGPR(3), l)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+        )
+        results = SIMDDSInterpreter().execute(wave, inst)
+        self.assertEqual(len(results), 32)
+        for l in range(32):
+            self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0x12345678)
+            self.assertEqual(lds.read_dword(l * 4), 0x12345600 | l)
+
+    def test_simd_divergent_lanes(self) -> None:
+        lds = LDSMemory(num_dwords=1024)
+        wave = SIMDWaveState(wave_size=32, exec_mask=0x55555555, lds=lds)
+        for l in range(32):
+            lds.write_dword(l * 4, 0x11111111)
+            wave.lanes[l].set_vgpr(VGPR(1), l * 4)
+            wave.lanes[l].set_vgpr(VGPR(2), 0xFFFFFFFF)
+            wave.lanes[l].set_vgpr(VGPR(3), 0x22222222)
+            wave.lanes[l].set_vgpr(VGPR(5), 0xCAFEBABE)
+
+        inst = DSMskorInstruction(
+            opcode=DSOpcode.DS_MSKOR_RTN_B32,
+            vdst=VGPR(5),
+            vaddr=VGPR(1),
+            vmask=VGPR(2),
+            vdata=VGPR(3),
+        )
+        SIMDDSInterpreter().execute(wave, inst)
+        for l in range(32):
+            if l % 2 == 0:
+                self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0x11111111)
+                self.assertEqual(lds.read_dword(l * 4), 0x22222222)
+            else:
+                self.assertEqual(wave.lanes[l].get_vgpr(VGPR(5)), 0xCAFEBABE)
+                self.assertEqual(lds.read_dword(l * 4), 0x11111111)
+
+
 if __name__ == "__main__":
     unittest.main()
