@@ -12,9 +12,13 @@ const worldEnd = html.indexOf('// Deterministic test terrain:', worldBegin);
 assert(worldBegin >= 0 && worldEnd > worldBegin, 'viewer world description section must exist');
 const worldSource = html.slice(worldBegin, worldEnd);
 
+// The browser globals the viewer module reads. A vm context gets only the ECMAScript built-ins, so every sandbox that
+// runs the module has to supply these; one object keeps them in step when the viewer gains another.
+const browserGlobals = { AbortController, setTimeout, clearTimeout, URLSearchParams };
+
 function loadWorld(fetch, search = '', timers = { setTimeout, clearTimeout }) {
     return vm.runInNewContext(worldSource + '\nloadWorld()', {
-        fetch, location: { search }, URLSearchParams, AbortController, ...timers,
+        ...browserGlobals, fetch, location: { search }, ...timers,
     });
 }
 
@@ -196,6 +200,7 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     const attributes = new Map();
     const start = { textContent: 'Click to fly', style: {}, setAttribute: (name, value) => attributes.set(name, value) };
     const startup = vm.runInNewContext(`(async () => { ${viewerModule} })()`, {
+        ...browserGlobals,
         THREE: { WebGLRenderer: class { constructor() { throw error; } } },
         document: { getElementById: id => { assert.equal(id, 'start'); return start; } },
     });
@@ -352,8 +357,7 @@ test('the bounds overlay creates helpers on the first G press and reuses them', 
         },
         document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
-        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
-        AbortController, setTimeout, clearTimeout,
+        ...browserGlobals, devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, location: { search: '' },
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks }), GLTFLoader: class {},
     });
     const pressG = (repeat = false) => handlers.get('keydown')({ code: 'KeyG', repeat });
@@ -410,8 +414,8 @@ test('Shift speeds the camera up and Ctrl slows it down, on either side of the k
         },
         document: { body: { prepend() {} }, getElementById: () => ({}), addEventListener() {} },
         addEventListener: (type, handler) => handlers.set(type, handler),
-        devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, URLSearchParams, location: { search: '' },
-        performance: { now: () => 0 }, AbortController, setTimeout, clearTimeout,
+        ...browserGlobals, devicePixelRatio: 1, innerWidth: 800, innerHeight: 600, location: { search: '' },
+        performance: { now: () => 0 },
         fetch: manifestResponse({ spawn: [0, 0, 0], chunks: [] }), GLTFLoader: class {},
     });
     // One frame is 0.1 s at the default 40 m/s, so E alone climbs 4 m.
@@ -441,6 +445,7 @@ function fixture(count = 1) {
     let now = 0, nextTimer = 0;
     class Group { add() {} }
     const context = vm.createContext({
+        ...browserGlobals,
         performance: { now: () => now },
         setTimeout(callback, delay) {
             const id = ++nextTimer;
@@ -450,7 +455,6 @@ function fixture(count = 1) {
         clearTimeout: id => timers.delete(id),
         THREE: { MeshStandardMaterial: class {}, Group, DoubleSide: 2,
             LoaderUtils: { extractUrlBase: url => url.slice(0, url.lastIndexOf('/') + 1) || './' } },
-        AbortController,
         fetch: (url, { signal }) => new Promise((resolve, reject) => {
             const request = { url, signal, reject };
             request.headers = (url = '') => resolve({ ok: true, url, arrayBuffer: () => new Promise((body, fail) => {
