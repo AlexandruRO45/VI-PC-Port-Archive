@@ -457,11 +457,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
     return true;
 }
 
-// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
-DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
-}
+DWORD view_protect(const Window& window) { return window.protect; }
 
 bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
 
