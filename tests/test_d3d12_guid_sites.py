@@ -209,6 +209,41 @@ class GuidSites(unittest.TestCase):
                 with open(header, "rb") as f:
                     self.assertEqual(f.read(), header_text)
 
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), *args],
+                              capture_output=True, text=True, cwd=ROOT)
+
+    def test_missing_image_is_one_error_line_and_exit_2(self):
+        # BUILD-1046: a path that is not there is a usage error, the way pe_inspect.py and rtti_scan.py say it.
+        missing = os.path.join(self.tmp.name, "no-such-image.dll")
+        result = self.run_cli(missing)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("ERROR:"), result.stderr)
+        self.assertIn(missing, lines[0])
+
+    def test_missing_image_is_reported_before_any_work_and_names_every_one(self):
+        # The scan reads section by section and prints as it goes, so a bad path has to be caught up front or the
+        # output of the images that were fine arrives before the error.
+        good, _ = pe32plus(lea(0x2000, 0x1000), QUEUE.bytes_le)
+        path = self.write("t7.dll", good)
+        missing = os.path.join(self.tmp.name, "no-such-image.dll")
+        result = self.run_cli(path, missing, "--known", f"ID3D12CommandQueue={QUEUE}")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn(missing, lines[0])
+        self.assertNotIn("t7.dll", result.stdout)
+
+    def test_a_folder_is_not_an_image(self):
+        result = self.run_cli(self.tmp.name)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
+        self.assertTrue(result.stderr.startswith("ERROR:"), result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

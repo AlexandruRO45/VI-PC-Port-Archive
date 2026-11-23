@@ -353,6 +353,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", help="also write the result here")
     args = ap.parse_args(argv)
 
+    # A path that is not there is a usage error, not a failed scan: the loop below prints each image as it goes,
+    # so every path has to be checked before the first read (BUILD-1046, the shape pe_inspect.py and rtti_scan.py
+    # already use). A folder reads as an OSError partway through the same loop, so it is named here too.
+    missing = [img for img in args.images if not os.path.exists(img)]
+    if missing:
+        for img in missing:
+            print(f"ERROR: {img}: does not exist", file=sys.stderr)
+        return 2
+    folders = [img for img in args.images if os.path.isdir(img)]
+    if folders:
+        for img in folders:
+            print(f"ERROR: {img}: is a folder, not a PE image", file=sys.stderr)
+        return 2
+
     header = args.header
     if header is None:
         header = default_header()

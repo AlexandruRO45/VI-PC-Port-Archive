@@ -19,6 +19,7 @@ MISSING_INPUT_TOOLS = (
     "bary_fallback_gs",
     "content_definitions",
     "cpu_ref",
+    "d3d12_guid_sites",
     "gamedata_maps",
     "gamedata_sps1",
     "navmesh_index",
