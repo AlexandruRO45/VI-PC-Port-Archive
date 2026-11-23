@@ -117,6 +117,18 @@ class TestRoundModeConfig(unittest.TestCase):
             with self.assertRaises(rdna2spirv.Unsupported):
                 support.translate_lines(f"cs_rm_fp16_rej_{imm}", prog, fssm=saveexec_run.fssm())
 
+class TestRoundModeRejection(unittest.TestCase):
+    def test_non_nearest_even_fp32_rejection(self):
+        for invalid_mode in (1, 2, 3):
+            prog = [f"s_round_mode {invalid_mode}", "s_endpgm"]
+            with self.assertRaises(rdna2spirv.Unsupported):
+                support.translate_lines(f"cs_rm_reject_{invalid_mode}", prog, fssm=saveexec_run.fssm())
+
+    def test_translator_round_mode_valid(self):
+        prog = ["s_round_mode 0", "s_endpgm"]
+        spv = support.translate_lines("cs_rm_valid", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+
 
 if __name__ == "__main__":
     unittest.main()
