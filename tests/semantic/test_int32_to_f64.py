@@ -14,8 +14,7 @@ import spirv_interface
 
 
 class Int32ToFloat64(unittest.TestCase):
-    @unittest.skipUnless(all(shutil.which(t) for t in ("spirv-as", "spirv-opt", "spirv-dis", "spirv-val")),
-                         "needs SPIRV-Tools")
+    @unittest.skipUnless(all(shutil.which(t) for t in ("spirv-as", "spirv-opt", "spirv-dis")), "needs SPIRV-Tools")
     def test_constant_folded_mrt_words(self):
         # Integer-to-double is exact. Float controls can prevent optimizers folding even these constants.
         default = translate_fixture("ps_int32_to_f64")
@@ -34,14 +33,10 @@ class Int32ToFloat64(unittest.TestCase):
             binary, folded = Path(tmp) / "int32.spv", Path(tmp) / "folded.spv"
             subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", binary, "-"],
                            input=foldable, text=True, check=True)
-            optimized = subprocess.run(["spirv-opt", "-O", binary, "-o", folded])
-            # A signal (POSIX) or an NTSTATUS exception code (Windows): spirv-opt crashed instead of reporting.
-            if optimized.returncode < 0 or optimized.returncode >= 0xC0000000:
-                # SPIRV-Tools 2025.1~rc1 (Ubuntu 24.04, Debian 13) crashes in its ccp pass here; 2026.4 folds it.
-                # An invalid module is still the translator's failure, so only a valid one skips.
-                subprocess.run(["spirv-val", "--target-env", "vulkan1.2", binary], check=True)
-                self.skipTest(f"spirv-opt crashed (exit {optimized.returncode}) on a module spirv-val accepts")
-            optimized.check_returncode()
+            # The passes the fold needs, not -O: SPIRV-Tools 2025.1~rc1 (Ubuntu 24.04, CI's Linux leg) segfaults in
+            # -O's ccp pass on this valid module, and simplify-instructions folds the same constants.
+            subprocess.run(["spirv-opt", "--scalar-replacement=0", "--ssa-rewrite", "--eliminate-dead-code-aggressive",
+                            "--simplify-instructions", binary, "-o", folded], check=True)
             listing = subprocess.check_output(["spirv-dis", "--raw-id", folded], text=True)
             stored, = re.findall(r"OpStore %\d+ (%\d+)", listing)
             components, = re.findall(rf"{stored} = OpConstantComposite %\d+ ((?:%\d+ ){{3}}%\d+)", listing)
