@@ -46,6 +46,33 @@ def ref_bfi_b32(mask: int, field: int, base: int) -> int:
     b = base & MASK32
     return ((m & f) | ((~m & MASK32) & b)) & MASK32
 
+@dataclasses.dataclass
+class ASTOperand:
+    kind: str  # "vgpr", "sgpr", "imm"
+    index: int = 0
+    value: int = 0
+
+    def format_asm(self) -> str:
+        if self.kind == "vgpr":
+            return f"v{self.index}"
+        elif self.kind == "sgpr":
+            return f"s{self.index}"
+        elif self.kind == "imm":
+            return f"{self.value:#010x}"
+        return f"{self.value}"
+
+
+@dataclasses.dataclass
+class ASTInstruction:
+    opcode: str
+    dst: ASTOperand
+    src0: ASTOperand
+    src1: ASTOperand
+    src2: ASTOperand
+
+    def format_asm(self) -> str:
+        return f"{self.opcode} {self.dst.format_asm()}, {self.src0.format_asm()}, {self.src1.format_asm()}, {self.src2.format_asm()}"
+
 
 class TestBfiOracle(unittest.TestCase):
     def test_identity_masks(self):
@@ -73,12 +100,41 @@ class TestBfiOracle(unittest.TestCase):
     def test_byte_insertions(self):
         base = 0x11223344
         field = 0xAABBCCDD
-        # insert low byte
         self.assertEqual(ref_bfi_b32(0x000000FF, field, base), 0x112233DD)
-        # insert second byte
         self.assertEqual(ref_bfi_b32(0x0000FF00, field, base), 0x1122CC44)
-        # insert high byte
         self.assertEqual(ref_bfi_b32(0xFF000000, field, base), 0xAA223344)
+
+
+class TestBfiAST(unittest.TestCase):
+    def test_ast_formatting(self):
+        inst = ASTInstruction(
+            opcode="v_bfi_b32",
+            dst=ASTOperand("vgpr", index=0),
+            src0=ASTOperand("vgpr", index=1),
+            src1=ASTOperand("vgpr", index=2),
+            src2=ASTOperand("vgpr", index=3),
+        )
+        self.assertEqual(inst.format_asm(), "v_bfi_b32 v0, v1, v2, v3")
+
+    def test_ast_literal_formatting(self):
+        inst = ASTInstruction(
+            opcode="v_bfi_b32",
+            dst=ASTOperand("vgpr", index=4),
+            src0=ASTOperand("imm", value=0x000000FF),
+            src1=ASTOperand("vgpr", index=1),
+            src2=ASTOperand("vgpr", index=2),
+        )
+        self.assertEqual(inst.format_asm(), "v_bfi_b32 v4, 0x000000ff, v1, v2")
+
+    def test_ast_sgpr_operands(self):
+        inst = ASTInstruction(
+            opcode="v_bfi_b32",
+            dst=ASTOperand("vgpr", index=0),
+            src0=ASTOperand("sgpr", index=0),
+            src1=ASTOperand("vgpr", index=1),
+            src2=ASTOperand("sgpr", index=2),
+        )
+        self.assertEqual(inst.format_asm(), "v_bfi_b32 v0, s0, v1, s2")
 
 
 if __name__ == "__main__":
