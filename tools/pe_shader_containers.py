@@ -59,7 +59,7 @@ def parse_container(data: bytes, offset: int):
     """Return (total_size, chunks) for the container at `offset`, or raise ContainerError.
 
     The package's containers differ from DXC's in one place only: the chunk table is a u32 offset array at
-    +32 (count at +28), and each chunk starts with its fourcc and a u32 size. `tools/fspx_unpack.parts()`
+    +32 (count at +28), and each chunk starts with its fourcc and a u32 size. `tools/fspx_unpack.dxbc_parts()`
     reads the same shape. The checks below reject the four-byte `DXBC` immediates and error strings that
     occur in ordinary code.
     """

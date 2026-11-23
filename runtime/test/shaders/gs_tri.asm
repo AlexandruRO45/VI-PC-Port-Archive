@@ -1,6 +1,6 @@
 ; Legacy (LDS-ring) geometry shader idioms: s_bfm_b64/s_cselect EXEC prologue, input vertex offsets from v0/v1 (SDWA),
 ; LDS reads of SV_Position (reg 0) and TEXCOORD0 (reg 1), output slots of 2 registers (8 dwords), EMIT x3, CUT, DONE.
-; Needs a DXBC with ISG1/OSG1 = {SV_Position reg 0, TEXCOORD0 reg 1}. Run: VKH_GS=gs_tri.spv vk_harness vs_attrs.spv
+; Needs a DXBC with ISG1/OSG1 = {SV_Position reg 0, TEXCOORD0 reg 1}. Run: VKH_GS=gs_tri.spv vk_harness vs_tri.spv
 ; fs_loc1.spv out.raw (fs_loc1 = fs_passthru reading location 1) -> every pixel = ((x+0.5)/64, (y+0.5)/64, 0, 0).
 s_bfe_i32 s0, s3, 0x80008
 s_bfm_b64 exec, s0, 0

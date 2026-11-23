@@ -531,7 +531,8 @@ match supports the model and does not prove RDNA2. Run these one at a time: a se
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
-`VK_LOADER_DRIVERS_SELECT=*amd*` or `VK_LOADER_DRIVERS_SELECT=nv-vk*` (or `VK_DRIVER_FILES=<path to the ICD json>`).
+`VK_LOADER_DRIVERS_SELECT=*amd*` or `VK_LOADER_DRIVERS_SELECT=nv-vk*` on Windows (`*radeon*` or `*nvidia*` on Linux,
+or `VK_DRIVER_FILES=<path to the ICD json>`).
 `vulkaninfo --summary` shows which devices the loader then sees.
 
 Two GPUs of one vendor share one driver, so the loader cannot tell them apart (an RTX 5070 Ti next to an RTX 3060,
