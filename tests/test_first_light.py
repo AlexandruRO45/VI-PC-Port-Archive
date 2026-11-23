@@ -449,6 +449,19 @@ class ReadObjTests(unittest.TestCase):
         )
         self.assertEqual(fl.read_obj(relative), fl.read_obj(positive))
 
+    def test_valid_fans_keep_first_encounter_order_and_uv_seams(self):
+        obj = self._write_obj(
+            "f 99 98\nf 3/1 4/1 5/1\nf 2/1 3/1 4/1 5/1\nf 1/1 2/2 3/1 4/1 5/1\n"
+            "v 0 0 0\nv 2 0 0\nv 3 1 0\nv 1 3 0\nv 0 2 0\n"
+            "vt 0 0\nvt 1 1\n"
+        )
+        vertices, indices = fl.read_obj(obj)
+        self.assertEqual(vertices, [
+            (3, 1, 0, 0, 0), (1, 3, 0, 0, 0), (0, 2, 0, 0, 0),
+            (2, 0, 0, 0, 0), (0, 0, 0, 0, 0), (2, 0, 0, 1, 1),
+        ])
+        self.assertEqual(indices, [0, 1, 2, 3, 0, 1, 3, 1, 2, 4, 5, 0, 4, 0, 1, 4, 1, 2])
+
     def test_rejects_zero_and_out_of_range_vertex_indices(self):
         for bad in (
             "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n",

@@ -208,6 +208,10 @@ def read_obj(
     path: str,
 ) -> tuple[list[tuple[float, float, float, float, float]], list[int]]:
     """Positions, UVs and triangles as (x, y, z, u, v) vertices plus a u32 index list."""
+    if TOOLS not in sys.path:
+        sys.path.insert(0, TOOLS)
+    from glb_writer import _triangulate_face
+
     positions, uvs, faces = [], [], []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in _obj_lines(f):
@@ -249,21 +253,33 @@ def read_obj(
                     else:
                         ti = -1
                     face.append((vi, ti))
-                for k in range(1, len(face) - 1):
-                    faces.extend((face[0], face[k], face[k + 1]))
+                if len(face) >= 3:
+                    faces.append(face)
     if not positions or not faces:
         raise SystemExit(f"no vertices or faces in {path}")
     unique, vertices, indices = {}, [], []
-    for vi, ti in faces:
-        if not 0 <= vi < len(positions):
-            raise SystemExit(f"{path}: vertex index {vi + 1} is out of range for {len(positions)} vertex(es)")
-        key = (vi, ti)
-        if key not in unique:
-            unique[key] = len(vertices)
-            x, y, z = positions[vi]
-            u, v = uvs[ti] if 0 <= ti < len(uvs) else (0.0, 0.0)
-            vertices.append((x, y, z, u, v))
-        indices.append(unique[key])
+    # Resolve forward references after reading the file. Number vertices in
+    # face order so ear clipping changes only how those vertices are indexed.
+    for face in faces:
+        face_indices = []
+        for vi, ti in face:
+            if not 0 <= vi < len(positions):
+                raise SystemExit(f"{path}: vertex index {vi + 1} is out of range for {len(positions)} vertex(es)")
+            key = (vi, ti)
+            if key not in unique:
+                unique[key] = len(vertices)
+                x, y, z = positions[vi]
+                u, v = uvs[ti] if 0 <= ti < len(uvs) else (0.0, 0.0)
+                vertices.append((x, y, z, u, v))
+            face_indices.append(unique[key])
+
+        triangles = None
+        if len(face) > 3 and len({vi for vi, _ in face}) == len(face):
+            triangles = _triangulate_face([positions[vi] for vi, _ in face])
+        if triangles is None:
+            triangles = ((0, k, k + 1) for k in range(1, len(face) - 1))
+        for a, b, c in triangles:
+            indices.extend((face_indices[a], face_indices[b], face_indices[c]))
     return vertices, indices
 
 

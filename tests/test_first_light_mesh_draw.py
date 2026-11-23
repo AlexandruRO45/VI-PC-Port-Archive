@@ -37,6 +37,40 @@ class FirstLightMeshDrawTests(unittest.TestCase):
         ))
         self.draw = self.enterContext(patch.object(first_light.subprocess, "run", side_effect=self.write_readback))
 
+    def test_prepare_concave_obj_leaves_notch_open_in_both_windings(self) -> None:
+        outline = [(-0.75, -0.75), (0.75, -0.75), (0.75, 0.75), (0.25, 0.75),
+                   (0.25, -0.25), (-0.25, -0.25), (-0.25, 0.75), (-0.75, 0.75)]
+        obj = self.work / "notched.obj"
+        for winding in (1, -1):
+            with self.subTest(winding=winding):
+                ordered = outline[:1] + outline[1:][::winding]
+                obj.write_text(
+                    "f 1 2 3 4 5 6 7 8\n" + "".join(f"v {x} {y} 0.5\n" for x, y in ordered),
+                    encoding="utf-8", newline="\n",
+                )
+                self.assertEqual(self.prepare("--obj", str(obj)), 0)
+                mesh = self.mesh.read_bytes()
+                vertex_count, index_count = struct.unpack_from("<II", mesh)
+                self.assertEqual((vertex_count, index_count), (8, 18))
+                index_offset = 8 + vertex_count * 20
+                positions = [v[:2] for v in struct.iter_unpack("<5f", mesh[8:index_offset])]
+                self.assertEqual(positions, ordered)
+                triangles = [
+                    (positions[a], positions[b], positions[c])
+                    for a, b, c in struct.iter_unpack("<3I", mesh[index_offset:])
+                ]
+                twice_areas = [
+                    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+                    for (ax, ay), (bx, by), (cx, cy) in triangles
+                ]
+                covers_notch = any(
+                    first_light.barycentric(0.0, 0.125, *a, *b, *c) is not None
+                    for a, b, c in triangles
+                )
+                self.assertEqual((covers_notch, sum(map(abs, twice_areas)) / 2), (False, 1.75))
+                self.assertTrue(all(winding * area > 0 for area in twice_areas))
+        self.draw.assert_not_called()
+
     @staticmethod
     def write_readback(arguments: list[str], *, env: dict[str, str], check: bool) -> None:
         if not Path(env["VKH_DRAW_MESH"]).is_file():
