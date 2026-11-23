@@ -371,5 +371,64 @@ class TestSaluXorB64IEEE754(unittest.TestCase):
         self.assertEqual(res, expected)
 
 
+class TestSaluXorB64NegativeControls(unittest.TestCase):
+    """Negative controls and mutation rejection."""
+
+    def test_mutation_or_instead_of_xor(self) -> None:
+        def mutant_or(s0: int, s1: int) -> int:
+            return s0 | s1
+        correct, _ = ref_xor_b64(0x0F, 0x0F)
+        mutated = mutant_or(0x0F, 0x0F)
+        self.assertNotEqual(correct, mutated)
+
+
+class TestSaluXorB64TranslationAndExecution(unittest.TestCase):
+    """Stage 8: End-to-end SPIR-V translation and fragment execution."""
+
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_mov_b32 s1, 0x9abcdef0",
+            "s_mov_b32 s2, 0x00ff00ff",
+            "s_mov_b32 s3, 0x0f0f0f0f",
+            "s_xor_b64 s[4:5], s[0:1], s[2:3]",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_test_xor_b64_emit", lines)
+        self.assertIn("OpBitwiseXor", spv)
+
+    def test_hardware_execution(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        s0_lo, s0_hi = 0x12345678, 0x9ABCDEF0
+        s1_lo, s1_hi = 0x00FF00FF, 0x0F0F0F0F
+        expected_lo = (s0_lo ^ s1_lo) & MASK32
+        expected_hi = (s0_hi ^ s1_hi) & MASK32
+
+        lines = [
+            f"s_mov_b32 s0, {s0_lo:#x}",
+            f"s_mov_b32 s1, {s0_hi:#x}",
+            f"s_mov_b32 s2, {s1_lo:#x}",
+            f"s_mov_b32 s3, {s1_hi:#x}",
+            "s_xor_b64 s[4:5], s[0:1], s[2:3]",
+            "s_cselect_b32 s6, 1, 0",
+            "v_mov_b32_e32 v0, s4",
+            "v_mov_b32_e32 v1, s5",
+            "v_mov_b32_e32 v2, s6",
+            "v_mov_b32_e32 v3, 0",
+            "exp mrt0, v0, v1, v2, v3 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_xor_b64_hw", lines)
+        words = support.mrt0_words(spv)
+
+        self.assertEqual(words[0], expected_lo)
+        self.assertEqual(words[1], expected_hi)
+        self.assertEqual(words[2], 1)
+        self.assertEqual(words[3], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
