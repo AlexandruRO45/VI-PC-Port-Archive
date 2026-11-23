@@ -66,7 +66,8 @@ $ErrorActionPreference = 'Stop'
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell diagnostics script")
 class FirstLookRebuildTest(unittest.TestCase):
-    def run_case(self, source_newer=False, missing=(), incomplete_build=False, tool_exit=0, stub_loader=True):
+    def run_case(self, source_newer=False, missing=(), incomplete_build=False, tool_exit=0, stub_loader=True,
+                 cache=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for folder in ("scripts", "tools", "runtime/build", "runtime/src"):
@@ -78,6 +79,8 @@ class FirstLookRebuildTest(unittest.TestCase):
                 (root / "tools" / name).write_text(TOOL_STUB_TEMPLATE % tool_exit, encoding="utf-8", newline="\n")
             (root / "fixture.exe").write_bytes(b"MZ")
             loader = root / "runtime" / "build" / "gta6rt.exe"
+            if cache is not None:
+                (loader.parent / "CMakeCache.txt").write_text(cache, encoding="utf-8")
             source = root / "runtime" / "src" / "pe_loader.cpp"
             tls = loader.with_name("gta6rt_tls_host.dll")
             loader.write_bytes(b"")
@@ -146,6 +149,18 @@ class FirstLookRebuildTest(unittest.TestCase):
         self.assertNotEqual(code, 0, out)
         self.assertIn("runtime build did not produce", out)
         self.assertIn("gta6rt_tls_host.dll", out)
+
+    def test_incomplete_visual_studio_cache_names_the_missing_command(self):
+        generator = "CMAKE_GENERATOR:INTERNAL=Visual Studio 17 2022\n"
+        for command in ("", "CMAKE_COMMAND:INTERNAL=\n"):
+            with self.subTest(command=command):
+                built, dry_run, code, out = self.run_case(source_newer=True, cache=generator + command)
+                self.assertNotEqual(code, 0, out)
+                self.assertFalse(built, out)
+                self.assertIn("CMakeCache.txt", out)
+                self.assertIn("Reconfigure", out)
+                self.assertIn("CMAKE_COMMAND", out)
+                self.assertFalse(dry_run, out)
 
 
 if __name__ == "__main__":
