@@ -297,6 +297,14 @@ class HelperTest(unittest.TestCase):
         # past float range included; an item without Pos is not a position at all.
         self.assertEqual((names, dup, malformed), ({"K": [[1.0, 2.0, 3.0]]}, 0, 8))
 
+    def test_names_file_saved_with_a_bom_is_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "wb") as f:  # an editor that marks UTF-8 with a BOM
+                f.write(b"\xef\xbb\xbf" + b'{"InteriorNames": {"K": [{"Pos": [1, 2, 3]}]}}')
+            names, dup, malformed = T.load_names(path)
+        self.assertEqual((names, dup, malformed), ({"K": [[1.0, 2.0, 3.0]]}, 0, 0))
+
     def test_json_type_names(self):
         self.assertEqual([T._json_type(v) for v in (None, True, 1, 1.5, "s", [], {})],
                          ["null", "a boolean", "a number", "a number", "a string", "a list", "an object"])
