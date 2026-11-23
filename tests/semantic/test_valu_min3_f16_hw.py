@@ -324,5 +324,84 @@ class TestValuMin3F16ScalarInterpreter(unittest.TestCase):
         out = mach.execute(ast)
         self.assertEqual(out, 0x3C005678)
 
+
+# -----------------------------------------------------------------------------
+# Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking
+# -----------------------------------------------------------------------------
+class SimdF16Wave:
+    def __init__(self, size: int = 32):
+        self.size = size
+        self.exec_mask: int = (1 << size) - 1
+        self.vgprs: dict[str, list[int]] = {}
+
+    def init_vgpr(self, reg: str, values: list[int]):
+        self.vgprs[reg] = list(values)
+
+    def execute(self, ast: VMin3F16AST, sgprs: dict[str, int]) -> list[int]:
+        if ast.dst_reg not in self.vgprs:
+            self.vgprs[ast.dst_reg] = [OLD_VAL] * self.size
+        dst_list = self.vgprs[ast.dst_reg]
+
+        for lane in range(self.size):
+            if not ((self.exec_mask >> lane) & 1):
+                continue
+            def lane_half(op: F16Operand) -> int:
+                if op.is_literal:
+                    raw = op.literal_value
+                elif op.is_vgpr:
+                    raw = self.vgprs.get(op.reg, [0] * self.size)[lane]
+                else:
+                    raw = sgprs.get(op.reg, 0)
+                word16 = ((raw >> 16) if op.hi else raw) & MASK16
+                return apply_f16_input_mod(word16, neg=op.neg, abs_val=op.abs_val)
+
+            w0 = lane_half(ast.src0)
+            w1 = lane_half(ast.src1)
+            w2 = lane_half(ast.src2)
+            res16 = ref_min3_f16(w0, w1, w2, clamp=ast.clamp)
+
+            old = dst_list[lane]
+            if ast.dst_hi:
+                dst_list[lane] = (old & 0x0000FFFF) | ((res16 & MASK16) << 16)
+            else:
+                dst_list[lane] = (old & 0xFFFF0000) | (res16 & MASK16)
+        return dst_list
+
+
+class TestValuMin3F16SimdDivergence(unittest.TestCase):
+    """Commit 4: Multi-lane execution under Wave32 and Wave64 masks."""
+
+    def test_wave32_divergence(self):
+        wave = SimdF16Wave(32)
+        wave.exec_mask = 0b10101010_10101010_10101010_10101010
+        wave.init_vgpr("v0", [0xAAAA0000 + i for i in range(32)])
+        wave.init_vgpr("v1", [POS_ONE if i % 2 == 0 else POS_TWO for i in range(32)])
+        wave.init_vgpr("v2", [POS_HALF] * 32)
+        wave.init_vgpr("v3", [POS_FOUR] * 32)
+
+        ast = VMin3F16AST.parse("v_min3_f16 v0, v1, v2, v3")
+        res = wave.execute(ast, {})
+        for lane in range(32):
+            if (wave.exec_mask >> lane) & 1:
+                self.assertEqual(res[lane], 0xAAAA3800)
+            else:
+                self.assertEqual(res[lane], 0xAAAA0000 + lane)
+
+    def test_wave64_divergence(self):
+        wave = SimdF16Wave(64)
+        wave.exec_mask = 0x00000000_FFFFFFFF  # lower 32 lanes active only
+        wave.init_vgpr("v0", [0xDEAD0000] * 64)
+        wave.init_vgpr("v1", [POS_ONE] * 64)
+        wave.init_vgpr("v2", [POS_TWO] * 64)
+        wave.init_vgpr("v3", [POS_HALF] * 64)
+
+        ast = VMin3F16AST.parse("v_min3_f16 v0, v1, v2, v3")
+        res = wave.execute(ast, {})
+        for lane in range(64):
+            if lane < 32:
+                self.assertEqual(res[lane], 0xDEAD3800)
+            else:
+                self.assertEqual(res[lane], 0xDEAD0000)
+
 if __name__ == '__main__':
     unittest.main()
