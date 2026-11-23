@@ -5,7 +5,9 @@
 Every byte in this file is constructed synthetically. No game file, carved payload,
 asset name, path string, or asset hash is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -21,6 +23,7 @@ TOOL = os.path.join(ROOT, "tools", "odrp_7a.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import odrp_7a  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def _align16(n):
@@ -637,6 +640,88 @@ class ArchiveAndCliTest(unittest.TestCase):
         self.assertIn("would overwrite", result.stderr)
         with open(source, "rb") as f:
             self.assertEqual(f.read(), self.meta_single)
+
+    def test_same_report_path_collision_spellings(self):
+        self.assertIs(odrp_7a.same_report_path, report_paths.same_report_path)
+
+        # Relative-path spelling against a single-file source.
+        json_src = os.path.join(self.root, "rel_same.json")
+        with open(json_src, "wb") as f:
+            f.write(self.meta_single)
+        rel_out = os.path.join("..", os.path.basename(self.root), "rel_same.json")
+        proc = subprocess.run(
+            [sys.executable, "-I", TOOL, "rel_same.json", rel_out, "--quiet"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("output must not overwrite the source", proc.stderr)
+        with open(json_src, "rb") as f:
+            self.assertEqual(f.read(), self.meta_single)
+
+        # Relative-path spelling against a carve manifest (index.json).
+        folder = os.path.join(self.root, "carved_coll")
+        os.mkdir(folder)
+        carved_bin = os.path.join(folder, "00000001.bin")
+        with open(carved_bin, "wb") as f:
+            f.write(self.meta_single)
+        manifest = os.path.join(folder, "index.json")
+        manifest_bytes = b'{"files": []}'
+        with open(manifest, "wb") as f:
+            f.write(manifest_bytes)
+        rel_manifest = os.path.join("carved_coll", ".", "index.json")
+        proc = subprocess.run(
+            [sys.executable, "-I", TOOL, "carved_coll", rel_manifest, "--quiet"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("would overwrite the carve manifest", proc.stderr)
+        with open(manifest, "rb") as f:
+            self.assertEqual(f.read(), manifest_bytes)
+
+        # Case-insensitive spelling: CLI directly on case-insensitive volumes, plus
+        # folding-volume hook via odrp_7a.main so case-sensitive filesystems also exercise it.
+        upper_src = os.path.join(self.root, "REL_SAME.JSON")
+        upper_manifest = os.path.join(folder, "INDEX.JSON")
+        if os.path.exists(upper_src):
+            proc = subprocess.run(
+                [sys.executable, "-I", TOOL, json_src, upper_src, "--quiet"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("output must not overwrite the source", proc.stderr)
+
+            proc = subprocess.run(
+                [sys.executable, "-I", TOOL, folder, upper_manifest, "--quiet"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+            self.assertIn("would overwrite the carve manifest", proc.stderr)
+
+        with unittest.mock.patch.object(report_paths, "same_name_on_folding_volume", return_value=True):
+            for argv, expected_msg in (
+                ([json_src, upper_src, "--quiet"], "output must not overwrite the source"),
+                ([folder, upper_manifest, "--quiet"], "would overwrite the carve manifest"),
+            ):
+                stderr_buf = io.StringIO()
+                with contextlib.redirect_stderr(stderr_buf):
+                    with self.assertRaises(SystemExit) as ctx:
+                        odrp_7a.main(argv)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn(expected_msg, stderr_buf.getvalue())
 
     def test_cli_validation_and_error_handling(self):
         # Bad numeric flags exit 2 without creating output.
