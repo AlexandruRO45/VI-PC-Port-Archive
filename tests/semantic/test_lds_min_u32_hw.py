@@ -478,5 +478,39 @@ class TestLdsMinU32SIMD(unittest.TestCase):
         self.assertEqual(simd.lds.read_dword(0x80), 50)
 
 
+# ---------------------------------------------------------------------------
+# Register Aliasing and In-Place Operand Preservation
+# ---------------------------------------------------------------------------
+
+class TestLdsMinU32RegisterAliasing(unittest.TestCase):
+    """Unit tests for overlapping register allocations and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLdsInterpreter(size_dwords=1024)
+
+    def test_aliasing_vaddr_same_as_vdata(self) -> None:
+        # ds_min_u32 v0, v0: v0 is both address and data operand
+        # When v0 = 0x40 (64), effective byte address is 64, data operand is 64.
+        self.interp.lds.write_dword(0x40, 100)
+        self.interp.write_vgpr(0, 0x40)
+
+        inst = Instruction(Opcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 0))
+        updated = self.interp.step(inst)
+        self.assertEqual(updated, 0x40)
+        self.assertEqual(self.interp.lds.read_dword(0x40), 0x40)
+        self.assertEqual(self.interp.read_vgpr(0), 0x40)
+
+    def test_preserve_all_vgprs_post_execution(self) -> None:
+        for reg in range(8):
+            self.interp.write_vgpr(reg, 0x1000 + reg)
+        self.interp.lds.write_dword(0x1000, 5000)
+
+        inst = Instruction(Opcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        self.interp.step(inst)
+
+        for reg in range(8):
+            self.assertEqual(self.interp.read_vgpr(reg), 0x1000 + reg)
+
+
 if __name__ == "__main__":
     unittest.main()
