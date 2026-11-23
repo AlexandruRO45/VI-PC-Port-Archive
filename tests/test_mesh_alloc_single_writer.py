@@ -7,8 +7,8 @@ import rdna2spirv
 import spirv_asm
 
 class MeshAllocSingleWriterTests(unittest.TestCase):
-    def test_ms_alloc_req_single_writer_guard(self):
-        """SHADER-766: s_sendmsg(MSG_GS_ALLOC_REQ) restricts OpStore %ms_counts to local_index == 0."""
+    def test_ms_alloc_req_atomic_exchange(self):
+        """s_sendmsg(MSG_GS_ALLOC_REQ) emits OpAtomicExchange on %ms_counts with Workgroup scope."""
         for mesh_compute in (False, True):
             orig_mc = rdna2spirv.MESH_COMPUTE
             try:
@@ -24,39 +24,26 @@ class MeshAllocSingleWriterTests(unittest.TestCase):
                 gen._insn(ins)
 
                 body_text = "\n".join(gen.body)
-                # 1. OpStore %ms_counts must be present
-                self.assertIn("OpStore %ms_counts", body_text)
+                # 1. OpAtomicExchange on %ms_counts must be present with Workgroup scope (%c2) and Relaxed (%c0)
+                self.assertIn("OpAtomicExchange %uint %ms_counts %c2 %c0", body_text)
 
-                # 2. Must load %local_index and compare to 0
-                self.assertIn("= OpLoad %uint %local_index", body_text)
-                self.assertRegex(body_text, r"%(\w+) = OpIEqual %bool %(\w+) %c0")
+                # 2. Must not depend on local_index == 0, so any wave (including wave 1) can emit alloc request
+                self.assertNotIn("OpIEqual %bool", body_text)
+                self.assertNotIn("OpBranchConditional", body_text)
 
-                # 3. Must have structured selection merge and conditional branch
-                self.assertRegex(body_text, r"OpSelectionMerge %(\w+) None\s+OpBranchConditional %(\w+) %(\w+) %(\w+)")
-
-                # 4. OpStore %ms_counts must only appear inside the conditional block
-                lines = [l.strip() for l in gen.body if l.strip()]
-                store_idx = next(i for i, l in enumerate(lines) if "OpStore %ms_counts" in l)
-                branch_cond_idx = next(i for i, l in enumerate(lines) if "OpBranchConditional" in l)
-                self.assertGreater(store_idx, branch_cond_idx)
-
-                # 5. Verify assembly into a complete module passes spirv_asm
-                # Build mock header
+                # 3. Verify assembly into a complete module passes spirv_asm
                 types_and_vars = [
                     "OpCapability Shader",
                     "OpCapability MeshShadingEXT" if not mesh_compute else "",
                     "OpMemoryModel Logical GLSL450",
-                    'OpEntryPoint GLCompute %main "main" %local_index' if mesh_compute else 'OpEntryPoint MeshEXT %main "main" %local_index',
+                    'OpEntryPoint GLCompute %main "main"' if mesh_compute else 'OpEntryPoint MeshEXT %main "main"',
                     "OpExecutionMode %main LocalSize 128 1 1",
-                    "OpDecorate %local_index BuiltIn LocalInvocationIndex",
                     "%void = OpTypeVoid",
-                    "%bool = OpTypeBool",
                     "%uint = OpTypeInt 32 0",
                     "%c0 = OpConstant %uint 0",
-                    "%_ptr_Input_uint = OpTypePointer Input %uint",
+                    "%c2 = OpConstant %uint 2",
                     "%_ptr_Workgroup_uint = OpTypePointer Workgroup %uint",
                     "%_ptr_Function_uint = OpTypePointer Function %uint",
-                    "%local_index = OpVariable %_ptr_Input_uint Input",
                     "%ms_counts = OpVariable %_ptr_Workgroup_uint Workgroup",
                     "%m0 = OpVariable %_ptr_Function_uint Function",
                     "%fn_t = OpTypeFunction %void",
