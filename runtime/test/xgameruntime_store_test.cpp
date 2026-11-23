@@ -201,10 +201,12 @@ int main() {
         std::snprintf(label, sizeof(label), "slot %d begins pending", index);
         check(hr == S_OK && XAsyncGetStatus(&request, false) == E_PENDING && callbacks == 0, label);
         if (hr != S_OK) continue;
+        const int result_slot = index == 62 ? 64 : index + 1;
+        check(at<AsyncResult>(store, result_slot)(store, &request) == E_PENDING,
+              "result remains pending before dispatch");
         XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
         XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
         std::snprintf(label, sizeof(label), "slot %d callback and offline result", index);
-        const int result_slot = index == 62 ? 64 : index + 1;
         check(callbacks == 1 && XAsyncGetStatus(&request, false) == E_FAIL &&
                   at<AsyncResult>(store, result_slot)(store, &request) == E_FAIL, label);
         if (index == 62) {
@@ -213,6 +215,17 @@ int main() {
                   "download packages count is zero on failure");
         }
     }
+    int canceled_callbacks = 0;
+    XAsyncBlock canceled{};
+    canceled.queue = queue;
+    canceled.context = &canceled_callbacks;
+    canceled.callback = on_async;
+    check(at<CtxIdAsync>(store, 71)(store, context, "id", &canceled) == S_OK, "cancel request begins");
+    XAsyncCancel(&canceled);
+    XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
+    XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
+    check(canceled_callbacks == 1 && XAsyncGetStatus(&canceled, false) == E_ABORT &&
+              at<AsyncResult>(store, 72)(store, &canceled) == E_ABORT, "canceled request reports E_ABORT");
     XTaskQueueCloseHandle(queue);
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
