@@ -146,7 +146,7 @@ public:
     // back to automatic: while the swapchain is HDR10, the SDR content brightness Windows has for the output the window
     // is on (a background thread refreshes it once a second; PresentX only reads the cached value), else 203 (ITU-R
     // BT.2408's reference white). Applies to the next PresentX. The setters may be called from any thread.
-    void set_sdr_white_nits(float nits) { sdr_white_override_ = std::isfinite(nits) && nits > 0.0f ? nits : 0.0f; }
+    void set_sdr_white_nits(float nits);
     // How SDR planes are decoded and an SDR output is encoded: piecewise sRGB (default) or gamma 2.2. The environment
     // variable LEONIDA_SDR_EOTF=gamma22 (or 2.2; any case; "srgb" is the default; other values are logged once and
     // ignored) chooses when the object is made.

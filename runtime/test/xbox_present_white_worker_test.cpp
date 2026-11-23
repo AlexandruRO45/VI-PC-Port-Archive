@@ -329,12 +329,19 @@ bool subtest_override_and_suspend_pause_polling() {
     CHECK(wait_query_count(state, 1, std::chrono::milliseconds(250)));
     CHECK(wait_composed_white(*xbox, clock, res, state, 260.0f, std::chrono::milliseconds(250)));
 
-    // Explicit positive override takes effect immediately and pauses background polling.
+    // Explicit positive override pauses background polling immediately even without another PresentX.
     xbox->set_sdr_white_nits(240.0f);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::uint32_t count_override_idle = state.query_count.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2200));
+    CHECK(state.query_count.load() == count_override_idle);
+
+    // And the next HDR10 present uses the override immediately and keeps polling paused.
     CHECK(present_hdr10(*xbox, clock, &res) == S_OK);
     CHECK(std::fabs(state.last_composed.sdr_white_nits - 240.0f) < 1e-3f);
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     const std::uint32_t count_override = state.query_count.load();
+    CHECK(count_override == count_override_idle);
     std::this_thread::sleep_for(std::chrono::milliseconds(1250));
     CHECK(state.query_count.load() == count_override);
 

@@ -64,12 +64,18 @@ XboxPresentation::~XboxPresentation() {
 void XboxPresentation::set_white_wanted(bool wanted) {
     {
         std::lock_guard lock(worker_mutex_);
-        if (wanted && pacer_.suspended()) wanted = false;
+        if (wanted && (pacer_.suspended() || sdr_white_override_.load() > 0.0f)) wanted = false;
         if (white_wanted_.load(std::memory_order_relaxed) == wanted) return;
         white_wanted_.store(wanted, std::memory_order_release);
         white_refresh_requested_ = wanted;
     }
     worker_wake_.notify_all();
+}
+
+void XboxPresentation::set_sdr_white_nits(float nits) {
+    const float clean = std::isfinite(nits) && nits > 0.0f ? nits : 0.0f;
+    sdr_white_override_.store(clean);
+    if (clean > 0.0f) set_white_wanted(false);
 }
 
 void XboxPresentation::sync_white_worker() {
