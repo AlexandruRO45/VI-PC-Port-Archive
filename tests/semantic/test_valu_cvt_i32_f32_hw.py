@@ -333,3 +333,90 @@ class TestScalarInterpreter(unittest.TestCase):
             expected = state.get_vgpr(0)
             translated = run_translator_cvt_i32_f32(bits, name=f"ps_interp_{idx}")
             self.assertEqual(translated, expected)
+
+
+# ==============================================================================
+# SECTION 4: SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+@dataclass
+class SIMDState:
+    num_lanes: int = 32
+    exec_mask: int = 0xFFFF_FFFF
+    vgprs: List[Dict[int, int]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.vgprs:
+            self.vgprs = [{} for _ in range(self.num_lanes)]
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def get_vgpr(self, lane: int, reg: int) -> int:
+        return self.vgprs[lane].get(reg, 0)
+
+    def set_vgpr(self, lane: int, reg: int, val: int) -> None:
+        self.vgprs[lane][reg] = val & MASK_32
+
+
+class SIMDInterpreter:
+    """SIMD vector interpreter executing instructions with lane masking."""
+
+    def __init__(self) -> None:
+        self.scalar_interp = ScalarInterpreter()
+
+    def step(self, instr: VCvtI32F32Instruction, state: SIMDState) -> List[int]:
+        updated_lanes = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                sub_state = ScalarState(vgprs=dict(state.vgprs[lane]))
+                self.scalar_interp.step(instr, sub_state)
+                state.vgprs[lane] = sub_state.vgprs
+                updated_lanes.append(lane)
+        return updated_lanes
+
+
+class TestSIMDDivergence(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_wave32_alternating_lanes(self) -> None:
+        num_lanes = 32
+        mask = 0x5555_5555
+        state = SIMDState(num_lanes=num_lanes, exec_mask=mask)
+        sentinel = 0xDEAD_BEEF
+
+        for lane in range(num_lanes):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, f32_to_bits(float(lane) + 0.5))
+
+        simd = SIMDInterpreter()
+        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+        updated = simd.step(instr, state)
+
+        self.assertEqual(len(updated), 16)
+        for lane in range(num_lanes):
+            if lane % 2 == 0:
+                self.assertEqual(state.get_vgpr(lane, 0), lane)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
+
+    def test_wave64_divergence(self) -> None:
+        num_lanes = 64
+        mask = 0xFFFF_FFFF_0000_0000
+        state = SIMDState(num_lanes=num_lanes, exec_mask=mask)
+        sentinel = 0xCAFE_BABE
+
+        for lane in range(num_lanes):
+            state.set_vgpr(lane, 0, sentinel)
+            state.set_vgpr(lane, 1, f32_to_bits(-float(lane)))
+
+        simd = SIMDInterpreter()
+        instr = VCvtI32F32Instruction(dst=VGPR(0), src=VGPR(1))
+        updated = simd.step(instr, state)
+
+        self.assertEqual(len(updated), 32)
+        for lane in range(num_lanes):
+            if lane >= 32:
+                self.assertEqual(state.get_vgpr(lane, 0), (-lane) & MASK_32)
+            else:
+                self.assertEqual(state.get_vgpr(lane, 0), sentinel)
