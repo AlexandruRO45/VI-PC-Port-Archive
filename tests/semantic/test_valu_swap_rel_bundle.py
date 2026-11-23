@@ -287,6 +287,19 @@ class TestMovRelS64Oracle(unittest.TestCase):
         self.assertIn("OpAccessChain", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestMovRelS64AST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        sgprs = {20: 0xAAAA, 21: 0xBBBB}
+        lo, hi = model_movrels_b64(18, 2, sgprs)
+        self.assertEqual(lo, 0xAAAA)
+        self.assertEqual(hi, 0xBBBB)
+
+    def test_translator_movrels64_ast(self):
+        prog = ["s_mov_b32 m0, 2", "s_mov_b32 s20, 0xAAAA", "s_mov_b32 s21, 0xBBBB", "s_movrels_b64 s[2:3], s[18:19]", "s_endpgm"]
+        spv = support.translate_lines("cs_movrels64_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpAccessChain", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
