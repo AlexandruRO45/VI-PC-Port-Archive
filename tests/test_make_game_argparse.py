@@ -125,6 +125,23 @@ class ArgparseDefaultsAndTypesTest(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn("unrecognized arguments", mock_err.getvalue())
 
+    def test_mesh_compute_and_native_mesh_are_mutually_exclusive(self):
+        with patch.object(sys, "argv", ["make_game.py", "--mesh-compute", "--native-mesh", "--find"]):
+            with patch("make_game.below_normal"), patch("make_game.find_dumps", return_value=[]):
+                with patch("sys.stdout", new_callable=io.StringIO):
+                    with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
+                        with self.assertRaises(SystemExit) as ctx:
+                            make_game.main()
+                        self.assertEqual(ctx.exception.code, 2)
+                        self.assertIn("--mesh-compute", mock_err.getvalue())
+                        self.assertIn("--native-mesh", mock_err.getvalue())
+        for flag in ("--mesh-compute", "--native-mesh"):
+            with self.subTest(flag=flag):
+                with patch.object(sys, "argv", ["make_game.py", flag, "--find"]):
+                    with patch("make_game.below_normal"), patch("make_game.find_dumps", return_value=[]):
+                        with patch("sys.stdout", new_callable=io.StringIO):
+                            self.assertEqual(make_game.main(), 0)
+
 
 class StageValidationAndSequencingTest(unittest.TestCase):
     """Test stage parsing, stage validation, and stage execution sequencing."""

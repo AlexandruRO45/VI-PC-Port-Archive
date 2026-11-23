@@ -2727,6 +2727,8 @@ def main() -> int:
                 ap.error(f"--stages: unknown stage '{s}' (choose from: {','.join(STAGES)})")
     if a.pick and a.game:
         ap.error("--pick and --game both choose the game folder: give one")
+    if a.mesh_compute and a.native_mesh:
+        ap.error("--mesh-compute and --native-mesh are mutually exclusive: give one")
     below_normal()
     if a.find:
         containers = []
