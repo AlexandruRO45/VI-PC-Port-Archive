@@ -1116,11 +1116,8 @@ struct DeviceState {
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
     std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
-<<<<<<< HEAD
-=======
     // VAs of buffers on a device with no GPU address arena (src/synthetic_va.h).
     leonida::SyntheticVa synthetic_va;
->>>>>>> 3ef855a24 (d3d12: buffers on a device without the GPU address arena always get a synthetic, aligned VA below 2^47)
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
