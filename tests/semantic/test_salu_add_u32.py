@@ -467,5 +467,59 @@ class SaluAddU32RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr(1), 0x3FFFFFF)
         self.assertEqual(state.get_sgpr(2), 0x7FFFFFE)
 
+
+# --- Section 6: Condition Codes and Status Flags Generation ---
+
+class SaluAddU32ConditionCodesTests(unittest.TestCase):
+    """Commit 6: Condition codes (SCC) and status flag generation tests."""
+
+    def test_scc_cleared_when_no_carry(self) -> None:
+        state = ScalarRegisterState()
+        state.scc = 1  # Preset SCC to 1
+        state.set_sgpr(0, 10)
+        state.set_sgpr(1, 20)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        _, scc = state.step(ast)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_set_when_carry(self) -> None:
+        state = ScalarRegisterState()
+        state.scc = 0  # Preset SCC to 0
+        state.set_sgpr(0, 0xFFFFFFFF)
+        state.set_sgpr(1, 1)
+        ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        _, scc = state.step(ast)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_prior_state_independence(self) -> None:
+        """s_add_u32 does not use carry-in: result is identical whether SCC was 0 or 1."""
+        for scc_preset in (0, 1):
+            state = ScalarRegisterState()
+            state.scc = scc_preset
+            state.set_sgpr(0, 0x7FFFFFFF)
+            state.set_sgpr(1, 1)
+            ast = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+            res, scc = state.step(ast)
+            self.assertEqual(res, 0x80000000)
+            self.assertEqual(scc, 0)
+
+    def test_boundary_carry_threshold(self) -> None:
+        """0xFFFFFFFE + 1 does not carry (SCC=0), but 0xFFFFFFFF + 1 carries (SCC=1)."""
+        state = ScalarRegisterState()
+        state.set_sgpr(0, 0xFFFFFFFE)
+        state.set_sgpr(1, 1)
+        ast1 = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        res1, scc1 = state.step(ast1)
+        self.assertEqual(res1, 0xFFFFFFFF)
+        self.assertEqual(scc1, 0)
+
+        state.set_sgpr(0, 0xFFFFFFFF)
+        ast2 = InstructionAST("s_add_u32", Operand(RegKind.SGPR, 2), Operand(RegKind.SGPR, 0), Operand(RegKind.SGPR, 1))
+        res2, scc2 = state.step(ast2)
+        self.assertEqual(res2, 0)
+        self.assertEqual(scc2, 1)
+
 if __name__ == "__main__":
     unittest.main()
