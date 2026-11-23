@@ -38,6 +38,12 @@ struct Vertex {
     std::uint8_t r, g, b, a;
 };
 
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+struct alignas(void*) StreamSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Inner inner;
+};
+
 D3D12_RESOURCE_DESC tex2d_desc(UINT w, UINT h, DXGI_FORMAT fmt, D3D12_RESOURCE_FLAGS flags) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -245,6 +251,20 @@ int main() {
     EXPECT(SUCCEEDED(reloaded->LoadGraphicsPipeline(L"gfx", &gfx_desc, IID_PPV_ARGS(&restored_gfx.p))) &&
            restored_gfx.p);
 
+    Ref<ID3D12PipelineLibrary1> reloaded1;
+    EXPECT(SUCCEEDED(reloaded->QueryInterface(IID_PPV_ARGS(&reloaded1.p))) && reloaded1.p);
+    struct ComputeStream {
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
+        StreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE> cs;
+    } compute_stream{};
+    compute_stream.root.inner = cs_rs.p;
+    compute_stream.cs.inner = cs_desc.CS;
+    D3D12_PIPELINE_STATE_STREAM_DESC compute_stream_desc{sizeof(compute_stream), &compute_stream};
+    Ref<ID3D12PipelineState> restored_stream;
+    EXPECT(SUCCEEDED(reloaded1->LoadPipeline(L"cs", &compute_stream_desc, IID_PPV_ARGS(&restored_stream.p))) &&
+           restored_stream.p);
+    EXPECT(reloaded1->LoadPipeline(L"gfx", &compute_stream_desc, IID_PPV_ARGS(&nope.p)) == E_INVALIDARG && !nope.p);
+
     // A restored library serializes to the same bytes.
     {
         std::vector<std::uint8_t> again(reloaded->GetSerializedSize());
@@ -270,13 +290,33 @@ int main() {
         EXPECT(device->CreatePipelineLibrary(huge_count.data(), huge_count.size(), IID_PPV_ARGS(&bad.p)) ==
                    E_INVALIDARG &&
                !bad.p);
+        const std::size_t flags_at = 16 + 4 + 4 * 2;
+        const std::size_t cached_at = flags_at + 1 + 4;
+        auto invalid_flags = blob;
+        invalid_flags[flags_at] = 3;
+        EXPECT(device->CreatePipelineLibrary(invalid_flags.data(), invalid_flags.size(), IID_PPV_ARGS(&bad.p)) ==
+                   E_INVALIDARG && !bad.p);
+        auto invalid_length = blob;
+        const std::uint32_t short_length = static_cast<std::uint32_t>(leonida::cached_pso::blob_bytes - 1);
+        std::memcpy(invalid_length.data() + flags_at + 1, &short_length, sizeof(short_length));
+        // Remove the unused byte so that, without the length guard, the remaining entry still parses.
+        invalid_length.erase(invalid_length.begin() + cached_at + short_length);
+        EXPECT(device->CreatePipelineLibrary(invalid_length.data(), invalid_length.size(), IID_PPV_ARGS(&bad.p)) ==
+                   E_INVALIDARG && !bad.p);
+        auto duplicate_name = blob;
+        const std::size_t second_at = cached_at + leonida::cached_pso::blob_bytes;
+        const std::uint32_t name_length = 2;
+        std::memcpy(duplicate_name.data() + second_at, &name_length, sizeof(name_length));
+        std::memcpy(duplicate_name.data() + second_at + 4, blob.data() + 20, 8);
+        duplicate_name.erase(duplicate_name.begin() + second_at + 12, duplicate_name.begin() + second_at + 16);
+        EXPECT(device->CreatePipelineLibrary(duplicate_name.data(), duplicate_name.size(), IID_PPV_ARGS(&bad.p)) ==
+                   E_INVALIDARG && !bad.p);
         auto flipped = blob;
         flipped.back() ^= 0x5A;  // inside the last cached blob's checksum
         EXPECT(device->CreatePipelineLibrary(flipped.data(), flipped.size(), IID_PPV_ARGS(&bad.p)) == E_INVALIDARG &&
                !bad.p);
         // A cached blob from another adapter (its vendor id, with the checksum made again) is refused as one.
         auto other_adapter = blob;
-        const std::size_t cached_at = 16 + 4 + 4 * 2 + 1 + 4;  // the first entry's cached blob
         other_adapter[cached_at + 8] ^= 0xFF;
         const std::uint32_t sum = leonida::cached_pso::fnv1a(other_adapter.data() + cached_at,
                                                             leonida::cached_pso::blob_bytes - 4);
@@ -284,6 +324,14 @@ int main() {
         EXPECT(device->CreatePipelineLibrary(other_adapter.data(), other_adapter.size(), IID_PPV_ARGS(&bad.p)) ==
                    D3D12_ERROR_ADAPTER_NOT_FOUND &&
                !bad.p);
+        auto other_driver = blob;
+        other_driver[cached_at + 16] ^= 0xFF;
+        const std::uint32_t driver_sum = leonida::cached_pso::fnv1a(other_driver.data() + cached_at,
+                                                                   leonida::cached_pso::blob_bytes - 4);
+        std::memcpy(other_driver.data() + cached_at + leonida::cached_pso::blob_bytes - 4, &driver_sum,
+                    sizeof(driver_sum));
+        EXPECT(device->CreatePipelineLibrary(other_driver.data(), other_driver.size(), IID_PPV_ARGS(&bad.p)) ==
+                   D3D12_ERROR_DRIVER_VERSION_MISMATCH && !bad.p);
     }
 
     // 4. Execute the loaded compute PSO and loaded graphics PSO on the GPU.
