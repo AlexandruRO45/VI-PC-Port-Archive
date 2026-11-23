@@ -78,6 +78,21 @@ class MergeCheckTest(unittest.TestCase):
         title = subject or f"{branch}: add the effect record section"
         self.git("commit", "-q", "-m", f"{title} (#{number})")
 
+    def add_commits_to_main(self, count):
+        """`count` first-parent commits on main from one `git fast-import` (a `git commit` each would take minutes)."""
+        parts = []
+        for i in range(count):
+            message = f"other work {i}\n"
+            content = f"Unrelated work on main, step {i}, that never touches the notes file.\n"
+            parts.append(f"commit refs/heads/main\ncommitter Test <test@example.invalid> 1700000000 +0000\n"
+                         f"data {len(message)}\n{message}")
+            if i == 0:
+                parts.append(f"from {self.git('rev-parse', 'main')}\n")
+            parts.append(f"M 100644 inline docs/other.md\ndata {len(content)}\n{content}\n")
+        r = subprocess.run(["git", "-C", self.repo, "fast-import", "--quiet"],
+                           input="".join(parts).encode("utf-8"), capture_output=True)
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+
     def run_check(self, *pairs):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -302,6 +317,30 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(r["verdict"], "clean")
         self.assertEqual(len(r["merges"]), 1)
         self.assertEqual(r["commits"], {"total": 3, "on_main": 0})
+
+    def test_a_merge_older_than_the_old_5000_commit_window_is_found(self):
+        # main outgrows any fixed window. --depth used to default to 5000 first-parent commits, so a PR merged
+        # further back than that was not found, and a rebased copy of it read `clean` instead of `already-merged`.
+        base = self.git("rev-parse", "main")
+        self.pr_branch("early", base, "\n" + PARAGRAPH)
+        self.squash_merge(31, "early")
+        self.git("checkout", "-q", "-b", "early_copy", base)
+        self.append("docs/notes.md", "\n" + PARAGRAPH)
+        self.commit("early: add the effect record section (rebased)")
+        self.git("checkout", "-q", "main")
+        self.add_commits_to_main(5000)
+        code, [r] = self.run_check("31=early_copy")
+        self.assertEqual(code, 1)
+        self.assertEqual(r["verdict"], "already-merged")
+        self.assertEqual(len(r["merges"]), 1)
+        # A window that ends before the merge still misses it: --depth is the cap it says it is.
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = mc.main(["--repo", self.repo, "--main", "main", "--json", "--depth", "5000", "31=early_copy"])
+        [capped] = json.loads(out.getvalue())
+        self.assertEqual(capped["merges"], [])
+        self.assertEqual(capped["verdict"], "clean")
+        self.assertEqual(code, 0)
 
     def test_a_revert_commit_is_not_counted_as_a_prior_merge(self):
         self.write("docs/other.md", "unrelated\n")

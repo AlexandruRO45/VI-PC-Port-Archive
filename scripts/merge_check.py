@@ -1,13 +1,15 @@
 """Before a merge round: is a pull request already on main, and would merging it again duplicate text?
 
-    python -I scripts/merge_check.py [--main REF] [--json] [--min-length N] PR=REF [PR=REF ...]
+    python -I scripts/merge_check.py [--main REF] [--json] [--min-length N] [--depth N] PR=REF [PR=REF ...]
 
 PR is the pull request number and REF its head (a branch, a fetched `refs/pull/PR/head`, a commit). For each one,
 against `--main` (default `origin/main`), using one history scan for the whole batch:
 
 - `merges`: first-parent commits on main whose subject is "Merge pull request #PR" or ends with " (#PR)" (squash
   merges; "Revert ..." subjects are ignored), newest first. A number that is already there is the case the repeated
-  merges come from: a rebased copy merged again keeps both copies of what it added.
+  merges come from: a rebased copy merged again keeps both copies of what it added. The whole first-parent history
+  is searched, in one `git log` pass; `--depth N` limits it to the newest N commits, and a merge older than that
+  is then not found.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
   characters once stripped) that already stand in the same order in the same file on main. This is what a second
@@ -62,7 +64,10 @@ def _merged_pr_number(subject):
 
 
 def prior_merges(repo, main, numbers, depth):
-    out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
+    # The whole history unless --depth caps it: main outgrows any fixed window, and a merge that falls out of it
+    # leaves a rebased copy of its PR reading `clean`, the doubled-text case this script is for.
+    limit = [] if depth is None else [f"-n{depth}"]
+    out = git(repo, "log", main, "--first-parent", *limit, "--format=%H%x09%s").stdout
     hits = {number: [] for number in numbers}
     for line in out.splitlines():
         sha, _, subject = line.partition("\t")
@@ -179,7 +184,8 @@ def main(argv=None):
     ap.add_argument("--main", default="origin/main", help="the branch the round merges into (default origin/main)")
     ap.add_argument("--repo", default=".", help="repository folder (default: the current one)")
     ap.add_argument("--min-length", type=int, default=40, help="shortest stripped line counted as a duplicate (40)")
-    ap.add_argument("--depth", type=int, default=5000, help="first-parent commits searched for earlier merges (5000)")
+    ap.add_argument("--depth", type=int, default=None,
+                    help="first-parent commits searched for earlier merges (default: the whole history)")
     ap.add_argument("--json", action="store_true", help="one JSON report instead of text")
     args = ap.parse_args(argv)
     try:
