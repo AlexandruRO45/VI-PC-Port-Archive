@@ -128,9 +128,12 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   name. The shim maps a console path with the `CreateFile` rules, deriving the access and disposition from the mode
   or the `_O_` flags as the CRT does (`a` and `r+` copy a package file up, `w` creates in the overlay), and calls
   ucrtbase's wide function with the host path, so the `FILE*` or descriptor belongs to the CRT the caller reads it
-  with. A refused path fails with `EINVAL` and a missing one with `ENOENT` in that CRT's `errno`. Host paths go to
-  ucrtbase unchanged. Not covered: the host's `msvcp140.dll` (every `std::fstream`), which `gta6rt` loads itself
-  and binds to the host CRT, and the CRT's other path calls (`remove`, `rename`, `_stat`, `_access`, `_mkdir`).
+  with. The UCRT's other path-taking calls follow the same view (RT-359): `remove`/`_wremove`, `rename`/`_wrename`,
+  `_access`/`_waccess`, `_mkdir`/`_wmkdir`, `_rmdir`/`_wrmdir` and the `_stat*`/`_wstat*` layouts. Mutations go through
+  the Win32 shims above so package files remain untouched; queries call the corresponding wide UCRT function on the
+  selected package or overlay path. A refused path fails with `EINVAL` and a missing one with `ENOENT` in that CRT's
+  `errno`. Host paths go to ucrtbase unchanged. Not covered: the host's `msvcp140.dll` (every `std::fstream`), which
+  `gta6rt` loads itself and binds to the host CRT.
 
 `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
 

@@ -840,6 +840,85 @@ int main() {
         check(f && read_stream(f) == "package", "a host path goes to the CRT unchanged");
     }
 
+    // The UCRT's remaining path calls (RT-359): queries see the merged view and mutations use the overlay.
+    {
+        write_path(package / "crt_paths" / "narrow.txt", "narrow");
+        write_path(package / "crt_paths" / "wide.txt", "wide");
+        using PathFn = int(__cdecl*)(const char*);
+        using WPathFn = int(__cdecl*)(const wchar_t*);
+        using RenameFn = int(__cdecl*)(const char*, const char*);
+        using WRenameFn = int(__cdecl*)(const wchar_t*, const wchar_t*);
+        using AccessFn = int(__cdecl*)(const char*, int);
+        using WAccessFn = int(__cdecl*)(const wchar_t*, int);
+        using Stat64Fn = int(__cdecl*)(const char*, struct _stat64*);
+        using WStat64Fn = int(__cdecl*)(const wchar_t*, struct _stat64*);
+
+        const char* filesystem = "api-ms-win-crt-filesystem-l1-1-0.dll";
+        const auto crt_remove = resolve<PathFn>("api-ms-win-crt-stdio-l1-1-0.dll", "remove");
+        const auto crt_wremove = resolve<WPathFn>("ucrtbase.dll", "_wremove");
+        const auto crt_rename = resolve<RenameFn>("ucrtbase.dll", "rename");
+        const auto crt_wrename = resolve<WRenameFn>("api-ms-win-crt-stdio-l1-1-0.dll", "_wrename");
+        const auto crt_access = resolve<AccessFn>(filesystem, "_access");
+        const auto crt_waccess = resolve<WAccessFn>(filesystem, "_waccess");
+        const auto crt_mkdir = resolve<PathFn>(filesystem, "_mkdir");
+        const auto crt_wmkdir = resolve<WPathFn>(filesystem, "_wmkdir");
+        const auto crt_rmdir = resolve<PathFn>(filesystem, "_rmdir");
+        const auto crt_wrmdir = resolve<WPathFn>(filesystem, "_wrmdir");
+        const auto crt_stat64 = resolve<Stat64Fn>(filesystem, "_stat64");
+        const auto crt_wstat64 = resolve<WStat64Fn>(filesystem, "_wstat64");
+        check(crt_remove && crt_wremove && crt_rename && crt_wrename && crt_access && crt_waccess && crt_mkdir &&
+                  crt_wmkdir && crt_rmdir && crt_wrmdir && crt_stat64 && crt_wstat64 &&
+                  resolve<void*>(filesystem, "_stat32") && resolve<void*>(filesystem, "_wstat32i64") &&
+                  resolve<void*>(filesystem, "_stat64i32"),
+              "the UCRT path calls and stat layouts resolve through its api sets and ucrtbase");
+
+        struct _stat64 info {};
+        check(crt_stat64("GAME:\\crt_paths\\narrow.txt", &info) == 0 && info.st_size == 6,
+              "_stat64 sees a package file through GAME:");
+        check(crt_wstat64(L"GAME:\\crt_paths\\wide.txt", &info) == 0 && info.st_size == 4,
+              "_wstat64 sees a package file through GAME:");
+        check(crt_access("GAME:\\crt_paths\\narrow.txt", 4) == 0 &&
+                  crt_waccess(L"GAME:\\crt_paths\\wide.txt", 4) == 0,
+              "_access and _waccess query the merged view");
+
+        check(crt_rename("GAME:\\crt_paths\\narrow.txt", "GAME:\\crt_paths\\renamed.txt") == 0,
+              "rename moves a package file through the overlay");
+        check(read_path(overlay / "crt_paths" / "renamed.txt") == "narrow" &&
+                  read_path(package / "crt_paths" / "narrow.txt") == "narrow" &&
+                  crt_access("GAME:\\crt_paths\\narrow.txt", 0) == -1,
+              "rename leaves the package untouched and hides the old name");
+        check(crt_wrename(L"GAME:\\crt_paths\\wide.txt", L"GAME:\\crt_paths\\wide-renamed.txt") == 0 &&
+                  read_path(overlay / "crt_paths" / "wide-renamed.txt") == "wide",
+              "_wrename follows the same overlay rule");
+
+        check(crt_remove("GAME:\\crt_paths\\renamed.txt") == 0 &&
+                  !std::filesystem::exists(overlay / "crt_paths" / "renamed.txt"),
+              "remove deletes the overlay file");
+        check(crt_wremove(L"GAME:\\crt_paths\\wide-renamed.txt") == 0 &&
+                  !std::filesystem::exists(overlay / "crt_paths" / "wide-renamed.txt"),
+              "_wremove deletes the wide-path overlay file");
+
+        check(crt_mkdir("GAME:\\crt_paths\\made") == 0 &&
+                  std::filesystem::is_directory(overlay / "crt_paths" / "made"),
+              "_mkdir creates a folder in the overlay");
+        check(crt_rmdir("GAME:\\crt_paths\\made") == 0 &&
+                  !std::filesystem::exists(overlay / "crt_paths" / "made"),
+              "_rmdir removes an overlay folder");
+        check(crt_wmkdir(L"T:\\wide-dir") == 0 &&
+                  std::filesystem::is_directory(overlay / ".gta6rt-temp" / "wide-dir"),
+              "_wmkdir maps the scratch drive");
+        check(crt_wrmdir(L"T:\\wide-dir") == 0, "_wrmdir removes the scratch folder");
+
+        *reinterpret_cast<int*(__cdecl*)()>(::GetProcAddress(::LoadLibraryW(L"ucrtbase.dll"), "_errno"))() = 0;
+        check(crt_stat64("GAME:\\..\\outside.txt", &info) == -1 &&
+                  !std::filesystem::exists(root / "outside.txt"),
+              "CRT queries refuse paths above GAME:");
+
+        const std::string host_path = (package / "crt_paths" / "wide.txt").string();
+        check(crt_stat64(host_path.c_str(), &info) == 0 && info.st_size == 4,
+              "a host path passed to _stat64 stays unchanged");
+    }
+
     std::filesystem::remove_all(root);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
