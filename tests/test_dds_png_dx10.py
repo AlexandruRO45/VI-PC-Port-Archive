@@ -44,12 +44,12 @@ class Dx10AlphaTests(unittest.TestCase):
                 self.assertEqual(row, bytes((0, 255, 0, 0, alpha)))
 
 
-def _dx10(width, height, dxgi, payload, pitch=0):
+def _dx10(width, height, dxgi, payload, pitch=0, alpha_mode=0):
     header = bytearray(148)
     header[:4] = b"DDS "
     struct.pack_into("<IIIII", header, 4, 124, 0x100F | (8 if pitch else 0), height, width, pitch)
     struct.pack_into("<II4s", header, 76, 32, 4, b"DX10")
-    struct.pack_into("<IIII", header, 128, dxgi, 3, 0, 1)
+    struct.pack_into("<IIIII", header, 128, dxgi, 3, 0, 1, alpha_mode)
     return bytes(header) + payload
 
 
@@ -64,6 +64,17 @@ class SingleChannelTests(unittest.TestCase):
         _, _, rgba = dds.decode_dds(_dx10(3, 2, 65, payload, pitch=4))
         self.assertEqual(rgba[3::4], bytes([1, 2, 3, 4, 5, 6]))
         self.assertEqual(set(rgba[0::4]) | set(rgba[1::4]) | set(rgba[2::4]), {0})
+
+    def test_a8_unorm_alpha_mode(self):
+        # No retail A8 texture carries an alpha mode, so this is synthetic only. Unknown (0), straight (1) and
+        # premultiplied (2) keep the mask; an "opaque" header (3) means the alpha channel is not to be used, as for
+        # any other format, so the preview is fully opaque.
+        payload = bytes([0, 1, 127, 128, 254, 255])
+        for mode, want in ((0, payload), (1, payload), (2, payload), (3, bytes([255] * 6))):
+            with self.subTest(alpha_mode=mode):
+                _, _, rgba = dds.decode_dds(_dx10(3, 2, 65, payload, alpha_mode=mode))
+                self.assertEqual(rgba[3::4], want)
+                self.assertEqual(set(rgba[0::4]) | set(rgba[1::4]) | set(rgba[2::4]), {0})
 
     def test_truncated_rejected(self):
         for dxgi, n in ((56, 7), (65, 3)):
