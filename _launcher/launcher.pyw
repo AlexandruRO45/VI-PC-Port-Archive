@@ -765,9 +765,8 @@ class App(tk.Tk):
                 else:
                     self.q.put(("tstate", key, "installing",
                                 "The installer is open. Follow its steps and allow the Windows prompt."))
-                    toolbox.verify_signature(path, t.get("signer"))
                     args = t["get"][2] if len(t["get"]) > 2 else ()
-                    code = toolbox.run_installer(path, args)
+                    code = toolbox.run_verified_installer(path, t.get("signer"), args)
                     if code not in (0, 3010, 1641):
                         raise RuntimeError(f"The installer closed with code {code} (cancelled or failed)")
                     self.q.put(("tinstalled", key, code))

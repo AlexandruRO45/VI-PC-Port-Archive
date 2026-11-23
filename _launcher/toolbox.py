@@ -31,6 +31,7 @@ TOOLS = [
      "signer": "O=Microsoft Corporation"},
     {"key": "vulkan", "label": "Vulkan SDK", "required": True, "why": "spirv-as / spirv-val, pipeline checker",
      "get": ("installer", "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"),
+     "signer": "O=LunarG, Inc.",
      "locate": ("dir", "the Vulkan SDK folder (the one with Bin\\spirv-val.exe)")},
     {"key": "git", "label": "Git", "required": True, "why": "Updates and the rpf9-explorer submodule",
      "get": ("installer", "github:git-for-windows/git:Git-*-64-bit.exe"), "locate": ("file", "git.exe"),
@@ -261,6 +262,27 @@ def verify_signature(path, signer=None):
                                "so it wasn't run")
 
 
+def run_verified_installer(path, signer, args=()):
+    """Check the installer's signature and run it while holding the file open with no write or delete sharing,
+    so no other program can swap it between the check and the launch (Windows can still read and run it).
+    Every installer must name its expected publisher. Returns the exit code."""
+    if not signer:
+        raise RuntimeError("This installer has no expected publisher set, so it wasn't run")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = ctypes.c_void_p
+    k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+                                ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    h = k32.CreateFileW(path, 0x80000000, 0x1, None, 3, 0x80, None)  # GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
+    if h is None or h == ctypes.c_void_p(-1).value:
+        raise RuntimeError(f"Couldn't lock the installer before checking it (Windows error {ctypes.get_last_error()})")
+    try:
+        verify_signature(path, signer)
+        return run_installer(path, args)
+    finally:
+        k32.CloseHandle(h)
+
+
 def run_installer(path, args=()):
     """Start an installer the way Explorer would (so Windows shows its admin prompt) and wait for it.
     Returns the exit code; raises with a reason when it can't start."""
@@ -307,7 +329,12 @@ def unzip_tool(zpath, exe_name):
     base = os.path.join(PORTABLE, os.path.splitext(os.path.basename(zpath))[0])
     if os.path.isdir(base):
         shutil.rmtree(base, ignore_errors=True)
+    root_dir = os.path.realpath(base)
     with zipfile.ZipFile(zpath) as z:
+        for name in z.namelist():  # refuse any entry that would land outside the tool folder ("zip slip")
+            dest = os.path.realpath(os.path.join(root_dir, name))
+            if os.path.commonpath([root_dir, dest]) != root_dir:
+                raise RuntimeError(f"The archive has an unsafe path ({name}), so it wasn't unpacked")
         z.extractall(base)
     for root, _, files in os.walk(base):
         if exe_name in files:
