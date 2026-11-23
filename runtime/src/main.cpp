@@ -29,6 +29,7 @@
 
 #include "base_reservation.h"
 #include "code_hooks.h"
+#include "cpu_emulation.h"
 #include "mods.h"
 #include "pe_loader.h"
 #include "../shims/d3d12_trace.h"
@@ -47,6 +48,16 @@ const char* binding_name(rt::Binding b) {
         default: return "UNIMPLEMENTED";
     }
 }
+
+// Module TLS index 0 for the game's executable (rt::reserve_tls_index0), from the CRT's initializer table: .CRT$XCT
+// runs after the C runtime is set up and before every C++ dynamic initializer of gta6rt (.CRT$XCU), so before any of
+// gta6rt's code can have started a thread. The frames above it (wmainCRTStartup, __scrt_common_main_seh, _initterm)
+// hold no TLS slot address. The result is read again where an image is run.
+void __cdecl reserve_tls_index0_at_start() { rt::reserve_tls_index0(); }
+#pragma section(".CRT$XCT", read)
+extern "C" __declspec(allocate(".CRT$XCT")) void(__cdecl* const gta6rt_reserve_tls_index0)() =
+    reserve_tls_index0_at_start;
+#pragma comment(linker, "/INCLUDE:gta6rt_reserve_tls_index0")
 
 int usage() {
     std::fprintf(stderr,
@@ -152,10 +163,33 @@ int wmain(int argc, wchar_t** argv) {
                                                    : "error: cannot create the trace file\n");
         return 2;
     }
+    // The console's Zen 2 instructions this CPU may lack (docs/cpu_features.md): emulated on #UD. Installed after the
+    // trace's handler so it runs first, and an emulated instruction is not recorded as an exception.
+    if (const auto host = rt::cpu_emulation::detect_host(); !host.sse4a || !host.clzero || !host.monitorx || !host.clwb)
+        std::fprintf(stderr, "[rt] cpu: this CPU lacks%s%s%s%s; the game's uses are emulated (docs/cpu_features.md)\n",
+                     host.sse4a ? "" : " SSE4a", host.clzero ? "" : " CLZERO", host.monitorx ? "" : " MONITORX",
+                     host.clwb ? "" : " CLWB");
+    if (!rt::cpu_emulation::install())
+        std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler failed (error %lu); instructions this CPU lacks "
+                             "will stop the game\n", GetLastError());
 
     try {
         rt::Loader loader(game_dir);
         rt::Module& main_module = loader.load(image);  // maps, binds and installs TLS; runs no image code
+        // An executable with TLS that did not get index 0: its /GA code would read and write the TLS in slot 0, which
+        // is gta6rt's own (or another executable's), so no code of it may run.
+        const auto* main_nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            main_module.base + reinterpret_cast<const IMAGE_DOS_HEADER*>(main_module.base)->e_lfanew);
+        const bool main_is_exe = (main_nt->FileHeader.Characteristics & IMAGE_FILE_DLL) == 0;
+        if ((init || run) && main_is_exe && main_module.tls_slot != rt::kNoTlsIndex && main_module.tls_index != 0) {
+            std::string why;
+            if (rt::reserve_tls_index0(&why)) why = "another mapped executable holds it";
+            std::fprintf(stderr,
+                         "error: %s cannot have module TLS index 0 (%s); code built with /GA would read and write "
+                         "another module's TLS through slot 0, so it is not run\n",
+                         main_module.name.c_str(), why.c_str());
+            return 1;
+        }
         // The mods' archetype swaps (docs/modding.md): hooked here, before any image code runs, when the lookup's RVA
         // for this executable is given. The count of redirected calls shows whether the RVA is the real lookup.
         if (view_mode_getter_rva) {

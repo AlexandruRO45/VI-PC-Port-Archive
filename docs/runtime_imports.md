@@ -90,6 +90,27 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
 
+Seven more `xmem.dll` imports follow argument shapes measured locally at a title's call sites (the comments in
+`runtime/shims/xmem.cpp` give each shape):
+
+- `XMemAllocDefault` and `XMemFreeDefault` take `XMemAlloc`'s and `XMemFree`'s arguments and share their heap.
+- `XMemAllocatePhysicalPages(attributes, UINT64* count, UINT64* pages)` returns a `BOOL` and the count it allocated.
+  Each call is one pagefile-backed section of `count` 64 KiB pages. A page number is a 4 KiB frame number: a
+  non-zero multiple of 16 below 2^25, which is what the measured title assumes when it packs them. `0` means "unmap".
+- `XMemMapPhysicalPages(address, UINT64 count, pages)` returns the address. A null page array unmaps.
+  `XMemMapPhysicalPagesScatter(addresses, UINT32 count, pages)` returns a `BOOL`, and a `0` entry unmaps.
+  `XMemFreePhysicalPages(UINT64 count, pages)` returns a `BOOL`. Every page is its own view, mapped with
+  `MapViewOfFile3` into a 64 KiB placeholder, so a page keeps its contents across remaps and can be mapped twice.
+- The windows are reserve-only 64 KiB-page `XMemVirtualAlloc` regions. The shim reserves them as placeholders and
+  keeps their protection, which mapped pages get (AWE's rule). The measured title also reserves a placeholder with
+  `MEM_RESERVE_PLACEHOLDER` and carves windows out of it with `MEM_REPLACE_PLACEHOLDER`, and the shim passes both
+  through. **ASSUMPTION:** nothing commits into a window with `kernel32!VirtualAlloc`, which a placeholder refuses.
+- `XMemVirtualAlloc` used to refuse 2 MiB pages, and five of the 23 measured calls commit them. They are now
+  committed 2 MiB-aligned through `VirtualAlloc2`. The attribute word is recorded (`xmem_attributes`) and the
+  console's `PAGE_GRAPHICS_*` bits are dropped from the protection, as before.
+- `XMemIsToolsMemAvailable()` is `FALSE`: a PC has no development-kit tools memory. The measured title asks only
+  on an out-of-memory path, after an allocation has already failed.
+
 ## The retail executable (RT-5)
 
 `game_scarlett_master.exe` (120,181,760 bytes on disk, SHA-256
@@ -130,6 +151,8 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
+
+The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
@@ -242,20 +265,25 @@ measurement in `d3d12_vulkan.md`, because its page could not be found.
 Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
 GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
 `xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
-`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
-thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
+`QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport` (one block of strings in each DLL), next to a statically
+linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s thunks `LoadLibraryW` the runtime and `GetProcAddress` those
+six names at run time. A runtime without `XErrorReport` is refused before any initializer is called: with only the
+five entry points served, the package's own libHttpClient `HCInitialize` returned `0x89240101`
+(`E_GAMERUNTIME_DLL_NOT_FOUND`) and XCurl's `curl_global_init` returned `CURLE_FAILED_INIT`, both called through
+`gta6rt --run` by a stand-in program that loads the two DLLs from the package. xodus-gaming/xgameruntime-docs
 (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
 `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
 mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
 
 Bound to the host, those calls would load the PC's Gaming Services runtime, or fail, and never reach the offline
 shims. `runtime/shims/library_loader.cpp` therefore answers `LoadLibrary*` and `GetModuleHandle*` for a module the
-shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`) with a
+shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `xmem.dll`, `gameinput.dll`, and the DirectStorage
+modules `dstorage_xs.dll`, `xcrdapi.dll` and `dstorage.dll`, [directstorage.md](directstorage.md)) with a
 pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
-`runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+`runtime/shims/xgameruntime.cpp` serves the five entry points and XErrorReport. Reports reach the callback registered with XErrorSetCallback.
+The initializers succeed offline and log the GDK version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
 `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
 (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
 `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and `XLauncherImpl` from xgameruntime-docs' layout (below); for any other class it logs
@@ -269,7 +297,8 @@ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` s
 pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
 host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
 case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
-one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time. `curl_global_init` also
+asks that module for `InitializeApiImpl`, which is not served; the call succeeds without it.
 
 ### Class layouts, measured
 

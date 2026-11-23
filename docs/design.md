@@ -73,6 +73,9 @@ This writes `reports/exe/` (JSON plus a readable summary). Check it in this orde
    `VERIFY` note of the runtime and the docs, with file and line. Notes in a shim whose class the exe calls are
    marked **called** and come first: those are the ones its first boot reaches, such as the `XStoreGameLicense`
    sizes.
+7. **CPU instructions.** `python -I tools/cpu_feature_scan.py <exe>` lists the instructions a desktop CPU may lack
+   (AMD-only, newer-Intel-only, privileged), with counts split by `.pdata` range. The retail executable has a few
+   AMD-only and CLWB sites that raise `#UD` on Intel hosts ([cpu_features.md](cpu_features.md)).
 
 Then `runtime\build\gta6rt.exe --dry-run <exe>` maps the image and binds every import to the shim table without
 running any game code. It reports what it couldn't bind.
@@ -181,7 +184,9 @@ Full-scan indexes are also saved to `%LOCALAPPDATA%\RpfPreview\Indexes`, so the 
   `CreateCommittedResource` with the Xbox `0x101`/`0x1` layout word replaced by the PC layout. Slots 9/10 are
   `ID3D12DescriptorHeap` methods, not device methods. The PC heap getters take a hidden return pointer (RDX),
   while Xbox expects the 8-byte handle in RAX, so slot 14 wraps the heap and slots 9/10 convert it. The heap holds
-  a reference to the device proxy and its `GetDevice` returns that same proxy. Queues, fences, command lists and
+  a reference to the device proxy and its `GetDevice` returns that same proxy. The retail executable calls the
+  struct-returning device methods with the C ABI, return buffer first: `GetCustomHeapProperties` (slot 26) is
+  measured as `rcx` = buffer, `rdx` = device. Slots 25 and 26 take that form, and still take the PC one. Queues, fences, command lists and
   `PresentX` extensions remain unimplemented.
 - PSO metadata is a new variant (`PSIN`, `LSCH` schema, `LENM`, `LSNS`, `LGID`, `LRSC`, `CHKS`, little-endian).
   CodeWalker's parser reads the container but not the new schema; dump it once the exe gives the field names.

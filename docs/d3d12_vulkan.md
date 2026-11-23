@@ -2084,7 +2084,7 @@ The trace will enumerate them.
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
-| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
+| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 48 is called as `(desc, riid, out)` with `IID_ID3D12CommandQueue` (PC slot 48 is `OpenExistingHeapFromAddress`; the 32-byte desc is a PC `D3D12_COMMAND_QUEUE_DESC` plus four Xbox words, logged once, and the proxy takes the slot 8 path with the PC prefix and only `DISABLE_GPU_TIMEOUT` kept), slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
 | `ID3D12CommandQueue` | one leased `VkQueue` per live queue: direct queues on the graphics family, compute queues on an async-compute family and copy queues on a transfer-only (DMA) family when the GPU has them (`src/queue_families.h`), else graphics-family leases | Distinct Vulkan queues allow cross-queue waits and signals to make progress. With more than one family in use, buffers, images, the arena and staging are created `VK_SHARING_MODE_CONCURRENT` over those families, so no ownership transfers are needed. Barriers on copy and compute queues are narrowed to the stages their family has; render-target and depth clears are refused there (as in D3D12), and the D24/RGB96 copy conversions and bindless flushes stay off a transfer-only queue. Tested by `vk_queue_test`. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). `Draw` views are inlined and moved into the command stream (D3D-289), eliminating per-draw heap allocations. |
@@ -2209,6 +2209,23 @@ The trace will enumerate them.
   Intel Raptor Lake-S (101.7092) and RTX 5060 Laptop (621.24) hosts wrap, two 2^63 buffers to 0, and WARP on that
   PC still saturates. A wrapped total could make a caller allocate less than one of its resources, so the layer
   keeps saturating, and the test accepts a host that wraps.
+  Behind the Xbox-ABI proxy (device slots 25 and 56) a 2D render target of a listed colour format with one sample is
+  padded to whole console tiles: the size is the sum over its mips (MipLevels 0 is the full chain, an odd extent
+  rounds up), each mip rounded up to the RDNA2 SW_64KB_D tile shape (`runtime/src/gfx10_tiling.h`: 256 x 128 pixels
+  for 2-byte elements, 128 x 128 for 4-byte, 128 x 64 for 8-byte, 64 x 64 for 16-byte), with the first mip that fits
+  in half a tile's width and a whole tile's height, and the mips after it, sharing one tail tile, times the array
+  size. A 1920 x 1080 RGBA8 target is 135 tiles, 8,847,360 bytes, where the PC answer is 8,323,072. The proxy lays
+  the descriptions out as the PC device does (each at its own alignment, the total rounded up to the largest
+  alignment, sums saturating) with each render target at the larger of its console size and its PC size; a 4 MiB
+  aligned multisampled neighbour therefore keeps its place (a 1 x 1 four-sample target and a 1080p target need 16 MiB,
+  not 12.5). Slot 56 reports the same offsets. The PC layout stands when no description grows
+  (`d3d12_xs_alloc_size.h`; `xs_proxy_mock_test`). **Assumption**: the
+  retail title's own sizes are not measured (#6982, stop 17), so that its allocation is these shapes and no DCC or
+  CMask memory is open until they are.
+  The descriptions the title passes to slot 25 carry console values (layout word `0x101`/`0x1`, flag bits above the PC
+  ones). For console-form calls or descriptors explicitly using layout `0x101`, the proxy strips Xbox-only flags and
+  translates layout `0x101` to ROW_MAJOR for buffers or UNKNOWN for textures. Other PC-form descriptors reach the host
+  unchanged for validation (`d3d12_xs_desc_clean.h`; #6982 section 3.7).
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
   adapter's LUID; `d3d12_fence_timing_test` finds it with `IDXGIFactory4::EnumAdapterByLuid` (RTX 4090, driver
   621.14). A driver that reports `deviceLUIDValid = VK_FALSE` gets a zero LUID, logged.
@@ -2217,6 +2234,13 @@ The trace will enumerate them.
   `WRITE_COMBINE`/`L0`, `READBACK` `WRITE_BACK`/`L0`, `GPU_UPLOAD` `WRITE_COMBINE`/`L1`, all with type `CUSTOM` and
   node masks 1. `CUSTOM`, unknown types and node masks above 1 get an all-zero answer, logged. The test compares
   `DEFAULT`, `UPLOAD` and `READBACK` byte for byte with the host runtime's answer (RTX 4090: identical).
+  The retail executable calls it (device slot 26) with the buffer for the returned struct in RCX and the device in
+  RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
+  and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
+  in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slot 43 returns a struct too and the
+  proxy still forwards it in the PC form: no call of slot 43 has been seen. Slots 25 and 56 take the same form by the
+  same rule (reported later in the boot, #6982; not measured), as #6973 first did for slot 25.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.
@@ -3433,6 +3457,8 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
 | Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
+| Indirect argument type 105 | The retail title's startup creates five one-argument command signatures (device slot 41) with no root signature; one has type 105 and a 12-byte stride. Its two `ExecuteIndirect` sites, read statically, set the compute state first, as the `DISPATCH` sites do, and pass one command from the same argument buffer, on a second command list | `d3d12_xs_device.cpp` creates it as `DISPATCH` (`D3D12_DISPATCH_ARGUMENTS`). What the console does differently for it is **Open**. |
+| Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix; the PC slot 61 is `CreateMetaCommand`. The layout of the description beyond the PC fields is **Open**. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
@@ -4125,8 +4151,9 @@ on a PC device behind the Xbox-ABI proxy). Measured:
 
 - `amd_fidelityfx_loader_xbox.dll`, `Bink2Scarlett.dll`, `libHttpClient.GDK.dll`, `XCurl.dll`: no `d3d12_xs`
   imports.
-- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. No
-  claim in this document depends on the executable's contents.
+- The package layout XML, chunk 1001, lists `game_scarlett_master.exe`; the file is absent from the folder. One
+  claim in this document comes from running the executable from a player's own copy: how it calls device slot 26
+  (section 4.1; register roles and argument values only). No other claim depends on the executable's contents.
 - The repository's existing import survey (`docs/design.md`, "Baseline already recorded") records that the 16
   bundled DLLs need only `xmem` and the two `d3d12_xs` root-signature calls; our scan of the six non-CRT DLLs is
   consistent.
