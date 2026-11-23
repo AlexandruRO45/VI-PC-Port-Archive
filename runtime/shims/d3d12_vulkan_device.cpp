@@ -1963,7 +1963,7 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
-        if (aliased_) leonida::title_va_aliases().remove(va_, title_alias_);
+        if (shader_aliased_) leonida::title_va_aliases().remove(va_, title_shader_va_);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -2150,7 +2150,7 @@ public:
     // reads with no copy. Its console VA is `address` itself, the VA the title chose, so vertex, index and immediate
     // writes the title names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to
     // that VA would not reach it, so the root views and V#s the layer writes for it name its device address minus
-    // heap_base instead (alias_title_va, docs/d3d12_vulkan.md section 3.3 "Title-placed buffers"); V#s the title
+    // heap_base instead (alias_title_shader_va, docs/d3d12_vulkan.md section 3.3 "Title-placed buffers"); V#s the title
     // writes into memory itself keep its VA. The pages stay the caller's: nothing is zeroed.
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
@@ -2247,16 +2247,16 @@ public:
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         // Shaders reach the imported pages by their device address (src/title_va_alias.h).
-        if (buffer_va_) alias_title_va(buffer_va_ - device_.arena.address);
+        if (buffer_va_) alias_title_shader_va(buffer_va_ - device_.arena.address);
         return S_OK;
     }
 
     // Registers [va_, va_ + width) as reached by shaders at `shader_va` (src/title_va_alias.h): the root views and
     // buffer V#s the layer writes for an address in it get the matching address of the buffer's GPU copy.
-    void alias_title_va(std::uint64_t shader_va) {
+    void alias_title_shader_va(std::uint64_t shader_va) {
         if (!leonida::title_va_aliases().add(va_, desc_.Width, shader_va)) return;
-        title_alias_ = shader_va;
-        aliased_ = true;
+        title_shader_va_ = shader_va;
+        shader_aliased_ = true;
     }
 
     // The fallback of create_host_buffer, for pages the driver will not import: write-combined or uncached ones (in
@@ -2296,7 +2296,7 @@ public:
             binding.va = va_;
             device_.context->add_resource(id(), binding);
             device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
-            alias_title_va(arena_offset_);
+            alias_title_shader_va(arena_offset_);
             return S_OK;
         }
         log_once("a title-placed shadow buffer does not fit the GPU address arena (raise LEONIDA_ARENA_MB), so it "
@@ -2347,7 +2347,7 @@ public:
         binding.va = va_;
         device_.context->add_resource(id(), binding);
         device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
-        if (buffer_va_) alias_title_va(buffer_va_ - device_.arena.address);
+        if (buffer_va_) alias_title_shader_va(buffer_va_ - device_.arena.address);
         return S_OK;
     }
 
@@ -2884,8 +2884,8 @@ private:
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
     std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
-    bool aliased_ = false;            // va_ is in leonida::title_va_aliases(), reached at title_alias_
-    std::uint64_t title_alias_ = 0;
+    bool shader_aliased_ = false;     // va_ is in leonida::title_va_aliases(), reached at title_shader_va_
+    std::uint64_t title_shader_va_ = 0;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
