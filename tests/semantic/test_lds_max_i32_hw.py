@@ -222,6 +222,74 @@ class TestSymbolicAST(unittest.TestCase):
                 vdst=None,
             )
 
+class LDSState:
+    def __init__(self, size_dwords: int = 1024):
+        self.size_dwords = size_dwords
+        self.data = [0] * size_dwords
+
+    def atomic_max_i32(self, byte_addr: int, val: int) -> int:
+        idx = ((byte_addr & MASK32) >> 2) & (self.size_dwords - 1)
+        old = self.data[idx]
+        self.data[idx] = ref_max_i32(old, val)
+        return old
+
+
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.scc = 0
+        self.vcc = 0
+
+
+class ScalarLDSInterpreter:
+    def __init__(self, lds: Optional[LDSState] = None, regs: Optional[ScalarRegisterState] = None):
+        self.lds = lds if lds is not None else LDSState()
+        self.regs = regs if regs is not None else ScalarRegisterState()
+
+    def step(self, insn: DSMaxI32Instruction) -> int:
+        base_addr = self.regs.vgprs[insn.vaddr.index]
+        eff_addr = (base_addr + insn.offset) & MASK32
+        vdata = self.regs.vgprs[insn.vdata.index]
+        old = self.lds.atomic_max_i32(eff_addr, vdata)
+        if insn.rtn and insn.vdst is not None:
+            self.regs.vgprs[insn.vdst.index] = old
+        return old
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step_and_chaining(self):
+        interp = ScalarLDSInterpreter()
+        # Seed LDS[0] with -100
+        interp.lds.data[0] = to_unsigned_u32(-100)
+
+        interp.regs.vgprs[0] = 0  # addr
+        interp.regs.vgprs[1] = to_unsigned_u32(-50)
+        interp.regs.vgprs[2] = to_unsigned_u32(10)
+
+        # Step 1: ds_max_rtn_i32 v3, v0, v1 -> old=-100, new=-50
+        insn1 = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(1),
+            rtn=True,
+            vdst=Operand.vgpr(3),
+        )
+        old1 = interp.step(insn1)
+        self.assertEqual(old1, to_unsigned_u32(-100))
+        self.assertEqual(interp.regs.vgprs[3], to_unsigned_u32(-100))
+        self.assertEqual(interp.lds.data[0], to_unsigned_u32(-50))
+
+        # Step 2: ds_max_rtn_i32 v4, v0, v2 -> old=-50, new=10
+        insn2 = DSMaxI32Instruction(
+            vaddr=Operand.vgpr(0),
+            vdata=Operand.vgpr(2),
+            rtn=True,
+            vdst=Operand.vgpr(4),
+        )
+        old2 = interp.step(insn2)
+        self.assertEqual(old2, to_unsigned_u32(-50))
+        self.assertEqual(interp.regs.vgprs[4], to_unsigned_u32(-50))
+        self.assertEqual(interp.lds.data[0], 10)
+
 
 if __name__ == "__main__":
     unittest.main()
