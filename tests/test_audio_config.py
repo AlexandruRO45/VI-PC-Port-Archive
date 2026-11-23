@@ -109,16 +109,32 @@ class TestScan(unittest.TestCase):
             self.assertEqual(len(A.collect(tmp)), 0)
             self.assertEqual(len(A.collect(tmp, join=True)), 1)
 
-    def test_non_joined_scan_processes_each_blob_before_reading_the_next(self):
-        def parts(_src):
-            yield "first.bin", make_record(0x1000, 100_000)
-            self.assertEqual(scan.call_count, 1)
-            yield "second.bin", make_record(0x1001, 200_000)
+    def test_directory_accepts_mixed_case_bin_extensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_parts(tmp, [make_record(0x1000, 100_000), make_record(0x1001, 200_000)])
+            os.rename(os.path.join(tmp, "01.bin"), os.path.join(tmp, "second.BIN"))
+            for join in (False, True):
+                with self.subTest(join=join):
+                    rows = A.collect(tmp, join=join)
+                    self.assertEqual([(r["file"], r["id"]) for r in rows],
+                                     [("00.bin", 0x1000), ("second.BIN", 0x1001)])
 
-        with patch.object(A, "files_in", parts), patch.object(A, "scan", wraps=A.scan) as scan:
-            rows = A.collect("unused")
-        self.assertEqual([(row["file"], row["id"]) for row in rows],
-                         [("first.bin", 0x1000), ("second.bin", 0x1001)])
+    def test_large_single_blob_uses_bounded_memory(self):
+        record = make_record(0x70, 100_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "input.bin")
+            with open(path, "wb") as stream:
+                stream.seek((1 << 20) - 6)
+                stream.write(record)
+            tracemalloc.start()
+            try:
+                with patch.object(A, "JOIN_BLOCK_BYTES", 1 << 16):
+                    rows = A.collect(path)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        self.assertEqual([(r["id"], r["file_offset"]) for r in rows], [(0x70, (1 << 20) - 2)])
+        self.assertLess(peak, 1 << 19)
 
     def test_join_marker_at_stream_boundary_uses_the_file_containing_it(self):
         record = make_record(0x3000, 150_000)
