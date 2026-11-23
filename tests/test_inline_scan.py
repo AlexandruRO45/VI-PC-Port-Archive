@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -156,6 +157,22 @@ class InlineScanTests(unittest.TestCase):
         sites = list(inline_scan.scan(listing(*GUARDED), stats))
         self.assertEqual(stats["instructions"], len(GUARDED))
         self.assertIn(f"instructions scanned: {len(GUARDED)}", inline_scan.summarize(sites, stats["instructions"]))
+
+    def test_a_listing_with_a_byte_order_mark_reads_like_plain_utf8(self):
+        # UTF-16 is what `dumpbin > listing.txt` writes in Windows PowerShell 5.1; the mark is on the first line.
+        text = "".join(listing(*GUARDED))
+        encoded = {"utf-8": text.encode("utf-8"), "utf-8-sig": text.encode("utf-8-sig"),
+                   "utf-16-le": b"\xff\xfe" + text.encode("utf-16-le"),
+                   "utf-16-be": b"\xfe\xff" + text.encode("utf-16-be")}
+        for name, data in encoded.items():
+            with self.subTest(encoding=name), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp, "listing.txt")
+                path.write_bytes(data)
+                stats = {}
+                (site,) = list(inline_scan.scan(inline_scan.read_lines(path), stats))
+                self.assertEqual(stats["instructions"], len(GUARDED))
+                self.assertTrue(site["checked"])
+                self.assertEqual(site["fallback_slot"], 14)
 
 
 class InlineScanCliTests(unittest.TestCase):

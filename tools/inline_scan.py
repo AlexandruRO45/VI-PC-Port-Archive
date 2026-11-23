@@ -68,7 +68,11 @@ def read_lines(source: Path):
         if proc.wait():
             sys.exit(f"dumpbin failed with exit code {proc.returncode}")
         return
-    with open(source, encoding="utf-8", errors="replace") as f:
+    with open(source, "rb") as f:
+        head = f.read(2)
+    # `dumpbin ... > listing.txt` in Windows PowerShell 5.1 writes UTF-16; a UTF-8 BOM would hide the first line.
+    encoding = "utf-16" if head in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    with open(source, encoding=encoding, errors="replace") as f:
         yield from f
 
 
