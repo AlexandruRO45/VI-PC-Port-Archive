@@ -338,5 +338,83 @@ class TestValuSubCoU32SIMDDivergence(unittest.TestCase):
                 self.assertEqual((vcc >> lane) & 1, 0)
         self.assertEqual(vcc, mask)
 
+# ---------------------------------------------------------------------------
+# Stage 5: Register aliasing and in-place operand preservation
+# ---------------------------------------------------------------------------
+
+class TestValuSubCoU32RegisterAliasing(unittest.TestCase):
+    """Stage 5: Register aliasing and in-place operand preservation for v_sub_co_u32."""
+
+    def test_inplace_dst_equals_src0(self) -> None:
+        # v0 = v0 - v1
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[0] = 100
+        interp.vgprs[1] = 40
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SPECIAL, 0, "vcc_lo"),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, 60)
+        self.assertEqual(borrow, 0)
+        self.assertEqual(interp.vgprs[0], 60)
+        self.assertEqual(interp.vgprs[1], 40)
+
+    def test_inplace_dst_equals_src1(self) -> None:
+        # v1 = v0 - v1
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[0] = 50
+        interp.vgprs[1] = 80
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 1),
+            Register(RegKind.SPECIAL, 0, "vcc_lo"),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 1),
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, (50 - 80) & MASK32)
+        self.assertEqual(borrow, 1)
+        self.assertEqual(interp.vgprs[1], (50 - 80) & MASK32)
+        self.assertEqual(interp.vgprs[0], 50)
+
+    def test_inplace_all_aliased(self) -> None:
+        # v0 = v0 - v0
+        interp = ValuSubCoInterpreter()
+        interp.vgprs[0] = 0xDEADBEEF
+
+        inst = VOP3COInstruction(
+            Opcode.V_SUB_CO_U32,
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.SPECIAL, 0, "vcc_lo"),
+            Register(RegKind.VGPR, 0),
+            Register(RegKind.VGPR, 0),
+        )
+        diff, borrow = interp.step(inst)
+        self.assertEqual(diff, 0)
+        self.assertEqual(borrow, 0)
+        self.assertEqual(interp.vgprs[0], 0)
+
+    def test_aliased_translated_execution(self) -> None:
+        global _TRANSLATE_ID
+        _TRANSLATE_ID += 1
+        lines = [
+            "v_mov_b32 v0, 100",
+            "v_mov_b32 v1, 35",
+            "v_sub_co_u32 v0, vcc_lo, v0, v1",
+            "v_cndmask_b32 v3, 0, 1, vcc_lo",
+            "exp mrt0 v0, v3, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines(f"ps_sub_co_alias_{_TRANSLATE_ID}", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK32, 65)
+        self.assertEqual(words[1] & 1, 0)
+
 if __name__ == "__main__":
     unittest.main()
