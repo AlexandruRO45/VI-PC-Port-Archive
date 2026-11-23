@@ -18,6 +18,11 @@ fragments, while world fragments do have them; see
 Source resource: `ambient_femalebody_upper_nohead.#ft` in `packs.rpf`, stream offset
 `0x45449F70` (stored 17,434 bytes, inflated 42,384 bytes).
 
+This stream is the **name table**, not the skeleton fragment. `tools/anim_glb.py --skeleton` takes a
+fragment offset; on 1.0.2.1 the sibling `ambient_femalebody_head.#ft` at `0x45417010` exports the
+596-joint skeleton with a 5.13e-6 bind error, while passing `0x45449F70` fails with
+`page directory: not a system pointer`.
+
 | Range | Contents |
 |---|---|
 | `0x0008..0x7FF8` | 4,095-slot hash table, 8 bytes per slot: `u32 joaat32(name)`, `u32 boneIndex` |
@@ -226,6 +231,14 @@ python -I tools/anim_glb.py <package>\packs.rpf --coverage --skeleton <fragment 
     --anim <package>\anim.rpf --jobs 8 --report <work>\coverage.json
 ```
 
+On 1.0.2.1, `--skeleton 0x45417010` names the `ambient_femalebody_head.#ft` fragment;
+`0x45449F70` in the section above is the name-table stream, not a fragment.
+
+`--clip` matches the full clip label or the dictionary hash. When the hash is the leaf-name hash,
+one value selects every path with that leaf: in dictionary `0xfc91b010`, `0xe61dc582` is
+`joaat32("move")` and selects all six `/move` clips. Pass the full label (for example
+`gameplay@locomotion@female_generic@normal@standing@walk@slope@up/move`) to export one clip.
+
 Offsets are zlib stream offsets (as `tools/skin_streams.py` and `rpf9dump` report them). The
 output is a standard glTF 2.0 file; Blender and the three.js editor play its animations. What
 it does and why:
@@ -300,6 +313,13 @@ section offsets are also in `drawable.buffers[vertex_buffer].mesh_blob.sections`
 | jacket | 9 | `JOINTS_1` | 314,304 | `0x25` | 39,272 |
 | jacket | 6 | `WEIGHTS_0` | 196,488 | `0x26` | 39,272 |
 | jacket | 7 | `WEIGHTS_1` | 235,760 | `0x26` | 39,272 |
+| *packed layout* | 8, 9 | `JOINTS_0/1`, 4 x u32 | section entry | `0x8C` | 16 x vertices |
+
+Joint slots may also use the packed `R32G32B32A32_UINT` layout, format `0x8C`: 16 bytes
+per vertex, four little-endian u32 words whose low 12 bits are the joint index (bits
+12–31 are a separate unidentified field). The exporter converts it to the same 4 x u8 row
+as `0x25` and rejects an index above 255. Only `0x8C` is accepted: no `0x8B` joint layout
+has been measured, so `0x8B` is rejected rather than guessed.
 
 The output has one skin. Its joints are the full ped skeleton plus any drawable-local helper
 joints named by the palette; a palette hash that resolves nowhere is emitted as
@@ -391,7 +411,8 @@ The model binding is also decoded. `PERSCHARS_INFO` (`data.rpf@0x1AA5F000`, reco
 `Name = 0x03A885E6` (`mandy`) to `ModelSetName = 0x03A885E6`; `CPedModelInfo__InitData`
 (`packs.rpf@0x11D1FF000`, record 1219) maps that link to `cs_mandy` (`0xD7C0CDFF`). `cs_mandy`
 is a live model id — a `story000.rpf` cutscene actor/voice table uses it — but there is **no
-named `cs_mandy` drawable**. Its 64-bit `ModelName` is `0x009B33B7D7C0CDFF`, and its `FragName`
+named `cs_mandy` drawable**. The `cs_mandy` ID above is the 32-bit `ModelName` at row offset
+`+0x0C` (schema type `0x4D`). The adjacent 64-bit `FragName` at `+0x10` (type `0x4F`)
 `0xC9888B65009B33B7` is the shared female cutscene base, carried by **904** female rows:
 `player_story000_00` (Lucia's model id `0xE472B687`), `cs_monalisa` (`0x9CB9BCC6`) and
 `cs_mandy` (`0xD7C0CDFF`), plus 901 others. No ped-model row carries `joaat("cs_lucia")`
@@ -411,13 +432,36 @@ values are not recoverable by name enumeration. `common.rpf` contains one variat
 `joaat32` of all 67 keys gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for
 Lucia and Monalisa) is a body/height scale, not a name. There is no component/outfit-name
 manager in `common.rpf`; `outfit_NN` exists only as a hash in the packs table.
+values are not recoverable by name enumeration. `common.rpf` holds `CPedVariationBodyTypeManager`
+(77,422 bytes, 67 keys) and `CPedComponentSetManager`; neither maps a variation index to a
+drawable plus texture. The first manager's keys are literal model names, and `joaat32` of all
+67 gives 0 hits against the 18. The `3cba3fe6` float (0.942 / 0.971 for Lucia and Monalisa) is a
+per-character scale, not a name; `outfit_NN` exists only as a hash in the packs table.
 
 The entities linked to Mandy carry three different per-state archetype hashes
 (`0x18BB2550`, `0x73E83886`, `0x57DDFFC2`), which fits her outfit changing between states, not
 three models. None of those hashes resolves through the package name dictionary, any drawable
 or prop name pool, the `packs.rpf` PSOs, or a `0x7a` meta hash scan, so they are state/archetype
-ids, not model names. The archetype-to-component-set table is not in the readable archives;
-whether it is in the missing executable or an undecoded store is not established.
+ids, not model names. The archetype-to-component-set lookup remains unidentified.
+
+**Component variation (ASSET-279).** At `packs.rpf@0x11D1FF000`, the first 16 inflated 64 KiB
+pages cover the instance blocks and row schema and end inside LSNS. The 16-byte root has one
+array of 2,714 model rows, each 384 bytes. The row schema has no array or map, and both struct
+pointers (row offsets `+0x118` and `+0x178`) are null in every row. Only record 1219 carries its `ModelName` in this table. Its `FragName`
+occurs in 906 rows, including the 904 female rows counted above.
+This layout provides no inline array or live struct pointer for either nine-entry table.
+
+At `data.rpf@0x1B076000`, the PSIN walker reached 25 structures across all seven blocks
+(756/756 instance bytes). One owner embeds both 12-byte settings at owner offsets `+0x0C`
+and `+0x18`. Each holds a `textureIndex` and two floats. Four separate root maps contain
+seven entries between them. The two settings are inline fields, and their subsystem is unknown.
+Two XML roots in `common.rpf` describe scale and body-shape profiles (`0x226000`) and entity
+components (`0x228000`). A byte comparison against the 1,576,148-byte character metadata prefix
+at `data.rpf@0x1AA5F000` found none of the settings candidate's nine distinct nonzero typed
+hashes at their original little-endian widths. That prefix did not validate as a complete PSIN.
+None of these checks establishes a variation selector. An external lookup keyed by a model-row
+field remains possible; confirming it requires tracing a component variation to both its
+drawable and its texture.
 
 `Mandy_FirstTingle`, `Mandy_ComingUp` and `Drug_Mandy_*` in `common.rpf` are MDMA drug effects,
 not the character. They are a red herring in any `mandy` name search.
@@ -433,7 +477,7 @@ table, not a unique `mandy` drawable.
 Steps 1-4 were measured with local tools that are not part of this repository; a reader can
 reproduce them with a standard zlib/RPF9 reader:
 
-1. Inflate the `.#ft` stream at `0x45449F70`; parse the 4,095-slot hash table and the
+1. Inflate the `.#ft` **name-table** stream at `0x45449F70`; parse the 4,095-slot hash table and the
    NUL-separated names; verify `joaat32` lowercased.
 2. Inflate the following 131,072-byte graphics page at `0x4544F010`; parse the records at
    `0x110 + 0x50*i`: rotation at +0x00, translation at +0x10, hash at +0x1C, parent at +0x46
