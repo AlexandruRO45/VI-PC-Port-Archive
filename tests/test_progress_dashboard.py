@@ -5,6 +5,8 @@
 Every input is written here by hand (Markdown tables, JUnit XML, a CTest log, a fake work folder whose shader names
 are sentinels). No game files, no GPU, no network: the GitHub path is fed synthetic gh output.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -439,6 +441,15 @@ class Scrub(unittest.TestCase):
 
 
 class Outputs(unittest.TestCase):
+    def test_login_without_github_is_an_argument_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            cmd = [sys.executable, "-I", TOOL, "--out", out, "--login", "fixture-reviewer"]
+            result = subprocess.run(cmd, capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--login requires --github", result.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_nonpositive_test_options_are_argument_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")
@@ -527,6 +538,17 @@ class Outputs(unittest.TestCase):
     def test_script_element_cannot_be_closed_by_data(self):
         snap = {"schema": pd.SCHEMA, "x": "</script><b>"}
         self.assertNotIn("</script><b>", pd.render_page(snap, []))
+
+    def test_out_as_existing_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file_out = os.path.join(tmp, "not_a_dir")
+            with open(file_out, "wb") as f:
+                f.write(b"x")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = pd.main(["--out", file_out])
+            self.assertEqual(rc, 2)
+            self.assertIn("is not a directory", err.getvalue())
 
 
 if __name__ == "__main__":
