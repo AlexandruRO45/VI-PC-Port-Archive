@@ -339,6 +339,7 @@ using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHin
 struct NetRegistration {
     bool running = false;
     bool unregistered = false;
+    DWORD callback_thread = 0;
 };
 std::mutex g_net_mu;
 std::condition_variable g_net_cv;
@@ -368,13 +369,17 @@ template <class Callback> struct InitialNotification {
             const auto it = g_net_registrations.find(n->token);
             if (canceled || it == g_net_registrations.end()) return;
             it->second.running = true;
+            it->second.callback_thread = GetCurrentThreadId();
         }
         notify(n->callback, n->context);
         {
             std::lock_guard lock(g_net_mu);
             const auto it = g_net_registrations.find(n->token);
             if (it->second.unregistered) g_net_registrations.erase(it);
-            else it->second.running = false;
+            else {
+                it->second.running = false;
+                it->second.callback_thread = 0;
+            }
         }
         g_net_cv.notify_all();
     }
@@ -417,7 +422,8 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
         return true;
     }
     it->second.unregistered = true;
-    if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
+    if (wait && it->second.callback_thread != GetCurrentThreadId())
+        g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
     return wait;
 }
 HRESULT STDMETHODCALLTYPE net_not_implemented(void*) { return E_NOTIMPL; }

@@ -536,6 +536,69 @@ void check_run_time_load() {
                                   unregister_hint(n, late_hint, false) && unregister_port(n, late_port, false);
         while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
         check(unregistered && late.calls == 0, "a registration ended before its queue is dispatched sends nothing");
+        // The watchdog turns a self-unregister deadlock into a bounded test failure.
+        struct SelfUnregister {
+            void* object;
+            Unregister unregister;
+            XTaskQueueRegistrationToken token{};
+            bool returned = false;
+        } self{n, unregister_hint};
+        const auto watchdog_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE watchdog = CreateThread(nullptr, 0, [](void* event) -> DWORD {
+            if (WaitForSingleObject(event, 5000) == WAIT_TIMEOUT) {
+                std::fprintf(stderr, "FAIL self-unregister watchdog expired\n");
+                std::fflush(stderr);
+                TerminateProcess(GetCurrentProcess(), 1);
+            }
+            return 0;
+        }, watchdog_done, 0, nullptr);
+        HintCallback self_callback = [](void* ctx, const Hint*) {
+            auto* state = static_cast<SelfUnregister*>(ctx);
+            state->returned = state->unregister(state->object, state->token, true);
+        };
+        const bool self_registered = register_hint(n, manual, &self, self_callback, &self.token) == S_OK;
+        XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0);
+        SetEvent(watchdog_done);
+        WaitForSingleObject(watchdog, INFINITE);
+        CloseHandle(watchdog);
+        CloseHandle(watchdog_done);
+        check(self_registered && self.returned && unregister_hint(n, self.token, true),
+              "unregister with wait from its own callback returns and completes removal");
+
+        struct BlockingCallback { HANDLE entered; HANDLE release; } blocking{
+            CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr)};
+        HintCallback blocking_callback = [](void* ctx, const Hint*) {
+            auto* state = static_cast<BlockingCallback*>(ctx);
+            SetEvent(state->entered);
+            WaitForSingleObject(state->release, INFINITE);
+        };
+        XTaskQueueRegistrationToken blocking_token{};
+        const bool blocking_registered = register_hint(n, manual, &blocking, blocking_callback, &blocking_token) == S_OK;
+        HANDLE dispatcher = CreateThread(nullptr, 0, [](void* queue) -> DWORD {
+            XTaskQueueDispatch(static_cast<XTaskQueueHandle>(queue), XTaskQueuePort::Completion, 0);
+            return 0;
+        }, manual, 0, nullptr);
+        const bool entered = WaitForSingleObject(blocking.entered, 5000) == WAIT_OBJECT_0;
+        struct Waiter { void* object; Unregister unregister; XTaskQueueRegistrationToken token; HANDLE started; bool result; };
+        Waiter waiter{n, unregister_hint, blocking_token, CreateEventW(nullptr, TRUE, FALSE, nullptr), false};
+        HANDLE waiting = CreateThread(nullptr, 0, [](void* ctx) -> DWORD {
+            auto* state = static_cast<Waiter*>(ctx);
+            SetEvent(state->started);
+            state->result = state->unregister(state->object, state->token, true);
+            return 0;
+        }, &waiter, 0, nullptr);
+        WaitForSingleObject(waiter.started, 5000);
+        const bool waited = WaitForSingleObject(waiting, 200) == WAIT_TIMEOUT;
+        SetEvent(blocking.release);
+        const bool finished = WaitForSingleObject(waiting, 5000) == WAIT_OBJECT_0;
+        WaitForSingleObject(dispatcher, 5000);
+        check(blocking_registered && entered && waited && finished && waiter.result,
+              "unregister with wait on another thread waits for the running callback");
+        CloseHandle(waiting);
+        CloseHandle(dispatcher);
+        CloseHandle(waiter.started);
+        CloseHandle(blocking.entered);
+        CloseHandle(blocking.release);
         XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
