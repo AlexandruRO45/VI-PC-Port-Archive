@@ -108,6 +108,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
+    shims/audio_stub.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -216,6 +217,18 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(xmem_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
+
+  # Audio boot shims: AcpHal.dll, xapu.dll and chad.dll. Resolves every name through the registry and calls it with
+  # valid, null and fake arguments. The three measured out-pointer calls get real buffers. No game data, no device.
+  add_executable(audio_stub_test
+    test/audio_stub_test.cpp
+    shims/audio_stub.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(audio_stub_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(audio_stub_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(audio_stub_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(audio_stub_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -964,6 +977,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
+  endif()
+  if(WIN32 AND TARGET audio_stub_test)
+    add_test(NAME audio_stub COMMAND audio_stub_test)
   endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
