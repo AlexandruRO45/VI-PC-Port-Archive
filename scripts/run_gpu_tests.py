@@ -869,6 +869,7 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, problem or f"4096 pixels in each of {len(GET_LOD_TESTS[name])} draw(s): the "
                             "clamped and the calculated LOD within 1/16"))
         elif name in ("cs_bounds", "cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_smem_sconst_off", "cs_buf_tail", "cs_oob_select", "cs_oob_tail",
+                      "cs_buf_swizzle_scratch",
                       "cs_buf_swizzle", "cs_cmpx_class_f32", "cs_cvt_pk_u8", "cs_buf_load_sub", "cs_buf_fmt8"):
             # num_records bounds check (cs_bounds.asm): the out-of-bounds store is dropped and the out-of-bounds
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
@@ -891,6 +892,9 @@ def run_suite(a, work: str) -> int:
                 # swizzled MUBUF addressing (measured natively on gfx1036) and ADD_TID_ENABLE (lanes 0 and 1 store)
                 "cs_buf_swizzle": [0x5EED0024, 0x5EED0044, 0x5EED004C, 0x5EED0008, 0x5EED000C, 0, 0xBEEF0000,
                                    0xBEEF0001],
+                # scratch swizzle: a raw dwordx2 steps 4 * IS, and lane 9 crosses IS 8 (the .asm header)
+                "cs_buf_swizzle_scratch": [0x5EED0000, 0x5EED0004, 0x5EED0008, 0x5EED0084, 0x5EED0040,
+                                           0x5EED0044, 0x5EED0048, 0x5EED0090],
                 "cs_cmpx_class_f32": CMPX_CLASS_WORDS,
                 "cs_cvt_pk_u8": CVT_PK_U8_WORDS,
                 # TEST-510: sub-dword MUBUF loads (RAW end check by element size) and GFX10_FORMAT_8_UINT
