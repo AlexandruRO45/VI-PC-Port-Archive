@@ -19,6 +19,7 @@ from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "story_index.py")
+CARVE_TOOL = os.path.join(ROOT, "tools", "rpf9_carve.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import story_index  # noqa: E402
@@ -511,6 +512,175 @@ class ArchiveTest(unittest.TestCase):
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(p.returncode, 2)
         self.assertIn("output would overwrite an input file", p.stderr)
+
+
+class FolderModeCarveManifestTest(unittest.TestCase):
+    """Carved-folder mode reads stored sizes and archive span/gaps from rpf9_carve.py's index.json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_carved_folder_matches_archive_summary_via_rpf9_carve(self):
+        rpf = os.path.join(self.root, "synthetic_story.rpf")
+        carved = os.path.join(self.root, "carved")
+        header = bytearray(0x100)
+        header[:4] = b"9FPR"
+        struct.pack_into("<I", header, 4, len(header))
+        body = bytearray()
+        body += zlib.compress(psin())
+        body += bytes(128)
+        body += zlib.compress(page())
+        body += bytes(0xA5 + (i % 17) for i in range(64))
+        body += bink()
+        body += bytes(32)
+        with open(rpf, "wb") as f:
+            f.write(header + body)
+
+        p = subprocess.run([sys.executable, "-I", CARVE_TOOL, rpf, carved],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+        arc_rows, arc_summary = story_index.scan_rpf(rpf)
+        dir_rows, dir_summary = story_index.scan_dir(carved)
+        self.assertEqual(dir_rows, arc_rows)
+        for key in ("files", "compressed_bytes", "inflated_bytes", "bink2_files", "bink2_bytes",
+                    "zero_padding", "unread_bytes", "span", "readable_fraction", "signatures"):
+            self.assertEqual(dir_summary[key], arc_summary[key], key)
+        self.assertLess(dir_summary["compressed_bytes"], dir_summary["inflated_bytes"])
+        self.assertEqual(dir_summary["zero_padding"], 160)
+        self.assertEqual(dir_summary["unread_bytes"], 64)
+        self.assertEqual(dir_summary["bink2_files"], 1)
+        self.assertLess(dir_summary["readable_fraction"], 1.0)
+
+    def test_index_json_supplies_stored_sizes_and_span_in_cli_json_and_csv(self):
+        carved = os.path.join(self.root, "carved")
+        os.makedirs(carved)
+        payload = psin().ljust(1000, b"\x00")
+        with open(os.path.join(carved, "000000001000.bin"), "wb") as f:
+            f.write(payload)
+        index = {
+            "summary": {"span": 2000, "zero_padding": 500, "unread_bytes": 1200},
+            "files": [{"off": 0x1000, "stored": 300, "size": 1000}],
+        }
+        with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(index, f)
+
+        out_json = os.path.join(self.root, "report.json")
+        out_csv = os.path.join(self.root, "report.csv")
+        for out in (out_json, out_csv):
+            p = subprocess.run([sys.executable, "-I", TOOL, carved, out, "--quiet"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+
+        with open(out_json, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual((doc["files"][0]["stored"], doc["files"][0]["size"]), (300, 1000))
+        summary = doc["summary"]
+        self.assertEqual((summary["compressed_bytes"], summary["inflated_bytes"]), (300, 1000))
+        self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (2000, 500, 1200))
+        self.assertAlmostEqual(summary["readable_fraction"], 300 / 2000, places=6)
+        self.assertEqual(summary["signatures"]["psin"]["stored"], 300)
+
+        with open(out_csv, newline="", encoding="utf-8") as f:
+            table = list(csv.reader(f))
+        self.assertEqual((table[1][1], table[1][2]), ("300", "1000"))
+
+    def test_empty_carved_archive_preserves_manifest_span_padding_and_unread(self):
+        carved = os.path.join(self.root, "empty_carve")
+        os.makedirs(carved)
+        index = {"summary": {"span": 512, "zero_padding": 256, "unread_bytes": 256}, "files": []}
+        with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(index, f)
+        rows, summary = story_index.scan_dir(carved)
+        self.assertEqual(rows, [])
+        self.assertEqual(
+            (summary["span"], summary["zero_padding"], summary["unread_bytes"],
+             summary["compressed_bytes"], summary["readable_fraction"]),
+            (512, 256, 256, 0, 0.0),
+        )
+
+    def test_short_hex_filename_matches_manifest_by_offset(self):
+        carved = os.path.join(self.root, "short_hex")
+        os.makedirs(carved)
+        with open(os.path.join(carved, "001000.bin"), "wb") as f:
+            f.write(psin().ljust(1000, b"\x00"))
+        index = {
+            "summary": {"span": 400, "zero_padding": 100, "unread_bytes": 50},
+            "files": [{"off": 0x1000, "stored": 250, "size": 1000}],
+        }
+        with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(index, f)
+        rows, summary = story_index.scan_dir(carved)
+        self.assertEqual(rows[0]["stored"], 250)
+        self.assertEqual(summary["compressed_bytes"], 250)
+        self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (400, 100, 50))
+
+    def test_partial_or_extra_files_do_not_misapply_full_span_or_zero_offset(self):
+        with self.subTest("extra_non_hex_file_with_offset_zero"):
+            carved = os.path.join(self.root, "extra")
+            os.makedirs(carved)
+            with open(os.path.join(carved, "-extra.bin"), "wb") as f:
+                f.write(page().ljust(200, b"\x00"))
+            with open(os.path.join(carved, "000000000000.bin"), "wb") as f:
+                f.write(psin())
+            index = {
+                "summary": {"span": 1000, "zero_padding": 880, "unread_bytes": 0},
+                "files": [{"off": 0, "stored": 120, "size": 512}],
+            }
+            with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            rows, summary = story_index.scan_dir(carved)
+            by_sig = {r["signature"]: r for r in rows}
+            self.assertEqual(by_sig["psin"]["stored"], 120)
+            self.assertEqual(by_sig["page-directory"]["stored"], 200)
+            self.assertEqual((summary["compressed_bytes"], summary["span"],
+                              summary["zero_padding"], summary["unread_bytes"]), (320, 320, 0, 0))
+
+        with self.subTest("subset_of_manifest_files"):
+            subset = os.path.join(self.root, "subset")
+            os.makedirs(subset)
+            with open(os.path.join(subset, "000000001000.bin"), "wb") as f:
+                f.write(psin())
+            index = {
+                "summary": {"span": 1000, "zero_padding": 700, "unread_bytes": 0},
+                "files": [
+                    {"off": 0x1000, "stored": 120, "size": 512},
+                    {"off": 0x2000, "stored": 180, "size": 512},
+                ],
+            }
+            with open(os.path.join(subset, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            rows, summary = story_index.scan_dir(subset)
+            self.assertEqual(rows[0]["stored"], 120)
+            self.assertEqual((summary["compressed_bytes"], summary["span"],
+                              summary["zero_padding"], summary["unread_bytes"]), (120, 120, 0, 0))
+
+    def test_malformed_or_invalid_index_json_falls_back_to_disk_sizes(self):
+        cases = (
+            ("invalid_json", "{bad", 1000, 1000),
+            ("list_manifest", '[{"off": 4096, "stored": 16}]', 1000, 1000),
+            ("negative_stored", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": -5}]}), 1000, 1000),
+            ("bool_stored", json.dumps({"summary": {"span": 2000}, "files": [{"off": 0x1000, "stored": True}]}), 1000, 1000),
+            ("negative_span", json.dumps({"summary": {"span": -1}, "files": [{"off": 0x1000, "stored": 300}]}), 300, 300),
+            ("span_smaller_than_stored", json.dumps({"summary": {"span": 10}, "files": [{"off": 0x1000, "stored": 300}]}), 300, 300),
+        )
+        for label, body_text, want_stored, want_span in cases:
+            with self.subTest(label=label):
+                carved = os.path.join(self.root, label)
+                os.makedirs(carved)
+                with open(os.path.join(carved, "000000001000.bin"), "wb") as f:
+                    f.write(psin().ljust(1000, b"\x00"))
+                with open(os.path.join(carved, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(body_text)
+                rows, summary = story_index.scan_dir(carved)
+                self.assertEqual(rows[0]["stored"], want_stored)
+                self.assertEqual(summary["compressed_bytes"], want_stored)
+                self.assertEqual(summary["span"], want_span)
+                self.assertEqual((summary["zero_padding"], summary["unread_bytes"]), (0, 0))
 
 
 if __name__ == "__main__":

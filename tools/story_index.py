@@ -234,10 +234,60 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     return rows, summary
 
 
+def _nonneg_int(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _carve_index(path):
+    """Read rpf9_carve.py's index.json in `path`.
+
+    Returns (by_name, by_offset, summary, has_manifest):
+      - by_name: {lowercase filename: (offset, stored_bytes)} for `<off:012x>.bin` and `<off:012x>.bk2`
+      - by_offset: {offset: stored_bytes} for hex-prefixed names of another width
+      - summary: the manifest's summary dict (or {})
+      - has_manifest: True when index.json is a valid carve manifest
+    """
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}, {}, {}, False
+    if not isinstance(index, dict):
+        return {}, {}, {}, False
+    raw_files = index.get("files")
+    if not isinstance(raw_files, list):
+        return {}, {}, {}, False
+    by_name = {}
+    by_offset = {}
+    for entry in raw_files:
+        if not isinstance(entry, dict):
+            return {}, {}, {}, False
+        off = _nonneg_int(entry.get("off"))
+        stored = _nonneg_int(entry.get("stored"))
+        if off is None or stored is None or off in by_offset:
+            return {}, {}, {}, False
+        ext = ".bk2" if entry.get("type") == "bink2" else ".bin"
+        by_name[f"{off:012x}{ext}"] = (off, stored)
+        by_offset[off] = stored
+    raw_summary = index.get("summary")
+    summary = raw_summary if isinstance(raw_summary, dict) else {}
+    return by_name, by_offset, summary, True
+
+
 def scan_dir(path, progress=None, output=None):
-    """Index carved files, excluding the output report. Use leading hex digits for offsets when possible."""
+    """Index carved files, excluding the output report. Use leading hex digits for offsets when possible.
+
+    With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and (when every carved
+    stream matches the manifest) the carve's span, zero padding and unread bytes come from it so compressed_bytes
+    and readable_fraction match archive mode; without a valid carve manifest, the length on disk is used.
+    """
     entries = []
     t0 = time.time()
+    by_name, by_offset, carve_summary, has_manifest = _carve_index(path)
+    matched = 0
+    matched_offsets = set()
     try:
         report = os.stat(output) if output is not None else None
     except FileNotFoundError:
@@ -257,9 +307,30 @@ def scan_dir(path, progress=None, output=None):
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
-        entries.append((offset, data))
-    rows = [classify(data, offset, len(data)) for offset, data in entries]
-    summary = summarise(rows, sum(len(data) for _, data in entries), 0, 0)
+        hit = by_name.get(name.lower())
+        if hit is not None:
+            entry_off, stored = hit
+            matched += 1
+            matched_offsets.add(entry_off)
+        elif m is not None and offset in by_offset:
+            stored = by_offset[offset]
+            matched += 1
+            matched_offsets.add(offset)
+        else:
+            stored = len(data)
+        entries.append((offset, data, stored))
+    rows = [classify(data, offset, stored) for offset, data, stored in entries]
+    total_stored = sum(r["stored"] for r in rows)
+    span = _nonneg_int(carve_summary.get("span")) if has_manifest else None
+    zero = _nonneg_int(carve_summary.get("zero_padding", 0)) if has_manifest else None
+    unread = _nonneg_int(carve_summary.get("unread_bytes", 0)) if has_manifest else None
+    if (has_manifest
+            and len(entries) == matched == len(matched_offsets) == len(by_offset)
+            and span is not None and zero is not None and unread is not None
+            and span >= total_stored):
+        summary = summarise(rows, span, zero, unread)
+    else:
+        summary = summarise(rows, total_stored, 0, 0)
     summary["mode"] = "directory"
     summary["directory"] = path
     summary["elapsed_seconds"] = round(time.time() - t0, 3)
