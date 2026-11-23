@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import random
 import struct
 import subprocess
 import sys
@@ -123,6 +124,78 @@ class PedGlbTextureTests(unittest.TestCase):
         self.assertEqual(self.source.read_bytes(), original)
         self.assert_embedded_output(target)
         self.assert_materials(pa.read_glb_parts(str(target)))
+
+    def test_repeated_nodes_and_shared_slots_retain_one_png_payload(self):
+        png = dds_png.encode_png(256, 256, random.Random(5824).randbytes(256 * 256 * 4))
+        for part in self.parts:
+            for slot, _ in SLOTS:
+                setattr(part.material, slot, png)
+        pa.write_assembled_glb(str(self.source), self.parts, apply_standing=False)
+        doc, payload = split_glb(self.source.read_bytes())
+        self.assertEqual(len(doc["images"]), 1)
+        # Different image/texture identities still name the same embedded buffer view.
+        for index in (1, 2):
+            doc["images"].append(dict(doc["images"][0]))
+            doc["textures"].append({"source": index})
+            texture_info(doc["materials"][0], SLOTS[index][1])["index"] = index
+        doc["nodes"] = [{"mesh": 0} for _ in range(64)]
+        doc["scenes"] = [{"nodes": list(range(64))}]
+        self.source.write_bytes(container(doc, payload))
+        parts = pa.read_glb_parts(str(self.source))
+        self.assertEqual(len(parts), 64)
+        blobs = [getattr(part.material, slot) for part in parts for slot, _ in SLOTS]
+        self.assertTrue(all(blob == png for blob in blobs))
+        distinct = {id(blob): blob for blob in blobs}
+        self.assertEqual(sum(map(len, distinct.values())), len(png))
+        output = self.root / "shared.glb"
+        pa.write_assembled_glb(str(output), parts, apply_standing=False)
+        written, _ = split_glb(output.read_bytes())
+        self.assertEqual(len(written["images"]), 1)
+        self.assertEqual(len(written["textures"]), 1)
+
+    def test_embedded_png_cache_is_local_to_one_import(self):
+        first = pa.read_glb_parts(str(self.source))
+        doc, payload = split_glb(self.source.read_bytes())
+        texture = doc["textures"][texture_info(doc["materials"][0], SLOTS[0][1])["index"]]
+        view = doc["bufferViews"][doc["images"][texture["source"]]["bufferView"]]
+        replacement = dds_png.encode_png(1, 1, bytes((212, 37, 19, 255)))
+        self.assertEqual(len(replacement), view["byteLength"])
+        start = view["byteOffset"]
+        payload = payload[:start] + replacement + payload[start + len(replacement):]
+        self.source.write_bytes(container(doc, payload))
+        second = pa.read_glb_parts(str(self.source))
+        self.assertEqual(first[0].material.base_color_png, self.pngs[0])
+        self.assertEqual(second[0].material.base_color_png, replacement)
+
+    def test_cached_span_keeps_reference_validation_and_uri_rules(self):
+        original, payload = split_glb(self.source.read_bytes())
+        texture = original["textures"][texture_info(original["materials"][0], SLOTS[0][1])["index"]]
+        image = original["images"][texture["source"]]
+        for case in ("image-uri", "buffer-uri", "float-length"):
+            with self.subTest(case=case):
+                doc = copy.deepcopy(original)
+                view = dict(doc["bufferViews"][image["bufferView"]])
+                doc["bufferViews"].append(view)
+                later_image = {"mimeType": "image/png", "bufferView": len(doc["bufferViews"]) - 1}
+                doc["images"].append(later_image)
+                doc["textures"].append({"source": len(doc["images"]) - 1})
+                texture_info(doc["materials"][1], SLOTS[0][1])["index"] = len(doc["textures"]) - 1
+                if case == "image-uri":
+                    later_image["uri"] = "not-opened.png"
+                elif case == "buffer-uri":
+                    doc["buffers"].append({"byteLength": len(payload), "uri": "not-opened.bin"})
+                    view["buffer"] = 1
+                else:
+                    # This equals the cached integer length as a dictionary key, but is invalid metadata.
+                    view["byteLength"] = float(view["byteLength"])
+                self.source.write_bytes(container(doc, payload))
+                if case == "float-length":
+                    with self.assertRaisesRegex(pa.PedAssembleError, "baseColorTexture"):
+                        pa.read_glb_parts(str(self.source))
+                else:
+                    parts = pa.read_glb_parts(str(self.source))
+                    self.assertEqual(parts[0].material.base_color_png, self.pngs[0])
+                    self.assertIsNone(parts[1].material.base_color_png)
 
     def test_embedded_image_views_stay_inside_declared_and_actual_buffers(self):
         original, payload = split_glb(self.source.read_bytes())

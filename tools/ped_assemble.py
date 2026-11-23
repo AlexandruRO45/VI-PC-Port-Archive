@@ -1150,7 +1150,8 @@ def _extract_glb_skin_joint_names(
     return joint_names
 
 
-def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, *, path: str, slot: str) -> bytes | None:
+def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, cache: dict[tuple[int, int], bytes],
+                  *, path: str, slot: str) -> bytes | None:
     """Recover a supported material slot's embedded PNG, without opening image or buffer URIs."""
     if info is None:
         return None
@@ -1184,7 +1185,11 @@ def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, *, path: str, slot:
         raise invalid("invalid embedded PNG buffer bounds")
     if start + length > declared or start + length > len(bin_chunk):
         raise invalid("embedded PNG bufferView exceeds buffer 0")
-    return bin_chunk[start:start + length]
+    # Validate every reference before reusing immutable data from this import's buffer 0.
+    span = (start, length)
+    if span not in cache:
+        cache[span] = bin_chunk[start:start + length]
+    return cache[span]
 
 
 def read_glb_parts(path: str) -> list[MeshPart]:
@@ -1217,6 +1222,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     meshes = doc.get("meshes", [])
     materials = doc.get("materials", [])
     skins = doc.get("skins", [])
+    png_cache: dict[tuple[int, int], bytes] = {}
     parts: list[MeshPart] = []
 
     mesh_nodes = [(n, n["mesh"]) for n in nodes if "mesh" in n]
@@ -1310,11 +1316,11 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                     alpha_cutoff=float(gm["alphaCutoff"]) if "alphaCutoff" in gm else None,
                     double_sided=bool(gm.get("doubleSided", False)),
                     base_color_png=_read_glb_png(
-                        doc, bin_chunk, pbr.get("baseColorTexture"), path=path, slot="baseColorTexture"),
+                        doc, bin_chunk, pbr.get("baseColorTexture"), png_cache, path=path, slot="baseColorTexture"),
                     normal_png=_read_glb_png(
-                        doc, bin_chunk, gm.get("normalTexture"), path=path, slot="normalTexture"),
+                        doc, bin_chunk, gm.get("normalTexture"), png_cache, path=path, slot="normalTexture"),
                     metallic_roughness_png=_read_glb_png(
-                        doc, bin_chunk, pbr.get("metallicRoughnessTexture"),
+                        doc, bin_chunk, pbr.get("metallicRoughnessTexture"), png_cache,
                         path=path, slot="metallicRoughnessTexture"),
                 )
             parts.append(MeshPart(
