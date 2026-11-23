@@ -202,5 +202,114 @@ class TestSaluNandSaveexecB32AST(unittest.TestCase):
         expected = ref_nand_saveexec_b32(0x00FF_00FF, 0x0F0F_0F0F)
         self.assertEqual(result, expected)
 
+# ==============================================================================
+# Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class ScalarMachineState:
+    """Architectural register state for scalar SALU operations."""
+
+    def __init__(self) -> None:
+        self.sgprs: List[int] = [0] * 106
+        self.exec_lo: int = MASK32
+        self.scc: int = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if isinstance(op, Immediate):
+            return op.value & MASK32
+        if isinstance(op, Register):
+            if op.kind == RegKind.SGPR:
+                return self.sgprs[op.index] & MASK32
+            if op.kind == RegKind.EXEC_LO:
+                return self.exec_lo & MASK32
+        raise TypeError(f"Invalid operand: {op}")
+
+    def write_reg(self, reg: Register, val: int) -> None:
+        if reg.kind == RegKind.SGPR:
+            self.sgprs[reg.index] = val & MASK32
+        elif reg.kind == RegKind.EXEC_LO:
+            self.exec_lo = val & MASK32
+        else:
+            raise TypeError(f"Unsupported write register: {reg}")
+
+
+class ScalarSALUInterpreter:
+    """Deterministic single-thread execution engine for SALU saveexec instructions."""
+
+    def step(self, inst: Instruction, state: ScalarMachineState) -> None:
+        if inst.opcode == Opcode.S_NAND_SAVEEXEC_B32:
+            s0 = state.read_operand(inst.src0)
+            old_exec = state.exec_lo
+            new_exec, saved_d, scc = ref_nand_saveexec_b32(s0, old_exec)
+            state.write_reg(inst.dst, saved_d)
+            state.exec_lo = new_exec
+            state.scc = scc
+        elif inst.opcode == Opcode.S_MOV_B32:
+            s0 = state.read_operand(inst.src0)
+            state.write_reg(inst.dst, s0)
+        else:
+            raise NotImplementedError(f"Unsupported opcode: {inst.opcode}")
+
+
+# ==============================================================================
+# Unit Tests: Deterministic Scalar Instruction Interpreter
+# ==============================================================================
+
+class TestSaluNandSaveexecB32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarSALUInterpreter()
+        self.state = ScalarMachineState()
+
+    def test_step_sgpr_source(self) -> None:
+        self.state.sgprs[1] = 0x0000_FFFF
+        self.state.exec_lo = 0x00FF_00FF
+
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 0),
+            src0=Register(RegKind.SGPR, 1),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.sgprs[0], 0x00FF_00FF)
+        self.assertEqual(self.state.exec_lo, 0xFFFF_FF00)
+        self.assertEqual(self.state.scc, 1)
+
+    def test_step_immediate_source(self) -> None:
+        self.state.exec_lo = MASK32
+
+        inst = Instruction(
+            opcode=Opcode.S_NAND_SAVEEXEC_B32,
+            dst=Register(RegKind.SGPR, 2),
+            src0=Immediate(MASK32),
+        )
+        self.interp.step(inst, self.state)
+        self.assertEqual(self.state.sgprs[2], MASK32)
+        self.assertEqual(self.state.exec_lo, 0)
+        self.assertEqual(self.state.scc, 0)
+
+    def test_sequential_determinism(self) -> None:
+        program = [
+            Instruction(Opcode.S_MOV_B32, Register(RegKind.SGPR, 5), Immediate(0xAAAA_5555)),
+            Instruction(Opcode.S_NAND_SAVEEXEC_B32, Register(RegKind.SGPR, 6), Register(RegKind.SGPR, 5)),
+        ]
+        self.state.exec_lo = 0xFFFF_0000
+        for inst in program:
+            self.interp.step(inst, self.state)
+
+        res_d = self.state.sgprs[6]
+        res_exec = self.state.exec_lo
+        res_scc = self.state.scc
+
+        fresh = ScalarMachineState()
+        fresh.exec_lo = 0xFFFF_0000
+        for inst in program:
+            self.interp.step(inst, fresh)
+
+        self.assertEqual(fresh.sgprs[6], res_d)
+        self.assertEqual(fresh.exec_lo, res_exec)
+        self.assertEqual(fresh.scc, res_scc)
+
 if __name__ == "__main__":
     unittest.main()
