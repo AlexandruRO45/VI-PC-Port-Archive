@@ -64,6 +64,8 @@ class CpuScore(unittest.TestCase):
         self.assertAlmostEqual(pc.cpu_score("Intel Core 7 150H"), 175 * 0.85)
         self.assertAlmostEqual(pc.cpu_score("Intel Core 5 120U"), 130 * 0.55)
         self.assertAlmostEqual(pc.cpu_score("Intel(R) Core(TM) 3 100U"), 100 * 0.55)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core 7 processor 250H"), 175 * 0.85)
+        self.assertAlmostEqual(pc.cpu_score("Intel Core 5 processor 220H"), 130 * 0.85)
 
     def test_unknown(self):
         self.assertIsNone(pc.cpu_score("Mystery CPU"))

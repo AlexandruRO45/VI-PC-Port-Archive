@@ -256,12 +256,12 @@ def cpu_lookup(name: str):
         return None, False
     s = re.sub(r"\((?:r|tm)\)|[®™]", "", name.lower())
 
-    m = re.search(r"core\s*ultra\s*([3579])\s*(\d{3})([a-z]*)", s)
+    m = re.search(r"core\s*ultra\s*([3579])\s*(?:processor\s+)?(\d{3})([a-z]*)", s)
     if m:
         base = ULTRA_BASE[int(m[1])]
         return (base if "k" in m[3] else base * 0.95), False
 
-    m = re.search(r"\bcore\s*([3579])\s*(\d{3})([a-z]*)\b", s)
+    m = re.search(r"\bcore\s*([3579])\s*(?:processor\s+)?(\d{3})([a-z]*)\b", s)
     if m:
         tier, num, suf = int(m[1]), m[2], m[3]
         base = _pick(INTEL_BASE, 14)[tier]
