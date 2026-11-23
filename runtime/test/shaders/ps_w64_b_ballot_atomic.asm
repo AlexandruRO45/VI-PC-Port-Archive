@@ -8,8 +8,9 @@
 ; wanted pixels, 4096 / 4 = 1024. Which pixel gets which slot depends on the partition (allocation order), so the
 ; expected result is a set: the counter word is 1024 and the 1024 slot words are exactly the numbers y * 64 + x + 1 of
 ; the pixels with x % 4 == 1, each once.
-; Run: VKH_SGPRS=0,0,65536,0x30000000 VKH_HEAP=0=0 VKH_HEAP_DUMP=heap.raw vk_harness vs_ids.spv ps_w64_b_ballot_atomic.spv
+; Run: VKH_SGPRS=0,0,65536,0x30016000 VKH_HEAP=0=0 VKH_HEAP_DUMP=heap.raw vk_harness vs_ids.spv ps_w64_b_ballot_atomic.spv
 ; out.raw, with VKH_SUBGROUP_SIZE=64 and 32. Image: (r0 = x % 4 == 1, 0, 0, 0) per pixel, equal in both runs.
+; The V# word3 carries FORMAT=32_FLOAT (22): a raw MUBUF access is suppressed for an INVALID format (measured, gfx1035, #1218).
 ; mattr: +wavefrontsize64,-wavefrontsize32
 v_interp_p1_f32_e32 v2, v0, attr0.x
 v_interp_p2_f32_e32 v2, v1, attr0.x
