@@ -88,7 +88,8 @@ SAVEEXEC = ("s_and_saveexec_b", "s_or_saveexec_b", "s_xor_saveexec_b", "s_andn2_
             "s_and_wrexec_b", "s_andn2_wrexec_b", "s_andn1_wrexec_b")
 RMW_DEST = (
     "v_fmac_f32", "v_fmac_f16", "v_mac_f32", "v_mac_legacy_f32", "v_pk_fmac_f16",
-    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot4c_i32_i8", "v_dot8c_i32_i4",
+    "v_dot2c_f32_f16", "v_dot2c_f32_bf16", "v_dot2c_i32_i16", "v_dot2c_u32_u16",
+    "v_dot4c_i32_i8", "v_dot4c_u32_u8", "v_dot8c_i32_i4", "v_dot8c_u32_u4",
     "s_addk_i32", "s_mulk_i32", "s_cmovk_i32", "s_cmov_b32", "s_cmov_b64",
     "s_bitset0_b32", "s_bitset0_b64", "s_bitset1_b32", "s_bitset1_b64",
 )
@@ -481,10 +482,10 @@ class Analysis:
 
         MIRROR of rdna2spirv's `sgpr_imm` folding (it cannot be imported here: this analysis runs before the
         translator emits a block, so its `sgpr_imm` is empty): s_mov_b32, s_movk_i32, s_mov_b64 (an immediate or an
-        SGPR pair), s_pack_ll/lh/hh_b32_b16, s_bfm_b32, s_not_b32, and the S2 folds s_and_b32, s_lshl_b32,
-        s_lshr_b32, s_mul_i32 (not s_or_b32: rdna2spirv does not record it). Not mirrored, so treated as run-time:
-        s_abs, s_sext, s_min/max, s_add/sub, s_xor/andn2 family, s_bfe, s_absdiff, s_lshlN_add. Keep the two lists
-        in step when rdna2spirv folds another op."""
+        SGPR pair), s_pack_ll/lh/hh_b32_b16, s_bfm_b32, s_not_b32, s_abs_i32, s_sext_i32_i8/16, s_min/max_i32/u32,
+        s_add/sub_u32/i32, s_lshl1..4_add_u32, s_bfe_u32/i32, s_absdiff_i32, and the S2/bitwise folds s_and_b32,
+        s_xor_b32, s_andn2_b32, s_orn2_b32, s_nand_b32, s_nor_b32, s_xnor_b32, s_lshl_b32, s_lshr_b32, s_mul_i32
+        (not s_or_b32: rdna2spirv does not record it). Keep the two lists in step when rdna2spirv folds another op."""
         for j in range(i - 1, -1, -1):
             ins = self.blocks[n][j]
             if ("s", r) not in [x for d in operands(ins)[0] for x in _regs(d)]:
@@ -506,8 +507,15 @@ class Analysis:
             if op == "s_movk_i32" and len(a) == 2 and a[1].get("k") == "imm":
                 v = a[1]["v"] & 0xFFFF
                 return (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF
-            if op == "s_not_b32" and x is not None:
+            if op == "s_not_b32" and len(a) == 2 and x is not None and not any(self.is_mask(ins, s) for s in a):
                 return ~x & 0xFFFFFFFF
+            if op == "s_abs_i32" and len(a) == 2 and x is not None:
+                xi = x if x < 0x80000000 else x - 0x100000000
+                return abs(xi) & 0xFFFFFFFF
+            if op in ("s_sext_i32_i8", "s_sext_i32_i16") and len(a) == 2 and x is not None:
+                if op.endswith("i8"):
+                    return (((x & 0xFF) ^ 0x80) - 0x80) & 0xFFFFFFFF
+                return (((x & 0xFFFF) ^ 0x8000) - 0x8000) & 0xFFFFFFFF
             if x is None or y is None or len(a) != 3:
                 return None
             if op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
@@ -516,7 +524,35 @@ class Analysis:
                 return lo | hi
             if op == "s_bfm_b32":
                 return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
-            folds = {"s_and_b32": x & y, "s_lshl_b32": x << (y & 31), "s_lshr_b32": x >> (y & 31), "s_mul_i32": x * y}
+            if op in ("s_bfe_u32", "s_bfe_i32"):
+                off_c = y & 31
+                wid_c = min((y >> 16) & 0x7F, 32 - off_c)
+                if wid_c == 0:
+                    return 0
+                raw = (x >> off_c) & ((1 << wid_c) - 1)
+                if op == "s_bfe_u32":
+                    return raw
+                sign_bit = 1 << (wid_c - 1)
+                return ((raw ^ sign_bit) - sign_bit) & 0xFFFFFFFF
+            if op in ("s_min_i32", "s_max_i32", "s_absdiff_i32"):
+                xi = x if x < 0x80000000 else x - 0x100000000
+                yi = y if y < 0x80000000 else y - 0x100000000
+                if op == "s_absdiff_i32":
+                    diff = (x - y) & 0xFFFFFFFF
+                    return abs(diff if diff < 0x80000000 else diff - 0x100000000) & 0xFFFFFFFF
+                return (min(xi, yi) if op == "s_min_i32" else max(xi, yi)) & 0xFFFFFFFF
+            if op in ("s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32"):
+                return ((x << int(op[6])) + y) & 0xFFFFFFFF
+            if op in ("s_and_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32",
+                      "s_nand_b32", "s_nor_b32", "s_xnor_b32") and any(self.is_mask(ins, s) for s in a):
+                return None
+            folds = {
+                "s_and_b32": x & y, "s_xor_b32": x ^ y, "s_andn2_b32": x & ~y, "s_orn2_b32": x | ~y,
+                "s_nand_b32": ~(x & y), "s_nor_b32": ~(x | y), "s_xnor_b32": ~(x ^ y),
+                "s_lshl_b32": x << (y & 31), "s_lshr_b32": x >> (y & 31), "s_mul_i32": x * y,
+                "s_add_u32": x + y, "s_sub_u32": x - y, "s_add_i32": x + y, "s_sub_i32": x - y,
+                "s_min_u32": min(x, y), "s_max_u32": max(x, y),
+            }
             return folds[op] & 0xFFFFFFFF if op in folds else None
         return None
 
