@@ -62,6 +62,13 @@ PFN_vkCmdPipelineBarrier real_barrier = nullptr;
 PFN_vkCmdCopyImageToBuffer real_copy_i2b = nullptr;
 PFN_vkDestroySwapchainKHR real_destroy_swapchain = nullptr;
 PFN_vkDeviceWaitIdle real_device_wait_idle = nullptr;
+PFN_vkAcquireNextImageKHR real_acquire = nullptr;
+PFN_vkCreateSwapchainKHR real_create_swapchain = nullptr;
+PFN_vkQueueWaitIdle real_queue_wait_idle = nullptr;
+std::atomic<int> suboptimal_acquires{0};
+std::atomic<int> suboptimal_presents{0};
+std::atomic<std::uint32_t> swapchain_creates{0};
+std::atomic<std::uint32_t> queue_wait_idles{0};
 
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
@@ -111,7 +118,33 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoK
         on_next_present = {};
         cb();
     }
-    return real_present(queue, info);
+    const VkResult result = real_present(queue, info);
+    if (result == VK_SUCCESS && suboptimal_presents.load() > 0) {
+        suboptimal_presents.fetch_sub(1);
+        return VK_SUBOPTIMAL_KHR;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice device, VkSwapchainKHR swapchain, std::uint64_t timeout,
+                                                  VkSemaphore semaphore, VkFence fence, std::uint32_t* index) {
+    const VkResult result = real_acquire(device, swapchain, timeout, semaphore, fence, index);
+    if (result == VK_SUCCESS && suboptimal_acquires.load() > 0) {
+        suboptimal_acquires.fetch_sub(1);
+        return VK_SUBOPTIMAL_KHR;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info,
+                                                const VkAllocationCallbacks* alloc, VkSwapchainKHR* swapchain) {
+    swapchain_creates.fetch_add(1);
+    return real_create_swapchain(device, info, alloc, swapchain);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL queue_wait_idle(VkQueue queue) {
+    queue_wait_idles.fetch_add(1);
+    return real_queue_wait_idle(queue);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL wait_for_fences(VkDevice device, std::uint32_t count, const VkFence* fences,
@@ -161,6 +194,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     if (n == "vkWaitForFences") return reinterpret_cast<PFN_vkVoidFunction>(wait_for_fences);
     if (n == "vkCmdPipelineBarrier") return reinterpret_cast<PFN_vkVoidFunction>(cmd_pipeline_barrier);
     if (n == "vkCmdCopyImageToBuffer") return reinterpret_cast<PFN_vkVoidFunction>(cmd_copy_image_to_buffer);
+    if (n == "vkAcquireNextImageKHR") return reinterpret_cast<PFN_vkVoidFunction>(acquire_next_image);
+    if (n == "vkCreateSwapchainKHR") return reinterpret_cast<PFN_vkVoidFunction>(create_swapchain);
+    if (n == "vkQueueWaitIdle") return reinterpret_cast<PFN_vkVoidFunction>(queue_wait_idle);
     return real_get_device(device, name);
 }
 
@@ -179,6 +215,9 @@ void install(PFN_vkGetInstanceProcAddr instance_proc, VkInstance instance, VkDev
     real_wait = reinterpret_cast<PFN_vkWaitForFences>(real_get_device(device, "vkWaitForFences"));
     real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real_get_device(device, "vkCmdPipelineBarrier"));
     real_copy_i2b = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(real_get_device(device, "vkCmdCopyImageToBuffer"));
+    real_acquire = reinterpret_cast<PFN_vkAcquireNextImageKHR>(real_get_device(device, "vkAcquireNextImageKHR"));
+    real_create_swapchain = reinterpret_cast<PFN_vkCreateSwapchainKHR>(real_get_device(device, "vkCreateSwapchainKHR"));
+    real_queue_wait_idle = reinterpret_cast<PFN_vkQueueWaitIdle>(real_get_device(device, "vkQueueWaitIdle"));
 }
 }  // namespace driver
 
@@ -521,6 +560,44 @@ int main() {
         EXPECT(!driver::unexpected_submit_error.load());
         EXPECT(queue.idle() && worker_queue.idle());
         std::printf("presenter sync: synthetic WSI device-idle during swapchain destruction serialized ok\n");
+
+        EXPECT(presenter.present(1, true) == VK_SUCCESS);
+        const VkExtent2D before = presenter.extent();
+        driver::swapchain_creates.store(0);
+        driver::queue_wait_idles.store(0);
+        driver::suboptimal_acquires.store(6);
+        driver::suboptimal_presents.store(6);
+        for (int i = 0; i < 12; ++i) {
+            pump();
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);
+        }
+        EXPECT(driver::suboptimal_acquires.load() == 0 && driver::suboptimal_presents.load() == 0);
+        EXPECT(driver::swapchain_creates.load() == 0);
+        EXPECT(driver::queue_wait_idles.load() == 0);
+        EXPECT(presenter.extent().width == before.width && presenter.extent().height == before.height);
+        std::printf("presenter sync: 12 SUBOPTIMAL results on an unchanged surface rebuilt nothing ok\n");
+
+        RECT grown{0, 0, LONG(width * 2), LONG(height * 2)};
+        AdjustWindowRect(&grown, WS_OVERLAPPEDWINDOW, FALSE);
+        EXPECT(SetWindowPos(window, nullptr, 0, 0, grown.right - grown.left, grown.bottom - grown.top,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE));
+        pump();
+        RECT client{};
+        EXPECT(GetClientRect(window, &client));
+        driver::swapchain_creates.store(0);
+        driver::suboptimal_presents.store(1);
+        bool followed = false;
+        for (int i = 0; i < 20 && !followed; ++i) {
+            pump();
+            EXPECT(presenter.present(1, true) == VK_SUCCESS);
+            const VkExtent2D now = presenter.extent();
+            followed = now.width == std::uint32_t(client.right) && now.height == std::uint32_t(client.bottom);
+        }
+        driver::suboptimal_presents.store(0);
+        EXPECT(followed);
+        EXPECT(driver::swapchain_creates.load() >= 1);
+        EXPECT(queue.idle());
+        std::printf("presenter sync: SUBOPTIMAL after a resize rebuilt the swapchain at the new extent ok\n");
     }
 
     DestroyWindow(window);

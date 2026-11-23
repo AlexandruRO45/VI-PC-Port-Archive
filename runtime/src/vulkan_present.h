@@ -442,6 +442,11 @@ private:
             want_hdr = (planes->plane[0].hdr10) || (planes->count > 1 && planes->plane[1].hdr10);
         else if (binding)
             want_hdr = false;
+        if (suboptimal_ && swapchain_ && !stale_) {
+            suboptimal_ = false;
+            SwapchainChoice now{};
+            if (!choose(vsync_, swapchain_srgb_, swapchain_hdr_req_, now) || !(now == chosen_)) stale_ = true;
+        }
         if (vsync != vsync_ || stale_ || srgb != swapchain_srgb_ || want_hdr != swapchain_hdr_req_) {
             // The swapchain's colour encoding is only recorded once the new swapchain exists, so a failed
             // recreate is tried again at the next present.
@@ -478,7 +483,7 @@ private:
             return VK_SUCCESS;
         }
         if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) return acquired;  // nothing was acquired
-        if (acquired == VK_SUBOPTIMAL_KHR) stale_ = true;
+        if (acquired == VK_SUBOPTIMAL_KHR) suboptimal_ = true;
         // An out-of-date retry above may have given the swapchain another extent: the compose target follows it.
         if (planes && !prepare_compose()) return give_back(frame, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
@@ -602,8 +607,11 @@ private:
             mark_surface_lost();
             result = VK_SUCCESS;
         }
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             stale_ = true;
+            result = VK_SUCCESS;
+        } else if (result == VK_SUBOPTIMAL_KHR) {
+            suboptimal_ = true;
             result = VK_SUCCESS;
         }
         return result;
@@ -615,6 +623,23 @@ private:
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
         std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
+    };
+    struct SwapchainChoice {
+        VkExtent2D extent{};
+        VkSurfaceFormatKHR format{};
+        bool hdr = false;
+        VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+        VkImageUsageFlags usage = 0;
+        std::uint32_t min_images = 0;
+        VkSurfaceTransformFlagBitsKHR transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
+        bool operator==(const SwapchainChoice& o) const {
+            return extent.width == o.extent.width && extent.height == o.extent.height &&
+                   format.format == o.format.format && format.colorSpace == o.format.colorSpace && hdr == o.hdr &&
+                   mode == o.mode && usage == o.usage && min_images == o.min_images && transform == o.transform &&
+                   alpha == o.alpha && tear == o.tear;
+        }
     };
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
@@ -997,18 +1022,7 @@ private:
         captured_ = false;
     }
 
-    // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
-    // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
-    // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
-    bool recreate(bool vsync, bool srgb, bool hdr = false) {
-        auto& vk = context_.vk;
-        const VkDevice device = context_.device();
-        {
-            std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
-        }
-        stale_ = true;  // until this succeeds
-        tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    bool choose(bool vsync, bool srgb, bool hdr, SwapchainChoice& out) {
         VkSurfaceCapabilitiesKHR caps{};
         if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR_(physical_, surface_, &caps) != VK_SUCCESS) return false;
         VkExtent2D extent = caps.currentExtent;
@@ -1025,19 +1039,9 @@ private:
                 extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
             }
         }
-        if (extent.width == 0 || extent.height == 0) {
-            {
-                std::lock_guard lock(context_.submit_mutex());
-                release(swapchain_);
-            }
-            swapchain_ = VK_NULL_HANDLE;
-            vsync_ = vsync;
-            swapchain_srgb_ = srgb;
-            swapchain_hdr_req_ = hdr;
-            hdr_active_ = false;
-            stale_ = false;
-            return true;
-        }
+        out = SwapchainChoice{};
+        out.extent = extent;
+        if (extent.width == 0 || extent.height == 0) return true;
         VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (capture_) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         if ((caps.supportedUsageFlags & usage) != usage) return false;
@@ -1115,26 +1119,67 @@ private:
                 }
         }
 
+        out.format = chosen;
+        out.hdr = chose_hdr;
+        out.mode = mode;
+        out.usage = usage;
+        out.min_images = std::max(caps.minImageCount + 1, 2u);
+        if (caps.maxImageCount) out.min_images = std::min(out.min_images, caps.maxImageCount);
+        out.transform = caps.currentTransform;
+        out.alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        if (!(caps.supportedCompositeAlpha & out.alpha)) out.alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR)
+            out.tear = find_tear_mode(modes, out.min_images, out.usage, out.extent);
+#endif
+        return true;
+    }
+
+    // (Re)creates the swapchain for the surface's current size. A zero-sized surface (minimised) leaves no
+    // swapchain and is retried on the next present. Keep the old swapchain until the surface queries succeed and
+    // the replacement can be attempted. An incomplete replacement stays stale so the next present tries again.
+    bool recreate(bool vsync, bool srgb, bool hdr = false) {
+        auto& vk = context_.vk;
+        const VkDevice device = context_.device();
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+        }
+        stale_ = true;  // until this succeeds
+        tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
+        SwapchainChoice choice{};
+        if (!choose(vsync, srgb, hdr, choice)) return false;
+        const VkExtent2D extent = choice.extent;
+        if (extent.width == 0 || extent.height == 0) {
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                release(swapchain_);
+            }
+            swapchain_ = VK_NULL_HANDLE;
+            vsync_ = vsync;
+            swapchain_srgb_ = srgb;
+            swapchain_hdr_req_ = hdr;
+            hdr_active_ = false;
+            stale_ = false;
+            return true;
+        }
         VkSwapchainCreateInfoKHR info{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         info.surface = surface_;
-        info.minImageCount = std::max(caps.minImageCount + 1, 2u);
-        if (caps.maxImageCount) info.minImageCount = std::min(info.minImageCount, caps.maxImageCount);
-        info.imageFormat = chosen.format;
-        info.imageColorSpace = chosen.colorSpace;
+        info.minImageCount = choice.min_images;
+        info.imageFormat = choice.format.format;
+        info.imageColorSpace = choice.format.colorSpace;
         info.imageExtent = extent;
         info.imageArrayLayers = 1;
-        info.imageUsage = usage;
+        info.imageUsage = choice.usage;
         info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        info.preTransform = caps.currentTransform;
-        info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        if (!(caps.supportedCompositeAlpha & info.compositeAlpha)) info.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
-        info.presentMode = mode;
+        info.preTransform = choice.transform;
+        info.compositeAlpha = choice.alpha;
+        info.presentMode = choice.mode;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
         // A vsync swapchain that can also be presented in IMMEDIATE (or FIFO_RELAXED), switched per present.
         VkSwapchainPresentModesCreateInfoEXT switchable{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
         std::array<VkPresentModeKHR, 2> switchable_modes{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAX_ENUM_KHR};
-        VkPresentModeKHR tear = VK_PRESENT_MODE_MAX_ENUM_KHR;
-        if (vsync && mode == VK_PRESENT_MODE_FIFO_KHR) tear = find_tear_mode(modes, info.minImageCount, info.imageUsage, info.imageExtent);
+        const VkPresentModeKHR tear = choice.tear;
         if (tear != VK_PRESENT_MODE_MAX_ENUM_KHR) {
             switchable_modes[1] = tear;
             switchable.presentModeCount = 2;
@@ -1163,6 +1208,7 @@ private:
             vkDestroySwapchainKHR_(device, fresh, nullptr);
             return false;
         };
+        std::uint32_t count = 0;
         if (vkGetSwapchainImagesKHR_(device, fresh, &count, nullptr) != VK_SUCCESS || !count) return discard();
         images.resize(count);
         if (vkGetSwapchainImagesKHR_(device, fresh, &count, images.data()) != VK_SUCCESS) return discard();
@@ -1179,10 +1225,10 @@ private:
 #endif
         images_ = std::move(images);
         ready_ = std::move(ready);
-        format_ = chosen.format;
+        format_ = choice.format.format;
         extent_ = extent;
         extent_packed_ = (std::uint64_t(extent.width) << 32) | extent.height;
-        hdr_active_ = chose_hdr;
+        hdr_active_ = choice.hdr;
         if (capture_) {
             // A capture that cannot be made fails the recreation with the swapchain in place and stale_ still set.
             const bool four_bytes = format_ == VK_FORMAT_B8G8R8A8_UNORM || format_ == VK_FORMAT_R8G8B8A8_UNORM ||
@@ -1194,6 +1240,8 @@ private:
         vsync_ = vsync;
         swapchain_srgb_ = srgb;
         swapchain_hdr_req_ = hdr;
+        chosen_ = choice;
+        suboptimal_ = false;
         stale_ = false;
         return true;
     }
@@ -1285,6 +1333,8 @@ private:
     std::atomic<std::uint64_t> presented_{0};
     bool vsync_ = true;
     bool stale_ = false;
+    bool suboptimal_ = false;
+    SwapchainChoice chosen_{};
     bool ok_ = false;
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     bool swapchain_hdr_req_ = false;  // the swapchain was built for an HDR10 request (it has the format only if hdr_active_)
