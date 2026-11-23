@@ -13,7 +13,10 @@ Run:
 ```powershell
 cargo fmt --manifest-path runtime/xma_decoder/Cargo.toml -- --check
 cargo test --manifest-path runtime/xma_decoder/Cargo.toml --locked
-cargo build --manifest-path runtime/xma_decoder/Cargo.toml --locked
+cargo rustc --manifest-path runtime/xma_decoder/Cargo.toml --locked --lib -- --print native-static-libs
 ```
 
-The C++ smoke test is run by the xma2-decoder workflow with MSVC. It links ws2_32, userenv, and ntdll for Rust's Windows standard library.
+The xma2-decoder workflow compiles the C++ smoke test with MSVC's `/MD` flag to use the
+same CRT as the default Rust MSVC target. Pass the arguments from Rust's `native-static-libs`
+note to the linker in the order reported. The list comes from the toolchain that builds the
+decoder static library.
