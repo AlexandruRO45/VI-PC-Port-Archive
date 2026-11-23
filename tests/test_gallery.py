@@ -275,6 +275,22 @@ class TestGalleryServer(unittest.TestCase):
                 self.assertEqual(status, 403)
                 self.assertNotIn(secret, body)
 
+    def test_dds_preview_finds_a_suffix_of_any_case(self) -> None:
+        # The catalog keeps the on-disk name, but its preview URL always ends in lowercase ".png" and the handler
+        # rebuilds the source as "<stem>.dds", which misses on a case-sensitive filesystem.
+        os.makedirs(os.path.join(self.textures_dir, "sub"), exist_ok=True)
+        for rel in ("UPPER.DDS", "MiXeD.DdS", "sub/Deep.DDS"):
+            with open(os.path.join(self.textures_dir, rel), "wb") as f:
+                f.write(_make_1x1_rgba_dds())
+            stem = os.path.splitext(rel)[0]
+            with self.subTest(rel=rel):
+                found = gallery.dds_source_any_case(self.textures_dir, stem)
+                self.assertEqual(os.path.basename(found or ""), os.path.basename(rel))
+                status, head, body = _raw_get(self.port, f"/textures/{stem}.png")
+                self.assertEqual(status, 200)
+                self.assertIn("Content-Type: image/png", head)
+                self.assertTrue(body.startswith(b"\x89PNG"))
+
     def test_dds_symlink_escape_is_forbidden(self) -> None:
         link = os.path.join(self.textures_dir, "escaped.dds")
         try:
