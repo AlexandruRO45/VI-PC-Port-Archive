@@ -1,10 +1,11 @@
 ; Lanterns compute shader (stage 3): moves the rising light points one step and writes the instance records the
 ; draw reads. Packed by ../fssm_pack.py: the FSSM header carries the thread-group size and COMPUTE_PGM_RSRC2 at
-; 0x138 (docs/design.md, "Compute shaders"). RSRC2 0x8c = six user SGPRs and TGID_X, so the group index is s6.
+; 0x138 (docs/design.md, "Compute shaders"). RSRC2 0x8c before D3D-448 (now 0x92, see the moves below) = six user
+; SGPRs and TGID_X, so the group index is s6.
 ; stage: cs
 ; wave: 32
 ; group: 64,1,1
-; rsrc2: 0x8c
+; rsrc2: 0x92
 ;
 ; User SGPRs, from the root signature [0] four 32-bit constants, [1] a table of two UAVs:
 ;   s0 = top (896)   s1 = range (832)   s2, s3 unused
@@ -16,6 +17,19 @@
 ;   offset = (x, y, z) / 256       scale = 0.125 + 0.0625 * bit 8
 ;   colour = (1, (5 + bits 9-10) / 8, (1 + bits 11-12) / 8, 1)
 ; lanterns_particles.h does the same on the CPU.
+; D3D-448: a D3D12 compute PSO gets its root arguments in the console layout (rt::rootsig::pack_stage,
+; docs/d3d12_vulkan.md section 3.5): from s4 in root-signature order, a descriptor table as ONE dword (the 32-bit
+; VA of its first descriptor; the heaps live below 4 GiB), a constant one dword per value; s0..s3 are the driver's.
+; RSRC2 0x92 therefore counts 9 user SGPRs (4 + 5), and the thread-group ids follow at s9. These moves rebuild the
+; layout the code below was written for: constants s4..s7 -> s0..s3; table s8 -> s[4:5] (high half 0); thread-group id
+; s9 -> s6.
+s_mov_b32 s0, s4
+s_mov_b32 s1, s5
+s_mov_b32 s2, s6
+s_mov_b32 s3, s7
+s_mov_b32 s4, s8
+s_mov_b32 s5, 0
+s_mov_b32 s6, s9
 s_load_dwordx4 s[8:11], s[4:5], 0x0
 s_load_dwordx4 s[12:15], s[4:5], 0x20
 s_lshl_b32 s7, s6, 6
