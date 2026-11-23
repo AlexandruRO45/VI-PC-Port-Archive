@@ -307,6 +307,84 @@ class TestVAshrrevI16ScalarInterpreter(unittest.TestCase):
         self.assertEqual(res, 0xABCD000A)
         self.assertEqual(self.state.get_vgpr(VGPR(0)), 0xABCD000A)
 
+class SIMDWaveState:
+    """Architectural state for a 32-lane or 64-lane SIMD wave."""
+
+    def __init__(self, wave_size: int = 32) -> None:
+        self.wave_size = wave_size
+        self.exec_mask = (1 << wave_size) - 1
+        self.lanes = [ScalarThreadState() for _ in range(wave_size)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool((self.exec_mask >> lane_id) & 1)
+
+
+class SIMDVALUInterpreter:
+    """Multi-lane SIMD interpreter for vector ALU instructions."""
+
+    def execute_wave(self, wave: SIMDWaveState, inst: VAshrrevI16Instruction) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * wave.wave_size
+        for lane_id in range(wave.wave_size):
+            if wave.is_lane_active(lane_id):
+                st = wave.lanes[lane_id]
+                val0 = st.get_vgpr(inst.src0) if isinstance(inst.src0, VGPR) else inst.src0
+                val1 = st.get_vgpr(inst.src1) if isinstance(inst.src1, VGPR) else inst.src1
+                old_dst = st.get_vgpr(inst.vdst)
+
+                res = ref_v_ashrrev_i16(val0, val1, old_dst=old_dst, e64=inst.e64, op_sel=inst.op_sel)
+                st.set_vgpr(inst.vdst, res)
+                results[lane_id] = res
+        return results
+
+
+class TestVAshrrevI16SIMDDivergenceAndExecMask(unittest.TestCase):
+    """Part 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.interp = SIMDVALUInterpreter()
+
+    def test_divergent_lanes_wave32(self) -> None:
+        wave = SIMDWaveState(wave_size=32)
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v0, v1, v2")
+
+        for i in range(32):
+            shift_amt = i % 16
+            val_in = 0xFF00 if (i % 2 == 0) else 0x0100
+            wave.lanes[i].set_vgpr(VGPR(1), shift_amt)
+            wave.lanes[i].set_vgpr(VGPR(2), val_in)
+
+        results = self.interp.execute_wave(wave, inst)
+
+        for i in range(32):
+            shift_amt = i % 16
+            val_in = 0xFF00 if (i % 2 == 0) else 0x0100
+            expected = ref_v_ashrrev_i16(shift_amt, val_in)
+            self.assertEqual(results[i], expected)
+            self.assertEqual(wave.lanes[i].get_vgpr(VGPR(0)), expected)
+
+    def test_exec_masking_wave64(self) -> None:
+        wave = SIMDWaveState(wave_size=64)
+        mask = 0
+        for i in range(0, 64, 2):
+            mask |= (1 << i)
+        wave.exec_mask = mask
+
+        inst = VAshrrevI16Instruction.parse("v_ashrrev_i16 v0, v1, v2")
+        for i in range(64):
+            wave.lanes[i].set_vgpr(VGPR(1), 1)
+            wave.lanes[i].set_vgpr(VGPR(2), 20)
+            wave.lanes[i].set_vgpr(VGPR(0), 0xDEADBEEF)
+
+        results = self.interp.execute_wave(wave, inst)
+
+        for i in range(64):
+            if i % 2 == 0:
+                self.assertEqual(results[i], 10)
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(0)), 10)
+            else:
+                self.assertIsNone(results[i])
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(0)), 0xDEADBEEF)
+
 
 if __name__ == '__main__':
     unittest.main()
