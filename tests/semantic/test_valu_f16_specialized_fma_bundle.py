@@ -286,5 +286,37 @@ class TestVFmaakF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & 0xFFFF, 0x4100)
 
+def ref_v_fmamk_f16(s0: int, k: int, s1: int, old_dst: int = 0) -> int:
+    if is_nan_f16(s0) or is_nan_f16(k) or is_nan_f16(s1):
+        res_f16 = 0x7E00
+    else:
+        fa = bits_to_f16(s0 & 0xFFFF)
+        fk = bits_to_f16(k & 0xFFFF)
+        fb = bits_to_f16(s1 & 0xFFFF)
+        r = fa * fk + fb
+        if math.isnan(r):
+            res_f16 = 0x7E00
+        elif math.isinf(r):
+            res_f16 = 0x7C00 if r > 0 else 0xFC00
+        else:
+            res_f16 = f16_to_bits(r)
+    return ((old_dst & 0xFFFF0000) | (res_f16 & 0xFFFF)) & MASK32
+
+GLOBAL_ORACLE_MAP[Opcode.V_FMAMK_F16] = ref_v_fmamk_f16
+
+
+class TestVFmamkF16Oracle(unittest.TestCase):
+    def test_basic_arithmetic(self) -> None:
+        # 1.0 * 2.0 + 0.5 = 2.5 (0x4100)
+        res = ref_v_fmamk_f16(0x3C00, 0x4000, 0x3800, old_dst=0xCAFE0000)
+        self.assertEqual(res & 0xFFFF, 0x4100)
+        self.assertEqual(res >> 16, 0xCAFE)
+
+    def test_zero_and_identity(self) -> None:
+        # 0.0 * 2.0 + 1.0 = 1.0 (0x3C00)
+        res = ref_v_fmamk_f16(0x0000, 0x4000, 0x3C00, old_dst=0x43210000)
+        self.assertEqual(res & 0xFFFF, 0x3C00)
+        self.assertEqual(res >> 16, 0x4321)
+
 if __name__ == "__main__":
     unittest.main()
