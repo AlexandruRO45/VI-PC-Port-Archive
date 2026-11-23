@@ -541,5 +541,18 @@ class TestPermB32U16ConditionCodesAndStatus(unittest.TestCase):
         self.assertTrue(flags.has_max)
         self.assertTrue(flags.has_mid)
 
+# ==============================================================================
+# Unsigned Integer Extremes and Boundary Handling
+# ==============================================================================
+
+class TestPermB32U16Boundaries(unittest.TestCase):
+    def test_max_zero_boundary_preservation(self):
+        src1 = pack_halves(UINT16_ZERO, UINT16_MAX)
+        src0 = pack_halves(UINT16_ONE, UINT16_MID)
+        sel = PermSelectorWord.identity_src1().raw
+        res = oracle_v_perm_b32_u16(src0, src1, sel)
+        self.assertEqual(extract_half(res, 0), UINT16_ZERO)
+        self.assertEqual(extract_half(res, 1), UINT16_MAX)
+
 if __name__ == "__main__":
     unittest.main()
