@@ -617,7 +617,8 @@ Chunk records add `distinct_models` (meshes stored) and `stored_triangles`; `tri
 `--lod-sets` places every `lodLevel` (unless `--lod-levels` narrows it) and builds one chunk set per tier, ids
 `c_<tier>_<x>_<z>` with tiers `hd`, `lod`, `slod1`, `slod2`, `slod3`, `slod4` and `orphan_hd`. Each chunk record
 names its `lod` tier and its grid `cell` (`[minx, minz, maxx, maxz]`, glTF metres). `world.json` gets
-`lod_bands`: for each tier, the camera distance band in which it is drawn, from the selected entities:
+`lod_bands`: for each tier, the camera distance band in which it is drawn, measured from placements that
+make it into the exported chunks.
 
 - a tier starts at its own median `childLodDist` (the distance inside which a parent hands over to its children);
   HD starts at 0;

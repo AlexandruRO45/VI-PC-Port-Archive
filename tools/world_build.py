@@ -567,15 +567,9 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
     inst_flags = array.array("b")          # bit 0 mirrored, bit 1 unverified
     inst_trs = array.array("d")            # 10 per instance: translation xyz, rotation xyzw, scale xyz
     inst_tier = array.array("b")           # lodLevel, used with lod_sets
-    child_lod: dict[int, array.array] = {}
-    lod_dist: dict[int, array.array] = {}
+    inst_lod_distances = array.array("d") if lod_sets else None
     for row in iter_placements(placements, counts, lod_levels, region):
         lvl = row.get("lod_level")
-        if lod_sets:
-            for src, dst in (("child_lod_dist", child_lod), ("lod_dist", lod_dist)):
-                v = row.get(src)
-                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0:
-                    dst.setdefault(lvl, array.array("d")).append(float(v))
         found, outcome = resolve_placement(index, row["_arch"], row.get("key"))
         if found is None:
             counts[outcome] += 1
@@ -594,6 +588,13 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         inst_flags.append((1 if mirrored else 0) | (2 if outcome == "placed_unverified" else 0))
         inst_trs.extend(t + q + sc)
         inst_tier.append(lvl if lod_sets else 0)
+        if inst_lod_distances is not None:
+            for field in ("child_lod_dist", "lod_dist"):
+                v = row.get(field)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0:
+                    inst_lod_distances.append(v)
+                else:
+                    inst_lod_distances.append(0.0)
 
     abs_out = os.path.abspath(out_dir)
     chunks_dir = os.path.join(abs_out, "chunks")
@@ -617,6 +618,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         del jobs
 
         cells: dict[tuple[int, int], array.array] = {}
+        child_lod: dict[int, array.array] = {}
+        lod_dist: dict[int, array.array] = {}
         for i in range(len(inst_model)):
             summary = info[inst_model[i]]
             if summary is None:
@@ -629,9 +632,16 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
                 box = [box[0], -box[4], box[2], box[3], -box[1], box[5]]
             v = inst_trs[i * 10:i * 10 + 10]
             b = glb_mod.instance_bounds(box[:3], box[3:], v[0:3], v[3:7], v[7:10])
-            key = (inst_tier[i], math.floor(0.5 * (b[0] + b[3]) / chunk_size),
+            tier = inst_tier[i]
+            key = (tier, math.floor(0.5 * (b[0] + b[3]) / chunk_size),
                    math.floor(0.5 * (b[2] + b[5]) / chunk_size))
             cells.setdefault(key, array.array("l")).append(i)
+            if inst_lod_distances is not None:
+                for offset, samples in enumerate((child_lod, lod_dist)):
+                    distance = inst_lod_distances[i * 2 + offset]
+                    if distance:
+                        samples.setdefault(tier, array.array("d")).append(distance)
+        del inst_lod_distances
         used = {inst_model[i] for arr in cells.values() for i in arr}
         counts["distinct_models"] = len(used)
         if not cells and limit != 0:
