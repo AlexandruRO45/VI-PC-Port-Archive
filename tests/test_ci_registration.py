@@ -5,7 +5,7 @@
 ``.github/workflows/ci.yml`` splits ``tests/test_*.py`` between two jobs with a single predicate
 (``PYTEST_FILE_MARKERS``, or no ``__main__``): the standard-library loop in ``check`` runs the rest with
 ``python -I``, and ``translator-tests`` hands the matched files to pytest.  ``tests/semantic/`` goes to
-``unittest discover`` and ``tests/*.cjs`` to ``node --test``.  This is the test-file counterpart of
+``unittest discover`` (one file per process, ``scripts/run_semantic_tests.py``) and ``tests/*.cjs`` to ``node --test``.  This is the test-file counterpart of
 ``tests/test_ctest_registration.py``: it reads the patterns from the workflow (not from a copy, so it cannot
 drift) and fails on the three ways a test goes missing without CI turning red --
 
@@ -62,7 +62,8 @@ def ci_rules(root):
     # The check loop and the translator list share this one find expression.
     pruned, loop_glob = find(r"-path\s+'([^']+)'\s+-prune\s+-o\s+-type\s+f\s+-name\s+'([^']+)'",
                              "the tests/test_*.py scan")
-    (semantic,) = find(r"python\s+-m\s+unittest\s+discover\s+-s\s+(\S+)", "unittest discover -s")
+    (semantic,) = find(r"(?:python\s+-m\s+unittest\s+discover\s+-s|scripts/run_semantic_tests\.py\s+--start)\s+(\S+)",
+                       "the semantic folder (unittest discover -s, or run_semantic_tests.py --start)")
     (viewer,) = find(r"node\s+--test\s+(\S+)", "node --test")
     if re.search(r"unittest\s+discover[^\n]*-p\s", text):
         raise AssertionError("unittest discover now passes -p; this test assumes its default 'test*.py' pattern")
