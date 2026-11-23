@@ -207,3 +207,66 @@ class TestSaluAndn2SaveexecB64AST(unittest.TestCase):
         )
         with self.assertRaises(TypeError):
             inst.validate()
+
+
+class ScalarRegisterState:
+    """Simulated state of GCN/RDNA Scalar Registers (SGPRs, EXEC, and SCC)."""
+
+    def __init__(self, exec_mask: int = ALL_LANES_ACTIVE):
+        self.sgpr = [0] * 106
+        self.exec_mask = u64(exec_mask)
+        self.scc = 0
+
+    def read_operand_u64(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.SGPR:
+            lo = self.sgpr[op.index]
+            hi = self.sgpr[op.index + 1]
+            return (hi << 32) | lo
+        elif op.kind == OperandKind.EXEC:
+            return self.exec_mask
+        elif op.kind in (OperandKind.LITERAL64, OperandKind.INLINE_CONST):
+            return op.value
+        raise ValueError(f"Unsupported operand kind for read: {op.kind}")
+
+    def write_sgpr_u64(self, index: int, val: int) -> None:
+        val = u64(val)
+        self.sgpr[index] = val & MASK32
+        self.sgpr[index + 1] = (val >> 32) & MASK32
+
+    def execute(self, inst: ASTInstruction) -> tuple[int, int, int]:
+        inst.validate()
+        s0 = self.read_operand_u64(inst.src0)
+        old_exec = self.exec_mask
+        new_exec, sdst_val, scc = ref_andn2_saveexec_b64(s0, old_exec)
+
+        if inst.dst.kind == OperandKind.SGPR:
+            self.write_sgpr_u64(inst.dst.index, sdst_val)
+        elif inst.dst.kind == OperandKind.EXEC:
+            self.exec_mask = sdst_val
+
+        self.exec_mask = new_exec
+        self.scc = scc
+        return new_exec, sdst_val, scc
+
+
+class TestSaluAndn2SaveexecB64ScalarInterpreter(unittest.TestCase):
+    """Test suite for deterministic scalar instruction execution."""
+
+    def test_scalar_interpreter_execution(self):
+        state = ScalarRegisterState(exec_mask=0x0000FFFFFFFF0000)
+        state.write_sgpr_u64(2, 0x00000000FFFFFFFF)
+        inst = ASTInstruction(
+            opcode=Opcode.S_ANDN2_SAVEEXEC_B64,
+            dst=ASTOperand.sgpr(0, 2),
+            src0=ASTOperand.sgpr(2, 2),
+        )
+        new_exec, sdst, scc = state.execute(inst)
+        # old_exec = 0x0000FFFFFFFF0000 -> ~old_exec has bits 0..15 and 48..63 set
+        # s0 = 0x00000000FFFFFFFF (bits 0..31 set)
+        # new_exec = s0 & ~old_exec = bits 0..15 set = 0x000000000000FFFF
+        self.assertEqual(new_exec, 0x000000000000FFFF)
+        self.assertEqual(sdst, 0x0000FFFFFFFF0000)
+        self.assertEqual(state.exec_mask, 0x000000000000FFFF)
+        self.assertEqual(state.sgpr[0], 0xFFFF0000)
+        self.assertEqual(state.sgpr[1], 0x0000FFFF)
+        self.assertEqual(state.scc, 1)
