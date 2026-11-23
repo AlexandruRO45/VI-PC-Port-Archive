@@ -377,6 +377,38 @@ bool check_unlisted_rtvs(ID3D12Device* device) {
 }
 } // namespace
 
+// The two RTVs share a resource format and castable list. Check the exact stored bits for each view. Needs no host
+// reference, so it runs where WARP is unavailable.
+bool check_castable_r32_rtvs(ID3D12Device* ours) {
+    constexpr DXGI_FORMAT r32_castable[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT};
+    struct R32Clear { DXGI_FORMAT view; FLOAT red; std::uint32_t bits; };
+    constexpr R32Clear r32_clears[] = {
+        {DXGI_FORMAT_R32_FLOAT, 1.0f, 0x3f800000},
+        {DXGI_FORMAT_R32_UINT, 5.0f, 5},
+    };
+    bool ok = true;
+    for (const auto& test : r32_clears) {
+        const FLOAT color[4]{test.red, 0, 0, 0};
+        std::vector<unsigned char> actual;
+        if (!clear_and_read(ours, DXGI_FORMAT_R32_FLOAT, 4, color, color, actual, false, test.view, r32_castable)) {
+            std::fprintf(stderr, "castable R32 RTV %d: clear or readback failed\n", int(test.view));
+            ok = false;
+            continue;
+        }
+        for (std::size_t offset = 0; offset < actual.size(); offset += sizeof(test.bits)) {
+            std::uint32_t bits;
+            std::memcpy(&bits, actual.data() + offset, sizeof(bits));
+            if (bits != test.bits) {
+                std::fprintf(stderr, "castable R32 RTV %d at byte %zu: got %08x, expected %08x\n", int(test.view),
+                             offset, unsigned(bits), unsigned(test.bits));
+                ok = false;
+                break;
+            }
+        }
+    }
+    return ok;
+}
+
 int main(int argc, char** argv) {
     const bool volume_only = argc == 2 && std::strcmp(argv[1], "--volume") == 0;
     const bool rgb9e5_only = argc == 2 && std::strcmp(argv[1], "--rgb9e5") == 0;
@@ -417,6 +449,7 @@ int main(int argc, char** argv) {
             }
             return check_shared_exponent_target(ours.p) ? 0 : 1;
         }
+        if (!check_castable_r32_rtvs(ours.p)) return 1;
         Ref<IDXGIFactory4> factory;
         Ref<IDXGIAdapter> warp;
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
@@ -495,33 +528,6 @@ int main(int argc, char** argv) {
                     break; // first mismatch per format; keep checking the other formats
                 }
                 ++cases_checked;
-            }
-        }
-        // The two RTVs share a resource format and castable list. Check the exact stored bits for each view.
-        constexpr DXGI_FORMAT r32_castable[] = {DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT};
-        struct R32Clear { DXGI_FORMAT view; FLOAT red; std::uint32_t bits; };
-        constexpr R32Clear r32_clears[] = {
-            {DXGI_FORMAT_R32_FLOAT, 1.0f, 0x3f800000},
-            {DXGI_FORMAT_R32_UINT, 5.0f, 5},
-        };
-        for (const auto& test : r32_clears) {
-            const FLOAT color[4]{test.red, 0, 0, 0};
-            std::vector<unsigned char> actual;
-            if (!clear_and_read(ours.p, DXGI_FORMAT_R32_FLOAT, 4, color, color, actual, false,
-                                test.view, r32_castable)) {
-                std::fprintf(stderr, "castable R32 RTV %d: clear or readback failed\n", int(test.view));
-                ++format_failures;
-                continue;
-            }
-            for (std::size_t offset = 0; offset < actual.size(); offset += sizeof(test.bits)) {
-                std::uint32_t bits;
-                std::memcpy(&bits, actual.data() + offset, sizeof(bits));
-                if (bits != test.bits) {
-                    std::fprintf(stderr, "castable R32 RTV %d at byte %zu: got %08x, expected %08x\n",
-                                 int(test.view), offset, unsigned(bits), unsigned(test.bits));
-                    ++format_failures;
-                    break;
-                }
             }
         }
         // RTVs through a castable-format list in another channel order or family, or a typed BGRA8 texture's sRGB
