@@ -1009,12 +1009,19 @@ the game's present entry point (`PresentX`; the DXGI factory/swapchain and the p
     there. Vertex and geometry stages are in neither list.
   - **A size the device cannot give** is logged once per stage with the first shader's name (and again at 10, 100,
     1000 shaders of that stage): `[rt] d3d12: <name> (<stage>) is a 64-wide shader but this device cannot require that
-    subgroup size ...`. For compute and mesh the fix is the build, `--wave64-emulate` (`make_game.py
-    --wave64-emulate auto` picks it for this GPU); a wave64 vertex, geometry or pixel shader has no emulation yet
-    (the ~10,000 wave64 pixel shaders are the open case on NVIDIA, SHADER-10).
+    subgroup size ...`. A wave64 vertex, geometry or pixel shader has no emulation yet, so its PSO is still built
+    and runs at the device's size (the ~10,000 wave64 pixel shaders are the open case on NVIDIA, SHADER-10).
+  - **A native wave64 compute shader where 64 cannot be had is refused:** `CreateComputePipelineState` returns
+    `E_NOTIMPL` with one line, `[rt] d3d12: <name> (cs) is a native wave64 shader and this device has no 64-wide
+    subgroup for the stage ... pipeline refused` (same once-per-stage rate), instead of a pipeline that reads lanes
+    32-63 that are not there and gives wrong results without an error. For compute and mesh the fix is the build,
+    `--wave64-emulate` (`make_game.py --wave64-emulate auto` picks it for this GPU), which is exact on any size
+    (`subgroup_refused` in `src/subgroup_size.h`; mesh PSOs, once they exist, can refuse the same way).
   - **Test:** `subgroup_size_test` (CPU) checks the decision against AMD-like, NVIDIA-like and old-RADV
     properties and the resulting create-info chain; `d3d12_subgroup_test` (GPU) runs `cs_w64x_readlane` natively
-    and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words.
+    and with `--wave64-emulate`, and `cs_wqm_w32`, through D3D12 PSOs and compares the read-back words; on a device
+    without 64-wide compute subgroups, and on any device told it has 32-wide subgroups only, the native PSO must be
+    refused.
 
 Known gaps: set 0 in pipelines (the device keeps the bindless set, but no pipeline declares or binds it yet) and
 therefore every translated shader that declares bindings; tessellation, geometry and mesh pipelines,
