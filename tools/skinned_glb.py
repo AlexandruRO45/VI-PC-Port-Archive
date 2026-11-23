@@ -553,7 +553,12 @@ class PaletteResolver:
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
                 self.by_hash.setdefault(joaat32(name), (name, "own"))
-        for text in drawable.get("strings") or []:
+        strings = drawable.get("strings")
+        if strings is None:
+            strings = []
+        if not isinstance(strings, list):
+            raise SkinError("drawable strings must be a list")
+        for text in strings:
             if not isinstance(text, str) or not text:
                 continue
             self._add_string(text, "string")

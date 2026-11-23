@@ -859,6 +859,32 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertTrue(os.path.exists(new_buf))
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
+    def test_cli_rejects_non_list_drawable_strings_without_replacing_output(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root)
+        model_path = os.path.join(component, "model.json")
+        model = _read_model(component)
+        output = os.path.join(self.root, "out.glb")
+        previous = b"previous output"
+        for strings in (7, False, "SyntheticBone", {}, {"SyntheticBone": 1}):
+            with self.subTest(strings=strings):
+                model["drawable"]["strings"] = strings
+                _write_json(model_path, model)
+                with open(output, "wb") as handle:
+                    handle.write(previous)
+                result = self._run_cli(skeleton, component)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["error: drawable strings must be a list"])
+                self.assertEqual(_read(output), previous)
+
+    def test_palette_resolver_keeps_optional_and_mixed_string_lists(self):
+        for drawable in ({}, {"strings": None}, {"strings": []}):
+            with self.subTest(drawable=drawable):
+                resolver = skinned_glb.PaletteResolver({"drawable": drawable}, {})
+                self.assertEqual(resolver.by_hash, {})
+        resolver = skinned_glb.PaletteResolver({"drawable": {"strings": [None, 7, "", "synthetic"]}}, {})
+        self.assertEqual(resolver.resolve(skinned_glb.joaat32("synthetic")), ("synthetic", "string"))
+
 
 if __name__ == "__main__":
     unittest.main()
