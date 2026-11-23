@@ -242,8 +242,13 @@ def main():
           f"{gfx10_diff} disagree with Mesa's GFX10 column, "
           f"{wave_diff} wave32/wave64 differences")
     if args.json_out:
-        with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
+        try:
+            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=2)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.json_out}: {getattr(exc, 'strerror', None) or exc}",
+                  file=sys.stderr)
+            return 2
     return 1 if gfx11_diff or wave_diff else 0
 
 
