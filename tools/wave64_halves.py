@@ -1415,13 +1415,13 @@ class Analysis:
 
     @staticmethod
     def narrowing_exec_write(ins, vote_masks):
-        """True when this EXEC write can only switch lanes off: EXEC AND (or AND-NOT) a mask, the and-saveexec
-        family, a v_cmpx, or the run side's `s_mov_b64 exec, M` of a vote on M (that vote's lanes are a subset of
+        """True when this EXEC write can only switch lanes off: EXEC AND (or AND-NOT) a mask, the and/andn1 saveexec and
+        wrexec forms (andn2 sets EXEC to S & ~EXEC, the lanes that were off: the switch to the else lanes), a v_cmpx, or the run side's `s_mov_b64 exec, M` of a vote on M (that vote's lanes are a subset of
         EXEC, as vote() checks)."""
         op, a = base_op(ins["op"]), ins["args"]
         if op.startswith("v_cmpx"):
             return True
-        if op.startswith(("s_and_saveexec_b64", "s_andn2_saveexec_b64", "s_and_wrexec_b64", "s_andn2_wrexec_b64")):
+        if op.startswith(("s_and_saveexec_b64", "s_andn1_saveexec_b64", "s_and_wrexec_b64", "s_andn1_wrexec_b64")):
             return True
         if op in ("s_and_b64", "s_andn2_b64") and len(a) == 3 and _regs(a[0]) == ["exec"]:
             return _regs(a[1]) == ["exec"] or (op == "s_and_b64" and _regs(a[2]) == ["exec"])

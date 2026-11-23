@@ -84,6 +84,11 @@ def _skip_then_def(first, define, widen):
 
 WIDENED_OR = _skip_then_def("v_cmp_gt_u32_e64 s[16:17], 0, v0", "s_or_b64 s[16:17], vcc, s[16:17]", True)
 WIDENED_ANDN2 = _skip_then_def("s_mov_b64 s[16:17], exec", "s_andn2_b64 s[16:17], s[16:17], vcc", True)
+# @shdann on #4656: the run side's EXEC write in the place of the restore; andn2 switches to the lanes that were off
+def _skip_then_exec_write(write):
+    return [write if x == "s_mov_b64 exec, s[10:11]" and i == 4 else x for i, x in enumerate(WIDENED_OR)]
+ELSE_SWITCHES = ("s_andn2_saveexec_b64 s[14:15], s[12:13]", "s_andn2_wrexec_b64 s[14:15], s[12:13]")
+NARROWINGS = ("s_andn1_saveexec_b64 s[14:15], s[12:13]", "s_andn1_wrexec_b64 s[14:15], s[12:13]")
 NARROWED_OR = _skip_then_def("v_cmp_gt_u32_e64 s[16:17], 0, v0", "s_or_b64 s[16:17], vcc, s[16:17]", False)
 
 
@@ -481,6 +486,22 @@ class Execution(unittest.TestCase):
         tier, whole, halves = self.run_both("vs_c_widened", vs(WIDENED_OR))
         self.assertEqual(tier, "C")
         self.assertNotEqual(whole, halves)
+
+    def test_andn2_saveexec_and_wrexec_switch_to_the_else_lanes_differ_and_are_c(self):
+        # @shdann on #4656: S & ~EXEC turns on the lanes that were off, so it is not a narrowing
+        for write in ELSE_SWITCHES:
+            with self.subTest(write):
+                tier, whole, halves = self.run_both("vs_c_else_switch", vs(_skip_then_exec_write(write)))
+                self.assertEqual(tier, "C")
+                self.assertNotEqual(whole, halves)
+
+    def test_andn1_saveexec_and_wrexec_narrow_and_run_the_same(self):
+        # the control: ~S & EXEC only switches lanes off
+        for write in NARROWINGS:
+            with self.subTest(write):
+                tier, whole, halves = self.run_both("vs_a_andn1", vs(_skip_then_exec_write(write)))
+                self.assertEqual(tier, "A")
+                self.assertEqual(whole, halves)
 
     def test_lane_local_def_while_exec_stays_narrowed_is_a(self):
         # the control: without the restore the lanes of the skipping half stay off at the compare
