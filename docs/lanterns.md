@@ -259,13 +259,16 @@ contribution is an interval, because the rebuilt position is known only within t
 - The albedo target must be exact on every certain pixel; probes of the normal codes and the view depth must be within
   their bounds (D3D12 lets a float-to-UNORM conversion be off by 0.6 ULP).
 - Every single-colour pixel of the lit frame must be exact, every other certain pixel within its bounds.
-- Each tile's list must be exactly the set of lights whose sphere meets its box.
+- Each tile's list must be exactly the set of lights whose sphere meets its box. The one tolerance: a light within 2e-3
+  of the box test's threshold (the GPU forms the same numbers in float) may go either way. The PASS line gives how many
+  light-tile pairs are in that band (6 of 98,304 here), and more than 32 fails, so a culling error hiding inside the band
+  would have to stay that small.
 - The output and list buffers start poisoned, and with culling off (every light in every tile) the image must be the
   same bit for bit.
 - Control: one light moved must change exactly the pixels the reference predicts and keep every other pixel.
 
 ```
-Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo 98144 of 98144 exact, RGB10A2 normal and R32F depth 52643 of 52643 probes), 75462 of 75462 single-colour pixels exact through tiled culling with LDS atomics (10.4 of 256 lights per tile, the exact set in 384 of 384 tiles), culling off gave the same image bit for bit from poisoned buffers, one light moved changed 1231 of 1231 predicted pixels
+Lanterns stage 9: PASS, G-buffer of 3 MRTs (RGBA8 albedo 98144 of 98144 exact, RGB10A2 normal and R32F depth 52643 of 52643 probes), 75462 of 75462 single-colour pixels exact through tiled culling with LDS atomics (10.4 of 256 lights per tile, the exact set in 384 of 384 tiles, 6 light-tile pairs within 2e-3 of the box test left free), culling off gave the same image bit for bit from poisoned buffers, one light moved changed 1231 of 1231 predicted pixels
 ```
 
 ## Build and run
@@ -280,7 +283,7 @@ Windows (native):
 ```sh
 cmake -S runtime -B runtime/build -DLEONIDA_TEST_LANTERNS=ON
 cmake --build runtime/build --config RelWithDebInfo --target gta6rt lanterns
-ctest --test-dir runtime/build -C RelWithDebInfo -R lanterns_stage1 --output-on-failure
+ctest --test-dir runtime/build -C RelWithDebInfo -R lanterns_stage --output-on-failure
 ```
 
 Linux with Wine: cross-build with `runtime/cmake/clang-cl-xwin.cmake` as in
@@ -293,6 +296,9 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" xvfb-run -a python3 -I runtime/test
     --gta6rt $B/gta6rt.exe --guest $B/fixtures/lanterns/RelWithDebInfo/lanterns.exe \
     --shaders $B/generated/lanterns --out $B/lanterns_out --stage 1
 ```
+
+There is one ctest per stage (`lanterns_stage1`, `lanterns_stage3`, ...; `-R lanterns_stage9` runs one), and the
+runner takes any stage in the table with `--stage N`.
 
 The packed containers are in `<build>/generated/lanterns/*.dxbc`. The translated shaders and their index
 (`spirv/index.json`, keyed by FSSM SHA-256) are in the same folder. The runner points `LEONIDA_SHADERS` at that

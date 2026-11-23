@@ -191,15 +191,22 @@ bool Gpu::create_pipelines(const Shaders& shaders) {
             desc.VS = {shaders.vs.data(), shaders.vs.size()};   // not the G-buffer pass: it skipped the pair
         }
     // The lookup control: the guest's own container of the VS program must give a pipeline, and the same writer's
-    // container with one name byte changed must be refused, so the refusal can only come from the lookup.
+    // container with one name byte changed must be refused, so the refusal can only come from the lookup. Both use
+    // stage 1's pairing (vs_lanterns with ps_lanterns_lit, one target) whatever this stage draws with: the G-buffer PS
+    // reads an attribute vs_lanterns does not export, and a VS that leaves a PS input unwritten is not a valid pipeline.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC control = desc;
+    control.PS = {shaders.ps_lit.data(), shaders.ps_lit.size()};
+    control.NumRenderTargets = 1;
+    control.RTVFormats[1] = control.RTVFormats[2] = DXGI_FORMAT_UNKNOWN;
     Ref<ID3D12PipelineState> rebuilt, unknown;
-    desc.VS = {shaders.rebuilt_vs.data(), shaders.rebuilt_vs.size()};
-    CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&rebuilt.p))) && rebuilt.p);
-    std::printf("lanterns: pipelines made (wave32 and wave64), and one from the guest's own container of vs_lanterns; "
+    control.VS = {shaders.rebuilt_vs.data(), shaders.rebuilt_vs.size()};
+    CHECK(SUCCEEDED(device_->CreateGraphicsPipelineState(&control, IID_PPV_ARGS(&rebuilt.p))) && rebuilt.p);
+    std::printf("lanterns: pipelines made (wave32 and wave64), and one from the guest's own container of vs_lanterns "
+                "(paired as in stage 1: ps_lanterns_lit, one target); "
                 "next, that container with one name byte changed, which the layer must refuse (its 'no translated vs' "
                 "line is expected)\n");
-    desc.VS = {shaders.unknown_vs.data(), shaders.unknown_vs.size()};
-    CHECK(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
+    control.VS = {shaders.unknown_vs.data(), shaders.unknown_vs.size()};
+    CHECK(device_->CreateGraphicsPipelineState(&control, IID_PPV_ARGS(&unknown.p)) == E_INVALIDARG && !unknown.p);
     return true;
 }
 
