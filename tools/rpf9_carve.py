@@ -30,6 +30,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter, then u32 size-8).
@@ -169,6 +170,7 @@ def main(argv=None) -> int:
                 print(f"--until-adat: first AWC bank at {boundary:#x}; scanning {pos:#x}..{boundary:#x}", flush=True)
         rows, last, unread, zero = [], pos, 0, 0
         unread_ranges = []
+        too_big = 0   # candidates whose output passed bounded_inflate's cap
 
         def account(a, b):
             """Count the gap m[a:b] as zero padding, or as an unread range that is also listed."""
@@ -204,27 +206,15 @@ def main(argv=None) -> int:
                         f.write(m[s:s + blen])
                 last = pos = s + blen
                 continue
-            d = zlib.decompressobj()
             try:
-                chunks, p = [], s
-                # Inflate only inside the scan window (all of the file without --limit): a stream that runs past
-                # its end is left out, so readable + zero + unread add up to the span, as in story_index (#712).
-                while not d.eof and p < end:
-                    chunk = m[p:min(p + (1 << 20), end)]
-                    if not chunk:
-                        break
-                    chunks.append(d.decompress(chunk))
-                    p += len(chunk)   # the slice can be short at EOF; advancing by 1 MiB overran it
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
+                out, used, why = inflate(m, s, end)
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            if out is None or len(out) < 64:
+                too_big += why == "too_big"
                 pos = s + 1
                 continue
-            used = p - s - len(d.unused_data)
             account(last, s)
             rows.append({"off": s, "stored": used, "size": len(out), "pre": m[max(0, s - 16):s].hex(),
                          "head": out[:16].hex()})
@@ -246,6 +236,8 @@ def main(argv=None) -> int:
                "span": span}
     if a.until_adat:
         summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
+    if too_big:   # only when the cap was hit, so ordinary indexes are unchanged
+        summary["skipped_too_big"] = too_big
     index_path = os.path.join(a.out, "index.json")
     try:
         with open(index_path, "w", encoding="utf-8", newline="\n") as f:

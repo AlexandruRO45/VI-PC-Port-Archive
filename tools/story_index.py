@@ -34,6 +34,7 @@ import zlib
 
 # -I keeps the script directory off sys.path; add it back so the sibling helpers are importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
 from anim_index import aux_table  # noqa: E402
 from file_mode import published_mode  # noqa: E402
 from zero_span import gap_split  # noqa: E402
@@ -178,6 +179,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
         end = min(size, pos + limit) if limit else size
         span_start = pos
         last, zero, unread = pos, 0, 0
+        too_big = 0   # candidates whose output passed bounded_inflate's cap
         while pos < end:
             match = ZHDR.search(m, pos, end)
             if not match:
@@ -198,23 +200,15 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 rows.append(record)
                 last = pos = s + blen
                 continue
-            d = zlib.decompressobj()
-            chunks, p = [], s
             try:
-                while not d.eof and p < end:
-                    block = m[p:min(p + (1 << 20), end)]
-                    chunks.append(d.decompress(block))
-                    p += len(block)   # advance by the actual slice, not the requested 1 MiB
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
+                out, used, why = inflate(m, s, end)
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            if out is None or len(out) < 64:
+                too_big += why == "too_big"
                 pos = s + 1
                 continue
-            used = p - s - len(d.unused_data)
             z, u = gap_split(m, last, s)
             zero += z
             unread += u
@@ -230,6 +224,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     summary = summarise(rows, end - span_start, zero, unread)
     summary["mode"] = "rpf9"
     summary["archive"] = path
+    if too_big:   # only when the cap was hit, so ordinary reports are unchanged
+        summary["skipped_too_big"] = too_big
     summary["elapsed_seconds"] = round(time.time() - t0, 3)
     return rows, summary
 

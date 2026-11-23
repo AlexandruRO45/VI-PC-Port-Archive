@@ -34,6 +34,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from zero_span import gap_split  # noqa: E402
+from bounded_inflate import inflate  # noqa: E402
 
 MAGIC = b"RBF0"
 PROLOGUE = b"\xfb\xff\x01\x00"
@@ -363,6 +364,7 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         end = min(size, pos + limit) if limit else size
         span_start = pos
         last, zero, unread = pos, 0, 0
+        too_big = 0   # candidates whose output passed bounded_inflate's cap
         while pos < end:
             match = ZHDR.search(mm, pos, end)
             if not match:
@@ -380,23 +382,15 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
                 rows.append({"offset": s, "stored": blen, "size": blen, "head": mm[s:s + 8]})
                 last = pos = s + blen
                 continue
-            d = zlib.decompressobj()
-            chunks, p = [], s
             try:
-                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
-                    block = mm[p:min(p + (1 << 20), end)]
-                    chunks.append(d.decompress(block))
-                    p += len(block)
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
+                out, used, why = inflate(mm, s, end)
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            if out is None or len(out) < 64:
+                too_big += why == "too_big"
                 pos = s + 1
                 continue
-            used = p - s - len(d.unused_data)
             gap_zero, gap_unread = gap_split(mm, last, s)
             zero += gap_zero
             unread += gap_unread
@@ -412,6 +406,8 @@ def scan_rpf(path, start=None, limit=None, progress=None, string_limit=16):
         records = resources_from_rows(rows, reader.read, check_gap=True, string_limit=string_limit)
     summary = summarise(rows, records, mspan, zero, unread, "rpf9")
     summary["archive"] = path
+    if too_big:   # only when the cap was hit, so ordinary reports are unchanged
+        summary["skipped_too_big"] = too_big
     return rows, records, summary
 
 

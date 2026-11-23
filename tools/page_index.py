@@ -38,6 +38,10 @@ import struct
 import sys
 import zlib
 
+# -I keeps the script directory off sys.path; add it back so the sibling helper is importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bounded_inflate import inflate  # noqa: E402
+
 # zlib stream start. Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 BASE = 0x50000000
@@ -97,25 +101,14 @@ def scan_rpf(path, start=None, limit=None):
                 if not match:
                     break
                 s = match.start()
-                d = zlib.decompressobj()
-                chunks, p = [], s
                 try:
-                    while not d.eof and p < end:
-                        block = m[p:min(p + (1 << 20), end)]
-                        if not block:
-                            break
-                        chunks.append(d.decompress(block))
-                        p += len(block)
-                        if d.unused_data or d.eof:
-                            break
-                    out = b"".join(chunks) + d.flush()
+                    out, used, _why = inflate(m, s, end)
                 except zlib.error:
                     pos = s + 1
                     continue
-                if not d.eof or len(out) < 64:
+                if out is None or len(out) < 64:
                     pos = s + 1
                     continue
-                used = p - s - len(d.unused_data)
                 yield s, used, out
                 pos = s + used
         finally:

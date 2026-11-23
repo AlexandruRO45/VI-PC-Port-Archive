@@ -34,6 +34,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from zero_span import gap_split  # noqa: E402
+from bounded_inflate import inflate  # noqa: E402
 
 # zlib stream start, or a Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
@@ -387,6 +388,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
         end = min(size, pos + limit) if limit else size
         span_start = pos
         last, zero, unread = pos, 0, 0
+        too_big = 0   # candidates whose output passed bounded_inflate's cap
         while pos < end:
             match = ZHDR.search(m, pos, end)
             if not match:
@@ -407,23 +409,15 @@ def scan_rpf(path, start=None, limit=None, progress=None):
                 rows.append(record)
                 last = pos = s + blen
                 continue
-            d = zlib.decompressobj()
-            chunks, p = [], s
             try:
-                while not d.eof and p < end:   # inside the --limit window, as in story_index (#712)
-                    block = m[p:min(p + (1 << 20), end)]
-                    chunks.append(d.decompress(block))
-                    p += len(block)
-                    if d.unused_data or d.eof:
-                        break
-                out = b"".join(chunks) + d.flush()
+                out, used, why = inflate(m, s, end)
             except zlib.error:
                 pos = s + 1
                 continue
-            if not d.eof or len(out) < 64:
+            if out is None or len(out) < 64:
+                too_big += why == "too_big"
                 pos = s + 1
                 continue
-            used = p - s - len(d.unused_data)
             z, u = gap_split(m, last, s)
             zero += z
             unread += u
@@ -437,6 +431,8 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     summary = summarise(rows, end - span_start, zero, unread)
     summary["mode"] = "rpf9"
     summary["archive"] = path
+    if too_big:   # only when the cap was hit, so ordinary reports are unchanged
+        summary["skipped_too_big"] = too_big
     return rows, summary
 
 
