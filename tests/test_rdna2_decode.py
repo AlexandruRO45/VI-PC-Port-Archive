@@ -434,6 +434,19 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual([i["op"] for i in dec12["insns"]], ["s_endpgm"])
         self.assertEqual(dec12["insns"][0]["pc"], 12)
 
+        # Unknown VOP3 opcode 0x3FF (hi6=0x35 -> 0xD7FF0000): also preserves 8-byte / 12-byte size.
+        raw_vop3_8 = struct.pack("<II", 0xD7FF0000, 0x7E02028A) + endpgm
+        dec_vop3_8 = rdna2_decode.decode_bytes(raw_vop3_8, wave32=True)
+        self.assertEqual(dec_vop3_8["invalid"], 1)
+        self.assertEqual([i["op"] for i in dec_vop3_8["insns"]], ["s_endpgm"])
+        self.assertEqual(dec_vop3_8["insns"][0]["pc"], 8)
+
+        raw_vop3_12 = struct.pack("<III", 0xD7FF0000, 0x000000FF, 0x7E02028A) + endpgm
+        dec_vop3_12 = rdna2_decode.decode_bytes(raw_vop3_12, wave32=True)
+        self.assertEqual(dec_vop3_12["invalid"], 1)
+        self.assertEqual([i["op"] for i in dec_vop3_12["insns"]], ["s_endpgm"])
+        self.assertEqual(dec_vop3_12["insns"][0]["pc"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

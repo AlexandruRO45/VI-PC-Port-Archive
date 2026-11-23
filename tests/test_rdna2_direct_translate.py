@@ -180,11 +180,81 @@ class DirectBinaryTranslateTests(unittest.TestCase):
                 spv_out = os.path.join(d, "spv_out")
                 r = subprocess.run(
                     [sys.executable, "-I", os.path.join(TOOLS, "rdna2spirv.py"),
-                     code_path, "--out", spv_out],
+                     os.path.join(out, "fspx"), "--out", spv_out],
                     capture_output=True, text=True,
                 )
                 self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
                 self.assertTrue(os.path.isfile(os.path.join(spv_out, "cs_fspx_plain.spv")))
+
+    def test_direct_mcpu_matches_text_path_for_vop3_0x140(self):
+        # VOP3 opcode 0x140 is v_mad_legacy_f32 on gfx1013 (.fssm) and v_fma_legacy_f32 on gfx1030 (.code).
+        w0 = (0x35 << 26) | (0x140 << 16) | 1
+        w1 = (256 + 1) | ((256 + 2) << 9) | ((256 + 3) << 18)
+        vop3_0x140 = struct.pack("<II", w0, w1)
+        endpgm = bytes([0x00, 0x00, 0x81, 0xBF])
+        # Plain stream and stream with an unreachable data word jumped over by s_branch +1 (exercises decode_reachable_direct).
+        plain = vop3_0x140 + endpgm
+        with_data = bytes([0x01, 0x00, 0x82, 0xBF]) + bytes([0xFF, 0xFF, 0xFF, 0xFF]) + vop3_0x140 + endpgm
+
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "fssm"))
+            for label, code in (("plain", plain), ("reachable", with_data)):
+                p = os.path.join(d, "fssm", f"cs_0x140_{label}.fssm")
+                with open(p, "wb") as f:
+                    f.write(_make_fssm(code))
+                spv = rdna2spirv.translate(p)
+                _validate(spv)
+                self.assertIn("OpReturn", spv)
+
+            for label, code in (("plain", plain), ("reachable", with_data)):
+                fspx_path = os.path.join(d, f"cs_fspx_0x140_{label}.fspx")
+                out = os.path.join(d, f"unpacked_{label}")
+                with open(fspx_path, "wb") as f:
+                    f.write(_make_fspx_payload(code))
+                self.assertEqual(fspx_unpack.main([fspx_path, "--out", out, "--disasm", "--backend", "python"]), 0)
+                code_path = os.path.join(out, "fspx", f"cs_fspx_0x140_{label}.code")
+                with self.assertRaises(rdna2spirv.Unsupported) as ctx:
+                    rdna2spirv.translate(code_path)
+                self.assertIn("v_fma_legacy_f32", str(ctx.exception))
+
+    def test_code_metadata_wave32_false_and_overlap_rejection(self):
+        # .code honours "wave32": false from its sidecar .json.
+        code = bytes([0x8A, 0x02, 0x02, 0x7E, 0x00, 0x00, 0x81, 0xBF])
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "cs_w64.fspx")
+            out = os.path.join(d, "unpacked")
+            with open(p, "wb") as f:
+                f.write(_make_fspx_payload(code, wave32=False))
+            self.assertEqual(fspx_unpack.main([p, "--out", out]), 0)
+            info = rdna2spirv.decode_binary_file(os.path.join(out, "fspx", "cs_w64.code"))
+            self.assertFalse(info["wave32"])
+            self.assertEqual(info["mcpu"], "gfx1030")
+
+        # decode_reachable_direct rejects a branch landing inside an 8-byte instruction.
+        # pc+0: s_cbranch_scc1 +1 -> targets pc+8 (middle of the 8-byte VOP3 starting at pc+4).
+        vop3_nop = struct.pack("<II", (0x35 << 26) | (0x140 << 16) | 1, (256 + 1) | ((256 + 2) << 9) | ((256 + 3) << 18))
+        bad_overlap = (
+            bytes([0x01, 0x00, 0x85, 0xBF])  # pc+0: s_cbranch_scc1 +1 -> pc+8
+            + vop3_nop                        # pc+4..11: 8-byte VOP3 (w1 at pc+8 is non-zero)
+            + bytes([0x00, 0x00, 0x81, 0xBF])
+        )
+        with self.assertRaises(rdna2spirv.Unsupported):
+            rdna2spirv.decode_reachable_direct(bad_overlap, 0, True, "gfx1013")
+
+    def test_python_disasm_signature_tracks_file_contents(self):
+        sig1 = json.loads(make_game.python_disasm_signature())
+        self.assertEqual(sig1[0], "python")
+        self.assertEqual(len(sig1[1]), 64)
+        with tempfile.TemporaryDirectory() as d:
+            for fname, body in (("rdna2_decode.py", b"v1"), ("rdna2_isa_tables.py", b"t1")):
+                with open(os.path.join(d, fname), "wb") as f:
+                    f.write(body)
+            with mock.patch.object(make_game, "TOOLS", d):
+                a = make_game.python_disasm_signature()
+                with open(os.path.join(d, "rdna2_decode.py"), "wb") as f:
+                    f.write(b"v2")
+                b = make_game.python_disasm_signature()
+        self.assertNotEqual(a, b)
 
     def test_make_game_python_disasm_backend_needs_no_llvm_mc(self):
         sig = make_game.disasm_signature("python")

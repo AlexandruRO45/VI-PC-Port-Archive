@@ -91,7 +91,7 @@ class SourceDiscovery(unittest.TestCase):
             p = subprocess.run([sys.executable, "-I", TOOL, os.path.join(tmp, "absent.s"), "--out", out],
                                capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 2, p.stderr)
-            self.assertIn("not a .s file or a folder of .s files", p.stderr)
+            self.assertIn("not a .s/.fssm/.code file or a folder of them", p.stderr)
             self.assertNotIn("Traceback", p.stderr)
             self.assertFalse(os.path.exists(out))
 

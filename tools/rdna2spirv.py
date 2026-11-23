@@ -16128,6 +16128,7 @@ def decode_binary_file(path):
     with open(path, "rb") as f:
         blob = f.read()
     wave32 = True
+    mcpu = "gfx1030" if path.endswith(".code") else "gfx1013"
     if path.endswith(".code"):
         meta_path = os.path.splitext(path)[0] + ".json"
         start = end = None
@@ -16151,21 +16152,22 @@ def decode_binary_file(path):
         if start is None:
             best = None
             for s in range(end - 4, max(0x100, end - 0x4000) - 1, -4):
-                cand = rdna2_decode.decode_bytes(blob[s:end], code_start=s, name=name)
+                cand = rdna2_decode.decode_bytes(blob[s:end], code_start=s, name=name, mcpu=mcpu)
                 if cand["invalid"] == 0:
                     best = s
             if best is None:
                 raise Unsupported("could not locate code start in .fssm binary")
             start = best
         code = blob[start:end]
-    info = rdna2_decode.decode_bytes(code, code_start=start, name=name, wave32=wave32)
+    info = rdna2_decode.decode_bytes(code, code_start=start, name=name, wave32=wave32, mcpu=mcpu)
     info["direct"] = True
     info["code"] = code
     info["wave32"] = wave32
+    info["mcpu"] = mcpu
     return info
 
 
-def decode_reachable_direct(code, code_start, wave32, mcpu="gfx1030"):
+def decode_reachable_direct(code, code_start, wave32, mcpu="gfx1013"):
     """Fail-closed recursive-descent decode from entry for direct binary streams that contain undecodable words.
 
     Follows exact instruction lengths and branch targets from PC 0 (`code_start`). Any undecodable instruction
@@ -16232,7 +16234,8 @@ def translate(path):
         if info.get("direct"):
             # Fail closed on any reachable undecodable instruction (including unknown multiword encodings) while
             # safely skipping unreachable embedded data tables via recursive-descent decode from entry.
-            insns = decode_reachable_direct(info["code"], info["code_start"], info["wave32"])
+            insns = decode_reachable_direct(info["code"], info["code_start"], info["wave32"],
+                                            info.get("mcpu", "gfx1013"))
         else:
             # Undecodable words are constant tables embedded in the code range (147/155 such VS/PS use s_getpc_b64 to
             # read them). LLVM skips them, so re-anchor every instruction to its true offset in the FSSM blob, then
@@ -17739,7 +17742,7 @@ def _out_inside_input(src, out):
 def main():
     global MAX_SHARED_BYTES, MAX_STRUCTURED_DEPTH
     ap = argparse.ArgumentParser()
-    ap.add_argument("src")
+    ap.add_argument("src", help=".s listing, native .fssm/.code binary, or a folder of them")
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=_limit_arg)
     ap.add_argument("--shard", type=_shard_arg,
