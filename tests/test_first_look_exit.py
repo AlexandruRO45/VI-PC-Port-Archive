@@ -36,6 +36,7 @@ class FirstLookExitTest(unittest.TestCase):
                 "Add-Type -OutputAssembly gta6rt.exe -OutputType ConsoleApplication -TypeDefinition @'\n"
                 "public class Loader { public static int Main() {\n"
                 "    int code = int.Parse(System.Environment.GetEnvironmentVariable(\"LEONIDA_TEST_LOADER_EXIT\"));\n"
+                "    if (code == 23) return code;  // silent retry\n"
                 "    var dir = new System.IO.DirectoryInfo(System.AppDomain.CurrentDomain.BaseDirectory);\n"
                 "    (code == 0 ? System.Console.Out : System.Console.Error).WriteLine(\"synthetic dry run from \" + dir.Name);\n"
                 "    return code;\n"
@@ -116,16 +117,24 @@ class FirstLookExitTest(unittest.TestCase):
                     self.assertIn("synthetic dry run from " + expected_dir,
                                   (report / "dryrun.txt").read_text(encoding="utf-16"))
                     self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    if layout not in ("Release", "MinSizeRel"):
+                        continue
                     if layout == "Release":
-                        # An interrupted rebuild may leave the loader path and TLS DLL in place.
                         (build / "Release/gta6rt.exe").write_bytes(b"")
-                        retry = subprocess.run(
-                            [*POWERSHELL, "-File", str(wrapper), "-Exe", str(image)],
-                            env=env, capture_output=True, text=True, timeout=30,
-                        )
-                        log = (report / "dryrun.txt").read_text(encoding="utf-16")
-                        self.assertNotIn("synthetic dry run from Release", log, retry.stdout + retry.stderr)
-                        self.assertIn("No loader output was captured for this dry run.", log)
+                    retry = subprocess.run(
+                        [*POWERSHELL, "-File", str(wrapper), "-Exe", str(image)],
+                        env={**env, "LEONIDA_TEST_LOADER_EXIT": "23"}, capture_output=True, text=True, timeout=30,
+                    )
+                    dryrun = report / "dryrun.txt"
+                    if layout == "MinSizeRel":
+                        self.assertEqual(retry.returncode, 23, retry.stdout + retry.stderr)
+                    elif not dryrun.exists():
+                        # A failed launch can explicitly discard the previous report (#5977).
+                        self.assertEqual(retry.returncode, 1, retry.stdout + retry.stderr)
+                        self.assertIn("the loader did not run", retry.stdout + retry.stderr)
+                        continue
+                    self.assertEqual(dryrun.read_text(encoding="utf-16").strip(),
+                                     "No loader output was captured for this dry run.")
 
 
 if __name__ == "__main__":
