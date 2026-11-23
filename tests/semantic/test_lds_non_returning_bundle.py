@@ -186,6 +186,25 @@ class TestLdsSubU32Offset(unittest.TestCase):
         self.assertEqual(fin[0x44], 40)
         self.assertEqual(fin[0x48], 40)
 
+class TestLdsSubU32Chaining(unittest.TestCase):
+    def test_chained_subtractions(self):
+        init = {0x40: 100}
+        ops = [("ds_sub_u32", 0x40, 0, (10,)), ("ds_sub_u32", 0x40, 0, (20,)), ("ds_sub_u32", 0x40, 0, (30,))]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 40)
+
+    def test_multi_location_independent_subtractions(self):
+        init = {0x10: 500, 0x20: 800}
+        ops = [
+            ("ds_sub_u32", 0x10, 0, (100,)),
+            ("ds_sub_u32", 0x20, 0, (200,)),
+            ("ds_sub_u32", 0x10, 0, (50,)),
+            ("ds_sub_u32", 0x20, 0, (100,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x10], 350)
+        self.assertEqual(fin[0x20], 500)
+
 
 if __name__ == "__main__":
     unittest.main()
