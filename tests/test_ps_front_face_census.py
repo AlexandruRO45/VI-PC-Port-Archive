@@ -11,7 +11,7 @@ from ps_front_face_census import census
 
 
 class FrontFaceTests(unittest.TestCase):
-    def run_cache(self, lines, *, mismatch=False):
+    def run_cache(self, lines, *, mismatch=False, wave=None):
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
             native = base / "fssm"
@@ -30,6 +30,9 @@ class FrontFaceTests(unittest.TestCase):
             (base / "p.dxbc").write_bytes(container + b"ISG1" + struct.pack("<I", len(sig)) + sig)
             start = 0x128
             blob = bytearray(start)
+            if wave is not None:
+                blob[:4] = b"FSSM"
+            struct.pack_into("<I", blob, 0xd4, 0 if wave == 64 else 0x20)
             struct.pack_into("<I", blob, 0xc0, start - 0x28)
             listing = [f"; p code 0x{start:x}..0x{start + 4 * len(lines):x}"]
             for k, line in enumerate(lines):
@@ -107,6 +110,37 @@ class FrontFaceTests(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 result = self.run_cache(prefix + ["v_mov_b32 v4, 1", "s_endpgm"])
                 self.assertEqual(result["shaders_per_unresolved_reason"], {"possible lane-partial write": 1})
+
+    def test_wave32_low_half_quad_coverage(self):
+        # Sweep every nibble in every quad, including the top bit of EXEC_LO.
+        # Compute the write mask lane by lane from the four neighbours.
+        for narrow in (False, True):
+            misses_entry = False
+            for shift in range(0, 32, 4):
+                for nibble in range(16):
+                    entry = nibble << shift
+                    active = entry & 0xffff if narrow else entry
+                    written = sum(1 << lane for lane in range(32)
+                                  if active & (15 << (lane & ~3)))
+                    misses_entry |= bool(entry & ~written)
+            self.assertEqual(misses_entry, narrow)
+            prefix = ["s_and_b32 exec_lo, exec_lo, 0xffff"] if narrow else []
+            result = self.run_cache(prefix + ["s_wqm_b32 exec_lo, exec_lo",
+                                    "v_mov_b32 v4, 1", "s_endpgm"], wave=32)
+            self.assertEqual(result["resolved_without_read"], int(not misses_entry))
+            self.assertEqual(result["unresolved"], int(misses_entry))
+
+    def test_width_and_half_controls(self):
+        for wave in (None, 32, 64):
+            for dst in ("exec_lo", "exec_hi"):
+                for src in ("exec_lo", "exec_hi", "vcc_lo"):
+                    if (wave, dst, src) == (32, "exec_lo", "exec_lo"):
+                        continue
+                    with self.subTest(wave=wave, dst=dst, src=src):
+                        result = self.run_cache([f"s_wqm_b32 {dst}, {src}",
+                                                 "v_mov_b32 v4, 1", "s_endpgm"], wave=wave)
+                        self.assertEqual(result["shaders_per_unresolved_reason"],
+                                         {"possible lane-partial write": 1})
 
     def test_unknown_edges_and_sidecar_mismatch(self):
         for lines, mismatch in [(["s_setpc_b64 s[0:1]"], False), (["s_branch -2"], False),

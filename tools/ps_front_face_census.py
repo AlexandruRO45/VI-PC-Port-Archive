@@ -42,11 +42,16 @@ def input_register(data):
     return 2 + sum(mask.bit_count() for mask in positions)
 
 
-def preserves_entry_coverage(ins):
+def preserves_entry_coverage(ins, wave_size):
     """A self-WQM expands each nonempty quad of the current mask."""
     args = ins["args"]
-    if ins["op"] == "s_wqm_b64" and len(args) == 2 and not ins["mods"]:
-        if all(a["k"] == "special" and a["t"] == "exec"
+    mask = None
+    if ins["op"] == "s_wqm_b64":
+        mask = "exec"
+    elif ins["op"] == "s_wqm_b32" and wave_size == 32:
+        mask = "exec_lo"
+    if mask and len(args) == 2 and not ins["mods"]:
+        if all(a["k"] == "special" and a["t"] == mask
                and not a.get("neg") and not a.get("abs") for a in args):
             return True
     # A vector ALU instruction can also have a scalar mask destination in
@@ -62,6 +67,7 @@ def first_uses(info, native, reg):
     end = info["code_end"]
     if end is None or len(native) < 0xc4 or start != struct.unpack_from("<I", native, 0xc0)[0] + 0x28:
         return set(), {"unknown entry"}
+    wave_size = fssm_header.wave_size(native)
     instructions = {}
     for ins in info["insns"]:
         enc = bytes.fromhex(ins["enc"] or "")
@@ -121,7 +127,7 @@ def first_uses(info, native, reg):
             elif ins["mods"] or isa.base_op(op) not in FULL_WRITES:
                 unresolved.add("unclassified destination")
             continue
-        pending.append((nxt, covers_entry and preserves_entry_coverage(ins)))
+        pending.append((nxt, covers_entry and preserves_entry_coverage(ins, wave_size)))
     return reads, unresolved
 
 
