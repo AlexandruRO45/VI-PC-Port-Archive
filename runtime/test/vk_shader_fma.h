@@ -114,7 +114,8 @@ struct ShaderFma {
         if ((float32 && float64) || !spirv_declares_capability(code, bytes, 6030)) return true;  // FMAKHR
         bool need32 = false, need64 = false;
         spirv_fma_widths(code, bytes, need32, need64);
-        if (!need32 && !need64) need32 = true;   // FMAKHR declared but no OpFmaKHR found: keep the old requirement
+        if (!need32 && !need64 && supported()) return true;  // Capability alone has no result width.
+        if (!need32 && !need64) need32 = true;
         const char* missing = need32 && !float32 ? "shaderFmaFloat32" : need64 && !float64 ? "shaderFmaFloat64" : nullptr;
         if (!missing) return true;
         std::fprintf(stderr, "unsupported: %s needs OpFmaKHR (VK_KHR_shader_fma, %s) and the device lacks it; "

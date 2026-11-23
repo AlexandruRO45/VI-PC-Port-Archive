@@ -690,6 +690,12 @@ int main() {
         CHECK(check_shader_fma_support(spv_malformed, false, false, &reason));
         CHECK(check_shader_fma_support(spv_truncated, false, false, &reason));
 
+        for (unsigned type : {1u, 2u}) {
+            auto half = spv_fma;
+            half.insert(half.end(), {0x30016, 1, 16, 0x40017, 2, 1, 2, 0x60000 | 4427, type, 3, 4, 5, 6});
+            CHECK(!check_shader_fma_support(half, true, true, &reason));
+            CHECK(check_shader_fma_support(half, false, false, &reason, true));
+        }
         ShaderEntry doubles;
         doubles.features = {"shaderFmaFloat64"};
         CHECK(!check_shader_fma_support(doubles, true, false, &reason));

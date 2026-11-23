@@ -69,7 +69,7 @@ int main() {
     expect(!accepts(only64, module(true, false, {1})), "f32 OpFmaKHR is refused without shaderFmaFloat32");
     expect(accepts(both, module(true, true, {1, 2})), "both widths on a device with both");
     expect(!accepts(none, module(true, false, {1})), "no VK_KHR_shader_fma refuses any OpFmaKHR");
-    expect(!accepts(only64, module(true, false, {})), "FMAKHR without an OpFmaKHR keeps needing shaderFmaFloat32");
+    expect(accepts(only64, module(true, false, {})), "capability-only FMAKHR has no result width");
     expect(only32.supported() && only64.supported() && !none.supported(), "supported() is either width");
 
     if (failures) return 1;

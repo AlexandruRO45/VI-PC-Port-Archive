@@ -729,7 +729,7 @@ struct ShaderEntry {
     }
 
     bool needs_shader_fma() const {
-        return has_feature("shaderFmaFloat32") || has_feature("shaderFmaFloat64") ||
+        return has_feature("shaderFmaFloat16") || has_feature("shaderFmaFloat32") || has_feature("shaderFmaFloat64") ||
                std::find(capabilities.begin(), capabilities.end(), "FMAKHR") != capabilities.end();
     }
 };
@@ -758,20 +758,22 @@ inline bool missing_shader_fma(const char* feature, std::string* reason) {
     return false;
 }
 
-inline bool check_shader_fma_support(const ShaderEntry& entry, bool f32, bool f64, std::string* reason = nullptr) {
+inline bool check_shader_fma_support(const ShaderEntry& entry, bool f32, bool f64, std::string* reason = nullptr, bool f16 = false) {
+    if (!f16 && entry.has_feature("shaderFmaFloat16")) return missing_shader_fma("shaderFmaFloat16", reason);
     if (!f64 && entry.has_feature("shaderFmaFloat64")) return missing_shader_fma("shaderFmaFloat64", reason);
     if (!f32 && entry.has_feature("shaderFmaFloat32")) return missing_shader_fma("shaderFmaFloat32", reason);
     // Capability-only metadata carries no width. If either is enabled, inspect the actual module next.
-    if (!f32 && !f64 && entry.needs_shader_fma()) return missing_shader_fma("FMAKHR", reason);
+    if (!f32 && !f64 && !f16 && entry.needs_shader_fma()) return missing_shader_fma("FMAKHR", reason);
     return true;
 }
 
 inline bool check_shader_fma_support(std::span<const std::uint32_t> words, bool f32, bool f64,
-                                     std::string* reason = nullptr) {
-    if ((f32 && f64) || !spirv_declares_capability(words, kSpvCapabilityFmaKhr)) return true;
-    if (!f32 && !f64) return missing_shader_fma("FMAKHR", reason);
-    bool needs32, needs64;
-    spirv_fma_widths(words.data(), words.size(), needs32, needs64);
+                                     std::string* reason = nullptr, bool f16 = false) {
+    if ((f16 && f32 && f64) || !spirv_declares_capability(words, kSpvCapabilityFmaKhr)) return true;
+    if (!f32 && !f64 && !f16) return missing_shader_fma("FMAKHR", reason);
+    bool needs16, needs32, needs64;
+    spirv_fma_widths(words.data(), words.size(), needs32, needs64, &needs16);
+    if (needs16 && !f16) return missing_shader_fma("shaderFmaFloat16", reason);
     if (needs32 && !f32) return missing_shader_fma("shaderFmaFloat32", reason);
     if (needs64 && !f64) return missing_shader_fma("shaderFmaFloat64", reason);
     return true;

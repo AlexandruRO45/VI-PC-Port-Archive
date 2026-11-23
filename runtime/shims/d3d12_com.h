@@ -185,6 +185,7 @@ struct VulkanDeviceInfo {
     // colours fall back to transparent black.
     bool custom_border_color = false;
     bool custom_border_color_without_format = false;
+    bool shader_fma_float16 = false;
     bool shader_fma_float64 = false;  // shaderFmaFloat64 enabled on the logical device.
 };
 
