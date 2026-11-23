@@ -238,14 +238,63 @@ pub(crate) fn dred_on() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on). A
+/// buffer's address range is kept too, for faults outside every allocation
+/// (see [`buffers_around`]).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     if dred_on()
-        && let Ok(object) = object.cast::<ID3D12Object>()
+        && let Ok(named) = object.cast::<ID3D12Object>()
     {
+        let text = text();
         // SAFETY: a plain call on a live object.
-        let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+        let _ = unsafe { named.SetName(&windows::core::HSTRING::from(text.as_str())) };
+        if let Ok(resource) = object.cast::<ID3D12Resource>() {
+            // SAFETY: plain calls on a live resource.
+            let (desc, gpu) = unsafe { (resource.GetDesc(), resource.GetGPUVirtualAddress()) };
+            if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && gpu != 0 {
+                // Named again (a use-specific name), or its address reused.
+                let mut all = NAMED_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+                all.retain(|b| b.0 != gpu);
+                all.push((gpu, desc.Width, text));
+            }
+        }
     }
+}
+
+/// Every buffer named so far: host GPU address, size and name. One per
+/// address, otherwise never trimmed, so some may have been released since.
+static NAMED_BUFFERS: Mutex<Vec<(u64, u64, String)>> = Mutex::new(Vec::new());
+
+/// For device-removed reports: the named buffers that end closest below
+/// host GPU address `va` and start closest above it, and how far away. A
+/// fault just past a buffer's end is a read or write that ran off it.
+fn buffers_around(va: u64) -> String {
+    let all = NAMED_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = format!("; of {} buffers ever named (some released since)", all.len());
+    let inside: Vec<_> = all.iter().filter(|b| b.0 <= va && va < b.0 + b.1).collect();
+    for (gpu, len, name) in inside.iter().rev().take(4) {
+        text.push_str(&format!(
+            ", inside \"{name}\" {gpu:#x}+{len:#x} at offset {:#x}",
+            va - gpu
+        ));
+    }
+    let mut below: Vec<_> = all.iter().filter(|b| b.0 + b.1 <= va).collect();
+    below.sort_by_key(|b| va - (b.0 + b.1));
+    for (gpu, len, name) in below.iter().take(3) {
+        text.push_str(&format!(
+            ", {:#x} past the end of \"{name}\" {gpu:#x}+{len:#x}",
+            va - (gpu + len)
+        ));
+    }
+    let mut above: Vec<_> = all.iter().filter(|b| b.0 > va).collect();
+    above.sort_by_key(|b| b.0 - va);
+    for (gpu, len, name) in above.iter().take(3) {
+        text.push_str(&format!(
+            ", {:#x} before \"{name}\" {gpu:#x}+{len:#x}",
+            gpu - va
+        ));
+    }
+    text
 }
 
 /// Upload chunks handed out front to back: the chunks, the one in use and
@@ -480,6 +529,7 @@ impl Host {
                     }
                 }
                 text.push_str(&crate::shadow::near(va));
+                text.push_str(&buffers_around(va));
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
@@ -1061,6 +1111,9 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if let Some(b) = &buffer {
+            name(b, || format!("upload {size:#x}"));
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -1410,6 +1463,9 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        if let Some(b) = &buffer {
+            name(b, || format!("shared {size:#x}"));
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
