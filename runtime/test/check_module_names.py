@@ -73,10 +73,15 @@ def main() -> int:
             if self_probe and mode in ("native", "--run"):
                 if not entry or "entered=1" not in entry:
                     errors.append("guest did not reach its name checks")
-                if exact_acp(image.name) is not None and (
-                    not entry or "representable=1 self_a=1 ascii_case_a=1" not in entry
-                ):
-                    errors.append("guest did not retain exact and ASCII-case ACP lookup")
+                # The wide lookups (as named, in the system table's upper case, and LoadLibraryW of the mapped
+                # image) must find the image for every name; the ANSI ones, exact, ASCII-case and code-page-case,
+                # for a name the code page can spell.
+                required = ["self_w=1", "case_w=1", "load_w=1"]
+                if exact_acp(image.name) is not None:
+                    required += ["representable=1", "self_a=1", "ascii_case_a=1", "acp_case_a=1"]
+                missing = [field for field in required if not entry or field not in entry.split()]
+                if missing:
+                    errors.append("guest lookups not retained: " + " ".join(missing))
             mapped_names: list[str] = []
             if mode != "native":
                 try:
