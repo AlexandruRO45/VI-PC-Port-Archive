@@ -11,7 +11,8 @@ writes its destination SGPRs to out[0..]. Every load either reads inside the see
 whatever the hardware rule turns out to be. Rows the assembler rejects (a negative `s_buffer_load` IMM) are encoded
 by hand as `.long` words. Standard library only; no game files.
 
-Exit codes: 0 every row matches the translator, 1 a mismatch, 2 harness error, 77 no hardware oracle.
+Exit codes: 0 every modelled row matches the translator (the bit-20 IMM rows are reported, not matched), 1 a
+mismatch, 2 harness error, 77 no hardware oracle.
 """
 import argparse
 import os
@@ -39,7 +40,9 @@ def sbuf_raw(sdst, sbase, soff, imm):
 
 # (name, lines, destination SGPRs, sOFF value or None, translator rule -> list of region offsets X or None)
 #   s_load:        address = (base & ~3) + (sOFF & ~3) + sext21(IMM & ~3), 64-bit, no bound
-#   s_buffer_load: off = (sOFF & ~3) + (IMM & ~3) as a 32-bit value; dword i is 0 when off + 4i + 4 > NUM_RECORDS
+#   s_buffer_load: off = (sOFF & ~3) + (IMM kept as the 32-bit value, & ~3), added without wrapping at 32
+#                  bits (SHADER-336, #1686); dword i is 0 when off + 4i + 4 > NUM_RECORDS. An IMM with bit
+#                  20 set reads data the translator does not model: those rows are reported, not matched.
 NUM_RECORDS = 0x100
 ROWS = [
     ("sload_imm_m4",        ["s_load_dword s40, s[4:5], -0x4"], [40], None, [-4]),
@@ -54,11 +57,16 @@ ROWS = [
     ("sbuf_soffm4",         ["s_buffer_load_dword s51, s[12:15], s20"], [51], 0xFFFFFFFC, None),
 ]
 
+# The hand-encoded rows carry an IMM with bit 20 set (llvm-mc rejects that encoding). Hardware then reads data
+# that is neither 0 nor the buffer's own words, differently in wave32 and wave64: the bound does not hold for it
+# and the translator does not model it (SHADER-336), so --oracle hw reports those rows without expecting a match.
+NOT_MODELLED = {"sbuf_imm_m4", "sbuf_soff8_imm_m4"}
+
 
 def translator_sbuf(soff, imm):
-    """The translator's s_buffer_load rule: a 32-bit offset (IMM kept as written, sOFF as is), bound-checked."""
-    off = ((soff or 0) & ~3) + (imm & ~3)
-    off &= 0xFFFFFFFF
+    """The translator's s_buffer_load rule: (sOFF & ~3) + (IMM & ~3), the IMM kept as the 32-bit value,
+    added without wrapping at 32 bits (SHADER-336, the translator got this in #1686), bound-checked."""
+    off = ((soff or 0) & ~3) + ((imm & 0xFFFFFFFF) & ~3)
     return [off] if off + 4 <= NUM_RECORDS else [None]
 
 
@@ -133,9 +141,12 @@ def main(argv=None):
         w64 = got[64][i:i + len(regs)]
         i += len(regs)
         exp = [0 if v is None else v for v in want[name]]
+        hw = " ".join(hex(v) for v in w32) + ("" if w32 == w64 else "  (wave64 " + " ".join(hex(v) for v in w64) + ")")
+        if name in NOT_MODELLED:
+            print(f"{name:22} hw {hw:26} translator {' '.join(hex(v) for v in exp):24} not modelled")
+            continue
         ok = w32 == exp and w64 == exp
         bad += not ok
-        hw = " ".join(hex(v) for v in w32) + ("" if w32 == w64 else "  (wave64 " + " ".join(hex(v) for v in w64) + ")")
         print(f"{name:22} hw {hw:26} translator {' '.join(hex(v) for v in exp):24} {'ok' if ok else 'DIFFERS'}")
     return 1 if bad else 0
 
