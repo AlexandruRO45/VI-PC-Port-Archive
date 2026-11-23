@@ -550,5 +550,26 @@ class VSubCoCiU32SimdBoundaryTests(unittest.TestCase):
         self.assertEqual(out[1], 1)
 
 
+class VSubCoCiU32TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution, operand modes, and negative mutation controls for v_sub_co_ci_u32."""
+
+    def test_sgpr_and_inline_operands(self):
+        out = run_prog([
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 20",
+            "v_sub_co_u32 v2, vcc, v0, v1",
+            "v_sub_co_ci_u32 v3, vcc, 50, 10, vcc",
+            "v_mov_b32 v0, v2",
+            "v_mov_b32 v1, v3",
+        ])
+        self.assertEqual(out[0], 0xFFFFFFF6)
+        self.assertEqual(out[1], 39)
+
+    def test_negative_mutation_rejection(self):
+        prog = ["v_sub_co_ci_u32 v0, vcc, v1, v2, vcc omod:2", "s_endpgm"]
+        with self.assertRaises(rdna2spirv.Unsupported):
+            translate_lines("ps_neg_sub_co_ci", prog)
+
+
 if __name__ == "__main__":
     unittest.main()
