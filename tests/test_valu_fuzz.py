@@ -9,7 +9,10 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
 from fractions import Fraction
+from itertools import permutations
+from pathlib import Path
 
 import pytest
 
@@ -70,6 +73,17 @@ def test_signed_zeros():
     assert vf.f16_op("add", 0x8000, 0x8000) == (0x8000, False)    # -0 + -0 = -0
     assert vf.f16_op("sub", 0x8000, 0x0000) == (0x8000, False)    # -0 - +0 = -0
     assert vf.f16_op("max", 0x0000, 0x8000)[1]                    # +0 vs -0: not promised, so uncertain
+
+
+@pytest.mark.parametrize("operands,expected", [
+    ((0x0000, 0x8000, 0x0000), 0x0000),  # +0, -0, +0
+    ((0x8000, 0x0000, 0x8000), 0x8000),  # -0, +0, -0
+    ((0xBC00, 0x0000, 0x8000), 0x8000),  # -1 < -0 < +0
+    ((0x3C00, 0x0000, 0x8000), 0x0000),  # -0 < +0 < +1
+])
+def test_f16_med3_orders_signed_zeros(operands, expected):
+    for args in dict.fromkeys(permutations(operands)):
+        assert vf.f16_op("med3", *args) == (expected, False), args
 
 
 @pytest.mark.parametrize("a,b,c,true,double", [
@@ -327,10 +341,19 @@ def _amd_tool(name):
 
 @pytest.mark.skipif(_amd_tool("llvm-mc") is None, reason="AMD llvm-mc (next to LEONIDA_AMD_CLANG) not found")
 def test_gfx11_opcode_table_matches_llvm_mc():
+    from hw_oracle import asm
+
     mc = _amd_tool("llvm-mc")
+    cmd = [mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1150", "-show-encoding"]
+
+    def assemble(text):
+        return subprocess.run(cmd, input=text, capture_output=True, text=True)
+
+    true16 = asm.needs_true16(lambda text: assemble(text).returncode == 0)
     for name, opcode in vf.GFX11_VOP3_OPCODE.items():
-        r = subprocess.run([mc, "-triple=amdgcn-amd-amdhsa", "-mcpu=gfx1150", "-show-encoding"],
-                           input=f"{name} v20, v21, v22\n", capture_output=True, text=True)
+        text = f"{name} v20, v21, v22\n"
+        r = assemble(asm.true16_spelling(text) if true16 else text)
+        assert r.returncode == 0 and "encoding: [" in r.stdout, (name, r.stderr, r.stdout)
         got = [int(b, 16) for b in r.stdout.split("encoding: [")[1].split("]")[0].split(",")]
         w0, w1 = vf.vop3_words(opcode, 20, [21, 22], 0)
         want = [w0 & 255, w0 >> 8 & 255, w0 >> 16 & 255, w0 >> 24, w1 & 255, w1 >> 8 & 255, w1 >> 16 & 255, w1 >> 24]
@@ -343,12 +366,18 @@ def test_gfx11_opcode_table_matches_llvm_mc():
 def test_hw_kernels_assemble(family, arch):
     from hw_oracle import asm
     fam = asm.family(arch)
+    cmd = [os.environ["LEONIDA_AMD_CLANG"], "--target=amdgcn-amd-amdhsa", f"-mcpu={arch}"]
+    assembler = ["-x", "assembler", "-c", "-", "-o", os.devnull]
+
+    def assemble(text, wave=32):
+        return subprocess.run(cmd + (["-mwavefrontsize64"] if wave == 64 else []) + assembler,
+                              input=text, capture_output=True, text=True)
+
+    true16 = fam != "gfx10" and asm.needs_true16(lambda text: assemble(text).returncode == 0)
     for p in vf.programs(family, 2, 12, (32, 64)):
         k = asm.Kernel(p.hw_lines(fam), p.wave, vf.THREADS, p.out_words(), raw=True, vgprs=vf.HW_VGPRS, sgprs=vf.HW_SGPRS)
         text = asm.module_text([k], arch, wave=p.wave)[0]
-        r = subprocess.run([os.environ["LEONIDA_AMD_CLANG"], "--target=amdgcn-amd-amdhsa", f"-mcpu={arch}",
-                            *(["-mwavefrontsize64"] if p.wave == 64 else []), "-x", "assembler", "-c", "-", "-o", os.devnull],
-                           input=text, capture_output=True, text=True)
+        r = assemble(asm.true16_spelling(text) if true16 else text, p.wave)
         assert r.returncode == 0, (arch, p.name, r.stderr[-600:])
 
 
@@ -358,6 +387,22 @@ def test_oracle_hw_exits_77_without_the_tools(monkeypatch, capsys, tmp_path):
         monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--oracle", "hw", "--programs", "2"])
         assert vf.main() == 77
     assert "hardware oracle unavailable" in capsys.readouterr().out
+
+
+def test_oracle_hw_exits_77_on_an_rdna4_gpu(monkeypatch, capsys):
+    from hw_oracle import runner
+
+    class Rdna4:
+        arch, device = "gfx1201", "fake"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner, "open_oracle", lambda **kw: Rdna4())
+    for family in sorted(vf.FAMILIES):
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", family, "--oracle", "hw", "--programs", "2"])
+        assert vf.main() == 77
+    assert "hardware oracle unavailable: gfx1201" in capsys.readouterr().out
 
 
 def test_oracle_option_is_validated(monkeypatch):
@@ -495,3 +540,172 @@ def test_emulated_wave64_is_compared_at_any_subgroup_size(monkeypatch, capsys, t
     status, out = _run_main(monkeypatch, capsys, tmp_path, UNPINNED, ["--wave", "64", "--emulate"])
     assert status == 1, out
     assert "MISMATCH" in out and "0 skipped" in out
+
+
+def test_gpu_timeout_is_a_harness_error_and_next_program_runs(monkeypatch, capsys, tmp_path):
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+    progs = vf.programs("f16", 1, 2, (32,))
+    attempted = []
+
+    def translate(progs, work, _emulate):
+        (work / "spirv").mkdir()
+        for p in progs:
+            (work / "spirv" / (p.name + ".spv")).touch()
+        return {p.name: {} for p in progs}, ""
+
+    def run(cmd, *, env, timeout, **kwargs):
+        assert timeout == 0.25
+        name = os.path.splitext(os.path.basename(cmd[1]))[0]
+        attempted.append(name)
+        if name == progs[0].name:
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        with open(env["VKC_DUMP"], "wb") as dump:
+            dump.write(bytes(4 * progs[1].out_words()))
+        return subprocess.CompletedProcess(cmd, 0, "compute subgroup size: 32", "")
+
+    def compare(prog, data):
+        prog.uncertain_words = 0
+        return []
+
+    monkeypatch.setenv("LEONIDA_GPU_TEST_TIMEOUT", "0.25")
+    monkeypatch.delenv("LEONIDA_PC_TAIL_UBO", raising=False)
+    monkeypatch.setattr(vf, "translate", translate)
+    monkeypatch.setattr(vf.subprocess, "run", run)
+    monkeypatch.setattr(vf, "compare", compare)
+    monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "f16", "--programs", "2", "--wave", "32",
+                                      "--build", str(build), "--work", str(tmp_path)])
+
+    assert vf.main() == 2
+    assert attempted == [p.name for p in progs]
+    out = capsys.readouterr().out
+    assert f"ERROR {progs[0].name}" in out and "timed out after 0.25 s" in out
+    assert "1/1 programs that ran match" in out and "1 harness errors" in out
+
+
+def test_pc_tail_ubo_forwarded_to_translator_and_vk_compute_test(monkeypatch, tmp_path):
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append((list(cmd), kw.get("env")))
+        out_dir = tmp_path / "spirv"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "index.json").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.subprocess, "run", fake_run)
+    vf.translate([], tmp_path, False)
+    vf.translate([], tmp_path, False, pc_tail=True)
+    assert "--pc-tail-ubo" not in cmds[0][0]
+    assert "--pc-tail-ubo" in cmds[1][0]
+
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / ("vk_compute_test" + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.delenv("LEONIDA_PC_TAIL_UBO", raising=False)
+    prog = vf.FAMILIES["mem"](1, 0, 32)
+    vf.run_gpu(prog, tmp_path / "a.spv", str(build), {}, False, tmp_path / "a.bin")
+    vf.run_gpu(prog, tmp_path / "a.spv", str(build), {}, False, tmp_path / "a.bin", pc_tail=True)
+    assert "LEONIDA_PC_TAIL_UBO" not in cmds[2][1]
+    assert cmds[3][1]["LEONIDA_PC_TAIL_UBO"] == "1"
+
+
+def test_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):
+    for extra, env_val, want in (
+        ([], "", False),
+        (["--pc-tail-ubo"], "", True),
+        ([], "1", True),
+        ([], "true", True),
+        ([], "0", False),
+    ):
+        seen_t, seen_g = [], []
+
+        def fake_translate(progs, work, _emulate, pc_tail=False):
+            seen_t.append(pc_tail)
+            (work / "spirv").mkdir(parents=True, exist_ok=True)
+            for p in progs:
+                (work / "spirv" / (p.name + ".spv")).touch()
+            return {p.name: {} for p in progs}, ""
+
+        def fake_run_gpu(p, _spv, _build, _entry, _emulate, dump, pc_tail=False):
+            seen_g.append(pc_tail)
+            return 77, "unsupported: test"
+
+        monkeypatch.setenv("LEONIDA_PC_TAIL_UBO", env_val)
+        monkeypatch.setattr(vf, "translate", fake_translate)
+        monkeypatch.setattr(vf, "run_gpu", fake_run_gpu)
+        monkeypatch.setattr(sys, "argv", ["valu_fuzz.py", "--family", "mem", "--programs", "1",
+                                          "--wave", "32", "--work", str(tmp_path), *extra])
+        vf.main()
+        assert seen_t == [want] and seen_g == [want], (extra, env_val)
+
+
+def test_parallel_assembly_preserves_wave_flags_and_inputs(monkeypatch, tmp_path):
+    progs = vf.programs("f16", 1, 2, (32, 64))
+    waves = {prog.asm(): prog.wave for prog in progs}
+    barrier = None
+
+    def fake_assemble(cmd, *, input, **kwargs):
+        assert ("-mattr=+wavefrontsize64,-wavefrontsize32" in cmd) == (waves[input] == 64)
+        if barrier:
+            barrier.wait(timeout=10)
+        return subprocess.CompletedProcess(cmd, 0, "\t.text\ns_endpgm\n", "")
+
+    def fake_translate(cmd, **kwargs):
+        output = Path(cmd[cmd.index("--out") + 1])
+        assert len(list((output.parent / "disasm").glob("*.s"))) == len(progs)
+        assert len(list((output.parent / "fssm").glob("*.fssm"))) == len(progs)
+        output.mkdir()
+        (output / "index.json").write_text("{}", encoding="utf-8", newline="\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.mc_command, "run", fake_assemble)
+    monkeypatch.setattr(vf.subprocess, "run", fake_translate)
+    serial = tmp_path / "serial"
+    parallel = tmp_path / "parallel"
+    vf.translate(progs, serial, False)
+    barrier = threading.Barrier(2)
+    vf.translate(progs, parallel, False, asm_jobs=2)
+    for path in serial.rglob("*"):
+        if path.is_file():
+            assert path.read_bytes() == (parallel / path.relative_to(serial)).read_bytes()
+
+
+def test_parallel_assembly_bounds_submitted_jobs(monkeypatch, tmp_path):
+    programs = vf.programs("f16", 1, 5, (32, 64))
+    submitted = 0
+    collected = 0
+    peak = 0
+
+    class MeasuringExecutor(vf.ThreadPoolExecutor):
+        def submit(self, fn, *args, **kwargs):
+            nonlocal submitted, peak
+            future = super().submit(fn, *args, **kwargs)
+            submitted += 1
+            peak = max(peak, submitted - collected)
+            collect = future.result
+
+            def result(*args, **kwargs):
+                nonlocal collected
+                collected += 1
+                return collect(*args, **kwargs)
+
+            future.result = result
+            return future
+
+    def fake_translate(cmd, **kwargs):
+        output = Path(cmd[cmd.index("--out") + 1])
+        output.mkdir()
+        (output / "index.json").write_text("{}", encoding="utf-8", newline="\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(vf, "ThreadPoolExecutor", MeasuringExecutor)
+    monkeypatch.setattr(vf.mc_command, "mc_command", lambda: ["llvm-mc"])
+    monkeypatch.setattr(vf.mc_command, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "s_endpgm\n", ""))
+    monkeypatch.setattr(vf.subprocess, "run", fake_translate)
+    vf.translate(programs, tmp_path, False, asm_jobs=2)
+    assert submitted == collected == len(programs)
+    assert peak == 4

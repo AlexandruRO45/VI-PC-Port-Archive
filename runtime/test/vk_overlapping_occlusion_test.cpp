@@ -16,8 +16,8 @@ namespace {
 
 using namespace leonida;
 constexpr std::uint32_t side = 8;
-constexpr std::uint32_t query_count = 4;
-constexpr std::uint32_t statistics_count = 4;
+constexpr std::uint32_t query_count = 10;
+constexpr std::uint32_t statistics_count = 9;
 constexpr std::uint32_t statistics_words = 11;  // D3D12_QUERY_DATA_PIPELINE_STATISTICS
 
 VkShaderModule load_shader(vktest::Device& d, const char* path) {
@@ -190,6 +190,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     // The statistics lists below: a split query (two segments), two unsplit references and a second split query.
     if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {3, 5, 3, 5, 3, 5});
     schedule.extents.insert(schedule.extents.end(), {2, 0, 0, 0, 1});
+    // The D3D-252 lists: three crossing statistics segment ends, three statistics references with the same draws,
+    // then the kind overlap's three segment ends and three occlusion references carrying the same draws.
+    if (d.pipeline_statistics_query) schedule.extents.insert(schedule.extents.end(), {7, 9, 11, 7, 9, 11});
+    schedule.extents.insert(schedule.extents.end(), {19, 21, 23, 19, 21, 23});
     schedule.every = bisect.enabled;
     schedule.no_draw = bisect.no_draw;
     draws = &schedule;
@@ -207,6 +211,10 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(copy_control.create(d, context, properties.limits));
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(queue.ok() && gate.semaphore());
+    // The gate stalls the GPU while the queue replays (the point of this test). A Wait on a fence with no submitted
+    // Signal is held on the CPU instead (queue_holds.h), so the gate is declared as having one: its Signal is
+    // "submitted" and the CPU completes it later, as a GPU-side signal behind long work would be.
+    context.holds().signaled(gate.semaphore(), 1);
     struct OpenGate { VulkanFence& fence; ~OpenGate() { fence.signal(1); } } open_gate{gate};
     constexpr QueryHeapId a = 1, b = 2, stats = 3;
     constexpr auto occ = d3d12_query::occlusion;
@@ -216,7 +224,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
                                     std::vector<bool>(query_count, false)});
 
     constexpr ResourceId dst_id = 4, predicate_id = 5;
-    constexpr VkDeviceSize binding_offset = 24, size = 160;
+    constexpr VkDeviceSize binding_offset = 24, size = 256;
     void* mapping = nullptr;
     ResourceBinding dst{};
     dst.buffer = d.buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &mapping);
@@ -388,7 +396,7 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     // gets one native draw before it ends (extents 3 and 5); two unsplit queries with the same draws are the
     // reference, and CSInvocations stays 0 because no application compute runs.
     constexpr ResourceId stats_dst_id = 6;
-    constexpr VkDeviceSize stats_result = statistics_words * sizeof(std::uint64_t), stats_slots = 5;
+    constexpr VkDeviceSize stats_result = statistics_words * sizeof(std::uint64_t), stats_slots = 10;
     void* stats_mapping = nullptr;
     ResourceBinding stats_dst{};
     if (fixture.statistics) {
@@ -446,6 +454,47 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
     EXPECT(single.close());
     const CommandList* fifth[] = {&single};
     EXPECT(queue.execute(fifth) == ReplayResult::success);
+    // D3D-252: overlapping pipeline-statistics queries and overlapping occlusion kinds. The hook's draw lands in
+    // the segment that is about to close, so each crossing query's sum covers its own intervals plus the shared
+    // intersection; the reference queries carry the same draws unsplit, and the sums must match them.
+    CommandList crossing_stats, stats_references, kind_overlap, kind_references;
+    if (d.pipeline_statistics_query) {
+        EXPECT(crossing_stats.begin_query({stats, d3d12_query::pipeline_statistics, 4}));
+        EXPECT(crossing_stats.begin_query({stats, d3d12_query::pipeline_statistics, 5}));
+        EXPECT(crossing_stats.end_query({stats, d3d12_query::pipeline_statistics, 4}));
+        EXPECT(crossing_stats.end_query({stats, d3d12_query::pipeline_statistics, 5}));
+        EXPECT(crossing_stats.resolve_queries({stats, d3d12_query::pipeline_statistics, 4, 1, stats_dst_id,
+                                               5 * stats_result}));
+        EXPECT(crossing_stats.resolve_queries({stats, d3d12_query::pipeline_statistics, 5, 1, stats_dst_id,
+                                               6 * stats_result}));
+        EXPECT(crossing_stats.close());
+        for (std::uint32_t index : {6u, 7u, 8u}) {
+            EXPECT(stats_references.begin_query({stats, d3d12_query::pipeline_statistics, index}));
+            EXPECT(stats_references.end_query({stats, d3d12_query::pipeline_statistics, index}));
+        }
+        EXPECT(stats_references.resolve_queries({stats, d3d12_query::pipeline_statistics, 6, 3, stats_dst_id,
+                                                 7 * stats_result}));
+        EXPECT(stats_references.close());
+    }
+    EXPECT(kind_overlap.begin_query({a, occ, 4}));
+    EXPECT(kind_overlap.begin_query({a, binary, 5}));
+    EXPECT(kind_overlap.end_query({a, binary, 5}));
+    EXPECT(kind_overlap.end_query({a, occ, 4}));
+    EXPECT(kind_overlap.resolve_queries({a, occ, 4, 1, dst_id, 168}));
+    EXPECT(kind_overlap.resolve_queries({a, binary, 5, 1, dst_id, 176}));
+    EXPECT(kind_overlap.close());
+    for (std::uint32_t index : {6u, 7u, 8u}) {
+        EXPECT(kind_references.begin_query({b, occ, index}));
+        EXPECT(kind_references.end_query({b, occ, index}));
+    }
+    EXPECT(kind_references.resolve_queries({b, occ, 6, 3, dst_id, 184}));
+    EXPECT(kind_references.close());
+    // The two statistics lists are recorded and closed only where the device has the feature, and execute()
+    // refuses a list that is not closed (list_open): MoltenVK has no pipelineStatisticsQuery.
+    std::vector<const CommandList*> overlap_lists;
+    if (d.pipeline_statistics_query) overlap_lists = {&crossing_stats, &stats_references};
+    overlap_lists.insert(overlap_lists.end(), {&kind_overlap, &kind_references});
+    EXPECT(queue.execute(overlap_lists) == ReplayResult::success);
     EXPECT(!schedule.overflow && schedule.next == schedule.extents.size());
     EXPECT(gate.signal(1));
     EXPECT(queue.idle());
@@ -455,6 +504,21 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
         {88, 2 * bursts + 1}, {96, 1}, {112, 4}, {120, 0}, {128, 4},
     };
     if (fixture.statistics) expected[0] = 2 * bursts + 1;  // the sum resolved inside the statistics query
+    {   // D3D-252: the ordinary result covers three segments (draws 19, 21 and 23); the binary result is the
+        // shared segment's count normalized to 1. The reference queries carry the same draws unsplit, and their
+        // own results at 184, 192 and 200 are the expectation for the sums.
+        const auto word_at = [&](VkDeviceSize at) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, static_cast<const char*>(mapping) + binding_offset + at, sizeof(value));
+            return value;
+        };
+        const std::uint64_t first = word_at(184), shared = word_at(192), last = word_at(200);
+        expected[168] = first + shared + last;
+        expected[176] = 1;
+        expected[184] = first;
+        expected[192] = shared;
+        expected[200] = last;
+    }
     for (VkDeviceSize offset = 0; offset < size; offset += 8) {
         const auto it = expected.find(offset - binding_offset);
         const auto want = it == expected.end() ? 0xcdcdcdcdcdcdcdcdULL : it->second;
@@ -487,9 +551,25 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
             }
         }
         EXPECT(word(0, cs_invocations) == 0 && word(1, 0) != 0 && word(2, 0) != 0);
+        // D3D-252: the crossing statistics queries (slots 5 and 6) each cover one private interval plus the shared
+        // intersection; slots 7 to 9 are the references with the same draws unsplit.
+        for (std::uint32_t counter = 0; counter < statistics_words; ++counter) {
+            if (word(5, counter) != word(7, counter) + word(8, counter) ||
+                word(6, counter) != word(8, counter) + word(9, counter)) {
+                std::fprintf(stderr, "crossing statistics counter %u: got %llu/%llu, wanted %llu/%llu\n", counter,
+                             static_cast<unsigned long long>(word(5, counter)),
+                             static_cast<unsigned long long>(word(6, counter)),
+                             static_cast<unsigned long long>(word(7, counter) + word(8, counter)),
+                             static_cast<unsigned long long>(word(8, counter) + word(9, counter)));
+                return 1;
+            }
+        }
+        EXPECT(word(5, cs_invocations) == 0 && word(6, cs_invocations) == 0);
         std::printf("statistics split around a sum: IA vertices %llu, PS invocations %llu, CS invocations 0, "
                     "equal to two unsplit queries\n",
                     static_cast<unsigned long long>(word(0, 0)), static_cast<unsigned long long>(word(0, 7)));
+        std::printf("crossing statistics: IA vertices %llu/%llu, CS invocations 0, equal to the unsplit references\n",
+                    static_cast<unsigned long long>(word(5, 0)), static_cast<unsigned long long>(word(6, 0)));
     }
     std::printf("crossing 80/20; nested 84/16; %u segments summed; alternating binary results 1/1; "
                 "resolve inside an active query 4; offsets and gated overwrites exact\n",
@@ -500,22 +580,29 @@ int run(vktest::Device& d, const char* vertex, const char* fragment, const Bisec
 
 } // namespace
 
-// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
+// vk_overlapping_occlusion_test <vert.spv> <frag.spv> [--no-statistics]
+//                               [--bisect [--gated] [--no-draw] [--no-resolve] [phase...]]
+// --no-statistics runs the test as a device without pipelineStatisticsQuery does (MoltenVK): no statistics pool,
+// no statistics lists. It makes that path testable on a device that has the feature.
 int main(int argc, char** argv) {
     EXPECT(argc >= 3);
     Bisect bisect;
+    bool no_statistics = false;
     for (int i = 3; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
+        if (std::strcmp(argv[i], "--no-statistics") == 0) no_statistics = true;
+        else if (std::strcmp(argv[i], "--bisect") == 0) bisect.enabled = true;
         else if (std::strcmp(argv[i], "--gated") == 0) bisect.gated = true;
         else if (std::strcmp(argv[i], "--no-draw") == 0) bisect.no_draw = true;
         else if (std::strcmp(argv[i], "--no-resolve") == 0) bisect.no_resolve = true;
         else bisect.phases.emplace_back(argv[i]);
     }
-    EXPECT(argc == 3 || bisect.enabled);
+    EXPECT(argc == 3 + (no_statistics ? 1 : 0) || bisect.enabled);
     vktest::Device device;
     const auto status = device.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     EXPECT(status == vktest::DeviceStatus::ready);
+    if (no_statistics) device.pipeline_statistics_query = false;
+    std::printf("pipeline statistics: %s\n", device.pipeline_statistics_query ? "checked" : "not checked");
     const int result = run(device, argv[1], argv[2], bisect);
     EXPECT(device.validation_errors() == 0);
     return result;

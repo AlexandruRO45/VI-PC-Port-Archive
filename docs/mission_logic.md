@@ -156,3 +156,23 @@ archetypes is not in the readable archives.
 This is **one more binding, not a general solution**. The other 143 ids in the mission table remain
 unattributed unless a character, schedule or other stable name gives them a bridge; joining ids to
 tables is still an open problem.
+
+## Reading these tables
+
+`tools/mission_tables.py` reads the 32-byte record tables and the 64-byte pool elements they point
+at, from inflated PSIN streams or a directory of carved `.bin` streams:
+
+```
+python -I tools/mission_tables.py <file-or-dir> [--json] [--limit N]
+```
+
+A lone path is the PSIN file: a file without the `PSIN` magic is one `ERROR: <path>: not a PSIN container`
+line and exit 2, while a folder is the place for the bare carved streams and is scanned as before. A PSIN
+file that holds no records is still a clean run.
+
+It prints per-file record, chunk, state and entity counts, plus each resolved entity's archetype
+hash, link hash, position and rotation. Pointers are scored in three encodings: **file-absolute**,
+**linked pool** (`pool_block_base + (offset >> 4)`), and **block-indexed** (`kind` is a 1-based
+block number and the byte offset is `(band << 12) | (poolOffset >> 4)`). A slot that does not match
+the 64-byte position/rotation layout is reported as unresolved or skipped, not guessed. The tests
+are synthetic (`python -I tests/test_mission_tables.py`) and need no game files.

@@ -14,9 +14,11 @@ The output is pcm_s16le at the stream's own sample rate and channel count (Opus 
 stream is trimmed to its Ogg Opus end granule minus pre-skip, because ffmpeg can keep samples beyond its declared
 end. For chained streams, ffmpeg handles each link's timing. ffmpeg must be on PATH or given with
 --ffmpeg; without it the tool exits with an explanation instead of a traceback.
+The decode queue holds at most one outstanding job per worker, even for a large input tree.
 
 For PCM copies of the AWC banks' Opus streams, first repackage the banks with awc_opus.py, then run this tool on
 its output (make_game.py does both, the second only with --wav).
+Usage: `python -I tools/audio_wav.py --help` lists the options.
 """
 import argparse
 import concurrent.futures
@@ -31,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import BinaryIO
 import unicodedata
 
 EXTS = (".ogg", ".opus")
@@ -61,11 +64,27 @@ def find_ffmpeg(explicit: str):
     return found
 
 
+def _read_opus_id(stream: BinaryIO) -> tuple[bytes, bytes] | None:
+    """Read the Opus ID packet and serial, leaving the stream at the next page."""
+    header = stream.read(27)
+    if len(header) != 27 or header[:6] != b"OggS\x00\x02":
+        return None
+    lacing = stream.read(header[26])
+    # An Opus identification packet completes on the BOS page and is its only packet (RFC 7845).
+    if len(lacing) != header[26] or not lacing or lacing[-1] == 255 or any(v != 255 for v in lacing[:-1]):
+        return None
+    size = sum(lacing)
+    packet = stream.read(size)
+    if len(packet) != size or size < 19 or not packet.startswith(b"OpusHead"):
+        return None
+    return packet, header[14:18]
+
+
 def looks_like_opus(path: str) -> bool:
     """True if the first Ogg page carries an OpusHead packet (so .ogg files that are Vorbis are left alone)."""
     try:
         with open(path, "rb") as f:
-            return b"OpusHead" in f.read(512)
+            return _read_opus_id(f) is not None
     except OSError:
         return True         # let ffmpeg report the real problem
 
@@ -75,23 +94,15 @@ def ogg_output_samples(path: str) -> int:
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as f:
-            first = f.read(65536)
-            if len(first) < 27 or first[:6] != b"OggS\x00\x02":
+            identification = _read_opus_id(f)
+            if identification is None:
                 return 0
-            # The Opus ID packet must finish on the BOS page and be its only packet.
-            body_start = 27 + first[26]
-            lacing = first[27:body_start]
-            if not lacing or lacing[-1] == 255 or lacing[:-1].count(255) != len(lacing) - 1:
+            head, serial = identification
+            if head[8] >= 16 or head[9] == 0:
                 return 0
-            body_end = body_start + sum(lacing)
-            head = first[body_start:body_end]
-            if (body_end > len(first) or len(head) < 19 or not head.startswith(b"OpusHead")
-                    or head[8] >= 16 or head[9] == 0):
-                return 0
-            serial = first[14:18]
             pre_skip, = struct.unpack_from("<H", head, 10)
             # Walk page headers forward so same-serial chained or multiplexed streams are rejected.
-            offset = body_end
+            offset = f.tell()
             while offset < size:
                 f.seek(offset)
                 hdr = f.read(27)
@@ -119,8 +130,11 @@ def ogg_output_samples(path: str) -> int:
 
 def collect(src: str):
     """([(input, relative output stem)], number of .ogg/.opus files that are not Ogg Opus)."""
+    def scan_failed(exc: OSError) -> None:
+        raise exc
+
     files, not_opus = [], 0
-    for root, dirs, names in os.walk(src):
+    for root, dirs, names in os.walk(src, onerror=scan_failed):
         dirs.sort()
         for name in sorted(names):
             if not name.lower().endswith(EXTS):
@@ -316,7 +330,7 @@ def plan_outputs(items, src, out, ffmpeg):
         for group in groups.values():
             repaired.update(native_collisions(group, named, target, unprobed))
         repaired.update(unprobed)
-    counters, digests = {}, {}
+    counters, digests, dest_digests = {}, {}, {}
 
     def holds_own_audio(i, stem):
         """True if stem.wav is free or already holds input i's decoded audio."""
@@ -330,15 +344,20 @@ def plan_outputs(items, src, out, ffmpeg):
             elif len(digests) % 100 == 0:
                 print(f"  Checked {len(digests)} input recordings...", flush=True)
             digests[i] = audio_digest(ffmpeg, path, source=True)
-        if digests[i] and os.path.isfile(dst) and audio_digest(ffmpeg, dst, source=False) == digests[i]:
-            return True
+        if digests[i] and os.path.isfile(dst):
+            if dst not in dest_digests:
+                dest_digests[dst] = audio_digest(ffmpeg, dst, source=False)
+            if dest_digests[dst] == digests[i]:
+                return True
         print(f"  Keeping {dst}: its audio could not be verified for {path}.", file=sys.stderr)
         return False
 
     def allocate(i, base):
         """Give input i the first unreserved name of base, base~2, ... that is free or holds its audio."""
         base_key = key(base)
-        stem, n = base, counters.get(base_key, 2)
+        first = counters.get(base_key, 2)
+        stem, n = (base, 2) if first == 2 else (f"{base}~{first}", first + 1)
+        skipped_unreserved = False
         while True:
             candidate = key(stem)
             if candidate not in reserved:
@@ -346,9 +365,10 @@ def plan_outputs(items, src, out, ffmpeg):
                     raise OSError(f"cannot distinguish names in a read-only directory and verify {stem}.wav")
                 if holds_own_audio(i, stem):
                     break
-                reserved[candidate] = i
+                skipped_unreserved = True
             stem, n = f"{base}~{n}", n + 1
-        counters[base_key] = n
+        if not skipped_unreserved:
+            counters[base_key] = n
         reserved[candidate] = i
         named[i] = (named[i][0], stem)
 
@@ -415,6 +435,24 @@ def decode(ffmpeg: str, src: str, dst: str):
         return False, str(e)
 
 
+def _decode_jobs(pool, ffmpeg, todo, workers):
+    """Yield (relative name, completed future) without retaining a future for every input."""
+    jobs = iter(todo)
+    pending = {}
+    while True:
+        while len(pending) < workers:
+            job = next(jobs, None)
+            if job is None:
+                break
+            path, rel, dst = job
+            pending[pool.submit(decode, ffmpeg, path, dst)] = rel
+        if not pending:
+            return
+        ready, _ = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        for future in ready:
+            yield pending.pop(future), future
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Decode Ogg Opus audio to 16-bit PCM WAV with ffmpeg.")
     ap.add_argument("src", help="a directory to search recursively, or one .ogg/.opus file")
@@ -438,7 +476,11 @@ def main(argv=None) -> int:
         not_opus = 0
         default_out = os.path.dirname(src)
     elif os.path.isdir(src):
-        items, not_opus = collect(src)
+        try:
+            items, not_opus = collect(src)
+        except OSError as exc:
+            error(f"cannot scan {exc.filename or src}: {exc.strerror or exc}")
+            return 2
         default_out = os.path.join(src, "wav")
     else:
         error(f"source not found: {a.src}")
@@ -472,23 +514,31 @@ def main(argv=None) -> int:
     t0 = time.time()
     written = skipped = 0
     todo = []
+    failed = 0
+    failure_samples: list[tuple[str, str]] = []
+
+    def record_failure(rel: str, message: str) -> None:
+        nonlocal failed
+        failed += 1
+        if len(failure_samples) < 10:
+            first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+            failure_samples.append((rel, first))
+
     for path, rel in items:
         dst = os.path.join(out, rel + ".wav")
-        if os.path.exists(dst):
+        if os.path.isfile(dst):
             skipped += 1
+        elif os.path.exists(dst):
+            record_failure(rel, f"output path is not a file: {dst}")
         else:
             todo.append((path, rel, dst))
 
-    failures = []
     done = 0
     workers = min(a.jobs, len(todo)) if todo else 1
     if todo:
         print(f"Decoding {len(todo)} file(s) with {workers} job(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(decode, ffmpeg, path, dst): (path, rel)
-                   for path, rel, dst in todo}
-        for future in concurrent.futures.as_completed(futures):
-            path, rel = futures[future]
+        for rel, future in _decode_jobs(pool, ffmpeg, todo, workers):
             try:
                 ok, message = future.result()
             except Exception as e:                  # never lose the summary to an unexpected worker error
@@ -497,23 +547,22 @@ def main(argv=None) -> int:
             if ok:
                 written += 1
             else:
-                failures.append((rel, message))
+                record_failure(rel, message)
             if done % 200 == 0:
                 print(f"  {done}/{len(todo)} decoded", flush=True)
 
     seconds = time.time() - t0
     summary = f"{len(items)} Ogg Opus file(s): {written} WAV written, {skipped} already present"
-    if failures:
-        summary += f", {len(failures)} failed"
+    if failed:
+        summary += f", {failed} failed"
     print(summary + f" ({seconds:.1f}s)")
     if not_opus:
         print(f"  {not_opus} .ogg/.opus file(s) skipped: not Ogg Opus")
-    for rel, message in failures[:10]:
-        first = next((line.strip() for line in message.splitlines() if line.strip()), "unknown error")
+    for rel, first in failure_samples:
         print(f"  FAILED {rel}: {first}")
-    if len(failures) > 10:
-        print(f"  ... and {len(failures) - 10} more failures")
-    return 1 if failures else 0
+    if failed > len(failure_samples):
+        print(f"  ... and {failed - len(failure_samples)} more failures")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

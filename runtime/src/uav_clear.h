@@ -89,6 +89,8 @@ inline constexpr Layout layouts[] = {
     {VK_FORMAT_R8G8_SINT, Kind::sint, 2, {{{0, 8}, {8, 8}, {}, {}}}},
     {VK_FORMAT_R16_SFLOAT, Kind::sfloat, 2, {{{0, 16}, {}, {}, {}}}},
     {VK_FORMAT_R16_UNORM, Kind::unorm, 2, {{{0, 16}, {}, {}, {}}}},
+    // A4B4G4R4_UNORM: typed UAVs are the driver's call (WARP has them, AMD's D3D12 driver doesn't).
+    {VK_FORMAT_R4G4B4A4_UNORM_PACK16, Kind::unorm, 2, {{{12, 4}, {8, 4}, {4, 4}, {0, 4}}}},
     {VK_FORMAT_R16_SNORM, Kind::snorm, 2, {{{0, 16}, {}, {}, {}}}},
     {VK_FORMAT_R16_UINT, Kind::uint, 2, {{{0, 16}, {}, {}, {}}}},
     {VK_FORMAT_R16_SINT, Kind::sint, 2, {{{0, 16}, {}, {}, {}}}},
@@ -201,7 +203,7 @@ inline std::uint32_t to_rgb9e5(float r, float g, float b) {
     const float max_c = std::max(r, std::max(g, b));
     if (max_c == 0.0f) return 0u;
     int exp_raw = 0;
-    std::frexp(max_c, &exp_raw);  // floor(log2(max_c)) == exp_raw - 1
+    (void)std::frexp(max_c, &exp_raw);  // floor(log2(max_c)) == exp_raw - 1
     int exp_shared = std::max(0, exp_raw + 15);
     double denom = std::ldexp(1.0, exp_shared - 24);  // 2^(exp_shared - 15 - 9)
     const int max_m = static_cast<int>(std::floor(double(max_c) / denom + 0.5));

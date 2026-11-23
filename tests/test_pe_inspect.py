@@ -249,6 +249,16 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(report["exports"], ["Alpha", "#12"])
             self.assertEqual(report["export_count"], 2)
 
+    def test_named_exports_require_a_populated_address_table_slot(self) -> None:
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                data = bytearray(with_exports([0x1000, 0, FORWARDER, 0x1010],
+                                              {0: "Alpha", 1: "Empty", 2: "Forwarded", 4: "Outside"},
+                                              is64=is64))
+                # The bytes after AddressOfFunctions are not part of its declared four slots.
+                place(data, EXPORT_FUNCS + 16, struct.pack("<I", 0x1020))
+                self.assertEqual(self.exports_of(bytes(data)), ["Alpha", "Forwarded", "#13"])
+
     def test_unused_slots_in_a_table_without_names(self):
         data = with_exports([0, 0x1000, 0, 0x1010, 0], {})
         self.assertEqual(self.exports_of(data), ["#11", "#13"])
@@ -304,6 +314,33 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("| xmem.dll | normal | shim | 1 |", md)
         self.assertIn("## Needs checking or a shim", md)
         self.assertIn("`XMemAlloc`", md)
+
+    def test_runtime_load_candidates(self):
+        """DLL names held as strings but not imported: what a run-time LoadLibrary* reaches
+        (docs/runtime_imports.md)."""
+        base = {d["name"] for d in self.report["runtime_load_candidates"]}
+        self.assertEqual(base, {"d3d12_xs.dll"}, "the 64-bit fixture names d3d12_xs.dll without importing it")
+        buf = bytearray(build_image())
+        place(buf, 0x1E00, "XGameRuntime.dll".encode("utf-16-le") + b"\0\0")
+        place(buf, 0x1E40, b"gameplatformservices.dll\0xmem.dll\0")
+        path = os.path.join(self.dir, "loads.dll")
+        with open(path, "wb") as f:
+            f.write(buf)
+        r = pe_inspect.inspect(path, self.dir)
+        found = {d["name"]: d for d in r["runtime_load_candidates"]}
+        self.assertEqual(set(found) - base, {"gameplatformservices.dll", "xgameruntime.dll"}, "xmem.dll is imported")
+        self.assertEqual(found["xgameruntime.dll"]["encoding"], "utf-16")
+        self.assertEqual(found["gameplatformservices.dll"]["encoding"], "ascii")
+        self.assertIn(found["xgameruntime.dll"]["where"], ("system", "shim"))
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("## Run-time load candidates", md)
+        self.assertIn("| xgameruntime.dll | utf-16 |", md)
+
+    def test_dll_strings_encodings_own_name_and_near_misses(self):
+        data = (b"a.dll\0" + "b.dll".encode("utf-16-le") + b"\0\0" + "a.dll".encode("utf-16-le") +
+                b" self.DLL x.dllz .dll y.dll")
+        got = pe_inspect.dll_strings(data, {"y.dll"}, "Self.dll")
+        self.assertEqual(got, [{"name": "a.dll", "encoding": "both"}, {"name": "b.dll", "encoding": "utf-16"}])
 
     def test_non_pe_input_is_rejected(self):
         bad = os.path.join(self.dir, "not_pe.bin")
@@ -513,6 +550,36 @@ class DirectoryCountTest(unittest.TestCase):
         self.assertEqual((r["imports"], r["exports"], r["has_relocs"]), ([], [], False))
 
 
+class ImportDescriptorBoundsTest(unittest.TestCase):
+    DIRECTORIES = (
+        ("normal", pe_inspect.DIR_IMPORT, 20, ["kernel32.dll", "xmem.dll"]),
+        ("delay", pe_inspect.DIR_DELAY_IMPORT, 32, ["xmem.dll", "d3d12_xs.dll"]),
+    )
+
+    def test_import_descriptors_fit_the_declared_directory(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for size, count in ((step - 1, 0), (2 * step - 1, 1), (2 * step, 2)):
+                with self.subTest(kind=kind, size=size):
+                    data = bytearray(build_image(is64=False))
+                    struct.pack_into("<I", data, OPT + 96 + index * 8 + 4, size)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:count])
+
+    def test_import_descriptors_fit_the_file_backed_section(self):
+        for kind, index, step, dlls in self.DIRECTORIES:
+            for extra in (0, 1):
+                with self.subTest(kind=kind, extra=extra):
+                    data = bytearray(build_image(is64=False)) + b"\0"
+                    directory = OPT + 96 + index * 8
+                    source_rva = struct.unpack_from("<I", data, directory)[0]
+                    source = TEXT_RAW + source_rva - TEXT_RVA
+                    rva = TEXT_RVA + TEXT_SIZE - step + extra
+                    place(data, rva, data[source:source + step])
+                    struct.pack_into("<II", data, directory, rva, step)
+                    imports = pe_inspect._imports(pe_inspect.PeImage(data), kind, index, delay=kind == "delay")
+                    self.assertEqual([entry["dll"] for entry in imports], dlls[:1 - extra])
+
+
 class SectionSpanTest(unittest.TestCase):
     """An RVA belongs to the section whose virtual span holds it, not to an earlier section's raw tail."""
 
@@ -663,6 +730,231 @@ class DeclaredOptionalHeaderSizeTest(unittest.TestCase):
                     pe_inspect.PeFormatError, "truncated optional header"
                 ):
                     pe_inspect.PeImage(bytes(data))
+
+
+class ShortHeaderTest(unittest.TestCase):
+    """A file too short for a header names the header it stops short of, not a signature that is present."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.dir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def dos_header(self, size: int, nt: int | None = None) -> bytes:
+        """`size` bytes starting with MZ, optionally with e_lfanew at 0x3c pointing at `nt`."""
+        data = bytearray(size)
+        data[0:2] = b"MZ"
+        if nt is not None:
+            struct.pack_into("<I", data, 0x3C, nt)
+        return bytes(data)
+
+    def check_rejected(self, name: str, data: bytes, expected: str, not_expected: str = "") -> None:
+        """PeImage raises the message, and the CLI prints it to stderr and exits 1; no traceback on either path."""
+        with self.assertRaisesRegex(pe_inspect.PeFormatError, expected):
+            pe_inspect.PeImage(data)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(pe_inspect.main([self.write(name, data), "--out", os.path.join(self.dir, "reports")]), 1)
+        self.assertIn(expected, err.getvalue())
+        if not_expected:
+            self.assertNotIn(not_expected, err.getvalue())
+
+    def test_mz_shorter_than_the_msdos_header_reports_the_length(self):
+        # a 4-byte truncated copy: the signature is there, the 64-byte MS-DOS header (e_lfanew lives at 0x3c) is not
+        self.check_rejected("short4.bin", self.dos_header(4),
+                            "file is 4 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_mz_one_byte_short_of_the_msdos_header_reports_the_length(self):
+        self.check_rejected("short63.bin", self.dos_header(63),
+                            "file is 63 bytes, shorter than the 64-byte MS-DOS header", not_expected="no MZ header")
+
+    def test_file_without_the_mz_signature_still_reports_no_mz_header(self):
+        for name, data in (("aaaa.bin", b"AAAA"), ("empty.bin", b""), ("one_byte.bin", b"A"), ("m.bin", b"M")):
+            with self.subTest(name=name):
+                self.check_rejected(name, data, "no MZ header")
+
+    def test_e_lfanew_past_the_end_reports_a_short_file_not_a_missing_signature(self):
+        # 64 bytes: the MS-DOS header fits, the PE header it points at at 0x40 does not
+        self.check_rejected("nt_past.bin", self.dos_header(64, 0x40),
+                            "file is 64 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_pe_header_cut_after_the_signature_reports_a_short_file(self):
+        # PE\0\0 at 0x40 is there, the 20 bytes of file header after it are cut off
+        data = bytearray(self.dos_header(68, 0x40))
+        data[0x40:0x44] = b"PE\0\0"
+        self.check_rejected("coff_cut.bin", bytes(data),
+                            "file is 68 bytes, too short to hold the PE header at 0x40",
+                            not_expected="no PE signature")
+
+    def test_a_long_enough_file_with_a_wrong_signature_still_reports_no_pe_signature(self):
+        data = bytearray(self.dos_header(88, 0x40))
+        data[0x40:0x44] = b"XX\0\0"
+        self.check_rejected("bad_sig.bin", bytes(data), "no PE signature")
+
+
+class SectionBoundaryReadTest(unittest.TestCase):
+    """Strings and multi-byte directory entries must not cross section/header boundaries or alias 64-bit thunks."""
+
+    @staticmethod
+    def two_section_bytes(is64: bool = True, a_vsize: int = 0x200, a_raw: int = 0x200) -> tuple[bytearray, int]:
+        """Build raw bytes for a two-section image with `.a` at 0x1000 and `.b` immediately after it."""
+        b_raw = 0x200 + a_raw
+        image = bytearray(build_image(is64=is64, with_directories=False)[:0x200]) + bytearray(a_raw + 0x200)
+        struct.pack_into("<H", image, 0x46, 2)
+        table = OPT + (240 if is64 else 224)
+        struct.pack_into("<IIII", image, table + 8, a_vsize, 0x1000, a_raw, 0x200)
+        image[table + 40:table + 48] = b".b\0\0\0\0\0\0"
+        struct.pack_into("<IIII", image, table + 48, 0x200, 0x2000, 0x200, b_raw)
+        struct.pack_into("<I", image, table + 76, 0x40000040)
+        struct.pack_into("<I", image, OPT + 56, 0x3000)
+        return image, b_raw
+
+    def test_string_at_does_not_cross_section_or_header_boundary(self):
+        # `.a` (0x200..0x400) immediately followed by `.b` (0x400..0x600)
+        image, b_raw = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        image[0x3FA:0x400] = b"UNTERM"
+        image[b_raw:b_raw + 7] = b"LEAKED\0"
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertIsNone(img.string_at(0x11FA))
+
+        # `.a` virtual span (0x200) shorter than its raw size (0x400), followed by unmapped raw tail
+        tail_image, _ = self.two_section_bytes(a_vsize=0x200, a_raw=0x400)
+        tail_image[0x3FA:0x400] = b"UNTERM"
+        tail_image[0x400:0x405] = b"TAIL\0"
+        self.assertIsNone(pe_inspect.PeImage(bytes(tail_image)).string_at(0x11FA))
+
+        # Unterminated string in headers stops at SizeOfHeaders (0x200) before `.a`
+        hdr_image, _ = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        hdr_image[0x1FD:0x200] = b"HDR"
+        hdr_image[0x200:0x206] = b"SEC_A\0"
+        self.assertIsNone(pe_inspect.PeImage(bytes(hdr_image)).string_at(0x1FD))
+
+        # Positive control: a NUL byte on the very last mapped byte of `.a` is read cleanly
+        good_image, b_raw = self.two_section_bytes(a_vsize=0x200, a_raw=0x200)
+        good_image[0x3FA:0x400] = b"EXACT\0"
+        good_image[b_raw:b_raw + 7] = b"LEAKED\0"
+        self.assertEqual(pe_inspect.PeImage(bytes(good_image)).string_at(0x11FA), "EXACT")
+
+    def test_thunk_entry_straddling_section_boundary_stops_cleanly(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                width = 8 if is64 else 4
+                ordinal_flag = 1 << (63 if is64 else 31)
+                image, b_raw = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                # Place one valid Hint/Name at RVA 0x1010 (raw 0x210)
+                image[0x210:0x21A] = b"\x00\x00GoodSym\0"
+                # Place thunk table so entry 0 fits in `.a` and entry 1 starts 2 bytes before `.a` ends
+                lookup_rva = 0x1200 - width - 2
+                entry0_off = 0x200 + (lookup_rva - 0x1000)
+                fmt = "<Q" if is64 else "<I"
+                struct.pack_into(fmt, image, entry0_off, 0x1010)
+                entry1 = struct.pack(fmt, ordinal_flag | 9)
+                image[0x3FE:0x400] = entry1[:2]
+                image[b_raw:b_raw + width - 2] = entry1[2:]
+                img = pe_inspect.PeImage(bytes(image))
+                self.assertEqual(img.thunk_names(lookup_rva), ["GoodSym"])
+
+    def test_pe64_non_ordinal_thunk_high_bits_are_not_masked(self):
+        image = bytearray(build_image(is64=True))
+        place(image, 0x1B00, b"\x00\x00AliasedSym\0")
+        place(image, 0x1200, struct.pack("<QQQ", 0x100001B00, 0x80001B00, 0))
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertEqual(img.thunk_names(0x1200), ["?", "?"])
+
+    def test_export_directory_and_tables_straddling_section_boundary_do_not_cross(self):
+        # Straddling export directory itself (starts 20 bytes before `.a` ends)
+        image, b_raw = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        dirs_at = OPT + 112
+        struct.pack_into("<II", image, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x11EC, 40)
+        image[0x210:0x21A] = b"leaked.dll"
+        image[0x21A] = 0
+        struct.pack_into("<IIII", image, 0x220, 0x1080, 0, 0, 0)
+        image[0x240:0x247] = b"ExpSym\0"
+        struct.pack_into("<I", image, 0x250, 0x1040)
+        struct.pack_into("<H", image, 0x254, 0)
+        struct.pack_into("<IIHHIIIIIII", image, 0x3EC, 0, 0, 0, 0, 0x1010, 1, 1, 1, 0x1020, 0x1050, 0x1054)
+        img = pe_inspect.PeImage(bytes(image))
+        self.assertEqual(pe_inspect._exports(img), [])
+        self.assertEqual(pe_inspect._export_module_name(img), "")
+
+        # Straddling export table entries (functions / names / ordinals)
+        image2, b_raw2 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image2, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image2[0x250:0x256] = b"First\0"
+        image2[b_raw2:b_raw2 + 16] = b"LeakedSym\0\0\0\0\0\0\0"
+        # AddressOfFunctions at 0x11FA (slot 0 in `.a`, slot 1 straddles 2 bytes in `.a` + 2 bytes in `.b`)
+        struct.pack_into("<I", image2, 0x3FA, 0x1080)
+        image2[0x3FE:0x400] = b"\x00\x00"
+        image2[b_raw2:b_raw2 + 2] = b"\x10\x00"
+        # AddressOfNames at 0x1100 (1 valid entry pointing to 0x1050), AddressOfNameOrdinals at 0x1110 ([0])
+        struct.pack_into("<I", image2, 0x300, 0x1050)
+        struct.pack_into("<H", image2, 0x310, 0)
+        struct.pack_into("<IIHHIIIIIII", image2, 0x220, 0, 0, 0, 0, 0, 1, 2, 1, 0x11FA, 0x1100, 0x1110)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image2))), ["First"])
+
+        # Straddling AddressOfNames and AddressOfNameOrdinals
+        image3, b_raw3 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image3, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image3[0x250:0x256] = b"First\0"
+        image3[0x260:0x26A] = b"SecondSym\0"
+        struct.pack_into("<II", image3, 0x280, 0x1080, 0x1090)
+        struct.pack_into("<I", image3, 0x3FA, 0x1050)
+        straddle_name = struct.pack("<I", 0x1060)
+        image3[0x3FE:0x400] = straddle_name[:2]
+        image3[b_raw3:b_raw3 + 2] = straddle_name[2:]
+        struct.pack_into("<HH", image3, 0x300, 0, 1)
+        struct.pack_into("<IIHHIIIIIII", image3, 0x220, 0, 0, 0, 0, 0, 1, 2, 2, 0x1080, 0x11FA, 0x1100)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image3))), ["First", "#2"])
+
+        image4, b_raw4 = self.two_section_bytes(is64=True, a_vsize=0x200, a_raw=0x200)
+        struct.pack_into("<II", image4, dirs_at + pe_inspect.DIR_EXPORT * 8, 0x1020, 40)
+        image4[0x250:0x256] = b"First\0"
+        image4[0x260:0x26A] = b"SecondSym\0"
+        struct.pack_into("<II", image4, 0x280, 0x1080, 0x1090)
+        struct.pack_into("<II", image4, 0x300, 0x1050, 0x1060)
+        struct.pack_into("<H", image4, 0x3FD, 0)
+        straddle_ord = struct.pack("<H", 1)
+        image4[0x3FF:0x400] = straddle_ord[:1]
+        image4[b_raw4:b_raw4 + 1] = straddle_ord[1:]
+        struct.pack_into("<IIHHIIIIIII", image4, 0x220, 0, 0, 0, 0, 0, 1, 2, 2, 0x1080, 0x1100, 0x11FD)
+        self.assertEqual(pe_inspect._exports(pe_inspect.PeImage(bytes(image4))), ["First", "#2"])
+
+    def test_tls_directory_and_callbacks_straddling_section_boundary_do_not_cross(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                width = 8 if is64 else 4
+                base = IMAGE_BASE if is64 else BASE32
+                dirs_at = OPT + (112 if is64 else 96)
+                tls_size = 40 if is64 else 24
+                cb_field = 24 if is64 else 12
+                fmt = "<Q" if is64 else "<I"
+
+                # TLS directory itself straddling `.a`/`.b`
+                image, _ = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                struct.pack_into("<II", image, dirs_at + pe_inspect.DIR_TLS * 8, 0x11F0, tls_size)
+                struct.pack_into(fmt, image, 0x220, base + 0x1080)
+                struct.pack_into(fmt, image, 0x220 + width, 0)
+                struct.pack_into(fmt, image, 0x3F0 + cb_field, base + 0x1020)
+                self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image))), 0)
+
+                # TLS callback array entry straddling `.a`/`.b`
+                image2, b_raw2 = self.two_section_bytes(is64=is64, a_vsize=0x200, a_raw=0x200)
+                struct.pack_into("<II", image2, dirs_at + pe_inspect.DIR_TLS * 8, 0x1020, tls_size)
+                cb_rva = 0x1200 - width - 2
+                struct.pack_into(fmt, image2, 0x220 + cb_field, base + cb_rva)
+                struct.pack_into(fmt, image2, 0x200 + (cb_rva - 0x1000), base + 0x1080)
+                straddle = struct.pack(fmt, base + 0x1090)
+                image2[0x3FE:0x400] = straddle[:2]
+                image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
+                self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

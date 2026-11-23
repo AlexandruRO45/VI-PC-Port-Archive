@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -49,7 +50,7 @@ leonida::ResourceBinding resource() {
     r.image = reinterpret_cast<VkImage>(std::uintptr_t{1});
     r.format = VK_FORMAT_R8G8B8A8_UNORM;
     r.width = 5; r.height = 3;
-    r.rgba8_typeless = true;
+    r.typeless = true;
     return r;
 }
 void reset_counters() {
@@ -102,7 +103,9 @@ int main() {
             } else if (format == ColorViewFormat::rgba8_sint) {
                 EXPECT(captured.int32[0] == 1 && captured.int32[1] == 2 && captured.int32[2] == 127 && captured.int32[3] == -1);
             } else {
-                EXPECT(std::memcmp(captured.float32, color.data(), sizeof(captured)) == 0);
+                // UNORM and sRGB views round and clamp like D3D (render_target_clear_color): 1.5 and 256 are 1.0, -1 is 0.
+                const VkClearColorValue converted = leonida::detail::render_target_clear_color(expected, color);
+                EXPECT(std::memcmp(captured.float32, converted.float32, sizeof(captured)) == 0);
             }
             ++checks;
         }
@@ -173,6 +176,8 @@ int main() {
             const auto resolve = [&](ResourceId id) { return id == 2 ? &predicate : &binding; };
             EXPECT(prepare(list, resolve, queries, prepared) ==
                    (inside ? ReplayResult::unsupported : ReplayResult::success));
+            EXPECT(prepare(list, resolve, queries, prepared, true) == ReplayResult::success);
+            EXPECT(prepared.statistics_segment_count == (inside ? 2u : 0u));
             ++checks;
         }
     }
@@ -252,7 +257,7 @@ int main() {
         EXPECT(requested_range.layerCount == view.layer_count && rendering_layers == view.layer_count);
         ++checks;
     }
-    auto wrong = binding; wrong.rgba8_typeless = false;
+    auto wrong = binding; wrong.typeless = false;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
     wrong = binding; wrong.format = VK_FORMAT_R32_SFLOAT;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_uint}));
@@ -262,6 +267,33 @@ int main() {
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.volume = true;
     EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    // A castable RGBA8 or BGRA8 image clears through a view in the other channel order (the device checked that the
+    // list names it); without a castable list, or for a UINT image, the other order stays refused.
+    {
+        const auto bgra8_unorm = static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_UNORM);
+        const auto bgra8_srgb = static_cast<ColorViewFormat>(VK_FORMAT_B8G8R8A8_SRGB);
+        auto castable = binding; castable.typeless = false; castable.castable_view_formats = true;
+        auto castable_bgra = castable; castable_bgra.format = VK_FORMAT_B8G8R8A8_UNORM;
+        const std::tuple<ResourceBinding, ColorViewFormat, VkFormat> crossings[] = {
+            {castable, bgra8_unorm, VK_FORMAT_B8G8R8A8_UNORM},
+            {castable, bgra8_srgb, VK_FORMAT_B8G8R8A8_SRGB},
+            {castable_bgra, ColorViewFormat::rgba8_unorm, VK_FORMAT_R8G8B8A8_UNORM},
+            {castable_bgra, ColorViewFormat::rgba8_srgb, VK_FORMAT_R8G8B8A8_SRGB},
+        };
+        for (const auto& [image, format, expected] : crossings) {
+            CommandList cross;
+            EXPECT(cross.clear_render_target({1, 0, 0, 1, format}, color) && cross.close());
+            EXPECT(run(cross, image, vk) == ReplayResult::success);
+            EXPECT(image_clears == 0 && attachment_clears == 1 && requested_format == expected);
+            ++checks;
+        }
+        auto typed = castable; typed.castable_view_formats = false;
+        EXPECT(rejects(typed, {1, 0, 0, 1, bgra8_unorm}));
+        EXPECT(rejects(binding, {1, 0, 0, 1, bgra8_unorm}));  // typeless RGBA8: another typeless family
+        auto uint_image = castable; uint_image.format = VK_FORMAT_R8G8B8A8_UINT;
+        EXPECT(rejects(uint_image, {1, 0, 0, 1, bgra8_unorm}));
+        checks += 3;
+    }
     {
         auto msaa = binding; msaa.samples = 4;
         for (const auto [format, expected] : formats) {
@@ -292,7 +324,7 @@ int main() {
     EXPECT(run(same_format, binding, unavailable) == ReplayResult::success && image_clears == 1 && !attachment_clears);
     ++checks;
     auto legacy = binding;
-    legacy.rgba8_typeless = false;
+    legacy.typeless = false;
     legacy.format = VK_FORMAT_UNDEFINED; // Existing ownerless float-only replay clients omit this metadata.
     CommandList legacy_list;
     EXPECT(legacy_list.clear_render_target({1, 0, 0, 1}, color) && legacy_list.close());

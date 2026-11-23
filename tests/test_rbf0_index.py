@@ -158,6 +158,26 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(rbf0_index.RbfError):
             rbf0_index.parse_rbf0(b"PSIN" + bytes(16))
 
+    def test_attribute_mismatch_counted_once_per_element(self):
+        # One element declares 1 attribute, has 0 attributes, three child elements, and a trailing value:
+        # must report 1 attribute mismatch at the first content transition (not 3 on main).
+        b = bytearray(b"RBF0")
+        b += _open(0, b"Root", attrs=1)
+        b += _open(1, b"A") + b"\xff\xff"
+        b += _open(2, b"B") + b"\xff\xff"
+        b += _open(3, b"C") + b"\xff\xff"
+        b += _value(4, 0x10, struct.pack("<I", 9), b"after")
+        b += b"\xff\xff"
+        r = rbf0_index.parse_rbf0(bytes(b))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["attributes"], 1)
+
+        # Truncated after content starts must still record the already-observed attribute mismatch once.
+        trunc = bytearray(b"RBF0") + _open(0, b"Root", attrs=1) + _text(b"hi")
+        rt = rbf0_index.parse_rbf0(bytes(trunc))
+        self.assertEqual(rt["status"], "truncated")
+        self.assertEqual(rt["attributes"], 1)
+
     def test_attribute_count(self):
         b = bytearray(WIDE)
         b += _open(0, b"Root", attrs=2)
@@ -304,6 +324,34 @@ class ArgumentTest(unittest.TestCase):
         self.assertNotIn("Traceback", p.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_directory_report_cannot_replace_a_carve_input(self):
+        manifest = os.path.join(self.root, "index.json")
+        stream = os.path.join(self.root, "00000001.bin")
+        for path, original in ((manifest, b'{"files": []}'), (stream, b"synthetic stream")):
+            with self.subTest(path=path):
+                with open(path, "wb") as f:
+                    f.write(original)
+                result = self.run_tool(self.root, path)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("would overwrite", result.stderr)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_directory_report_cannot_replace_a_stream_via_a_hard_link(self):
+        stream = os.path.join(self.root, "00000001.bin")
+        out = os.path.join(self.root, "report.csv")
+        with open(stream, "wb") as f:
+            f.write(b"synthetic stream")
+        try:
+            os.link(stream, out)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(str(e))
+        result = self.run_tool(self.root, out)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("would overwrite", result.stderr)
+        with open(stream, "rb") as f:
+            self.assertEqual(f.read(), b"synthetic stream")
+
     def test_unwritable_output_path_fails_before_the_scan(self):
         for out in (os.path.join(self.root, "no_such_folder", "x.json"), self.root):
             p = self.run_tool(self.rpf, out)
@@ -364,6 +412,43 @@ class OutputTest(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         self.assertEqual(doc["files"][0]["sample_strings"], ["alpha", "body"])
+
+
+class ScanDirCollisionAndTrailingTest(unittest.TestCase):
+    def _make_rbf0(self, root_name):
+        raw = root_name.encode("utf-8")
+        return b"RBF0\x00\x00" + struct.pack("<H", len(raw)) + raw + struct.pack("<HHH", 0, 0, 0) + b"\xff\xff"
+
+    def test_scan_dir_keeps_each_file_on_offset_collisions(self):
+        with tempfile.TemporaryDirectory() as d:
+            # Non-hex name used to get offset=len(entries)=1, colliding with 00000001.bin, and
+            # duplicate hex prefixes (00001000.bin + 00001000_alt.bin) used to overwrite in by_offset.
+            with open(os.path.join(d, "00000001.bin"), "wb") as f:
+                f.write(self._make_rbf0("Alpha"))
+            with open(os.path.join(d, "extra.bin"), "wb") as f:
+                f.write(b"NOT_RBF0_PAYLOAD" * 8)
+            with open(os.path.join(d, "00001000.bin"), "wb") as f:
+                f.write(self._make_rbf0("First"))
+            with open(os.path.join(d, "00001000_alt.bin"), "wb") as f:
+                f.write(self._make_rbf0("Second"))
+            _, records, _ = rbf0_index.scan_dir(d)
+        self.assertEqual([r["root"] for r in records], ["Alpha", "First", "Second"])
+
+    def test_join_resource_stops_on_trailing_status(self):
+        hdr = b"RBF0\x00\x00" + struct.pack("<H", 4) + b"Root" + struct.pack("<HHH", 0, 0, 0)
+        full = hdr + b"\xfd\xff" + struct.pack("<I", 70000) + (b"A" * 70000) + b"\xff\xff"
+        c1, c2 = full[:65536], full[65536:].ljust(65536, b"\x00")
+        c3 = b"UNRELATED_NON_RBF0_CHUNK" + b"\x00" * 100
+        rows = [
+            {"offset": 0, "stored": len(c1), "size": len(c1), "head": c1[:8]},
+            {"offset": len(c1), "stored": len(c2), "size": len(c2), "head": c2[:8]},
+            {"offset": len(c1) + len(c2), "stored": len(c3), "size": len(c3), "head": c3[:8]},
+        ]
+        blobs = {0: c1, len(c1): c2, len(c1) + len(c2): c3}
+        blob, chunks, parsed = rbf0_index.join_resource(rows, 0, lambda r: blobs[r["offset"]], check_gap=False)
+        self.assertEqual(chunks, 2)
+        self.assertEqual(len(blob), 131072)
+        self.assertEqual(parsed["status"], "trailing")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 
 Zero game data: all tests use deterministic, synthetic byte sequences constructed in-memory.
 """
+import errno
 import io
 import json
 import os
@@ -124,6 +125,48 @@ class TestPartsParsing(unittest.TestCase):
         self.assertEqual(fssm_unpack.parts(container), {b"DXIL": b""})
 
 
+class TestDirectoryBounds(unittest.TestCase):
+    def test_dxbc_bounds(self):
+        blob = make_dxbc([(b"TEST", b"abc")])
+        table = 32
+        part = table + 4
+        for label, data in [
+            ("header", blob[:31]),
+            ("offset table", blob[:part - 1]),
+            ("part header", blob[:part + 7]),
+            ("part payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(data)
+
+        for offset in (table, len(blob) + 1):
+            data = bytearray(blob)
+            struct.pack_into("<I", data, table, offset)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "DXBC"):
+                fssm_unpack.parts(bytes(data))
+
+    def test_xdat_bounds(self):
+        prefix = b"prefix"
+        blob = make_xdat({7: b"abc"}, pre_padding=prefix)
+        x = len(prefix)
+        for label, data in [
+            ("header", blob[:x + 11]),
+            ("directory", blob[:x + 23]),
+            ("payload", blob[:-1]),
+        ]:
+            with self.subTest(label=label), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(data)
+
+        for offset, size in [(x + 12, 1), (len(blob) + 1, 0), (len(blob), 1)]:
+            data = bytearray(blob)
+            struct.pack_into("<II", data, x + 16, offset, size)
+            with self.subTest(offset=offset), self.assertRaisesRegex(ValueError, "XDAT"):
+                fssm_unpack.xdat_entries_all(bytes(data))
+
+    def test_empty_payload_at_end_of_dxil(self):
+        self.assertEqual(fssm_unpack.xdat_entries_all(make_xdat({7: b""})), [(7, b"")])
+
+
 class TestXdatEntries(unittest.TestCase):
     def test_missing_xdat_magic(self):
         dxil = b"arbitrary-dxil-bytes-without-magic"
@@ -188,7 +231,7 @@ class TestDuplicateXdatPayloads(unittest.TestCase):
             with open(os.path.join(tmp, "dup.dxbc"), "wb") as f:
                 f.write(dxbc)
             p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--payload", "first"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             self.assertEqual(p.returncode, 0, p.stderr)
             with open(os.path.join(tmp, "fssm", "dup.fssm"), "rb") as f:
                 self.assertEqual(f.read(), first)
@@ -416,11 +459,44 @@ class TestCrcAndChecksumBounds(unittest.TestCase):
             fssm_unpack.unpack(dxbc)
 
 
+class TestMainBadOutput(unittest.TestCase):
+    def test_file_at_output_directory_is_preserved(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            with open(out, "wb") as f:
+                f.write(b"keep me")
+
+            res = subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True, errors="replace")
+
+            self.assertEqual(res.returncode, 2)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(len(res.stderr.splitlines()), 1, res.stderr)
+            self.assertIn(f"cannot create output directory {out}", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertEqual(os.listdir(src), ["fssm"])
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), b"keep me")
+
+    def test_output_directory_creation_errors_name_the_path(self):
+        with tempfile.TemporaryDirectory() as src:
+            out = os.path.join(src, "fssm")
+            for error in (PermissionError(errno.EACCES, "Permission denied"),
+                          OSError(errno.ENOSPC, "No space left on device")):
+                with self.subTest(error=error), mock.patch.object(fssm_unpack.os, "makedirs",
+                                                                 side_effect=error) as mkdir, \
+                        mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                    self.assertEqual(fssm_unpack.main([src]), 2)
+                    mkdir.assert_called_once_with(out, exist_ok=True)
+                    self.assertEqual(stderr.getvalue().splitlines(),
+                                     [f"ERROR: cannot create output directory {out}: {error.strerror}"])
+                    self.assertEqual(os.listdir(src), [])
+
+
 class TestMainBadSource(unittest.TestCase):
     """A source that is missing, a file, or unlistable is one line on stderr, exit 2, and nothing is created."""
 
     def run_tool(self, src):
-        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True)
+        return subprocess.run([sys.executable, "-I", TOOL, src], capture_output=True, text=True, errors="replace")
 
     def test_missing_source_is_not_created(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -455,6 +531,23 @@ class TestMainBadSource(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "fssm")))
 
 
+    def test_unreadable_shader_leaves_completion_index_unchanged(self):
+        with tempfile.TemporaryDirectory() as src:
+            shader = os.path.join(src, "input.dxbc")
+            index = os.path.join(src, "fssm_index.json")
+            with open(shader, "wb") as f:
+                f.write(b"synthetic")
+            with open(index, "wb") as f:
+                f.write(b"previous index")
+            error = PermissionError(errno.EACCES, "input is locked", shader)
+            with mock.patch.object(fssm_unpack, "open", create=True, side_effect=error), \
+                    mock.patch.object(sys, "stderr", io.StringIO()) as stderr:
+                self.assertEqual(fssm_unpack.main([src]), 2)
+            self.assertEqual(stderr.getvalue().splitlines(), [f"ERROR: cannot read {shader}: input is locked"])
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), b"previous index")
+
+
 class TestMainDirectoryProcessing(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -462,6 +555,20 @@ class TestMainDirectoryProcessing(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_carve_index_selects_current_containers(self):
+        shader = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        for name in ("current", "obsolete"):
+            with open(os.path.join(self.src, name + ".dxbc"), "wb") as f:
+                f.write(shader)
+        index = os.path.join(self.src, "index.json")
+        with open(index, "w", encoding="utf-8") as f:
+            json.dump([{"file": "current.dxbc"}], f)
+        result = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", index],
+                                capture_output=True, text=True, errors="replace")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(os.path.join(self.src, "fssm")), ["current.fssm"])
+        self.assertTrue(os.path.isfile(os.path.join(self.src, "obsolete.dxbc")))
 
     def test_main_rejects_invalid_fssm_magic(self):
         bad_payload = b"JUNK\x01\x01" + bytes(58)
@@ -471,7 +578,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write(bad_dxbc)
 
         cmd = [sys.executable, "-I", TOOL, self.src]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 1, res.stdout)
         self.assertIn("'ValueError': 1", res.stdout)
         self.assertIn("no shader in", res.stderr)
@@ -483,7 +590,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         with open(os.path.join(self.src, "good.dxbc"), "wb") as f:
             f.write(good_dxbc)
 
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("'ValueError': 1", res.stdout)
         self.assertEqual(os.listdir(fssm_dir), ["good.fssm"])
@@ -517,7 +624,7 @@ class TestMainDirectoryProcessing(unittest.TestCase):
             f.write("not a dxbc container")
         os.mkdir(os.path.join(self.src, "cache.dxbc"))
 
-        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True)
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
         self.assertEqual(res.returncode, 0, res.stderr)
 
         self.assertIn("2 FSSM blobs", res.stdout)
@@ -555,6 +662,28 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(entry_b["version"], 0x0102)
         self.assertEqual(entry_b["endpgm"], [0x20, 0x60])
         self.assertEqual(entry_b["tags"], ["0xd"])
+
+    def test_index_publication_never_uses_fixed_tmp_sentinel(self):
+        """The old fixed fssm_index.json.tmp staging path could truncate an unrelated user file (or a
+        hardlink to one). Index publication must use private staging and leave any pre-existing
+        .tmp sentinel untouched."""
+        fssm_1 = make_fssm(version=0x0101, instructions=[(0x40, S_ENDPGM)])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(fssm_1)}))]))
+
+        sentinel = os.path.join(self.src, "fssm_index.json.tmp")
+        with open(sentinel, "w") as f:
+            f.write("keep-me")
+
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        with open(sentinel, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me")
+        with open(os.path.join(self.src, "fssm_index.json"), encoding="utf-8") as f:
+            self.assertEqual([row["name"] for row in json.load(f)], ["shader_a"])
+        self.assertEqual(sorted(os.listdir(self.src)),
+                         ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
 
 if __name__ == "__main__":

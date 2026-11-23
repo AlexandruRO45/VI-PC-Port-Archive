@@ -19,6 +19,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402  one spelling comparison for every report pair
+
 INTERFACE = re.compile(
     r'MIDL_INTERFACE\("[0-9a-fA-F-]+"\)\s*\n\s*(\w+)\s*:\s*public\s+(\w+)\s*\{\s*public:(.*?)\n\s*\};', re.S)
 METHOD = re.compile(r'virtual\s+(.*?)\s*STDMETHODCALLTYPE\s+(\w+)\s*\((.*)\)\s*(const)?\s*=\s*0\s*;\s*$', re.S)
@@ -106,7 +109,8 @@ def implemented_names(paths):
     names = set()
     for path in paths:
         with open(path, encoding="utf-8", errors="replace") as f:
-            names.update(OVERRIDE.findall(f.read()))
+            source = COMMENTS_OR_LITERALS.sub(" ", f.read())
+            names.update(OVERRIDE.findall(source))
     return names
 
 
@@ -118,6 +122,9 @@ def coverage(interfaces, leaves, sources):
         methods = []
         for name in chain(interfaces, leaf):
             methods.extend((name, item[2]) for item in interfaces[name][1] if item[0] == "m")
+        # d3d12.h declares a struct-returning method twice, once in each branch of
+        # `#if defined(_MSC_VER) || !defined(_WIN32)` / `#else`; it is one vtable slot, so count it once.
+        methods = list(dict.fromkeys(methods))
         open_methods = [f"{owner}::{method}" for owner, method in methods if method not in implemented]
         report.append({
             "interface": leaf,
@@ -140,6 +147,23 @@ def write_if_changed(path, text):
         f.write(text)
 
 
+def same_path(first, second):
+    """True when writing first would replace second (same file, or a case/symlink alias of it). The comparison is
+    report_paths.same_report_path, which also folds case on a case-insensitive volume: os.path.normcase does that
+    only on Windows, and macOS's default APFS volume would let `R.json` and `r.json` pass as two artifacts."""
+    return same_report_path(first, second)
+
+
+def write_report(path, text):
+    """write_if_changed with a one-line ERROR instead of a traceback; False when it could not write."""
+    try:
+        write_if_changed(path, text)
+    except OSError as e:
+        print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
+        return False
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", help="generated stub header (required unless --report is given)")
@@ -153,15 +177,30 @@ def main():
         parser.error("--out is required unless --report is given")
     if args.report and not args.source:
         parser.error("--report needs at least one --source")
+    for path in args.source:
+        if not os.path.isfile(path):
+            parser.error(f"--source {path}: no such file")
+    for path in (args.out, args.report):
+        if path and os.path.isdir(path):
+            parser.error(f"{path} is a folder, not a file")
+    if args.out and args.report and same_path(args.out, args.report):
+        parser.error("--out and --report must use different paths")
     header = args.header or find_header()
     if not header:
         raise SystemExit("d3d12.h not found: pass --header or run from a vcvars environment")
+    if not os.path.isfile(header):
+        parser.error(f"--header {header}: no such file")
+    for path in [header] + list(args.source):
+        for flag, target in (("--out", args.out), ("--report", args.report)):
+            if target and same_path(target, path):
+                parser.error(f"{flag} {target} would overwrite the input {path}")
     with open(header, encoding="utf-8", errors="replace") as f:
         interfaces = parse_interfaces(f.read())
 
     if args.report:
         report = coverage(interfaces, args.interfaces, args.source)
-        write_if_changed(args.report, json.dumps(report, indent=2) + "\n")
+        if not write_report(args.report, json.dumps(report, indent=2) + "\n"):
+            return 2
     if not args.out:
         return 0
 
@@ -175,7 +214,8 @@ def main():
     ]
     parts += [emit_class(interfaces, leaf) for leaf in dict.fromkeys(args.interfaces)]
     parts.append("#pragma warning(pop)")
-    write_if_changed(args.out, "\n".join(parts) + "\n")
+    if not write_report(args.out, "\n".join(parts) + "\n"):
+        return 2
     return 0
 
 

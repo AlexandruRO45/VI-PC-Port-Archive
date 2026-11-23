@@ -69,7 +69,10 @@ def _imm_u32(a):
     if a["k"] == "imm":
         v = a["v"] & 0xFFFFFFFF
     elif a["k"] == "fimm":
-        v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        try:
+            v = struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        except OverflowError:   # a double no float32 holds is not a constant this can name
+            return None
     else:
         return None
     if a.get("abs"):
@@ -82,7 +85,44 @@ def _imm_u32(a):
 def _sgpr_regs(a):
     if a["k"] == "sgpr":
         return list(range(a["r"], a["r"] + a.get("n", 1)))
+    if a["k"] == "slist":
+        return [r for r in a["r"] if isinstance(r, int)]
     return []
+
+
+def _sgpr_slots(a, n, exact=True):
+    """Return `n` scalar operand slots (SGPR int indices or special names like 'vcc_lo'), or None."""
+    if a["k"] == "sgpr":
+        count = a.get("n", 1)
+        if count == n if exact else count >= n:
+            return list(range(a["r"], a["r"] + n))
+    elif a["k"] == "slist":
+        items = a["r"]
+        if len(items) == n if exact else len(items) >= n:
+            return list(items[:n])
+    return None
+
+
+def _slot_tag(sym, slot):
+    return sym.get(slot) if isinstance(slot, int) else None
+
+
+def _record_ptr_pair(events, sym, slots, is_desc_width=False):
+    lo_t, hi_t = _slot_tag(sym, slots[0]), _slot_tag(sym, slots[1])
+    u_lo, u_hi = _user_of(lo_t), _user_of(hi_t)
+    if u_lo is not None and u_hi is not None:
+        events["ptr64"].add((u_lo, u_hi))
+        if is_desc_width:
+            events["table_loads"] = True
+    elif u_lo is not None and hi_t == ("const", 0):
+        events["ptr32_lo"].add(u_lo)
+        events["truncates_high"] = True
+        if is_desc_width:
+            events["table_loads"] = True
+    elif u_lo is not None:
+        events["ptr64_lo_only"].add(u_lo)
+        if is_desc_width:
+            events["table_loads"] = True
 
 
 def _user_of(tag):
@@ -152,12 +192,33 @@ def _fold_scalar_alu(op, x, y):
         return x & (~y & 0xFFFFFFFF)
     if op == "s_orn2_b32":
         return (x | (~y & 0xFFFFFFFF)) & 0xFFFFFFFF
+    if op == "s_nand_b32":
+        return ~(x & y) & 0xFFFFFFFF
+    if op == "s_nor_b32":
+        return ~(x | y) & 0xFFFFFFFF
+    if op == "s_xnor_b32":
+        return ~(x ^ y) & 0xFFFFFFFF
     if op == "s_lshl_b32":
         return (x << (y & 31)) & 0xFFFFFFFF
     if op == "s_lshr_b32":
         return (x & 0xFFFFFFFF) >> (y & 31)
     if op == "s_mul_i32":
         return (x * y) & 0xFFFFFFFF
+    if op == "s_ashr_i32":
+        signed = x - 0x100000000 if x & 0x80000000 else x
+        return (signed >> (y & 31)) & 0xFFFFFFFF
+    if op == "s_bfm_b32":
+        # A mask of (x & 31) ones, shifted left by (y & 31).
+        return (((1 << (x & 31)) - 1) << (y & 31)) & 0xFFFFFFFF
+    if op == "s_bfe_u32":
+        # y packs the offset in bits [4:0] and the width in bits [22:16]; the field stops at bit 31.
+        offset = y & 31
+        width = min((y >> 16) & 0x7F, 32 - offset)
+        return ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+    if op == "s_min_u32":
+        return min(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
+    if op == "s_max_u32":
+        return max(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
     return None
 
 
@@ -174,68 +235,54 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
 
     # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
-        if op.startswith("s_load_dword") and len(a) >= 2 and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
-            b = a[1]["r"]
-            lo_t, hi_t = sym.get(b), sym.get(b + 1)
-            u_lo, u_hi = _user_of(lo_t), _user_of(hi_t)
-            is_desc_width = op in ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
-            if u_lo is not None and u_hi is not None:
-                events["ptr64"].add((u_lo, u_hi))
+        if op.startswith(("s_load_dword", "s_store_dword")) and len(a) >= 2:
+            slots = _sgpr_slots(a[1], 2)
+            if slots is not None:
+                is_desc_width = op in ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
+                _record_ptr_pair(events, sym, slots, is_desc_width=is_desc_width)
                 if is_desc_width:
-                    events["table_loads"] = True
-            elif u_lo is not None and hi_t == ("const", 0):
-                events["ptr32_lo"].add(u_lo)
-                events["truncates_high"] = True
-                if is_desc_width:
-                    events["table_loads"] = True
-            elif u_lo is not None:
-                events["ptr64_lo_only"].add(u_lo)
-                if is_desc_width:
-                    events["table_loads"] = True
-            if is_desc_width:
-                events["strides"].update(ptr_stride.get(b, ()))
-                if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
-                    events["strides"].update(scale.get(a[2]["r"], ()))
-        elif op.startswith("s_buffer_load_dword") and len(a) >= 2 and a[1]["k"] == "sgpr" and a[1].get("n") == 4:
-            b = a[1]["r"]
-            tags = [sym.get(b + i) for i in range(4)]
-            if all(t is not None and t[0] == "user" for t in tags):
-                for t in tags:
-                    events["vsharp"].add(t[1])
-            if op in ("s_buffer_load_dwordx4", "s_buffer_load_dwordx8", "s_buffer_load_dwordx16"):
-                if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
-                    events["strides"].update(scale.get(a[2]["r"], ()))
+                    if isinstance(slots[0], int):
+                        events["strides"].update(ptr_stride.get(slots[0], ()))
+                    if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
+                        events["strides"].update(scale.get(a[2]["r"], ()))
+        elif op.startswith(("s_buffer_load_dword", "s_buffer_store_dword")) and len(a) >= 2:
+            slots = _sgpr_slots(a[1], 4)
+            if slots is not None:
+                tags = [_slot_tag(sym, s) for s in slots]
+                if all(t is not None and t[0] == "user" for t in tags):
+                    for t in tags:
+                        events["vsharp"].add(t[1])
+                if op in ("s_buffer_load_dwordx4", "s_buffer_load_dwordx8", "s_buffer_load_dwordx16"):
+                    if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
+                        events["strides"].update(scale.get(a[2]["r"], ()))
         elif op.startswith(("global_load", "global_store")) and len(a) >= 3:
-            saddr = a[2]
-            if saddr["k"] == "sgpr" and saddr.get("n") == 2:
-                b = saddr["r"]
-                lo_t, hi_t = sym.get(b), sym.get(b + 1)
-                u_lo, u_hi = _user_of(lo_t), _user_of(hi_t)
-                if u_lo is not None and u_hi is not None:
-                    events["ptr64"].add((u_lo, u_hi))
-                elif u_lo is not None and hi_t == ("const", 0):
-                    events["ptr32_lo"].add(u_lo)
-                    events["truncates_high"] = True
-                elif u_lo is not None:
-                    events["ptr64_lo_only"].add(u_lo)
+            slots = _sgpr_slots(a[2], 2)
+            if slots is not None:
+                _record_ptr_pair(events, sym, slots, is_desc_width=False)
+        elif op.startswith("global_atomic_"):
+            saddr_idx = 3 if "glc" in ins.get("mods", ()) else 2
+            if len(a) > saddr_idx:
+                slots = _sgpr_slots(a[saddr_idx], 2)
+                if slots is not None:
+                    _record_ptr_pair(events, sym, slots, is_desc_width=False)
         elif op.startswith(("buffer_load", "buffer_store", "buffer_atomic", "tbuffer_")) and len(a) >= 3:
-            srsrc = a[2]
-            if srsrc["k"] == "sgpr" and srsrc.get("n") == 4:
-                tags = [sym.get(srsrc["r"] + i) for i in range(4)]
+            slots = _sgpr_slots(a[2], 4)
+            if slots is not None:
+                tags = [_slot_tag(sym, s) for s in slots]
                 if all(t is not None and t[0] == "user" for t in tags):
                     for t in tags:
                         events["vsharp"].add(t[1])
         elif op.startswith("image_") and len(a) >= 3:
-            tsharp = a[2]
-            if tsharp["k"] == "sgpr" and tsharp.get("n", 1) >= 8:
-                tags = [sym.get(tsharp["r"] + i) for i in range(8)]
+            slots = _sgpr_slots(a[2], 8, exact=False)
+            if slots is not None:
+                tags = [_slot_tag(sym, s) for s in slots]
                 if all(t is not None and t[0] == "user" for t in tags):
                     for t in tags:
                         events["tsharp"].add(t[1])
             if op.startswith(SAMPLER_IMAGE_OPS) and len(a) >= 4:
-                ssharp = a[3]
-                if ssharp["k"] == "sgpr" and ssharp.get("n", 1) >= 4:
-                    tags = [sym.get(ssharp["r"] + i) for i in range(4)]
+                s_slots = _sgpr_slots(a[3], 4, exact=False)
+                if s_slots is not None:
+                    tags = [_slot_tag(sym, s) for s in s_slots]
                     if all(t is not None and t[0] == "const" for t in tags):
                         events["literal_samplers"].add(tuple(t[1] for t in tags))
                     elif all(t is not None and t[0] == "user" for t in tags):
@@ -292,7 +339,11 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_scale[d] = scale[s]
             if s in ptr_stride:
                 new_pstride[d] = ptr_stride[s]
-    elif op == "s_movk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+    elif op == "s_brev_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            new_sym[a[0]["r"]] = ("const", int(f"{c & 0xFFFFFFFF:032b}"[::-1], 2))
+    elif op == "s_movk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "imm":
         v = a[1]["v"] & 0xFFFF
         if v & 0x8000:
             v -= 0x10000
@@ -310,6 +361,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                     new_sym[d + i] = sym[s + i]
                 if s + i in ptr_stride:
                     new_pstride[d + i] = ptr_stride[s + i]
+    elif op == "s_not_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        # A dword of a literal S# built as the complement of a known constant (for example 0xFFFFFFFF from 0).
+        c = _const_of(sym, a[1])
+        if c is not None:
+            new_sym[a[0]["r"]] = ("const", ~c & 0xFFFFFFFF)
+    elif op == "s_abs_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            signed = c - 0x100000000 if c & 0x80000000 else c
+            new_sym[a[0]["r"]] = ("const", abs(signed) & 0xFFFFFFFF)  # abs(0x80000000) stays 0x80000000
     elif op == "v_readfirstlane_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1 and a[1]["r"] in vscale:
             new_scale[a[0]["r"]] = vscale[a[1]["r"]]
@@ -364,7 +425,8 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             # High-dword carry-add on a zeroed upper word (descriptor table truncated below 4 GB).
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
-                "s_andn2_b32", "s_orn2_b32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+                "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
+                "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
@@ -375,7 +437,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             c = cy if cy is not None else cx
             if _valid_stride(c):
                 new_scale[d] = frozenset((c,))
-    elif op == "s_addk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr":
+    elif op == "s_addk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "imm":
         d = a[0]["r"]
         v = a[1]["v"] & 0xFFFF
         if v & 0x8000:
@@ -389,6 +451,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_pstride[d] = ptr_stride[d]
         elif d in scale:
             new_scale[d] = scale[d]
+    elif op == "s_mulk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1 and a[1]["k"] == "imm":
+        d = a[0]["r"]
+        v = a[1]["v"] & 0xFFFF
+        if v & 0x8000:
+            v -= 0x10000
+        old = sym.get(d)
+        if old is not None and old[0] == "const":
+            new_sym[d] = ("const", (old[1] * v) & 0xFFFFFFFF)
+        elif _valid_stride(v):
+            new_scale[d] = frozenset((v,))
 
     for r in writes:
         if r in new_sym:
@@ -573,29 +645,30 @@ def read_dxbc_meta(data):
         p = parts[b"ISG1"]
         if len(p) >= 8:
             ecnt, eo = struct.unpack_from("<II", p, 0)
-            elems = []
-            for i in range(ecnt):
-                base = eo + 32 * i
-                if base + 32 > len(p):
-                    break
-                _, noff, sidx, sysv, ctype, reg = struct.unpack_from("<6I", p, base)
-                mask, rw_mask = p[base + 24], p[base + 25]
-                semantic = ""
-                if 8 <= noff < len(p):
+            strings = eo + 32 * ecnt
+            if 8 <= eo and strings <= len(p):
+                elems = []
+                for i in range(ecnt):
+                    base = eo + 32 * i
+                    _, noff, sidx, sysv, ctype, reg = struct.unpack_from("<6I", p, base)
+                    mask, rw_mask = p[base + 24], p[base + 25]
+                    if not strings <= noff < len(p):
+                        break
                     end = p.find(b"\x00", noff)
-                    if end > noff:
-                        semantic = p[noff:end].decode("ascii", "replace")
-                elems.append({
-                    "semantic": semantic,
-                    "semantic_index": sidx,
-                    "register": reg,
-                    "mask": mask,
-                    "rw_mask": rw_mask,
-                    "system_value": sysv,
-                    "component_type": COMPONENT_TYPES.get(ctype, str(ctype)),
-                })
-            if elems:
-                out["input_signature"] = elems
+                    if end <= noff:
+                        break
+                    semantic = p[noff:end].decode("ascii", "replace")
+                    elems.append({
+                        "semantic": semantic,
+                        "semantic_index": sidx,
+                        "register": reg,
+                        "mask": mask,
+                        "rw_mask": rw_mask,
+                        "system_value": sysv,
+                        "component_type": COMPONENT_TYPES.get(ctype, str(ctype)),
+                    })
+                if elems and len(elems) == ecnt:
+                    out["input_signature"] = elems
 
     if b"SFI0" in parts and len(parts[b"SFI0"]) >= 8:
         flags = struct.unpack_from("<Q", parts[b"SFI0"], 0)[0]
@@ -614,12 +687,45 @@ def fssm_sha256_file(disasm_path, name):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def fspx_code_sha256_file(disasm_path, name):
+    """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.code, the kind-6 program tools/fspx_unpack.py writes for an
+    FSPX shader without an FSSM blob, or None. The run time computes the same key from the bytes a compute PSO gets
+    (docs/fspx.md, "Run-time lookup")."""
+    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    if os.path.isfile(os.path.join(parent, "fssm", name + ".fssm")):
+        return None
+    code = os.path.join(parent, "fspx", name + ".code")
+    if not os.path.isfile(code):
+        return None
+    with open(code, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def fspx_state_sha256_file(disasm_path, name):
+    """SHA-256 hex digest of <disasm_dir>/../fspx/<name>.state, the program's kind-0 entry (dispatch state), or None.
+    Two FSPX programs can share their kind-6 bytes and differ in kind 0; the run time tells them apart by this key
+    when the bytecode carries kind 0 (docs/fspx.md, "Build and run-time lookup")."""
+    parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))
+    state = os.path.join(parent, "fspx", name + ".state")
+    if not os.path.isfile(state):
+        return None
+    with open(state, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def collect(disasm_path, name, blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     """Collect all build-time runtime metadata for one translated shader."""
     meta = {}
     digest = fssm_sha256_file(disasm_path, name)
     if digest is not None:
         meta["fssm_sha256"] = digest
+    else:
+        code_digest = fspx_code_sha256_file(disasm_path, name)
+        if code_digest is not None:
+            meta["fspx_code_sha256"] = code_digest
+            state_digest = fspx_state_sha256_file(disasm_path, name)
+            if state_digest is not None:
+                meta["fspx_state_sha256"] = state_digest
 
     dxbc_info = {}
     parent = os.path.dirname(os.path.dirname(os.path.realpath(disasm_path)))

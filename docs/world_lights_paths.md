@@ -12,6 +12,10 @@ python -I tools/world_lights_paths.py <levels.rpf> --jobs 24 --out reports/world
 `--lights-out` writes one JSON line per placed light (position, direction, colour, type, ...). It is derived
 from your own copy of the game, so it stays in your local work folder.
 
+`--limit` caps where a scanned resource may start (a resource that starts inside it is still read to its end). It
+must be at least 1 (decimal or `0x` hex); a smaller value stops with a one-line error and exit code 2 before any
+scan or report is written.
+
 ## Names
 
 Struct and member hashes are the case-sensitive joaat of the GTA V names where those are recovered:
@@ -75,6 +79,10 @@ With `--entities`, every map entity whose archetype carries lights places them i
 with `scale = (scaleXY, scaleXY, scaleZ)`, the same transform `world_build.py --placements` uses
 ([world.md](world.md)). Directions are rotated without the translation. Entity lights are placed through
 their own entity.
+
+When an archetype is defined more than once, placement uses its first light list. The summary counts that
+archetype once in `archetype_light_definitions_differ` if any other list differs in length, order or decoded
+light fields, including the effect offset.
 
 | Measure | Count |
 |---|---:|

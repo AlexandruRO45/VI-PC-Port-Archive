@@ -146,6 +146,27 @@ class DxbcMetaTests(unittest.TestCase):
         self.assertTrue(got["sfi0_resource_heap_directly_indexed"])
         self.assertFalse(got["sfi0_sampler_heap_directly_indexed"])
 
+    def test_invalid_isg1_table_does_not_publish_partial_signature(self):
+        fourcc, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3)])
+        for count, offset in ((2, 8), (1, 0)):
+            with self.subTest(count=count, offset=offset):
+                malformed = struct.pack("<II", count, offset) + payload[8:]
+                dxbc = make_dxbc([(fourcc, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)])
+                meta = M.read_dxbc_meta(dxbc)
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
+    def test_invalid_second_name_drops_whole_signature(self):
+        tag, payload = isg1_chunk([("POSITION", 0, 0, 7, 7, 0, 3), ("TEXCOORD", 0, 1, 3, 3, 0, 3)])
+        second_name = struct.unpack_from("<I", payload, 8 + 32 + 4)[0]
+        for offset, data in ((8, payload), (len(payload), payload), (second_name, payload[:-1])):
+            with self.subTest(offset=offset):
+                malformed = bytearray(data)
+                struct.pack_into("<I", malformed, 8 + 32 + 4, offset)
+                meta = M.read_dxbc_meta(make_dxbc([(tag, malformed), sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING)]))
+                self.assertNotIn("input_signature", meta)
+                self.assertTrue(meta["sfi0_resource_heap_directly_indexed"])
+
     def test_sfi0_both_heaps_and_empty_dxbc(self):
         dxbc = make_dxbc([sfi0_chunk(M.SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING | M.SFI0_SAMPLER_DESCRIPTOR_HEAP_INDEXING)])
         got = M.read_dxbc_meta(dxbc)
@@ -459,6 +480,245 @@ class OperandClassificationTests(unittest.TestCase):
         _, meta = translate_synthetic("ps_rmw_user", lines)
         sgprs = [r["sgpr"] for r in meta["user_sgpr_reads"]]
         self.assertEqual(sgprs, [0, 1, 2, 3, 4, 5, 6, 7])
+
+    def test_global_atomic_ptr64_and_truncated_ptr32(self):
+        # global_atomic_add without glc (saddr at a[2]) and with glc (saddr at a[3]) must classify
+        # 64-bit user-SGPR pointers and 32-bit high-zeroed pointers the same way as global_load/store.
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "v_mov_b32_e32 v1, 1",
+            "global_atomic_add v0, v1, s[0:1]",
+            "global_atomic_add v2, v0, v1, s[2:3] glc",
+            "s_mov_b32 s5, 0",
+            "global_atomic_add v3, v0, v1, s[4:5] glc",
+            "exp mrt0 v2, v3, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_global_atomic_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "ptr32_lo"},
+        ])
+        self.assertEqual(meta["descriptor_access"], {
+            "table_loads": False,
+            "truncates_table_ptr_high": True,
+        })
+
+    def test_s_mulk_i32_stride_and_constant_folding(self):
+        # s_mulk_i32 scales a descriptor index (32-byte stride) and folds signed 16-bit constants.
+        lines = [
+            "s_mov_b32 s4, s2",
+            "s_mulk_i32 s4, 32",
+            "s_load_dwordx8 s[16:23], s[0:1], s4",
+            "s_mov_b32 s12, 0x49",
+            "s_mulk_i32 s12, 2",
+            "s_mov_b32 s13, 1",
+            "s_mulk_i32 s13, -1",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_mulk_meta", lines)
+        self.assertEqual(meta["descriptor_strides"], [32])
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0xFFFFFFFF, 0, 0]])
+
+    def test_s_brev_b32_constant_folding(self):
+        # A literal S# with one dword bit-reversed by s_brev_b32 from an immediate or a known SGPR.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, 1",
+            "s_mov_b32 s20, 0x3",
+            "s_brev_b32 s14, s20",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_meta", lines)
+        self.assertEqual(meta["literal_samplers"], [[0x92, 0x80000000, 0xC0000000, 0]])
+
+    def test_s_brev_b32_of_unknown_source_is_not_a_literal(self):
+        # s_brev_b32 of a user SGPR leaves its destination unknown, so no literal S# is recorded.
+        lines = [
+            "s_mov_b32 s12, 0x92",
+            "s_brev_b32 s13, s2",
+            "s_mov_b32 s14, 0",
+            "s_mov_b32 s15, 0",
+            "v_mov_b32_e32 v0, 0.5",
+            "v_mov_b32_e32 v1, 0.5",
+            "image_sample v[4:7], v[0:1], s[0:7], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "exp mrt0 v4, v5, v6, v7 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_brev_user_meta", lines)
+        self.assertNotIn("literal_samplers", meta)
+
+    def test_scalar_store_pointer_and_vsharp(self):
+        # s_store_dword* classifies its 2-SGPR pointer pair without marking table_loads,
+        # and s_buffer_store_dword* classifies its 4-SGPR resource descriptor as vsharp.
+        insns = self._parse([
+            "s_store_dword s8, s[0:1], 0x0",
+            "s_mov_b32 s3, 0",
+            "s_store_dwordx4 s[8:11], s[2:3], 0x0",
+            "s_buffer_store_dword s8, s[4:7], 0x0",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        self.assertEqual(got["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr32_lo"},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+            {"sgpr": 8, "kind": "const32"},
+            {"sgpr": 9, "kind": "const32"},
+            {"sgpr": 10, "kind": "const32"},
+            {"sgpr": 11, "kind": "const32"},
+        ])
+        self.assertFalse(got["table_loads"])
+        self.assertTrue(got["truncates_high"])
+
+    @staticmethod
+    def _literal_samplers_with(build_s13):
+        # A literal S# in s[12:15]: s12 = 0x92, s14 = s15 = 0, and s13 built by the given hand-written lines.
+        # s8 = 0x80000000 and s9 = 0xf0 are known constants; s3 is a user SGPR (not a known constant).
+        import shader_ir
+        lines = ["s_mov_b32 s8, 0x80000000", "s_mov_b32 s9, 0xf0", "s_mov_b32 s12, 0x92", *build_s13,
+                 "s_mov_b32 s14, 0", "s_mov_b32 s15, 0",
+                 "image_sample v[4:7], v[0:1], s[16:23], s[12:15] dmask:0xf dim:SQ_RSRC_IMG_2D", "s_endpgm"]
+        return M.analyse_instructions([[shader_ir.parse_line(ln) for ln in lines]], [[]])["literal_samplers"]
+
+    def test_inverted_scalar_logic_folds_into_literal_sampler(self):
+        # s_not_b32, s_nand_b32, s_nor_b32 and s_xnor_b32 of known constants give a known constant, so a literal
+        # S# with a dword built by one of them is reported in literal_samplers.
+        cases = [
+            (["s_not_b32 s13, 0"], 0xFFFFFFFF),
+            (["s_not_b32 s13, s9"], 0xFFFFFF0F),
+            (["s_not_b32 s13, s8"], 0x7FFFFFFF),
+            (["s_mov_b32 s13, 0xf0", "s_not_b32 s13, s13"], 0xFFFFFF0F),  # source and destination are one register
+            (["s_nand_b32 s13, s9, 0x30"], 0xFFFFFFCF),
+            (["s_nand_b32 s13, s8, s8"], 0x7FFFFFFF),
+            (["s_nor_b32 s13, s9, 0x0f"], 0xFFFFFF00),
+            (["s_nor_b32 s13, 0, 0"], 0xFFFFFFFF),
+            (["s_xnor_b32 s13, s9, 0xff"], 0xFFFFFFF0),
+            (["s_xnor_b32 s13, s9, s9"], 0xFFFFFFFF),
+            # The case found with #4289 open: the complement of 0, then a second fold of the result.
+            (["s_not_b32 s13, 0", "s_and_b32 s13, s13, 0xffff00ff"], 0xFFFF00FF),
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_shift_bitfield_min_max_abs_fold_into_literal_sampler(self):
+        # s_ashr_i32, s_bfm_b32, s_bfe_u32, s_min_u32, s_max_u32 and s_abs_i32 of known constants give a known
+        # constant. The expected values are the ones the translator computes for immediates (rdna2spirv.py).
+        cases = [
+            (["s_ashr_i32 s13, s8, 4"], 0xF8000000),          # the sign bit comes in from the left
+            (["s_ashr_i32 s13, s9, 4"], 0x0000000F),
+            (["s_ashr_i32 s13, s8, 36"], 0xF8000000),         # the shift count is taken modulo 32
+            (["s_bfm_b32 s13, 4, 8"], 0x00000F00),            # width 4, offset 8
+            (["s_bfm_b32 s13, 0, 8"], 0x00000000),
+            (["s_bfm_b32 s13, 31, 1"], 0xFFFFFFFE),
+            (["s_bfe_u32 s13, s9, 0x40004"], 0x0000000F),     # offset 4, width 4
+            (["s_bfe_u32 s13, s8, 0x20001f"], 0x00000001),    # offset 31, width 32: the field stops at bit 31
+            (["s_bfe_u32 s13, s9, 0x4"], 0x00000000),         # width 0
+            (["s_min_u32 s13, s9, 0x10"], 0x00000010),
+            (["s_min_u32 s13, s8, s9"], 0x000000F0),          # unsigned: 0x80000000 is the larger value
+            (["s_max_u32 s13, s9, 0x10"], 0x000000F0),
+            (["s_max_u32 s13, s8, s9"], 0x80000000),
+            (["s_abs_i32 s13, s9"], 0x000000F0),
+            (["s_abs_i32 s13, -16"], 0x00000010),
+            (["s_abs_i32 s13, s8"], 0x80000000),              # the most negative value has no positive form
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_shift_bitfield_min_max_abs_of_unknown_source_is_not_a_literal(self):
+        for build in (["s_ashr_i32 s13, s3, 4"],
+                      ["s_mov_b32 s13, 0", "s_ashr_i32 s13, s9, s3"],
+                      ["s_bfm_b32 s13, s3, 8"],
+                      ["s_bfe_u32 s13, s3, 0x40004"],
+                      ["s_bfe_u32 s13, s9, s3"],
+                      ["s_min_u32 s13, s9, s3"],
+                      ["s_max_u32 s13, s3, s9"],
+                      ["s_mov_b32 s13, 0", "s_abs_i32 s13, s3"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
+    def test_inverted_scalar_logic_of_unknown_source_is_not_a_literal(self):
+        # A source that is not a known constant (the user SGPR s3) must not give a literal sampler, also when the
+        # destination held a known constant before the operation.
+        for build in (["s_not_b32 s13, s3"],
+                      ["s_mov_b32 s13, 0", "s_not_b32 s13, s3"],
+                      ["s_nand_b32 s13, s3, 0x30"],
+                      ["s_nor_b32 s13, s9, s3"],
+                      ["s_mov_b32 s13, 0", "s_xnor_b32 s13, s3, s9"]):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
+    def test_slist_operands_classify_pointers_and_descriptors(self):
+        # LLVM VCCTuple slist syntax ([s0, s1], [s4, s5, s6, s7], ...) must be classified
+        # identically to contiguous s[a:b] ranges.
+        lines = [
+            "s_load_dwordx4 s[16:19], [s0, s1], 0x0",
+            "v_mov_b32_e32 v0, 0",
+            "global_load_dword v1, v0, [s2, s3]",
+            "buffer_load_dword v2, v0, [s4, s5, s6, s7], 0 offen",
+            "v_add_nc_u32_e32 v1, v1, v2",
+            "v_add_nc_u32_e32 v1, s16, v1",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        _, meta = translate_synthetic("ps_slist_meta", lines)
+        self.assertEqual(meta["user_sgpr_reads"], [
+            {"sgpr": 0, "kind": "ptr64_lo", "pair": [0, 1]},
+            {"sgpr": 1, "kind": "ptr64_hi", "pair": [0, 1]},
+            {"sgpr": 2, "kind": "ptr64_lo", "pair": [2, 3]},
+            {"sgpr": 3, "kind": "ptr64_hi", "pair": [2, 3]},
+            {"sgpr": 4, "kind": "vsharp"},
+            {"sgpr": 5, "kind": "vsharp"},
+            {"sgpr": 6, "kind": "vsharp"},
+            {"sgpr": 7, "kind": "vsharp"},
+        ])
+        self.assertTrue(meta["descriptor_access"]["table_loads"])
+
+        # Also verify slist tsharp, ssharp, and literal sampler via analyse_instructions.
+        insns = self._parse([
+            "s_mov_b32 s20, 0x92",
+            "s_mov_b32 s21, 0",
+            "s_mov_b32 s22, 0",
+            "s_mov_b32 s23, 0",
+            "image_sample v[0:3], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s20, s21, s22, s23] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "image_sample v[4:7], v[0:1], [s0, s1, s2, s3, s4, s5, s6, s7], [s8, s9, s10, s11] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_endpgm",
+        ])
+        got = M.analyse_instructions([insns], [[]])
+        kinds = {r["sgpr"]: r["kind"] for r in got["user_sgpr_reads"]}
+        for r in range(8):
+            self.assertEqual(kinds[r], "tsharp")
+        for r in range(8, 12):
+            self.assertEqual(kinds[r], "ssharp")
+        self.assertEqual(got["literal_samplers"], [[0x92, 0, 0, 0]])
+
+        # A VCCTuple slist mixing a user SGPR with vcc_lo must classify the SGPR without crashing.
+        insns_vcc = self._parse([
+            "global_load_dword v0, v1, [s0, vcc_lo]",
+            "s_endpgm",
+        ])
+        got_vcc = M.analyse_instructions([insns_vcc], [[]])
+        self.assertEqual(got_vcc["user_sgpr_reads"], [{"sgpr": 0, "kind": "ptr64_lo"}])
 
 
 if __name__ == "__main__":

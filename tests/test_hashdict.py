@@ -3,12 +3,15 @@ lookup CLI, case-insensitivity, and collision handling.
 
     python -I tests/test_hashdict.py
 """
+import errno
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "hashdict.py")
@@ -332,6 +335,20 @@ class CarveAndExtraCLITest(unittest.TestCase):
             text=True,
         )
 
+    def test_missing_extra_input_leaves_existing_dictionary_untouched(self):
+        missing = os.path.join(self.dir, "missing.txt")
+        previous = {"00000001": "previous_name"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(previous, output)
+
+        result = self.run_tool(self.carve_dir, "--extra", self.extra_file, missing, "--out", self.out_json)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--extra", result.stderr)
+        self.assertIn(missing, result.stderr)
+        with open(self.out_json, encoding="utf-8") as output:
+            self.assertEqual(json.load(output), previous)
+
     def test_build_dictionary_and_roundtrip_lookup(self):
         p = self.run_tool(
             self.carve_dir,
@@ -359,6 +376,32 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(p_lookup.returncode, 0, p_lookup.stderr)
         self.assertIn(f"{lookup_hash} model_prop", p_lookup.stdout)
 
+    def test_unreadable_extra_subdirectory_preserves_existing_dictionary(self):
+        blocked = os.path.join(self.extra_dir, "blocked")
+        os.mkdir(blocked)
+        previous = {"12345678": "keep"}
+        with open(self.out_json, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(previous, f)
+        scandir = os.scandir
+
+        def scan(path):
+            if path == blocked:
+                raise PermissionError(errno.EACCES, "synthetic access denied", path)
+            return scandir(path)
+
+        command = [TOOL, self.carve_dir, "--extra", self.extra_dir, "--out", self.out_json]
+        with (mock.patch.object(os, "scandir", side_effect=scan),
+              mock.patch.object(sys, "argv", command),
+              mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+              mock.patch.object(sys, "stderr", new_callable=io.StringIO) as stderr):
+            result = hashdict.main()
+
+        self.assertEqual(result, 2, stderr.getvalue())
+        self.assertIn("--extra", stderr.getvalue())
+        self.assertIn(blocked, stderr.getvalue())
+        with open(self.out_json, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), previous)
+
     def test_one_archive_folder_is_harvested_as_that_archive(self):
         # <work>/carve/common (its own index.json, as the gamedata_* tools take it) used to give an empty
         # dictionary with exit 0: only <carve>/<archive>/index.json was looked for.
@@ -384,6 +427,44 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertIn("is one of the inputs", p.stderr)
         with open(index, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def assert_carved_blob_preserved(self, output, blob):
+        with open(blob, "rb") as f:
+            original = f.read()
+        p = self.run_tool(self.carve_dir, "--out", output)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is one of the inputs", p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        with open(blob, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_out_cannot_replace_a_harvested_blob(self):
+        # The existing --out check protects index.json and --extra, but the
+        # <offset>.bin files read during harvesting are inputs as well.
+        for archive, offset in (("common", 0), ("custom_pack", 32)):
+            with self.subTest(archive=archive):
+                blob = os.path.join(self.carve_dir, archive, f"{offset:012x}.bin")
+                self.assert_carved_blob_preserved(blob, blob)
+
+    def test_out_cannot_replace_a_hard_link_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_alias.json")
+        try:
+            os.link(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.samefile(blob, alias))
+
+    def test_out_cannot_replace_a_symlink_to_a_harvested_blob(self):
+        blob = os.path.join(self.carve_dir, "common", f"{0:012x}.bin")
+        alias = os.path.join(self.dir, "harvest_link.json")
+        try:
+            os.symlink(blob, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {error}")
+        self.assert_carved_blob_preserved(alias, blob)
+        self.assertTrue(os.path.islink(alias))
 
     def test_build_requires_an_explicit_carve_directory(self):
         empty = os.path.join(self.dir, "empty")
@@ -411,6 +492,30 @@ class CarveAndExtraCLITest(unittest.TestCase):
                 with open(self.out_json, encoding="utf-8") as f:
                     self.assertEqual(json.load(f), {"12345678": "keep"})
 
+    def test_non_bink_row_head_and_offset_are_validated_before_writing(self):
+        # Missing/nonstring head and invalid (missing, negative, float, bool) offsets must be one ERROR
+        # line naming the file and row, exit 2, and never overwrite --out.
+        cases = [
+            {"off": 0, "type": "bin"},                       # missing head
+            {"off": 0, "head": 123, "type": "bin"},          # non-string head
+            {"head": "00000000", "type": "bin"},             # missing offset
+            {"off": -1, "head": "00000000", "type": "bin"},  # negative offset
+            {"off": 1.5, "head": "00000000", "type": "bin"}, # non-integer offset
+            {"off": True, "head": "00000000", "type": "bin"},# bool offset (True == 1)
+        ]
+        for row in cases:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as carve:
+                os.makedirs(os.path.join(carve, "arch"))
+                with open(os.path.join(carve, "arch", "index.json"), "w", encoding="utf-8") as f:
+                    json.dump({"files": [row]}, f)
+                out = os.path.join(carve, "out.json")
+                p = self.run_tool(carve, "--out", out)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("index.json", p.stderr)
+                self.assertIn("row 0", p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+                self.assertFalse(os.path.exists(out), "no report may be written on bad input")
+
     def test_listed_blob_missing_from_disk_is_skipped_and_reported(self):
         # The PSIN blob is listed in custom_pack/index.json but gone: the run keeps every other string.
         os.remove(os.path.join(self.carve_dir, "custom_pack", f"{32:012x}.bin"))
@@ -423,6 +528,24 @@ class CarveAndExtraCLITest(unittest.TestCase):
             d = json.load(f)
         self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
         self.assertNotIn(f"{hashdict.joaat('pso_metadata_token'):08x}", d)
+
+    def test_archive_index_saved_with_a_utf8_bom_is_read(self):
+        # Windows PowerShell 5.1 (Set-Content, Out-File) and old Notepad write JSON with a UTF-8 BOM; the
+        # names in that index must still be harvested, not end the build with "Expecting value".
+        index = os.path.join(self.carve_dir, "common", "index.json")
+        with open(index, "rb") as f:
+            raw = f.read()
+        with open(index, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + raw)
+
+        p = self.run_tool(self.carve_dir, "--out", self.out_json)
+
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("Expecting value", p.stderr)
+        with open(self.out_json, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d.get(f"{hashdict.joaat('common_archive_asset'):08x}"), "common_archive_asset")
 
     def test_build_is_reproducible_with_collisions(self):
         with open(self.extra_file, "wb") as f:
@@ -445,6 +568,71 @@ class CarveAndExtraCLITest(unittest.TestCase):
         self.assertEqual(mapping[f"{hashdict.joaat('widget'):08x}"], "Widget")
         # The two synthetic identifiers share a 32-bit hash.
         self.assertEqual(mapping["18c8836d"], "str_63346_847129")
+
+
+class ContinuationStreamTest(unittest.TestCase):
+    """A carved stream that fills whole 64 KiB blocks continues in the next one (docs/page_directory.md): the
+    blob is harvested with its continuation, so a name across the boundary is kept whole."""
+
+    NAME = b"synthetic_rig_name"
+    CUT = 8                       # the boundary falls after "syntheti"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.carve = os.path.join(self.tmp.name, "carve")
+        self.out = os.path.join(self.tmp.name, "hashes.json")
+
+    def write_archive(self, arch, streams):
+        """One archive folder of carved streams laid out back to back, as rpf9_carve.py writes them."""
+        folder = os.path.join(self.carve, arch)
+        os.makedirs(folder)
+        rows, off = [], 0
+        for data in streams:
+            with open(os.path.join(folder, f"{off:012x}.bin"), "wb") as f:
+                f.write(data)
+            rows.append({"off": off, "stored": len(data), "size": len(data), "head": data[:16].hex()})
+            off += 0x10000 * ((len(data) + 0xFFFF) // 0x10000)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"files": rows}, f)
+
+    def first_stream(self, magic, size=65536):
+        """`size` bytes starting with `magic` and ending in the first CUT bytes of NAME."""
+        tail = b"\x00" + self.NAME[:self.CUT]
+        return magic + b"\x01" * (size - len(magic) - len(tail)) + tail
+
+    def names(self, *args):
+        p = subprocess.run([sys.executable, "-I", TOOL, self.carve, "--out", self.out, *args],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(self.out, encoding="utf-8") as f:
+            return set(json.load(f).values())
+
+    def test_pso_blob_is_read_past_its_first_stream(self):
+        # levels is not in the default --archives: only PSIN/RBF0 blobs are read there, now with their continuation
+        self.write_archive("levels", [self.first_stream(b"PSIN" + bytes(12)),
+                                      self.NAME[self.CUT:] + b"\x00continuation_only_name\x00"])
+        names = self.names()
+        self.assertIn(self.NAME.decode(), names)
+        self.assertIn("continuation_only_name", names)
+        self.assertNotIn(self.NAME[:self.CUT].decode(), names)
+
+    def test_name_across_the_boundary_of_a_fully_harvested_archive(self):
+        # a first stream of 128 KiB continues as well (docs/page_directory.md)
+        self.write_archive("common", [self.first_stream(b"\x00" * 16, 2 * 65536), self.NAME[self.CUT:] + b"\x00"])
+        names = self.names()
+        self.assertIn(self.NAME.decode(), names)
+        self.assertNotIn(self.NAME[:self.CUT].decode(), names)
+        self.assertNotIn(self.NAME[self.CUT:].decode(), names)
+
+    def test_streams_that_do_not_continue_are_harvested_apart(self):
+        # a stream short of a whole block ends its blob, and a new PSIN stream never continues the one before
+        self.write_archive("common", [self.first_stream(b"\x00" * 16, 65535), self.NAME[self.CUT:] + b"\x00",
+                                      self.first_stream(b"\x00" * 16), b"PSIN" + self.NAME[self.CUT:] + b"\x00"])
+        names = self.names()
+        self.assertNotIn(self.NAME.decode(), names)
+        self.assertIn(self.NAME[:self.CUT].decode(), names)
+        self.assertIn(self.NAME[self.CUT:].decode(), names)
 
 
 class OutputPathTest(unittest.TestCase):

@@ -16,10 +16,12 @@ contain element values, entry names or payload bytes, so the CSV/JSON can be rev
 game data. Non-XML payloads follow the 64 KiB block rule; a file whose inflated size is an exact multiple of
 64 KiB can merge with the next stream. XML documents close on their root element, so their grouping is exact.
 The tool is standard library only and never writes outside the requested output files.
+Usage: `python -I tools/gamedata_index.py --help` lists the options.
 """
 from __future__ import annotations
 
 import argparse
+import codecs
 import csv
 import json
 import mmap
@@ -28,9 +30,12 @@ import re
 import subprocess
 import sys
 import tempfile
-import unicodedata
 import zlib
 from collections import defaultdict
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CARVER = os.path.join(ROOT, "rpf9_carve.py")
@@ -40,7 +45,7 @@ XML_OPEN = re.compile(rb"<([A-Za-z_][\w.:-]*)")
 XML_CLOSE_TAIL = re.compile(rb"</([A-Za-z_][\w.:-]*)>\s*$")
 # Tag-like text inside these cannot open or close an element.
 XML_NON_TAG = re.compile(rb"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>", re.S)
-MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1Z": "SPS1Z", b"RBF0": "RBF0", b"PSIN": "PSIN"}
+MAGIC = {b"MHIU": "MHIU", b"PAMH": "PAMH", b"SPS1": "SPS1", b"RBF0": "RBF0", b"PSIN": "PSIN"}
 # A resource whose page directory starts the stream carries "0DRP" at +16 (docs/animation.md, "0DRP page marker").
 # Its first 4 KiB can be over 95% printable, so without this check such a stream reads as text, and as XML when it
 # holds a "<": data.rpf has 337 of them and no XML at all (docs/gamedata.md, "Relationship to data.rpf").
@@ -53,6 +58,27 @@ def printable(data: bytes) -> float:
         return 0.0
     good = sum(1 for c in sample if c in (9, 10, 13) or 32 <= c < 127)
     return good / len(sample)
+
+
+def _utf8_text(data: bytes) -> bool:
+    """True when the leading 4 KiB decodes as printable UTF-8 text (tolerating a split multibyte boundary)."""
+    sample = data[:4096]
+    if not sample or b"\x00" in sample:
+        return False
+    start = 0
+    while start < min(3, len(sample)) and 0x80 <= sample[start] <= 0xBF:
+        start += 1
+    sample = sample[start:]
+    if not sample:
+        return False
+    try:
+        text = codecs.getincrementaldecoder("utf-8")("strict").decode(sample, final=False)
+    except UnicodeDecodeError:
+        return False
+    if not text:
+        return False
+    good = sum(1 for ch in text if ch in "\t\r\n" or (ord(ch) >= 0x20 and ord(ch) != 0x7F and ch.isprintable()))
+    return good / len(text) >= 0.95
 
 
 def has_xml_decl(data: bytes) -> bool:
@@ -109,10 +135,17 @@ def xml_complete(root: str, data: bytes) -> bool:
     return bool(closes or self_closed)
 
 
+def _self_closing_root(root: str, data: bytes) -> bool:
+    text = data[3:] if data.startswith(BOM) else data
+    text = XML_NON_TAG.sub(b"", text).strip()
+    name = re.escape(root.encode("ascii", "replace"))
+    return bool(re.fullmatch(rb"<" + name + rb"(?=[\s/])(?:\"[^\"]*\"|'[^']*'|[^'\">])*/>", text))
+
+
 def standalone_xml(data: bytes) -> bool:
     """A complete document in one stream, with or without a declaration."""
     root = xml_root(data)
-    return bool(root) and tail_root(data) == root and xml_complete(root, data)
+    return bool(root) and xml_complete(root, data) and (tail_root(data) == root or _self_closing_root(root, data))
 
 
 def stream_kind(data: bytes, row: dict) -> str:
@@ -143,12 +176,27 @@ def magic_name(data: bytes) -> str:
     return ""
 
 
+CARVED_STREAM = re.compile(r"[0-9a-f]{12}\.(?:bin|bk2)")
+
+
+def carved_stream(address: str, directory: str):
+    """The carved stream a report at `address` would overwrite in `directory`, or None.
+
+    rpf9_carve.py writes one `<offset:012x>.bin` (or `.bk2`) per stream beside its index.json, so it is an input,
+    not a place for a report; guarding only index.json left `--json`/`--csv` free to replace a carved stream.
+    """
+    if not CARVED_STREAM.fullmatch(os.path.basename(address)):
+        return None
+    candidate = os.path.join(directory, os.path.basename(address))
+    return candidate if os.path.isfile(candidate) and same_report_path(address, candidate) else None
+
+
 class DirectorySource:
     """Reads .bin/.bk2 files next to an rpf9_carve.py index.json."""
 
     def __init__(self, directory: str):
         self.directory = directory
-        with open(os.path.join(directory, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(directory, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
 
@@ -179,7 +227,7 @@ class ArchiveSource:
                                capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise RuntimeError((r.stdout + r.stderr).strip() or "rpf9_carve.py failed")
-        with open(os.path.join(index_dir, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(index_dir, "index.json"), encoding="utf-8-sig") as f:
             self.index = json.load(f)
         self.rows = sorted(self.index["files"], key=lambda r: r["off"])
         self._fh = open(archive, "rb")
@@ -237,7 +285,10 @@ def build_rows(rows: list, source) -> list:
             group = [i]
             detail = magic_name(data)
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
+            # A resource's first stream may be any whole number of 64 KiB blocks (docs/page_directory.md: 128 and
+            # 192 KiB first streams continue in the next one). Only these headed kinds take that rule: a binary,
+            # text or XML run has no header proving a continuation, so it keeps the exact 64 KiB rule below.
+            while j < n and rows[j - 1]["size"] and rows[j - 1]["size"] % 65536 == 0:
                 nxt = source.read(rows[j])
                 nk = stream_kind(nxt, rows[j])
                 if nk in ("decl", "bink2", "rbf0", "psin", "other"):
@@ -252,20 +303,27 @@ def build_rows(rows: list, source) -> list:
         if kind in ("rbf0", "psin", "text", "binary"):
             group = [i]
             chunks = [data] if kind == "text" and b"<" in data else None
+            start_root = xml_root(data) if chunks is not None else ""
             j = i + 1
-            while j < n and rows[j - 1]["size"] == 65536:
-                nxt = source.read(rows[j])
-                if standalone_xml(nxt):
-                    break
-                nk = stream_kind(nxt, rows[j])
-                if nk in ("decl", "bink2", "rbf0", "psin", "other"):
-                    break
-                if chunks is not None:
-                    chunks.append(nxt)
-                group.append(j)
-                j += 1
+            if not (chunks is not None and standalone_xml(data)):
+                while j < n and rows[j - 1]["size"] == 65536:
+                    nxt = source.read(rows[j])
+                    if standalone_xml(nxt):
+                        break
+                    nk = stream_kind(nxt, rows[j])
+                    if nk in ("decl", "bink2", "rbf0", "psin", "other") or (
+                        chunks is not None and nk == "binary" and not _utf8_text(nxt)
+                    ):
+                        break
+                    if chunks is not None:
+                        chunks.append(nxt)
+                    group.append(j)
+                    j += 1
+                    if chunks is not None and start_root and tail_root(nxt) == start_root and xml_complete(start_root, b"".join(chunks)):
+                        break
             if chunks is not None:
-                root = tail_root(b"".join(chunks))
+                blob = b"".join(chunks)
+                root = tail_root(blob) or (xml_root(blob) if standalone_xml(blob) else "")
                 out.append(row_for("xml", rows, group, root=root, header=False, complete=bool(root)))
             else:
                 out.append(row_for(kind, rows, group))
@@ -357,42 +415,6 @@ def write_csv(path: str, rows: list) -> None:
         w.writerows(rows)
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path):
-    """True when the volume that will hold `path` ignores letter case, as macOS's default APFS volume does.
-    os.path.normcase folds case only on Windows, so on macOS `R.json` and `r.json` would pass as two reports."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True  # the macOS default; folding can only refuse a pair, never overwrite one
-
-
-def _path_key(path):
-    path = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(path):
-        # APFS and HFS+ also treat composed and decomposed accents as one name.
-        path = unicodedata.normalize("NFD", path.casefold())
-    return path
-
-
-def same_report_path(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
@@ -416,6 +438,10 @@ def main() -> int:
             for input_path in protected:
                 if same_report_path(path, input_path):
                     ap.error(f"{flag} would overwrite the input {input_path}")
+            for directory in (a.target, a.carve_dir):
+                stream = directory and os.path.isdir(directory) and carved_stream(path, directory)
+                if stream:
+                    ap.error(f"{flag} would overwrite the carved stream {stream}")
     source = None
     try:
         if os.path.isdir(a.target):
@@ -440,11 +466,19 @@ def main() -> int:
             source.close()
 
     if a.csv:
-        write_csv(a.csv, rows)
+        try:
+            write_csv(a.csv, rows)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.csv}: {e.strerror or e}", file=sys.stderr)
+            return 2
     if a.json:
-        _make_parent(a.json)
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        try:
+            _make_parent(a.json)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": summary, "rows": rows}, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
 
     print(f'{summary["streams"]} streams, {summary["stored"]:,} stored, '
           f'{summary["inflated"]:,} inflated')
