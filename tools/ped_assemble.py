@@ -948,6 +948,23 @@ def _normalize_triangles(raw_indices: list) -> list[tuple[int, int, int]]:
     ]
 
 
+def _glb_triangles(indices: list[int], mode: object, *, path: str) -> list[tuple[int, int, int]]:
+    """Expand glTF triangle topology while retaining winding and degenerate primitives."""
+    if mode == 4:
+        return _normalize_triangles(indices)
+    if mode not in (5, 6):
+        raise PedAssembleError(
+            f"{path}: unsupported GLB primitive mode {mode!r}; expected triangles (4), strip (5), or fan (6)"
+        )
+    if len(indices) < 3:
+        raise PedAssembleError(f"{path}: GLB primitive mode {mode!r} requires at least three vertices")
+    if mode == 5:
+        # Parity advances even across degenerate triangles in the strip.
+        return [(indices[i], indices[i + 1 + i % 2], indices[i + 2 - i % 2])
+                for i in range(len(indices) - 2)]
+    return [(indices[i + 1], indices[i + 2], indices[0]) for i in range(len(indices) - 2)]
+
+
 def _parse_joint_names(raw: object, *, part_name: str) -> list[str] | None:
     if raw is None:
         return None
@@ -1205,7 +1222,9 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 raw_idx = [int(i) for i in _read_glb_accessor(doc, bin_chunk, prim["indices"])]
             else:
                 raw_idx = list(range(len(positions)))
-            triangles = _normalize_triangles(raw_idx)
+            triangles = _glb_triangles(
+                raw_idx, prim.get("mode", 4), path=f"{path}: meshes[{mesh_idx}].primitives[{pi}]"
+            )
             normals = (
                 [tuple(float(x) for x in n) for n in _read_glb_accessor(doc, bin_chunk, attrs["NORMAL"])]
                 if "NORMAL" in attrs else None
