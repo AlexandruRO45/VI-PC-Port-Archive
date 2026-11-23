@@ -118,9 +118,10 @@ class F64DiffTests(unittest.TestCase):
     def test_div_fmas_initializes_vcc_and_reference_reads_lane_zero(self):
         _, body, _, _ = fd.make_case(random.Random(0), "v_div_fmas_f64")
         self.assertEqual(body[0], "s_mov_b32 vcc_lo, -1")
-        fmas = "v_div_fmas_f64 v[8:9], 1.0, 1.0, 1.0"
-        self.assertEqual(fd.ref_program([body[0], fmas])[:2], [0, 0x44000000])
-        self.assertEqual(fd.ref_program(["s_mov_b32 vcc_lo, 2", fmas])[:2], [0, 0x40000000])
+        # 2**1000 + 2 rounds to 2**1000 unscaled and overflows with the RDNA2 scale-up.
+        fmas = "v_div_fmas_f64 v[8:9], 0x7e700000, 1.0, 2.0"
+        self.assertEqual(fd.ref_program([body[0], fmas])[:2], [0, 0x7ff00000])
+        self.assertEqual(fd.ref_program(["s_mov_b32 vcc_lo, 2", fmas])[:2], [0, 0x7e700000])
 
     def test_compare_reference_does_not_write_v8_without_cndmask(self):
         for op in ("v_cmp_eq_f64_e64 s20, v[12:13], 0.0",
