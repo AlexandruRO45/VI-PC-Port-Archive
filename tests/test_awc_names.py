@@ -107,6 +107,15 @@ class TestBanks(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "declared header"):
                         A.bank_ids(path)
 
+    def test_declared_header_past_the_file(self):
+        # The stream table fits in the file and in the declared header, but the header itself does not fit in
+        # the file; the canonical rsc8_audio parser rejects the same bytes.
+        raw = b"ADAT" + struct.pack("<IIII", 0, 1, 21, 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write(os.path.join(tmp, "bad.awc"), raw)
+            with self.assertRaisesRegex(ValueError, "declared header"):
+                A.bank_ids(path)
+
     def test_truncated_stream_table_reads_only_header(self):
         # A truncated ordinary bank with a stream count larger than the file holds must fail from the header
         # and file size alone: os.fstat reports the real size without a seek, so only the 16-byte header is

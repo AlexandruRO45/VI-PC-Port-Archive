@@ -94,8 +94,11 @@ def bank_ids(path: str) -> list:
         skip = (4 if flags & 0x400000 else 0) + (n * 2 if flags & 0x10000 else 0) \
             + ((n + 1) * 4 if flags & 0x200000 else 0)
         table_end = 16 + skip + 4 * n
-        if table_end > os.fstat(fh.fileno()).st_size:
+        file_size = os.fstat(fh.fileno()).st_size
+        if table_end > file_size:
             raise ValueError(f"{path}: stream table extends past the end of the file")
+        if header_size > file_size:
+            raise ValueError(f"{path}: declared header extends past the end of the file")
         if header_size < 16 or table_end > header_size:
             raise ValueError(f"{path}: stream table extends past the declared header")
         fh.seek(16 + skip)
