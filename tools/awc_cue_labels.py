@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 
 def convert(sheet, output):
-    data = json.loads(sheet.read_text(encoding="utf-8"))
+    data = json.loads(sheet.read_text(encoding="utf-8-sig"))
     if (not isinstance(data, dict) or data.get("sample_rate") != 48000
             or not isinstance(data.get("regions"), list)):
         raise ValueError("expected a 48 kHz cue sheet with a regions list")

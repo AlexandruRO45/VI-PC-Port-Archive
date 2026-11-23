@@ -48,6 +48,15 @@ class LabelTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(self.output.exists())
 
+    def test_bom_prefixed_sheet_is_read(self):
+        row = dict(file="00000001.ogg", name_hash="00000000", start_sample=0, end_sample=48000)
+        self.sheet.write_bytes(json.dumps({"sample_rate": 48000, "regions": [row]}).encode("utf-8-sig"))
+        result = subprocess.run([sys.executable, "-I", TOOL, self.sheet, self.output],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.output / "00000001.txt").read_text(encoding="utf-8"),
+                         "0.000000000\t1.000000000\t00000000 #1\n")
+
 
 if __name__ == "__main__":
     unittest.main()
