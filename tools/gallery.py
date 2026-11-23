@@ -148,8 +148,9 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_models_json(self) -> None:
         items = []
+        scan_errors: list[str] = []
         if os.path.isdir(self.models_dir):
-            for root, dirs, files in os.walk(self.models_dir):
+            for root, dirs, files in os.walk(self.models_dir, onerror=lambda exc: scan_errors.append(exc.filename or str(exc))):
                 dirs.sort()
                 for fn in sorted(files):
                     if fn.lower().endswith((".glb", ".gltf")):
@@ -184,6 +185,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             "models": items,
             "categories": {k: len(v) for k, v in categories.items()},
             "folders": {k: len(v) for k, v in folders.items()},
+            "scan_errors": scan_errors,
         }, ensure_ascii=False).encode("utf-8")
 
         self.send_response(200)
@@ -194,8 +196,9 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_textures_json(self) -> None:
         items = []
+        scan_errors: list[str] = []
         if os.path.isdir(self.textures_dir):
-            for root, dirs, files in os.walk(self.textures_dir):
+            for root, dirs, files in os.walk(self.textures_dir, onerror=lambda exc: scan_errors.append(exc.filename or str(exc))):
                 dirs.sort()
                 for fn in sorted(files):
                     lower = fn.lower()
@@ -222,6 +225,7 @@ class StudioHandler(http.server.BaseHTTPRequestHandler):
             "count": len(items),
             "textures": items,
             "textures_dir": self.textures_dir,
+            "scan_errors": scan_errors,
         }, ensure_ascii=False).encode("utf-8")
 
         self.send_response(200)

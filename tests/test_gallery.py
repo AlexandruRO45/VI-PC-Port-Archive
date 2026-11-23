@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -102,6 +103,68 @@ class TestGalleryServer(unittest.TestCase):
         with urllib.request.urlopen(f"{base}/textures/test_tex.png", timeout=3) as r:
             self.assertEqual(r.status, 200)
             self.assertTrue(r.read().startswith(b"\x89PNG"))
+
+    def test_unlistable_subfolder_is_reported_not_silently_skipped(self) -> None:
+        # os.walk skips a directory it cannot list unless onerror reports it; the listing used to drop
+        # the sub-folder's assets and return 200 with no indication the scan was incomplete.
+        msub = os.path.join(self.models_dir, "locked_models")
+        os.makedirs(msub)
+        with open(os.path.join(msub, "hidden.glb"), "wb") as f:
+            f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+        tsub = os.path.join(self.textures_dir, "locked_tex")
+        os.makedirs(tsub)
+        with open(os.path.join(tsub, "hidden.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+        os.chmod(msub, 0o000)
+        os.chmod(tsub, 0o000)
+        try:
+            try:
+                os.listdir(msub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            base = f"http://127.0.0.1:{self.port}"
+            with urllib.request.urlopen(f"{base}/api/models", timeout=3) as r:
+                data = json.loads(r.read())
+            self.assertTrue(any(msub in e for e in data.get("scan_errors", [])), data.get("scan_errors"))
+            self.assertEqual(data["count"], 1)  # the root model is still listed
+            with urllib.request.urlopen(f"{base}/api/textures", timeout=3) as r:
+                tdata = json.loads(r.read())
+            self.assertTrue(any(tsub in e for e in tdata.get("scan_errors", [])), tdata.get("scan_errors"))
+        finally:
+            os.chmod(msub, 0o755)
+            os.chmod(tsub, 0o755)
+
+    def test_unlistable_subfolder_is_reported_when_chmod_is_not_enough(self) -> None:
+        # The chmod case above self-skips on Windows and as root, and CI does not exercise the
+        # guard there. Forcing os.scandir to raise for the sub-folders hands os.walk the same
+        # PermissionError a real lockout would, on every platform.
+        msub = os.path.join(self.models_dir, "locked_models")
+        os.makedirs(msub)
+        with open(os.path.join(msub, "hidden.glb"), "wb") as f:
+            f.write(b"glTF\x02\x00\x00\x00\x0c\x00\x00\x00")
+        tsub = os.path.join(self.textures_dir, "locked_tex")
+        os.makedirs(tsub)
+        with open(os.path.join(tsub, "hidden.png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+        real_scandir = os.scandir
+        locked = {os.path.normcase(os.path.abspath(msub)), os.path.normcase(os.path.abspath(tsub))}
+
+        def scandir(path, *args, **kwargs):
+            if os.path.normcase(os.path.abspath(str(path))) in locked:
+                raise PermissionError(13, "Access is denied", str(path))
+            return real_scandir(path, *args, **kwargs)
+
+        base = f"http://127.0.0.1:{self.port}"
+        with mock.patch.object(gallery.os, "scandir", scandir):
+            with urllib.request.urlopen(f"{base}/api/models", timeout=3) as r:
+                data = json.loads(r.read())
+            with urllib.request.urlopen(f"{base}/api/textures", timeout=3) as r:
+                tdata = json.loads(r.read())
+        self.assertTrue(any(msub in e for e in data.get("scan_errors", [])), data.get("scan_errors"))
+        self.assertEqual(data["count"], 1)  # the root model is still listed
+        self.assertTrue(any(tsub in e for e in tdata.get("scan_errors", [])), tdata.get("scan_errors"))
+        self.assertEqual(tdata["count"], 1)
 
 
 if __name__ == "__main__":
