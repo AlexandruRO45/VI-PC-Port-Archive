@@ -329,5 +329,35 @@ class TestSaluNandB64Aliasing(unittest.TestCase):
         self.assertEqual(state.read_operand64(ASTOperand.sgpr(0)), expected)
 
 
+class TestSaluNandB64ConditionCodes(unittest.TestCase):
+    """Stage 6: Condition codes, status flags, and carry/borrow generation."""
+
+    def test_scc_set_when_nonzero(self) -> None:
+        state = ScalarMachineState()
+        instr = ASTInstruction(
+            Opcode.S_NAND_B64,
+            ASTOperand.sgpr(0),
+            ASTOperand.literal64(0),
+            ASTOperand.literal64(0),
+        )
+        _, scc = ScalarInterpreter().step(instr, state)
+        self.assertEqual(scc, 1)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_cleared_when_zero(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        instr = ASTInstruction(
+            Opcode.S_NAND_B64,
+            ASTOperand.sgpr(0),
+            ASTOperand.literal64(ALL_LANES_ACTIVE),
+            ASTOperand.literal64(ALL_LANES_ACTIVE),
+        )
+        res, scc = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+        self.assertEqual(state.scc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
