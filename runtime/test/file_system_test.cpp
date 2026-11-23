@@ -5,6 +5,11 @@
 // folder that stands in for the game install, an overlay folder, and a "GAME:" path in each variant.
 #include <windows.h>
 
+#include <fcntl.h>
+#include <share.h>
+#include <sys/stat.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <string>
@@ -742,6 +747,97 @@ int main() {
         check(attributes_w(L"T:\\x") == INVALID_FILE_ATTRIBUTES && GetLastError() != ERROR_INVALID_NAME,
               "without configured folders G: and T: stay host drives");
         rt::fs::configure(package, overlay);
+    }
+
+    // The Universal CRT's opens (RT-354). A package DLL linked against the dynamic CRT reads the FILE* or descriptor
+    // with ucrtbase's own functions, so this does too: the test itself links the static CRT.
+    {
+        write_path(package / "crt" / "read.txt", "package");
+        write_path(package / "crt" / "append.txt", "package");
+        const HMODULE ucrtbase = ::LoadLibraryW(L"ucrtbase.dll");
+        using FopenFn = FILE*(__cdecl*)(const char*, const char*);
+        using WfopenFn = FILE*(__cdecl*)(const wchar_t*, const wchar_t*);
+        using FopenSFn = errno_t(__cdecl*)(FILE**, const char*, const char*);
+        using OpenFn = int(__cdecl*)(const char*, int, int);
+        using WsopenDispatchFn = errno_t(__cdecl*)(const wchar_t*, int, int, int, int*, int);
+        const auto host_fread = reinterpret_cast<size_t(__cdecl*)(void*, size_t, size_t, FILE*)>(
+            ::GetProcAddress(ucrtbase, "fread"));
+        const auto host_fputs = reinterpret_cast<int(__cdecl*)(const char*, FILE*)>(::GetProcAddress(ucrtbase, "fputs"));
+        const auto host_fclose = reinterpret_cast<int(__cdecl*)(FILE*)>(::GetProcAddress(ucrtbase, "fclose"));
+        const auto host_read = reinterpret_cast<int(__cdecl*)(int, void*, unsigned)>(::GetProcAddress(ucrtbase, "_read"));
+        const auto host_write =
+            reinterpret_cast<int(__cdecl*)(int, const void*, unsigned)>(::GetProcAddress(ucrtbase, "_write"));
+        const auto host_close = reinterpret_cast<int(__cdecl*)(int)>(::GetProcAddress(ucrtbase, "_close"));
+        const auto host_errno = reinterpret_cast<int*(__cdecl*)()>(::GetProcAddress(ucrtbase, "_errno"));
+        const auto read_stream = [&](FILE* f) {
+            std::string text;
+            char buffer[64];
+            size_t got = 0;
+            while ((got = host_fread(buffer, 1, sizeof(buffer), f)) != 0) text.append(buffer, got);
+            host_fclose(f);
+            return text;
+        };
+
+        const char* stdio = "api-ms-win-crt-stdio-l1-1-0.dll";
+        const auto crt_fopen = resolve<FopenFn>(stdio, "fopen");
+        const auto crt_wfopen = resolve<WfopenFn>(stdio, "_wfopen");
+        const auto crt_fopen_s = resolve<FopenSFn>(stdio, "fopen_s");
+        const auto crt_open = resolve<OpenFn>("ucrtbase.dll", "_open");
+        const auto crt_wsopen_dispatch = resolve<WsopenDispatchFn>(stdio, "_wsopen_dispatch");
+        check(crt_fopen && crt_wfopen && crt_fopen_s && crt_open && crt_wsopen_dispatch &&
+                  resolve<void*>(stdio, "_wfsopen") && resolve<void*>(stdio, "freopen_s") &&
+                  resolve<void*>("ucrtbase.dll", "_sopen_dispatch"),
+              "the CRT opens resolve under api-ms-win-crt-stdio-l1-1-0 and ucrtbase");
+
+        FILE* f = crt_fopen("GAME:\\crt\\read.txt", "r");
+        check(f && read_stream(f) == "package", "fopen reads a package file through GAME:");
+
+        f = crt_wfopen(L"game:/crt/new.txt", L"w");
+        check(f != nullptr, "_wfopen creates a console file");
+        if (f) {
+            host_fputs("crt", f);
+            host_fclose(f);
+        }
+        check(read_path(overlay / "crt" / "new.txt") == "crt" && !std::filesystem::exists(package / "crt" / "new.txt"),
+              "the new file lands in the overlay, not the package");
+
+        f = crt_fopen("GAME:\\crt\\append.txt", "a");
+        if (f) {
+            host_fputs("+crt", f);
+            host_fclose(f);
+        }
+        check(read_path(overlay / "crt" / "append.txt") == "package+crt" &&
+                  read_path(package / "crt" / "append.txt") == "package",
+              "append mode copies the package file up and leaves the package as installed");
+
+        const int fd = crt_open("GAME:\\crt\\read.txt", _O_RDONLY | _O_BINARY, 0);
+        char buffer[16] = {};
+        check(fd >= 0 && host_read(fd, buffer, sizeof(buffer)) == 7 && std::string(buffer, 7) == "package",
+              "_open reads a package file through GAME:");
+        if (fd >= 0) host_close(fd);
+
+        // The C++ _open overloads in the CRT headers call _wsopen_dispatch.
+        int out = -1;
+        const errno_t created = crt_wsopen_dispatch(L"T:\\crt\\fd.bin", _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+                                                    _SH_DENYNO, _S_IREAD | _S_IWRITE, &out, 0);
+        check(created == 0 && out >= 0 && host_write(out, "fd", 2) == 2, "_wsopen_dispatch creates a T: file");
+        if (out >= 0) host_close(out);
+        check(read_path(overlay / ".gta6rt-temp" / "crt" / "fd.bin") == "fd", "and it lands in the scratch folder");
+
+        *host_errno() = 0;
+        check(crt_fopen("GAME:\\crt\\missing.txt", "r") == nullptr && *host_errno() == ENOENT,
+              "a missing console file fails with ENOENT in the CRT's errno");
+        *host_errno() = 0;
+        check(crt_fopen("GAME:\\..\\outside.txt", "w") == nullptr && *host_errno() == EINVAL &&
+                  !std::filesystem::exists(root / "outside.txt"),
+              "GAME:\\.. is refused with EINVAL and nothing is written");
+        FILE* missing = reinterpret_cast<FILE*>(1);
+        check(crt_fopen_s(&missing, "GAME:\\crt\\missing.txt", "r") == ENOENT && missing == nullptr,
+              "fopen_s returns ENOENT and clears the stream");
+
+        const std::string host_path = (package / "crt" / "read.txt").string();
+        f = crt_fopen(host_path.c_str(), "r");
+        check(f && read_stream(f) == "package", "a host path goes to the CRT unchanged");
     }
 
     std::filesystem::remove_all(root);
