@@ -1328,6 +1328,7 @@ def run_suite(a, work: str) -> int:
                 "ps_vcmpx_f16_e64": (0x64C11100, 0x6CF171C1, 0x67C71D18, 0x6FF77DD9),   # same, e64 with swapped operands
                 "ps_cvt_off": (0xBF000000, 0x3EE00000, 0xBE800000, 0x3F800000),
                 "ps_fmac_f16_mods": (0xAAAA3C00, 0xAAAA3A00, 0xAAAA0000, 0xAAAA4400),
+                "ps_fmac_f16_rounding": (0xDEAD3E01, 0xA55A8010, 0xDEADBE01, 0xA55A0010),
                 "ps_vop3_const_mods": (0xC0000000, 0xBF800000, 0x3F800000, 0xAAAABC00),
                 "ps_cndmask_sign_mods": (0xFF800001, 0x7F800001, 0x80000001, 0x7F800001),
                 "ps_interp_f32_mods": (0x3F800000, 0x00000000, 0x3F400000, 0x3F800000),   # drawn with vs_interp_consts
