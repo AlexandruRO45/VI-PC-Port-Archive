@@ -49,6 +49,32 @@ static int oversized_module_still_gets_in_alone() {
     return 0;
 }
 
+static int overflow_boundary_estimates_are_rejected() {
+    constexpr uint64_t kBudget = 10;
+    LargeModuleGate gate(kBudget, 4);
+
+    // Admitted when empty: oversized job can run alone
+    CHECK(gate.admits(UINT64_MAX));
+
+    // When an item is inflight within budget, huge estimates that would wrap uint64_t must be rejected
+    gate.enter(4);
+    CHECK(gate.admits(6));            // 4 + 6 == 10 fits
+    CHECK(!gate.admits(7));           // 4 + 7 == 11 exceeds budget
+    CHECK(!gate.admits(UINT64_MAX));  // 4 + UINT64_MAX would wrap to 3 <= 10 without overflow check
+    CHECK(!gate.admits(UINT64_MAX - 1));
+    CHECK(!gate.admits(UINT64_MAX - 3)); // 4 + (UINT64_MAX - 3) == 0 <= 10
+    gate.leave(4);
+
+    // When an oversized module is inflight, nothing joins it even if wrapping arithmetic would be <= budget
+    gate.enter(100);
+    CHECK(!gate.admits(1));
+    CHECK(!gate.admits(UINT64_MAX - 95)); // 100 + (UINT64_MAX - 95) == 4 <= 10
+    gate.leave(100);
+
+    CHECK(gate.inflight() == 0);
+    return 0;
+}
+
 static int max_inflight_zero_means_one() {
     LargeModuleGate gate(100, 0);
     CHECK(gate.max_inflight() == 1);
@@ -159,6 +185,7 @@ int main() {
 #endif
     if (int r = budget_and_count()) return r;
     if (int r = oversized_module_still_gets_in_alone()) return r;
+    if (int r = overflow_boundary_estimates_are_rejected()) return r;
     if (int r = max_inflight_zero_means_one()) return r;
     if (int r = ticket_releases()) return r;
     if (int r = threads_never_exceed_the_budget()) return r;
