@@ -178,9 +178,18 @@ def probe(oracle, asm, waves):
         kernels = [asm.Kernel(kernel_lines(c, wave), wave=wave, threads=1,
                               words=4, raw=True) for c in CASES]
         results = oracle.run(kernels, words=4)
+        if len(results) != len(CASES):
+            raise RuntimeError(f"wave{wave} oracle returned {len(results)} result(s) for {len(CASES)} kernel(s)")
         rows = []
         for case, result in zip(CASES, results):
-            word = result[0] if isinstance(result, list) else result
+            if isinstance(result, list):
+                if not result or not isinstance(result[0], int) or isinstance(result[0], bool):
+                    raise RuntimeError(f"wave{wave} oracle returned invalid result for {case[0]}: {result!r}")
+                word = result[0]
+            elif isinstance(result, int) and not isinstance(result, bool):
+                word = result
+            else:
+                raise RuntimeError(f"wave{wave} oracle returned invalid result for {case[0]}: {result!r}")
             oob = word == 0
             rows.append({"name": case[0], "got": word & 0xFFFFFFFF, "oob": oob,
                          "gfx10_oob": oob_gfx10(case), "gfx11_oob": oob_gfx11(case)})
@@ -223,6 +232,9 @@ def main():
             print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
             return 77
         report = probe(oracle, asm, waves)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     finally:
         oracle.close()
     gfx10_diff = gfx11_diff = wave_diff = 0
