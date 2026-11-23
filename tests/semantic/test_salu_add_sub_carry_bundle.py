@@ -82,6 +82,22 @@ class TestSAddI32Oracle(unittest.TestCase):
         # 0x80000000 + 0x80000000 -> 0 (negative + negative = 0 -> overflow)
         self.assertEqual(ref_s_add_i32(0x80000000, 0x80000000), (0, 1))
 
+class SAddI32Expr(ASTNode):
+    def __init__(self, src0: int, src1: int) -> None:
+        self.src0 = src0
+        self.src1 = src1
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_add_i32(self.src0, self.src1)
+
+
+class TestSAddI32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SAddI32Expr(100, -50)
+        self.assertEqual(expr.eval(), (50, 0))
+        expr_ovf = SAddI32Expr(0x7FFFFFFF, 10)
+        self.assertEqual(expr_ovf.eval(), ((0x7FFFFFFF + 10) & MASK32, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
