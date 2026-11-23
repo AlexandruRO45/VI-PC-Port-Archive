@@ -6,6 +6,7 @@
 // index 1 and a magenta fallback at index 0, draws a full-screen triangle and dumps the RGBA32F result.
 //
 //   vk_texture_test <vs.spv> <fs.spv> <out.raw> <ptr_sgpr> <s0> <s1> <s2> <s3> [--two-mip|--two-mip-sint|--two-mip-uint]   (S# words as hex)
+//   vk_texture_test <vs.spv> <fs.spv> <out.raw> --zero-root: leave all user SGPRs and heap bytes zero for control-flow A/B draws.
 //   --two-mip: expose a 128x128 quadrant texture and its solid cyan mip 1 to the 64x64 draw; the SINT and UINT
 //   forms bind the same image as a signed or unsigned integer view instead of the default UNORM one.
 //   vk_texture_test cube [out.raw]: ps_cube_sample against two 8x8 cubes, a 12-layer 2D array at binding 3 (the
@@ -106,12 +107,15 @@ int main(int argc, char** argv) {
     bool autonomous = false;
     uint32_t ssharp[8] = {0x92, 0xc00000, 0x14500000, 0,
                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
-    if (argc == 9 || two_mip) {
+    const bool zero_root = argc == 5 && std::strcmp(argv[4], "--zero-root") == 0;
+    if (zero_root || argc == 9 || two_mip) {
         vs_path = argv[1];
         fs_path = argv[2];
         out_path = argv[3];
-        ptr_sgpr = std::atoi(argv[4]);
-        for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
+        if (!zero_root) {
+            ptr_sgpr = std::atoi(argv[4]);
+            for (int i = 0; i < 4; ++i) ssharp[i] = (uint32_t)strtoul(argv[5 + i], 0, 16);
+        }
     } else if (argc <= 2 || ((cube || dref) && argc == 3)) {
         // Autonomous mode using synthetic hand-written shaders (no game files required)
         autonomous = true;
@@ -138,7 +142,7 @@ int main(int argc, char** argv) {
         if (dref)
             ssharp[0] |= 3u << 12;              // the shader's S#: DEPTH_COMPARE_FUNC = LESSEQUAL
     } else {
-        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
+        std::fprintf(stderr, "usage: vk_texture_test [cube|dref|dref_a16|dref_c|dref_c_b] [out] | vs fs out --zero-root | vs fs out ptr_sgpr s0 s1 s2 s3 [--two-mip|--two-mip-sint|--two-mip-uint]\n");
         return 2;
     }
     // Word 1 also selects the numeric type when the shader fetches through this key. Word 3 keeps BASE_LEVEL [15:12]
@@ -306,7 +310,7 @@ int main(int argc, char** argv) {
     const VkDeviceSize heap_bytes = heap_mb && std::atoi(heap_mb) > 0 ? VkDeviceSize(std::atoi(heap_mb)) << 20 : 65536;
     CHECK(make_buffer(heap_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, &heap, &heapm, &heapp));
     std::memset(heapp, 0, size_t(heap_bytes));
-    std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
+    if (!zero_root) std::memcpy(static_cast<char*>(heapp) + tsharp_va, tsharp, 32);
     if (two_mip)  // The gather test loads its S# from the four words just after the T#.
         std::memcpy(static_cast<char*>(heapp) + tsharp_va + 32, ssharp, 16);
     VkBufferDeviceAddressInfo bdai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; bdai.buffer = heap;
@@ -538,7 +542,7 @@ int main(int argc, char** argv) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &ds, 0, nullptr);
     uint32_t pc[push_words] = {};
-    pc[ptr_sgpr] = tsharp_va;               // pointer to the T# (low dword; the shader forces the high dword to 0)
+    if (!zero_root) pc[ptr_sgpr] = tsharp_va;               // pointer to the T# (low dword; the shader forces the high dword to 0)
     pc[32] = uint32_t(heap_base); pc[33] = uint32_t(heap_base >> 32);
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_VERTEX_BIT, 0, push_bytes, pc);
     if (tail_block) {

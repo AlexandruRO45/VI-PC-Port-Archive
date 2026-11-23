@@ -978,6 +978,8 @@ class PipelineExecutionTest(unittest.TestCase):
                     data = bytearray(pixel * (image_size // len(pixel)))
                     if all_attachments:
                         self.assertEqual(args[4:], ["64", "64", str(max(targets) + 1)])
+                    else:
+                        self.assertEqual(args[4:], ["--zero-root"])
                     if divergent and "dispatch" in args[2]:
                         data[AB.READBACK_BYTES] ^= 1
                     f.write(data)

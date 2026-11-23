@@ -15,7 +15,7 @@ What the comparison needs to mean anything, each learned from a run that looked 
   - Shaders with loops go to a software driver first (--harness with a Linux build under Mesa llvmpipe). One
     that never ends is killed after --timeout there; on a real GPU it resets the driver. Feed the ones that
     finish back with --names.
-The heap is zeros. Equal MRT0 readbacks can result from different execution paths. By default the harness binds only
+The single-attachment worker starts with zero user SGPRs and a zero-filled heap. Equal MRT0 readbacks can result from different execution paths. By default the harness binds only
 MRT0. The rows in <out dir>/outcomes.tsv distinguish clear-only matches and list unobserved colour targets.
 Pass --all-attachments to use vk_ps_sweep and compare each declared RGBA32F target separately.
 Usage: `python -I tools/ab_control_flow.py --help` lists the options.
@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 # Left out: anything that writes memory or images, LDS, and the rare instructions the harness has no setup for.
-# Loads are fine: with empty user data they read zeros from the start of the harness's heap, the same for both.
+# Both forms receive the same user data. A computed load address must still be inside the fixture heap.
 NEEDS = re.compile(r"^\t(image_store|image_atomic|buffer_(?:store|atomic)|tbuffer_|global_store|global_atomic|ds_|s_swappc|"
                    r"s_getpc|s_sendmsg|s_sleep)", re.M)
 BRANCH = re.compile(r"^\ts_c?branch", re.M)
@@ -199,7 +199,7 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
     for form, (tag, directory) in enumerate(forms):
         spirv = os.path.join(directory, name + ".spv")
         raw = os.path.join(out, f"{tag}.raw")
-        args = ["64", "64", str(count)] if all_attachments else ["8", "92", "c00000", "14500000", "0"]
+        args = ["64", "64", str(count)] if all_attachments else ["--zero-root"]
         for _ in range(runs):
             if os.path.isfile(raw):
                 os.remove(raw)
