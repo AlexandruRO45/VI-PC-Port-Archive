@@ -227,6 +227,22 @@ class Program:
 # Deterministic Scalar Instruction Interpreter
 # ---------------------------------------------------------------------------
 
+
+@dataclasses.dataclass(frozen=True)
+class LdsReadI16ConditionCodes:
+    """Condition codes resulting from signed read interpretation."""
+    zero: bool
+    negative: bool
+    positive: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class LdsReadI16StatusFlags:
+    """Execution status and address resolution metadata."""
+    effective_byte_address: int
+    raw_16bit: int
+    sign_extended_32bit: int
+
 class ScalarLDSInterpreter:
     """Deterministic scalar interpreter for ds_read_i16."""
 
@@ -256,8 +272,19 @@ class ScalarLDSInterpreter:
     def step(self, inst: Instruction) -> int:
         """Executes a single ds_read_i16 instruction."""
         vaddr = self.read_reg_u32(RegKind.VGPR, inst.vaddr.index)
+        eff_addr = (vaddr + (inst.offset.offset & OFFSET16_MASK)) & MASK32
         res = self.lds.read_i16(vaddr, inst.offset.offset)
         self.write_reg_u32(RegKind.VGPR, inst.vdst.index, res)
+        self.last_condition_codes = LdsReadI16ConditionCodes(
+            zero=(res == 0),
+            negative=bool(res & 0x80000000),
+            positive=(res > 0 and not bool(res & 0x80000000)),
+        )
+        self.last_status_flags = LdsReadI16StatusFlags(
+            effective_byte_address=eff_addr,
+            raw_16bit=res & 0xFFFF,
+            sign_extended_32bit=res,
+        )
         self.trace.append(f"{inst.to_assembly()} => {inst.vdst.format_asm()}={res:#010x}")
         return res
 
@@ -580,6 +607,74 @@ class TestLdsReadI16RegisterAliasing(unittest.TestCase):
         res = interp.step(inst)
         self.assertEqual(res, 0xFFFFFFFF)
         self.assertEqual(interp.read_reg_u32(RegKind.VGPR, 1), 0xFFFFFFFF)
+
+
+
+class TestLdsReadI16ConditionCodes(unittest.TestCase):
+    """Unit tests for condition codes, status flags, and VCC isolation."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLDSInterpreter(capacity_dwords=1024)
+
+    def test_zero_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 0x0000)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertTrue(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_positive_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 0x0042)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 66)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertFalse(cc.zero)
+        self.assertFalse(cc.negative)
+        self.assertTrue(cc.positive)
+
+    def test_negative_flag(self) -> None:
+        self.interp.lds.write_dword(0x10, 0x8001)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        res = self.interp.step(inst)
+        self.assertEqual(res, 0xFFFF8001)
+        cc = self.interp.last_condition_codes
+        self.assertIsNotNone(cc)
+        self.assertFalse(cc.zero)
+        self.assertTrue(cc.negative)
+        self.assertFalse(cc.positive)
+
+    def test_vcc_isolation(self) -> None:
+        self.interp.vcc = 0x12345678DEADBEEF
+        self.interp.lds.write_dword(0x10, 0x1234)
+        self.interp.write_reg_u32(RegKind.VGPR, 1, 0x10)
+        inst = Instruction(
+            opcode=Opcode.DS_READ_I16,
+            vdst=Register(RegKind.VGPR, 2),
+            vaddr=Register(RegKind.VGPR, 1),
+        )
+        self.interp.step(inst)
+        self.assertEqual(self.interp.vcc, 0x12345678DEADBEEF)
 
 
 if __name__ == "__main__":
