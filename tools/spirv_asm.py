@@ -5,8 +5,8 @@ conforming SPIR-V assembly targeting Vulkan 1.0–1.4) directly into binary SPIR
 words in memory.
 
 Grammar tables in tools/spirv_asm_tables.py are derived from Khronos Group
-SPIRV-Headers (MIT License): spirv.core.grammar.json, extinst.glsl.std.450.grammar.json,
-and extinst.nonsemantic.shader.debuginfo.100.grammar.json.
+SPIRV-Headers (MIT License): spirv.core.grammar.json and
+extinst.glsl.std.450.grammar.json.
 
 As a module:
     from spirv_asm import assemble
@@ -49,8 +49,8 @@ TARGET_ENV_VERSION = {
 
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
 _EXT_SETS = {
-    "GLSL.std.450": GLSL_STD_450,
     "NonSemantic.Shader.DebugInfo.100": NONSEMANTIC_SHADER_DEBUGINFO_100,
+    "GLSL.std.450": GLSL_STD_450,
 }
 
 # Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)
