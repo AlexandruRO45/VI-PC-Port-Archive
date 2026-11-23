@@ -205,6 +205,95 @@ def test_wrexec_cases_catch_a_swapped_complement(case, wave, monkeypatch):
     assert status == "mismatch"
 
 
+# s_bitcmp of a lane mask: FEW_LANES sets lanes 4 and 20 of VCC, so bit 4 / 20 is 1 and bit 5 is 0 in every lane,
+# while each lane's own bit differs. EXEC inside a FEW_LANES `if` is lanes 4 and 20 only, so bit 5 of it is 0 although
+# every running lane's own bit is 1.
+BITCMP_CASES = {
+    "bitcmp1 vcc bit 4": [("bitcmp", FEW_LANES, "vcc", "1", None, "4", "s_cbranch_scc0", [("probe", 11)])],
+    "bitcmp0 vcc bit 5": [("bitcmp", FEW_LANES, "vcc", "0", None, "5", "s_cbranch_scc1", [("probe", 11)])],
+    "bitcmp1 exec bit 5 in an if": [("if", FEW_LANES, False, [
+        ("bitcmp", FEW_LANES, "exec", "1", None, "5", "s_cbranch_scc0", [("probe", 11)])])],
+    "bitcmp1 vcc bit from s11": [("op", "s_mov_b32 s11, 20"),
+                                 ("bitcmp", FEW_LANES, "vcc", "1", None, "s11", "s_cbranch_scc0", [("probe", 11)])],
+}
+BITCMP_W64_CASES = {
+    # 36 >= lane: lanes 0-36 are set, so bit 4 of vcc_hi (lane 36) is 1.
+    "bitcmp1 vcc_hi bit 4 (lane 36)": [("bitcmp", ("ge", "u32", 36, 0), "vcc", "1", "hi", "4", "s_cbranch_scc0",
+                                        [("probe", 11)])],
+    "bitcmp0 vcc bit 4 (b64)": [("bitcmp", FEW_LANES, "vcc", "0", None, "4", "s_cbranch_scc1", [("probe", 11)])],
+    "bitcmp1 vcc bit 40 (b64)": [("bitcmp", ("le", "u32", 36, 0), "vcc", "1", None, "40", "s_cbranch_scc0",
+                                  [("probe", 11)])],
+}
+SCMPK_CASES = {
+    "cmpk lt i32 0xffff (-1)": [("op", "s_mov_b32 s11, -5"), ("scmpk", ("lt", "i32", 11, 0xFFFF), "s_cbranch_scc0",
+                                                               [("probe", 11)])],
+    "cmpk lt u32 0xffff": [("op", "s_mov_b32 s11, -5"), ("scmpk", ("lt", "u32", 11, 0xFFFF), "s_cbranch_scc1",
+                                                          [("probe", 11)])],
+    "cmpk eq u32 12": [("scmpk", ("eq", "u32", 13, 12), "s_cbranch_scc0", [("probe", 11)])],
+}
+
+
+@pytest.mark.parametrize("case", sorted(BITCMP_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_bitcmp_of_a_lane_mask_matches(case, wave, structured):
+    status, detail = cf_diff.run_case("ps_bitcmp", BITCMP_CASES[case], wave, structured)
+    assert status == "match", detail
+
+
+@pytest.mark.parametrize("case", sorted(BITCMP_W64_CASES))
+@pytest.mark.parametrize("structured", (True, False), ids=("structured", "dispatch-loop"))
+def test_bitcmp_of_a_wave64_mask_half_matches(case, structured):
+    status, detail = cf_diff.run_case("ps_bitcmp", BITCMP_W64_CASES[case], 64, structured)
+    assert status == "match", detail
+
+
+def _per_lane_bitcmp(monkeypatch):
+    """The slip this guards: s_bitcmp reading the lane's own mask bit (a lane mask taken as data)."""
+    real = rdna2spirv.Gen.bitcmp
+
+    def bitcmp(self, op, a):
+        self.holds_lane_mask = lambda x: False
+        try:
+            return real(self, op, a)
+        finally:
+            del self.holds_lane_mask
+    monkeypatch.setattr(rdna2spirv.Gen, "bitcmp", bitcmp)
+
+
+@pytest.mark.parametrize("case", sorted(BITCMP_CASES))
+def test_bitcmp_cases_catch_a_per_lane_bit(case, monkeypatch):
+    _per_lane_bitcmp(monkeypatch)
+    assert cf_diff.run_case("ps_bitcmp", BITCMP_CASES[case], 32)[0] == "mismatch"
+
+
+@pytest.mark.parametrize("case", sorted(BITCMP_W64_CASES))
+def test_bitcmp_w64_cases_catch_a_per_lane_bit(case, monkeypatch):
+    _per_lane_bitcmp(monkeypatch)
+    assert cf_diff.run_case("ps_bitcmp", BITCMP_W64_CASES[case], 64)[0] == "mismatch"
+
+
+@pytest.mark.parametrize("case", sorted(SCMPK_CASES))
+@pytest.mark.parametrize("wave", (32, 64))
+def test_scmpk_matches(case, wave):
+    status, detail = cf_diff.run_case("ps_scmpk", SCMPK_CASES[case], wave)
+    assert status == "match", detail
+
+
+def test_reference_cmpk_extends_the_immediate():
+    # s11 = -5: as i32, -5 < sext(0xffff) = -1; as u32, 0xfffffffb < 0x0000ffff is false.
+    for ty, want in (("i32", 1), ("u32", 0)):
+        body = [("op", "s_mov_b32 s11, -5"), ("op", f"s_cmpk_lt_{ty} s11, 0xffff"), ("op", "s_cselect_b32 s12, 1, 0"),
+                ("op", "v_mov_b32 v9, s12")]
+        lines = cf_diff.build(body, 32)
+        with tempfile.TemporaryDirectory() as t:
+            os.mkdir(os.path.join(t, "disasm"))
+            p = os.path.join(t, "disasm", "ps_k.s")
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(cf_diff.listing_text(lines, "ps_k"))
+            assert cf_ref.run(p, wave=32)["exports"][0][1] == want, ty
+
+
 # Float compares into EXEC (values from Emitter.fvalue). v1 = lane & 7 gives normals and NaNs (bit 2); v3 =
 # lane * 5 & 15 adds +inf and +0 (bits 2-3); v8 = 9 ^ lane reaches bit 4 too, so even in wave32 its lanes hold every
 # value: +-normals, NaNs, +-inf and +-0.
@@ -417,7 +506,7 @@ def test_generator_covers_every_shape():
         walk(cf_diff.generate(random.Random(i), 32))
     assert {"if", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop", "irr", "sccmask", "csel", "probe",
             "ifs", "cexec", "halfexec", "halfscc", "scmpmask", "cselmask", "vccloop", "cmpxloop", "mread", "waterfall", "wqm", "lanes", "far",
-            "wrelse", "wrloop", "fif", "fcmpx"} <= kinds
+            "wrelse", "wrloop", "fif", "fcmpx", "bitcmp", "scmpk"} <= kinds
 
 
 @pytest.mark.parametrize("op_name", ("andn1", "andn2", "orn1", "orn2", "xor", "nand", "nor", "xnor"))

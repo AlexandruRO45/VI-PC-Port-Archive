@@ -18,6 +18,9 @@ Shapes (each nests, up to --depth):
   irr       two-entry cycle on uniform SCC branches                                   (irreducible graph)
   sccmask   s_and/andn2/or/xor of VCC and EXEC, or s_not of VCC -> s_cbranch_scc0/1 (SCC = whole mask != 0)
   csel      the same SCC read by s_cselect_b32 into a uniform SGPR
+  bitcmp    s_bitcmp0/1 of bit N (a constant or a uniform SGPR) of VCC after a compare, or of EXEC: the whole
+            mask (_b64 in wave64) or one 32-bit half -> s_cbranch_scc0/1 over a block (whether lane N is set)
+  scmpk     s_cmpk_<cc>_u32/i32 of a uniform SGPR against a 16-bit immediate -> s_cbranch_scc0/1
   fif       v_cmp_<cc>_f32 / v_cmp_class_f32 -> s_and_saveexec -> [s_cbranch_execz] -> body -> s_or exec
   fcmpx     s_mov save, exec -> v_cmpx_<cc>_f32 / v_cmpx_class_f32 -> [s_cbranch_execz] -> body -> s_mov exec
             (both compare a per-lane f32 built in v12 from a data VGPR: +-1.0..1.75, +-0, +-inf or a NaN, never a
@@ -174,7 +177,18 @@ class Gen:
         kind = r.choice(("if", "if", "ifelse", "ifelse", "cmpx", "saveexec", "vccz", "sif", "sloop", "vloop",
                          "vloop", "irr", "sccmask", "csel", "ifs", "ifs", "cexec", "halfexec", "halfscc", "scmpmask",
                          "cselmask", "vccloop", "cmpxloop", "mread", "mread", "waterfall",
-                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far", "wrelse", "wrloop", "fif", "fcmpx"))
+                         "waterfall", "wqm", "wqm", "lanes", "lanes", "far", "wrelse", "wrloop", "fif", "fcmpx", "bitcmp", "scmpk"))
+        if kind == "bitcmp":
+            half = r.choice((None, "lo", "hi")) if self.wave == 64 else None
+            bit = str(r.randrange(0, 32 if half or self.wave == 32 else 64)) if r.random() < 0.7 \
+                else f"s{r.choice(SREGS)}"
+            return ("bitcmp", self.cmp(), r.choice(("vcc", "exec")), r.choice(("0", "1")), half, bit,
+                    r.choice(("s_cbranch_scc0", "s_cbranch_scc1")), [self.probe()] + self.block(depth))
+        if kind == "scmpk":
+            k = r.choice((0, 1, 5, 12, 37, 64, 0x7FFF, 0x8000, 0xFFFF, 0xFFF0))
+            return ("scmpk", (r.choice(("eq", "lg", "gt", "ge", "lt", "le")), r.choice(("u32", "i32")),
+                              r.choice(SREGS), k), r.choice(("s_cbranch_scc0", "s_cbranch_scc1")),
+                    [self.probe()] + self.block(depth))
         if kind in ("fif", "fcmpx"):
             return (kind, self.fcond(), r.random() < 0.6, [self.probe()] + self.block(depth))
         if kind == "far":
@@ -714,6 +728,27 @@ class Emitter:
             # Loop again while any lane is left: EXECNZ, or SCC of the s_andn2 (= new EXEC != 0).
             self.br("s_cbranch_scc1" if scc_exit else "s_cbranch_execnz", head)
             self.ins(f"s_or_{w} {ex}, {ex}, {brk_mask}")
+        elif kind == "bitcmp":
+            # A wave-uniform test of one lane's bit: every lane takes the same side, the body runs with EXEC as is.
+            _, c, src, which, half, bit, mnemonic, body = n
+            end = self.label()
+            if src == "vcc":
+                self.vcmp(c)
+            if half:
+                reg, width = f"{src}_{half}", "b32"
+            else:
+                reg, width = (self.vcc() if src == "vcc" else ex), self.b()
+            self.ins(f"s_bitcmp{which}_{width} {reg}, {bit}")
+            self.br(mnemonic, end)
+            self.nodes(body)
+            self.place(end)
+        elif kind == "scmpk":
+            _, (cc, ty, sr, k), mnemonic, body = n
+            end = self.label()
+            self.ins(f"s_cmpk_{cc}_{ty} s{sr}, 0x{k:x}")
+            self.br(mnemonic, end)
+            self.nodes(body)
+            self.place(end)
         elif kind == "fif":
             _, fc, skip, body = n
             save, end = self.sreg(20), self.label()
@@ -836,6 +871,8 @@ FAR_SIZE = 20       # s_getpc_b64 (4) + s_add/sub_u32 with a literal (8) + s_add
 def _size(text):
     """Bytes of the encoding: 4, or 8 for VOP3 and exp, plus 4 for a literal (an integer outside -16..64)."""
     op, _, rest = text.partition(" ")
+    if op.startswith("s_cmpk_"):
+        return 4                                   # SOPK: the 16-bit immediate is part of the instruction word
     base = 8 if op == "exp" or op.endswith("_e64") or op in VOP3 else 4
     return base + (4 if any(not -16 <= v <= 64 for v in _ints(rest)) else 0)
 

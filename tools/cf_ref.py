@@ -345,6 +345,30 @@ class WaveMachine(cpu_ref.Machine):
             x, y = self._read_mask(a[0]), self._read_mask(a[1])
             self.scc = 1 if (x == y) == (base == "s_cmp_eq_u64") else 0
             return None
+        if base in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
+            # SOPC: SCC = bit (S1 & 31, or & 63 for _b64) of S0 is 0 (bitcmp0) / 1 (bitcmp1). S0 may be a lane mask:
+            # EXEC, VCC, one 32-bit half of them or an SGPR (pair); the bit is then one lane's, the same in every lane.
+            self._expect(ins, 2)
+            if base.endswith("b64"):
+                if a[0]["k"] not in ("special", "sgpr"):
+                    raise Unsupported(op, self.pc, "a 64-bit s_bitcmp source other than a mask is not modelled")
+                v, n = self._read_mask(a[0]), self._int_src(a[1], 0, scalar=True) & 63
+            else:
+                v, n = self._int_src(a[0], 0, scalar=True), self._int_src(a[1], 0, scalar=True) & 31
+            bit = v >> n & 1
+            self.scc = bit if base.startswith("s_bitcmp1") else 1 - bit
+            return None
+        if base.startswith("s_cmpk_"):
+            # SOPK: compare S0 with SIMM16, zero-extended for _u32 and sign-extended for _i32.
+            self._expect(ins, 2)
+            cc, _, ty = base[len("s_cmpk_"):].partition("_")
+            if cc not in _CMP or ty not in ("u32", "i32") or a[1]["k"] != "imm":
+                raise Unsupported(op, self.pc, "compare is not modelled")
+            x, k = self._int_src(a[0], 0, scalar=True), a[1]["v"] & 0xFFFF
+            if ty == "i32":
+                x, k = _signed(x), _signed(k, 16)
+            self.scc = 1 if _CMP[cc](x, k) else 0
+            return None
         if base.startswith("s_cmp_"):
             self._expect(ins, 2)
             cc, _, ty = base[len("s_cmp_"):].partition("_")
