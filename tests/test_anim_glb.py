@@ -98,7 +98,7 @@ SINGULAR_ZERO_COFACTOR = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
 SINGULAR_LIVE_COFACTOR = [1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0, 1.0]
 
 
-def skeleton_resource(shift_bind=0.0, singular_bind=None):
+def skeleton_resource(shift_bind=0.0, singular_bind=None, *, names=NAMES, hash_names=NAMES):
     p = Page()
     directory = drawable_header(p, "synthetic_skeleton")
     p.b[directory + 8], p.b[directory + 9] = 1, 0
@@ -112,11 +112,11 @@ def skeleton_resource(shift_bind=0.0, singular_bind=None):
         binds[0] = singular_bind
     matrices = p.alloc(b"".join(struct.pack("<16f", *m) for m in binds))
     parents = p.alloc(b"".join(struct.pack("<H", 0xFFFF if x is None else x) for x in PARENTS))
-    for i, name in enumerate(NAMES):
+    for i, name in enumerate(names):
         r = records + 0x50 * i
         struct.pack_into("<4f", p.b, r, *ROTATIONS[i])
         struct.pack_into("<3f", p.b, r + 0x10, *TRANSLATIONS[i])
-        struct.pack_into("<I", p.b, r + 0x1C, joaat32(name.lower()))
+        struct.pack_into("<I", p.b, r + 0x1C, joaat32(hash_names[i].lower()))
         struct.pack_into("<3f", p.b, r + 0x20, 1.0, 1.0, 1.0)
         p.ptr(r + 0x30, p.alloc(name.encode() + b"\0"))
         struct.pack_into("<HH", p.b, r + 0x46, 0xFFFF if PARENTS[i] is None else PARENTS[i], i)
@@ -430,6 +430,24 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(report, encoding="utf-8") as f:
             return read_glb(out), json.load(f)
+
+    def test_same_display_name_uses_stored_hash_only_when_unique(self):
+        names = (NAMES[0], NAMES[0], NAMES[2])
+        for hash_names, ambiguous in ((NAMES, False), (names, True)):
+            with self.subTest(ambiguous=ambiguous):
+                skeleton = skeleton_resource(names=names, hash_names=hash_names)
+                part = part_resource([joaat32("skel_c")])
+                self.offsets = write_archive(self.packs, [[skeleton], list(part)])
+                (doc, _), report = self.export()
+                a, b, c = doc["skins"][0]["joints"]
+                self.assertEqual(doc["nodes"][a]["name"], doc["nodes"][b]["name"])
+                self.assertNotEqual(doc["nodes"][a]["translation"], doc["nodes"][b]["translation"])
+                targets = [(ch["target"]["node"], ch["target"]["path"])
+                           for ch in doc["animations"][0]["channels"]]
+                expected = [(c, "translation")] if ambiguous else [(a, "rotation"), (b, "rotation"), (c, "translation")]
+                self.assertCountEqual(targets, expected)
+                self.assertEqual(report["counts"]["tracks_ambiguous_bone"], int(ambiguous))
+                self.assertEqual(report["clips"][0].get("tracks_bone_not_in_skeleton", 0), int(ambiguous))
 
     def test_export_writes_skin_joints_and_clip(self):
         (gltf, binary), report = self.export()

@@ -366,14 +366,20 @@ def read_part(sys, gfx, drawable, lod=0):
     return meshes
 
 
+def joint_indices_by_hash(joints):
+    """Return a joint index for unique hashes and -1 for ambiguous ones."""
+    by_hash = {}
+    for i, j in enumerate(joints):
+        by_hash[j["hash"]] = i if j["hash"] not in by_hash else -1
+    return by_hash
+
+
 def bind_part(meshes, joints, max_influences=8):
     """Model bone index -> skeleton joint index through the bone hashes; -> per mesh JOINTS/WEIGHTS sets.
 
     With `max_influences` 4, a vertex keeps its four largest weights, renormalised, in one set (three.js and
     other viewers read only JOINTS_0/WEIGHTS_0)."""
-    by_hash = {}
-    for i, j in enumerate(joints):
-        by_hash[j["hash"]] = i if j["hash"] not in by_hash else -1
+    by_hash = joint_indices_by_hash(joints)
     for mesh in meshes:
         mapping = [by_hash.get(h) for h in mesh["palette"]]
         missing = {mesh["palette"][b] for pairs in mesh["skin"] for b, _w in pairs if mapping[b] is None or mapping[b] < 0}
@@ -491,6 +497,9 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
                 target = joint_by_hash.get(bone)
                 if target is None:
                     tally["tracks_bone_not_in_skeleton"] += 1
+                    continue
+                if target < 0:
+                    tally["tracks_ambiguous_bone"] += 1
                     continue
             tally["tracks_exported"] += 1
             if (target, path) in channels:
@@ -646,12 +655,11 @@ def export(args):
     clips = []
     if args.anim:
         s, dictionary = load_dictionary(args.anim, args.dictionary)
-        joint_by_hash = {}
-        for i, j in enumerate(joints):
-            joint_by_hash.setdefault(j["hash"], i)
+        joint_by_hash = joint_indices_by_hash(joints)
         for clip in select_clips(dictionary, args.clip):
             tally = collections.Counter()
             channels = clip_channels(s, dictionary, clip, joint_by_hash, not args.no_root_motion, tally)
+            report["counts"]["tracks_ambiguous_bone"] += tally["tracks_ambiguous_bone"]
             clips.append((clip_label(clip), channels))
             report["clips"].append(dict(hash=f"0x{clip['hash']:08x}", channels=len(channels), **tally))
     data, gltf = build(joints, meshes, clips, root_motion=not args.no_root_motion)
