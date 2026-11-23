@@ -143,8 +143,6 @@ int main() {
         {VK_FORMAT_A2B10G10R10_UNORM_PACK32, {0.5f, 0.5f, 0.5f, 0.5f}, {512, 512, 512, 2}, {1023, 1023, 1023, 3}},
         {VK_FORMAT_R16G16B16A16_UNORM, {0.5f, 0.25f, 0.75f, 1.0f}, {32768, 16384, 49151, 65535},
          {65535, 65535, 65535, 65535}},
-        {VK_FORMAT_R8G8B8A8_SRGB, {0.2f, 0.7f, 0.5f, 0.5f}, {0, 0, 0, 128}, {0, 0, 0, 255}},  // colour: the GPU's sRGB curve
-        {VK_FORMAT_B8G8R8A8_SRGB, {0.5f, 0.25f, 0.75f, 0.499f}, {0, 0, 0, 127}, {0, 0, 0, 255}},
         {VK_FORMAT_R16_UNORM, {0.5f, 0, 0, 0}, {32768, 0, 0, 0}, {65535, 65535, 65535, 65535}},
         // Signed normalised: -1.0 is -127 (-32767), the scale is 127 (32767) and ties go to the even neighbour.
         {VK_FORMAT_R8G8B8A8_SNORM, {-1, -0.5f, 0.5f, 1}, {-127, -64, 64, 127}, {127, 127, 127, 127}},
@@ -162,6 +160,42 @@ int main() {
                         int(n.format), int(rect), i, double(captured.float32[i]), double(expected));
                     return 1;
                 }
+            }
+            ++checks;
+        }
+    }
+    // 8-bit sRGB (D3D-993): the colour channels must land on the code D3D writes (the sRGB curve, rounded to nearest)
+    // whether the GPU's encode rounds to nearest or truncates, as the Intel UHD Graphics driver does. So the encoded
+    // value of what Vulkan gets must lie in [code, code + 0.5). Alpha is plain UNORM. Codes worked out with the sRGB
+    // curve in double precision; 0.5 is 187.516 (WARP 188, a truncating encoder 187).
+    struct Srgb {
+        VkFormat format;
+        leonida::ClearColor color;
+        std::array<int, 4> codes;  // channels 0..2 sRGB codes, channel 3 UNORM steps of 255
+    };
+    const Srgb srgbs[] = {
+        {VK_FORMAT_R8G8B8A8_SRGB, {0.2f, 0.7f, 0.5f, 0.5f}, {124, 218, 188, 128}},
+        {VK_FORMAT_B8G8R8A8_SRGB, {0.5f, 0.25f, 0.75f, 0.499f}, {188, 137, 225, 127}},
+        {VK_FORMAT_R8G8B8A8_SRGB, {0.0039f, 0.5019f, 0.9961f, 0.3333f}, {13, 188, 255, 85}},
+        {VK_FORMAT_B8G8R8A8_SRGB, {nan, inf, -inf, 1.0f}, {0, 255, 0, 255}},
+        {VK_FORMAT_R8G8B8A8_SRGB, {0, 1, -1, 2}, {0, 255, 0, 255}},
+    };
+    for (const auto& s : srgbs) {
+        for (const bool rect : {false, true}) {
+            if (!replay_color(s.format, s.color, rect)) return 1;
+            for (unsigned i = 0; i < 3; ++i) {
+                const double encoded = leonida::detail::srgb_encode(double(captured.float32[i])) * 255.0;
+                // 1e-6 absorbs double rounding at the ends (1.055 - 0.055 is a hair below 1).
+                if (!(encoded >= s.codes[i] - 1e-6 && encoded < s.codes[i] + 0.5)) {
+                    std::fprintf(stderr, "sRGB clear: format %d rect %d channel %u: %.9g encodes to %.4f, want code %d\n",
+                        int(s.format), int(rect), i, double(captured.float32[i]), encoded, s.codes[i]);
+                    return 1;
+                }
+            }
+            if (captured.float32[3] != static_cast<float>(s.codes[3] / 255.0)) {
+                std::fprintf(stderr, "sRGB clear: format %d rect %d alpha: got %.9g, expected %d/255\n", int(s.format),
+                    int(rect), double(captured.float32[3]), s.codes[3]);
+                return 1;
             }
             ++checks;
         }

@@ -1089,6 +1089,29 @@ inline float quantize_unorm(float value, double maximum) {
     return static_cast<float>(round_half_even(double(value) * maximum) / maximum);
 }
 
+// The colour channels of an 8-bit sRGB render target. D3D encodes the linear clear value with the sRGB curve and
+// rounds to the nearest code; Vulkan leaves the encode to the GPU, and the Intel UHD Graphics driver (Xe-LP, Windows
+// 101.7088) truncates instead, one code below WARP whenever the encoded value's fraction is .5 or more (0.5 gives 187
+// where WARP writes 188). So the code is chosen here, and the GPU gets the linear value a quarter of a code above that
+// code's start: an encoder that rounds to nearest and one that truncates both land on it. NaN is 0 and values outside
+// 0..1 clamp, as for UNORM (D3D-993).
+inline double srgb_encode(double linear) {
+    return linear <= 0.0031308 ? linear * 12.92 : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
+}
+
+inline double srgb_decode(double encoded) {
+    return encoded <= 0.04045 ? encoded / 12.92 : std::pow((encoded + 0.055) / 1.055, 2.4);
+}
+
+inline float quantize_srgb(float value) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    const double code = round_half_even(srgb_encode(double(value)) * 255.0);
+    if (code <= 0.0) return 0.0f;
+    if (code >= 255.0) return 1.0f;
+    return static_cast<float>(srgb_decode((code + 0.25) / 255.0));
+}
+
 // The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
 // as -127 and ties go to the even neighbour.
 inline float quantize_snorm(float value, double maximum) {
@@ -1110,6 +1133,7 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     bool is_integer = true, is_signed = false;
     std::array<double, 4> unorm{};  // the largest value of each normalised channel; 0 leaves the channel to the GPU
     double snorm = 0;               // the largest value of a signed normalised format
+    bool srgb = false;              // an 8-bit sRGB format: channels 0..2 go through quantize_srgb
     switch (format) {
     case VK_FORMAT_R8_UINT:
     case VK_FORMAT_R8G8_UINT:
@@ -1141,8 +1165,9 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     case VK_FORMAT_R8G8B8A8_UNORM:
     case VK_FORMAT_B8G8R8A8_UNORM: is_integer = false; unorm = {255, 255, 255, 255}; break;
     case VK_FORMAT_R8G8B8A8_SRGB:
-    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels go through the sRGB curve on the GPU
+    case VK_FORMAT_B8G8R8A8_SRGB:  // the colour channels are chosen by quantize_srgb, alpha is plain UNORM
         is_integer = false;
+        srgb = true;
         unorm = {0, 0, 0, 255};
         break;
     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: is_integer = false; unorm = {1023, 1023, 1023, 3}; break;
@@ -1156,6 +1181,7 @@ inline VkClearColorValue render_target_clear_color(VkFormat format, const ClearC
     for (std::size_t i = 0; i < input.size(); ++i) {
         if (!is_integer) {
             if (snorm != 0) value.float32[i] = quantize_snorm(input[i], snorm);
+            else if (srgb && i < 3) value.float32[i] = quantize_srgb(input[i]);
             else value.float32[i] = unorm[i] != 0.0 ? quantize_unorm(input[i], unorm[i]) : input[i];
             continue;
         }

@@ -2593,8 +2593,12 @@ The trace will enumerate them.
   and 2^32 in alpha match WARP). `d3d12_clear_test` compares full and rectangular D3D12 readbacks with WARP across
   UNORM, SNORM, FLOAT, all 15 exposed UINT/SINT render targets (11 value vectors, including 8-/16-/10-/2-bit range
   boundaries) and depth/stencil; `clear_color_test` checks both replay paths for 19 integer formats without a GPU,
-  including unchanged float values. SRGB clears are omitted from the comparison: the
-  linear→sRGB encoding rounds differently at the `.5` boundary on WARP vs Vulkan (a 1-ulp driver difference).
+  including unchanged float values. SRGB clears are omitted from this comparison; `d3d12_clear_formats` compares
+  them with WARP. The linear→sRGB encode of the colour channels is not left to the driver: the Intel UHD Graphics
+  driver (Xe-LP, Windows 101.7088) truncates it where WARP rounds to nearest (0.5 stored `bb` vs WARP `bc`, 10 of
+  `d3d12_clear_formats`' 251 clears). `quantize_srgb` picks D3D's code and hands Vulkan the linear value a quarter of
+  a code above that code's start, which a rounding and a truncating encoder both store as that code (D3D-993;
+  251/251 on that Intel UHD and on an RTX 5060 Laptop, 621.24; `clear_color_test` checks both replay paths).
   **Open:** on NVIDIA RTX 5080 (driver 616.56) clears that land exactly on a `.5` UNORM/SNORM step round down where
   WARP rounds up: `R8G8B8A8_UNORM`/`SNORM` 0.5 store `7f`/`3f` vs WARP `80`/`40`, and a `D16_UNORM` 0.5 depth clear
   stores `0x7fff` vs WARP `0x8000` (all on `main` before this change; same 1-ulp class as SRGB, not addressed here).
