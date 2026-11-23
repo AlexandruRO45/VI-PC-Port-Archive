@@ -5595,6 +5595,33 @@ class Gen:
 
     MASK_SOP2_B32 = ("s_and_b32", "s_or_b32", "s_xor_b32", "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32",
                      "s_xnor_b32", "s_cselect_b32")
+    _SOP2_B32_DST_SPECIAL = frozenset(("null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi"))
+    _SOP2_B32_SRC_SPECIAL = frozenset((
+        "null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi",
+        "scc", "src_scc", "src_pops_exiting_wave_id",
+    ))
+
+    def _validate_sop2_b32(self, ins, op, a, mods):
+        """Validate a 32-bit SOP2 instruction's encoding, modifiers, arity, and scalar operands."""
+        raw_op = ins["op"]
+        if raw_op != op:
+            raise Unsupported(f"{raw_op} encoding")
+        if mods:
+            raise Unsupported(f"{op} modifiers")
+        if len(a) != 3:
+            raise Unsupported(f"{op} operands")
+        for arg in a:
+            if arg.get("neg") or arg.get("abs") or arg.get("sext") or "sdwa_sel" in arg or "sdwa_dst" in arg:
+                raise Unsupported(f"{op} operand modifiers")
+        dst = a[0]
+        if not ((dst["k"] == "sgpr" and dst.get("n", 1) == 1)
+                or (dst["k"] == "special" and dst.get("t") in self._SOP2_B32_DST_SPECIAL)):
+            raise Unsupported(f"{op} destination")
+        for src in a[1:3]:
+            if not ((src["k"] == "sgpr" and src.get("n", 1) == 1)
+                    or src["k"] in ("imm", "fimm")
+                    or (src["k"] == "special" and src.get("t") in self._SOP2_B32_SRC_SPECIAL)):
+                raise Unsupported(f"{op} operand")
 
     @staticmethod
     def _maskable_b32(x):
@@ -7803,6 +7830,7 @@ class Gen:
         elif op in ("s_pack_ll_b32_b16", "s_pack_lh_b32_b16", "s_pack_hh_b32_b16"):
             # D = {S1 half, S0 half}: the low result half comes from S0, the high one from S1; the letters name the
             # half taken from each (l = bits 15:0, h = bits 31:16), S0 first. SCC is not written.
+            self._validate_sop2_b32(ins, op, a, mods)
             val = None
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
             if x_val is not None and y_val is not None:
@@ -7825,6 +7853,7 @@ class Gen:
                 self.sgpr_imm[a[0]["r"]] = val
         elif op == "s_bfm_b32":
             # D = ((1 << (S0 & 31)) - 1) << (S1 & 31): an ordinary scalar value
+            self._validate_sop2_b32(ins, op, a, mods)
             val = None
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
             if x_val is not None and y_val is not None:
@@ -8490,6 +8519,7 @@ class Gen:
             self.emit(f"{r} = OpBitwiseAnd %uint {self.src_u(a[0])} {n}")
             self.dst(a[0], r)
         elif op in ("s_min_i32", "s_max_i32"):
+            self._validate_sop2_b32(ins, op, a, mods)
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
             if x_val is not None and y_val is not None:
                 xi = x_val if x_val < 0x80000000 else x_val - 0x100000000
@@ -9537,6 +9567,8 @@ class Gen:
             self.cu(3), self.cu(4)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
+            if op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_cselect_b32"):
+                self._validate_sop2_b32(ins, op, a, mods)
             val = None
             to_mask_dst, dst_half = (self._mask_b32_dst_half(a[0], a[1:3])
                                      if op in self.MASK_SOP2_B32 else (False, None))
@@ -10336,6 +10368,7 @@ class Gen:
             self.uses_psb = True        # Int64 capability and %ulong / %long come with the PSB declarations
         elif op in ("s_bfe_u32", "s_bfe_i32"):
             # src1 packs offset in bits [4:0] and width in bits [22:16].
+            self._validate_sop2_b32(ins, op, a, mods)
             ctl_val = self.imm_val(a[2])
             if ctl_val is not None:
                 off_c = ctl_val & 31
@@ -11321,6 +11354,8 @@ class Gen:
             self.emit(f"{result} = OpSelect %uint {in_range} {converted} {saturated}")
             self.dst(a[0], result)
         elif op in U2 or op in S2:
+            if op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32"):
+                self._validate_sop2_b32(ins, op, a, mods)
             to_mask_dst, dst_half = (self._mask_b32_dst_half(a[0], a[1:3])
                                      if op in self.MASK_SOP2_B32 else (False, None))
             if op in S2:
