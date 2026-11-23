@@ -49,9 +49,11 @@ class ImageFuzzWorkIsolation(unittest.TestCase):
                 with (patch.object(sys, "argv", argv), patch.object(imf.mc_command, "run", side_effect=assemble),
                       patch.object(imf, "translate", side_effect=translate),
                       patch.object(imf.subprocess, "run", side_effect=harness), contextlib.redirect_stdout(out)):
-                    self.assertEqual(imf.main(), 0)
+                    # Every case skipped (unsupported device): exit 2, same as f64_diff / wave_diff (#8433).
+                    self.assertEqual(imf.main(), 2)
                 outputs.append(out.getvalue())
                 self.assertIn("1 skipped", outputs[-1])
+                self.assertIn("no program ran: every one was skipped", outputs[-1])
                 for path, content in sentinels.items():
                     self.assertEqual(path.read_bytes(), content, f"image_fuzz overwrote {path}")
 
