@@ -106,6 +106,9 @@ The runtime's offline `XGameSaveImpl` (`runtime/shims/xgameruntime_gamesave.cpp`
 `LEONIDA_SAVE_DIR\local-user\<container>\<blob>`, defaulting to `%LOCALAPPDATA%\Leonida\saves`, with names
 %-encoded. `python -I tools/saves.py import <save folder>... [--out DIR] [--map OLD=CONTAINER/BLOB]` writes payloads
 in that layout with the same encoding, plus `import-manifest.json` (source, size, SHA-256).
+Import prepares every blob and the manifest before replacing files. The manifest hashes the staged bytes. If a
+replacement fails, import restores earlier destinations and reports any backup path that still needs manual recovery.
+This recovery assumes no concurrent writer in the destination save directory.
 
 Checked earlier with the shim of the open #279, which used the same layout: four imported blobs (2 KB to 1.2 MB)
 read back byte-identical through its `XGameSaveReadBlobData`.

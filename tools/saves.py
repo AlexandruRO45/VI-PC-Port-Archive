@@ -21,8 +21,10 @@ Commands
                                  VERIFY: container/blob names are a guess until the executable shows them; by default
                                  container = slot name (from the ASAV header), blob = payload file name. Use --map.
 """
+import hashlib
 import json
 import os
+import shutil
 import stat
 import struct
 import sys
@@ -477,13 +479,142 @@ def save_slot(folder):
     return meta.get('save_directory') or os.path.basename(os.path.normpath(folder)), payload, slot, title
 
 
+def _remove_import_file(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        if os.name != 'nt' or os.path.islink(path):
+            raise
+        # Staged and backup files may inherit a Windows read-only bit.
+        os.chmod(path, 0o600)
+        os.unlink(path)
+
+
+def _print_import_entry(entry, size):
+    print(f"{entry['folder']:34} {entry['source']:24} -> container {entry['container']!r:12} "
+          f"blob {entry['blob']!r:24} {size:>9} bytes  ({entry['title']})")
+
+
+def _publish_save_import(plan, manifest_path, manifest, force):
+    workspaces, created_directories, temporary = {}, [], []
+    retain = set()
+    committed = False
+
+    def stage_path(destination, kind):
+        parent = os.path.dirname(destination)
+        if parent not in workspaces:
+            missing, ancestor = [], parent
+            while not os.path.isdir(ancestor):
+                previous = os.path.dirname(ancestor)
+                if previous == ancestor or os.path.lexists(ancestor):
+                    raise NotADirectoryError(f'{ancestor} is not a directory')
+                missing.append(ancestor)
+                ancestor = previous
+            for directory in reversed(missing):
+                os.mkdir(directory)
+                created_directories.append(directory)
+            # A private sibling directory keeps publication on the destination's filesystem.
+            workspaces[parent] = tempfile.mkdtemp(prefix='.saves-import-', dir=parent)
+        path = os.path.join(workspaces[parent], f'{len(temporary)}.{kind}')
+        temporary.append(path)
+        return path
+
+    try:
+        staged = []
+        for source, destination, entry in plan:
+            path = stage_path(destination, 'blob')
+            digest, size = hashlib.sha256(), 0
+            with open(source, 'rb') as reader, open(path, 'wb') as writer:
+                for chunk in iter(lambda: reader.read(1024 * 1024), b''):
+                    writer.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            entry.update(size=size, sha256=digest.hexdigest())
+            staged.append((path, destination))
+        path = stage_path(manifest_path, 'json')
+        with open(path, 'w', encoding='utf-8', newline='\n') as f:
+            json.dump(manifest, f, indent=1)
+        staged.append((path, manifest_path))
+
+        jobs = []
+        for path, destination in staged:
+            backup = None
+            if os.path.lexists(destination):
+                if destination != manifest_path and not force:
+                    raise FileExistsError(f'{destination} exists; pass --force to overwrite')
+                mode = os.lstat(destination).st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                    raise OSError(f'cannot back up non-file {destination}')
+                backup = stage_path(destination, 'backup')
+                shutil.copy2(destination, backup, follow_symlinks=False)
+            os.chmod(path, published_mode(destination))
+            jobs.append((path, destination, backup))
+
+        for _, _, entry in plan:
+            _print_import_entry(entry, entry['size'])
+        sys.stdout.flush()
+
+        attempted = []
+        try:
+            for path, destination, backup in jobs:
+                if backup is not None:
+                    retain.add(backup)
+                attempted.append((path, destination, backup))
+                os.replace(path, destination)
+        except BaseException as publish_error:
+            recovery = []
+            for path, destination, backup in reversed(attempted):
+                # A local replacement consumes the staged file, including when an interrupt follows the syscall.
+                if os.path.lexists(path):
+                    retain.discard(backup)
+                    continue
+                try:
+                    if backup is None:
+                        _remove_import_file(destination)
+                    else:
+                        os.replace(backup, destination)
+                except OSError as restore_error:
+                    hint = f'remove {destination} to restore its previous absence'
+                    if backup is not None:
+                        hint = f'previous file saved at {backup}'
+                    recovery.append(f'could not restore {destination}: {restore_error}; {hint}')
+                else:
+                    retain.discard(backup)
+            if recovery:
+                raise OSError(f'{publish_error}; {"; ".join(recovery)}') from publish_error
+            raise
+        committed = True
+        retain.clear()
+    finally:
+        for path in temporary:
+            if path not in retain:
+                try:
+                    _remove_import_file(path)
+                except OSError as error:
+                    print(f'could not remove import staging file {path}: {error}', file=sys.stderr)
+        retained_dirs = {os.path.dirname(path) for path in retain}
+        for directory in workspaces.values():
+            if directory not in retained_dirs:
+                try:
+                    os.rmdir(directory)
+                except OSError as error:
+                    print(f'could not remove import staging directory {directory}: {error}', file=sys.stderr)
+        if not committed:
+            for directory in reversed(created_directories):
+                try:
+                    os.rmdir(directory)
+                except OSError:
+                    pass  # Nonempty when a backup or a new file needs manual recovery.
+
+
 def import_saves(args):
     flags = {'--out', '--map', '--with-packed', '--force', '--dry-run'}
     for option, following in zip(args, args[1:]):
         if option in ('--out', '--map') and following in flags:
             raise ValueError(f'import: {option} needs a value before {following}')
 
-    import hashlib
     out, maps, with_packed, force, dry = None, {}, False, False, False
     folders = []
     it = iter(args)
@@ -528,32 +659,28 @@ def import_saves(args):
             files.append(('chives.dat', 'chives.dat'))
         for src_name, blob_name in files:
             src = os.path.join(folder, src_name)
-            dst = os.path.join(root, xgs_encode(container), xgs_encode(blob_name))
-            plan.append((src, dst))
-            data = read(src)
-            manifest['entries'].append({'folder': sd, 'source': src_name, 'title': title, 'container': container,
-                                        'blob': blob_name, 'size': len(data),
-                                        'sha256': hashlib.sha256(data).hexdigest()})
-            print(f'{sd:34} {src_name:24} -> container {container!r:12} blob {blob_name!r:24} {len(data):>9} bytes'
-                  f'  ({title})')
-    dsts = [d.lower() for _, d in plan]
+            parent = os.path.realpath(os.path.join(root, xgs_encode(container)))
+            dst = os.path.join(parent, xgs_encode(blob_name))
+            entry = {'folder': sd, 'source': src_name, 'title': title, 'container': container, 'blob': blob_name}
+            manifest['entries'].append(entry)
+            plan.append((src, dst, entry))
+    dsts = [d.lower() for _, d, _ in plan]
     if len(set(dsts)) != len(dsts):
         raise SystemExit('import: two payloads map to the same container/blob (names are case-insensitive on '
                          'Windows); use --map to separate them')
+    # The old manifest writer followed a symlink. Replace its resolved target but keep the link.
+    manifest_path = os.path.realpath(os.path.join(out, 'import-manifest.json'))
+    if manifest_path.lower() in dsts:
+        raise ValueError('import: the manifest and a payload must have different destinations')
     if dry:
+        for src, _, entry in plan:
+            _print_import_entry(entry, len(read(src)))
         print('dry run: nothing written')
         return
-    for src, dst in plan:
-        if os.path.exists(dst) and not force:
+    for _, dst, _ in plan:
+        if os.path.lexists(dst) and not force:
             raise SystemExit(f'{dst} exists; pass --force to overwrite')
-    for src, dst in plan:
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        tmp = os.path.join(os.path.dirname(dst), '~' + os.path.basename(dst))   # the shim's temp-file convention
-        with open(tmp, 'wb') as f:
-            f.write(read(src))
-        os.replace(tmp, dst)
-    with open(os.path.join(out, 'import-manifest.json'), 'w', encoding='utf-8', newline="\n") as f:
-        json.dump(manifest, f, indent=1)
+    _publish_save_import(plan, manifest_path, manifest, force)
     print(f'wrote {len(plan)} blobs under {root}')
 
 

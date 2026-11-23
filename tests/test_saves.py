@@ -6,6 +6,7 @@ save data is used or quoted.
 """
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
@@ -555,6 +556,167 @@ class ImportTest(unittest.TestCase):
             m = rd_json(os.path.join(out, "import-manifest.json"))
             self.assertEqual(sorted(e["container"] for e in m["entries"]), ["Player", "SLOT3"])
             self.assertFalse(any(n.startswith("~") for _, _, fs in os.walk(out) for n in fs))
+
+    def _existing_import(self, out):
+        story = os.path.join(out, "local-user", "SLOT3", "SLOT0")
+        profile = os.path.join(out, "local-user", "Player", "Player")
+        manifest = os.path.join(out, "import-manifest.json")
+        write(story, b"previous story")
+        write(manifest, b'{"previous_manifest":true}\n')
+        return story, profile, manifest
+
+    def _tree(self, root):
+        return {os.path.relpath(os.path.join(parent, name), root):
+                None if name in directories else rd(os.path.join(parent, name))
+                for parent, directories, files in os.walk(root) for name in directories + files}
+
+    def test_import_rolls_back_each_failed_publication(self):
+        for fail_on in range(3):
+            with self.subTest(fail_on=fail_on), tempfile.TemporaryDirectory() as tmp:
+                story, profile, _ = self._folders(tmp)
+                out = os.path.realpath(os.path.join(tmp, "saves"))
+                before = self._existing_import(out)
+                snapshot = self._tree(out)
+                replace = os.replace
+
+                def fail_once(src, dst):
+                    if dst == before[fail_on] and not failed:
+                        failed.append(dst)
+                        raise OSError("injected publication failure")
+                    return replace(src, dst)
+
+                failed = []
+                with mock.patch.object(os, "replace", side_effect=fail_once), \
+                        self.assertRaisesRegex(OSError, "injected publication failure"):
+                    quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+                self.assertEqual(failed, [before[fail_on]])
+                self.assertEqual(self._tree(out), snapshot)
+
+    def test_import_removes_new_output_tree_after_failed_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, profile, _ = self._folders(tmp)
+            out = os.path.realpath(os.path.join(tmp, "new", "saves"))
+            replace = os.replace
+
+            def fail_manifest(src, dst):
+                if dst == os.path.join(out, "import-manifest.json"):
+                    raise OSError("injected manifest failure")
+                return replace(src, dst)
+
+            with mock.patch.object(os, "replace", side_effect=fail_manifest), \
+                    self.assertRaisesRegex(OSError, "injected manifest failure"):
+                quiet(saves.import_saves, [story, profile, "--out", out])
+            self.assertFalse(os.path.exists(os.path.dirname(out)))
+
+    def test_import_restores_a_write_interrupted_after_replace(self):
+        for interrupt_at in range(3):
+            with self.subTest(interrupt_at=interrupt_at), tempfile.TemporaryDirectory() as tmp:
+                story, profile, _ = self._folders(tmp)
+                out = os.path.realpath(os.path.join(tmp, "saves"))
+                destinations = self._existing_import(out)
+                snapshot = self._tree(out)
+                replace = os.replace
+                interrupted = []
+
+                def replace_then_interrupt(src, dst):
+                    replace(src, dst)
+                    if dst == destinations[interrupt_at] and not interrupted:
+                        interrupted.append(dst)
+                        raise KeyboardInterrupt
+
+                with mock.patch.object(os, "replace", side_effect=replace_then_interrupt), self.assertRaises(
+                    KeyboardInterrupt
+                ):
+                    quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+                self.assertEqual(interrupted, [destinations[interrupt_at]])
+                self.assertEqual(self._tree(out), snapshot)
+
+    def test_import_flushes_report_before_replacing_anything(self):
+        class ClosedOutput(io.StringIO):
+            def flush(self):
+                raise BrokenPipeError("injected output failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            story, profile, _ = self._folders(tmp)
+            out = os.path.realpath(os.path.join(tmp, "saves"))
+            self._existing_import(out)
+            snapshot = self._tree(out)
+            with contextlib.redirect_stdout(ClosedOutput()), self.assertRaisesRegex(
+                BrokenPipeError, "injected output failure"
+            ):
+                saves.import_saves([story, profile, "--out", out, "--force"])
+            self.assertEqual(self._tree(out), snapshot)
+
+    def test_import_prepares_every_blob_before_publishing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, profile, _ = self._folders(tmp)
+            out = os.path.realpath(os.path.join(tmp, "saves"))
+            _, second, _ = self._existing_import(out)
+            snapshot = self._tree(out)
+            second_parent = os.path.dirname(second)
+
+            def fail_to_stage(path, mode, *args, **kwargs):
+                if mode == "wb" and os.path.commonpath((path, second_parent)) == second_parent:
+                    raise OSError("injected staging failure")
+                return open(path, mode, *args, **kwargs)
+
+            with mock.patch.object(saves, "open", side_effect=fail_to_stage, create=True), \
+                    self.assertRaisesRegex(OSError, "injected staging failure"):
+                quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+            self.assertEqual(self._tree(out), snapshot)
+
+    def test_import_reports_where_the_backup_remains_if_restore_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, profile, _ = self._folders(tmp)
+            out = os.path.realpath(os.path.join(tmp, "saves"))
+            first, second, manifest = self._existing_import(out)
+            replace = os.replace
+            restores = []
+            published = []
+
+            def fail_publish_and_restore(src, dst):
+                if dst == second:
+                    raise OSError("injected publication failure")
+                if dst == first:
+                    if published:
+                        restores.append(src)
+                        raise OSError("injected restore failure")
+                    published.append(dst)
+                return replace(src, dst)
+
+            with mock.patch.object(os, "replace", side_effect=fail_publish_and_restore), \
+                    self.assertRaisesRegex(OSError, "injected restore failure") as error:
+                quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+            self.assertEqual(len(restores), 1)
+            self.assertIn(restores[0], str(error.exception))
+            self.assertEqual(rd(restores[0]), b"previous story")
+            self.assertEqual(rd(manifest), b'{"previous_manifest":true}\n')
+            self.assertFalse(os.path.exists(second))
+
+    def test_forced_import_manifest_hashes_the_persisted_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            story, profile, _ = self._folders(tmp)
+            out = os.path.join(tmp, "saves")
+            first, second, manifest = self._existing_import(out)
+            source = os.path.join(story, "SLOT0")
+            new_bytes, _, _ = make_jsav(seed=20)
+            opens = []
+
+            def changing_source(path, mode, *args, **kwargs):
+                if path == source and mode == "rb":
+                    opens.append(path)
+                    if len(opens) == 4:
+                        write(source, new_bytes)
+                return open(path, mode, *args, **kwargs)
+
+            with mock.patch.object(saves, "open", side_effect=changing_source, create=True):
+                quiet(saves.import_saves, [story, profile, "--out", out, "--force"])
+            files = [first, second]
+            for entry, path in zip(rd_json(manifest)["entries"], files, strict=True):
+                data = rd(path)
+                self.assertEqual(entry["size"], len(data))
+                self.assertEqual(entry["sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(sum(data is not None for data in self._tree(out).values()), 3)
 
     def test_map_dry_run_force_and_collision(self):
         with tempfile.TemporaryDirectory() as tmp:
