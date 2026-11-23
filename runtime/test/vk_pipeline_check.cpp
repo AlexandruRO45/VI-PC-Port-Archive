@@ -902,14 +902,20 @@ int main(int argc, char** argv) {
 
     std::set<std::string> skip_names;   // --skip-file: modules that killed the driver in an earlier run
     if (!skip_path.empty()) {
-        std::ifstream sf(skip_path);
-        if (!sf) {
-            std::fprintf(stderr, "error: cannot read --skip-file %s\n", skip_path.c_str());
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(skip_path, error)) {
+            std::fprintf(stderr, "error: cannot read --skip-file %s: %s\n", skip_path.c_str(),
+                         error ? error.message().c_str() : "expected a regular file");
             return 2;
         }
+        std::ifstream sf(skip_path);
         for (std::string line; std::getline(sf, line);) {
             while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
             if (!line.empty()) skip_names.insert(line);
+        }
+        if (sf.bad() || !sf.eof()) {
+            std::fprintf(stderr, "error: cannot read --skip-file %s\n", skip_path.c_str());
+            return 2;
         }
     }
 

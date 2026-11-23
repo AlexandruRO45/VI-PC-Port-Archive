@@ -25,6 +25,23 @@ check_invalid(--slow 1.2.3)  # strtod must consume the whole token, not just its
 check_invalid(--stage --graphics-only)
 check_invalid(--stats)
 
+file(MAKE_DIRECTORY "${TEST_DIR}/skip-directory")
+foreach(path IN ITEMS "${TEST_DIR}/skip-directory" "${TEST_DIR}/skip-directory/missing.txt")
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --skip-file "${path}"
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  string(FIND "${log}" "cannot read --skip-file ${path}" found)
+  if(NOT code STREQUAL "2" OR found EQUAL -1 OR log MATCHES "index.json: ")
+    message(FATAL_ERROR "--skip-file ${path}: expected a skip-file error before index parsing, got ${code}\n${log}")
+  endif()
+endforeach()
+
+file(WRITE "${TEST_DIR}/empty-skip.txt" "")
+execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --skip-file "${TEST_DIR}/empty-skip.txt"
+                RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: ")
+  message(FATAL_ERROR "Expected an empty skip file to reach the malformed index, got ${code}\n${log}")
+endif()
+
 function(check_protected_input name)
   execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" ${ARGN}
                   RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)

@@ -41,7 +41,7 @@ normal driver check. Mesh pipelines on devices without mesh shader support still
 | `--cache-feedback` | Group successful pipeline creations by `VkPipelineCreationFeedback`: cache hits, no hit reported, and unavailable. |
 | `--isolate` | POSIX only: check in child processes, `--isolate-batch N` modules at a time (default 256), so a crashing module is recorded as `MODULE CRASH` and the pass continues. Not compatible with `--stats`. |
 | `--inflight-file F` | Keep the modules currently in the driver in F as `name<TAB>phase` lines. It is rewritten by the watchdog and when a large module enters or leaves, and emptied at the end; `make_game.py`'s pipelines stage reads it. |
-| `--skip-file F` | Do not compile modules named one per line in F; each is reported as `MODULE CRASH` and counted as a failed pipeline. `make_game.py` writes F after a crash so the next run checks the rest. |
+| `--skip-file F` | Read module names one per line from a regular file. Each named module is reported as `MODULE CRASH` and counted as a failed pipeline without compiling it. `make_game.py` writes F after a crash so the next run checks the rest. An unreadable or non-regular F exits 2 before Vulkan setup. |
 
 `--isolate-child` is internal to the parent/child protocol and is not meant to be passed directly. A module with a missing partner stub is skipped; without `--isolate`, a driver crash ends the run.
 
