@@ -259,9 +259,12 @@ def scan_range(path, start, end, records, log=None):
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         pos = start
         while pos < end:
-            page = (pos + PAGE - 1) & ~(PAGE - 1)
+            page = pos & ~(PAGE - 1)
             at = page + 16
-            if at + 2 > size or page >= end:
+            if at < pos:   # the stream in this page starts before the requested range
+                page += PAGE
+                at += PAGE
+            if at + 2 > size or at >= end:
                 break
             pos = page + PAGE
             if m[at - 16:at] != b"\0" * 16 or not ZHDR.match(m, at):

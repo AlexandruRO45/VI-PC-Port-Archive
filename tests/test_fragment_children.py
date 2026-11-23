@@ -198,6 +198,16 @@ class TestFragmentChildren(unittest.TestCase):
         self.assertEqual(later["fragments"], 1)
         self.assertEqual(later["child_drawables"], 2)
 
+    def test_range_bounds_land_on_the_streams_not_on_pages(self):
+        # archive() puts one stream at 0x1010 and one at 0x2010.
+        blob = archive(fragment(), fragment(drawables=3))
+        for start, want in ((0x1000, 2), (0x1001, 2), (0x1010, 2), (0x1011, 1), (0x2001, 1)):
+            with self.subTest(start=hex(start)):
+                self.assertEqual(self.scan(blob, start=start)["fragments"], want)
+        for end, want in ((0x1001, 0), (0x1010, 0), (0x1011, 1), (0x2010, 1)):
+            with self.subTest(end=hex(end)):
+                self.assertEqual(self.scan(blob, start=0, end=end)["fragments"], want)
+
     def test_empty_archive(self):
         self.assertEqual(self.scan(b"")["fragments"], 0)
 
