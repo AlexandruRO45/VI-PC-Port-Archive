@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "fspx_unpack.py")
@@ -420,19 +421,44 @@ class Cli(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
             self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
 
-    def test_refuses_case_variant_collision_with_input(self):
+    def test_case_variant_of_an_input_is_refused_only_where_case_is_ignored(self):
+        # FOO.DXBC in, FOO.dxbc out: one file on Windows and on a case-insensitive macOS volume (refused), two files
+        # on a case-sensitive volume such as ext4 (written beside the input, which stays untouched).
+        import report_paths
         c = Containers().container()
         with tempfile.TemporaryDirectory() as t:
             src = os.path.join(t, "FOO.DXBC")
             with open(src, "wb") as f:
                 f.write(c)
+            ignores_case = report_paths.path_key(src) == report_paths.path_key(os.path.join(t, "FOO.dxbc"))
             code, _, err = self.run_tool(src, "--out", t)
-            self.assertEqual(code, 1)
-            self.assertIn("refusing to overwrite", err.lower())
             with open(src, "rb") as f:
                 self.assertEqual(f.read(), c)
-            self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
-            self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
+            if ignores_case:
+                self.assertEqual(code, 1)
+                self.assertIn("refusing to overwrite", err.lower())
+                self.assertFalse(os.path.exists(os.path.join(t, "fspx")))
+                self.assertFalse(os.path.exists(os.path.join(t, "index.json")))
+            else:
+                self.assertEqual(code, 0, err)
+                self.assertTrue(os.path.isfile(os.path.join(t, "FOO.dxbc")))
+                self.assertTrue(os.path.isfile(os.path.join(t, "index.json")))
+
+    def test_case_sensitive_volume_writes_beside_a_case_variant_input(self):
+        # The Linux case from review on any host: report_paths keeps letter case on a case-sensitive volume, so
+        # a case variant that doesn't exist yet is another file; the input's own name still collides.
+        import report_paths
+        c = Containers().container()
+        with tempfile.TemporaryDirectory() as t:
+            src = os.path.join(t, "FOO.DXBC")
+            with open(src, "wb") as f:
+                f.write(c)
+            out = os.path.join(t, "FOO.dxbc")
+            if os.path.exists(out):
+                self.skipTest("this volume ignores letter case; the test above covers it")
+            with mock.patch.object(report_paths, "path_key", side_effect=os.path.realpath):
+                self.assertFalse(fspx_unpack._collides_with_input(out, src))
+                self.assertTrue(fspx_unpack._collides_with_input(src, src))
 
     def test_refuses_collision_with_sidecar_or_index_input(self):
         payload = make_fspx([(0, kind0()), (6, program())])

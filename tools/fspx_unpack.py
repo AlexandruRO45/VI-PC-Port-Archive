@@ -31,7 +31,9 @@ import json
 import os
 import struct
 import sys
-import unicodedata
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -176,58 +178,15 @@ def unpack_payload(payload: bytes):
     return (meta, blob), 0
 
 
-_PC_CASE_SENSITIVE = 11  # <sys/unistd.h> on macOS; os.pathconf_names doesn't list it
-
-
-def _case_insensitive_volume(path: str) -> bool:
-    """True when the volume holding `path` ignores letter case (macOS default APFS/HFS+)."""
-    if sys.platform != "darwin":
-        return False
-    while not os.path.exists(path):
-        parent = os.path.dirname(path)
-        if parent == path:
-            break
-        path = parent
-    try:
-        return os.pathconf(path, _PC_CASE_SENSITIVE) == 0
-    except (OSError, ValueError):
-        return True
-
-
-def _path_key(path: str) -> str:
-    resolved = os.path.normcase(os.path.realpath(path))
-    if _case_insensitive_volume(resolved):
-        resolved = unicodedata.normalize("NFD", resolved.casefold())
-    return resolved
-
-
-def _same_dir(first: str, second: str) -> bool:
-    if _path_key(first) == _path_key(second):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def _collides_with_input(out_path: str, input_path: str) -> bool:
-    """True when writing `out_path` would overwrite or case-collide with `input_path`."""
-    if _path_key(out_path) == _path_key(input_path):
-        return True
-    try:
-        if os.path.samefile(out_path, input_path):
-            return True
-    except OSError:
-        pass
-    out_abs = os.path.abspath(out_path)
-    out_dir = os.path.dirname(out_abs)
-    out_name = unicodedata.normalize("NFD", os.path.basename(out_abs).casefold())
-    for candidate in (os.path.abspath(input_path), os.path.realpath(input_path)):
-        cand_dir = os.path.dirname(candidate)
-        cand_name = unicodedata.normalize("NFD", os.path.basename(candidate).casefold())
-        if out_name == cand_name and _same_dir(out_dir, cand_dir):
-            return True
-    return False
+    """True when writing `out_path` would overwrite `input_path`.
+
+    `report_paths.same_report_path` decides it, as for the other tools: the same resolved name (letter case and
+    composed/decomposed accents folded only where the volume ignores them: Windows, a case-insensitive macOS
+    volume), or one file under two spellings (a link, a junction). On a case-sensitive volume `FOO.DXBC` and
+    `FOO.dxbc` are two files, and writing one leaves the other alone.
+    """
+    return same_report_path(out_path, input_path)
 
 
 def _validate_out_dir(out_dir: str, need_disasm: bool):
