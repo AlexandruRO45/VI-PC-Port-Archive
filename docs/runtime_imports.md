@@ -348,7 +348,7 @@ connectivity (level None), the port and URL security-information queries fail wi
 certificate check fails the same way, the two change registrations send the one initial notification Microsoft
 documents (on the queue's completion port, the process queue when none is given: the hint above, or port 0) and
 none after, and the three `IXNetworkingImpl2` additions store the three TCP receive-buffer limits (Xbox defaults: 32 MiB
-title, 4 MiB system, 0 tools) and zero the 40-byte TCP receive-buffer statistics buffer.
+title, 4 MiB system, `UINT64_MAX` tools) and zero the 40-byte TCP receive-buffer statistics buffer.
 
 `XUserImpl` (`runtime/shims/xgameruntime_user.cpp`) is served from xgameruntime-docs' layout alone. No package DLL
 calls an `XUser*` slot (`libHttpClient.GDK.dll` only holds the GUID table). The executable links thunks for

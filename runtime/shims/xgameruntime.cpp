@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -273,7 +274,7 @@ const void* const kErrorVtable[] = {
 // network fails with kNoNetwork (asynchronously, through XAsync, for the *Async calls), a change registration sends
 // the initial notification Microsoft documents (on the queue's completion port) and none after, since nothing
 // changes, and the IXNetworkingImpl2 additions store the three TCP receive-buffer limits atomically (Xbox defaults:
-// 32 MiB title, 4 MiB system, 0 tools) and report zeroed TCP receive-buffer statistics offline.
+// 32 MiB title, 4 MiB system, UINT64_MAX tools) and report zeroed TCP receive-buffer statistics offline.
 
 constexpr GUID kNetworkingClass = {0x37e56907, 0x2f10, 0x41e8, {0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a}};
 constexpr GUID kNetworking2 = {0xbf2346b2, 0x39af, 0x4658, {0xb5, 0xea, 0x44, 0x71, 0x3c, 0x7e, 0x83, 0xb3}};
@@ -425,13 +426,13 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
 // 1 = MaxSystemTcpQueuedReceiveBufferSize, 2 = MaxToolsTcpQueuedReceiveBufferSize) and XNetworkingStatisticsType
 // (0 = TitleTcpQueuedReceivedBufferUsage, 1 = SystemTcpQueuedReceivedBufferUsage,
 // 2 = ToolsTcpQueuedReceivedBufferUsage). Defaults follow Microsoft's public XNetworking documentation for Xbox
-// consoles (32 MiB title, 4 MiB system, 0 tools); offline no TCP payload is queued so every statistic is zero.
+// consoles (32 MiB title, 4 MiB system, UINT64_MAX tools); offline no TCP payload is queued so every statistic is zero.
 constexpr uint32_t kNetConfigSettingCount = 3;
 constexpr uint32_t kNetStatisticsTypeCount = 3;
 std::atomic<uint64_t> g_net_config_settings[kNetConfigSettingCount] = {
-    {32ull * 1024 * 1024},  // MaxTitleTcpQueuedReceiveBufferSize (32 MiB Xbox default)
-    {4ull * 1024 * 1024},   // MaxSystemTcpQueuedReceiveBufferSize (4 MiB Xbox default)
-    {0},                    // MaxToolsTcpQueuedReceiveBufferSize
+    {32ull * 1024 * 1024},                     // MaxTitleTcpQueuedReceiveBufferSize (32 MiB Xbox default)
+    {4ull * 1024 * 1024},                      // MaxSystemTcpQueuedReceiveBufferSize (4 MiB Xbox default)
+    {std::numeric_limits<uint64_t>::max()},    // MaxToolsTcpQueuedReceiveBufferSize (UINT64_MAX Xbox default)
 };
 
 // XNetworkingTcpQueuedReceivedBufferUsageStatistics / XNetworkingStatisticsBuffer: five UINT64 counters.

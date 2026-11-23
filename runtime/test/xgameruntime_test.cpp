@@ -550,20 +550,21 @@ void check_run_time_load() {
         const auto set_config = reinterpret_cast<SetConfig>(slot(n, 19));
         const auto query_stats = reinterpret_cast<QueryStats>(slot(n, 20));
 
-        uint64_t title_max = 1, system_max = 1, tools_max = 1;
+        uint64_t title_max = 1, system_max = 1, tools_max = 123;
         check(query_config(n, 0, &title_max) == S_OK && title_max == 32ull * 1024 * 1024 &&
                   query_config(n, 1, &system_max) == S_OK && system_max == 4ull * 1024 * 1024 &&
-                  query_config(n, 2, &tools_max) == S_OK && tools_max == 0,
+                  query_config(n, 2, &tools_max) == S_OK && tools_max == UINT64_MAX,
               "slot 18 (XNetworkingQueryConfigurationSetting): Xbox defaults for title, system and tools");
 
-        uint64_t q0 = 0, q1 = 0, q2 = 0, q0_zero = 99;
+        uint64_t q0 = 0, q1 = 0, q2 = 0, q0_zero = 99, q2_zero = 99;
         check(set_config(n, 0, 16ull * 1024 * 1024) == S_OK &&
                   set_config(n, 1, 8ull * 1024 * 1024) == S_OK &&
                   set_config(n, 2, 1ull * 1024 * 1024) == S_OK &&
                   query_config(n, 0, &q0) == S_OK && q0 == 16ull * 1024 * 1024 &&
                   query_config(n, 1, &q1) == S_OK && q1 == 8ull * 1024 * 1024 &&
                   query_config(n, 2, &q2) == S_OK && q2 == 1ull * 1024 * 1024 &&
-                  set_config(n, 0, 0) == S_OK && query_config(n, 0, &q0_zero) == S_OK && q0_zero == 0,
+                  set_config(n, 0, 0) == S_OK && query_config(n, 0, &q0_zero) == S_OK && q0_zero == 0 &&
+                  set_config(n, 2, 0) == S_OK && query_config(n, 2, &q2_zero) == S_OK && q2_zero == 0,
               "slots 18/19 round-trip all three configuration settings independently, including zero");
         set_config(n, 0, title_max);
         set_config(n, 1, system_max);
