@@ -33,6 +33,7 @@ for p in (HERE, TESTS_DIR):
         sys.path.insert(0, p)
 
 from support import translate_lines, mrt0_words  # noqa: E402
+import rdna2spirv  # noqa: E402  (support puts tools/ on sys.path)
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -491,7 +492,7 @@ class VFrexpExpI32F64TranslatorTests(unittest.TestCase):
         self.assertEqual(val, 1)
 
     def test_frexp_exp_f64_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(rdna2spirv.Unsupported):
             translate_lines("ps_bad_frexp_exp_f64", ["v_frexp_exp_i32_f64 v0, v[0:1] clamp"])
 
 # -----------------------------------------------------------------------------
@@ -560,7 +561,7 @@ class VFrexpMantF64TranslatorTests(unittest.TestCase):
         self.assertEqual(res[1], 0x3FE00000)
 
     def test_frexp_mant_f64_syntax_rejection(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(rdna2spirv.Unsupported):
             translate_lines("ps_bad_frexp_mant_f64", ["v_frexp_mant_f64 v0, v[0:1]"])
 
 

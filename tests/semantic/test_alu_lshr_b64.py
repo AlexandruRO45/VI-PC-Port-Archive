@@ -517,7 +517,7 @@ class TestLshrB64ExtremesAndControls(unittest.TestCase):
         ]
         for bad_line in invalid_instructions:
             with self.subTest(bad_line=bad_line):
-                with self.assertRaises(Exception):
+                with self.assertRaises(rdna2spirv.Unsupported):
                     run_ps_lines([bad_line])
 
 
