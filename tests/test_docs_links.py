@@ -38,15 +38,19 @@ def slug(heading):
 
 def anchors(path):
     """Every anchor a heading on the page generates, including the -N suffix of a duplicate."""
-    seen = {}
+    next_suffix = {}
     found = set()
     with open(path, encoding="utf-8", errors="replace") as f:
         text = strip_fences(f.read())
     for match in HEADING.finditer(text):
         base = slug(match.group(2))
-        count = seen.get(base, 0)
-        seen[base] = count + 1
-        found.add(base if count == 0 else f"{base}-{count}")
+        anchor = base
+        suffix = next_suffix.get(base, 1)
+        while anchor in found:
+            anchor = f"{base}-{suffix}"
+            suffix += 1
+        next_suffix[base] = suffix
+        found.add(anchor)
     return found
 
 
@@ -128,6 +132,19 @@ class SlugTest(unittest.TestCase):
             with open(page, "w", encoding="utf-8") as f:
                 f.write("# Same\n\n# Same\n")
             self.assertEqual(anchors(page), {"same", "same-1"})
+
+    def test_heading_suffixes_skip_earlier_anchors(self):
+        cases = (
+            ("# Guide-1\n# Guide\n# Guide\n# Guide-2\n", {"guide-1", "guide", "guide-2", "guide-2-1"}),
+            ("# Guide\n# Guide\n# Guide-1\n# Guide\n", {"guide", "guide-1", "guide-1-1", "guide-2"}),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            page = os.path.join(tmp, "page.md")
+            for headings, expected in cases:
+                with self.subTest(headings=headings):
+                    with open(page, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(headings)
+                    self.assertEqual(anchors(page), expected)
 
 
 class RepositoryLinksTest(unittest.TestCase):
