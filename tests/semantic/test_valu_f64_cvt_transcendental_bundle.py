@@ -133,6 +133,73 @@ class VCvtF32F64OracleTests(unittest.TestCase):
         self.assertEqual(oracle_cvt_f32_f64(F64_QNAN), F32_QNAN)
         self.assertEqual(oracle_cvt_f32_f64(F64_SNAN), F32_QNAN)
 
+class RegKind(enum.Enum):
+    VGPR_PAIR = "vgpr_pair"
+    VGPR_SINGLE = "vgpr_single"
+    SGPR_PAIR = "sgpr_pair"
+    SGPR_SINGLE = "sgpr_single"
+    IMM_F64 = "imm_f64"
+    IMM_I32 = "imm_i32"
+    IMM_U32 = "imm_u32"
+
+
+@dataclass(frozen=True)
+class Operand64:
+    kind: RegKind
+    index: int = 0
+    imm_val: int = 0
+
+
+@dataclass(frozen=True)
+class Instruction64AST:
+    mnemonic: str
+    dst: Operand64
+    src0: Operand64
+    src1: Operand64 | None = None
+    src2: Operand64 | None = None
+
+
+class SimdWaveState64:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.exec_mask: int = (1 << lane_count) - 1
+        self.vgprs = [[0] * 256 for _ in range(lane_count)]
+
+    def get_f64(self, lane: int, reg_idx: int) -> int:
+        lo = self.vgprs[lane][reg_idx] & MASK32
+        hi = self.vgprs[lane][reg_idx + 1] & MASK32
+        return (hi << 32) | lo
+
+    def set_f64(self, lane: int, reg_idx: int, val: int):
+        val &= MASK64
+        self.vgprs[lane][reg_idx] = val & MASK32
+        self.vgprs[lane][reg_idx + 1] = (val >> 32) & MASK32
+
+    def get_u32(self, lane: int, reg_idx: int) -> int:
+        return self.vgprs[lane][reg_idx] & MASK32
+
+    def set_u32(self, lane: int, reg_idx: int, val: int):
+        self.vgprs[lane][reg_idx] = val & MASK32
+
+
+class VCvtF32F64AstInterpreterTests(unittest.TestCase):
+    def test_cvt_f32_f64_ast_construction(self):
+        ast = Instruction64AST(
+            "v_cvt_f32_f64",
+            Operand64(RegKind.VGPR_SINGLE, 2),
+            Operand64(RegKind.VGPR_PAIR, 0),
+        )
+        self.assertEqual(ast.mnemonic, "v_cvt_f32_f64")
+        self.assertEqual(ast.dst.index, 2)
+        self.assertEqual(ast.src0.index, 0)
+
+    def test_cvt_f32_f64_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_f64(0, 0, f64_to_u64(128.75))
+        res_f32 = oracle_cvt_f32_f64(wave.get_f64(0, 0))
+        wave.set_u32(0, 2, res_f32)
+        self.assertEqual(wave.get_u32(0, 2), f32_to_u32(128.75))
+
 
 if __name__ == "__main__":
     unittest.main()
