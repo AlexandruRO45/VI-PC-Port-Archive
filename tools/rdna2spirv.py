@@ -18129,6 +18129,15 @@ def main():
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
         invalid.add(name)
 
+    def write_error(name, e):
+        # The output side of this shader could not be written: a directory where the module or the listing belongs,
+        # an --out without write permission, a full disk. Every later shader writes to the same folder, so this is
+        # the setup error a missing spirv-as is (one ERROR line, exit 2), not a traceback, and not this shader's
+        # fault: nothing is retired, since the failing path may be the module it would delete.
+        path = getattr(e, "filename2", None) or e.filename or a.out
+        print(f"ERROR: {name}: cannot write {path}: {e.strerror or e}", file=sys.stderr)
+        return 2
+
     for i, p in enumerate(files, 1):
         name = os.path.splitext(os.path.basename(p))[0]
         try:
@@ -18153,15 +18162,18 @@ def main():
         sv = os.path.join(a.out, name + ".spv")
         write_asm = not (a.no_asm and a.assembler == "python")
         if write_asm:
-            with open(sa, "w", encoding="utf-8", newline="\n") as f:
-                f.write(asm)
+            try:
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+            except OSError as e:
+                return write_error(name, e)
         try:
             r = assemble_spirv(sa, sv, asm_text=asm, assembler=a.assembler, validate=not a.no_validate)
         except OSError as e:
             # A missing spirv-as/spirv-val fails every shader the same way; report it once as a setup
             # error (exit 2) instead of a FileNotFoundError traceback from the first one.
             if e.filename not in ("spirv-as", "spirv-val"):
-                raise
+                return write_error(name, e)
             print(f"ERROR: {e.filename} not found; install SPIRV-Tools (spirv-as, spirv-val) "
                   "and put it on PATH", file=sys.stderr)
             return 2
@@ -18174,8 +18186,11 @@ def main():
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
             if not write_asm:
-                with open(sa, "w", encoding="utf-8", newline="\n") as f:
-                    f.write(asm)
+                try:
+                    with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(asm)
+                except OSError as e:
+                    return write_error(name, e)
             drop_stale(name)
             why["INVALID: " + (r.stderr.strip().splitlines() or ["?"])[0][:90]] += 1
         if a.no_asm and os.path.exists(sa):

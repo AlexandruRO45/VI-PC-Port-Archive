@@ -600,5 +600,103 @@ class PopsInvocationInterlock(unittest.TestCase):
         self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 0)
 
 
+class OutputWriteFailure(unittest.TestCase):
+    """An output this run cannot write -- a directory where the module or the listing belongs, an --out without
+    write permission -- is one ERROR line and exit 2, not a traceback that leaves the run half done."""
+
+    def shader(self, root):
+        (root / "disasm").mkdir()
+        (root / "disasm" / "ps_x.s").write_text("\ts_endpgm\n", encoding="utf-8")
+        (root / "ps_x.dxbc").write_bytes(b"DXBC" + bytes(28))
+
+    def run_tool(self, root):
+        """main() with the SPIR-V binaries stubbed, as the other in-process tests here do, so this runs where
+        spirv-as/spirv-val are not installed. Returns (exit code, stdout, stderr)."""
+        def spirv_tool(cmd, **kwargs):
+            if cmd[0] == "spirv-as":
+                Path(kwargs.get("cwd", ""), cmd[3]).write_bytes(b"new module")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", [TOOL, str(root / "disasm"), "--out", str(root / "spirv")]), \
+                mock.patch.object(rdna2spirv.subprocess, "run", side_effect=spirv_tool), \
+                redirect_stdout(out), redirect_stderr(err):
+            code = rdna2spirv.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def deny_write(self, path):
+        """chmod 0o555 path, or skip when that does not deny a write here (root, or a volume that ignores it)."""
+        os.chmod(path, 0o555)
+        try:
+            with open(path / ".probe", "wb"):
+                pass
+        except PermissionError:
+            return
+        os.unlink(path / ".probe")
+        os.chmod(path, 0o755)
+        self.skipTest(f"chmod 555 does not deny a write here: {path}")
+
+    def assert_write_error(self, root, path_name):
+        code, stdout, stderr = self.run_tool(root)
+        self.assertEqual(code, 2, stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(len(stderr.strip().splitlines()), 1, stderr)
+        self.assertTrue(stderr.startswith("ERROR: ps_x: cannot write "), stderr)
+        self.assertIn(path_name, stderr)
+        self.assertNotIn("cannot read", stderr)
+        self.assertFalse((root / "spirv" / "index.json").exists())   # a run that cannot publish has no marker
+
+    def test_a_module_path_that_is_a_directory_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.shader(root)
+            (root / "spirv").mkdir()
+            (root / "spirv" / "ps_x.spv").mkdir()
+            self.assert_write_error(root, "ps_x.spv")
+
+    def test_a_spvasm_path_that_is_a_directory_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.shader(root)
+            (root / "spirv").mkdir()
+            (root / "spirv" / "ps_x.spvasm").mkdir()
+            self.assert_write_error(root, "ps_x.spvasm")
+
+    def test_an_out_without_write_permission_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.shader(root)
+            (root / "spirv").mkdir()
+            self.deny_write(root / "spirv")
+            try:
+                self.assert_write_error(root, "ps_x.spvasm")
+            finally:
+                os.chmod(root / "spirv", 0o755)
+
+    def test_a_normal_run_is_byte_identical_when_run_twice(self):
+        # Positive control: a run that publishes is untouched, and the same command twice gives the same bytes.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.shader(root)
+            code, stdout, stderr = self.run_tool(root)
+            self.assertIsNone(code, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual(stdout.splitlines()[-1], "1 shaders: 1 translated, 1 pass spirv-val")
+            out = root / "spirv"
+            self.assertEqual((out / "ps_x.spv").read_bytes(), b"new module")
+            spvasm = (out / "ps_x.spvasm").read_text(encoding="utf-8")
+            self.assertIn("OpCapability Shader", spvasm)
+            self.assertIn('OpEntryPoint Fragment %main "main"', spvasm)
+            index = json.loads((out / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(set(index), {"ps_x"})
+            self.assertEqual(index["ps_x"]["stage"], "ps")
+            tree = {f.relative_to(out).as_posix(): f.read_bytes() for f in out.rglob("*") if f.is_file()}
+            code, stdout, stderr = self.run_tool(root)
+            self.assertIsNone(code, stderr)
+            self.assertEqual(stderr, "")
+            self.assertEqual({f.relative_to(out).as_posix(): f.read_bytes() for f in out.rglob("*") if f.is_file()},
+                             tree)
+
+
 if __name__ == "__main__":
     unittest.main()
