@@ -291,5 +291,84 @@ class TestSymbolicAST(unittest.TestCase):
             Operand.vgpr(300)
 
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.vcc = 0
+        self.scc = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            raw = self.vgprs[op.index]
+        elif op.reg_type == RegType.SGPR:
+            raw = self.sgprs[op.index]
+        else:
+            raw = op.literal_val
+        return apply_src_mods(raw, op.neg, op.abs_)
+
+    def write_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def __init__(self, state: Optional[ScalarRegisterState] = None):
+        self.state = state if state is not None else ScalarRegisterState()
+
+    def step(self, insn: VCubemaF32Instruction) -> int:
+        u0 = self.state.read_operand(insn.src0)
+        u1 = self.state.read_operand(insn.src1)
+        u2 = self.state.read_operand(insn.src2)
+        res = ref_cubema_f32(u0, u1, u2, clamp=insn.clamp)
+        self.state.write_vgpr(insn.dst.index, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step_and_chaining(self):
+        interp = ScalarInterpreter()
+        interp.state.vgprs[0] = FOUR_F32
+        interp.state.vgprs[1] = ONE_F32
+        interp.state.vgprs[2] = TWO_F32
+        interp.state.vgprs[4] = f32_to_u32(20.0)
+        interp.state.vgprs[5] = f32_to_u32(5.0)
+
+        # Insn 1: v3 = v_cubema_f32(v0, v1, v2) -> major X (4.0) -> 8.0
+        insn1 = VCubemaF32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        res1 = interp.step(insn1)
+        self.assertEqual(res1, EIGHT_F32)
+        self.assertEqual(interp.state.vgprs[3], EIGHT_F32)
+
+        # Insn 2: v6 = v_cubema_f32(v3, v4, v5) -> (8.0, 20.0, 5.0) -> major Y (20.0) -> 40.0
+        insn2 = VCubemaF32Instruction(
+            dst=Operand.vgpr(6),
+            src0=Operand.vgpr(3),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr(5),
+        )
+        res2 = interp.step(insn2)
+        self.assertEqual(res2, f32_to_u32(40.0))
+        self.assertEqual(interp.state.vgprs[6], f32_to_u32(40.0))
+
+    def test_scalar_interpreter_matches_translator_chain(self):
+        lines = [
+            f"v_mov_b32 v0, {FOUR_F32:#x}",
+            f"v_mov_b32 v1, {ONE_F32:#x}",
+            f"v_mov_b32 v2, {TWO_F32:#x}",
+            f"v_mov_b32 v4, {f32_to_u32(20.0):#x}",
+            f"v_mov_b32 v5, {f32_to_u32(5.0):#x}",
+            "v_cubema_f32 v3, v0, v1, v2",
+            "v_cubema_f32 v3, v3, v4, v5",
+        ]
+        words = run_ps_cubema(lines)
+        self.assertEqual(words[0], f32_to_u32(40.0))
+
+
 if __name__ == "__main__":
     unittest.main()
+
