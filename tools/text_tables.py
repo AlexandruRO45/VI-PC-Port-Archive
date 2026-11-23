@@ -236,6 +236,10 @@ def _protect_carve_inputs(src, outputs):
         return
     from gamedata_index import same_report_path
 
+    if os.name == "nt":
+        # Win32 strips trailing dots and spaces when publishing a report, even if
+        # realpath() kept them on a missing payload. Device paths use literal names.
+        outputs = [p if os.fspath(p).startswith(("\\\\?\\", "\\\\.\\")) else os.path.abspath(p) for p in outputs]
     manifest = os.path.join(src.directory, "index.json")
     candidates = set()
     check_all = False

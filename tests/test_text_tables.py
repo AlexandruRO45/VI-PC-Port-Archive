@@ -249,6 +249,25 @@ class TestChains(unittest.TestCase):
                 self.assertEqual(T.main([tmp, "--tables", str(available)]), 0)
             self.assertTrue(available.read_text(encoding="utf-8").startswith("source,offset,"))
 
+    @unittest.skipUnless(os.name == "nt", "Win32 strips trailing dots and spaces")
+    def test_index_only_carve_rejects_windows_report_aliases(self):
+        for name, suffix in (("000000000010.bin", "."), ("000000000020.bk2", " ")):
+            with self.subTest(name=name, suffix=suffix), tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "index.json").write_text(json.dumps({"files": [
+                    {"off": 16, "size": 0}, {"off": 32, "type": "bink2"},
+                ]}), encoding="utf-8")
+                reserved = Path(tmp, name)
+                report = Path(tmp, "dialogue.csv")
+                report.write_bytes(b"previous report")
+                result = subprocess.run(
+                    [sys.executable, "-I", T.__file__, tmp, "--dialogue", str(report),
+                     "--tables", str(reserved) + suffix], capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("overwrite", result.stderr)
+                self.assertFalse(reserved.exists())
+                self.assertEqual(report.read_bytes(), b"previous report")
+
     def test_report_hard_link_to_carved_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             carve = Path(tmp, "carve")
