@@ -3,7 +3,8 @@
 Usage:
     python -I rpf_probe.py <game_dir> [--out FILE]
 
-Reads the first 64 KiB of each archive only. It doesn't decrypt or extract anything.
+Reads the first 64 KiB of each archive only. For RPF9, a valid data offset bounds the entropy sample.
+It doesn't decrypt or extract anything.
 A directory scan or archive read error stops the survey before it writes the report.
 The report destination must not name an input archive or an alias of one.
 """
@@ -36,14 +37,20 @@ def probe(path: str) -> dict:
     # Little-endian 'RPFn' is stored as bytes 'nFPR'.
     version = magic[::-1].decode("latin-1") if magic[1:] == b"FPR" else None
     words = list(struct.unpack_from("<4I", head, 4)) if len(head) >= 20 else []
+    size = os.path.getsize(path)
     body = head[16:]
+    if version == "RPF9" and len(head) >= 8:
+        data_start = struct.unpack_from("<I", head, 4)[0]
+        if 16 <= data_start <= size:
+            body = head[16:data_start]
+    body_entropy = entropy(body)
     return {
         "file": path,
-        "size": os.path.getsize(path),
+        "size": size,
         "version": version,
         "header_words": [hex(w) for w in words],
-        "head_entropy": round(entropy(body), 3),
-        "looks_encrypted": entropy(body) > 7.9,
+        "head_entropy": round(body_entropy, 3),
+        "looks_encrypted": body_entropy > 7.9,
     }
 
 

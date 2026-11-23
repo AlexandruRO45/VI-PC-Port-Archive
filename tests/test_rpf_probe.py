@@ -100,6 +100,15 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(row["head_entropy"], 0.0)
         self.assertFalse(row["looks_encrypted"])
 
+    def test_rpf9_entropy_ignores_data_after_the_table(self):
+        dense = bytes(range(256)) * 32
+        for table, payload, expected in ((dense, bytes(32768), 8.0), (bytes(256), dense, 0.0)):
+            with self.subTest(expected=expected):
+                header = struct.pack("<4sIII", b"9FPR", 16 + len(table), 0, 0)
+                row = probe.probe(self.write(header + table + payload))
+                self.assertEqual(row["head_entropy"], expected)
+                self.assertEqual(row["looks_encrypted"], expected > 7.9)
+
     def test_size_is_the_full_file(self):
         self.assertEqual(probe.probe(self.write(archive_bytes(pad_to=0x10000)))["size"], 0x10000)
 

@@ -640,8 +640,9 @@ noperspective on SV_Position), flat otherwise. Synthetic tests: `tests/test_ps_i
 
 - `reports/manifest.json`: SHA-256 of all 108 files in `Documents\GTA6` (208.5 GiB). Run
   `python -I tools\manifest.py verify <game>` to check a copy against it.
-- `reports/rpf_probe.json`: all 22 archives are **RPF9**. Five have tables that look packed or encrypted (`levels`,
-  `movies`, `core_bvh4`, `navmeshes`, `data`).
+- `reports/rpf_probe.json`: all 22 archives are **RPF9**. The original survey flagged five archives (`levels`,
+  `movies`, `core_bvh4`, `navmeshes`, `data`) using the first 64 KiB of each archive with the 16-byte header
+  excluded. The probe now limits that sample to the bytes before the RPF9 data offset when the offset is valid.
 - `reports/pe/`: the 16 bundled DLLs are plain x86-64 PE with no encrypted sections. Through the loader their
   `xmem.dll` imports and two `d3d12_xs.dll` root-signature calls bind to shims. Every other import resolves on
   desktop Windows. The proxy covers the measured device slots and forwards the rest in PC vtable order; the Xbox
