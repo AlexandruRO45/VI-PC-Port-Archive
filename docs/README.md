@@ -63,6 +63,7 @@ method, scope and caveats. No game data is included.
 | Document | Measured content |
 |---|---|
 | [d3d12_vulkan.md](d3d12_vulkan.md) | Xbox D3D12 to Vulkan plan and status; device proxy, queues, command lists, barriers, copies. |
+| [gpu_test_results.md](gpu_test_results.md) | A local record of GPU test runs, one entry per GPU, driver and commit: `build.py`, `check.py` and `run_gpu_tests.py` counts, the fixture that failed, and whether it is flaky on that GPU. Results are posted to the public tracker, not kept here. |
 | [boot.md](boot.md) | The first real boot: the `gta6rt --trace`/`--trace-d3d12` runbook, the startup + D3D12 trace summary (`tools/boot_trace.py`), the triage order and the Q1–Q22 checklist. |
 | [retail_boot_chain.md](retail_boot_chain.md) | How far `gta6rt --run` gets with the retail executable: the stops in order and what clears each, the physical-page export shapes, and device slots 26, 48 and 73. |
 | [descriptor_lookup_apple.md](descriptor_lookup_apple.md) | M3 Max GPU timings for texture and sampler descriptor lookups at 1k, 10k and 100k live entries. |
