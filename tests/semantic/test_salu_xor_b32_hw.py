@@ -366,5 +366,73 @@ class SXorB32Ieee754BoundariesTests(unittest.TestCase):
         self.assertEqual(res, neg_inf_bits)
         self.assertEqual(scc, 1)
 
+class SXorB32NegativeControlsAndRejectionTests(unittest.TestCase):
+    def test_missing_operand_rejection(self):
+        bad_lines = ["s_xor_b32 s0, s1"]
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_xor_missing", bad_lines)
+
+    def test_bare_opcode_rejection(self):
+        bad_lines = ["s_xor_b32"]
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_xor_bare", bad_lines)
+
+
+class SXorB32TranslatorIntegrationTests(unittest.TestCase):
+    def _run_ps(self, lines: list[str]) -> tuple[int, int]:
+        lines = list(lines) + [
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_xor_b32", lines)
+        words = mrt0_words(spv)
+        return words[0], words[1]
+
+    def test_translator_basic_execution(self):
+        # Dynamic s_xor_b32 with register operands and SCC capture
+        lines = [
+            "s_mov_b32 s0, 0x00FF00FF",
+            "s_mov_b32 s2, 0x0F0F0F0F",
+            "s_xor_b32 s0, s0, s2",
+            "s_cselect_b32 s1, 1, 0",
+        ]
+        res, scc = self._run_ps(lines)
+        self.assertEqual(res, 0x0FF00FF0)
+        self.assertEqual(scc, 1)
+
+    def test_translator_self_xor_zero_and_scc(self):
+        lines = [
+            "s_mov_b32 s0, 0x12345678",
+            "s_xor_b32 s0, s0, s0",
+            "s_cselect_b32 s1, 1, 0",
+        ]
+        res, scc = self._run_ps(lines)
+        self.assertEqual(res, 0)
+        self.assertEqual(scc, 0)
+
+    def test_translator_constant_folding(self):
+        # Constant folding path in rdna2spirv
+        lines = [
+            "s_xor_b32 s0, 0xAAAAAAAA, 0x55555555",
+            "s_cselect_b32 s1, 1, 0",
+        ]
+        res, scc = self._run_ps(lines)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+    def test_translator_in_place_aliasing(self):
+        lines = [
+            "s_mov_b32 s0, 0xF0F0F0F0",
+            "s_mov_b32 s1, 0x0F0F0F0F",
+            "s_xor_b32 s0, s0, s1",
+            "s_cselect_b32 s1, 1, 0",
+        ]
+        res, scc = self._run_ps(lines)
+        self.assertEqual(res, 0xFFFFFFFF)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
