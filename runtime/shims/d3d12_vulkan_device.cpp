@@ -4944,6 +4944,14 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         default: return E_NOTIMPL;
         }
+        // Stopgap until arguments before the draw or dispatch execute (#2077): ExecuteIndirect keeps only the final
+        // argument and reads it at the start of each record, so [CONSTANT, DRAW] would draw with the constant as its
+        // vertex count and without the constant (d3d12_indirect_signature_test). A clear refusal beats wrong draws.
+        if (desc->NumArgumentDescs > 1) {
+            log_once("CreateCommandSignature refused (E_NOTIMPL): arguments before the draw or dispatch are not "
+                     "executed yet; argument count", int(desc->NumArgumentDescs));
+            return E_NOTIMPL;
+        }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
     }
 
