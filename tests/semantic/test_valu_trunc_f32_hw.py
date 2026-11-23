@@ -202,5 +202,58 @@ class TestValuTruncF32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[0], f32_to_u32(12.0))
 
 
+class SIMDMachineState:
+    def __init__(self, num_lanes: int = 64, exec_mask: int = MASK64) -> None:
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.lanes_vgpr: list[list[int]] = [[0] * 256 for _ in range(num_lanes)]
+        self.sgprs: list[int] = [0] * 106
+
+    def is_lane_active(self, lane: int) -> bool:
+        return bool((self.exec_mask >> lane) & 1)
+
+    def read_lane_operand(self, lane: int, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.lanes_vgpr[lane][op.index] & MASK32
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+
+class SIMDInterpreter:
+    def step(self, instr: ASTInstruction, state: SIMDMachineState) -> list[Optional[int]]:
+        results: list[Optional[int]] = []
+        for lane in range(state.num_lanes):
+            if state.is_lane_active(lane):
+                s0 = state.read_lane_operand(lane, instr.src0)
+                res = ref_trunc_f32(s0)
+                if instr.dst.kind == OperandKind.VGPR:
+                    state.lanes_vgpr[lane][instr.dst.index] = res
+                results.append(res)
+            else:
+                results.append(None)
+        return results
+
+
+class TestValuTruncF32SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_divergence_masking(self) -> None:
+        state = SIMDMachineState(num_lanes=32, exec_mask=0x55555555)  # even lanes active
+        for lane in range(32):
+            state.lanes_vgpr[lane][1] = f32_to_u32(lane + 0.75)
+            state.lanes_vgpr[lane][0] = 0xDEADBEEF  # canary
+
+        instr = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        results = SIMDInterpreter().step(instr, state)
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(results[lane], f32_to_u32(float(lane)))
+                self.assertEqual(state.lanes_vgpr[lane][0], f32_to_u32(float(lane)))
+            else:
+                self.assertIsNone(results[lane])
+                self.assertEqual(state.lanes_vgpr[lane][0], 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
