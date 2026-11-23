@@ -56,6 +56,7 @@ import os
 import struct
 import sys
 import tempfile
+from operator import add as _add, mul as _mul, sub as _sub
 
 FLAG_DEHYDRATED = 0x01000000
 FLAG_UPDATABLE = 0x00040000
@@ -74,27 +75,75 @@ M32 = 0xFFFFFFFF
 
 # --- float32 / half helpers -------------------------------------------------------------------------------------
 
+_F_PACK, _F_UNPACK = struct.Struct("<f").pack, struct.Struct("<f").unpack
+_I_PACK, _I_UNPACK = struct.Struct("<I").pack, struct.Struct("<I").unpack
+_H_PACK, _H_UNPACK = struct.Struct("<H").pack, struct.Struct("<H").unpack
+_E_PACK, _E_UNPACK = struct.Struct("<e").pack, struct.Struct("<e").unpack
+
+
 def f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+    return _F_UNPACK(_F_PACK(x))[0]
 
 
 def bits32(x):
-    return struct.unpack("<I", struct.pack("<f", x))[0]
+    return _I_UNPACK(_F_PACK(x))[0]
 
 
 def from_bits32(b):
-    return struct.unpack("<f", struct.pack("<I", b & M32))[0]
+    return _F_UNPACK(_I_PACK(b & M32))[0]
 
 
 def half_to_float(h):
-    return struct.unpack("<e", struct.pack("<H", h & 0xFFFF))[0]
+    return _E_UNPACK(_H_PACK(h & 0xFFFF))[0]
 
 
 def float_to_half(x):
     try:
-        return struct.unpack("<H", struct.pack("<e", x))[0]
+        return _H_UNPACK(_E_PACK(x))[0]
     except OverflowError:
         return HALF_NEG_INF if x < 0 else HALF_POS_INF
+
+
+_V3_UNPACK_FROM = struct.Struct("<3f").unpack_from
+_H3_UNPACK_FROM = struct.Struct("<3H").unpack_from
+_I3_UNPACK_FROM = struct.Struct("<3I").unpack_from
+BATCH_POINTS = (3, 4)       # points per leaf: a triangle, or a triangle and the vertex a second primitive adds
+_ROUNDERS = {3 * k: (struct.Struct("<%df" % (3 * k)).pack, struct.Struct("<%df" % (3 * k)).unpack)
+             for k in BATCH_POINTS}
+
+
+def _rounder(n):
+    """(pack, unpack) for n float32 values: `unpack(pack(*vals))` rounds a whole batch to float32 in one step."""
+    fn = _ROUNDERS.get(n)
+    if fn is None:      # not a leaf-sized batch: nothing is kept
+        st = struct.Struct("<%df" % n)
+        fn = st.pack, st.unpack
+    return fn
+
+
+def _rep(n, a, b, c):
+    """a n times, then b n times, then c n times: one value per (row, point) in the order the batches use."""
+    return [a] * n + [b] * n + [c] * n
+
+
+def _columns(rows, n):
+    """Column k of the three matrix rows, each value repeated for n points, for every column the rows have."""
+    return tuple(_rep(n, rows[0][k], rows[1][k], rows[2][k]) for k in range(len(rows[0])))
+
+
+def _matvec(pts, cols, rnd):
+    """The rows of M * v for every point, each as the float32 chain `f32(c0 * x)`, `f32(c1 * y + acc)`,
+    `f32(c2 * z + acc)` the scalar code computes, all rows of all points rounded together. Returns the 3n values row
+    by row (n x, then n y, then n z)."""
+    pack, unpack = rnd
+    xs, ys, zs = zip(*pts)
+    acc = unpack(pack(*list(map(_mul, cols[0], xs * 3))))
+    acc = unpack(pack(*list(map(_add, map(_mul, cols[1], ys * 3), acc))))
+    return unpack(pack(*list(map(_add, map(_mul, cols[2], zs * 3), acc))))
+
+
+def _by_point(acc, n):
+    return list(zip(acc[:n], acc[n:2 * n], acc[2 * n:]))
 
 
 def min_num(a, b):
@@ -114,30 +163,45 @@ def max_num(a, b):
     return a if a >= b else b
 
 
+_HALF_MIN_NORMAL_BITS = 0x38800000      # float32 bits of 2 ** -14, the smallest normal half
+_HALF_OVERFLOW_BITS = 0x47800000        # float32 bits of 2 ** 16: a half cannot hold this magnitude or more
+_HALF_REBIAS = 112 << 10                # float32 exponent bias 127 minus half bias 15, at the half exponent position
+
+
+def _half_of_magnitude(m):
+    """Half bits (without sign) of the float32 magnitude bits m, whose low 13 bits are clear, when m lies from
+    2 ** -14 up to 2 ** 16; 0x7C00 (infinity) from there up."""
+    return 0x7C00 if m >= _HALF_OVERFLOW_BITS else (m >> 13) - _HALF_REBIAS
+
+
 def half_down(x):
-    """Largest half not above x (a box16 minimum)."""
+    """Largest half not above x (a box16 minimum): the float32 bits are rounded toward -inf at the half's 13 dropped
+    mantissa bits, a magnitude below the smallest normal half becomes -2 ** -14 or zero, and the result is
+    converted to half (overflow gives -inf or +inf)."""
     if x != x:
         return float_to_half(x)
     b = bits32(x)
     if x < 0.0:
-        y = min_num(from_bits32((b + 0x1FFF) & ~0x1FFF), -HALF_MIN_NORMAL)
-    else:
-        y = from_bits32(b & ~0x1FFF)
-        y = 0.0 if y < HALF_MIN_NORMAL else y
-    return float_to_half(y)
+        m = ((b + 0x1FFF) & ~0x1FFF) & 0x7FFFFFFF
+        return 0x8400 if m < _HALF_MIN_NORMAL_BITS else 0x8000 | _half_of_magnitude(m)
+    m = b & ~0x1FFF & 0x7FFFFFFF
+    if m < _HALF_MIN_NORMAL_BITS or b & 0x80000000:       # -0.0 and magnitudes below 2 ** -14 give +0.0
+        return 0
+    return _half_of_magnitude(m)
 
 
 def half_up(x):
-    """Smallest half not below x (a box16 maximum)."""
+    """Smallest half not below x (a box16 maximum), the mirror of half_down."""
     if x != x:
         return float_to_half(x)
     b = bits32(x)
     if x > 0.0:
-        y = max_num(from_bits32((b + 0x1FFF) & ~0x1FFF), HALF_MIN_NORMAL)
-    else:
-        y = from_bits32(b & ~0x1FFF)
-        y = 0.0 if y > -HALF_MIN_NORMAL else y
-    return float_to_half(y)
+        m = ((b + 0x1FFF) & ~0x1FFF) & 0x7FFFFFFF
+        return 0x0400 if m < _HALF_MIN_NORMAL_BITS else _half_of_magnitude(m)
+    m = b & ~0x1FFF & 0x7FFFFFFF
+    if m < _HALF_MIN_NORMAL_BITS or not b & 0x80000000:   # +0.0, -0.0 and magnitudes below 2 ** -14 give +0.0
+        return 0
+    return 0x8000 | _half_of_magnitude(m)
 
 
 # --- header and frames ------------------------------------------------------------------------------------------
@@ -209,6 +273,7 @@ class LeafFrame:
     def __init__(self, hdr):
         word = hdr.compression
         self.on = word != NO_TRANSFORM
+        self._consts = {}        # point count -> constant lists apply_many multiplies by
         self.r = rotation((word >> 24) & 0x3F)
         self.t = [0.0, 0.0, 0.0]
         self.s = [1.0, 1.0, 1.0]
@@ -231,6 +296,23 @@ class LeafFrame:
             out.append(f32(f32(acc - self.t[row]) * self.s[row]))
         return tuple(out)
 
+    def apply_many(self, pts):
+        """[apply(v) for v in pts], the same float32 steps with each rounding done for all rows of all points at
+        once (three or four points per leaf)."""
+        if not self.on:
+            return list(pts)
+        n = len(pts)
+        consts = self._consts.get(n)
+        if consts is None:
+            consts = (_columns(self.r, n), _rep(n, *self.t), _rep(n, *self.s))
+            if n in BATCH_POINTS:
+                self._consts[n] = consts
+        cols, t, sc = consts
+        rnd = _rounder(3 * n)
+        pack, unpack = rnd
+        acc = unpack(pack(*list(map(_sub, _matvec(pts, cols, rnd), t))))
+        return _by_point(unpack(pack(*list(map(_mul, acc, sc)))), n)
+
 
 # --- geometry ---------------------------------------------------------------------------------------------------
 
@@ -243,13 +325,14 @@ class Geometry:
             raise ValueError("vertex stride %d is below 12" % stride)
         self.vertices, self.stride, self.indices, self.index16 = bytes(vertices), stride, indices, index16
         self.transform = transform
+        self._consts = {}        # point count -> (transform, constant lists vertex_batch multiplies by)
 
     def triangle(self, prim):
         if self.indices is None:
             return 3 * prim, 3 * prim + 1, 3 * prim + 2
         if self.index16:
-            return struct.unpack_from("<3H", self.indices, 6 * prim)
-        return struct.unpack_from("<3I", self.indices, 12 * prim)
+            return _H3_UNPACK_FROM(self.indices, 6 * prim)
+        return _I3_UNPACK_FROM(self.indices, 12 * prim)
 
     def vertex(self, i):
         v = struct.unpack_from("<3f", self.vertices, i * self.stride)
@@ -264,11 +347,40 @@ class Geometry:
             out.append(f32(acc + m[row][3]))
         return tuple(out)
 
+    def vertex_batch(self, indices):
+        """[vertex(i) for i in indices] with each float32 rounding done for all rows of all vertices at once."""
+        pts = [_V3_UNPACK_FROM(self.vertices, i * self.stride) for i in indices]
+        m = self.transform
+        if m is None:
+            return pts
+        n = len(pts)
+        key = self._consts.get(n)
+        if key is None or key[0] is not m:
+            key = (m, _columns(m, n))
+            if n in BATCH_POINTS:
+                self._consts[n] = key
+        rnd = _rounder(3 * n)
+        pack, unpack = rnd
+        cols = key[1]
+        acc = _matvec(pts, cols, rnd)
+        return _by_point(unpack(pack(*list(map(_add, acc, cols[3])))), n)
+
 
 # --- rehydration ------------------------------------------------------------------------------------------------
 
 def read_u24(buf, at):
     return buf[at] | buf[at + 1] << 8 | buf[at + 2] << 16
+
+
+def read_u24_run(buf, at, count):
+    """`count` little-endian 24-bit values stored back to back from `at`."""
+    raw = buf[at:at + 3 * count]
+    wide = bytearray(4 * count)
+    wide[0::4], wide[1::4], wide[2::4] = raw[0::3], raw[1::3], raw[2::3]
+    return struct.unpack("<%dI" % count, wide)
+
+
+LEAF_BLOCK = 64      # leaves decoded per step, so the decoded arrays stay under a KiB each
 
 
 def leaf_records(src, hdr):
@@ -279,10 +391,12 @@ def leaf_records(src, hdr):
         base = hdr.offset_to_elements + chunk * CHUNK_STRIDE
         if base + 11 * c > len(src):
             raise ValueError("leaf chunk %d runs past the input" % chunk)
-        for i in range(c):
-            prim1 = read_u24(src, base + 7 * c + 3 * i)
-            yield (base + 64 * i, read_u24(src, base + 3 * i), src[base + 3 * c + i], read_u24(src, base + 4 * c + 3 * i),
-                   None if prim1 == 0xFFFFFF else prim1, src[base + 10 * c + i])
+        for i in range(0, c, LEAF_BLOCK):
+            n = min(LEAF_BLOCK, c - i)
+            for rec in zip(range(base + 64 * i, base + 64 * (i + n), 64), read_u24_run(src, base + 3 * i, n),
+                           src[base + 3 * c + i:base + 3 * c + i + n], read_u24_run(src, base + 4 * c + 3 * i, n),
+                           read_u24_run(src, base + 7 * c + 3 * i, n), src[base + 10 * c + i:base + 10 * c + i + n]):
+                yield rec[0], rec[1], rec[2], rec[3], None if rec[4] == 0xFFFFFF else rec[4], rec[5]
         remaining -= c
         chunk += 1
 
@@ -292,12 +406,21 @@ def write_leaves(src, dst, hdr, geometries, frame):
         if gi >= len(geometries):
             raise ValueError("a leaf uses geometry index %d but %d geometries were given" % (gi, len(geometries)))
         g = geometries[gi]
-        tri = [frame.apply(g.vertex(i)) for i in g.triangle(prim0)]
-        if prim1 is None:
-            fourth = (NAN32, NAN32, NAN32)
-        else:
-            j = g.triangle(prim1)
-            fourth = frame.apply(g.vertex(j[0] if order & 0x20 else j[1] if order & 0x80 else j[2]))
+        try:
+            picks = g.triangle(prim0)
+            if prim1 is not None:
+                j = g.triangle(prim1)
+                picks += (j[0] if order & 0x20 else j[1] if order & 0x80 else j[2],)
+            pts = frame.apply_many(g.vertex_batch(picks))
+            tri = pts[:3]
+            fourth = (NAN32, NAN32, NAN32) if prim1 is None else pts[3]
+        except struct.error:    # an index or a vertex outside its buffer: go through them one at a time so the
+            tri = [frame.apply(g.vertex(i)) for i in g.triangle(prim0)]       # first error is the one reported
+            if prim1 is None:
+                fourth = (NAN32, NAN32, NAN32)
+            else:
+                j = g.triangle(prim1)
+                fourth = frame.apply(g.vertex(j[0] if order & 0x20 else j[1] if order & 0x80 else j[2]))
         a, b = order & 3, (order >> 2) & 3
         slots = [None, None, None, fourth]
         for which, value in zip((a, b, (a ^ 3) - b), tri):
@@ -307,45 +430,59 @@ def write_leaves(src, dst, hdr, geometries, frame):
                          (order & 0xF) | ((order << 4) & 0xF00))
 
 
+_F12_UNPACK_FROM = struct.Struct("<12f").unpack_from
+_F9_UNPACK_FROM = struct.Struct("<9f").unpack_from
+_F24_UNPACK_FROM = struct.Struct("<24f").unpack_from
+_E24_UNPACK_FROM = struct.Struct("<24e").unpack_from
+_I_UNPACK_FROM = struct.Struct("<I").unpack_from
+EMPTY_BOUNDS = (FLT_MAX,) * 3 + (-FLT_MAX,) * 3
+
+
+def _bounds_of(lows, highs):
+    """(min xyz, max xyz) from per-point minima and maxima, folded with minNum / maxNum so a NaN loses."""
+    lo, hi = list(lows[0]), list(highs[0])
+    for low, high in zip(lows[1:], highs[1:]):
+        for a in range(3):
+            lo[a] = min_num(lo[a], low[a])
+            hi[a] = max_num(hi[a], high[a])
+    return tuple(lo) + tuple(hi)
+
+
 def node_bounds(dst, ptr):
-    """(min xyz, max xyz) of the rehydrated node a child pointer names."""
+    """(min xyz, max xyz) of the rehydrated node a child pointer names.
+
+    The builtin min and max keep the first of equal operands and ignore a NaN that is not first, which is what the
+    minNum / maxNum fold does, so they give its result unless a NaN comes first; that case shows as a NaN in the sum
+    of the six bounds and is folded the slow way (an infinity minus an infinity also takes it, with the same result).
+    """
     kind, at = ptr & 7, (ptr >> 3) << 6
     if kind == TRI0:
-        v = struct.unpack_from("<12f", dst, at)
-        pts = [v[0:3], v[3:6], v[6:9]] + ([v[9:12]] if struct.unpack_from("<I", dst, at + 48)[0] & 0x80 else [])
+        v = _F12_UNPACK_FROM(dst, at)
+        if _I_UNPACK_FROM(dst, at + 48)[0] & 0x80:
+            r = (min(v[0], v[3], v[6], v[9]), min(v[1], v[4], v[7], v[10]), min(v[2], v[5], v[8], v[11]),
+                 max(v[0], v[3], v[6], v[9]), max(v[1], v[4], v[7], v[10]), max(v[2], v[5], v[8], v[11]))
+            pts = (v[0:3], v[3:6], v[6:9], v[9:12])
+        else:
+            r = (min(v[0], v[3], v[6]), min(v[1], v[4], v[7]), min(v[2], v[5], v[8]),
+                 max(v[0], v[3], v[6]), max(v[1], v[4], v[7]), max(v[2], v[5], v[8]))
+            pts = (v[0:3], v[3:6], v[6:9])
+        lows = highs = pts
     elif kind == TRI1:
-        v = struct.unpack_from("<9f", dst, at + 12)
-        pts = [v[0:3], v[3:6], v[6:9]]
-    elif kind == BOX32:
-        f = struct.unpack_from("<24f", dst, at + 16)
-        pts = None
-        lo = [f[a] for a in range(3)]
-        hi = [f[3 + a] for a in range(3)]
-        for s in range(1, 4):
-            for a in range(3):
-                lo[a] = min_num(lo[a], f[6 * s + a])
-                hi[a] = max_num(hi[a], f[6 * s + 3 + a])
-        return tuple(lo) + tuple(hi)
-    elif kind == BOX16:
-        h = struct.unpack_from("<24H", dst, at + 16)
-        out = []
-        for c in range(6):
-            best = h[c]
-            for s in range(1, 4):
-                cand = h[6 * s + c]
-                x, y = half_to_float(best), half_to_float(cand)
-                if x != x or (y == y and ((y < x) if c < 3 else (y > x))):
-                    best = cand
-            out.append(half_to_float(best))
-        return tuple(out)
+        v = _F9_UNPACK_FROM(dst, at + 12)
+        r = (min(v[0], v[3], v[6]), min(v[1], v[4], v[7]), min(v[2], v[5], v[8]),
+             max(v[0], v[3], v[6]), max(v[1], v[4], v[7]), max(v[2], v[5], v[8]))
+        lows = highs = (v[0:3], v[3:6], v[6:9])
+    elif kind == BOX32 or kind == BOX16:
+        f = (_F24_UNPACK_FROM if kind == BOX32 else _E24_UNPACK_FROM)(dst, at + 16)
+        r = (min(f[0], f[6], f[12], f[18]), min(f[1], f[7], f[13], f[19]), min(f[2], f[8], f[14], f[20]),
+             max(f[3], f[9], f[15], f[21]), max(f[4], f[10], f[16], f[22]), max(f[5], f[11], f[17], f[23]))
+        lows, highs = (f[0:3], f[6:9], f[12:15], f[18:21]), (f[3:6], f[9:12], f[15:18], f[21:24])
     else:
-        return (FLT_MAX,) * 3 + (-FLT_MAX,) * 3
-    lo, hi = list(pts[0]), list(pts[0])
-    for p in pts[1:]:
-        for a in range(3):
-            lo[a] = min_num(lo[a], p[a])
-            hi[a] = max_num(hi[a], p[a])
-    return tuple(lo) + tuple(hi)
+        return EMPTY_BOUNDS
+    s = sum(r)
+    if s != s:
+        return _bounds_of(lows, highs)
+    return r
 
 
 def levels(src, hdr):
@@ -365,9 +502,23 @@ def levels(src, hdr):
     return out
 
 
+_BOX32_PACK_INTO = struct.Struct("<4I24f4I").pack_into
+_BOX16_PACK_INTO = struct.Struct("<4I24H").pack_into
+_U32_PACK_INTO = struct.Struct("<I").pack_into
+_ABSENT32 = [FLT_MAX] * 3 + [-FLT_MAX] * 3          # the components of an empty slot, per slot
+_ABSENT16 = [HALF_POS_INF] * 3 + [HALF_NEG_INF] * 3
+
+
 def write_box_groups(src, dst, hdr, start, count, wide):
     """Rehydrate `count` BOX32 (wide) or BOX16 nodes stored from offsetToNodes + start."""
     node_size, group_bytes = (128, 1 << 13) if wide else (64, 1 << 12)
+    pack_node = _BOX32_PACK_INTO if wide else _BOX16_PACK_INTO
+    absent = [_ABSENT32 * 4, _ABSENT32 * 3, _ABSENT32 * 2, _ABSENT32, []] if wide else         [_ABSENT16 * 4, _ABSENT16 * 3, _ABSENT16 * 2, _ABSENT16, []]
+    value_format, value_size = ("<%df", 4) if wide else ("<%dH", 2)
+    kind = BOX32 if wide else BOX16
+    updatable = hdr.flags & FLAG_UPDATABLE
+    # hdr.stored_parent_entry, inlined for the per-child writes below
+    elements, parents, limit = hdr.offset_to_elements, hdr.offset_to_parents, min(hdr.offset_to_elements, len(dst))
     for g in range((count + GROUP - 1) // GROUP):
         n = min(GROUP, count - g * GROUP)
         base = hdr.offset_to_nodes + start + g * group_bytes
@@ -375,37 +526,44 @@ def write_box_groups(src, dst, hdr, start, count, wide):
         total_children = sum(w >> 24 for w in words)
         child_at = base + 4 * n
         value_at = base + 4 * (n + total_children)
-        for t, word in enumerate(words):
+        at = base
+        for word in words:
             kids, mask = word >> 24, word & 0xFFFFFF
-            children = list(struct.unpack_from("<%dI" % kids, src, child_at)) + [INVALID] * (4 - kids)
+            children = struct.unpack_from("<%dI" % kids, src, child_at) + (INVALID,) * (4 - kids)
             child_at += 4 * kids
             comps = []
-            for slot in range(4):
-                if slot < kids:
-                    b = node_bounds(dst, children[slot])
-                    comps += list(b) if wide else [half_down(b[0]), half_down(b[1]), half_down(b[2]),
-                                                   half_up(b[3]), half_up(b[4]), half_up(b[5])]
+            for slot in range(min(kids, 4)):
+                b = node_bounds(dst, children[slot])
+                if wide:
+                    comps += b
                 else:
-                    comps += [FLT_MAX] * 3 + [-FLT_MAX] * 3 if wide else [HALF_POS_INF] * 3 + [HALF_NEG_INF] * 3
-            for bit in range(24):
-                if mask >> bit & 1:
-                    if wide:
-                        comps[bit] = struct.unpack_from("<f", src, value_at)[0]
-                        value_at += 4
-                    else:
-                        comps[bit] = struct.unpack_from("<H", src, value_at)[0]
-                        value_at += 2
-            at = base + t * node_size
+                    comps += (half_down(b[0]), half_down(b[1]), half_down(b[2]),
+                              half_up(b[3]), half_up(b[4]), half_up(b[5]))
+            comps += absent[min(kids, 4)]
+            if mask:
+                try:
+                    stored = struct.unpack_from(value_format % mask.bit_count(), src, value_at)
+                except struct.error:        # read them one at a time so the error names the first missing value
+                    for bit in range(mask.bit_count()):
+                        struct.unpack_from(value_format % 1, src, value_at + value_size * bit)
+                    raise
+                value_at += value_size * len(stored)
+                for value in stored:        # one stored value per set bit, lowest bit first
+                    low = mask & -mask
+                    comps[low.bit_length() - 1] = value
+                    mask ^= low
             if wide:
-                struct.pack_into("<4I24f4I", dst, at, *children, *comps, 0, 0, 0, 0)
+                pack_node(dst, at, *children, *comps, 0, 0, 0, 0)
             else:
-                struct.pack_into("<4I24H", dst, at, *children, *comps)
-            me = (at >> 6) << 3 | (BOX32 if wide else BOX16)
+                pack_node(dst, at, *children, *comps)
+            me = (at >> 6) << 3 | kind
             for child in children:
-                if (child & 6) == 4 or ((child & 7) == TRI0 and hdr.flags & FLAG_UPDATABLE):
-                    entry = hdr.stored_parent_entry(((child >> 3) << 6) & M32, len(dst))
-                    if entry is not None:
-                        struct.pack_into("<I", dst, entry, me)
+                if (child & 6) == 4 or ((child & 7) == TRI0 and updatable):
+                    unit = ((((child >> 3) << 6) & M32) - elements & M32) >> 6
+                    entry = (parents + 4 * unit) & M32
+                    if 64 <= entry and entry + 4 <= limit:
+                        _U32_PACK_INTO(dst, entry, me)
+            at += node_size
 
 
 def rehydrate(dehydrated, geometries, header_offset=0):
