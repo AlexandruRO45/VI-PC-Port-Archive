@@ -1066,9 +1066,9 @@ By default the generator keeps lane masks and 64-bit data in separate registers 
 lane on, so a default run is a regression check. Two known gaps on `main` are opt-in: `--masks-as-data` (#210, #293) and
 `--permlane-partial` (SHADER-74, #580).
 
-Results, 2026-11-22 (`--max-ops 16`, half wave32, half wave64, nothing skipped): on `main` f847748c, 199 of 200 match
-(seed 301); the mismatch is `s_ff0_i32_b64` of a negative constant, which #1409 fixes. With #1409, 600 of 600 match
-(seeds 301 to 303).
+Results (`--max-ops 16`, half wave32, half wave64, nothing skipped): it found `s_and_b32 exec_lo, exec_lo, K` in
+wave32 and `s_ff0_i32_b64` of a negative constant (#1409), both fixed on `main` since; on `main` 7b7d73f8, 600 of
+600 match (seeds 401 to 403).
 
 ### 32-bit float VALU on the GPU (`tools/f32_fuzz.py`, FUZZ-3)
 
