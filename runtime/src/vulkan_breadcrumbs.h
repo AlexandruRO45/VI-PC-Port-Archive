@@ -56,7 +56,7 @@ inline constexpr std::uint32_t set_marker = 0, begin_event = 1, end_event = 2, d
                                clear_unordered_access_view = 13, clear_depth_stencil_view = 14,
                                resource_barrier = 15, resolve_query_data = 18, atomic_copy_buffer_uint = 23,
                                resolve_subresource_region = 25, write_buffer_immediate = 26,
-                               build_raytracing_acceleration_structure = 31, barrier = 45;
+                               build_raytracing_acceleration_structure = 31, dispatch_mesh = 42, barrier = 45;
 }  // namespace breadcrumb_op
 
 // The D3D12 breadcrumb operation a recorded command stands for, or false for a command that is not a D3D12
@@ -104,7 +104,7 @@ inline bool breadcrumb_op_of(const Command& command, std::uint32_t& op) {
             } else if constexpr (std::is_same_v<T, Dispatch>) {
                 op = o::dispatch;
             } else if constexpr (std::is_same_v<T, Draw>) {
-                op = c.indexed ? o::draw_indexed_instanced : o::draw_instanced;
+                op = c.mesh ? o::dispatch_mesh : c.indexed ? o::draw_indexed_instanced : o::draw_instanced;
             } else {
                 known = false;  // Predication, BeginQuery, EndQuery, DiscardResource: no breadcrumb of their own
             }
@@ -121,6 +121,7 @@ inline const char* breadcrumb_op_name(std::uint32_t op) {
         case o::end_event: return "EndEvent";
         case o::draw_instanced: return "DrawInstanced";
         case o::draw_indexed_instanced: return "DrawIndexedInstanced";
+        case o::dispatch_mesh: return "DispatchMesh";
         case o::execute_indirect: return "ExecuteIndirect";
         case o::dispatch: return "Dispatch";
         case o::copy_buffer_region: return "CopyBufferRegion";
