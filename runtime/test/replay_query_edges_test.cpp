@@ -673,6 +673,7 @@ void test_query_state() {
     // opt-in, and split both ordinary and overlapping queries around a buffer copy (D3D-494).
     QueryPool transfer_stat{handle<VkQueryPool>(14), d3d12_query_heap::pipeline_statistics, heap_count, false,
         std::vector<bool>(heap_count), {}};
+    c.values[transfer_stat.pool].resize(heap_count);
     auto previous_query_pool = vk.query_pool;
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 2 ? &transfer_stat : previous_query_pool(id);
@@ -695,6 +696,15 @@ void test_query_state() {
     expect(transfer_split.statistics_segment_count == 2 && transfer_split.queries.size() == 2 &&
            transfer_split.queries[1].statistics_count == 2,
            "ANV transfer splits ordinary statistics into two summed segments");
+    auto transfer_pool = make_segment_pool(15);
+    c.values[transfer_pool->pool].resize(2);
+    QueryReplay transfer_batch;
+    expect(transfer_batch.plan(transfer_split, {}, 0, true, transfer_pool) == ReplayResult::success,
+           "plan ANV transfer statistics emission");
+    c.events.clear();
+    emit(transfer_split, {}, vk);
+    expect(c.events == std::vector<std::string>{"begin_query", "end_query", "native_copy", "begin_query", "end_query"},
+           "emitted statistics segments bracket the transfer command");
 
     CommandList overlapping_transfer;
     expect(overlapping_transfer.begin_query({2, d3d12_query::pipeline_statistics, 2}) &&

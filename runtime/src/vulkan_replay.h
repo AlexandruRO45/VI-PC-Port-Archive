@@ -3398,6 +3398,27 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             end_statistics();
             begin_statistics();
         }
+        struct TransferStatisticsSplit {
+            const PreparedList& prepared;
+            const ReplayFunctions& vk;
+            VkCommandBuffer command_buffer;
+            std::uint32_t end;
+            std::uint32_t begin;
+            bool enabled;
+
+            TransferStatisticsSplit(const PreparedList& list, const ReplayFunctions& functions, VkCommandBuffer cb,
+                                    std::uint32_t query_end, std::uint32_t query_begin, bool split)
+                : prepared(list), vk(functions), command_buffer(cb), end(query_end), begin(query_begin), enabled(split) {
+                if (enabled) detail::end_statistics_segment(prepared, end, command_buffer, vk);
+            }
+            ~TransferStatisticsSplit() {
+                if (enabled) detail::begin_statistics_segment(prepared, begin, command_buffer, vk);
+            }
+        } transfer_statistics_split(
+            prepared, vk, command_buffer, p.statistics_end,
+            p.statistics_begin, vk.exclude_transfers_from_pipeline_statistics && statistics_transfer_command(command) &&
+                                   p.statistics_end != detail::PreparedQuery::no_segment &&
+                                   p.statistics_begin != detail::PreparedQuery::no_segment);
         if (const auto* predication = std::get_if<Predication>(&command)) {
             // Conditional rendering cannot nest, so a new predicate ends the previous one first.
             if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
@@ -3654,9 +3675,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
             if (!p.predicated_copy.empty()) {
-                end_statistics();
+                if (!transfer_statistics_split.enabled) end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
-                begin_statistics();
+                if (!transfer_statistics_split.enabled) begin_statistics();
             } else if (!p.buffer_copies.empty()) {
                 vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, std::uint32_t(p.buffer_copies.size()),
                                p.buffer_copies.data());
@@ -3724,9 +3745,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    end_statistics();
+                    if (!transfer_statistics_split.enabled) end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
-                    begin_statistics();
+                    if (!transfer_statistics_split.enabled) begin_statistics();
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
                     converted = p.buffer_image_copies;
@@ -3766,9 +3787,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    end_statistics();
+                    if (!transfer_statistics_split.enabled) end_statistics();
                     for (const auto& part : p.depth24_parts) run_depth24(part);
-                    begin_statistics();
+                    if (!transfer_statistics_split.enabled) begin_statistics();
                     detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
