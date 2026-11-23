@@ -27,6 +27,9 @@ namespace {
 
 using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);  // heap slot 9: 8-byte handle in RAX
 
+// The test sets the client size itself. Under Wine, a tiling compositor can override it for a resizable window.
+constexpr DWORD window_style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+
 template<class T>
 struct Ref {
     T* p = nullptr;
@@ -103,7 +106,7 @@ bool is_top_window_at(HWND window, POINT screen_point) {
 
 void set_client_size(HWND window, int width, int height) {
     RECT rect{0, 0, width, height};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&rect, window_style, FALSE);
     SetWindowPos(window, HWND_TOP, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
 }
@@ -267,9 +270,9 @@ int main() {
     }
     constexpr int width = 320, height = 240;
     RECT frame_rect{0, 0, width, height};
-    AdjustWindowRect(&frame_rect, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&frame_rect, window_style, FALSE);
     HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida M0: D3D12 clear on Vulkan",
-                                  WS_OVERLAPPEDWINDOW, 100, 100, frame_rect.right - frame_rect.left,
+                                  window_style, 100, 100, frame_rect.right - frame_rect.left,
                                   frame_rect.bottom - frame_rect.top, nullptr, nullptr, window_class.hInstance,
                                   nullptr);
     if (!window) {
