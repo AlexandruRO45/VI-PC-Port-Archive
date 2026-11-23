@@ -544,7 +544,6 @@ python -I tools/navmesh_links.py <package>\navmeshes.rpf --out <temp>/navmesh-li
 python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
 python -I tests/test_navmesh_links.py -v
 python -I tools/navmesh_nodes.py <package>\navmeshes.rpf <package>\levels.rpf --jobs 8 --out <temp>/navmesh-nodes.json
-python -I -W error::ResourceWarning tests/test_navmesh_decode.py -v
 python -I tests/test_navmesh_nodes.py
 python -I tests/test_navmesh_index.py
 ```
