@@ -66,5 +66,97 @@ class TestSFf0I32B32Reference(unittest.TestCase):
         self.assertEqual(ref_ff0_i32_b32(0xFFFFFFFF), MASK32)
 
 
+class RegType(enum.Enum):
+    SGPR = "s"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index_or_val: int
+    is_64bit: bool = False
+
+    @classmethod
+    def sgpr32(cls, idx: int) -> Operand:
+        if not (0 <= idx < 106):
+            raise ValueError(f"SGPR index out of range: {idx}")
+        return cls(RegType.SGPR, idx, False)
+
+    @classmethod
+    def sgpr64(cls, idx: int) -> Operand:
+        if not (0 <= idx < 105):
+            raise ValueError(f"64-bit SGPR pair index out of range: {idx}")
+        return cls(RegType.SGPR, idx, True)
+
+    @classmethod
+    def imm32(cls, val: int) -> Operand:
+        return cls(RegType.IMM, val & MASK32, False)
+
+    @classmethod
+    def imm64(cls, val: int) -> Operand:
+        return cls(RegType.IMM, val & MASK64, True)
+
+
+@dataclasses.dataclass
+class Instruction:
+    opcode: str
+    dst: Operand
+    src0: Operand
+
+
+class SaluState:
+    def __init__(self) -> None:
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+        self.scc: int = 0
+
+    def read_u32(self, op: Operand) -> int:
+        if op.reg_type == RegType.IMM:
+            return op.index_or_val & MASK32
+        return self.sgprs[op.index_or_val] & MASK32
+
+    def read_u64(self, op: Operand) -> int:
+        if op.reg_type == RegType.IMM:
+            return op.index_or_val & MASK64
+        lo = self.sgprs[op.index_or_val] & MASK32
+        hi = self.sgprs[op.index_or_val + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_u32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def write_u64(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+def step_scalar_ff0_i32_b32(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_ff0_i32_b32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    src0 = state.read_u32(instr.src0)
+    res = ref_ff0_i32_b32(src0)
+    state.write_u32(instr.dst.index_or_val, res)
+    # SCC is preserved by s_ff0_i32_b32
+
+
+class TestSFf0I32B32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_ff0_i32_b32."""
+
+    def test_ast_construction_and_bounds(self):
+        instr = Instruction("s_ff0_i32_b32", Operand.sgpr32(2), Operand.sgpr32(0))
+        self.assertEqual(instr.opcode, "s_ff0_i32_b32")
+        self.assertEqual(instr.dst.index_or_val, 2)
+        with self.assertRaises(ValueError):
+            Operand.sgpr32(106)
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 0b1111)  # bits 0..3 are 1, bit 4 is 0
+        state.scc = 1
+        instr = Instruction("s_ff0_i32_b32", Operand.sgpr32(1), Operand.sgpr32(0))
+        step_scalar_ff0_i32_b32(state, instr)
+        self.assertEqual(state.sgprs[1], 4)
+        self.assertEqual(state.scc, 1)  # SCC preserved
+
+
 if __name__ == "__main__":
     unittest.main()
