@@ -79,6 +79,13 @@ using Register = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, XTaskQueueHandle, vo
                                              XTaskQueueRegistrationToken*);
 using Unregister = bool(STDMETHODCALLTYPE*)(void*, Handle, XTaskQueueRegistrationToken, bool);
 using NoArgs = HRESULT(STDMETHODCALLTYPE*)(void*);
+using ArrayAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char**, size_t, XAsyncBlock*);
+using PurchaseAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char*, const char*, XAsyncBlock*);
+using RedeemAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, const char**, size_t, bool, XAsyncBlock*);
+using AssociatedAsync = HRESULT(STDMETHODCALLTYPE*)(void*, Handle, const char*, uint32_t, XAsyncBlock*);
+using AsyncResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*);
+
+void CALLBACK on_async(XAsyncBlock* a) { ++*static_cast<int*>(a->context); }
 
 int g_callbacks = 0;
 void CALLBACK on_change(void*) { ++g_callbacks; }
@@ -171,8 +178,42 @@ int main() {
           "the query has no products and no further pages");
     at<Close>(store, 19)(store, products);
 
-    // ---- what needs the service fails before starting ----
-    check(at<NoArgs>(store, 49)(store) == E_FAIL, "XStoreShowPurchaseUIAsync is not available offline");
+    // ---- service-backed requests schedule an offline failure ----
+    XTaskQueueHandle queue = nullptr;
+    check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue) == S_OK,
+          "manual queue created");
+    const int slots[] = {49, 51, 53, 58, 60, 62, 71, 73, 75};
+    for (int index : slots) {
+        int callbacks = 0;
+        XAsyncBlock request{};
+        request.queue = queue;
+        request.context = &callbacks;
+        request.callback = on_async;
+        HRESULT hr;
+        if (index == 49) hr = at<PurchaseAsync>(store, index)(store, context, "id", nullptr, nullptr, &request);
+        else if (index == 51) hr = at<CtxAsync>(store, index)(store, context, &request);
+        else if (index == 53) hr = at<RedeemAsync>(store, index)(store, context, "token", nullptr, 0, false, &request);
+        else if (index == 58 || index == 60 || index == 62)
+            hr = at<ArrayAsync>(store, index)(store, context, ids, 1, &request);
+        else if (index == 73) hr = at<AssociatedAsync>(store, index)(store, context, "id", 1, &request);
+        else hr = at<CtxIdAsync>(store, index)(store, context, "id", &request);
+        char label[80];
+        std::snprintf(label, sizeof(label), "slot %d begins pending", index);
+        check(hr == S_OK && XAsyncGetStatus(&request, false) == E_PENDING && callbacks == 0, label);
+        if (hr != S_OK) continue;
+        XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0);
+        XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0);
+        std::snprintf(label, sizeof(label), "slot %d callback and offline result", index);
+        const int result_slot = index == 62 ? 64 : index + 1;
+        check(callbacks == 1 && XAsyncGetStatus(&request, false) == E_FAIL &&
+                  at<AsyncResult>(store, result_slot)(store, &request) == E_FAIL, label);
+        if (index == 62) {
+            uint32_t result_count = 99;
+            check(at<Count>(store, 63)(store, &request, &result_count) == E_FAIL && result_count == 0,
+                  "download packages count is zero on failure");
+        }
+    }
+    XTaskQueueCloseHandle(queue);
     check(at<NoArgs>(store, 46)(store) == E_NOTIMPL, "an undocumented slot answers E_NOTIMPL");
 
     check(at<Register>(store, 66)(store, context, nullptr, nullptr, on_change, &token) == S_OK &&

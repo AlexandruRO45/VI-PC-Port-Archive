@@ -115,9 +115,8 @@ template <class T> void close_handle(std::unordered_set<const void*>& set, T* h)
 
 // ---- Slots that are not available offline ----
 
-// An operation that needs the store service or a store UI. The *Async function fails before starting, so the
-// XAsyncBlock is never used and no callback runs; its Result/ResultSize partners return the same error. Their
-// arguments don't matter, so the functions take none (x64: the caller owns the argument area).
+// Unimplemented offline slots return E_FAIL. Their arguments don't matter, so the functions take none
+// (x64: the caller owns the argument area).
 template <int Slot> HRESULT STDMETHODCALLTYPE offline_failure(void*) {
     static std::atomic<bool> s_logged{false};
     if (!s_logged.exchange(true))
@@ -136,7 +135,7 @@ template <int Slot> HRESULT STDMETHODCALLTYPE unknown_slot(void*) {
 // ---- Async: every served *Async completes at once on the title's queue ----
 
 const char kProductsIdentity = 0, kLicenseIdentity = 0, kCanAcquireIdentity = 0, kGameLicenseIdentity = 0,
-           kAddOnsIdentity = 0, kUpdatesIdentity = 0;
+           kAddOnsIdentity = 0, kUpdatesIdentity = 0, kOfflineIdentity = 0;
 
 size_t result_size(const void* identity) {
     if (identity == &kProductsIdentity) return sizeof(XStoreProductQueryHandle);
@@ -154,7 +153,7 @@ HRESULT CALLBACK store_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::Begin:
         return XAsyncSchedule(data->async, 0);
     case XAsyncOp::DoWork:
-        XAsyncComplete(data->async, S_OK, result_size(identity));
+        XAsyncComplete(data->async, identity == &kOfflineIdentity ? E_FAIL : S_OK, result_size(identity));
         return S_OK;
     case XAsyncOp::GetResult:
         if (!data->buffer || data->bufferSize < result_size(identity)) return E_INVALIDARG;
@@ -183,6 +182,33 @@ HRESULT begin(XStoreContextHandle context, XAsyncBlock* async, const char* ident
     if (!async) return E_POINTER;
     if (!live(g_contexts, context)) return E_INVALIDARG;
     return XAsyncBegin(async, const_cast<char*>(identity), identity, name, store_provider);
+}
+
+HRESULT STDMETHODCALLTYPE store_offline_array_async(void*, XStoreContextHandle c, const char**, size_t, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreOfflineArrayAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_id_async(void*, XStoreContextHandle c, const char*, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreOfflineIdAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_context_async(void*, XStoreContextHandle c, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreOfflineContextAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_purchase_async(void*, XStoreContextHandle c, const char*, const char*,
+                                                        const char*, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreShowPurchaseUIAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_redeem_async(void*, XStoreContextHandle c, const char*, const char**, size_t,
+                                                      bool, XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreShowRedeemTokenUIAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_associated_async(void*, XStoreContextHandle c, const char*, uint32_t,
+                                                          XAsyncBlock* a) {
+    return begin(c, a, &kOfflineIdentity, "XStoreShowAssociatedProductsUIAsync");
+}
+HRESULT STDMETHODCALLTYPE store_offline_count(void*, XAsyncBlock* a, uint32_t* count) {
+    if (!count) return E_POINTER;
+    *count = 0;
+    return XAsyncGetResult(a, &kOfflineIdentity, 0, nullptr, nullptr);
 }
 
 // ---- IXStoreImpl (slots 3-69), IXStoreImpl2-6 (70-83) ----
@@ -438,21 +464,21 @@ const void* const kStoreVtable[] = {
     FN(unknown_slot<46>),                    // 46 (unknown in the docs)
     FN(unknown_slot<47>),                    // 47 (unknown in the docs)
     FN(unknown_slot<48>),                    // 48 (unknown in the docs)
-    FN(offline_failure<49>),                 // 49 XStoreShowPurchaseUIAsync
+    FN(store_offline_purchase_async),        // 49 XStoreShowPurchaseUIAsync
     FN(offline_failure<50>),                 // 50 XStoreShowPurchaseUIResult
-    FN(offline_failure<51>),                 // 51 XStoreShowRateAndReviewUIAsync
+    FN(store_offline_context_async),         // 51 XStoreShowRateAndReviewUIAsync
     FN(offline_failure<52>),                 // 52 XStoreShowRateAndReviewUIResult
-    FN(offline_failure<53>),                 // 53 XStoreShowRedeemTokenUIAsync
+    FN(store_offline_redeem_async),          // 53 XStoreShowRedeemTokenUIAsync
     FN(offline_failure<54>),                 // 54 XStoreShowRedeemTokenUIResult
     FN(store_updates_async),                 // 55 XStoreQueryGameAndDlcPackageUpdatesAsync
     FN(store_updates_count),                 // 56 XStoreQueryGameAndDlcPackageUpdatesResultCount
     FN(store_updates_result),                // 57 XStoreQueryGameAndDlcPackageUpdatesResult
-    FN(offline_failure<58>),                 // 58 XStoreDownloadPackageUpdatesAsync
+    FN(store_offline_array_async),           // 58 XStoreDownloadPackageUpdatesAsync
     FN(offline_failure<59>),                 // 59 XStoreDownloadPackageUpdatesResult
-    FN(offline_failure<60>),                 // 60 XStoreDownloadAndInstallPackageUpdatesAsync
+    FN(store_offline_array_async),           // 60 XStoreDownloadAndInstallPackageUpdatesAsync
     FN(offline_failure<61>),                 // 61 XStoreDownloadAndInstallPackageUpdatesResult
-    FN(offline_failure<62>),                 // 62 XStoreDownloadAndInstallPackagesAsync
-    FN(offline_failure<63>),                 // 63 XStoreDownloadAndInstallPackagesResultCount
+    FN(store_offline_array_async),           // 62 XStoreDownloadAndInstallPackagesAsync
+    FN(store_offline_count),                 // 63 XStoreDownloadAndInstallPackagesResultCount
     FN(offline_failure<64>),                 // 64 XStoreDownloadAndInstallPackagesResult
     FN(store_query_package_identifier),      // 65 XStoreQueryPackageIdentifier
     FN(store_register),                      // 66 XStoreRegisterGameLicenseChanged
@@ -460,11 +486,11 @@ const void* const kStoreVtable[] = {
     FN(store_register),                      // 68 XStoreRegisterPackageLicenseLost
     FN(store_unregister),                    // 69 XStoreUnregisterPackageLicenseLost
     FN(unknown_slot<70>),                    // 70 XStoreIsAvailabilityPurchasable (2; no documented signature)
-    FN(offline_failure<71>),                 // 71 XStoreAcquireLicenseForDurablesAsync (3)
+    FN(store_offline_id_async),              // 71 XStoreAcquireLicenseForDurablesAsync (3)
     FN(offline_failure<72>),                 // 72 XStoreAcquireLicenseForDurablesResult (3)
-    FN(offline_failure<73>),                 // 73 XStoreShowAssociatedProductsUIAsync (4)
+    FN(store_offline_associated_async),      // 73 XStoreShowAssociatedProductsUIAsync (4)
     FN(offline_failure<74>),                 // 74 XStoreShowAssociatedProductsUIResult (4)
-    FN(offline_failure<75>),                 // 75 XStoreShowProductPageUIAsync (4)
+    FN(store_offline_id_async),              // 75 XStoreShowProductPageUIAsync (4)
     FN(offline_failure<76>),                 // 76 XStoreShowProductPageUIResult (4)
     FN(store_query_associated_for_id_async), // 77 XStoreQueryAssociatedProductsForStoreIdAsync (5)
     FN(store_products_result),               // 78 XStoreQueryAssociatedProductsForStoreIdResult (5)
