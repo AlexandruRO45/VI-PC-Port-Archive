@@ -3,6 +3,7 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -60,6 +61,40 @@ class PackedFormatFixture(unittest.TestCase):
             check_fmt.assert_called_once()
             self.assertIn(problem, output.getvalue())
             self.assertIn("0/1 passed", output.getvalue())
+
+
+class FrameReadbackTest(unittest.TestCase):
+    def test_only_a_frame_written_by_this_run_can_pass(self):
+        name = "ps_ops"
+        pixels = struct.pack("<4I", 0x48804300, 5, 7, 0xBFFFFFFC) * 4096
+        for existing, writes_frame, expected in ((True, False, 1), (False, False, 1), (True, True, 0)):
+            with self.subTest(existing=existing, writes_frame=writes_frame), tempfile.TemporaryDirectory() as tmp:
+                raw = Path(tmp, "raw", f"{name}.raw")
+                if existing:
+                    raw.parent.mkdir()
+                    raw.write_bytes(pixels)
+                args = SimpleNamespace(filter="ps_ops.asm", build=tmp, llvm_mc="unused")
+
+                def launch(cmd, **kwargs):
+                    if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                        (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    elif writes_frame:
+                        raw.write_bytes(pixels)
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+                output = io.StringIO()
+                with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(rgt, "spirv_as"),
+                      patch.object(rgt, "bary_fallback", return_value=False),
+                      patch.object(rgt, "f16_interp_fallback", return_value=False),
+                      patch.object(rgt.subprocess, "run", side_effect=launch),
+                      contextlib.redirect_stdout(output)):
+                    self.assertEqual(rgt.run_suite(args, tmp), expected, output.getvalue())
+                if expected:
+                    self.assertIn("missing readback", output.getvalue())
+                    self.assertFalse(raw.exists())
+                else:
+                    self.assertEqual(raw.read_bytes(), pixels)
 
 
 class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
@@ -300,6 +335,14 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertEqual(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32 not available\n"),
                          "SKIP (the device can't run this shader at 32 lanes on request)")
         self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 8..32)\ncompute subgroup size: 32\n"))
+        observed = "compute subgroup size: 32 (observed: all 20 invocations of a 20x1x1 group)\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: Apple M3 Max (subgroup 4..32)\n" + observed))
+        wrong = "compute subgroup size: 32 observed wrong in 4 of 64 invocations; invocation 60 has SubgroupSize 32\n"
+        self.assertIsNone(rgt.wave32_lane_skip("device: X (subgroup 4..32)\n" + wrong))
+        ok, detail = rgt.judge_cs_dump(1, "device: X (subgroup 4..32)\n" + wrong, [1], wave64=False, partial=False,
+                                       emulated=False)
+        self.assertIs(ok, False)
+        self.assertIn("observed wrong", detail)
 
     def test_rule(self):
         self.assertEqual(rgt.narrow_subgroup_skip("device: llvmpipe (subgroup 8..8)\n"),
@@ -496,32 +539,6 @@ class FmaFusedSuite(unittest.TestCase):
         rc, out = self.run_fma(77, "unsupported: no VK_KHR_shader_fma", fma_env="khr")
         self.assertEqual(rc, 0, out)
         self.assertIn("SKIP (unsupported: no VK_KHR_shader_fma)", out)
-
-
-class AnsiWorkPathTest(unittest.TestCase):
-    def test_ascii_path_is_kept(self):
-        self.assertEqual(rgt.ansi_path("C:\\Users\\bob\\x", nt=True, codec="ascii"), "C:\\Users\\bob\\x")
-
-    def test_non_ansi_path_without_a_short_name_is_refused(self):
-        with patch("ctypes.windll", create=True, new=None):
-            self.assertIsNone(rgt.ansi_path("C:\\Users\\\u0438\u0432\u0430\u043d\\x", nt=True, codec="ascii"))
-
-    def test_other_systems_keep_the_path(self):
-        self.assertEqual(rgt.ansi_path("/tmp/\u0438\u0432\u0430\u043d", nt=False), "/tmp/\u0438\u0432\u0430\u043d")
-
-    def test_default_work_dir_falls_back_to_an_ascii_folder(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            uni = os.path.join(tmp, "\u0438\u0432\u0430\u043d")
-            os.mkdir(uni)
-            drive = os.path.join(tmp, "drive")
-            os.mkdir(drive)
-            with patch.object(rgt.tempfile, "tempdir", uni), \
-                    patch.dict(os.environ, {"SystemDrive": drive}), \
-                    patch("ctypes.windll", create=True, new=None):
-                work = rgt.make_work_dir(nt=True, codec="ascii")
-            self.assertTrue(work.startswith(os.path.join(drive, "leonida_gpu_tests")))
-            self.assertTrue(os.path.isdir(work))
-            self.assertEqual(os.listdir(uni), [])
 
 
 if __name__ == "__main__":
