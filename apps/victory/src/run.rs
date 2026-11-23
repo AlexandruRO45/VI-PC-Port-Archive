@@ -13,8 +13,28 @@ pub fn run(
     console: Console,
 ) -> Result<()> {
     use std::sync::Arc;
+    use victory_hle::modules::xmem::{MIN_COMMIT_HEADROOM, system_commit};
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
+
+    // A title commits its physical-page pool when it maps it, in one call.
+    // Say what the host has before it stops with a breakpoint of its own.
+    if let Some(commit) = system_commit() {
+        println!(
+            "commit         {} MiB available of {} MiB limit",
+            commit.available >> 20,
+            commit.limit >> 20
+        );
+        if commit.available < MIN_COMMIT_HEADROOM {
+            eprintln!(
+                "warning: only {} MiB of Windows commit available; the title \
+                 commits about 6.5 GiB at startup. Increase the paging file \
+                 (a fixed 32 GB one is known to work) or it will stop on a \
+                 breakpoint.",
+                commit.available >> 20
+            );
+        }
+    }
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();

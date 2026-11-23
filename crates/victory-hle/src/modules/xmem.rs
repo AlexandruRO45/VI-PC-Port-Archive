@@ -21,7 +21,10 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE,
     UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
-use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
+    PROCESS_MEMORY_COUNTERS,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -639,13 +642,81 @@ fn commit(base: usize, len: usize) -> bool {
     let done =
         !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
     if !done {
-        tracing::warn!(
-            len,
-            error = %std::io::Error::last_os_error(),
-            "committing physical pages failed"
+        let error = std::io::Error::last_os_error();
+        tracing::error!(
+            %error,
+            "{}",
+            commit_failure_message(len, system_commit())
         );
     }
     done
+}
+
+/// The host's system-wide commit charge, in bytes. The title's physical-page
+/// section is reserved at creation and committed when mapped, so this is
+/// what decides whether a Series X title gets past its startup allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitStatus {
+    pub limit: u64,
+    pub total: u64,
+    pub available: u64,
+}
+
+/// Headroom a Series X title needs for its physical-page pool, with margin.
+/// The title commits about 6.5 GiB in one call; below this the startup check
+/// says so before it stops on its own breakpoint.
+pub const MIN_COMMIT_HEADROOM: u64 = 7 * 1024 * 1024 * 1024;
+
+/// Reads the system commit limit and charge. `None` only costs the numbers
+/// in a failure message; the advice is still given.
+pub fn system_commit() -> Option<CommitStatus> {
+    let mut info = PERFORMANCE_INFORMATION {
+        cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a correctly sized structure, filled by the system call.
+    if unsafe { K32GetPerformanceInfo(&mut info, info.cb) } == 0 {
+        return None;
+    }
+    let page = info.PageSize as u64;
+    let limit = info.CommitLimit as u64 * page;
+    let total = info.CommitTotal as u64 * page;
+    Some(CommitStatus {
+        limit,
+        total,
+        available: limit.saturating_sub(total),
+    })
+}
+
+/// What a refused commit should say: the size asked for, the headroom the
+/// host had, and the change that fixes it. `None` when the system would not
+/// report its commit charge.
+fn commit_failure_message(wanted: usize, status: Option<CommitStatus>) -> String {
+    let mib = |bytes: u64| bytes >> 20;
+    match status {
+        Some(s) => {
+            let short = (wanted as u64).saturating_sub(s.available);
+            format!(
+                "committing physical pages failed: asked for {} MiB, Windows \
+                 commit limit {} MiB with {} MiB already committed and {} MiB \
+                 available (short by {} MiB). Increase the Windows paging file \
+                 by at least {} MiB; a fixed 32 GB paging file is known to work \
+                 for this title.",
+                mib(wanted as u64),
+                mib(s.limit),
+                mib(s.total),
+                mib(s.available),
+                mib(short),
+                mib(short)
+            )
+        }
+        None => format!(
+            "committing physical pages failed: asked for {} MiB (Windows error \
+             1455, ERROR_COMMITMENT_LIMIT). Set a fixed Windows paging file of \
+             at least 32 GB.",
+            mib(wanted as u64)
+        ),
+    }
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -781,6 +852,34 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_failure_names_the_shortfall_and_the_fix() {
+        let status = CommitStatus {
+            limit: 20 * 1024 * MIB as u64,
+            total: 14 * 1024 * MIB as u64,
+            available: 6 * 1024 * MIB as u64,
+        };
+        let wanted = 6_538_919_936; // 99,776 pages of 64 KiB
+        let message = commit_failure_message(wanted, Some(status));
+        assert!(message.contains("6236 MiB"), "{message}");
+        assert!(message.contains("short by 92 MiB"), "{message}");
+        assert!(message.contains("paging file"), "{message}");
+
+        let without_status = commit_failure_message(wanted, None);
+        assert!(without_status.contains("ERROR_COMMITMENT_LIMIT"));
+        assert!(without_status.contains("paging file"));
+    }
+
+    #[test]
+    fn system_commit_reports_a_consistent_charge() {
+        let Some(status) = system_commit() else {
+            return; // the system would not report it
+        };
+        assert!(status.limit > 0);
+        assert!(status.available <= status.limit);
+        assert_eq!(status.available, status.limit.saturating_sub(status.total));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

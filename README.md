@@ -48,7 +48,11 @@ What each part does today and what it still needs:
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
+`rust-toolchain.toml`), and at least 7 GiB of available Windows commit.
+`victory run` prints the available commit and warns when it is too low: the
+title commits a 6.5 GiB physical-page pool in one call, and a system-managed
+paging file that cannot cover it fails with error 1455 and stops the title.
+A fixed 32 GB paging file is known to work.
 
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
