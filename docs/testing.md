@@ -673,4 +673,6 @@ python -I tools/pc_checker.py --cli --check --json
 
 `--cpu`, `--gpu` and `--ram` override the detected values when a VM or a remote session hides them. Its scores are
 rough estimates made for this tool, not benchmarks, so put the detected model names in the #166 entry, not the score.
+`LEONIDA_SKIP_SPEC_CHECK=1` skips the weak-PC prompt instead of answering it: `--warn` then exits with the verdict
+(`1` on a weak PC) where declining exits `3`, and a launcher that calls `SpecChecker().warn_if_weak()` starts anyway.
 `python -I tests/test_pc_checker.py` checks the parsing and the comparison with the window mocked.
