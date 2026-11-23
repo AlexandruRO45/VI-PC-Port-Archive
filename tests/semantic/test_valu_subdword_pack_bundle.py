@@ -175,6 +175,18 @@ class TestPackB32F16Mutation(unittest.TestCase):
         self.assertIn("OpShiftLeftLogical", spv)
         self.assertIn("OpBitwiseOr", spv)
 
+class TestPackB32F16Translator(unittest.TestCase):
+    def test_translator_matrix(self):
+        cases = [
+            (0x0001, 0x0002, 0x0002_0001),
+            (0xAAAA, 0x5555, 0x5555_AAAA),
+            (0x1234, 0x5678, 0x5678_1234),
+            (0x8000, 0x7FFF, 0x7FFF_8000),
+        ]
+        for s0, s1, expected in cases:
+            res = run_ps_pack(s0, s1, name=f"ps_pack_mat_{s0}_{s1}")
+            self.assertEqual(res, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
