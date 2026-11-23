@@ -38,6 +38,8 @@ void check(bool condition, const char* what) {
 using Microsoft::WRL::ComPtr;
 
 using XboxCreateDeviceFn = HRESULT(WINAPI*)(IUnknown*, const void*, const IID*, void**);
+// The console's standard export (measured at ordinal 5): the PC signature, not the Xbox one.
+using StandardCreateDeviceFn = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
 using XboxCreateResourceFn = HRESULT(WINAPI*)(void*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
                                               const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
                                               const D3D12_CLEAR_VALUE*, REFIID, void**);
@@ -148,6 +150,32 @@ int main(int argc, char** argv) {
     ComPtr<ID3D12Device> device;
     device.Attach(static_cast<ID3D12Device*>(created));
     check(rt::d3d12_xs::is_device_proxy(device.Get()), "returned pointer is an Xbox-ABI proxy");
+
+    // The console exports the standard create-device name too (measured at ordinal 5, docs/d3d12_xs_surface.md
+    // section 2.1). A title that imports it must reach the same console device: the same proxy, with the caller's
+    // feature level instead of the Xbox entry point's 12_0 floor. Before the export existed the import resolved to
+    // nothing, so the title failed at load, before any device or draw.
+    auto create_device_standard = reinterpret_cast<StandardCreateDeviceFn>(
+        rt::shims::find("d3d12_xs.dll", "D3D12CreateDevice"));
+    check(create_device_standard != nullptr,
+          "shim registry exposes d3d12_xs!D3D12CreateDevice (the measured standard export)");
+    if (!create_device_standard) return 1;
+    void* standard_created = nullptr;
+    hr = create_device_standard(warp.Get(), D3D_FEATURE_LEVEL_11_0, iid_device, &standard_created);
+    check(SUCCEEDED(hr) && standard_created != nullptr, "D3D12CreateDevice returns a device");
+    if (!standard_created) {
+        std::printf("device_proxy_test: FAILED (no device from D3D12CreateDevice)\n");
+        return 1;
+    }
+    ComPtr<ID3D12Device> standard_device;
+    standard_device.Attach(static_cast<ID3D12Device*>(standard_created));
+    check(rt::d3d12_xs::is_device_proxy(standard_device.Get()), "D3D12CreateDevice returns the Xbox-ABI proxy");
+    check(rt::d3d12_xs::device_proxy_real_device(standard_device.Get()) != nullptr,
+          "the proxy from D3D12CreateDevice wraps a real device");
+    void* refused = reinterpret_cast<void*>(static_cast<std::uintptr_t>(0x1234));
+    hr = create_device_standard(warp.Get(), D3D_FEATURE_LEVEL_10_0, iid_device, &refused);
+    check(hr == E_INVALIDARG && refused == nullptr,
+          "D3D12CreateDevice refuses a feature level below 11_0 with E_INVALIDARG");
 
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device.Get());
     check(real != nullptr, "proxy exposes its PC device");

@@ -117,6 +117,91 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+// The device creation behind both entry points. On the console `D3D12CreateDevice` is a standard, token-free export
+// next to the Xbox create-device call (ordinal 5, docs/d3d12_xs_surface.md section 2.1), and it hands back the same
+// console device, so both wrap the real device in the Xbox-ABI proxy. The feature level is the caller's; the console
+// entry point's own floor is 12_0.
+HRESULT create_console_device(const char* method, IUnknown* adapter, D3D_FEATURE_LEVEL minimum, const IID* riid,
+                             void** out) {
+    using rt::d3d12_trace::result;
+    if (!out) return result(method, E_POINTER);
+    *out = nullptr;
+    if (!riid) return result(method, E_POINTER);
+
+    static std::atomic<bool> proxy_logged{false};
+    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: %s: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
+                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n",
+                     method);
+    }
+
+#ifdef LEONIDA_VULKAN_DEVICE
+    // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
+    // behind the same proxy instead of the host's D3D12 device. The layer's device is the console's 12_0 one, so a
+    // higher floor is not synthesised here.
+    char backend[16] = {};
+    size_t backend_length = 0;
+    if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
+        ID3D12Device* vulkan = nullptr;
+        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
+            __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
+        if (FAILED(vhr)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: %s: Vulkan device failed (hr=0x%08lx)\n", method,
+                         static_cast<unsigned long>(vhr));
+            return result(method, vhr);
+        }
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        if (FAILED(vhr)) {
+            vulkan->Release();
+            std::fprintf(stderr, "[rt] d3d12_xs: %s: proxy over the Vulkan device failed (hr=0x%08lx)\n", method,
+                         static_cast<unsigned long>(vhr));
+            return result(method, vhr);
+        }
+        rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        if (!rt::d3d12_trace::enabled())
+            std::fprintf(stderr, "[rt] d3d12_xs: %s -> proxy %p (Vulkan device %p)\n", method, *out,
+                         static_cast<void*>(vulkan));
+        return result(method, S_OK);
+    }
+#endif
+
+    static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
+    if (!create) return result(method, E_NOTIMPL);
+
+    ID3D12Device* real = nullptr;
+    HRESULT hr = create(adapter, minimum, __uuidof(ID3D12Device), reinterpret_cast<void**>(&real));
+    if (FAILED(hr) || !real) {
+        if (real) real->Release();
+        std::fprintf(stderr, "[rt] d3d12_xs: %s: PC D3D12CreateDevice failed (hr=0x%08lx)\n", method,
+                     static_cast<unsigned long>(hr));
+        return result(method, FAILED(hr) ? hr : E_FAIL);
+    }
+
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    if (FAILED(hr)) {
+        // create_device_proxy keeps the caller's reference on failure.
+        real->Release();
+        std::fprintf(stderr, "[rt] d3d12_xs: %s: proxy creation failed (hr=0x%08lx)\n", method,
+                     static_cast<unsigned long>(hr));
+        return result(method, hr);
+    }
+    if (!rt::d3d12_trace::enabled())
+        std::fprintf(stderr, "[rt] d3d12_xs: %s -> proxy %p (PC device %p)\n", method, *out, static_cast<void*>(real));
+    return result(method, S_OK);
+}
+
+// The measured standard export (ordinal 5): the PC signature `(adapter, minimumFeatureLevel, riid, out)`, which D3D12
+// refuses below 11_0 with E_INVALIDARG. The device is the console device, so it is the proxy the Xbox entry returns.
+HRESULT WINAPI create_device_standard(IUnknown* adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out) {
+    constexpr auto method = "D3D12CreateDevice";
+    if (minimum < D3D_FEATURE_LEVEL_11_0) {
+        if (out) *out = nullptr;
+        return rt::d3d12_trace::result(method, E_INVALIDARG);
+    }
+    return create_console_device(method, adapter, minimum, &riid, out);
+}
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
@@ -150,72 +235,14 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice params = null\n");
     }
 
-    static std::atomic<bool> proxy_logged{false};
-    if (!proxy_logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
-                     "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
-    }
-
-#ifdef LEONIDA_VULKAN_DEVICE
-    // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
-    // behind the same proxy instead of the host's D3D12 device.
-    char backend[16] = {};
-    size_t backend_length = 0;
-    if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0) {
-        ID3D12Device* vulkan = nullptr;
-        HRESULT vhr = rt::d3d12::create_vulkan_device_standalone(
-            __uuidof(ID3D12Device), reinterpret_cast<void**>(&vulkan), rt::d3d12::QueueTestSettings::ignore);
-        if (FAILED(vhr)) {
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: Vulkan device failed (hr=0x%08lx)\n",
-                         static_cast<unsigned long>(vhr));
-            return result(method, vhr);
-        }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
-        if (FAILED(vhr)) {
-            vulkan->Release();
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
-                                 "(hr=0x%08lx)\n", static_cast<unsigned long>(vhr));
-            return result(method, vhr);
-        }
-        rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
-        if (!tracing)
-            std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
-                         static_cast<void*>(vulkan));
-        return result(method, S_OK);
-    }
-#endif
-
-    static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
-    if (!create) return result(method, E_NOTIMPL);
-
-    ID3D12Device* real = nullptr;
-    HRESULT hr = create(adapter, D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device),
-                        reinterpret_cast<void**>(&real));
-    if (FAILED(hr) || !real) {
-        if (real) real->Release();
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
-                     static_cast<unsigned long>(hr));
-        return result(method, FAILED(hr) ? hr : E_FAIL);
-    }
-
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
-    if (FAILED(hr)) {
-        // create_device_proxy keeps the caller's reference on failure.
-        real->Release();
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy creation failed (hr=0x%08lx)\n",
-                     static_cast<unsigned long>(hr));
-        return result(method, hr);
-    }
-    if (!tracing)
-        std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (PC device %p)\n", *out,
-                     static_cast<void*>(real));
-    return result(method, S_OK);
+    return create_console_device(method, adapter, D3D_FEATURE_LEVEL_12_0, riid, out);
 }
 
 static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
+static_assert(std::is_same_v<decltype(&create_device_standard), CreateDeviceFn>);
+
 
 // Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
 // dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
@@ -230,5 +257,6 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
+    {"d3d12_xs.dll", "D3D12CreateDevice", reinterpret_cast<void*>(&create_device_standard)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );
