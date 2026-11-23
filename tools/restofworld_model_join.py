@@ -240,6 +240,37 @@ def parse_page_map(sys_bytes):
     }
 
 
+class ModelSystemPages:
+    """Track the existing model-map exception to the 64-byte scanned-stream cutoff.
+
+    Only a map readable in the first, full-sized model page establishes a run. Callers supply their
+    existing framing checks; archive scans require adjacent, zero-padded streams, while folder joins
+    already treat their ordered files as contiguous. No payload is retained.
+    """
+
+    def __init__(self):
+        self.remaining = 0
+
+    def reset(self):
+        self.remaining = 0
+
+    def minimum_size(self, adjacent):
+        return 1 if adjacent and self.remaining == 1 else 64
+
+    def accept(self, data, *, adjacent, root_framed):
+        previous = self.remaining
+        self.reset()
+        if not data or len(data) % 65536:
+            return
+        if adjacent and previous:
+            self.remaining = previous - 1
+        elif root_framed and classify_system_root(data) in ("drawable", "drawable_dict", "fragment"):
+            try:
+                self.remaining = parse_page_map(data)["system_pages"] - 1
+            except JoinError:
+                pass  # The full join still checks maps that extend into another system page.
+
+
 def _check_cstring(sys_bytes, ptr_at, skip=0):
     """Validate that a name pointer resolves to printable ASCII without returning the name."""
     p = _u64(sys_bytes, ptr_at)
@@ -930,7 +961,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                 raise ValueError("start offset is outside the archive")
             end = min(file_size, pos + limit) if limit is not None else file_size
             last = pos
-            system_pages_remaining = 0
+            system_pages = ModelSystemPages()
             while pos < end:
                 found = ZHDR.search(m, pos, end)
                 if not found:
@@ -962,14 +993,13 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                         "head_tag": "bink2",
                     })
                     last = pos = s + blen
-                    system_pages_remaining = 0
+                    system_pages.reset()
                     continue
 
-                continued_system = (system_pages_remaining > 0 and s == ((last + 15) & ~15)
-                                    and not any(m[last:s]))
+                adjacent = s == ((last + 15) & ~15) and not any(m[last:s])
                 # A declared final system page can be smaller than the minimum for a scanned stream.
                 data, used, too_big = _inflate_exact(
-                    m, s, end, max_inflate, min_inflate=1 if continued_system and system_pages_remaining == 1 else 64)
+                    m, s, end, max_inflate, min_inflate=system_pages.minimum_size(adjacent))
                 if data is None:
                     if too_big:
                         skipped += 1
@@ -992,16 +1022,8 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     "head_tag": classify_graphics_head(data),
                 }
                 streams.append(meta)
-                if continued_system:
-                    system_pages_remaining = system_pages_remaining - 1 if len(data) % 65536 == 0 else 0
-                else:
-                    system_pages_remaining = 0
-                    if (meta["align4k_plus16"] and meta["pre16_zero"] and len(data) % 65536 == 0
-                            and classify_system_root(data) in ("drawable", "drawable_dict", "fragment")):
-                        try:
-                            system_pages_remaining = parse_page_map(data)["system_pages"] - 1
-                        except JoinError:
-                            pass  # The full join checks page maps that extend into another system page.
+                system_pages.accept(data, adjacent=adjacent,
+                                    root_framed=meta["align4k_plus16"] and meta["pre16_zero"])
                 last = pos = s + used
 
             cache = {}
@@ -1028,6 +1050,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     streams = []
     files = []
     skipped = 0
+    system_pages = ModelSystemPages()
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
@@ -1035,14 +1058,23 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         fsize = os.path.getsize(full)
         if name.endswith(".bin") and fsize > max_inflate:
             skipped += 1
+            system_pages.reset()
             continue
-        if fsize < 64:
+        minimum = 64 if name.endswith(".bk2") else system_pages.minimum_size(True)
+        if fsize < minimum:
+            system_pages.reset()
             continue
         match = re.match(r"([0-9a-fA-F]{6,})", name)
         off = int(match.group(1), 16) if match else len(streams)
         with open(full, "rb") as fh:
             head = fh.read(32)
-        if head[:3] == b"KB2" and len(head) >= 0x1C:
+            if fsize % 65536 == 0 and head[:3] != b"KB2":
+                # Inspect the model header and map without copying a full page just for this metadata pass.
+                with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                    system_pages.accept(data, adjacent=True, root_framed=True)
+            else:
+                system_pages.reset()
+        if fsize >= 64 and head[:3] == b"KB2" and len(head) >= 0x1C:
             streams.append({
                 "stream_index": len(streams),
                 "offset": off,

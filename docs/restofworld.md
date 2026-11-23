@@ -454,6 +454,11 @@ and a valid zlib checksum. That restores the normal draw binding. Both the
 diagnostic and the pinned model reader recover the containing dictionary's 11
 children.
 
+`rpf9_carve.py` and the carved-folder model join use the same short final-system-page
+exception, so a carve retains that page and can reproduce the archive join. Unrelated
+streams still need at least 64 inflated bytes. The folder join keeps its existing
+file-order framing policy; archive readers additionally require alignment and zero padding.
+
 | Pointed-to group start relative to the target stream (original survey) | Blocks |
 |---|---:|
 | Preceding stream | 68 |
