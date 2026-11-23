@@ -84,7 +84,7 @@ class LodExportTest(unittest.TestCase):
             unavailable = manifests[1]["ModelDecodeFailures"].get("lod-unavailable", 0)
             self.assertTrue(second and unavailable, "the window should hold drawables with and without a second LOD")
             self.assertLessEqual(set(second), set(first))
-            # Every drawable that decodes at LOD 0 either decodes at LOD 1 or is counted as not having it.
+            # Every drawable that decodes at LOD 0 either decodes at LOD 1 or is counted as lod-unavailable.
             self.assertEqual(len(second) + unavailable, len(first))
             self.assertTrue(all(second[k]["Tris"] < first[k]["Tris"] for k in second))
             self.assertFalse(any(Path(tmp, "levels", "models_lod1").glob("*_tex")))

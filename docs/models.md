@@ -284,14 +284,15 @@ written to the index cache, which describes a whole file; the manifest records `
 `Scan.Length` for it. One measured 1 GiB slice of `levels.rpf`: 1,228 models scanned, recovered,
 decoded and exported in about 2 s (497 MB of OBJ and manifest).
 
-`--lod N` exports another of the drawable's four LOD model lists: 0 (the default) is the list at drawable
-`+0x50`, 1 to 3 the lists at `+0x58`, `+0x60` and `+0x68`. A LOD export is written to
-`<outdir>/<archive>/models_lod<N>/`, beside the LOD 0 export and with the same OBJ names, so it never stands in
-for `models/manifest.json`, which `make_game.py` resumes on; it writes no embedded textures, which belong to the
-drawable. A drawable without that LOD is counted under `lod-unavailable` and left out of the manifest; it does not
-fail the run. In a 64 MiB window of `levels.rpf` where many drawables have one, 709 of 1,115 drawables decode at
-LOD 1, each with fewer triangles than at LOD 0, and the other 406 are `lod-unavailable`. Most interior BLAS are
-built from LOD 1 ([bvh.md](bvh.md) §7).
+`--lod N` exports another of the drawable's four LOD model lists: 0 (the default) is the list at drawable `+0x50`, 1
+to 3 the lists at `+0x58`, `+0x60` and `+0x68`. A LOD export is written to `<outdir>/<archive>/models_lod<N>/`,
+beside the LOD 0 export and with the same OBJ names, so it never stands in for `models/manifest.json`, which
+`make_game.py` resumes on; it writes no embedded textures, which belong to the drawable. A drawable that decodes at
+LOD 0 but not at LOD N is counted under `lod-unavailable` and left out of the manifest; it does not fail the run.
+That covers a drawable without that LOD (a zero pointer) and one whose LOD N list the decoder rejects for its
+layout; the count does not tell the two apart. In a 64 MiB window of `levels.rpf` where many drawables have one, 709
+of 1,115 drawables decode at LOD 1, each with fewer triangles than at LOD 0, and the other 406 are
+`lod-unavailable`. Most interior BLAS are built from LOD 1 ([bvh.md](bvh.md) §7).
 
 To locate a named drawable before decoding, `tools/rpf9_names.py` indexes the measured
 `name.#dr`/`#ft`/`#dd` spellings in bounded zlib prefixes without the encrypted TOC; see

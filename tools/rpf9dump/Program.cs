@@ -359,7 +359,7 @@ else if (mode is "models" or "textures")
                 return new Result(new { e.Offset, Drawable = e.ResourceDrawableOffset, File = stem + ".obj", m.Name, Meshes = m.Meshes.Count, Verts = m.Meshes.Sum(x => x.Positions.Count), Tris = m.Meshes.Sum(x => x.Indices.Count) / 3, m.IsFragment, m.HasBoneBindings,
                     Min = new[] { m.BoundsMin.X, m.BoundsMin.Y, m.BoundsMin.Z }, Max = new[] { m.BoundsMax.X, m.BoundsMax.Y, m.BoundsMax.Z },
                     // Per geometry, in the order of the OBJ's `o` groups: triangles, the model it belongs to in the
-                    // drawable's primary-LOD list and its position in that model (a dehydrated BLAS leaf's geometry
+                    // exported LOD's model list and its position in that model (a dehydrated BLAS leaf's geometry
                     // index counts the geometries whose shader it keeps, docs/bvh.md §4a).
                     MeshShaders = m.Meshes.Select(x => x.ShaderIndex).ToArray(),
                     MeshTris = m.Meshes.Select(x => x.Indices.Count / 3).ToArray(),
