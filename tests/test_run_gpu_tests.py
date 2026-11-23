@@ -321,6 +321,22 @@ class UniformBranchCheck(unittest.TestCase):
     def test_set_bit_without_8_fails(self):
         self.assertFalse(self.judge([(7, 1, 0.5), (8, 0, 0.1), (7, 0, 0.1)])[0])
 
+    def test_no_s5_8_at_all_reports_wave_branch_never_taken(self):
+        ok, detail = self.judge([(7, 0, 0.1)])
+        self.assertFalse(ok)
+        self.assertIn("no pixel got s5=8", detail)
+        self.assertNotIn("decided per lane", detail)
+
+    def test_no_bit_1_pixel_reports_missing_bit_1(self):
+        ok, detail = self.judge([(8, 0, 0.1), (7, 0, 0.1)])
+        self.assertFalse(ok)
+        self.assertIn("no bit=1 pixel got s5=8", detail)
+
+    def test_no_s5_7_reports_wave_branch_always_taken(self):
+        ok, detail = self.judge([(8, 1, 0.5), (8, 0, 0.1)])
+        self.assertFalse(ok)
+        self.assertIn("no pixel got s5=7", detail)
+
 
 class Wave32LaneDumps(unittest.TestCase):
     """run_gpu_tests.py skips cs_wqm_w32 and cs_w32_lane_wrap below 32 lanes with check.py's rule."""

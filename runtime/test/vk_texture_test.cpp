@@ -182,6 +182,41 @@ int main(int argc, char** argv) {
     float prio = 1;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
+    // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
+    LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures2);
+    VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
+    std::fprintf(stderr, "device: %s\ntexel offset limits: %d..%d, gather %d..%d\n", pdp.deviceName,
+                 pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
+                 pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
+    std::vector<const char*> enable;
+    bool has_m8_ext = false;
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
+    // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
+    uint32_t en = 0; vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
+    std::vector<VkExtensionProperties> exts(en); vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, exts.data());
+    for (auto& x : exts) has_m8_ext = has_m8_ext || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
+    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f11q;
+    VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2q.pNext = &f12q;
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (has_m8_ext) { m8q.pNext = f2q.pNext; f2q.pNext = &m8q; }
+#endif
+    vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    if (!f11q.shaderDrawParameters) {
+        std::fprintf(stderr, "unsupported: vk_texture_test needs shaderDrawParameters\n");
+        return 77;
+    }
+    if (!f12q.bufferDeviceAddress || !f12q.runtimeDescriptorArray || !f12q.descriptorIndexing) {
+        std::fprintf(stderr, "unsupported: vk_texture_test needs bufferDeviceAddress, runtimeDescriptorArray, and descriptorIndexing\n");
+        return 77;
+    }
+    if (!f2q.features.shaderInt64 || !f2q.features.shaderSampledImageArrayDynamicIndexing) {
+        std::fprintf(stderr, "unsupported: vk_texture_test needs shaderInt64 and shaderSampledImageArrayDynamicIndexing\n");
+        return 77;
+    }
     // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) for the zero-based v0 / v3.
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
     f11.shaderDrawParameters = VK_TRUE;
@@ -190,31 +225,21 @@ int main(int argc, char** argv) {
     f12.bufferDeviceAddress = VK_TRUE; f12.runtimeDescriptorArray = VK_TRUE; f12.descriptorIndexing = VK_TRUE;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2}; f2.pNext = &f12;
     f2.features.shaderInt64 = VK_TRUE;
-    // Texel offsets: the limits the shader's Offset operands must stay inside, and the two optional features.
-    LI(vkEnumerateDeviceExtensionProperties); LI(vkGetPhysicalDeviceFeatures);
-    VkPhysicalDeviceProperties pdp; vkGetPhysicalDeviceProperties(pd, &pdp);
-    std::fprintf(stderr, "device: %s\ntexel offset limits: %d..%d, gather %d..%d\n", pdp.deviceName,
-                 pdp.limits.minTexelOffset, int(pdp.limits.maxTexelOffset),
-                 pdp.limits.minTexelGatherOffset, int(pdp.limits.maxTexelGatherOffset));
-    VkPhysicalDeviceFeatures have; vkGetPhysicalDeviceFeatures(pd, &have);
-    f2.features.shaderImageGatherExtended = have.shaderImageGatherExtended;
-    f2.features.shaderResourceMinLod = have.shaderResourceMinLod;
-    if (declares_capability(read_spv(fs_path.c_str()), 42) && !have.shaderResourceMinLod) {   // 42 = MinLod
+    f2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    f2.features.shaderImageGatherExtended = f2q.features.shaderImageGatherExtended;
+    f2.features.shaderResourceMinLod = f2q.features.shaderResourceMinLod;
+    if (declares_capability(read_spv(fs_path.c_str()), 42) && !f2q.features.shaderResourceMinLod) {   // 42 = MinLod
         std::printf("unsupported: shaderResourceMinLod (the shader clamps its LOD with MinLod)\n");
         return 77;
     }
-    std::vector<const char*> enable;
     leonida::vk_test::ShaderFma fma;      // OpFmaKHR (rdna2spirv.py --fma khr), when the device has it
     fma.query(gipa, inst, pd);
     if (fma.supported()) { enable.push_back(fma.extension()); fma.link_after(&f2); }
     bool m8_on = false;
-#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME   // the structure type is an enumerator: defined() never sees it
-    // Older Vulkan headers (as on some CI images) do not declare maintenance8; the test is then unsupported.
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
-    uint32_t en = 0; vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr);
-    std::vector<VkExtensionProperties> exts(en); vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, exts.data());
-    for (auto& x : exts) m8_on = m8_on || !std::strcmp(x.extensionName, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
-    if (m8_on) {
+    if (has_m8_ext && m8q.maintenance8) {
+        m8_on = true;
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         m8.maintenance8 = VK_TRUE; f11.pNext = &m8;
         std::fprintf(stderr, "enabled %s\n", VK_KHR_MAINTENANCE_8_EXTENSION_NAME);

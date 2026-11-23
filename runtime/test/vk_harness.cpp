@@ -304,7 +304,32 @@ int main(int argc, char** argv) {
             needs_float64 = true;
         i += words;
     }
-    if (needs_barycentric && !has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12q.pNext = &f11q;
+    VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    f13q.pNext = &f12q;
+    VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2q.pNext = &f13q;
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR baryq{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+    if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+        baryq.pNext = f2q.pNext; f2q.pNext = &baryq;
+    }
+    VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lockq{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
+    if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+        lockq.pNext = f2q.pNext; f2q.pNext = &lockq;
+    }
+#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
+    VkPhysicalDeviceMaintenance8FeaturesKHR m8q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+    if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+        m8q.pNext = f2q.pNext; f2q.pNext = &m8q;
+    }
+#endif
+    vkGetPhysicalDeviceFeatures2(pd, &f2q);
+    if (needs_barycentric &&
+        (!has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) || !baryq.fragmentShaderBarycentric)) {
         std::fprintf(stderr, "unsupported: %s reads BaryCoordKHR and the device has no %s\n",
                      argv[2], VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         return 77;
@@ -323,11 +348,11 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
     VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT lock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT};
-    if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+    if (has(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) && baryq.fragmentShaderBarycentric) {
         enable.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         bary.fragmentShaderBarycentric = VK_TRUE; bary.pNext = chain; chain = &bary;
     }
-    if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+    if (has(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME) && lockq.fragmentShaderPixelInterlock) {
         enable.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
         lock.fragmentShaderPixelInterlock = VK_TRUE; lock.pNext = chain; chain = &lock;
     }
@@ -390,19 +415,11 @@ int main(int argc, char** argv) {
     }
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
-    if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
+    if (has(VK_KHR_MAINTENANCE_8_EXTENSION_NAME) && m8q.maintenance8) {
         enable.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
         m8.maintenance8 = VK_TRUE; m8.pNext = chain; chain = &m8;
     }
 #endif
-    VkPhysicalDeviceVulkan11Features f11q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    f12q.pNext = &f11q;
-    VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    f13q.pNext = &f12q;
-    VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
-    vkGetPhysicalDeviceFeatures2(pd, &f2q);
     // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
     // zero-based ids.
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};

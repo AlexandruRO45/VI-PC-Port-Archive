@@ -492,9 +492,15 @@ def check_uniform_branch(raw_path: str) -> tuple[bool, str]:
     if bad:
         return False, first
     detail = f"s5==8: {n8} ({n80} of them with bit 0), s5==7: {n7} ({len(u32)} px)"
+    if not n8:
+        return False, "no pixel got s5=8 (wave branch never taken); " + detail
     if not n80:
         return False, "no bit=0 pixel got s5=8: the branch was decided per lane, not by the wave; " + detail
-    return (n8 - n80 > 0 and n7 > 0), detail
+    if n8 - n80 <= 0:
+        return False, "no bit=1 pixel got s5=8; " + detail
+    if not n7:
+        return False, "no pixel got s5=7 (wave branch always taken); " + detail
+    return True, detail
 
 
 def check_d16_texture(raw_path: str) -> tuple[bool, str]:
