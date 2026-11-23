@@ -390,6 +390,9 @@ def main(argv=None):
     try:
         names = read_mount_lists(a.mount)
     except (OSError, ValueError) as error:
+        # str(OSError) quotes the path with repr(), which doubles every backslash of a Windows path
+        if isinstance(error, OSError) and error.filename and error.strerror:
+            error = f"{error.filename}: {error.strerror}"
         print(f"bink_names: error: {error}", file=sys.stderr)
         return 1
     try:
