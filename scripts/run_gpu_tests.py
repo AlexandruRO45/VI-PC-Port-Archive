@@ -29,7 +29,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
                    fmt_xy_xyz_test, tbuffer_store_test)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, GRADIENT_TESTS, ROUND_MODE_WORDS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST
@@ -964,6 +964,14 @@ def run_suite(a, work: str) -> int:
             n = len(CVT_F32_SAT_CASES)
             results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
                             else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+        elif name == "cs_round_mode":
+            # Translator contract row s_round_mode (docs/design.md): MODE.FP_ROUND[3:2] selects the f16 rounding
+            # (0 nearest even, 3 toward zero) and s_setreg_imm32_b32 on the same field writes the same state.
+            # One thread and a fixed tie value per result, so no wave64 requirement; words in cs_round_mode.asm.
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            ok, detail = judge_cs_dump(rc, msg, ROUND_MODE_WORDS, wave64=False, partial=False, emulated=False,
+                                       hexwords=True)
+            results.append((name, ok, detail))
         elif name == "cs_fma_fused":
             # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
             # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).
