@@ -11,8 +11,9 @@ tens of thousands of small blobs a spotty one. ``docs/gamedata.md`` uses these c
 
 Only counts are written. The input is the user's own export and stays local.
 
-`--json` is published from a staging file next to the destination, creating the folder when it is missing, so
-a run that fails while writing leaves an older report in place; a write error is one `ERROR:` line and exit 2.
+`--json` follows symbolic links and publishes from a staging file next to the resolved destination, creating
+the folder when it is missing. A failed write leaves the older report in place; a write error is one `ERROR:`
+line and exit 2. Other hard links to a replaced destination keep the previous file.
 Usage: `python -I tools/mask_channels.py --help` lists the options.
 """
 from __future__ import annotations
@@ -84,9 +85,10 @@ def main(argv=None) -> int:
         ap.error("--thresholds takes integers")
     if not thresholds or any(not 0 < t <= 255 for t in thresholds):
         ap.error("--thresholds must be within 1..255")
-    if a.json and same_report_path(a.dds, a.json):
+    json_path = os.path.realpath(a.json) if a.json else None
+    if json_path and same_report_path(a.dds, json_path):
         ap.error("--json names the input texture; writing it would replace the DDS")
-    if a.json and os.path.isdir(a.json):
+    if json_path and os.path.isdir(json_path):
         print(f"error: --json path is a directory: {a.json}", file=sys.stderr)
         return 2
     try:
@@ -102,16 +104,16 @@ def main(argv=None) -> int:
                  for t, v in row["thresholds"].items()]
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
-    if a.json:
-        out_dir = os.path.dirname(os.path.abspath(a.json))
+    if json_path:
+        out_dir = os.path.dirname(json_path)
         try:
             os.makedirs(out_dir, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
                 staged = os.path.join(staging, "masks.json")
                 with open(staged, "w", encoding="utf-8", newline="\n") as fh:
                     json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
-                os.chmod(staged, published_mode(a.json))    # tempfile creates 0600; the report gets the usual bits
-                os.replace(staged, a.json)
+                os.chmod(staged, published_mode(json_path))  # tempfile creates 0600; use the report's usual bits
+                os.replace(staged, json_path)
         except OSError as error:
             # A failed write must not leave a half-written report where the last good one was.
             reason = error.strerror or str(error)

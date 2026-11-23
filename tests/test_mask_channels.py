@@ -188,7 +188,7 @@ class MaskChannelTests(unittest.TestCase):
                     self.assertRaises(SystemExit) as cm:
                 mc.main([path, "--json", out])
             self.assertEqual(cm.exception.code, 2)
-            guard.assert_called_once_with(path, out)
+            guard.assert_called_once_with(path, os.path.realpath(out))
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), original)
 
