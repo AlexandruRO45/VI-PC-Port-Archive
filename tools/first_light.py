@@ -593,7 +593,11 @@ def rebuild_if_stale(harness: str) -> None:
         return
     build = os.path.dirname(harness)
     print(f"first_light: {harness} is older than the runtime sources, rebuilding vk_harness", file=sys.stderr)
-    if subprocess.run(["cmake", "--build", build, "--target", "vk_harness"]).returncode != 0:
+    try:
+        result = subprocess.run(["cmake", "--build", build, "--target", "vk_harness"])
+    except FileNotFoundError:
+        raise SystemExit("cmake not found, cannot rebuild vk_harness") from None
+    if result.returncode != 0:
         raise SystemExit(f"vk_harness is out of date and rebuilding it failed: fix the build in {build}, or pass --harness")
 
 
@@ -608,6 +612,8 @@ def find_harness(explicit: str | None) -> str:
     ):
         if candidate and os.path.isfile(candidate):
             if candidate not in (explicit, os.environ.get("LEONIDA_VK_HARNESS")):
+                # This check runs on every host. Without --config, a multi-config build
+                # rebuilds the default configuration, which may differ from the binary found here.
                 rebuild_if_stale(candidate)
             return candidate
     for folder in build_dirs:

@@ -69,6 +69,14 @@ class StaleBinary(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 first_light.find_harness(None)
 
+    def test_first_light_reports_missing_cmake_when_rebuilding_a_stale_harness(self):
+        self.touch(self.source, NEW)
+        with mock.patch.object(first_light, "ROOT", self.root), \
+                mock.patch.dict(os.environ, {"PATH": self.root}), \
+                mock.patch.object(first_light.subprocess, "run", side_effect=FileNotFoundError), \
+                self.assertRaisesRegex(SystemExit, "^cmake not found, cannot rebuild vk_harness$"):
+            first_light.rebuild_if_stale(self.harness_path)
+
     def pipelines_preflight(self, source_time):
         self.touch(self.source, source_time)
         work = os.path.join(self.root, "work")
