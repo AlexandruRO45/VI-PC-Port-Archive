@@ -351,8 +351,37 @@ def collect_skeletons_dir(path):
     return out
 
 
+def _carve_spans(path):
+    """Optional carver metadata: canonical file name -> (compressed size, inflated size)."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}
+    rows = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    spans = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        offset, stored, size = (row.get(key) for key in ("off", "stored", "size"))
+        if any(type(v) is not int for v in (offset, stored, size)) or offset < 0 or stored <= 0 or size < 0:
+            continue
+        name = f"{offset:012x}.bin"
+        if name in spans:  # An ambiguous manifest cannot identify one stored span for this file.
+            return {}
+        spans[name] = stored, size
+    return spans
+
+
 def collect_rbf0_dir(path):
-    """The same continuation rule for a carved directory sorted by offset."""
+    """The same continuation rule for a carved directory sorted by offset.
+
+    File names hold archive offsets, so gaps need the carver's compressed spans. Without matching metadata,
+    keep the legacy length-based rule for bare folders.
+    """
+    spans = _carve_spans(path)
     entries = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
@@ -361,22 +390,25 @@ def collect_rbf0_dir(path):
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(entries)
         with open(full, "rb") as f:
-            entries.append((offset, name, f.read()))
+            data = f.read()
+        span = spans.get(name)
+        stored = span[0] if span is not None and span[1] == len(data) else len(data)
+        entries.append((offset, name, data, stored))
     entries.sort(key=lambda e: e[0])
-    first = next((i for i, (_, _, data) in enumerate(entries) if data[:4] == b"RBF0"), None)
+    first = next((i for i, (_, _, data, _) in enumerate(entries) if data[:4] == b"RBF0"), None)
     if first is None:
         return None
     blob = bytearray(entries[first][2])
-    previous_end = entries[first][0] + len(entries[first][2])
+    previous_end = entries[first][0] + entries[first][3]
     previous_size = len(entries[first][2])
-    for offset, _, data in entries[first + 1:]:
+    for offset, _, data, stored in entries[first + 1:]:
         if previous_size != MAX_CHUNK:
             break
         sign = classify(data, offset, len(data))["signature"]
         if len(blob) >= 8 * 1024 * 1024 or offset > previous_end + 16 or sign in STOP_SIGNATURES or len(data) > MAX_CHUNK:
             break
         blob += data
-        previous_end = offset + len(data)
+        previous_end = offset + stored
         previous_size = len(data)
     return bytes(blob)
 
