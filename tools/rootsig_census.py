@@ -32,9 +32,15 @@ import glob
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 KNOWN_VERSIONS = {1: "1.0", 2: "1.1", 3: "1.2"}
 TYPE_NAMES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
@@ -289,6 +295,41 @@ def summarize(rows):
     }
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(report, fh, indent=1, sort_keys=True)
+            fh.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".rootsig_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="tools/fspx_unpack.py --out folder")
@@ -329,9 +370,7 @@ def main(argv=None):
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
-            fh.write("\n")
+        write_json_report(a.json, {"rows": rows, "summary": summary})
     return 1 if errors else 0
 
 

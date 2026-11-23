@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -270,6 +271,17 @@ class TestCensus(unittest.TestCase):
                 lines = r.stderr.splitlines()
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
+
+    def test_json_write_failure_preserves_previous_report(self):
+        previous = '{"previous": true}\n'
+        path = os.path.join(self.tmp.name, "keep.json")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(previous)
+        with mock.patch.object(R, "replace_retry", side_effect=OSError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                R.write_json_report(path, {"rows": [], "summary": {}})
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), previous)
 
 
 if __name__ == "__main__":
