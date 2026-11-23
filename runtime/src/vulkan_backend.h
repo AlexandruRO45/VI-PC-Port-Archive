@@ -548,11 +548,14 @@ public:
 
     // Longest single vkWaitSemaphores call in run(): bounds how long the thread can sit in an uninterruptible wait.
     static constexpr std::uint64_t kWaitSliceNs = 100'000'000;  // 100 ms
+    // Short wait slice used when wakeup_sem_ could not be created on an otherwise healthy device, so new waits,
+    // cancel(), and stop() still wake promptly while healthy fence waits never complete before their target value.
+    static constexpr std::uint64_t kFallbackWaitSliceNs = 1'000'000;  // 1 ms
 
     FenceWaitDispatcher(VkDevice device, const VulkanDeviceFunctions& vk, std::atomic<bool>& device_lost)
-        : device_(device), vk_(vk), device_lost_(device_lost) {
-        if (device_ && vk_.vkCreateSemaphore && vk_.vkDestroySemaphore && vk_.vkSignalSemaphore &&
-            vk_.vkWaitSemaphores && vk_.vkGetSemaphoreCounterValue) {
+        : device_(device), vk_(vk), device_lost_(device_lost),
+          can_wait_(device_ && vk_.vkWaitSemaphores && vk_.vkGetSemaphoreCounterValue) {
+        if (can_wait_ && vk_.vkCreateSemaphore && vk_.vkDestroySemaphore && vk_.vkSignalSemaphore) {
             VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
             type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             type.initialValue = 0;
@@ -586,7 +589,7 @@ public:
         SignalEventFn immediate_fn = nullptr;
         {
             std::lock_guard lock(mutex_);
-            if (stop_ || !wakeup_sem_ || device_lost_.load(std::memory_order_acquire)) {
+            if (stop_ || !can_wait_ || device_lost_.load(std::memory_order_acquire)) {
                 immediate_fn = signal_event_;
             } else {
                 pending_.push_back({sem, value, event_handle, {}});
@@ -611,7 +614,7 @@ public:
         std::function<void()> immediate_cb;
         {
             std::lock_guard lock(mutex_);
-            if (stop_ || !wakeup_sem_ || device_lost_.load(std::memory_order_acquire)) {
+            if (stop_ || !can_wait_ || device_lost_.load(std::memory_order_acquire)) {
                 immediate_cb = std::move(cb);
             } else {
                 pending_.push_back({sem, value, nullptr, std::move(cb)});
@@ -886,8 +889,10 @@ private:
 
             semaphores_.clear();
             values_.clear();
-            semaphores_.push_back(wakeup_sem_);
-            values_.push_back(wakeup_val_ + 1);
+            if (wakeup_sem_) {
+                semaphores_.push_back(wakeup_sem_);
+                values_.push_back(wakeup_val_ + 1);
+            }
             for (const Entry& e : pending_) {
                 semaphores_.push_back(e.semaphore);
                 values_.push_back(e.value);
@@ -906,7 +911,8 @@ private:
             // is pending (d3d12_queue_wait_timeout's _Exit, or quitting with a fence outstanding) never finishes
             // exiting, and TerminateProcess cannot end it either. A timeout returns here and the loop re-arms the
             // same wait; completions still wake it at once through the ANY wait.
-            const VkResult res = vk_.vkWaitSemaphores(device_, &wi, kWaitSliceNs);
+            const VkResult res =
+                vk_.vkWaitSemaphores(device_, &wi, wakeup_sem_ ? kWaitSliceNs : kFallbackWaitSliceNs);
 
             lock.lock();
             waiting_ = false;
@@ -968,6 +974,7 @@ private:
     VkDevice device_;
     const VulkanDeviceFunctions& vk_;
     std::atomic<bool>& device_lost_;
+    bool can_wait_ = false;
     SignalEventFn signal_event_ = nullptr;
     VkSemaphore wakeup_sem_ = VK_NULL_HANDLE;
     std::uint64_t wakeup_val_ = 0;

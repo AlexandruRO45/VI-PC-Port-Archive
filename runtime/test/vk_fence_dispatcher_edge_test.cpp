@@ -1,7 +1,9 @@
 // FenceWaitDispatcher edge-case regressions (runtime/src/vulkan_backend.h):
 //   1. wakeup_sem_ creation failure (VK_ERROR_OUT_OF_HOST_MEMORY / VK_ERROR_DEVICE_LOST):
-//      enqueue() / enqueue_callback() complete immediately outside mutex_ instead of stranding
-//      entries in pending_ with no worker thread, and VK_ERROR_DEVICE_LOST sets device_lost_.
+//      on a healthy device (OOM), waits still start the worker and wait on the real target
+//      semaphores with a short fallback slice (zero early hits before the target value,
+//      immediate completion when reached, bounded cancel/stop, zero VK_NULL_HANDLE waits);
+//      on VK_ERROR_DEVICE_LOST, device_lost_ is set immediately and waits complete promptly.
 //   2. cancel(sem) on unstarted entries in a live ready batch (both cross-thread and re-entrant):
 //      claims and dispatches callbacks and events synchronously before cancel() returns (so
 //      FenceWaiter / held-signal bookkeeping is never dropped), while preserving dea6c38354's
@@ -48,6 +50,7 @@ PFN_vkGetSemaphoreCounterValue real_get_counter = nullptr;
 
 std::atomic<VkResult> fail_next_create_sem{VK_SUCCESS};
 std::atomic<bool> destroyed_null_or_garbage{false};
+std::atomic<bool> waited_on_null_or_empty{false};
 std::atomic<bool> in_wait_semaphores{false};
 std::atomic<std::uint32_t> wait_sem_count{0};
 std::atomic<VkResult> fail_wait_result{VK_SUCCESS};
@@ -77,7 +80,14 @@ VKAPI_ATTR void VKAPI_CALL destroy_semaphore(VkDevice device, VkSemaphore sem, c
 
 VKAPI_ATTR VkResult VKAPI_CALL wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
     wait_calls.fetch_add(1, std::memory_order_relaxed);
-    wait_sem_count.store(info->semaphoreCount, std::memory_order_release);
+    if (!info || info->semaphoreCount == 0 || !info->pSemaphores) {
+        waited_on_null_or_empty.store(true, std::memory_order_release);
+    } else {
+        for (std::uint32_t i = 0; i < info->semaphoreCount; ++i) {
+            if (info->pSemaphores[i] == VK_NULL_HANDLE) waited_on_null_or_empty.store(true, std::memory_order_release);
+        }
+    }
+    wait_sem_count.store(info ? info->semaphoreCount : 0u, std::memory_order_release);
     const VkResult inject = fail_wait_result.load(std::memory_order_acquire);
     if (inject != VK_SUCCESS) return inject;
     in_wait_semaphores.store(true, std::memory_order_release);
@@ -166,8 +176,11 @@ int main() {
     }
     driver::install(d.device_proc, d.device);
     driver::destroyed_null_or_garbage.store(false, std::memory_order_release);
+    driver::waited_on_null_or_empty.store(false, std::memory_order_release);
 
-    // 1. wakeup_sem_ creation failure: immediate completion outside mutex_ + DEVICE_LOST propagation.
+    // 1. wakeup_sem_ creation failure: healthy OOM waits on target semaphores with a short fallback slice (never
+    //    firing early before the target value, completing when signaled, and cancelling promptly); DEVICE_LOST sets
+    //    device_lost_ immediately.
     {
         driver::reset_faults();
         driver::fail_next_create_sem.store(VK_ERROR_OUT_OF_HOST_MEMORY, std::memory_order_release);
@@ -179,23 +192,70 @@ int main() {
         EXPECT(fence.semaphore() != VK_NULL_HANDLE);
 
         EventCounter evt;
+        std::mutex mu;
+        std::condition_variable cv;
+        int cb_hits = 0;
         ctx.set_signal_event_fn(signal_event_counter);
         ctx.enqueue_fence_wait(fence.semaphore(), 100, &evt);
+        ctx.enqueue_fence_callback(fence.semaphore(), 100, [&] {
+            {
+                std::lock_guard lk(mu);
+                ++cb_hits;
+            }
+            cv.notify_all();
+        });
+
+        // Must NOT fire immediately on a healthy device, must start the worker without wakeup_sem_
+        // (2 real target entries, zero VK_NULL_HANDLE), and must still stay quiet after an intermediate signal of 99.
+        {
+            std::lock_guard lk(evt.mu);
+            EXPECT(evt.hits == 0);
+        }
+        {
+            std::lock_guard lk(mu);
+            EXPECT(cb_hits == 0);
+        }
+        EXPECT(wait_until_wait_sem_count(2));
+        EXPECT(fence.signal(99));
+        {
+            std::unique_lock lk(mu);
+            EXPECT(!cv.wait_for(lk, std::chrono::milliseconds(50), [&] { return cb_hits > 0; }));
+        }
+        {
+            std::lock_guard lk(evt.mu);
+            EXPECT(evt.hits == 0);
+        }
+        EXPECT(!ctx.is_device_lost());
+
+        // Reaching 100 must wake vkWaitSemaphores and complete both the event and callback.
+        EXPECT(fence.signal(100));
         {
             std::unique_lock lk(evt.mu);
-            EXPECT(evt.hits == 1);
+            EXPECT(evt.cv.wait_for(lk, std::chrono::milliseconds(2000), [&] { return evt.hits == 1; }));
+        }
+        {
+            std::unique_lock lk(mu);
+            EXPECT(cv.wait_for(lk, std::chrono::milliseconds(2000), [&] { return cb_hits == 1; }));
         }
 
-        int cb_hits = 0;
-        int nested_hits = 0;
-        ctx.enqueue_fence_callback(fence.semaphore(), 100, [&] {
-            ++cb_hits;
-            // Re-entrant enqueue must not deadlock when running outside mutex_.
-            ctx.enqueue_fence_callback(fence.semaphore(), 101, [&] { ++nested_hits; });
+        // Unsignaled wait must still cancel promptly via the short fallback wait slice.
+        bool cancel_cb_hit = false;
+        ctx.enqueue_fence_callback(fence.semaphore(), 200, [&] {
+            std::lock_guard lk(mu);
+            cancel_cb_hit = true;
+            cv.notify_all();
         });
-        EXPECT(cb_hits == 1);
-        EXPECT(nested_hits == 1);
-        ctx.cancel_fence_waits(fence.semaphore());
+        EXPECT(wait_until_wait_sem_count(1));
+        bool cancel_done = false;
+        std::thread canceller([&] {
+            ctx.cancel_fence_waits(fence.semaphore());
+            std::lock_guard lk(mu);
+            cancel_done = true;
+            cv.notify_all();
+        });
+        EXPECT(wait_flag(mu, cv, cancel_done, 2000));
+        canceller.join();
+        EXPECT(cancel_cb_hit);
     }
     {
         driver::reset_faults();
@@ -203,9 +263,16 @@ int main() {
         VulkanContext ctx(driver::get_device, d.device, true);
         EXPECT(ctx.loaded());
         EXPECT(ctx.is_device_lost());
+        VulkanFence fence(ctx, 0);
+        EXPECT(fence.semaphore() != VK_NULL_HANDLE);
+        int lost_cb_hits = 0;
+        ctx.enqueue_fence_callback(fence.semaphore(), 100, [&] { ++lost_cb_hits; });
+        EXPECT(lost_cb_hits == 1);
+        ctx.cancel_fence_waits(fence.semaphore());
     }
     EXPECT(!driver::destroyed_null_or_garbage.load(std::memory_order_acquire));
-    std::printf("fence dispatcher edge 1: wakeup_sem_ creation failure fallback & DEVICE_LOST ok\n");
+    EXPECT(!driver::waited_on_null_or_empty.load(std::memory_order_acquire));
+    std::printf("fence dispatcher edge 1: wakeup_sem_ OOM fallback wait & DEVICE_LOST ok\n");
 
     // 2a. Cross-thread cancel(sem_b) on unstarted ready-batch entries completes callback + event synchronously
     //     before cancel() returns and never runs them again after cancel() returns.
@@ -676,6 +743,7 @@ int main() {
     std::printf("fence dispatcher edge 7: concurrent stop() waits for drain completion & re-entrant stop ok\n");
 
     EXPECT(!driver::destroyed_null_or_garbage.load(std::memory_order_acquire));
+    EXPECT(!driver::waited_on_null_or_empty.load(std::memory_order_acquire));
     EXPECT(d.validation_errors() == 0);
     std::printf("vk_fence_dispatcher_edge_test: ok\n");
     return 0;
