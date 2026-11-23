@@ -314,5 +314,95 @@ class TestFrexpExpI32F32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.machine.vgprs[0], 0)
 
 
+# ==============================================================================
+# SIMD Multi-Lane Divergence and 32/64-Bit EXEC Masking
+# ==============================================================================
+
+class SIMDWave:
+    def __init__(self, wave_size: int = 64):
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size: int = wave_size
+        self.vgprs: List[List[int]] = [[0] * wave_size for _ in range(256)]
+        self.sgprs: List[int] = [0] * 106
+        self.exec_mask: int = (1 << wave_size) - 1
+
+    def read_operand_lane(self, op: Union[RegisterOperand, LiteralOperand], lane: int) -> int:
+        if isinstance(op, LiteralOperand):
+            return op.value & MASK32
+        elif op.op_type == OperandType.VGPR:
+            return self.vgprs[op.index][lane] & MASK32
+        elif op.op_type == OperandType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        raise TypeError(f"Unknown operand type: {type(op)}")
+
+    def step(self, insn: VFrexpExpI32F32Instruction):
+        for lane in range(self.wave_size):
+            if (self.exec_mask >> lane) & 1:
+                val_s0 = self.read_operand_lane(insn.src0, lane)
+                res = ref_frexp_exp_i32_f32(val_s0)
+                self.vgprs[insn.dst.index][lane] = res
+
+
+class TestFrexpExpI32F32SIMDDivergence(unittest.TestCase):
+    def test_simd64_full_divergence(self):
+        wave = SIMDWave(wave_size=64)
+        dst = RegisterOperand(OperandType.VGPR, 0)
+        src0 = RegisterOperand(OperandType.VGPR, 1)
+        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
+
+        # Populate lanes with powers of two: 2^(lane - 30)
+        for lane in range(64):
+            # Exponent shift from 1.0f (which is exp 1)
+            fval = math.ldexp(1.0, lane - 30)
+            wave.vgprs[1][lane] = f32_to_bits(fval)
+
+        wave.step(insn)
+
+        for lane in range(64):
+            expected_exp = (lane - 30 + 1) & MASK32
+            self.assertEqual(
+                wave.vgprs[0][lane],
+                expected_exp,
+                f"Lane {lane} failed: got {wave.vgprs[0][lane]}, expected {expected_exp}",
+            )
+
+    def test_simd32_exec_masking(self):
+        wave = SIMDWave(wave_size=32)
+        dst = RegisterOperand(OperandType.VGPR, 0)
+        src0 = RegisterOperand(OperandType.VGPR, 1)
+        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
+
+        for lane in range(32):
+            wave.vgprs[0][lane] = 0xDEAD_BEEF
+            wave.vgprs[1][lane] = f32_to_bits(2.0)  # exp 2
+
+        # Active on even lanes only
+        wave.exec_mask = 0x5555_5555
+        wave.step(insn)
+
+        for lane in range(32):
+            if lane % 2 == 0:
+                self.assertEqual(wave.vgprs[0][lane], 2)
+            else:
+                self.assertEqual(wave.vgprs[0][lane], 0xDEAD_BEEF)
+
+    def test_zero_exec_mask_no_mutation(self):
+        wave = SIMDWave(wave_size=64)
+        dst = RegisterOperand(OperandType.VGPR, 0)
+        src0 = RegisterOperand(OperandType.VGPR, 1)
+        insn = VFrexpExpI32F32Instruction(dst=dst, src0=src0)
+
+        for lane in range(64):
+            wave.vgprs[0][lane] = 0xCAFE_BABE
+            wave.vgprs[1][lane] = f32_to_bits(1.0)
+
+        wave.exec_mask = 0
+        wave.step(insn)
+
+        for lane in range(64):
+            self.assertEqual(wave.vgprs[0][lane], 0xCAFE_BABE)
+
+
 if __name__ == '__main__':
     unittest.main()
