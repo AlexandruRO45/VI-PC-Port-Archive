@@ -374,5 +374,18 @@ class VMadU32U16OracleTests(unittest.TestCase):
         res = ref_mad_u32_u16(0xFFFF, 0xFFFF, 0)
         self.assertEqual(res, 4294836225)
 
+class VMadU32U16AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_mad_u32_u16."""
+
+    def test_ast_emission(self):
+        node = Mul16AstNode("v_mad_u32_u16", "v3", "v0", "v1", "v2")
+        self.assertEqual(node.emit_asm(), "v_mad_u32_u16 v3, v0, v1, v2")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v0": 500, "v1": 300, "v2": 10000}
+        res = ref_mad_u32_u16(regs["v0"], regs["v1"], regs["v2"])
+        regs["v3"] = res
+        self.assertEqual(regs["v3"], 160000)
+
 if __name__ == "__main__":
     unittest.main()
