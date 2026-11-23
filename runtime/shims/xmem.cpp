@@ -17,12 +17,15 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "shims.h"
 #include "startup_trace.h"
@@ -127,12 +130,22 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
 }
 
 // XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
+//
+// Measured on the executable's static initializers (#6824, and the same site here): the call is
+// XMemVirtualAlloc(address, size, allocation_type, protect) — four arguments, no attribute word. After two 64 KiB
+// reservations (0x21) it commits 2 MiB-page pools with 0x20400000 and 0x20402000, the high word 0x2040 selecting the
+// mode and 0x2000 being console MEM_VERIFY, which the host does not have and which is dropped. Rejecting the mode
+// stops the boot at an int3 right after the call, so it is folded onto the host: the region is rounded to 2 MiB and
+// the host commits on first touch.
 constexpr DWORD kXmemLargePages = 0x20000000;
+constexpr DWORD kXmem2mPages = 0x20400000;
 constexpr DWORD kXmem64kPages = 0x20400000;
-constexpr DWORD kXmemPageModeMask = kXmem64kPages;
+constexpr DWORD kXmemPageModeMask = 0x20400000 | 0x00200000;
+constexpr DWORD kXmemMemVerify = 0x00200000;
+constexpr SIZE_T kXmemPageSize2m = 0x200000;
 constexpr SIZE_T kXmemPageSize64k = 0x10000;
 constexpr DWORD kXmemHostAllocationTypeMask =
-    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000 | 0x00400000;
 
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
@@ -141,45 +154,63 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     return true;
 }
 
-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
-    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, DWORD attributes, DWORD protect) {
+    if (std::getenv("LEONIDA_XMEM_TRACE"))
+        std::fprintf(stderr, "[rt] xmem: entry addr=%p size=%zu type=0x%lx attr=0x%lx prot=0x%lx\n", address,
+                     static_cast<size_t>(size), static_cast<unsigned long>(allocation_type),
+                     static_cast<unsigned long>(attributes), static_cast<unsigned long>(protect));
+    // Host-backed support covers ordinary, 64 KiB and 2 MiB guest modes. The 2 MiB mode is rounded rather than
+    // rejected: rejecting it stops the boot (see above).
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (attributes != 0) {
-        SetLastError(ERROR_NOT_SUPPORTED);
-        return nullptr;
+
+    // The console's page-mode and verify bits are pure console: any of them that is set selects the 2 MiB rounding.
+    // (0x20000000 large pages and 0x00400000 are both part of the measured word; the host has neither.)
+    const bool two_mib = (allocation_type & (0x20000000 | 0x00400000)) != 0;
+
+    if (attributes != 0 && std::getenv("LEONIDA_XMEM_TRACE")) {
+        std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc attributes=0x%lx (undecoded)\n",
+                     static_cast<unsigned long>(attributes));
     }
 
-    const DWORD page_mode = allocation_type & kXmemPageModeMask;
-    if (page_mode == kXmemLargePages) {
-        SetLastError(ERROR_NOT_SUPPORTED);
-        return nullptr;
-    }
-    if (page_mode != 0 && page_mode != kXmem64kPages) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
-
-    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | kXmemPageModeMask);
+    const DWORD unsupported = allocation_type & ~(kXmemHostAllocationTypeMask | 0x20000000 | 0x00400000 | 0x00200000 |
+                                                  MEM_4MB_PAGES | 0x00010000 | 0x00003000 | 0x0000C000);
     if (unsupported != 0) {
+        if (std::getenv("LEONIDA_XMEM_TRACE"))
+            std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc type=0x%lx unsupported bits=0x%lx\n",
+                         static_cast<unsigned long>(allocation_type), static_cast<unsigned long>(unsupported));
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
-    DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
+    // Host bits taken by name only: the console also sets low flags the host does not have (0x10000, 0x3000), so the
+    // rest of the word is not forwarded.
+    DWORD host_type = 0;
+    if (allocation_type & MEM_RESERVE) host_type |= MEM_RESERVE;
+    if (allocation_type & MEM_COMMIT) host_type |= MEM_COMMIT;
+    if (allocation_type & MEM_RESET) host_type |= MEM_RESET;
+    if (allocation_type & MEM_TOP_DOWN) host_type |= MEM_TOP_DOWN;
+    if (allocation_type & MEM_WRITE_WATCH) host_type |= MEM_WRITE_WATCH;
+    if (allocation_type & 0x01000000u) host_type |= 0x01000000u;
     if (host_type == 0) host_type = MEM_RESERVE | MEM_COMMIT;
+
+    // PAGE_GRAPHICS_* (0x800..0x40000) is a console modifier on top of the access bits: 0x801 is graphics +
+    // PAGE_NOACCESS, which after stripping alone would stay NOACCESS and fail. Take the access from the low bits and
+    // map a stripped NOACCESS to read-write. Measured words: 0x4, 0x801, 0x2404, 0x22004 (#6824 and this run).
+    DWORD access = protect & 0x7u;
+    if (access == 0 || access == 1u) access = PAGE_READWRITE;
+    if (protect & 0x20u) access |= PAGE_WRITECOMBINE;
+    DWORD host_protect = access;
 
     SYSTEM_INFO system_info{};
     GetSystemInfo(&system_info);
-    const SIZE_T page_granularity = page_mode == kXmem64kPages ? kXmemPageSize64k : system_info.dwPageSize;
+    const SIZE_T page_granularity = two_mib ? kXmemPageSize2m : system_info.dwPageSize;
     const SIZE_T base_granularity =
-        page_mode == kXmem64kPages
-            ? kXmemPageSize64k
-            : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
+        two_mib ? kXmemPageSize2m
+                : ((host_type & MEM_RESERVE) ? 0x10000 /* allocation granularity: never below, keeps reservations cheap */
+                                             : system_info.dwPageSize);
     if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
         (base_granularity & (base_granularity - 1)) != 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
@@ -203,12 +234,36 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
                               ~(static_cast<uintptr_t>(page_granularity) - 1);
         address = reinterpret_cast<void*>(base);
         size = static_cast<SIZE_T>(end - base);
-    } else if (page_mode == kXmem64kPages && !round_up_size(size, page_granularity, size)) {
+    } else if (two_mib && !round_up_size(size, page_granularity, size)) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
-    return VirtualAlloc(address, size, host_type, protect);
+    void* host = VirtualAlloc(address, size, host_type, host_protect);
+    if (!host) {
+        const DWORD last = GetLastError();
+        if (std::getenv("LEONIDA_XMEM_TRACE"))
+            std::fprintf(stderr,
+                         "[rt] xmem: VirtualAlloc(addr=%p size=%zu type=0x%lx -> host_type=0x%lx prot=0x%lx->0x%lx) "
+                         "failed %lu\n",
+                         address, static_cast<size_t>(size), static_cast<unsigned long>(allocation_type),
+                         static_cast<unsigned long>(host_type), static_cast<unsigned long>(protect),
+                         static_cast<unsigned long>(host_protect), static_cast<unsigned long>(last));
+        SetLastError(last);
+        std::fprintf(stderr,
+                     "[rt] xmem: XMemVirtualAlloc(%p, %zu, type=0x%lx, prot=0x%lx) FAILED last=%lu\n", address,
+                     static_cast<size_t>(size), static_cast<unsigned long>(allocation_type),
+                     static_cast<unsigned long>(protect), static_cast<unsigned long>(GetLastError()));
+        return nullptr;
+    }
+
+    // Diagnostic for the boot's pool commits (#6824): one line per call, via LEONIDA_XMEM_TRACE.
+    if (std::getenv("LEONIDA_XMEM_TRACE")) {
+        std::fprintf(stderr, "[rt] xmem: XMemVirtualAlloc(%p, %zu, type=0x%lx, prot=0x%lx) -> %p\n", address,
+                     static_cast<size_t>(size), static_cast<unsigned long>(allocation_type),
+                     static_cast<unsigned long>(protect), host);
+    }
+    return host;
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
@@ -282,15 +337,48 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
 
 // ---- The default-allocator pair and the physical-page set ----
 //
-// The executable imports these seven and nothing else of xmem that was not already served (gta6rt --dry-run, 30
-// unimplemented imports in all). The console's title memory is one physical space the GPU and CPU share; a PC has
-// already one virtual space per process, so the physical-page calls have nothing to translate and the default
-// allocator is the same aligned heap as XMemAlloc. Shapes below are the measured call sites' (same registers as
-// XMemAlloc/XMemFree); the attribute word stays undecoded exactly as it is there.
+// The executable imports these seven and nothing else of xmem that was not already served (gta6rt --dry-run).
 //
-// ASSUMPTION: the exact return types of the page calls are not measured. BOOL-returning ones are logged once and
-// answer TRUE (a title stops at startup if its page setup fails, while doing nothing changes nothing here); void
-// ones do the same silently. The page bookkeeping only records what a mapping asked for, for the trace.
+// The physical-page calls are not free to fake: the measured call site asks for 0x2c60 pages of 64 KiB with flags
+// 0x280 and the title breaks (`int3`) unless the call returns 1 *and* the full count (issue #6824). So a real page
+// store answers them. A PC has already one virtual space, which is why the mapping calls only have to record what
+// each page holds: pages are handed out zeroed on allocation, the count is returned in full, and a map remembers
+// which page sits where so the next allocate can hand out a different one and a free stays all-or-nothing.
+//
+// `XMemAllocatePhysicalPages` returns the count through its out pointer; the flags word stays undecoded exactly as it
+// is at the FSR call sites.
+//
+// ASSUMPTION: the argument shapes are the #6824 call site's (`count`, flags, out) and (address, `pages`, count,
+// flags); the free form takes (`pages`, count, flags). Nothing is committed per page beyond bookkeeping - the host
+// commits on first touch, which a 64 KiB granularity does not change.
+
+// One page is 64 KiB, the granularity the measured call site uses (0x2c60 pages, #6824).
+constexpr size_t kPhysicalPageSize = 0x10000;
+
+struct PhysicalPage {
+    uint32_t id;   // 0 = not allocated by this store
+};
+
+std::mutex g_page_mutex;
+uint32_t g_next_page = 1;
+std::unordered_map<uint32_t, uintptr_t> g_page_host;   // page id -> the backing bytes
+std::set<uint32_t> g_page_live;
+std::set<uint32_t> g_page_mapped;
+std::vector<uint32_t> g_page_last;   // the pages the last allocation handed out
+
+// The flags word every allocation is logged with, once per value, so a run shows what the title asks for.
+void note_page_flags(uint32_t flags) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::mutex mutex;
+    static std::set<uint32_t> seen;
+    {
+        const std::lock_guard lock(mutex);
+        if (!seen.insert(flags).second) return;
+    }
+    rt::startup_trace::event("xmem_page_flags",
+                             "\"api\":\"XMemAllocatePhysicalPages\",\"flags\":" +
+                                 rt::startup_trace::quote(rt::startup_trace::hex(flags)));
+}
 
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) { return XMemAlloc(size, attributes); }
 
@@ -300,29 +388,92 @@ void __stdcall XMemFreeDefault(void* p, uint64_t attributes) { XMemFree(p, attri
 // "tools memory" is always present: FALSE would make a title fall back to a path that does not exist on a PC.
 BOOL __stdcall XMemIsToolsMemAvailable(uint32_t /*kind*/) { return TRUE; }
 
-// BOOL XMemAllocatePhysicalPages(size, attributes) / BOOL XMemFreePhysicalPages(size, attributes): a PC has no
-// physical page arena of its own; the host commits on first touch.
-BOOL __stdcall XMemAllocatePhysicalPages(size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
+// BOOL XMemAllocatePhysicalPages(uint32_t count, uint32_t flags, uint32_t* out_count): hands out `count` pages and
+// writes `count` back. TRUE and the full count, or FALSE with nothing handed out - the measured site checks both.
+BOOL __stdcall XMemAllocatePhysicalPages(uint32_t count, uint32_t flags, uint32_t* out_count) {
+    note_page_flags(flags);
+    if (count == 0) {
+        if (out_count) *out_count = 0;
+        return TRUE;
+    }
+    if (!out_count) return FALSE;
+
+    std::vector<uint32_t> ids;
+    ids.reserve(count);
+    {
+        const std::lock_guard lock(g_page_mutex);
+        for (uint32_t i = 0; i < count; ++i) {
+            void* host = std::calloc(1, kPhysicalPageSize);
+            if (!host) {  // all or nothing: give back what this call took
+                for (uint32_t id : ids) {
+                    std::free(reinterpret_cast<void*>(g_page_host[id]));
+                    g_page_host.erase(id);
+                    g_page_live.erase(id);
+                }
+                return FALSE;
+            }
+            const uint32_t id = g_next_page++;
+            g_page_host[id] = reinterpret_cast<uintptr_t>(host);
+            g_page_live.insert(id);
+            ids.push_back(id);
+        }
+    }
+    g_page_last.assign(ids.begin(), ids.end());
+    *out_count = count;
     return TRUE;
 }
 
-BOOL __stdcall XMemFreePhysicalPages(size_t size, uint64_t attributes) {
-    note_attributes(false, attributes, size, _ReturnAddress());
+// BOOL XMemFreePhysicalPages(const uint32_t* pages, uint32_t count, uint32_t flags): all or nothing, refused while a
+// page is mapped at a virtual address.
+BOOL __stdcall XMemFreePhysicalPages(const uint32_t* pages, uint32_t count, uint32_t flags) {
+    note_page_flags(flags);
+    if (!pages || count == 0) return FALSE;
+    const std::lock_guard lock(g_page_mutex);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!g_page_live.count(pages[i]) || g_page_mapped.count(pages[i])) return FALSE;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        std::free(reinterpret_cast<void*>(g_page_host[pages[i]]));
+        g_page_host.erase(pages[i]);
+        g_page_live.erase(pages[i]);
+    }
     return TRUE;
 }
 
-// XMemMapPhysicalPages / XMemMapPhysicalPagesScatter: a mapping of consecutive (or scattered) 64 KiB pages into a
-// reservation. Recorded once per shape and answered TRUE without an actual map, since a PC address is usable the
-// moment it is committed.
-BOOL __stdcall XMemMapPhysicalPages(void* address, size_t size, uint64_t attributes) {
-    note_attributes(true, attributes, size, _ReturnAddress());
-    return address != nullptr;
+// BOOL XMemMapPhysicalPages(void* address, const uint32_t* pages, uint32_t count, uint32_t flags): records which
+// page each slot shows. The store is the one the last XMemAllocatePhysicalPages filled, the way the measured call
+// site consumes it.
+BOOL __stdcall XMemMapPhysicalPages(void* address, const uint32_t* pages, uint32_t count, uint32_t flags) {
+    note_page_flags(flags);
+    if (!address || count == 0) return FALSE;
+    const std::lock_guard lock(g_page_mutex);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = pages ? pages[i] : (i < g_page_last.size() ? g_page_last[i] : 0);
+        if (id && (!g_page_live.count(id) || g_page_mapped.count(id))) return FALSE;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = pages ? pages[i] : (i < g_page_last.size() ? g_page_last[i] : 0);
+        if (id) g_page_mapped.insert(id);
+    }
+    return TRUE;
 }
 
-BOOL __stdcall XMemMapPhysicalPagesScatter(const void* const* addresses, size_t count, uint64_t attributes) {
-    note_attributes(true, attributes, count, _ReturnAddress());
-    return addresses != nullptr && count != 0;
+// BOOL XMemMapPhysicalPagesScatter(const uint32_t* const* addresses, const uint32_t* pages, uint32_t count,
+// uint32_t flags): the scattered form, one address per slot.
+BOOL __stdcall XMemMapPhysicalPagesScatter(const void* const* addresses, const uint32_t* pages, uint32_t count,
+                                           uint32_t flags) {
+    note_page_flags(flags);
+    if (!addresses || count == 0) return FALSE;
+    const std::lock_guard lock(g_page_mutex);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = pages ? pages[i] : 0;
+        if (id && (!g_page_live.count(id) || g_page_mapped.count(id))) return FALSE;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = pages ? pages[i] : 0;
+        if (id) g_page_mapped.insert(id);
+    }
+    return TRUE;
 }
 
 }  // namespace
