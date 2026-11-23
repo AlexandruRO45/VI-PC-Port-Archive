@@ -530,6 +530,13 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   `ds_bpermute` is skipped with that reason; under `--perturb bpermute_wave64_cross` all 1,000 wave64 programs of
   seed 1 match there. RX 9070 XT, AMD 26.11.2, `--programs 1000`, seeds 1 and 2: wave32 1,000/1,000 match; wave64
   537 and 506 match, 0 mismatch, the rest skipped for that reason. The gfx1036 iGPU gives 1,000/1,000 in both.
+  **A wave64 `ds_permute_b32` sends to all 64 lanes on GFX12 as well** (`--permute`; measured on an RX 9060 XT,
+  gfx1200, AMD 26.11.2). With `--permute --wave 64 --programs 1000`, 197 of the 547 programs of seed 1 that have no
+  `ds_bpermute` mismatch the RDNA2 model, and every one matches under `--perturb permute_wave64_cross` (0 of 547 for
+  seed 1, 0 of 556 for seed 2), so the collision rule (the highest active sender wins) and the zero for a lane
+  nobody sends to hold across the 64 lanes. A wave64 program with a `ds_permute` is skipped on gfx12xx for that
+  reason too; `--extended --programs 1000` then gives wave32 1,000/1,000 and wave64 305 and 323 match, 0 mismatch
+  (seeds 1 and 2), and the rest skipped. The same card reproduces the RX 9070 XT numbers above exactly.
 - **Wider op mix**, opt-in so that a seed keeps its programs: `--permute` (`ds_permute_b32`), `--swizzle-exec`
   (`ds_swizzle_b32` under EXEC masks), `--threads`, `--extended` (all three). `ds_permute_b32` and a masked
   `ds_swizzle_b32` carry a hypothesis (the model's reading of the ISA text); on the hardware a failing one is a
@@ -538,11 +545,13 @@ python -I tools/lds_fuzz.py --oracle hw --programs 50 --seed 1 --wave 32 --only 
   that lane is on"): gfx1150 returns 0 when the source lane is off in EXEC, as `ds_bpermute` does. The model now
   says that.
 - **Negative controls.** `--perturb NAME` judges the hardware against a deliberately wrong model (mismatches must
-  appear); `--negative-control` re-judges the words of the run with all 16 (`max_i32` unsigned, `min_u32` signed,
+  appear); `--negative-control` re-judges the words of the run with all 18 (`max_i32` unsigned, `min_u32` signed,
   swapped `cmpst`, zero-extended `i8`/`i16`, d16 reads clearing the other half, `b16_d16_hi` shift, swapped
-  `write2`, `st64` unit, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
-  swizzle or/xor, permute writing no zero, permute lowest source winning a collision) and exits 1 if one goes
-  unnoticed. `--minimize` drops ops while a program still differs, `--keep DIR` writes the native kernel of each
+  `write2`, `st64` unit, swapped `wrxchg2`, bpermute reading off lanes or crossing the wave64 halves, reversed quad permute, swapped
+  swizzle or/xor, permute writing no zero, permute lowest source winning a collision, permute crossing the wave64
+  halves) and exits 1 if one goes unnoticed. The two that cross the wave64 halves change no wave32 program, so they
+  are judged on the wave64 programs only; where none with the op ran (`--wave 32`, or GFX12, which skips them) they
+  are listed as not exercised. `--minimize` drops ops while a program still differs, `--keep DIR` writes the native kernel of each
   mismatch, `--only I,J` runs chosen indices.
 
 RDNA2 `ds_permute_b32` verification (`FUZZ-10`, `SHADER-133`): raw kernels on an AMD Radeon RX 6800 (`gfx1030`, wave32

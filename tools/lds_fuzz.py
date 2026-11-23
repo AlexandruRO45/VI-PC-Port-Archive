@@ -110,7 +110,10 @@ PERTURBATIONS = {
     "swizzle_or_xor_swapped": ("swizzle", "the bit-mask or and xor fields are swapped"),
     "permute_no_zero": ("permute", "ds_permute_b32 leaves an unwritten lane's register alone instead of writing 0"),
     "permute_lowest_wins": ("permute", "ds_permute_b32 lets the lowest active source lane win a collision"),
+    "permute_wave64_cross": ("permute", "a wave64 ds_permute_b32 sends to all 64 lanes"),
 }
+# The perturbations that leave every wave32 program unchanged (negative_control).
+WAVE64_ONLY = frozenset(("bpermute_wave64_cross", "permute_wave64_cross"))
 PERTURB = set()
 
 
@@ -729,10 +732,11 @@ class Program:
             src = [regs[t][op["src"]] for t in range(T)]
             sent = {}
             lanes = range(T - 1, -1, -1) if "permute_lowest_wins" in PERTURB else range(T)
+            group = 63 if self.wave == 64 and "permute_wave64_cross" in PERTURB else 31
             for t in lanes:
                 if act[t]:
                     word = ((t * op["mul"] + op["add"]) * 4 + op["offset"]) >> 2
-                    sent[(t & ~31) | (word & 31)] = src[t]
+                    sent[(t & ~group) | (word & group)] = src[t]
             for t in range(T):
                 if act[t] and not ("permute_no_zero" in PERTURB and t not in sent):
                     regs[t][op["dst"]] = sent.get(t, 0)
@@ -931,11 +935,18 @@ def hw_skip_reason(p, arch):
     generation, and what this model describes) keeps each 32-lane half separate. Measured with every lane asking for
     lane (l + 32) mod 64: an RX 9070 XT (gfx1201) returns lane l ^ 32, a gfx1036 iGPU returns lane l, and on gfx1201
     300 of 300 wave64 programs match --perturb bpermute_wave64_cross. So those programs can't check the RDNA2 model on
-    GFX12 and are skipped there; wave32 and every other wave64 program still run."""
+    GFX12 and are skipped there; wave32 and every other wave64 program still run.
+
+    The forward permute does the same: a wave64 ds_permute_b32 sends to all 64 lanes on GFX12. Measured on an
+    RX 9060 XT (gfx1200) with --permute --wave 64: against the RDNA2 model 197 of 547 programs of seed 1 mismatch, and
+    under --perturb permute_wave64_cross 0 of 547 (seed 1) and 0 of 556 (seed 2) do, so the collision and zero rules
+    hold across the 64 lanes. Those programs are skipped on GFX12 for the same reason."""
     from hw_oracle import asm
-    if asm.family(arch) == "gfx12" and p.wave == 64 and "bpermute_wave64_cross" not in PERTURB \
-            and any(op["kind"] == "bpermute" for op in p.ops):
-        return "a wave64 ds_bpermute_b32 reaches all 64 lanes on GFX12 (measured on gfx1201), not each 32-lane half"
+    if asm.family(arch) == "gfx12" and p.wave == 64:
+        if "bpermute_wave64_cross" not in PERTURB and any(op["kind"] == "bpermute" for op in p.ops):
+            return "a wave64 ds_bpermute_b32 reaches all 64 lanes on GFX12 (measured on gfx1201), not each 32-lane half"
+        if "permute_wave64_cross" not in PERTURB and any(op["kind"] == "permute" for op in p.ops):
+            return "a wave64 ds_permute_b32 sends to all 64 lanes on GFX12 (measured on gfx1200), not each 32-lane half"
     return None
 
 
@@ -1069,7 +1080,10 @@ def attribute(results):
 
 def negative_control(results, only=None):
     """Re-judge the hardware words already collected with each deliberately wrong model. Returns {name: (programs
-    that contain the op family, programs the wrong model mismatched on)}."""
+    that contain the op family, programs the wrong model mismatched on)}. A perturbation that only changes a wave64
+    program (WAVE64_ONLY) counts the wave64 programs alone: a wave32 program cannot tell it from the right model, so
+    counting it would report the perturbation as not detected wherever no wave64 program with the op ran (--wave 32,
+    or GFX12, which skips those programs)."""
     out = {}
     for name, (fam, _) in PERTURBATIONS.items():
         if only and name != only:
@@ -1077,6 +1091,8 @@ def negative_control(results, only=None):
         cases = bad = 0
         with perturbed(name):
             for p, regs, lds in results:
+                if name in WAVE64_ONLY and p.wave != 64:
+                    continue
                 if not any(op_family(op) == fam or op_family(op).startswith(fam + "_") or
                            op_family(op).endswith("_" + fam) for op in p.ops):
                     continue

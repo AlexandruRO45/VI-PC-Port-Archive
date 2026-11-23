@@ -335,6 +335,40 @@ class RunHw(unittest.TestCase):
         finally:
             f.PERTURB.discard("bpermute_wave64_cross")
 
+    def test_gfx12_skips_only_wave64_programs_with_a_permute(self):
+        # The forward permute crosses the 32-lane halves on GFX12 as ds_bpermute does (measured on gfx1200).
+        kinds = lambda p: {o["kind"] for o in p.ops}
+        w64 = next(p for p in f.programs(1, 200, (64,), permute=True) if "permute" in kinds(p)
+                   and "bpermute" not in kinds(p))
+        w32 = next(p for p in f.programs(1, 200, (32,), permute=True) if "permute" in kinds(p))
+        plain = next(p for p in f.programs(1, 200, (64,), permute=True) if not kinds(p) & {"permute", "bpermute"})
+        self.assertIn("ds_permute_b32 sends to all 64 lanes", f.hw_skip_reason(w64, "gfx1200"))
+        self.assertIsNone(f.hw_skip_reason(w32, "gfx1200"))
+        self.assertIsNone(f.hw_skip_reason(plain, "gfx1200"))
+        for arch in ("gfx1150", "gfx1030"):                   # halves stay separate there (measured)
+            self.assertIsNone(f.hw_skip_reason(w64, arch), arch)
+        with f.perturbed("bpermute_wave64_cross"):             # the other op's perturbation does not lift it
+            self.assertIn("ds_permute_b32", f.hw_skip_reason(w64, "gfx1200"))
+        with f.perturbed("permute_wave64_cross"):              # the model that crosses halves can run them
+            self.assertIsNone(f.hw_skip_reason(w64, "gfx1200"))
+
+    def test_permute_wave64_cross_sends_to_the_other_half(self):
+        # Every lane sends to lane (l + 32) mod 64: within its own half that is itself, across 64 lanes the other half.
+        def run(wave):
+            p = f.Program(1, 0, wave)
+            p.ops = [{"kind": "permute", "mul": 1, "add": 32, "offset": 0, "src": 20, "dst": 21, "exec": None}]
+            return p.model()[0]
+        init = f.Program(1, 0, 64)
+        init.ops = []
+        r0 = init.model()[0]
+        halves, wave32 = run(64), run(32)
+        with f.perturbed("permute_wave64_cross"):
+            crossed, wave32_perturbed = run(64), run(32)
+        for t in range(64):
+            self.assertEqual(halves[t][21], r0[t][20])
+            self.assertEqual(crossed[t][21], r0[t ^ 32][20])
+        self.assertEqual(wave32_perturbed, wave32)             # a wave32 program is not changed by it
+
     def test_gfx12_kernels_use_its_barrier_and_lds_wait(self):
         p = f.programs(1, 1, (64,))[0]               # every kernel waits and barriers after each op
         g12, g11 = p.hw_lines("gfx1201"), p.hw_lines("gfx1150")
@@ -393,6 +427,25 @@ class RunHw(unittest.TestCase):
         for name, (cases, bad) in f.negative_control(results).items():
             self.assertGreater(cases, 0, name)
             self.assertGreater(bad, 0, f"{name} is not detected")
+
+    def test_negative_control_counts_a_wave64_only_perturbation_on_wave64_programs(self):
+        # A wave32 program cannot show these two, so a run without wave64 programs (--wave 32, or GFX12, which skips
+        # the wave64 programs with the op) reports them as not exercised, not as a perturbation that went undetected.
+        self.assertEqual(f.WAVE64_ONLY, {"bpermute_wave64_cross", "permute_wave64_cross"})
+        progs = f.programs(1, 60, (32,), permute=True)
+        rc, out, tally, results = self.run_hw(FakeOracle(progs), progs)
+        self.assertEqual(rc, 0, out)
+        control = f.negative_control(results)
+        for name in f.WAVE64_ONLY:
+            self.assertEqual(control[name], (0, 0), name)
+        self.assertGreater(control["bpermute_inactive_reads"][0], 0)       # the others still count wave32 programs
+        self.assertGreater(control["permute_lowest_wins"][1], 0)
+        progs = f.programs(1, 60, (64,), permute=True)
+        rc, out, tally, results = self.run_hw(FakeOracle(progs), progs)
+        control = f.negative_control(results)
+        for name in f.WAVE64_ONLY:
+            cases, bad = control[name]
+            self.assertTrue(cases and bad, (name, cases, bad))
 
     def test_family_table_and_attribution(self):
         progs = f.programs(1, 20, (32,))
