@@ -59,4 +59,16 @@ inline void report_no_device() {
     }
 }
 
+// The Vulkan 1.1 / 1.2 / 1.3 core feature structs are valid pNext members of VkPhysicalDeviceFeatures2 and
+// VkDeviceCreateInfo on a device of that version only (VUID-VkDeviceCreateInfo-pNext-pNext; the 1.1 struct itself
+// is a 1.2 addition), and a 1.0 instance has no vkGetPhysicalDeviceFeatures2. A program that chains them checks the
+// chosen device first and reports an older one as unsupported, which the runners count as a skip (exit 77).
+inline bool api_version_at_least(const VkPhysicalDeviceProperties& props, std::uint32_t needed, const char* program) {
+    if (props.apiVersion >= needed) return true;
+    std::fprintf(stderr, "unsupported: %s is a Vulkan %u.%u device, %s needs %u.%u\n", props.deviceName,
+                 VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), program,
+                 VK_API_VERSION_MAJOR(needed), VK_API_VERSION_MINOR(needed));
+    return false;
+}
+
 }  // namespace leonida::vk_test

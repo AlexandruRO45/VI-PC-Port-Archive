@@ -25,6 +25,12 @@ void expect_index(const char* what, std::size_t got, std::size_t want) {
     ++failures;
 }
 
+void expect_bool(const char* what, bool got, bool want) {
+    if (got == want) return;
+    std::fprintf(stderr, "FAIL %s: got %s, expected %s\n", what, got ? "true" : "false", want ? "true" : "false");
+    ++failures;
+}
+
 void set_filter(const char* value) {
 #ifdef _WIN32
     _putenv_s("LEONIDA_VK_DEVICE", value);
@@ -109,6 +115,20 @@ int main() {
     set_filter("no-such-gpu");
     expect_index("filter matches nothing", pick_device(devices), devices.size());
     set_filter("");
+
+    // The core feature structs a harness chains need a device of that version: a 1.1 device is reported as
+    // unsupported for a 1.2 program, a 1.2 device passes a 1.2 program and fails a 1.3 one, a 1.3 device passes both.
+    using leonida::vk_test::api_version_at_least;
+    VkPhysicalDeviceProperties old_device = device(VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, intel, "Intel HD 4000");
+    old_device.apiVersion = VK_API_VERSION_1_1;
+    VkPhysicalDeviceProperties mid_device = device(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, amd, "MoltenVK 1.2");
+    mid_device.apiVersion = VK_MAKE_API_VERSION(0, 1, 2, 290);
+    VkPhysicalDeviceProperties new_device = device(VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU, nvidia, "RTX 4070 SUPER");
+    new_device.apiVersion = VK_API_VERSION_1_3;
+    expect_bool("1.1 device fails a 1.2 program", api_version_at_least(old_device, VK_API_VERSION_1_2, "test"), false);
+    expect_bool("1.2 device passes a 1.2 program", api_version_at_least(mid_device, VK_API_VERSION_1_2, "test"), true);
+    expect_bool("1.2 device fails a 1.3 program", api_version_at_least(mid_device, VK_API_VERSION_1_3, "test"), false);
+    expect_bool("1.3 device passes a 1.3 program", api_version_at_least(new_device, VK_API_VERSION_1_3, "test"), true);
 
     if (failures) {
         std::fprintf(stderr, "%d device-pick test(s) failed\n", failures);

@@ -188,6 +188,7 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDevice pd = pds[chosen];
     VkPhysicalDeviceProperties properties = candidates[chosen];
+    if (!leonida::vk_test::api_version_at_least(properties, VK_API_VERSION_1_2, "vk_texture_test")) return 77;
     constexpr uint32_t push_words = 36;
     // LEONIDA_PC_TAIL_UBO=1 (rdna2spirv.py --pc-tail-ubo): s0..s31 only; the heap base is in a uniform block at set 1
     // (vk_pc_tail.h), so a 128-byte device runs these tests too.

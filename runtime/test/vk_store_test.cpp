@@ -88,6 +88,7 @@ int main(int argc, char** argv) {
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
     std::fprintf(stderr, "device: %s\n", props.deviceName);
+    if (!leonida::vk_test::api_version_at_least(props, VK_API_VERSION_1_2, "vk_store_test")) return 77;
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);

@@ -284,6 +284,7 @@ int main(int argc, char** argv) {
         VkPhysicalDeviceProperties pp; vkGetPhysicalDeviceProperties(p, &pp);
         if (int r = leonida::vk_test::device_rank(pp.deviceType, pp.vendorID); r > best) { pd = p; props = pp; best = r; }
     }
+    if (!leonida::vk_test::api_version_at_least(props, VK_API_VERSION_1_2, "vk_sandbox")) return 77;
     constexpr uint32_t push_words = 36, push_bytes = push_words * 4;
     if (props.limits.maxPushConstantsSize < push_bytes) { std::fprintf(stderr, "unsupported: push constants\n"); return 77; }
     std::fprintf(stderr, "device: %s\n", props.deviceName);

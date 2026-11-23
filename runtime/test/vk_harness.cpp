@@ -268,6 +268,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    if (!leonida::vk_test::api_version_at_least(props, VK_API_VERSION_1_2, "vk_harness")) return 77;
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     if (props.apiVersion >= VK_API_VERSION_1_2) sgProps.pNext = &driver;
@@ -411,7 +412,8 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     f13q.pNext = &f12q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-    f2q.pNext = &f13q;
+    // The 1.3 struct is a valid pNext on a 1.3 device only; on a 1.2 device it stays zero (no subgroup size control).
+    f2q.pNext = props.apiVersion >= VK_API_VERSION_1_3 ? static_cast<void*>(&f13q) : &f12q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     // Translated vertex shaders read BaseVertex / BaseInstance (DrawParameters) to give v0 / v3 the hardware's
     // zero-based ids.

@@ -1099,6 +1099,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    if (!leonida::vk_test::api_version_at_least(props, VK_API_VERSION_1_2, "vk_pipeline_check")) return 77;
     VkPhysicalDeviceSubgroupSizeControlProperties sgProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
     VkPhysicalDeviceFloatControlsProperties fcProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
     VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -1136,7 +1137,7 @@ int main(int argc, char** argv) {
     };
     link(&f11, reinterpret_cast<VkBaseOutStructure*>(&f11), nullptr, true);   // shaderDrawParameters (VS v0/v3)
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
-    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
+    link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, props.apiVersion >= VK_API_VERSION_1_3);  // 1.3 devices only
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, want_mesh);
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);

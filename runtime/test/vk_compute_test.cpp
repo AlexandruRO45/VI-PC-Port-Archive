@@ -232,6 +232,7 @@ static int run(int argc, char** argv) {
         return 1;
     }
     VkPhysicalDeviceProperties props; vkGetPhysicalDeviceProperties(pd, &props);
+    if (!leonida::vk_test::api_version_at_least(props, VK_API_VERSION_1_2, "vk_compute_test")) return 77;
     const uint32_t max_groups_x = props.limits.maxComputeWorkGroupCount[0];
     if (groups > max_groups_x) {
         std::fprintf(stderr, "groups: %u exceeds the X dispatch limit of %u on %s\n",
@@ -257,8 +258,9 @@ static int run(int argc, char** argv) {
     qci.queueFamilyIndex = qi; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkPhysicalDeviceVulkan13Features f13q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-    f12q.pNext = &f13q;
     VkPhysicalDeviceFeatures2 f2q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    // The 1.3 struct is a valid pNext on a 1.3 device only; on a 1.2 device it stays zero (no subgroup size control).
+    f12q.pNext = props.apiVersion >= VK_API_VERSION_1_3 ? &f13q : nullptr;
     f2q.pNext = &f12q;
     vkGetPhysicalDeviceFeatures2(pd, &f2q);
     const char* sg_env = std::getenv("VKC_SUBGROUP_SIZE");
