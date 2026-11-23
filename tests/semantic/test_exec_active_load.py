@@ -1,11 +1,12 @@
-"""The translator makes one pointer per register and basic block, not one per access.
+"""The translator loads this lane's EXEC bit once per EXEC state, not once per VALU write.
 
-`Gen.load_reg` and `store_reg` used to emit a new `OpAccessChain` on `%vgpr` or `%sgpr` for every read and write.
-ScreenProbes_ActivateProbes had 244,087 of them (16.6% of its words), most repeating the previous one. The pointer is
-now made once in a basic block and reused until the block ends (an OpLabel, a block boundary, an emulated segment cut).
-Standard library only, no GPU, no game files. A straight-line program that touches v7, v8 and v9 many times has a
-single chain for each, and still computes the right words. That no pointer is reused past a block end is covered by
-the rest of tests/semantic: its branch, loop and wave64-emulation tests fail with an invalid or wrong module if one is.
+`Gen.active_b` used to emit `OpLoad %bool %active` for every VALU write: 80,091 loads in ScreenProbes_ActivateProbes,
+5% of its instructions. `%active` only changes by an `OpStore %active` the translator emits itself, so one load
+serves a basic block until the next such store (an OpLabel or any block boundary forgets it too). A straight-line
+program that writes six registers loads it once; an EXEC write in between makes it load again.
+The first class also keeps `main`'s one-`OpAccessChain`-per-register rule (SHADER-789) from regressing.
+Standard library only, no GPU, no game files. That no load is reused past a block end is covered by the rest of
+tests/semantic: its branch, loop and wave64-emulation tests fail with an invalid or wrong module if one is.
 """
 import re
 import unittest
