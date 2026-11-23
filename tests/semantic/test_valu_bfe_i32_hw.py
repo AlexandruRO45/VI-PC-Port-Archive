@@ -58,13 +58,9 @@ def run_ps_bfe_i32(instructions: Sequence[str]) -> list[int]:
 
 class TestReferenceOracleAndTranslator(unittest.TestCase):
     def test_basic_signed_bitfield_extract(self):
-        # Extract positive subfield: 0x12345678, offset=4, width=8 -> 0x67
         self.assertEqual(ref_bfe_i32(0x12345678, 4, 8), 0x67)
-        # Extract negative subfield with sign extension: 0xFFFFFFF0, offset=2, width=4 -> 0xFFFFFFFC (-4)
         self.assertEqual(ref_bfe_i32(0xFFFFFFF0, 2, 4), 0xFFFFFFFC)
-        # Extract single sign bit: 0x80000000, offset=31, width=1 -> 0xFFFFFFFF (-1)
         self.assertEqual(ref_bfe_i32(0x80000000, 31, 1), 0xFFFFFFFF)
-        # Extract zero bit from MSB: 0x7FFFFFFF, offset=31, width=1 -> 0
         self.assertEqual(ref_bfe_i32(0x7FFFFFFF, 31, 1), 0)
 
     def test_width_zero_yields_zero(self):
@@ -89,6 +85,92 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
             "v_bfe_i32 v3, v0, v1, v2",
         ])
         self.assertEqual(words[0], 0xFFFFFFFC)
+
+
+class RegType(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    LITERAL = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    literal_val: int = 0
+
+    def __post_init__(self):
+        if self.reg_type == RegType.VGPR and not (0 <= self.index <= 255):
+            raise ValueError(f"VGPR index {self.index} out of bounds [0, 255]")
+        if self.reg_type == RegType.SGPR and not (0 <= self.index <= 105):
+            raise ValueError(f"SGPR index {self.index} out of bounds [0, 105]")
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        return cls(RegType.VGPR, index=idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        return cls(RegType.SGPR, index=idx)
+
+    @classmethod
+    def literal(cls, val: int) -> Operand:
+        return cls(RegType.LITERAL, literal_val=val & MASK32)
+
+    def to_asm(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        else:
+            return f"{self.literal_val:#x}"
+
+
+@dataclass(frozen=True)
+class VBfeI32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self):
+        if self.dst.reg_type != RegType.VGPR:
+            raise TypeError("Destination must be a VGPR for VALU instruction v_bfe_i32")
+
+    def to_asm(self) -> str:
+        return f"v_bfe_i32 {self.dst.to_asm()}, {self.src0.to_asm()}, {self.src1.to_asm()}, {self.src2.to_asm()}"
+
+
+class TestSymbolicAST(unittest.TestCase):
+    def test_ast_construction_and_formatting(self):
+        insn = VBfeI32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.sgpr(4),
+            src2=Operand.literal(8),
+        )
+        self.assertEqual(insn.to_asm(), "v_bfe_i32 v3, v0, s4, 0x8")
+
+    def test_ast_immutability(self):
+        insn = VBfeI32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        with self.assertRaises(Exception):
+            insn.dst = Operand.vgpr(4)  # type: ignore
+
+    def test_ast_validation_errors(self):
+        with self.assertRaises(TypeError):
+            VBfeI32Instruction(
+                dst=Operand.sgpr(3),
+                src0=Operand.vgpr(0),
+                src1=Operand.vgpr(1),
+                src2=Operand.vgpr(2),
+            )
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
 
 
 if __name__ == "__main__":
