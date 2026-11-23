@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 from unittest.mock import patch
 from urllib.parse import unquote
@@ -76,6 +77,29 @@ def markdown_files(root):
 def broken_links(root, files):
     """(page, link, reason) for every relative link whose file or anchor does not resolve."""
     cache = {}
+    directory_entries = {}
+
+    def matches_checkout_spelling(path):
+        # Compare only the path inside the checkout; its own directory can have an alias.
+        try:
+            parts = os.path.relpath(path, root).split(os.sep)
+        except ValueError:  # differing drives on Windows
+            return True
+        if parts[0] in (os.curdir, os.pardir):
+            return True  # keep the ordinary existence check for paths outside the checkout
+        parent = root
+        for part in parts:
+            if parent not in directory_entries:
+                try:
+                    # macOS can expose a decomposed spelling; compare case, not normalization form.
+                    directory_entries[parent] = {unicodedata.normalize("NFC", entry) for entry in os.listdir(parent)}
+                except OSError:
+                    directory_entries[parent] = None  # a searchable directory need not be listable
+            names = directory_entries[parent]
+            if names is not None and unicodedata.normalize("NFC", part) not in names:
+                return False
+            parent = os.path.join(parent, part)
+        return True
 
     def anchors_of(path):
         if path not in cache:
@@ -106,7 +130,7 @@ def broken_links(root, files):
                 continue
             target = unquote(target.split("?", 1)[0])
             destination = os.path.normpath(os.path.join(os.path.dirname(path), target))
-            if not os.path.exists(destination):
+            if not os.path.exists(destination) or not matches_checkout_spelling(destination):
                 problems.append((os.path.relpath(path, root), link, "missing file"))
             elif anchor and os.path.isfile(destination) and anchor not in anchors_of(destination):
                 problems.append((os.path.relpath(path, root), link, "anchor not found"))
@@ -141,6 +165,33 @@ class RepositoryLinksTest(unittest.TestCase):
                 f.write("[missing](missing.md)\n")
             subprocess.run(["git", "add", "--", page], cwd=tmp, check=True)
             self.assertEqual(broken_links(tmp, markdown_files(tmp)), [(page, "missing.md", "missing file")])
+
+    def test_requires_exact_path_case_even_when_lookup_folds_case(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "Docs")
+            os.mkdir(folder)
+            guide = os.path.join(folder, "Guide Notes.md")
+            with open(guide, "w", encoding="utf-8", newline="\n") as f:
+                f.write("# Setup\n")
+            pages = os.path.join(tmp, "Pages")
+            os.mkdir(pages)
+            page = os.path.join(pages, "README.md")
+            with open(page, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[folder case](../docs/Guide%20Notes.md)\n"
+                        "[filename case](../Docs/guide%20Notes.md)\n"
+                        "[correct](../Docs/Guide%20Notes.md#setup)\n"
+                        "[directory](../Docs/)\n")
+
+            exists = os.path.exists
+            # Simulate a folding lookup without depending on the test volume's name rules.
+            def folding_exists(path):
+                return exists(path) or path.casefold() == guide.casefold()
+
+            with patch.object(os.path, "exists", side_effect=folding_exists):
+                self.assertEqual(broken_links(tmp, [page]), [
+                    (os.path.join("Pages", "README.md"), "../docs/Guide%20Notes.md", "missing file"),
+                    (os.path.join("Pages", "README.md"), "../Docs/guide%20Notes.md", "missing file"),
+                ])
 
     def test_markdown_files_walks_the_tree_when_git_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
