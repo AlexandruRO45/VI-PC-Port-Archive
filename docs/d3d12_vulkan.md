@@ -898,7 +898,8 @@ and any validation error fails them.
   destination's clear value (MoltenVK overwrote all 28 of them before the scratch copy). It is skipped where the
   device has no `MIN` depth resolve (llvmpipe), and without `copy_scratch` the list is refused.
 - `d3d12_vulkan_device_test` also runs both atomic copies and the discards through COM, and checks that
-  `WriteBufferImmediate` is refused at execution while no buffer has a GPU virtual address on `main`.
+  `WriteBufferImmediate` to an address no buffer covers is refused at execution (`unresolved_resource`);
+  a write into a placed buffer is replayed and read back.
 - `vk_bindless_test` (run by `runtime/test/shaders/check.py` and `scripts/run_gpu_tests.py`): the translator's
   own lookup against the table and the set. `ps_tex.asm`, a hand-written RDNA2 pixel shader built by `build.py`,
   loads a T# and an S# from a descriptor table and samples. The test draws the gradient with the T# at the fourth
@@ -2080,7 +2081,7 @@ The trace will enumerate them.
   (`runtime/src/buffer_va_index.h`, kept in step with the registered resources); aliasing placed buffers can
   overlap: the one whose range starts closest below the address and also holds the bytes the view or write needs
   wins, or, when none holds all of them, the one that starts closest below (`buffer_va_index_test`). These are the same fields and lookup as #291's arena, and the device fills
-  `va` once `GetGPUVirtualAddress` lands (#157/#291); until then, a list with an immediate write is refused as
+  `va` from `GetGPUVirtualAddress`; a list whose immediate write lands in no buffer is refused as
   `unresolved_resource`. `DEFAULT` adds no barrier: it is ordered like any copy, by the application's barriers.
   `MARKER_OUT` waits for every earlier command to finish and sees its writes (`ALL_COMMANDS`/`MEMORY_WRITE` →
   `TRANSFER`/`TRANSFER_WRITE`). `MARKER_IN` only needs earlier commands to have started. Vulkan cannot express
