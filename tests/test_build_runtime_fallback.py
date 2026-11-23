@@ -18,6 +18,8 @@ sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "runtime" / "test" / "shaders"
 import check  # noqa: E402
 import image_fuzz  # noqa: E402
 import run_gpu_tests  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 SCRIPT = ROOT / "scripts" / "build_runtime.ps1"
 
@@ -117,7 +119,7 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             )
             env = dict(os.environ, PATH=";".join(str(p) for p in path_dirs), LEONIDA_VS_DIR=str(vs_dir))
             res = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                [windows_powershell(), "-NoProfile", "-NonInteractive", "-Command", ps],
                 env=env, capture_output=True, text=True, check=True, timeout=30,
             )
             found = {}

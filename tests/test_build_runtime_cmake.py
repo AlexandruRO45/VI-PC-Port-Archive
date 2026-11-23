@@ -8,8 +8,11 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "build_runtime.ps1"
 CSC = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
@@ -79,7 +82,7 @@ class CMakeBatchTest(unittest.TestCase):
                    + branch + writer)
         encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            [windows_powershell(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
             env=dict(os.environ, LEONIDA_CMAKE_ROOT=str(root), LEONIDA_CMAKE_LOG=str(folder),
                      LEONIDA_CMAKE_INSTALLER=str(self.base),
                      LEONIDA_CMAKE_EXE=str(cmake), LEONIDA_CMAKE_NINJA=str(ninja),

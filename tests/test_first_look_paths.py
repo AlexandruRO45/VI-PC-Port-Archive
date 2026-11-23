@@ -11,6 +11,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_pe_inspect import build_image
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from make_game import windows_powershell  # noqa: E402
 
 
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell first-look diagnostics")
@@ -38,7 +40,7 @@ class FirstLookPathTests(unittest.TestCase):
                 "FIRST_LOOK_SCRIPT": str(repo / "scripts/first_look.ps1"),
                 "FIRST_LOOK_PACKAGE": str(game),
             }
-            ps = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
+            ps = [windows_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
             # Stand-in for gta6rt: record the actual arguments in the normal dry-run report.
             subprocess.run([*ps, """$ErrorActionPreference = 'Stop'
 Add-Type -OutputAssembly gta6rt.exe -OutputType ConsoleApplication -TypeDefinition '
