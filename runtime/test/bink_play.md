@@ -16,8 +16,9 @@ Options: `--game-dir DIR`, `--frames N`, `--headless`, `--loop`. The game folder
 
 Names come from the table `tools/bink_play.py` keeps in `%LOCALAPPDATA%\Leonida\bink_names.csv` (names, offsets
 and frame sizes from `tools/bink_names.py` and `common.rpf`'s mount lists; no movie data). When a game folder is
-selected, the table must refer to that folder's `movies.rpf` and `common.rpf`. Switching packages or changing the
-archive size triggers a rebuild. The first run takes about half a minute and needs the game folder, for example
+selected, the table must refer to that folder's `movies.rpf` and `common.rpf`. Both sources must still match the
+cached size and modification time, including when no game folder is selected. Switching packages or updating a
+source triggers a rebuild once a game folder is selected. The first run takes about half a minute, for example
 `bink_play stinger --game-dir C:\path\to\package`. After that a double-click is enough.
 `python tools/bink_play.py --list [TEXT]` lists the names.
 

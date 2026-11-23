@@ -230,35 +230,60 @@ std::filesystem::path name_table_path() {
     return base.empty() ? std::filesystem::path() : std::filesystem::path(base) / "Leonida" / "bink_names.csv";
 }
 
+bool matches_file_stamp(const std::filesystem::path& path, const std::string& size, const std::string& mtime) {
+    // Open the target for attributes so symlinks are followed, as in Python's Path.stat().
+    const HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool read = GetFileInformationByHandle(file, &info) != 0;
+    CloseHandle(file);
+    if (!read || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return false;
+    const uint64_t bytes = (uint64_t(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    if (std::to_string(bytes) != size) return false;
+
+    constexpr uint64_t unix_epoch = 116444736000000000ULL;
+    const auto& modified = info.ftLastWriteTime;
+    const uint64_t ticks = (uint64_t(modified.dwHighDateTime) << 32) | modified.dwLowDateTime;
+    if (ticks == unix_epoch) return mtime == "0";
+    const bool before_epoch = ticks < unix_epoch;
+    const uint64_t elapsed = before_epoch ? unix_epoch - ticks : ticks - unix_epoch;
+    // Write 100 ns FILETIME ticks as Unix nanoseconds without overflowing a fixed-width integer.
+    return mtime == (before_epoch ? "-" : "") + std::to_string(elapsed) + "00";
+}
+
 // tools/bink_play.py stamps both sources: "# <archive>|<size>|<mtime>|<mount>|<size>|<mtime>".
-// Stale when the archive's size changed. Paths in the table have no commas (they are game file paths).
+// Paths in the table have no commas (they are game file paths).
 bool read_name_table(NameTable& out, const std::filesystem::path& game_dir) {
     const std::filesystem::path p = name_table_path();
     std::ifstream f(p);
     std::string line;
     if (p.empty() || !f || !std::getline(f, line) || line.rfind("# ", 0) != 0) return false;
     std::istringstream stamp(line.substr(2));
-    std::string archive, archive_size, mtime, mount;
+    std::string archive, archive_size, archive_mtime, mount, mount_size, mount_mtime;
     if (!std::getline(stamp, archive, '|') || !std::getline(stamp, archive_size, '|') ||
-        !std::getline(stamp, mtime, '|')) return false;
-    std::error_code ec;
+        !std::getline(stamp, archive_mtime, '|') || !std::getline(stamp, mount, '|') ||
+        !std::getline(stamp, mount_size, '|') || !std::getline(stamp, mount_mtime)) return false;
     try {
-        out.archive = std::u8string(archive.begin(), archive.end());
+        std::filesystem::path cached_archive = std::u8string(archive.begin(), archive.end());
+        std::filesystem::path cached_mount = std::u8string(mount.begin(), mount.end());
         if (!game_dir.empty()) {
-            // A name and its offset belong to this pair of files. A cache for another installation
-            // can still have a valid size, and the Python helper may have indexed a custom mount.
+            // An explicitly selected package uses its own archive and default mount.
+            std::error_code ec;
             const auto selected_archive = game_dir / "movies.rpf";
-            if (!std::filesystem::equivalent(selected_archive, out.archive, ec) || !std::getline(stamp, mount, '|'))
-                return false;
-            const std::filesystem::path cached_mount = std::u8string(mount.begin(), mount.end());
-            if (!std::filesystem::equivalent(game_dir / "common.rpf", cached_mount, ec)) return false;
-            out.archive = selected_archive;
+            const auto selected_mount = game_dir / "common.rpf";
+            if (!std::filesystem::equivalent(selected_archive, cached_archive, ec) ||
+                !std::filesystem::equivalent(selected_mount, cached_mount, ec)) return false;
+            cached_archive = selected_archive;
+            cached_mount = selected_mount;
         }
+        if (!matches_file_stamp(cached_archive, archive_size, archive_mtime) ||
+            !matches_file_stamp(cached_mount, mount_size, mount_mtime)) return false;
+        out.archive = cached_archive;
     } catch (const std::system_error&) {
         return false;  // invalid UTF-8 in a cached path
     }
-    const auto size = std::filesystem::file_size(out.archive, ec);
-    if (ec || std::to_string(size) != archive_size) return false;
     std::getline(f, line);  // header
     out.movies.clear();
     while (std::getline(f, line)) {
