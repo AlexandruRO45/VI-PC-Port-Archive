@@ -52,6 +52,11 @@ argument is null (explicit unload). A map-only load receives no detach notificat
 `--dry-run`, `--init` and `--run` are separate modes: give exactly one. Two together (`--dry-run --run`)
 print the usage and exit 2 before anything is mapped.
 
+`--init` and `--run` first check that the host can run the game's AVX code (CPUID.1 AVX and OSXSAVE, XCR0 YMM
+state; `src/host_cpu.h`). Without it they print one line naming what is missing and exit 4 before anything is
+mapped. In a virtual machine, pass the host CPU through (QEMU `-cpu host`); under Rosetta on macOS, set
+`ROSETTA_ADVERTISE_AVX=1`. `LEONIDA_SKIP_CPU_CHECK=1` skips the check; `--dry-run` never runs it.
+
 The report line is:
 
 ```
@@ -108,11 +113,13 @@ are deduped by basename, so an import graph that reaches the same DLL twice maps
 key uses the filesystem's native path representation with ASCII case folded; it does not require a
 Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
 bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
-and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
-`LoadLibrary`/`GetModuleHandle` API conversions.
+and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
+basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
+module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
+compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
-reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
+reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
 and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
 trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
@@ -133,6 +140,16 @@ slot. This reserves one index; every additional simultaneous TLS module gets its
 clone of the helper from `%TEMP%\leonida_tls_host_<pid>_<slot>.dll`, so up to 16 modules can be live at
 once and a further one is rejected with an error instead of sharing a slot. Images without a TLS
 directory (or with an all-zero one) load normally.
+
+A `/GA` executable's code reaches its static TLS directly at index 0 (`mov r64, gs:[58h]`), but the
+loader can only get that image an index from the OS, and it need not be 0. Before the image's sections
+are protected and before any of its code runs, TLS callbacks included, the loader rewrites each such
+slot-0 read in an executable section to the same instruction reading `TEB->TlsSlots[slot]` instead
+(`patch_ga_tls_reads`), with one `TlsAlloc` slot per image; the rewrite is the same length, so nothing
+else in the image moves. It applies only to an EXE whose own TLS index is not 0 and that has a TLS
+directory; the loader's log names the image, the number of rewritten reads and the slot. Set
+`LEONIDA_TLS_GA_PATCH=0` to turn the rewrite off, for measuring what the image does without it; any other
+value, or leaving it unset, keeps it on.
 
 Current limits, by design:
 
@@ -161,7 +178,12 @@ Current limits, by design:
   measured three-argument
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
-  address.
+  address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
+  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
+  and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
+  (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
+  64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
+  64 KiB-page `XMemVirtualAlloc` becomes, with that reservation's protection. `XMemIsToolsMemAvailable` is `FALSE`.
 - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
@@ -234,7 +256,8 @@ SDK, or `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to download the pinned Khronos Vulka
   and found by FSSM hash; three draws into a float target, compared bit for bit. Needs `llvm-mc` (`LLVM_MC`) and the
   Vulkan SDK's `spirv-as` and `spirv-val` at build time.
 - `d3d12_compute_test` — the compute path: root signature, a compute PSO found by its FSSM hash in a
-  translator-style index, root arguments through the GPU address arena, and two dispatches.
+  translator-style index, root arguments through the GPU address arena, and two dispatches. A second program is
+  found the same way in `<shaders>/bvh/index.json`, where the BVH builder's programs go (`docs/embedded_shaders.md`).
 - `d3d12_fspx_compute_test` — compute PSOs from synthetic FSPX programs (`docs/fspx.md`): an `ACCC` container
   through slot 62 and a bare kind-6 program, found by `fspx_code_sha256` in `<shaders>/fspx/index.json`, one
   dispatch each that reads its kind-6 program as the code base; malformed directories and untranslated programs
@@ -267,6 +290,52 @@ readings, plays each motor and trigger, and holds a constant force on a pad that
 16-byte aligned at the call into the runtime, that rbx/rbp/rdi/rsi/r12-r15 and xmm6-xmm15 survive a call
 (`test/fixtures/abi_probe.asm`, MASM; skipped without `ml64`), and that `RtlVirtualUnwind` from inside the call walks
 back to the caller.
+
+### PE-loader fuzzer: `pe_loader_fuzz`
+
+`pe_loader_fuzz` (RT-388) is a deterministic mutation fuzzer for `Loader::load`. Each case builds three small
+synthetic DLLs in the test itself (headers and four sections, base relocations, import and delay-import tables, exports
+with forwarders and ordinal-only entries, a TLS directory with template, index and callbacks, and an exception
+directory with `UNWIND_INFO`), mutates their fields and bytes, writes them to a scratch folder and loads the first one.
+A case passes when `load()` returns or throws a `std::exception`, the `Loader` is destroyed again, and after a
+successful load every export and unwind table lies inside its image. It fails on a crash, an AddressSanitizer report,
+a non-`std::exception` throw, or a case that runs past `--timeout-ms` (30 s). No image code runs (it never calls
+`initialise()`), and nothing is read from the game.
+
+CTest runs the first 120 cases of the fixed seed. Case `N` of a seed is the same everywhere, so a failure reproduces
+with `--case N` and shrinks with `--minimize N`, which retries in child processes with each mutation left out and
+prints the ones the failure needs. `--dump N DIR` writes the case's images for a closer look. A process memory limit
+(`--mem-mb`, 1024 by default) turns a mutated size of several gigabytes into a failed allocation. On a machine
+with many threads, most of each case is the loader's snapshot of every thread in the system for a TLS module
+(`install_on_existing_threads`); expect a few cases per second.
+
+```powershell
+pe_loader_fuzz --iters 20000                 # or --seconds 3600; LEONIDA_LOADER_FUZZ_ITERS/_SECONDS/_SEED
+pe_loader_fuzz --seed 0x4C454F4E49444131 --case 1234 --verbose
+pe_loader_fuzz --minimize 1234
+pe_loader_fuzz --start 10000000 --seconds 3600   # a second process on another range of cases
+```
+
+For AddressSanitizer, configure a separate build with `-DLEONIDA_LOADER_FUZZ_ASAN=ON` and `RelWithDebInfo`
+(`/fsanitize=address` does not combine with Debug's `/RTC1`). That instruments the fuzzer and the loader sources
+compiled into it, and copies `clang_rt.asan_dynamic-x86_64.dll` beside the test. MSVC needs the Visual Studio
+component "C++ AddressSanitizer". clang-cl from an official LLVM release works with the MSVC headers and libraries
+(LLVM 23.1.5 with MSVC 14.44 was tested). Run it from an x64 Developer prompt:
+
+```powershell
+cmake -S runtime -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_LOADER_FUZZ_ASAN=ON `
+  -DCMAKE_C_COMPILER=<llvm>/bin/clang-cl.exe -DCMAKE_CXX_COMPILER=<llvm>/bin/clang-cl.exe `
+  -DCMAKE_LINKER=<llvm>/bin/lld-link.exe -DCMAKE_AR=<llvm>/bin/llvm-lib.exe -DCMAKE_RC_COMPILER=<llvm>/bin/llvm-rc.exe `
+  -DCMAKE_MT=<llvm>/bin/llvm-mt.exe
+cmake --build build-asan --target pe_loader_fuzz
+build-asan/pe_loader_fuzz --seconds 3600
+```
+
+With clang-cl the target is built with `-fsanitize-address-use-after-return=never`: clang-cl 23's
+stack-use-after-return frames make MSVC C++ exception dispatch fault in `_C_specific_handler_noexcept` at `/O2`, and
+every rejected image is a thrown exception. STL container annotations are off (`_DISABLE_STRING_ANNOTATION`,
+`_DISABLE_VECTOR_ANNOTATION`), because they need the component's `stl_asan.lib` and the libraries linked in are
+built without ASan.
 
 The PE-loader and Bink-decode tests that need the retail package are optional: when
 `LEONIDA_GAME_DIR` (and, for Bink, `LEONIDA_MOVIE`) is unset they print `SKIP` and exit 0. They read
@@ -351,7 +420,8 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
+| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
+| `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
@@ -453,6 +523,8 @@ dimension outside the enum must be refused alike. It also copies a pattern throu
 ```powershell
 $env:LEONIDA_VK_VALIDATION = '1'
 .\runtime\build\RelWithDebInfo\d3d12_placed_dimensions_test.exe
+```
+
 ### 1D render targets and depth buffers
 
 `d3d12_texture1d_target_test` creates `TEXTURE1D` textures with `ALLOW_RENDER_TARGET` (10 color formats) or

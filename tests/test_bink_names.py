@@ -341,6 +341,18 @@ class TestCli(unittest.TestCase):
             with open(report, "rb") as f:
                 self.assertEqual(f.read(), b"previous report")
 
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(names_mod, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    names_mod.write(path, [], [], {"streams": 0})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
     def test_rejects_negative_max_skip(self):
         with tempfile.TemporaryDirectory() as tmp:
             xml = os.path.join(tmp, "list.xml")
@@ -453,6 +465,14 @@ class TestCli(unittest.TestCase):
             xml_file = os.path.join(mount_dir, "list.xml")
             with open(xml_file, "w", encoding="utf-8") as fh:
                 fh.write(xml_text)
+            for folder in (src_dir, mount_dir):
+                reserved = os.path.join(folder, "index.json")
+                with self.subTest(folder=folder), contextlib.redirect_stderr(io.StringIO()) as err:
+                    with self.assertRaises(SystemExit) as cm:
+                        names_mod.main([src_dir, "--mount", mount_dir, "--out", reserved])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("carve manifest", err.getvalue())
+                    self.assertFalse(os.path.exists(reserved))
             for target in (stream_file, xml_file, src_dir):
                 with self.subTest(target=target):
                     with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
