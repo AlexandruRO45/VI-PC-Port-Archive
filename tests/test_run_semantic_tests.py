@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -49,6 +50,14 @@ class RunnerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             suite(tmp, {"helper.py": "X = 1\n", "test_p1.py": PASS, "test_p2.py": PASS})
             code, out = run(tmp, "-j", "2")
+            self.assertEqual(code, 0, out)
+            self.assertIn("2 files, 4 tests, 0 files failed", out)
+
+    def test_parallel_workers_can_import_without_implicit_cwd(self):
+        with tempfile.TemporaryDirectory(prefix="semantic suite ") as tmp:
+            suite(tmp, {"helper.py": "X = 1\n", "test_p.py": PASS, "pkg/__init__.py": "", "pkg/test_p.py": PASS})
+            with mock.patch.dict(os.environ, {"PYTHONSAFEPATH": "1"}):
+                code, out = run(tmp, "-j", "2")
             self.assertEqual(code, 0, out)
             self.assertIn("2 files, 4 tests, 0 files failed", out)
 

@@ -4,9 +4,9 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
     python -I scripts/run_semantic_tests.py tests/semantic -j 4     # four at a time
     python -I scripts/run_semantic_tests.py tests/semantic -v       # also print the output of the files that pass
 
-It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
-`python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
-run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
+It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), one
+module per worker. The worker explicitly adds the suite folder to its import path, as discover does. The files
+can run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
 or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
 line, and exits 1 if a file fails or none is found. Standard library only.
 """
@@ -33,8 +33,10 @@ def test_modules(directory):
 
 
 def run_module(directory, module, verbose):
-    """(return code, tests run, output) of `python -m unittest <module>` run from `directory`."""
-    cmd = [sys.executable, "-m", "unittest", *(["-v"] if verbose else []), module]
+    """(return code, tests run, output) for one unittest module in the suite."""
+    # Windows embeddable Python (and Python's safe-path mode) omit the working directory from sys.path.
+    worker = "import os, sys, unittest; sys.path.insert(0, os.getcwd()); unittest.main(module=None)"
+    cmd = [sys.executable, "-c", worker, *(["-v"] if verbose else []), module]
     p = subprocess.run(cmd, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        errors="replace")
     ran = re.search(r"^Ran (\d+) tests? in", p.stdout, re.M)
