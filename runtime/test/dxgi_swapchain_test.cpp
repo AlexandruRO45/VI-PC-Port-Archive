@@ -1308,10 +1308,16 @@ int main() {
 
         // VBlank, frame statistics, overlay/hw-composition, and duplication checks.
         if (FAILED(out0->WaitForVBlank())) return fail("WaitForVBlank failed");
+        // IDXGIOutput::GetFrameStatistics is supported only in full-screen mode (Microsoft's reference), and the layer's
+        // outputs never are: host dxgi.dll answers DXGI_ERROR_INVALID_CALL on a windowed output, with or without a
+        // structure, and leaves the structure as it was.
         DXGI_FRAME_STATISTICS out_stats{};
+        out_stats.PresentCount = 0x5a5a5a5au;
+        out_stats.SyncQPCTime.QuadPart = 0x1234;
         if (out0->GetFrameStatistics(nullptr) != DXGI_ERROR_INVALID_CALL ||
-            FAILED(out0->GetFrameStatistics(&out_stats)) || out_stats.SyncQPCTime.QuadPart == 0)
-            return fail("Output::GetFrameStatistics failed");
+            out0->GetFrameStatistics(&out_stats) != DXGI_ERROR_INVALID_CALL || out_stats.PresentCount != 0x5a5a5a5au ||
+            out_stats.SyncQPCTime.QuadPart != 0x1234)
+            return fail("Output::GetFrameStatistics on a windowed output should be DXGI_ERROR_INVALID_CALL");
         UINT comp_flags = 99;
         if (out6->CheckHardwareCompositionSupport(nullptr) != E_INVALIDARG ||
             FAILED(out6->CheckHardwareCompositionSupport(&comp_flags)) ||

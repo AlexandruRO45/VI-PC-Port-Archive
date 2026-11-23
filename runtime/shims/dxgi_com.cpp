@@ -947,13 +947,10 @@ public:
     HRESULT STDMETHODCALLTYPE GetGammaControl(DXGI_GAMMA_CONTROL*) override { return DXGI_ERROR_INVALID_CALL; }
     HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface*) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface*) override { return DXGI_ERROR_INVALID_CALL; }
-    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
-        if (!stats) return DXGI_ERROR_INVALID_CALL;
-        std::memset(stats, 0, sizeof(*stats));
-        LARGE_INTEGER qpc{};
-        if (QueryPerformanceCounter(&qpc)) stats->SyncQPCTime = qpc;
-        return S_OK;
-    }
+    // Microsoft: "Calling this method is only supported while in full-screen mode." No swap chain the layer makes
+    // takes an output full-screen, so every call is refused; the host dxgi.dll answers a windowed output the same
+    // way, with or without a structure, and leaves the structure as it was (Windows 11, RTX 3080, driver 621.24).
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS*) override { return DXGI_ERROR_INVALID_CALL; }
 
     // IDXGIOutput1
     HRESULT STDMETHODCALLTYPE GetDisplayModeList1(DXGI_FORMAT fmt, UINT, UINT* num_modes,
