@@ -360,6 +360,23 @@ class TestVBfmB32SIMDAndIEEE(unittest.TestCase):
         res = ref_v_bfm_b32(qnan, snan)
         self.assertIsInstance(res, int)
 
+class TestVBfmB32Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 0x9abcdef0",
+            "v_mov_b32 v2, 0x55555555",
+            "v_bfm_b32 v2, 8, 4",
+            "exp mrt0, v3, v3, v3, v3 done" if "v3" in "v_bfm_b32 v2, 8, 4" else "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_bfm_b32", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xff0)
+
 
 if __name__ == "__main__":
     unittest.main()
