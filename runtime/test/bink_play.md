@@ -15,10 +15,11 @@ Options: `--game-dir DIR`, `--frames N`, `--headless`, `--loop`. The game folder
 `LEONIDA_GAME_DIR`, or the archive the name table was built from.
 
 Names come from the table `tools/bink_play.py` keeps in `%LOCALAPPDATA%\Leonida\bink_names.csv` (names, offsets
-and frame sizes from `tools/bink_names.py` and `common.rpf`'s mount lists; no movie data), rebuilt when the archive's
-size changes. Without a table, `bink_play` runs that tool once to build it, which takes about half a minute and needs
-the game folder the first time: `bink_play stinger --game-dir C:\path\to\package`. After that a double-click
-is enough. `python tools/bink_play.py --list [TEXT]` lists the names.
+and frame sizes from `tools/bink_names.py` and `common.rpf`'s mount lists; no movie data). When a game folder is
+selected, the table must refer to that folder's `movies.rpf` and `common.rpf`. Switching packages or changing the
+archive size triggers a rebuild. The first run takes about half a minute and needs the game folder, for example
+`bink_play stinger --game-dir C:\path\to\package`. After that a double-click is enough.
+`python tools/bink_play.py --list [TEXT]` lists the names.
 
 For `archive@OFFSET` it calls `BinkSetFileOffset(OFFSET)` and opens the archive with `BinkOpen`'s `BINKFILEOFFSET`
 flag (0x20); without the flag the offset is ignored and `BinkOpen` reports "Not a Bink file". An error in a windowed

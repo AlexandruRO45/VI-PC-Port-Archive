@@ -942,6 +942,13 @@ if(BUILD_TESTING)
     add_dependencies(bink_play gta6rt_tls_host)
     add_test(NAME bink_play_headless COMMAND bink_play --headless --frames 30)
     set_tests_properties(bink_play_headless PROPERTIES SKIP_RETURN_CODE 77)
+    if(NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME bink_play_cache_source COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_bink_cache_source.py" "$<TARGET_FILE:bink_play>")
+      endif()
+    endif()
 
     # Optional: skips unless LEONIDA_GAME_DIR is set. Drives the package's FSR DLL on the Xbox-ABI device proxy.
     if(D3D12_LIBRARY AND DXGI_LIBRARY)

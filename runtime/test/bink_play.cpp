@@ -32,6 +32,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -229,20 +230,35 @@ std::filesystem::path name_table_path() {
     return base.empty() ? std::filesystem::path() : std::filesystem::path(base) / "Leonida" / "bink_names.csv";
 }
 
-// tools/bink_play.py's table: "# <archive>|<size>|<mtime>", then a header and path,offset,width,height,frames rows.
+// tools/bink_play.py stamps both sources: "# <archive>|<size>|<mtime>|<mount>|<size>|<mtime>".
 // Stale when the archive's size changed. Paths in the table have no commas (they are game file paths).
-bool read_name_table(NameTable& out) {
+bool read_name_table(NameTable& out, const std::filesystem::path& game_dir) {
     const std::filesystem::path p = name_table_path();
     std::ifstream f(p);
     std::string line;
     if (p.empty() || !f || !std::getline(f, line) || line.rfind("# ", 0) != 0) return false;
-    const std::string stamp = line.substr(2);
-    const size_t bar1 = stamp.find('|'), bar2 = stamp.find('|', bar1 + 1);
-    if (bar1 == std::string::npos || bar2 == std::string::npos) return false;
-    out.archive = std::filesystem::path(stamp.substr(0, bar1));
+    std::istringstream stamp(line.substr(2));
+    std::string archive, archive_size, mtime, mount;
+    if (!std::getline(stamp, archive, '|') || !std::getline(stamp, archive_size, '|') ||
+        !std::getline(stamp, mtime, '|')) return false;
     std::error_code ec;
+    try {
+        out.archive = std::u8string(archive.begin(), archive.end());
+        if (!game_dir.empty()) {
+            // A name and its offset belong to this pair of files. A cache for another installation
+            // can still have a valid size, and the Python helper may have indexed a custom mount.
+            const auto selected_archive = game_dir / "movies.rpf";
+            if (!std::filesystem::equivalent(selected_archive, out.archive, ec) || !std::getline(stamp, mount, '|'))
+                return false;
+            const std::filesystem::path cached_mount = std::u8string(mount.begin(), mount.end());
+            if (!std::filesystem::equivalent(game_dir / "common.rpf", cached_mount, ec)) return false;
+            out.archive = selected_archive;
+        }
+    } catch (const std::system_error&) {
+        return false;  // invalid UTF-8 in a cached path
+    }
     const auto size = std::filesystem::file_size(out.archive, ec);
-    if (ec || std::to_string(size) != stamp.substr(bar1 + 1, bar2 - bar1 - 1)) return false;
+    if (ec || std::to_string(size) != archive_size) return false;
     std::getline(f, line);  // header
     out.movies.clear();
     while (std::getline(f, line)) {
@@ -268,7 +284,9 @@ bool build_name_table(const std::filesystem::path& game_dir) {
     if (tool.empty() || game_dir.empty()) return false;
     std::printf("naming the movies in movies.rpf (about half a minute, once)...\n");
     std::fflush(stdout);
-    const std::wstring cmd = L"python \"" + tool.wstring() + L"\" --list --game-dir \"" + game_dir.wstring() + L"\"";
+    // A trailing backslash would escape the closing quote in the child's command line.
+    const std::wstring cmd = L"python -I \"" + tool.wstring() + L"\" --list --game-dir \"" +
+                             (game_dir / L".").wstring() + L"\"";
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags = STARTF_USESTDHANDLES;
     HANDLE nul = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -279,13 +297,15 @@ bool build_name_table(const std::filesystem::path& game_dir) {
     std::vector<wchar_t> line(cmd.begin(), cmd.end());
     line.push_back(0);
     const bool ok = CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+    DWORD exit_code = 1;
     if (ok) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
+        if (WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &exit_code);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
-    return ok;
+    return ok && exit_code == 0;
 }
 
 // The movie a NAME means: exactly that path (case-insensitive), else the only path containing it.
@@ -340,13 +360,13 @@ int main(int argc, char** argv) {
     const bool is_name = movie_arg.find('@') == std::string::npos && !std::filesystem::is_regular_file(movie_arg, ec);
     if (is_name) {
         NameTable table;
-        if (!read_name_table(table)) {
+        if (!read_name_table(table, game_dir_arg)) {
             if (game_dir_arg.empty())
                 fatal("bink_play needs the game folder once, to name the movies:\n\n"
                       "  bink_play " + movie_arg + " --game-dir <package folder>\n\n"
                       "After that, double-clicking bink_play.exe plays the stinger.");
-            build_name_table(game_dir_arg);
-            if (!read_name_table(table)) fatal("could not build the movie name table with tools\\bink_play.py");
+            if (!build_name_table(game_dir_arg) || !read_name_table(table, game_dir_arg))
+                fatal("could not build the movie name table with tools\\bink_play.py");
         }
         const NamedMovie m = find_named(table, movie_arg);
         std::printf("%s\n", m.path.c_str());
