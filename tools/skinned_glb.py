@@ -544,16 +544,23 @@ class PaletteResolver:
     def __init__(self, component: dict, ped_by_name: dict[str, dict]):
         self.ped_by_name = ped_by_name
         drawable = component.get("drawable") or {}
-        own = drawable.get("skeleton") or []
+        own = drawable.get("skeleton")
+        if not isinstance(own, list):
+            own = []
         self.own_skeleton = own
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                continue
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
                 self.by_hash.setdefault(joaat32(name), (name, "own"))
-        for text in drawable.get("strings") or []:
+        strings = drawable.get("strings")
+        if not isinstance(strings, list):
+            strings = []
+        for text in strings:
             if not isinstance(text, str) or not text:
                 continue
             self._add_string(text, "string")
