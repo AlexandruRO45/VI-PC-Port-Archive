@@ -1,4 +1,6 @@
 """Tests for tools/pc_checker.py. Run with: python -I tests/test_pc_checker.py"""
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -152,6 +154,42 @@ class Api(unittest.TestCase):
         os.environ[pc.SKIP_ENV] = "1"
         c = pc.SpecChecker(XBOX)
         self.assertTrue(c.warn_if_weak(c.check(*self.WEAK)))
+
+
+class CheckOnlyFlags(unittest.TestCase):
+    """`--json` and `--warn` change a `--check` run only, so either one without it is refused, not dropped: a
+    wrapper that forgets `--check` used to get the window instead of the report it asked for."""
+
+    def setUp(self):
+        self.calls = []
+        for name in ("run_check", "run_cli", "run_gui"):
+            original = getattr(pc, name)
+            self.addCleanup(setattr, pc, name, original)
+        pc.run_check = lambda args: self.calls.append("check") or 0
+        pc.run_cli = lambda args: self.calls.append("cli")
+        pc.run_gui = lambda: self.calls.append("gui")
+        self.original_argv = sys.argv
+        self.addCleanup(setattr, sys, "argv", self.original_argv)
+
+    def run_main(self, *flags):
+        sys.argv = ["pc_checker.py", *flags]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as raised:
+                pc.main()
+        return raised.exception.code, stderr.getvalue()
+
+    def test_json_without_check_is_refused(self):
+        code, err = self.run_main("--json")
+        self.assertEqual(code, 2)
+        self.assertIn("--json needs --check", err)
+        self.assertEqual(self.calls, [])        # no window, no report: nothing ran
+
+    def test_warn_without_check_is_refused(self):
+        code, err = self.run_main("--warn", "--cli")
+        self.assertEqual(code, 2)
+        self.assertIn("--warn needs --check", err)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":
