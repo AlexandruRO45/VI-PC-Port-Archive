@@ -9,6 +9,8 @@
 // ASSUMPTION: the attribute word is not decoded by the measured call sites (one passes 0x5e50000). Until a call
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
 // zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
+//
+// The default routines and their hooks follow the public GDK XMem reference.
 #include <windows.h>
 #include <intrin.h>
 #include <malloc.h>
@@ -50,14 +52,44 @@ void note_attributes(bool is_alloc, uint64_t attributes, size_t size, const void
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
+void* __stdcall XMemAllocDefault(size_t size, uint64_t /*attributes*/) {
+    return _aligned_malloc(size ? size : 1, kAlign);
+}
+
+void __stdcall XMemFreeDefault(void* p, uint64_t /*attributes*/) { _aligned_free(p); }
+
+// XMemSetAllocationHooks replaces the routines XMemAlloc and XMemFree call. Titles install them once at startup, before
+// allocating, so the pair is two atomics rather than a lock on every allocation. The free hook is published first: a
+// block that comes from a new alloc hook always meets its matching free hook.
+using AllocRoutine = void*(__stdcall*)(size_t, uint64_t);
+using FreeRoutine = void(__stdcall*)(void*, uint64_t);
+std::atomic<AllocRoutine> g_alloc_hook{nullptr};
+std::atomic<FreeRoutine> g_free_hook{nullptr};
+
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes(true, attributes, size, _ReturnAddress());
-    return _aligned_malloc(size ? size : 1, kAlign);
+    const AllocRoutine hook = g_alloc_hook.load(std::memory_order_acquire);
+    return hook ? hook(size, attributes) : XMemAllocDefault(size, attributes);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
     note_attributes(false, attributes, 0, _ReturnAddress());
-    _aligned_free(p);
+    const FreeRoutine hook = g_free_hook.load(std::memory_order_acquire);
+    if (hook)
+        hook(p, attributes);
+    else
+        XMemFreeDefault(p, attributes);
+}
+
+// Both routines or neither: the GDK documents hooking only one of them as an error, and a lone hook would hand out
+// blocks the other side cannot release. Two nulls restore the defaults.
+void __stdcall XMemSetAllocationHooks(AllocRoutine alloc, FreeRoutine free_routine) {
+    if ((alloc == nullptr) != (free_routine == nullptr)) {
+        std::fprintf(stderr, "[rt] xmem: XMemSetAllocationHooks with only one routine ignored\n");
+        return;
+    }
+    g_free_hook.store(free_routine, std::memory_order_release);
+    g_alloc_hook.store(alloc, std::memory_order_release);
 }
 
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
@@ -258,4 +290,7 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
+    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
+    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemSetAllocationHooks", reinterpret_cast<void*>(&XMemSetAllocationHooks)},
 );
