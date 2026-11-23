@@ -252,8 +252,7 @@ is the one the stems fall under:
 
 `Searched` counts what the tool that searched reports, so the unit differs per row: banks and channels for the
 AWC exporter, Bink tracks for the movie rows, and zlib streams for the inflated-archive rows. The three
-script/config archives are **1,057 / 954 / 2,632 zlib streams** in a 1.0.2.1 carve (`tools/rpf9_carve.py`); this
-row first recorded 1,058 / 955 / 2,633, one item more per archive than the carve finds, while the `packs.rpf`
+script/config archives are **1,057 / 954 / 2,632 zlib streams** in a 1.0.2.1 carve (`tools/rpf9_carve.py`; its summary reports the total as `files` and counts Bink 2 rows in it too, but `bink2_files` is 0 in these archives, so `files` is the zlib-stream count here); this row first recorded 1,058 / 955 / 2,633, one item more per archive than the carve finds, while the `packs.rpf`
 and `data.rpf` rows above match their stream counts exactly. `gamedata.md`'s archive table gives the same 954
 streams for `common.rpf`, but its `script.rpf` row still says 714 (671 `PSIN`), which both this carve (1,057)
 and the 1,012 `PSIN` in `docs/psin.md` disagree with, so the carve count is the one to use here.
