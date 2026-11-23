@@ -16,7 +16,7 @@
 // (VK_ERROR_DEVICE_LOST) the outputs hold what the layer knows, and nothing it does not:
 //   - a node for each list kept by the breadcrumb ring that the GPU did not complete, oldest first. The
 //     granularity is the list: *pLastBreadcrumbValue is 0 (one that started may have run some of its operations).
-//     The list and queue debug names are copies taken at submission (Object::debug_name); pCommandList and
+//     The list and queue debug names are copies taken at submission (dred_debug_name); pCommandList and
 //     pCommandQueue stay null, since nothing keeps those objects alive after ExecuteCommandLists, and there are no
 //     breadcrumb contexts. Without VK_AMD_buffer_marker the GPU progress is unknown and there is no node at all;
 //     the stderr report lists the submitted lists instead;
@@ -40,6 +40,25 @@
 #include <vector>
 
 namespace rt::d3d12 {
+
+// The D3D12 debug name of `object` as it is now: SetName stores it as WKPDID_D3DDebugObjectNameW private data with
+// its terminator (d3d12_com_object.h), and GetPrivateData reads it under the object's own lock. Empty without one.
+// The caller holds a reference to `object`; the name is a copy.
+template<class T>
+std::wstring dred_debug_name(T* object) {
+    if (!object) return {};
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        UINT size = 0;
+        if (object->GetPrivateData(T::kDebugObjectNameW, &size, nullptr) != S_OK || size < sizeof(wchar_t)) return {};
+        std::vector<wchar_t> text(size / sizeof(wchar_t) + 1, L'\0');
+        UINT read = size;
+        const HRESULT hr = object->GetPrivateData(T::kDebugObjectNameW, &read, text.data());
+        if (hr == DXGI_ERROR_MORE_DATA) continue;  // renamed to something longer between the two calls
+        if (hr != S_OK) return {};
+        return std::wstring(text.data(), wcsnlen(text.data(), read / sizeof(wchar_t)));
+    }
+    return {};
+}
 
 // LEONIDA_DRED=1 asks for device-lost diagnostics, read once.
 inline bool dred_requested() {
@@ -166,37 +185,28 @@ public:
     ULONG STDMETHODCALLTYPE Release() override { return device_->Release(); }
 
     HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT* out) override {
-        const HRESULT hr = ready(out);
-        if (hr == S_OK) out->pHeadAutoBreadcrumbNode = snapshot_.head();
-        return hr;
+        return ready(out, [&] { out->pHeadAutoBreadcrumbNode = snapshot_.head(); });
     }
     HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput(D3D12_DRED_PAGE_FAULT_OUTPUT* out) override {
-        const HRESULT hr = ready(out);
-        if (hr == S_OK) *out = {snapshot_.fault_va(), nullptr, nullptr};
-        return hr;
+        return ready(out, [&] { *out = {snapshot_.fault_va(), nullptr, nullptr}; });
     }
     HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput1(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1* out) override {
-        const HRESULT hr = ready(out);
-        if (hr == S_OK) out->pHeadAutoBreadcrumbNode = snapshot_.head1();
-        return hr;
+        return ready(out, [&] { out->pHeadAutoBreadcrumbNode = snapshot_.head1(); });
     }
     HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput1(D3D12_DRED_PAGE_FAULT_OUTPUT1* out) override {
-        const HRESULT hr = ready(out);
-        if (hr == S_OK) *out = {snapshot_.fault_va(), nullptr, nullptr};
-        return hr;
+        return ready(out, [&] { *out = {snapshot_.fault_va(), nullptr, nullptr}; });
     }
     HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput2(D3D12_DRED_PAGE_FAULT_OUTPUT2* out) override {
-        const HRESULT hr = ready(out);
-        if (hr == S_OK) *out = {snapshot_.fault_va(), nullptr, nullptr, D3D12_DRED_PAGE_FAULT_FLAGS_NONE};
-        return hr;
+        return ready(out, [&] { *out = {snapshot_.fault_va(), nullptr, nullptr, D3D12_DRED_PAGE_FAULT_FLAGS_NONE}; });
     }
     D3D12_DRED_DEVICE_STATE STDMETHODCALLTYPE GetDeviceState() override { return D3D12_DRED_DEVICE_STATE_UNKNOWN; }
 
 private:
     // The host runtime's order: not enabled, then not removed, then the output. The data is taken once, at the
-    // first call after the loss, so the pointers handed out stay valid.
-    template<class T>
-    HRESULT ready(T* out) {
+    // first call after the loss, so the pointers handed out stay valid; `fill` reads it under the same lock, since a
+    // caller that saw only RemoveDevice may read while another one takes the data after a real loss.
+    template<class T, class Fill>
+    HRESULT ready(T* out, Fill&& fill) {
         if (!enabled_) return DXGI_ERROR_UNSUPPORTED;
         const bool lost = context_ && context_->is_device_lost();
         if (!lost && !(removed_ && removed_->load(std::memory_order_acquire))) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
@@ -216,6 +226,7 @@ private:
             }
             taken_ = true;
         }
+        fill();
         return S_OK;
     }
 

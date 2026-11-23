@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -109,6 +110,20 @@ int synthetic() {
     EXPECT(unknown.find("list 0x113 \"shadow pass \xc3\xa9\" on queue 0x9000 \"direct\", tag 20: submitted, GPU "
                         "progress UNKNOWN") != std::string::npos);
     EXPECT(unknown.find("completed") == std::string::npos && unknown.find("not started") == std::string::npos);
+    // A submission that failed leaves nothing behind; the next one is kept.
+    {
+        BreadcrumbRing ring;
+        ring.initialize_cpu_only();
+        std::vector<BreadcrumbRing::Mark> lost{ring.mark(list)};
+        ring.submitted(std::move(lost), false);
+        EXPECT(ring.snapshot().empty());
+        std::vector<BreadcrumbRing::Mark> kept{ring.mark(list)};
+        const std::uint32_t tag = kept[0].tag;
+        ring.submitted(std::move(kept), true);
+        const auto kept_entries = ring.snapshot();
+        EXPECT(kept_entries.size() == 1 && kept_entries[0].tag == tag &&
+               kept_entries[0].state == BreadcrumbState::unknown);
+    }
     std::printf("breadcrumbs: state, operations and report on synthetic data ok\n");
     return 0;
 }
@@ -191,6 +206,18 @@ int main() {
         EXPECT(queue.execute({&pa, 1}) == ReplayResult::success);
         EXPECT(queue.idle());
         EXPECT(ring->snapshot().back().list_name.empty());
+        // A queue that never names itself (the device's staging queue) and lands at the address of a named queue
+        // that was destroyed must not carry that queue's name.
+        std::optional<VulkanQueue> reused;
+        reused.emplace(context, d.queue, d.family);
+        ring->label_queue(&*reused, L"destroyed queue");
+        reused.reset();
+        reused.emplace(context, d.queue, d.family);  // the same storage, so the same address
+        EXPECT(reused->ok());
+        EXPECT(reused->execute({&pa, 1}) == ReplayResult::success);
+        EXPECT(reused->idle());
+        EXPECT(ring->snapshot().back().queue_name.empty());
+        reused.reset();
         std::printf("breadcrumbs: CPU only without VK_AMD_buffer_marker: submitted lists, queue and names, progress "
                     "UNKNOWN ok\n");
     }
@@ -223,23 +250,79 @@ int main() {
         EXPECT(entries[0].state == BreadcrumbState::completed);
         EXPECT(entries[0].ops.size() == 1 && entries[0].ops[0] == breadcrumb_op::copy_buffer_region);
 
+        // A Wait for a fence value no Signal has reached holds the batch on the CPU (QueueHolds): nothing reached
+        // vkQueueSubmit, so the ring has nothing for it. The Signal releases it; the ring then marks the held copy
+        // under the list the application passed, with that list's name.
+        ring->label_list(pb, L"held list");
         queue.wait(fence.semaphore(), 1);
-        EXPECT(queue.execute({&pb, 1}) == ReplayResult::success);  // vkQueueSubmit succeeded: CPU knowledge only
+        EXPECT(queue.execute({&pb, 1}) == ReplayResult::success);
         entries = ring->snapshot();
-        EXPECT(entries.size() == 2);
-        const auto* held = find(entries, reinterpret_cast<std::uintptr_t>(pb));
-        EXPECT(held && held->state == BreadcrumbState::submitted);  // held before its first command
-        EXPECT(find(entries, reinterpret_cast<std::uintptr_t>(pa))->state == BreadcrumbState::completed);
-        const std::string text = report_of(entries);
-        EXPECT(text.find("1 of the last 2 lists did not complete") != std::string::npos);
-        EXPECT(text.find(": submitted (not started), 2 operations: CopyBufferRegion, ResourceBarrier") != std::string::npos);
+        EXPECT(entries.size() == 1 && !find(entries, reinterpret_cast<std::uintptr_t>(pb)));
+        EXPECT(report_of(entries).find("every one of the 1 lists kept completed") != std::string::npos);
 
         EXPECT(fence.signal(1));
         EXPECT(queue.idle());
         entries = ring->snapshot();
         EXPECT(entries.size() == 2);
-        EXPECT(find(entries, reinterpret_cast<std::uintptr_t>(pb))->state == BreadcrumbState::completed);
-        std::printf("breadcrumbs: completed / submitted behind an unsignalled fence / completed ok\n");
+        const auto* released = find(entries, reinterpret_cast<std::uintptr_t>(pb));
+        EXPECT(released && released->state == BreadcrumbState::completed && released->list_name == L"held list");
+        EXPECT(released->ops.size() == 2 && released->ops[1] == breadcrumb_op::resource_barrier);
+        ring->label_list(pb, L"");
+        std::printf("breadcrumbs: completed / held behind an unsignalled fence, then released under its own id and "
+                    "name / completed ok\n");
+
+        // Held batches keep the names they had at ExecuteCommandLists, while the application's objects were alive:
+        //   1. X is held, then X and its queue are renamed: the breadcrumb keeps the old names;
+        //   2. the application releases X and a new list Y takes its storage, is named and runs at once on another
+        //      queue before X's batch is released: X's breadcrumb must not take Y's name;
+        //   3. a second batch, Z, is held on the other queue behind another fence; Z is released first, then X:
+        //      each keeps its own name, and the ring lists them in the order they reached vkQueueSubmit.
+        {
+            VulkanQueue other(context, d.queue, d.family);
+            EXPECT(other.ok());
+            VulkanFence fence_x(context, 0), fence_z(context, 0);
+            EXPECT(fence_x.semaphore() != VK_NULL_HANDLE && fence_z.semaphore() != VK_NULL_HANDLE);
+            std::optional<CommandList> storage;
+            storage.emplace(b);  // X: b's two operations
+            const CommandList* px = &*storage;
+            ring->label_queue(&queue, L"queue one");
+            ring->label_list(px, L"X");
+            queue.wait(fence_x.semaphore(), 1);
+            EXPECT(queue.execute({&px, 1}) == ReplayResult::success);  // held
+            ring->label_list(px, L"X renamed");                         // 1.
+            ring->label_queue(&queue, L"queue one renamed");
+            storage.reset();                                            // 2. X released ...
+            storage.emplace(a);                                         //    ... Y (a's one operation) in its place
+            EXPECT(&*storage == px);
+            ring->label_list(px, L"Y");
+            EXPECT(other.execute({&px, 1}) == ReplayResult::success);   //    Y is not held: it runs now
+            EXPECT(other.idle());
+            const CommandList* pz = pa;                                 // 3.
+            ring->label_list(pz, L"Z");
+            other.wait(fence_z.semaphore(), 1);
+            EXPECT(other.execute({&pz, 1}) == ReplayResult::success);  // held
+            ring->label_list(pz, L"Z renamed");
+            EXPECT(fence_z.signal(1));  // releases Z first
+            EXPECT(other.idle());
+            EXPECT(fence_x.signal(1));  // then X
+            EXPECT(queue.idle());
+            entries = ring->snapshot();
+            EXPECT(entries.size() >= 3);
+            const BreadcrumbRing::Entry& y = entries[entries.size() - 3];
+            const BreadcrumbRing::Entry& z = entries[entries.size() - 2];
+            const BreadcrumbRing::Entry& x = entries[entries.size() - 1];
+            EXPECT(y.list_name == L"Y" && y.ops.size() == 1 && y.queue_id == reinterpret_cast<std::uintptr_t>(&other));
+            EXPECT(z.list_name == L"Z" && z.list_id == reinterpret_cast<std::uintptr_t>(pz) && z.ops.size() == 1);
+            EXPECT(x.list_name == L"X" && x.list_id == reinterpret_cast<std::uintptr_t>(px) && x.ops.size() == 2);
+            EXPECT(x.queue_name == L"queue one" && x.queue_id == reinterpret_cast<std::uintptr_t>(&queue));
+            EXPECT(y.tag < z.tag && z.tag < x.tag);  // marked when submitted, not when held
+            for (const auto* e : {&y, &z, &x}) EXPECT(e->state == BreadcrumbState::completed);
+            ring->label_list(px, L"");
+            ring->label_list(pz, L"");
+            ring->label_queue(&queue, L"");
+            std::printf("breadcrumbs: held batches keep the names they had when held (renamed, address reused, "
+                        "released out of order) ok\n");
+        }
 
         // Two lists in one ExecuteCommandLists get a slot each, and the ring keeps the newest kSlots lists.
         const CommandList* both[] = {&a, &b};

@@ -279,8 +279,27 @@ public:
     void label_list(const CommandList* list, std::wstring name) { label(list_names_, list, std::move(name)); }
     void label_queue(const void* queue, std::wstring name) { label(queue_names_, queue, std::move(name)); }
 
-    // Takes the next slot and tag for `list`, submitted by `queue`, and notes its D3D12 operations.
-    Mark mark(const CommandList& list, const void* queue = nullptr) {
+    // The debug names the ring holds for `list` on `queue` now, as copies. A batch held on the CPU takes them when
+    // it is held, while the application's objects are alive; by the time it is released, their addresses may
+    // belong to other objects.
+    struct Names {
+        std::wstring list, queue;
+    };
+    Names names_of(const CommandList* list, const void* queue) const {
+        std::lock_guard lock(mutex_);
+        Names names;
+        if (const auto it = list_names_.find(list); it != list_names_.end()) names.list = it->second;
+        if (const auto it = queue_names_.find(queue); it != queue_names_.end()) names.queue = it->second;
+        return names;
+    }
+
+    // Takes the next slot and tag for `list`, submitted by `queue`, and notes its D3D12 operations. For a batch held
+    // on the CPU and released later, `list` is the held copy, `identity` the list the application passed (its
+    // address is the list id; it is only stored as a number, never dereferenced or looked up) and `held` the names
+    // taken when it was held.
+    Mark mark(const CommandList& list, const void* queue = nullptr, const CommandList* identity = nullptr,
+              const Names* held = nullptr) {
+        if (!identity) identity = &list;
         Mark m;
         {
             std::lock_guard lock(mutex_);
@@ -293,10 +312,15 @@ public:
             // Queues submit in their own order, so the history is not sorted by slot; snapshot() skips any
             // entry whose slot has a newer owner.
             owner_[m.slot] = m.tag;
-            if (const auto it = list_names_.find(&list); it != list_names_.end()) m.list_name = it->second;
-            if (const auto it = queue_names_.find(queue); it != queue_names_.end()) m.queue_name = it->second;
+            if (held) {
+                m.list_name = held->list;
+                m.queue_name = held->queue;
+            } else {
+                if (const auto it = list_names_.find(&list); it != list_names_.end()) m.list_name = it->second;
+                if (const auto it = queue_names_.find(queue); it != queue_names_.end()) m.queue_name = it->second;
+            }
         }
-        m.list_id = reinterpret_cast<std::uintptr_t>(&list);
+        m.list_id = reinterpret_cast<std::uintptr_t>(identity);
         m.queue_id = reinterpret_cast<std::uintptr_t>(queue);
         std::uint32_t op = 0;
         for (const auto& command : list.commands())
