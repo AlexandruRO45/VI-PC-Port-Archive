@@ -19,6 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack
 from report_paths import same_report_path
 
+# The file each codec's loader in bcpack_tables_bptc.py reads when --history names a directory.
+_HISTORY_JSON = {1: "bc1.json", 3: "bc3.json", 4: "bc4.json", 5: "bc5.json", 6: "bc6h.json", 7: "bc7.json"}
+
 
 def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
     """Analyze stream structure, compression ratio and per-lane statistics."""
@@ -110,6 +113,16 @@ def decode_file(
             f"output path '{out_path}' names the compressed input '{in_path}'; "
             f"refusing to overwrite it"
         )
+
+    if isinstance(history, (str, os.PathLike)):
+        history_file = os.fspath(history)
+        if os.path.isdir(history_file) and codec in _HISTORY_JSON:
+            history_file = os.path.join(history_file, _HISTORY_JSON[codec])
+        if same_report_path(out_path, history_file):
+            raise ValueError(
+                f"output path '{out_path}' names the --history file '{history_file}'; "
+                f"refusing to overwrite it"
+            )
 
     with open(in_path, "rb") as f:
         raw = f.read()

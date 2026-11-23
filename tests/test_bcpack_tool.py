@@ -128,6 +128,69 @@ class TestBcpackTool(unittest.TestCase):
             with open(in_file, "rb") as f:
                 self.assertEqual(f.read(), self.compressed_stream)
 
+    def test_decode_refuses_history_file_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "in.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            history = os.path.join(tmp_dir, "hist.json")
+            with open(history, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}\n")
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, history, codec=1, out_size=len(self.original_blocks),
+                    history=history,
+                )
+            self.assertIn(history, str(ctx.exception))
+            self.assertIn("--history", str(ctx.exception))
+            with open(history, "rb") as f:
+                self.assertEqual(f.read(), b"{}\n")
+
+    def test_decode_refuses_history_directory_codec_file_output(self) -> None:
+        # A --history directory is read through <dir>/<codec>.json (bc1.json, bc7.json, ...),
+        # so naming that file as the output must be refused as well.
+        for codec, name in ((1, "bc1.json"), (7, "bc7.json")):
+            with self.subTest(codec=codec), tempfile.TemporaryDirectory() as tmp_dir:
+                in_file = os.path.join(tmp_dir, "in.bcpack")
+                with open(in_file, "wb") as f:
+                    f.write(self.compressed_stream)
+                hist_dir = os.path.join(tmp_dir, "history")
+                os.makedirs(hist_dir)
+                hist_file = os.path.join(hist_dir, name)
+                with open(hist_file, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("{}\n")
+                with self.assertRaises(ValueError) as ctx:
+                    bcpack_tool.decode_file(
+                        in_file, hist_file, codec=codec, out_size=len(self.original_blocks),
+                        history=hist_dir,
+                    )
+                self.assertIn(hist_file, str(ctx.exception))
+                with open(hist_file, "rb") as f:
+                    self.assertEqual(f.read(), b"{}\n")
+
+    def test_decode_with_separate_history_still_writes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "in.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            hist_dir = os.path.join(tmp_dir, "history")
+            os.makedirs(hist_dir)
+            hist_file = os.path.join(hist_dir, "bc1.json")
+            with open(hist_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}\n")
+            for history in (hist_file, hist_dir):
+                with self.subTest(history=history):
+                    out_file = os.path.join(tmp_dir, "out.raw")
+                    written = bcpack_tool.decode_file(
+                        in_file, out_file, codec=1, out_size=len(self.original_blocks),
+                        history=history,
+                    )
+                    self.assertEqual(written, len(self.original_blocks))
+                    with open(out_file, "rb") as f:
+                        self.assertEqual(f.read(), self.original_blocks)
+                    with open(hist_file, "rb") as f:
+                        self.assertEqual(f.read(), b"{}\n")
+
     def test_cli_subcommands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             in_file = os.path.join(tmp_dir, "sample.bcpack")
@@ -300,6 +363,23 @@ class TestCliErrorPaths(unittest.TestCase):
             self._assert_one_error_line(rc, err, "same.bcpack")
             with open(in_file, "rb") as f:
                 self.assertEqual(f.read(), self.compressed_stream)
+
+    def test_decode_history_as_output_cli_exits_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            history = os.path.join(tmp_dir, "hist.json")
+            with open(history, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}\n")
+            rc, err, _ = self._cli(
+                ["decode", in_file, history, "--codec", "1", "--size", "32",
+                 "--history", history],
+                tmp_dir, "decode_hist_as_out",
+            )
+            self._assert_one_error_line(rc, err, "hist.json")
+            with open(history, "rb") as f:
+                self.assertEqual(f.read(), b"{}\n")
 
     def test_success_path_still_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
