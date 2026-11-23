@@ -286,9 +286,8 @@ std::string words_text(const Words& w) {
 }
 
 // What the decision function says about the shader's own index entry on this device.
-leonida::SubgroupRequest expected_request(const Shader& shader, const leonida::SubgroupSizeCaps& caps) {
+leonida::SubgroupRequest expected_request(const std::filesystem::path& dir, const leonida::SubgroupSizeCaps& caps) {
     leonida::ShaderLibrary index;
-    const auto dir = std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / shader.folder / "spirv";
     if (!index.load(dir.string())) return {};
     const auto* entry = index.find("cs", leonida::sha256_hex(fixture_fssm()));
     return entry ? leonida::decide_subgroup_size(*entry, caps) : leonida::SubgroupRequest{};
@@ -548,14 +547,15 @@ int main() {
 
     unsigned judged = 0;
     for (const Shader* shader : {&w64_native, &w64_emulated, &w32_native}) {
-        const leonida::SubgroupRequest want = expected_request(*shader, caps);
+        const leonida::SubgroupRequest want = expected_request(shader_dir(*shader), caps);
         const Result result = run(d, shader_dir(*shader), caps);
         EXPECT(!result.failure);
         if (shader == &w64_native && want.outcome == leonida::SubgroupOutcome::unavailable) {
             // This GPU cannot give a wave64 compute shader 64 lanes: the PSO is refused (one log line, above). The
             // build for this GPU uses --wave64-emulate, which the next case checks.
-            std::printf("%s: PSO refused (0x%08x), this device has no 64-wide compute subgroup (sizes %u..%u)\n",
-                        shader->label, unsigned(result.pso), caps.min_size, caps.max_size);
+            std::printf("%s: PSO %s (0x%08x) on a device with no 64-wide compute subgroup (sizes %u..%u)\n",
+                        shader->label, FAILED(result.pso) ? "refused" : "BUILT", unsigned(result.pso), caps.min_size,
+                        caps.max_size);
             EXPECT(result.pso == E_NOTIMPL);
             const Result control = run(d, shader_dir(*shader), off);
             EXPECT(!control.failure && control.pso == S_OK);
@@ -616,9 +616,11 @@ int main() {
         const auto library = compute_probe_library(*mode);
         const Result r = run(d, library, caps);
         EXPECT(!r.failure);
-        if (FAILED(r.pso)) {
-            // Only a native wave64 probe on a device without 64-wide compute subgroups is refused (checked above).
-            EXPECT(mode == &mode_w64 && r.pso == E_NOTIMPL && caps.max_size < 64);
+        // The native wave64 probe is refused where 64 cannot be had, as the shader above; nothing else is.
+        const bool refused = mode == &mode_w64 &&
+                             expected_request(library, caps).outcome == leonida::SubgroupOutcome::unavailable;
+        EXPECT(r.pso == (refused ? E_NOTIMPL : S_OK));
+        if (refused) {
             std::printf("compute probe, %s: PSO refused\n", mode->label);
         } else {
             EXPECT(r.requests.size() == 1);

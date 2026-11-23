@@ -164,13 +164,15 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
 // for a wave32 shader on a 64-wide default, reads lanes that are not its own). A native wave64 compute shader
 // is refused instead (leonida::subgroup_refused): one line says so and names the build that fixes it.
 // Logged once per stage with the first shader's name, then again at 10, 100, 1000... of that stage so a whole corpus
-// stays readable.
+// stays readable; refused and built shaders are counted apart, so the first refusal is always logged.
 void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
                                  const leonida::SubgroupSizeCaps& caps) {
     static std::mutex mutex;
-    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
+    // (stage, refused) -> names, next report
+    static std::map<std::pair<std::string, bool>, std::pair<std::set<std::string>, unsigned>> seen;
     std::lock_guard lock(mutex);
-    auto& [names, next_report] = seen[entry.stage];
+    const bool refused = leonida::subgroup_refused(request);
+    auto& [names, next_report] = seen[{entry.stage, refused}];
     if (!names.insert(entry.name).second) return;
     if (names.size() == 1) next_report = 10;
     else if (names.size() != next_report) return;
@@ -178,7 +180,7 @@ void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonid
     const bool emulable = entry.stage == "cs" || entry.stage == "ms";
     const std::string so_far =
         names.size() > 1 ? " (shaders of this stage so far: " + std::to_string(names.size()) + ")" : "";
-    if (leonida::subgroup_refused(request)) {
+    if (refused) {
         std::fprintf(stderr,
                      "[rt] d3d12: %s (%s) is a native wave64 shader and this device has no 64-wide subgroup for the "
                      "stage (device sizes %u..%u, default %u): pipeline refused, it would give wrong results; "
