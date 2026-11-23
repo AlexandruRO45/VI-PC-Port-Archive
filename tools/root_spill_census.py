@@ -26,14 +26,20 @@ Usage:
     python -I tools/root_spill_census.py <spirv/index.json> [--carve <dxbc/index.json>] [--json OUT]
     python -I tools/root_spill_census.py <spirv/index.json> --expect-no-spill
         (exit 1 if any stage has a spill-pointer candidate)
+
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 """
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 POINTER_KINDS = ("ptr32_lo", "ptr64_lo", "ptr64_hi")
@@ -164,10 +170,7 @@ def main(argv=None):
         print(line)
     if a.json:
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(a.json)), exist_ok=True)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1, sort_keys=True)
-                f.write("\n")
+            write_json_report(a.json, summary)
         except OSError as e:
             print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2
@@ -177,6 +180,41 @@ def main(argv=None):
         print(f"SPILL POINTER CANDIDATES {spilled}", file=sys.stderr)
         return 1
     return 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, sort_keys=True)
+            f.write("\n")
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".root_spill_census-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, sort_keys=True)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "root_spill_census.py")
@@ -238,6 +239,18 @@ class CliTest(unittest.TestCase):
             self.assertEqual(r.returncode, 2)
             self.assertIn("error: cannot write", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            js = os.path.join(tmp, "census.json")
+            with open(js, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(rsc, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    rsc.write_json_report(js, {"stages": {}})
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
 
 
     def test_index_saved_with_bom_is_read(self):
