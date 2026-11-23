@@ -248,10 +248,10 @@ void test_classification() {
     bool valid = true;
     check(rt::shims::parse_unimplemented_policy("fail", &valid) == UnimplementedPolicy::Fail && valid, "parse fail");
     check(rt::shims::parse_unimplemented_policy("STOP", &valid) == UnimplementedPolicy::Stop && valid, "parse STOP");
-    check(rt::shims::parse_unimplemented_policy(nullptr, &valid) == UnimplementedPolicy::Log && valid, "null is log");
-    check(rt::shims::parse_unimplemented_policy("", &valid) == UnimplementedPolicy::Log && valid, "empty is log");
-    check(rt::shims::parse_unimplemented_policy("bogus", &valid) == UnimplementedPolicy::Log && !valid,
-          "a bad value is log and invalid");
+    check(rt::shims::parse_unimplemented_policy(nullptr, &valid) == UnimplementedPolicy::Fail && valid, "null defaults to fail");
+    check(rt::shims::parse_unimplemented_policy("", &valid) == UnimplementedPolicy::Fail && valid, "empty defaults to fail");
+    check(rt::shims::parse_unimplemented_policy("bogus", &valid) == UnimplementedPolicy::Fail && !valid,
+          "a bad value defaults to fail and is invalid");
 }
 
 void test_in_process(const fs::path& dir) {
@@ -440,11 +440,11 @@ void test_env_and_default(const fs::path& dir) {
         const char* expect;
         bool warns;
     } cases[] = {
-        {nullptr, "unset (the default) behaves as log", "hresult=00000000 other=00000000", false},
+        {nullptr, "unset (the default) fails known HRESULT imports", "hresult=80004001 other=00000000", false},
         {L"log", "log", "hresult=00000000 other=00000000", false},
         {L"fail", "fail", "hresult=80004001 other=00000000", false},
         {L"FAIL", "FAIL is case-insensitive", "hresult=80004001 other=00000000", false},
-        {L"bogus", "a bad value falls back to log with a warning", "hresult=00000000 other=00000000", true},
+        {L"bogus", "a bad value falls back to fail with a warning", "hresult=80004001 other=00000000", true},
     };
     for (const auto& c : cases) {
         const ChildResult r = run_child(args, c.env);
