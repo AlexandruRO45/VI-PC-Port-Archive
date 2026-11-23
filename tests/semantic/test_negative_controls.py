@@ -9,7 +9,8 @@ import test_value_semantics as vals
 
 CONTROLS = [
     # (shader, expected words, text to replace, replacement, what the sabotage models)
-    ("ps_sdwa", sem.EXPECTED_PS_SDWA, "OpBitFieldSExtract", "OpBitFieldUExtract", "sext() ignored in SDWA"),
+    ("ps_sdwa", sem.EXPECTED_PS_SDWA, "OpShiftRightArithmetic", "OpShiftRightLogical", "sext() ignored in SDWA"),
+    ("ps_sdwa", sem.EXPECTED_PS_SDWA, "OpBitFieldSExtract", "OpBitFieldUExtract", "dst_unused:UNUSED_SEXT ignored in SDWA"),
     ("ps_ops", sem.EXPECTED_PS_OPS, "OpBitFieldSExtract", "OpBitFieldUExtract", "v_bfe_i32 treated as unsigned"),
     ("ps_ops", sem.EXPECTED_PS_OPS, "glsl UMin", "glsl SMax", "v_min3_u32 computing a (signed) maximum"),
     ("ps_ops", sem.EXPECTED_PS_OPS, "glsl SMax", "glsl UMin", "v_max3_i32 treated as unsigned"),

@@ -6410,8 +6410,18 @@ class Gen:
         if width == 32:
             return v
         r = self.tmp()
-        f = "OpBitFieldSExtract" if a.get("sext") else "OpBitFieldUExtract"
-        self.emit(f"{r} = {f} %uint {v} {self.cu(off)} {self.cu(width)}")
+        if a.get("sext"):
+            # Sign-extend with two shifts, not OpBitFieldSExtract: NVIDIA's driver (620.70.06, RTX 2060 SUPER) turns
+            # OpConvertUToF of an OpBitFieldSExtract into a signed conversion, so v_cvt_f32_u32_sdwa of sext(0xbb62)
+            # gave -17566.0 instead of 4294949632.0. The shifts give the same bits and convert correctly there.
+            top = 32 - off - width
+            if top:
+                t = self.tmp()
+                self.emit(f"{t} = OpShiftLeftLogical %uint {v} {self.cu(top)}")
+                v = t
+            self.emit(f"{r} = OpShiftRightArithmetic %uint {v} {self.cu(32 - width)}")
+        else:
+            self.emit(f"{r} = OpBitFieldUExtract %uint {v} {self.cu(off)} {self.cu(width)}")
         return r
 
     def sdwa_dst(self, d, val):
