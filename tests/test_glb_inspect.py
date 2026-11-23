@@ -684,5 +684,36 @@ class GlbInspectTests(unittest.TestCase):
                                 for issue in issues))
 
 
+    def test_animation_morph_weight_counts_use_the_target_mesh(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "weights.glb")
+            out = os.path.join(folder, "report.json")
+            for target_path, interpolation, count, valid in (
+                ("weights", "LINEAR", 4, True),
+                ("weights", "LINEAR", 2, False),
+                ("weights", "CUBICSPLINE", 12, True),
+                ("weights", "CUBICSPLINE", 6, False),
+                ("translation", "LINEAR", 3, False),
+            ):
+                with self.subTest(path=target_path, interpolation=interpolation, count=count):
+                    gltf = animated_gltf()
+                    animation = gltf["animations"][0]
+                    animation["channels"][0]["target"]["path"] = target_path
+                    animation["samplers"][0]["interpolation"] = interpolation
+                    gltf["meshes"][0]["primitives"][0]["targets"] = [{"POSITION": 0}, {"POSITION": 0}]
+                    gltf["accessors"][3].update(type="SCALAR" if target_path == "weights" else "VEC3", count=count)
+                    with open(path, "wb") as handle:
+                        handle.write(glb(gltf, triangle_bin()))
+                    result = self.run_tool(path, "--json", out)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    with open(out, encoding="utf-8") as handle:
+                        issues = json.load(handle)["animations"][0]["issues"]
+                    if valid:
+                        self.assertEqual(issues, [])
+                    else:
+                        self.assertEqual(len(issues), 1, issues)
+                        self.assertIn(f"sampler[0] has {count} output values", issues[0])
+
+
 if __name__ == "__main__":
     unittest.main()
