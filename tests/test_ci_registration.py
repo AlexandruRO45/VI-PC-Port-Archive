@@ -24,7 +24,8 @@ drift) and fails on the three ways a test goes missing without CI turning red --
 
 It also runs the standard-library loops themselves (``check`` on Windows and ``stdlib-tests-linux``), taken
 from the workflow, under bash on a synthetic tree: each loop has to run every file and then fail, since
-stopping at the first failure hides the files sorted after it.
+stopping at the first failure hides the files sorted after it -- and a file that reads its stdin must not
+swallow the file list the loop reads on its own stdin.
 
 Only the tracked test files and the workflow are read; no game files, no build tools, no pytest. The loop check
 needs bash (Git for Windows' on Windows) and skips without it, except on a GitHub runner.
@@ -551,9 +552,12 @@ class StdlibLoopTest(unittest.TestCase):
         markers = ci_rules(ROOT)[0]
         failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
         passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        # Sorted first: given the loop's own stdin it would read the rest of the file list, and those files never run.
+        reads_stdin = "import sys\nif __name__ == \"__main__\":\n    print(\"stdin:\", repr(sys.stdin.read()))\n"
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
             files = {
+                "tests/test_0_reads_stdin.py": reads_stdin,
                 "tests/test_a_fails.py": failing,
                 "tests/test_b_passes.py": passing,
                 "tests/test_c_fails.py": failing,
@@ -575,11 +579,12 @@ class StdlibLoopTest(unittest.TestCase):
             env = dict(os.environ, PYTEST_FILE_MARKERS=markers, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
             # GitHub runs `shell: bash` as `bash --noprofile --norc -eo pipefail {0}`.
             result = subprocess.run([git_bash(), "--noprofile", "--norc", "-eo", "pipefail", "step.sh"], cwd=tmp,
-                                    env=env, capture_output=True, text=True, timeout=120)
+                                    env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
         out = result.stdout + result.stderr
         self.assertNotEqual(result.returncode, 0, out)
         ran = re.findall(r"^== (\S+)$", out, re.M)
-        self.assertEqual(ran, ["tests/test_a_fails.py", "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
+        self.assertEqual(ran, ["tests/test_0_reads_stdin.py", "tests/test_a_fails.py", "tests/test_b_passes.py",
+                               "tests/test_c_fails.py"], out)
         errors = re.findall(r"^::error file=(\S+)::", out, re.M)
         self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
 
