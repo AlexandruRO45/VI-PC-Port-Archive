@@ -74,6 +74,22 @@ int conversion_checks() {
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0xf0}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 0, 0, 1.0f)) == V{0x0f, 0x00}));
     EXPECT((element(VK_FORMAT_R4G4B4A4_UNORM_PACK16, true, floats(0, 1.0f, 0.2f, 0)) == V{0x30, 0x0f}));
+    // Packed 16-bit UAVs use the same little-endian channel bits as their DXGI resource formats.
+    // Uint takes low channel bits, including the low alpha bit, rather than converting or clamping.
+    EXPECT((element(VK_FORMAT_R5G6B5_UNORM_PACK16, false, {0x123, 0x2aa, 0x35c, 0x567}) == V{0x5c, 0x1d}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, false, {0x123, 0x2aa, 0x35c, 0x567}) == V{0x5c, 0x8d}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, false, {0x123, 0x2aa, 0x35c, 0x566}) == V{0x5c, 0x0d}));
+    EXPECT((element(VK_FORMAT_A4R4G4B4_UNORM_PACK16, false, {0x123, 0x2aa, 0x35c, 0x567}) == V{0xac, 0x73}));
+    EXPECT((element(VK_FORMAT_R5G6B5_UNORM_PACK16, true, floats(1.0f, 0.25f, 0.75f, 0.5f)) == V{0x17, 0xfa}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, true, floats(1.0f, 0.25f, 0.75f, 0.5f)) == V{0x17, 0x7d}));
+    EXPECT((element(VK_FORMAT_A4R4G4B4_UNORM_PACK16, true, floats(1.0f, 0.25f, 0.75f, 0.5f)) == V{0x4b, 0x8f}));
+    for (VkFormat packed : {VK_FORMAT_R5G6B5_UNORM_PACK16, VK_FORMAT_A1R5G5B5_UNORM_PACK16})
+        EXPECT((element(packed, true, floats(-1.0f, NAN, 2.0f, NAN)) == V{0x1f, 0}));
+    EXPECT((element(VK_FORMAT_A4R4G4B4_UNORM_PACK16, true, floats(-1.0f, NAN, 2.0f, NAN)) == V{0x0f, 0}));
+    // The one-bit alpha half-step is the tie-to-even boundary, not a boolean conversion.
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, true, floats(0, 0, 0, 0.5f)) == V{0, 0}));
+    EXPECT((element(VK_FORMAT_A1R5G5B5_UNORM_PACK16, true,
+                    floats(0, 0, 0, std::nextafter(0.5f, 1.0f))) == V{0, 0x80}));
     // Half floats round to nearest even; too large is infinity; tiny values become subnormals.
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(1.0f, 0, 0, 0)) == V{0x00, 0x3c}));
     EXPECT((element(VK_FORMAT_R16_SFLOAT, true, floats(-2.0f, 0, 0, 0)) == V{0x00, 0xc0}));
@@ -688,6 +704,29 @@ int main() {
                       texture_clear(VK_FORMAT_R4G4B4A4_UNORM_PACK16, false, {1, 2, 3, 4}, 0, 0, 1)}});
             } else {
                 std::printf("A4B4G4R4_UNORM: no typed UAV on this device, its clears skipped\n");
+            }
+        }
+        {
+            struct Packed { const char* name; DXGI_FORMAT dxgi; VkFormat vk; };
+            const Packed packed[] = {
+                {"B5G6R5_UNORM", DXGI_FORMAT_B5G6R5_UNORM, VK_FORMAT_R5G6B5_UNORM_PACK16},
+                {"B5G5R5A1_UNORM", DXGI_FORMAT_B5G5R5A1_UNORM, VK_FORMAT_A1R5G5B5_UNORM_PACK16},
+                {"B4G4R4A4_UNORM", DXGI_FORMAT_B4G4R4A4_UNORM, VK_FORMAT_A4R4G4B4_UNORM_PACK16},
+            };
+            for (const auto& format : packed) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format.dxgi};
+                if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support))) ||
+                    !(support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) ||
+                    !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+                    std::printf("%s: no typed UAV on this device, its clears skipped\n", format.name);
+                    continue;
+                }
+                all_textures.push_back(
+                    {format.name, format.dxgi, format.vk, 8, 8, 2, 2, false,
+                     {texture_clear(format.vk, false, {0x123, 0x2aa, 0x35c, 0x567}, 0, 0, 2),
+                      texture_clear(format.vk, true, floats(1.0f, 0.25f, 0.75f, 0.5f), 1, 0, 2),
+                      texture_clear(format.vk, true, floats(2.0f, NAN, -1.0f, 0.5f), 0, 1, 1, {{1, 1, 6, 7}}),
+                      texture_clear(format.vk, false, {0x1f, 0x3f, 0x1e, 0x100}, 1, 1, 1, {{1, 1, 8, 3}})}});
             }
         }
         for (const auto& test : all_textures)

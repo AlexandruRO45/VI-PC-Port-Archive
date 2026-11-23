@@ -324,6 +324,10 @@ What is implemented (all of it testable without the game):
     every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
     the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
     hand-computed elements in `d3d12_uav_clear_test`.
+    The packed `B5G6R5_UNORM`, `B5G5R5A1_UNORM`, and `B4G4R4A4_UNORM` layouts use two bytes when the device
+    advertises typed UAV support. The same test pins their channel order, Uint low-bit masking and Float clamp,
+    NaN and one-bit alpha rounding, then checks whole and rectangle texture clears across mips and array layers.
+    Synthetic native WARP comparisons confirm these packed bytes, including alpha at and just above `0.5f`.
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
