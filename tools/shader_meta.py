@@ -290,7 +290,27 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                             events["ssharp"].add(t[1])
 
     # Track VGPR index scaling (e.g. v_lshlrev_b32 -> v_readfirstlane_b32 -> s_load_dwordx8).
-    if a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
+    if op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
+        # M0-dependent destinations can overwrite any tracked VGPR. SGPR facts
+        # already copied out of the register file remain valid.
+        vscale.clear()
+    elif (op == "v_swap_b32" and len(a) >= 2
+          and all(arg["k"] == "vgpr" and arg.get("n", 1) == 1 for arg in a[:2])):
+        regs = (a[0]["r"], a[1]["r"])
+        old = [vscale.get(reg) for reg in regs]
+        for reg, new in zip(regs, reversed(old)):
+            if new:
+                vscale[reg] = new
+            else:
+                vscale.pop(reg, None)
+    elif op.startswith(("global_atomic_", "buffer_atomic_", "image_atomic_")):
+        if "glc" in ins.get("mods", ()) and a[0]["k"] == "vgpr":
+            # A 32-bit cmpswap reads two data words but returns only the first.
+            # The supported x2 buffer/global forms return both dwords.
+            count = 2 if op.endswith("_x2") else 1
+            for reg in range(a[0]["r"], a[0]["r"] + count):
+                vscale.pop(reg, None)
+    elif a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
         vd = a[0]["r"]
         vn = a[0].get("n", 1)
         new_vs = frozenset()
