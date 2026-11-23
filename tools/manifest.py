@@ -185,35 +185,35 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return out
 
 
-def load_manifest(manifest: str) -> dict:
-    """The manifest's "files" table, checked entry by entry, so a damaged file is reported by name rather than
-    as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
+def _load_doc(manifest: str) -> dict:
+    """The manifest's top-level document, checked entry by entry, so a damaged file is reported by name rather
+    than as a JSONDecodeError, KeyError or TypeError traceback halfway through verify."""
     with open(manifest, encoding="utf-8") as f:
         try:
             doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
         except ValueError as error:  # JSONDecodeError, duplicate keys, or UnicodeDecodeError for non-UTF-8
             raise ManifestError(f"{manifest} is not valid JSON ({error}); create it again") from None
-    files = doc.get("files") if isinstance(doc, dict) else None
-    if not isinstance(files, dict):
-        raise ManifestError(f"{manifest} has no \"files\" table; create it again")
-    for rel, info in files.items():
+    if not isinstance(doc, dict) or not isinstance(doc.get("files"), dict):
+        raise ManifestError(f'{manifest} has no "files" table; create it again')
+    for rel, info in doc["files"].items():
         if not (isinstance(info, dict) and type(info.get("size")) is int and isinstance(info.get("sha256"), str)):
             raise ManifestError(f"{manifest}: entry {rel!r} needs an integer \"size\" and a \"sha256\" string")
-    return files
+    return doc
+
+
+def load_manifest(manifest: str) -> dict:
+    """The manifest's "files" table."""
+    return _load_doc(manifest)["files"]
 
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
-    want = load_manifest(manifest)
+    doc = _load_doc(manifest)
+    want = doc["files"]
     # The recorded executable (the manifest's "expected_exe") lives next to the package, outside the "files"
     # table on purpose, so it must not be reported as NEW.
-    expected_exe = None
-    try:
-        with open(manifest, encoding="utf-8") as f:
-            doc = json.load(f)
-        if isinstance(doc, dict) and isinstance(doc.get("expected_exe"), str) and doc["expected_exe"]:
-            expected_exe = doc["expected_exe"]
-    except (OSError, ValueError):
-        pass
+    expected_exe = doc.get("expected_exe")
+    if not isinstance(expected_exe, str) or not expected_exe:
+        expected_exe = None
     have = dict(walk(game_dir, exclude=manifest))
     if not want and have:
         # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
