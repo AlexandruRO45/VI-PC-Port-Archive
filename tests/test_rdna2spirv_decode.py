@@ -15,6 +15,12 @@ import rdna2spirv  # noqa: E402
 
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
+# Eight bytes standing in for the words llvm-mc skipped (SHADER-813). Made up here, not taken from any game file, finding
+# or disassembler output: two little-endian 32-bit marker words, 0xDEADBEEF and 0xBAADF00D. The translator never reads
+# them as an instruction (the listing's "invalid instruction encoding" line is what marks the gap), they only fill the
+# blob between the instructions so every later offset is the one the listing implies.
+SYNTHETIC_GAP = list(struct.pack("<II", 0xDEADBEEF, 0xBAADF00D))
+
 
 class TestSameEncodingBytecodeBoundary(unittest.TestCase):
     """Exercise same_encoding() with synthetic short buffers, exact matches, and opcode bitfield tolerances."""
@@ -392,7 +398,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
         export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
         endpgm = [0x00, 0x00, 0x81, 0xBF]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]   # the word from the finding, as llvm-mc leaves it
+        gap = SYNTHETIC_GAP
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)
@@ -415,7 +421,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
                 f"\ts_endpgm ; encoding: [{enc(endpgm)}]\n"
             )
             src = os.path.join(disasm, "ps_gap.s")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(shader_text)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
@@ -427,7 +433,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
         # code range the header declares, so the path runs into them as well
         mov0 = [0xF2, 0x02, 0x00, 0x7E]
         mov1 = [0xF2, 0x02, 0x02, 0x7E]
-        gap = [0x00, 0x50, 0x16, 0xCC, 0x01, 0x05, 0x0E, 0x0C]
+        gap = SYNTHETIC_GAP
 
         def enc(words):
             return ",".join(f"0x{b:02x}" for b in words)
@@ -448,7 +454,7 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
                 "; invalid instruction encoding at 0x8\n"
             )
             src = os.path.join(disasm, "ps_tail.s")
-            with open(src, "w", encoding="utf-8") as f:
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
                 f.write(shader_text)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
