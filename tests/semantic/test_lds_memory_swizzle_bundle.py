@@ -431,6 +431,25 @@ class TestDsBPermuteB32Translator(unittest.TestCase):
         for d in range(32):
             self.assertEqual(results[d], 100 + ((d + 1) % 32))
 
+def ref_ds_read_u16(lds: LdsModel, addr: int, offset: int = 0) -> int:
+    """Reference mathematical oracle for ds_read_u16."""
+    return lds.read_u16(addr + offset)
+
+
+class TestDsReadU16Oracle(unittest.TestCase):
+    def test_read_u16_zero_extension(self) -> None:
+        lds = LdsModel()
+        lds.write_u32(0x100, 0x8ABC1234)
+        # Read low halfword at 0x100 -> 0x1234
+        self.assertEqual(ref_ds_read_u16(lds, 0x100, 0), 0x1234)
+        # Read high halfword at 0x100 + 2 -> 0x8ABC (zero-extended)
+        self.assertEqual(ref_ds_read_u16(lds, 0x100, 2), 0x8ABC)
+
+    def test_read_u16_wrapping(self) -> None:
+        lds = LdsModel()
+        lds.write_u16(0, 0xBEEF)
+        self.assertEqual(ref_ds_read_u16(lds, LDS_SIZE, 0), 0xBEEF)
+
 
 if __name__ == "__main__":
     unittest.main()
