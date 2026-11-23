@@ -426,7 +426,7 @@ def local_bc3(symbols, profile):
 
 def export_file(pool, index, target, mips, force, profile):
     target = Path(target)
-    with open(profile, encoding="utf-8") as source:
+    with open(profile, encoding="utf-8-sig") as source:  # a profile saved by Notepad or PowerShell 5.1 has a BOM
         decoder = LocalDecoder(pool, json.load(source))
     try:
         data = decoder.dds(index, mips)
