@@ -423,7 +423,7 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
 
     root_name = os.path.basename(path)
     candidates[root_name.lower()] = [root_name]
-    modules = {root_name: {"name": root_name, "chain": [root_name], "status": "ok"}}
+    modules = {root_name: {"name": root_name, "parent": None, "status": "ok"}}
     edges = []
     exports: dict[str, set[str]] = {}
     pending = deque([root_name])
@@ -464,7 +464,7 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
                 continue
             target = edge["target"] = matches[0]
             if target not in modules:
-                modules[target] = {"name": target, "chain": node["chain"] + [target], "status": "ok"}
+                modules[target] = {"name": target, "parent": name, "status": "ok"}
                 pending.append(target)
 
     for edge in edges:
@@ -476,6 +476,15 @@ def dependency_graph(path: str, game_dir: str, root: PeImage) -> dict:
             missing = sorted(set(edge["functions"]) - exports[target])
             edge.update(status="missing_exports" if missing else "declared", missing_exports=missing)
     return {"modules": list(modules.values()), "imports": edges}
+
+
+def _dependency_chain(modules: dict, name: str | None) -> list[str]:
+    """Reconstruct a path only when a diagnostic needs to print it."""
+    chain = []
+    while name is not None:
+        chain.append(name)
+        name = modules[name]["parent"]
+    return chain[::-1]
 
 
 def inspect(path: str, game_dir: str | None, *, dependencies: bool = False) -> dict:
@@ -568,13 +577,14 @@ def to_markdown(r: dict) -> str:
         findings = []
         for node in modules.values():
             if node["status"] == "unreadable":
-                chain = " → ".join(node["chain"])
+                chain = " → ".join(_dependency_chain(modules, node["name"]))
                 findings.append(f"- {escape(chain)} — unreadable ({escape(node['error'])})")
         for imp in edges:
             status = imp["status"]
             if status in ("declared", "host_candidate", "unreadable"):
                 continue
-            chain = " → ".join(modules[imp["from"]]["chain"] + [imp["target"] or imp["dll"]])
+            path = _dependency_chain(modules, imp["from"])
+            chain = " → ".join([*path, imp["target"] or imp["dll"]])
             detail = ", ".join(imp["missing_exports"]) or ", ".join(imp.get("candidates", []))
             if status == "machine_mismatch":
                 detail = modules[imp["target"]]["machine"]
@@ -632,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
+    reports = []
+    protected_inputs = dict.fromkeys(a.image)
     for img in a.image:
         search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
         key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
@@ -656,13 +668,18 @@ def main(argv: list[str] | None = None) -> int:
         if n > 1:
             print(f"{img}: another input is also named {r['file']}; report written as {name}.json/.md",
                   file=sys.stderr)
+        graph = r.get("dependency_graph", {})
+        for node in graph.get("modules", [])[1:]:
+            protected_inputs[os.path.join(search_dir, node["name"])] = None
+        reports.append((img, name, r))
+
+    # A report for one entry image can alias a dependency discovered from another entry image.
+    for img, name, r in reports:
         stem = os.path.join(a.out, name)
         json_path = stem + ".json"
         md_path = stem + ".md"
         collision = None
-        graph = r.get("dependency_graph", {})
-        local_inputs = [os.path.join(search_dir, node["name"]) for node in graph.get("modules", [])[1:]]
-        for other in [*a.image, *local_inputs]:
+        for other in protected_inputs:
             if same_output_path(other, json_path):
                 collision = json_path
                 break

@@ -251,7 +251,7 @@ class PackageDependenciesTest(unittest.TestCase):
         report = json.loads((self.out / "demo.exe.json").read_text(encoding="utf-8"))
         graph = report["dependency_graph"]
         self.assertEqual([node["name"] for node in graph["modules"]], ["demo.exe", "Engine.DLL", "renderer.dll"])
-        self.assertEqual(graph["modules"][-1]["chain"], ["demo.exe", "Engine.DLL", "renderer.dll"])
+        self.assertEqual([node["parent"] for node in graph["modules"]], [None, "demo.exe", "Engine.DLL"])
         self.assertEqual([(edge["kind"], edge["status"], edge["missing_exports"]) for edge in graph["imports"]],
                          [("normal", "declared", []), ("normal", "declared", []),
                           ("normal", "missing_exports", ["start"]), ("delay", "not_in_package", [])])
@@ -296,6 +296,34 @@ class PackageDependenciesTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("would overwrite input file", result.stderr)
         self.assertEqual(dependency.read_bytes(), before)
+
+    def test_deep_package_stores_a_single_predecessor_and_renders_the_finding(self):
+        names = ["demo.exe"] + [f"module-{i:03}.dll" for i in range(1, 129)]
+        requested = [*names[1:], "missing.dll"]
+        for name, target in zip(names, requested):
+            self.write(name, package_image([(target, ["Run"])], exports=with_exports([0x1000], {0: "Run"})))
+
+        report = pe_inspect.inspect(str(self.package / names[0]), str(self.package), dependencies=True)
+        nodes = report["dependency_graph"]["modules"]
+        self.assertEqual([(node["name"], node["parent"]) for node in nodes], list(zip(names, [None, *names[:-1]])))
+        self.assertTrue(all("chain" not in node for node in nodes))
+        self.assertIn(" → ".join([*names, "missing.dll"]), pe_inspect.to_markdown(report))
+
+    def test_report_cannot_overwrite_a_dependency_of_a_later_entry_image(self):
+        first = self.write("demo.exe", package_image())
+        second = self.write("second.exe", package_image([("demo.exe.json", ["Run"])]))
+        dependency = self.write("demo.exe.json", package_image(exports=with_exports([0x1000], {0: "Run"})))
+        before = dependency.read_bytes()
+        result = subprocess.run(
+            [sys.executable, "-I", os.path.join(TOOLS_DIR, "pe_inspect.py"), str(first), str(second),
+             "--game-dir", str(self.package), "--dependencies", "--out", str(self.package)],
+            capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("would overwrite input file", result.stderr)
+        self.assertEqual(dependency.read_bytes(), before)
+        graph = json.loads((self.package / "second.exe.json").read_text(encoding="utf-8"))["dependency_graph"]
+        self.assertEqual(graph["imports"][0]["status"], "declared")
 
 
 class PeInspectTest(unittest.TestCase):

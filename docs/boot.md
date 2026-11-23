@@ -84,8 +84,9 @@ report. The same report works without a runtime build:
 python -I tools/pe_inspect.py $exe --game-dir $pkg --dependencies --out reports/pe
 ```
 
-JSON records each reachable package image and its normal and delay import descriptors. Markdown shows the path
-from the executable to dependencies that are absent, unreadable, built for a different machine or missing a
+JSON records each reachable package image and its normal and delay import descriptors. Each image's `parent`
+points to its predecessor on a shortest path from the entry image, whose `parent` is `null`. Markdown reconstructs
+that path to dependencies that are absent, unreadable, built for a different machine or missing a
 requested export. Export names are case-sensitive, and imports by ordinal can match both named and unnamed
 exports. The scan reads local files without loading them. A System32 file or API-set contract is a host candidate.
 Forwarded exports count as declarations. For actual shim, host and forwarded bindings, use `gta6rt --dry-run`.
