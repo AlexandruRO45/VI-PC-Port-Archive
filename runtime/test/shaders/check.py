@@ -80,7 +80,7 @@ CS_STORE = [0x400080ff, 0xe00003ff, 0x3c004000, 0xeeeeeeee, 0x40003c00, 0xbc0038
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
-WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_cvt_f16_f32_omod", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
@@ -135,6 +135,8 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
+            # the VOP3 omod overflow on a rounded f16 under MODE toward zero (cs_cvt_f16_f32_omod.asm header)
+            ("cs_cvt_f16_f32_omod", [0x7bff, 0xfbff, 0x7bff, 0x77ff, 0xf7ff, 0x7c00, 0xfc00, 0x7c00]),
             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
             ("cs_w32_andn2_exec", [1, 8, 16, 2064, 2068, 3, 20, 1544]),
             ("cs_wave64_ballot", [32, 16, 24, 40, 8, 48]),
