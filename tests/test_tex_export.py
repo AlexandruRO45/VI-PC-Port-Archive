@@ -293,6 +293,26 @@ def test_blob_cache_is_reused_for_the_same_blob(eq, tmp_path):
     assert T.export_one(t2, carve, str(tmp_path / "out"), cache) == "ok:first"
 
 
+def test_blob_cache_distinguishes_different_gpu_chains_at_same_offset(eq, tmp_path):
+    carve, expected = build_case(eq, tmp_path, 10, top_first=True)
+    with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
+        blob = f.read()
+    os.remove(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"))
+    cut = 12345
+    write_blob(carve, "x.rpf", 0x1000, blob[:cut])
+    write_blob(carve, "x.rpf", 0x9000, blob[cut:])
+    cache = {}
+    out = str(tmp_path / "out")
+    short = texture(10, "R16G16B16A16_FLOAT", 16, 16, mips=1, gpu=0x1000, gpu_size=cut)
+    assert T.export_one(short, carve, out, cache) == "ok:first"
+    chained = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2, q_index=4,
+                      gpu=0x1000, gpu_size=len(blob),
+                      gpu_chain=[[0x1000, cut], [0x9000, len(blob) - cut]])
+    assert T.export_one(chained, carve, out, cache) == "ok:first"
+    with open(os.path.join(out, "x.rpf", chained["export"]["file"]), "rb") as f:
+        assert f.read()[148:] == expected
+
+
 @pytest.mark.parametrize("fmt", [9999, 6, 7, 8])  # 6-8: 12-byte R32G32B32 has no SW_4K_S equation
 def test_unsupported_format_is_reported(fmt):
     assert T.export_one(texture(fmt, "X", 4, 4, 1), "unused", "unused", {}) == "unsupported format"
@@ -584,6 +604,16 @@ def test_main_reports_an_index_row_without_keys(tmp_path, monkeypatch, capsys):
     assert "ERROR: cannot read " in err, err
     assert "row has no 'archive'" in err, err
     assert "Traceback" not in err
+
+
+def test_main_reads_an_index_saved_with_a_utf8_bom(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("\ufeff[]", encoding="utf-8")   # Notepad and PowerShell's ">" write a BOM
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() is None       # read as an empty texture list; nothing to export
+    assert (out / "export_log.json").read_text(encoding="utf-8") == "[]"
+    assert capsys.readouterr().err == ""
 
 
 def test_main_rejects_an_out_that_is_a_file(tmp_path, monkeypatch, capsys):
