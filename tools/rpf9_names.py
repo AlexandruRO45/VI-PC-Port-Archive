@@ -248,7 +248,7 @@ def main(argv=None):
     out_abs = os.path.abspath(a.out)
     try:
         if os.path.exists(a.out) and os.path.samefile(a.archive, a.out):
-            raise ValueError(f"output {a.out!r} is the input archive")
+            raise ValueError(f"output {a.out} is the input archive")
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
