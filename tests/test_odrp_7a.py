@@ -676,6 +676,32 @@ class ArchiveAndCliTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 2, proc.stderr)
 
+    def test_scan_dir_survives_an_infinite_offset_or_size_in_the_index(self):
+        # json reads 1e400 as infinity and int() raises OverflowError on it: a damaged index.json
+        # is ignored like any other unreadable one, and the .bin files are scanned on their own.
+        folder = os.path.join(self.root, "carve_bad_index")
+        os.makedirs(folder)
+        with open(os.path.join(folder, f"{0x1000:012x}.bin"), "wb") as fh:
+            fh.write(self.meta_single)
+        for entry in ('{"off": 1e400, "stored": 300}', '{"off": 4096, "stored": 1e400}',
+                      '{"off": -1e400, "stored": 300}'):
+            with self.subTest(entry=entry):
+                with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as fh:
+                    fh.write('{"files": [%s]}' % entry)
+                self.assertEqual(odrp_7a._carve_stored_map(folder), {})
+                rows, summary = odrp_7a.scan_dir(folder)
+                self.assertEqual(summary["streams"], 1)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["placement"], "standalone")
+
+                out = os.path.join(self.root, "bad_index.json")
+                proc = subprocess.run(
+                    [sys.executable, "-I", TOOL, folder, out, "--quiet"],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                )
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+
     def test_scan_rpf_closes_mmap_on_success_and_out_of_range_start(self):
         created = []
         real_mmap = odrp_7a.mmap.mmap

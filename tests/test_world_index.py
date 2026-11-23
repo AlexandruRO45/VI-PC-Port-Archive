@@ -311,6 +311,30 @@ class WorldIndexTest(unittest.TestCase):
         self.assertEqual(stats["scanned_bytes"], 0)
         self.assertEqual(stats["scan_end"], 0x40 + stored - 1)
 
+    def test_carve_scan_survives_an_infinite_offset_or_size_in_the_index(self):
+        # json reads 1e400 as infinity and int() raises OverflowError on it: a damaged index.json
+        # is ignored like any other unreadable one, and the files are parsed one by one.
+        blob = make_resource()
+        carve_dir = os.path.join(self.dir, "carve_bad_index")
+        os.makedirs(carve_dir)
+        with open(os.path.join(carve_dir, f"{0x1000:012x}.bin"), "wb") as f:
+            f.write(blob)
+        for entry in ('{"off": 1e400, "stored": 300}', '{"off": 4096, "stored": 1e400}',
+                      '{"off": -1e400, "stored": 300}'):
+            with self.subTest(entry=entry):
+                with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8") as f:
+                    f.write('{"files": [%s]}' % entry)
+                self.assertEqual(WI._carve_successors(carve_dir), {})
+                rows, stats = WI.scan_path(carve_dir)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["kind"], "map")
+
+                out = os.path.join(self.dir, "bad_index.json")
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(WI.main([carve_dir, "--out", out]), 0)
+                self.assertNotIn("Traceback", err.getvalue())
+
     def test_missing_path_is_an_error_not_a_traceback(self):
         out = os.path.join(self.dir, "missing.json")
         err = io.StringIO()

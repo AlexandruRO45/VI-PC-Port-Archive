@@ -972,7 +972,8 @@ def _carve_stored_map(folder):
         with open(manifest, encoding="utf-8") as fh:
             files = json.load(fh).get("files", [])
         return {int(item["off"]): int(item["stored"]) for item in files}
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+    # OverflowError: json decodes a number such as 1e400 as infinity, and int() refuses it.
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         return {}
 
 
