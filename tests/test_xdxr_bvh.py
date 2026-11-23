@@ -509,6 +509,22 @@ class Cli(unittest.TestCase):
         self.assertTrue(text.startswith("ERROR: "), text)
         return text
 
+    def test_check_build_missing_folder_is_one_error_line(self):
+        # A folder that is not there is a mistyped or removed path, not a build that wrote no cases: it used to
+        # print "no cases in ...: skipped (the build step skipped or did not run)" and return the 77 skip code.
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "no-such-build-folder")
+            self.assertFalse(os.path.exists(missing))
+            self.assertIn(missing, self.check_build_stderr(missing))
+
+    def test_check_build_empty_folder_is_still_the_77_skip(self):
+        # The skip is for a build step that ran and wrote nothing; an existing empty folder keeps it.
+        with tempfile.TemporaryDirectory() as d:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(X.main(["check-build", d]), 77)
+            self.assertIn(f"no cases in {d}: skipped", out.getvalue())
+
     def test_check_build_case_without_its_bin_is_one_line(self):
         # check-build runs on a build folder that may hold other reports: any *.json there is treated as a case,
         # so a stray one must name itself instead of dying on the missing .bin beside it.
