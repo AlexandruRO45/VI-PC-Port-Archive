@@ -300,6 +300,12 @@ shim registry owns (`rt::shims::owns_dll`: `xgameruntime.dll`, `d3d12_xs.dll`, `
 with a pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name the registry doesn't serve is `NULL`
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
+Windows reserves `LoadLibraryExA/W`'s `hFile` parameter for future use. A call with a non-null `hFile` goes directly to
+the host, which rejects it with `ERROR_INVALID_PARAMETER` before any shim-owned or bundled lookup. The bundled-load
+fixture checks both variants with an open file and still loads the DLL by name with a null handle.
+[Microsoft's `LoadLibraryExW` reference](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-loadlibraryexw)
+documents the null-handle requirement.
+
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
 version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
 `XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
