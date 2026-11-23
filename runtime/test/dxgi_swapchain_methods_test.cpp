@@ -141,7 +141,7 @@ std::vector<Case> make_cases() {
     add("colour spaces: out-of-range values", [](const Target& t) {
         return with_swapchain(t, DXGI_FORMAT_B8G8R8A8_UNORM, 2, [](IDXGISwapChain3* sc, HWND) {
             std::int64_t v = 0;
-            for (int cs : {26, 27, 28, 29, 30, 31, 32, 33, 34, 40, 50, 64, 100, 255, 256, 0x7fffffff, -1, -2}) {
+            for (int cs : {26, 28, 29, 30, 31, 32, 33, 34, 40, 50, 64, 100, 255, 256, 0x7fffffff, -1, -2}) {
                 UINT flags = 0xdeadbeef;
                 const HRESULT c = sc->CheckColorSpaceSupport(static_cast<DXGI_COLOR_SPACE_TYPE>(cs), &flags);
                 const HRESULT sh = sc->SetColorSpace1(static_cast<DXGI_COLOR_SPACE_TYPE>(cs));
@@ -149,6 +149,22 @@ std::vector<Case> make_cases() {
                 note("%lld:%llx/%llx/%llx ", cs, hr(c) & 0xffffffffll, flags, hr(sh) & 0xffffffffll);
             }
             return v;
+        });
+    });
+    // 27 is not in the SDK's enum. Measured hosts disagree on the same Windows build (26200.9974): the RTX 4080 SUPER,
+    // the UHD 770 and WARP here accept it (support flag PRESENT, SetColorSpace1 S_OK), while an RTX 4090, an RTX 5070 Ti
+    // and an AMD iGPU elsewhere answer flags 0 and E_INVALIDARG. So the row pins only that the check and the set agree
+    // with each other and with one of those two answers, and that the answer is the same on repeat.
+    add("colour spaces: value 27 is accepted or refused consistently", [](const Target& t) {
+        return with_swapchain(t, DXGI_FORMAT_B8G8R8A8_UNORM, 2, [](IDXGISwapChain3* sc, HWND) {
+            UINT flags = 0xdeadbeef;
+            const auto cs = static_cast<DXGI_COLOR_SPACE_TYPE>(27);
+            const HRESULT c = sc->CheckColorSpaceSupport(cs, &flags);
+            const HRESULT sh = sc->SetColorSpace1(cs);
+            const bool accepted = c == S_OK && flags == 1 && sh == S_OK;
+            const bool refused = c == S_OK && flags == 0 && sh == E_INVALIDARG;
+            note("27:%llx/%llx/%llx ", hr(c) & 0xffffffffll, flags, hr(sh) & 0xffffffffll);
+            return std::int64_t(accepted || refused ? 1 : 0);
         });
     });
     add("colour spaces: SetColorSpace1 then GetDesc1 format", [](const Target& t) {

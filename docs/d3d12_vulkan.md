@@ -3043,7 +3043,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   The DXGI shim's swap chain now answers `IDXGISwapChain4` and validates `SetHDRMetaData` as the host runtime does (no
   type with no data, or one `DXGI_HDR_METADATA_HDR10` of exactly 40 bytes, with any values; anything else is `E_INVALIDARG`),
   and still discards the block. `CheckColorSpaceSupport` and `SetColorSpace1` follow the host's table per swap chain
-  format (FP16: scRGB only; the 8-bit and 10-bit formats: the RGB sRGB, studio, BT.2020 and HDR10 spaces), `SetRotation`
+  format (FP16: scRGB only; the 8-bit and 10-bit formats: the RGB sRGB, studio, BT.2020 and HDR10 spaces; the value 27,
+  which is not in the SDK enum, is accepted, as on some hosts and refused on others), `SetRotation`
   takes `IDENTITY` to `ROTATE270` and `SetBackgroundColor` components in 0..1. An accepted colour space changes nothing on
   screen yet.
 

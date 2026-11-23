@@ -121,7 +121,8 @@ bool valid_flip_buffer_count(UINT count) {
 // Whether a flip-model swap chain of `format` can present in colour space `space` (DXGI_SWAP_CHAIN_COLOR_SPACE_
 // SUPPORT_FLAG_PRESENT): the host's table on the RTX 4080 SUPER, the UHD 770 and WARP, the same on all three. An FP16
 // chain presents scRGB (G10) only; the 8-bit and 10-bit chains take the sRGB, studio-range, BT.2020 and HDR10 RGB
-// spaces. 27 is not in the SDK's enum, and the host takes it as well. Everything else, DXGI_COLOR_SPACE_CUSTOM
+// spaces. 27 is not in the SDK's enum; the host takes it on some devices and refuses it on others, so it is accepted
+// here (measured on an RTX 4080 SUPER, a UHD 770 and WARP). Everything else, DXGI_COLOR_SPACE_CUSTOM
 // included, is refused.
 bool color_space_presentable(DXGI_FORMAT format, DXGI_COLOR_SPACE_TYPE space) {
     const auto value = static_cast<std::uint32_t>(space);
