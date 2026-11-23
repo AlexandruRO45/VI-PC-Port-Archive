@@ -246,11 +246,12 @@ void test_classification() {
     check(cls("leonida_policy_probe.dll", "PolicyProbeOther") == ReturnClass::Other, "unknown import is other");
 
     for (const char* name : {"XGameStreamingInitialize", "XGameStreamingGetStreamAddedLatency",
-                             "XGameStreamingRegisterConnectionStateChanged", "XSystemGetXboxLiveSandboxId",
+                             "XGameStreamingRegisterConnectionStateChanged", "XGameStreamingIsTouchInputEnabled",
+                             "XSystemGetXboxLiveSandboxId",
                              "XThreadSetTimeSensitive", "XErrorReport"})
         check(cls("xgameruntime.dll", name) == ReturnClass::HResult, std::string(name) + " returns HRESULT");
     for (const char* name : {"XGameStreamingIsStreaming", "XGameStreamingGetClientCount",
-                             "XGameStreamingGetConnectionState", "XGameStreamingIsTouchInputEnabled",
+                             "XGameStreamingGetConnectionState",
                              "XGameStreamingUninitialize", "XGameStreamingUnregisterClientPropertiesChanged",
                              "XGameStreamingUnregisterConnectionStateChanged", "XGameStreamingUnregisterFuture"})
         check(cls("xgameruntime.dll", name) == ReturnClass::Other, std::string(name) + " is not HRESULT");
@@ -262,6 +263,21 @@ void test_classification() {
     check(rt::shims::parse_unimplemented_policy("", &valid) == UnimplementedPolicy::Log && valid, "empty is log");
     check(rt::shims::parse_unimplemented_policy("bogus", &valid) == UnimplementedPolicy::Log && !valid,
           "a bad value is log and invalid");
+}
+
+void test_touch_input_fallback() {
+    using Fn = HRESULT (*)(uint64_t, bool*);
+    auto fn = reinterpret_cast<Fn>(rt::shims::make_unimplemented_thunk(
+        "xgameruntime.dll", "XGameStreamingIsTouchInputEnabled"));
+    for (auto policy : {UnimplementedPolicy::Log, UnimplementedPolicy::Fail}) {
+        rt::shims::set_unimplemented_policy(policy);
+        bool enabled = true;
+        const HRESULT result = fn(42, &enabled);
+        const std::string tag = policy == UnimplementedPolicy::Fail ? "touch fail" : "touch log";
+        check(result == S_OK, tag + " returns S_OK");
+        check(!enabled, tag + " clears the output");
+    }
+    rt::shims::set_unimplemented_policy(UnimplementedPolicy::Log);
 }
 
 void test_in_process(const fs::path& dir) {
@@ -494,6 +510,7 @@ int wmain(int argc, wchar_t** argv) {
 
         const fs::path dir = test_dir();
         test_classification();
+        test_touch_input_fallback();
         test_in_process(dir);
         test_abi(dir);
         test_env_and_default(dir);

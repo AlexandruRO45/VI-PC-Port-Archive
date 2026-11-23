@@ -72,6 +72,7 @@ std::vector<Lookup> g_lookups;
 //                            return HRESULT except the functions in kNotHResult, which the same pages show as
 //                            void/bool/int: XAsync*, XTaskQueue*, XUser*, XStore*, XGameSave*, XPackage*, XGameUi*.
 //                            XGameStreaming* follows the same rule, including the unregister prefix exception.
+//                            XGameStreamingIsTouchInputEnabled keeps S_OK and writes false in its fallback.
 //                            XGameRuntimeInitialize, XGameEventWrite, XSystemGetXboxLiveSandboxId,
 //                            XThreadSetTimeSensitive and XErrorReport return HRESULT (see xgameruntime.cpp).
 //                            Other mixed families remain unclassified.
@@ -93,7 +94,7 @@ const char* const kNotHResult[] = {
     "XStoreProductsQueryHasMorePages", "XStoreUnregisterGameLicenseChanged", "XStoreUnregisterPackageLicenseLost",
     "XGameSaveCloseContainer", "XGameSaveCloseProvider", "XGameSaveCloseUpdate",
     "XGameStreamingIsStreaming", "XGameStreamingGetClientCount", "XGameStreamingGetConnectionState",
-    "XGameStreamingIsTouchInputEnabled", "XGameStreamingUninitialize",
+    "XGameStreamingUninitialize",
     "XPackageCloseInstallationMonitorHandle", "XPackageCloseMountHandle", "XPackageGetInstallationProgress",
     "XPackageIsPackagedProcess", "XPackageUninstallPackage", "XPackageUnregisterInstallationProgressChanged",
     "XPackageUnregisterPackageInstalled", "XPackageUpdateInstallationMonitor",
@@ -185,7 +186,9 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
             cls = it->second;
         }
     }
-    const uint64_t fail_value = cls == ReturnClass::HResult ? kENotImpl : 0;
+    // This documented HRESULT query has a safe offline success result. Keep S_OK and initialize its bool output.
+    const bool touch_query = std::strcmp(what, "xgameruntime.dll!XGameStreamingIsTouchInputEnabled") == 0;
+    const uint64_t fail_value = cls == ReturnClass::HResult && !touch_query ? kENotImpl : 0;
     if (first && startup_trace::enabled())
         startup_trace::event("unimplemented_call", "\"import\":" + startup_trace::quote(what) +
                                                        ",\"caller\":" + startup_trace::quote(module_offset(info->ret)));
@@ -199,11 +202,12 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
                      what, describe_address(info->ret).c_str(), static_cast<unsigned long long>(info->rcx),
                      static_cast<unsigned long long>(info->rdx), static_cast<unsigned long long>(info->r8),
                      static_cast<unsigned long long>(info->r9), cls == ReturnClass::HResult ? "hresult" : "other",
-                     cls == ReturnClass::HResult ? "E_NOTIMPL" : "0");
+                     fail_value == kENotImpl ? "E_NOTIMPL" : "0");
         if (IsDebuggerPresent()) {
             std::fprintf(stderr, "[rt]   debugger attached: breaking; continuing returns the `fail` value\n");
             std::fflush(stderr);
             __debugbreak();
+            if (touch_query && info->rdx) *reinterpret_cast<bool*>(info->rdx) = false;
             return fail_value;
         }
         std::fprintf(stderr, "[rt]   no debugger attached: terminating the process (exit code %d)\n", kStopExitCode);
@@ -214,8 +218,9 @@ extern "C" uint64_t rt_unimplemented(const char* what, const CallInfo* info) {
     if (first)
         std::fprintf(stderr, "[rt] unimplemented: %s%s\n", what,
                      policy == UnimplementedPolicy::Fail
-                         ? (cls == ReturnClass::HResult ? " (returns E_NOTIMPL)" : " (returns 0)")
+                         ? (fail_value == kENotImpl ? " (returns E_NOTIMPL)" : " (returns 0)")
                          : "");
+    if (touch_query && info->rdx) *reinterpret_cast<bool*>(info->rdx) = false;
     return policy == UnimplementedPolicy::Fail ? fail_value : 0;
 }
 
