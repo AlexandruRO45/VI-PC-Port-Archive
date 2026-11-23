@@ -16,10 +16,11 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cctype>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -1089,6 +1090,224 @@ bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void*, XTaskQueueRegistrat
 bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
 bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
 
+// XPackageKind / XPackageEnumerationScope / XPackageDetails (Microsoft public GDK reference,
+// learn.microsoft.com/gaming/gdk/docs/reference/system/xpackage):
+// IXPackageImpl2 (slot 35) added ageRestricted; IXPackageImpl3 (slot 39) appended titleID at offset 72.
+// Because XPackageDetails is passed by const pointer to the callback and each revision only appends fields,
+// one 80-byte struct satisfies both slot 35 and slot 39 callers.
+enum class XPackageKind : uint32_t {
+    Game = 0,
+    Content = 1,
+    PublisherContent = 2,
+};
+
+enum class XPackageEnumerationScope : uint32_t {
+    ThisOnly = 0,
+    ThisAndRelated = 1,
+    ThisPublisher = 2,
+};
+
+struct XPackageDetails {
+    const char* packageIdentifier;
+    XVersion version;
+    XPackageKind kind;
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleID;
+};
+static_assert(offsetof(XPackageDetails, packageIdentifier) == 0, "XPackageDetails::packageIdentifier offset");
+static_assert(offsetof(XPackageDetails, version) == 8, "XPackageDetails::version offset");
+static_assert(offsetof(XPackageDetails, kind) == 16, "XPackageDetails::kind offset");
+static_assert(offsetof(XPackageDetails, displayName) == 24, "XPackageDetails::displayName offset");
+static_assert(offsetof(XPackageDetails, description) == 32, "XPackageDetails::description offset");
+static_assert(offsetof(XPackageDetails, publisher) == 40, "XPackageDetails::publisher offset");
+static_assert(offsetof(XPackageDetails, storeId) == 48, "XPackageDetails::storeId offset");
+static_assert(offsetof(XPackageDetails, installing) == 56, "XPackageDetails::installing offset");
+static_assert(offsetof(XPackageDetails, index) == 60, "XPackageDetails::index offset");
+static_assert(offsetof(XPackageDetails, count) == 64, "XPackageDetails::count offset");
+static_assert(offsetof(XPackageDetails, ageRestricted) == 68, "XPackageDetails::ageRestricted offset");
+static_assert(offsetof(XPackageDetails, titleID) == 72, "XPackageDetails::titleID offset");
+static_assert(sizeof(XPackageDetails) == 80, "XPackageDetails layout");
+
+using XPackageEnumerationCallback = bool(CALLBACK*)(void* context, const XPackageDetails* details);
+
+bool package_title_id(uint32_t& out);
+
+std::string get_env_string_a(const char* name) {
+    const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+    if (needed == 0) return {};
+    std::string value(needed, '\0');
+    const DWORD written = GetEnvironmentVariableA(name, value.data(), needed);
+    if (written == 0 || written >= needed) return {};
+    value.resize(written);
+    return value;
+}
+
+std::string current_process_package_id() {
+    char id[XPACKAGE_IDENTIFIER_MAX_LENGTH] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_PACKAGE_ID", id, sizeof(id));
+    return (n > 0 && n < sizeof(id)) ? std::string(id) : std::string(kDefaultPackageIdentifier);
+}
+
+std::string xml_tag_value(const std::string& xml, const char* tag) {
+    const std::string open_tag = std::string("<") + tag + ">";
+    const std::string close_tag = std::string("</") + tag + ">";
+    const size_t open = xml.find(open_tag);
+    if (open == std::string::npos) return {};
+    const size_t close = xml.find(close_tag, open + open_tag.size());
+    if (close == std::string::npos) return {};
+    const size_t begin = xml.find_first_not_of(" \t\r\n", open + open_tag.size());
+    if (begin == std::string::npos || begin >= close) return {};
+    size_t end = close;
+    while (end > begin && std::isspace(static_cast<unsigned char>(xml[end - 1]))) --end;
+    return xml.substr(begin, end - begin);
+}
+
+std::string xml_element_attr(const std::string& xml, const char* element, const char* attr) {
+    const std::string prefix = std::string("<") + element;
+    const std::string key = std::string(attr) + "=";
+    for (size_t at = 0; (at = xml.find(prefix, at)) != std::string::npos; at += prefix.size()) {
+        const size_t after = at + prefix.size();
+        if (after >= xml.size() || !std::isspace(static_cast<unsigned char>(xml[after]))) continue;
+        const size_t end = xml.find('>', after);
+        if (end == std::string::npos) return {};
+        for (size_t pos = after; (pos = xml.find(key, pos)) != std::string::npos && pos < end; pos += key.size()) {
+            if (pos > after && !std::isspace(static_cast<unsigned char>(xml[pos - 1]))) continue;
+            const size_t q = pos + key.size();
+            if (q >= end) break;
+            const char quote = xml[q];
+            if (quote != '"' && quote != '\'') continue;
+            const size_t close = xml.find(quote, q + 1);
+            if (close != std::string::npos && close < end) return xml.substr(q + 1, close - q - 1);
+        }
+    }
+    return {};
+}
+
+bool parse_package_version(const std::string& text, XVersion& out) {
+    uint16_t parts[4] = {};
+    size_t pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (pos >= text.size()) return false;
+        uint32_t value = 0;
+        size_t digits = 0;
+        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+            value = value * 10u + static_cast<uint32_t>(text[pos] - '0');
+            if (value > 65535u) return false;
+            ++pos;
+            ++digits;
+        }
+        if (digits == 0) return false;
+        parts[i] = static_cast<uint16_t>(value);
+        if (i < 3) {
+            if (pos >= text.size() || text[pos] != '.') return false;
+            ++pos;
+        }
+    }
+    if (pos != text.size()) return false;
+    out = {parts[0], parts[1], parts[2], parts[3]};
+    return true;
+}
+
+// HRESULT XPackageEnumeratePackages(XPackageKind kind, XPackageEnumerationScope scope, void* context,
+//                                   XPackageEnumerationCallback* callback)
+// Reports the current process's game package for XPackageKind::Game (with metadata from MicrosoftGame.Config when
+// present) and any packages configured in LEONIDA_CONTENT_PACKAGES for XPackageKind::Content (zero when unset).
+HRESULT STDMETHODCALLTYPE pkg_enumerate_packages(void*, XPackageKind kind, XPackageEnumerationScope scope,
+                                                 void* context, XPackageEnumerationCallback callback) {
+    if (!callback) return E_INVALIDARG;
+    const uint32_t kind_val = static_cast<uint32_t>(kind);
+    const uint32_t scope_val = static_cast<uint32_t>(scope);
+    if (kind_val > static_cast<uint32_t>(XPackageKind::PublisherContent) ||
+        scope_val > static_cast<uint32_t>(XPackageEnumerationScope::ThisPublisher)) {
+        return E_INVALIDARG;
+    }
+
+    const std::string process_id = current_process_package_id();
+
+    if (kind == XPackageKind::Game) {
+        const std::string xml = package_config();
+        XVersion version{1, 0, 0, 0};
+        const std::string ver_text = xml_element_attr(xml, "Identity", "Version");
+        if (!ver_text.empty()) {
+            XVersion parsed{};
+            if (parse_package_version(ver_text, parsed)) version = parsed;
+        }
+        std::string display_name = xml_element_attr(xml, "ShellVisuals", "DefaultDisplayName");
+        if (display_name.empty()) display_name = xml_element_attr(xml, "Identity", "Name");
+        const std::string description = xml_element_attr(xml, "ShellVisuals", "Description");
+        std::string publisher = xml_element_attr(xml, "ShellVisuals", "PublisherDisplayName");
+        if (publisher.empty()) publisher = xml_element_attr(xml, "Identity", "Publisher");
+        const std::string store_id = xml_tag_value(xml, "StoreId");
+
+        char title_id_buf[16] = {};
+        uint32_t tid = 0;
+        if (package_title_id(tid)) std::snprintf(title_id_buf, sizeof(title_id_buf), "%08X", tid);
+
+        const XPackageDetails details{
+            process_id.c_str(),
+            version,
+            XPackageKind::Game,
+            display_name.c_str(),
+            description.c_str(),
+            publisher.c_str(),
+            store_id.c_str(),
+            false,
+            0,
+            1,
+            false,
+            title_id_buf,
+        };
+        (void)callback(context, &details);
+        return S_OK;
+    }
+
+    if (kind == XPackageKind::Content) {
+        const std::string mapping = get_env_string_a("LEONIDA_CONTENT_PACKAGES");
+        std::vector<std::string> ids;
+        size_t pos = 0;
+        while (pos < mapping.size()) {
+            const size_t sep = mapping.find(';', pos);
+            const size_t end = (sep == std::string::npos) ? mapping.size() : sep;
+            const size_t eq = mapping.find('=', pos);
+            if (eq != std::string::npos && eq < end && eq > pos) {
+                std::string id = mapping.substr(pos, eq - pos);
+                if (id != process_id && std::find(ids.begin(), ids.end(), id) == ids.end()) {
+                    ids.push_back(std::move(id));
+                }
+            }
+            pos = (sep == std::string::npos) ? mapping.size() : sep + 1;
+        }
+        const uint32_t total = static_cast<uint32_t>(ids.size());
+        for (uint32_t i = 0; i < total; ++i) {
+            const XPackageDetails details{
+                ids[i].c_str(),
+                XVersion{1, 0, 0, 0},
+                XPackageKind::Content,
+                ids[i].c_str(),
+                "",
+                "",
+                "",
+                false,
+                i,
+                total,
+                false,
+                "",
+            };
+            if (!callback(context, &details)) break;
+        }
+        return S_OK;
+    }
+
+    return S_OK;
+}
+
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
 const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
@@ -1113,9 +1332,10 @@ const void* const kPackageVtable[] = {
                                                       // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36), PN(37), PN(38),                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
-                                                      //   MountWithUiAsync, MountWithUiResult
-    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),  // 35 IXPackageImpl2::XPackageEnumeratePackages
+    PN(36), PN(37), PN(38),                                  // 36 RegisterPackageInstalled, 37-38 MountWithUiAsync/Result
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),  // 39 IXPackageImpl3::XPackageEnumeratePackages
+    PN(40),                                                  // 40 IXPackageImpl3::XPackageRegisterPackageInstalled
 };
 #undef PN
 static_assert(std::size(kPackageVtable) == 41, "IUnknown + IXPackageImpl's 32 + IXPackageImpl2's 4 + IXPackageImpl3's 2");

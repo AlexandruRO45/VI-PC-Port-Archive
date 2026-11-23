@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <XAsync.h>
 #include <XAsyncProvider.h>
@@ -819,6 +821,171 @@ void check_run_time_load() {
                   reinterpret_cast<UnregInstalled>(slot(pk, 22))(pk, XTaskQueueRegistrationToken{1}, false) &&
                   !reinterpret_cast<Uninstall>(slot(pk, 34))(pk, "pkg"),
               "the bool slots 8, 10, 22 and 34 return their documented offline answers");
+        // Slots 35 (IXPackageImpl2) and 39 (IXPackageImpl3): XPackageEnumeratePackages.
+        {
+            struct PackageDetails {
+                const char* packageIdentifier;
+                XVersion version;
+                uint32_t kind;
+                const char* displayName;
+                const char* description;
+                const char* publisher;
+                const char* storeId;
+                bool installing;
+                uint32_t index;
+                uint32_t count;
+                bool ageRestricted;
+                const char* titleID;
+            };
+            static_assert(sizeof(PackageDetails) == 80, "XPackageDetails must be 80 bytes per GDK ABI");
+            static_assert(offsetof(PackageDetails, ageRestricted) == 68, "ageRestricted offset");
+            static_assert(offsetof(PackageDetails, titleID) == 72, "titleID offset");
+
+            struct RecordedPackage {
+                std::string id;
+                XVersion version;
+                uint32_t kind;
+                std::string display_name;
+                std::string description;
+                std::string publisher;
+                std::string store_id;
+                bool installing;
+                uint32_t index;
+                uint32_t count;
+                bool age_restricted;
+                std::string title_id;
+            };
+            struct EnumCtx {
+                std::vector<RecordedPackage> items;
+                bool keep_going = true;
+                bool all_non_null = true;
+            };
+            using EnumCallback = bool(CALLBACK*)(void*, const PackageDetails*);
+            using EnumPackages = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, EnumCallback);
+
+            EnumCallback collect = [](void* raw_ctx, const PackageDetails* d) -> bool {
+                auto* c = static_cast<EnumCtx*>(raw_ctx);
+                if (!d || !d->packageIdentifier || !d->displayName || !d->description || !d->publisher ||
+                    !d->storeId || !d->titleID) {
+                    c->all_non_null = false;
+                    return false;
+                }
+                c->items.push_back(RecordedPackage{
+                    d->packageIdentifier, d->version, d->kind, d->displayName, d->description, d->publisher,
+                    d->storeId, d->installing, d->index, d->count, d->ageRestricted, d->titleID});
+                return c->keep_going;
+            };
+
+            for (int enum_slot : {35, 39}) {
+                const auto enum_fn = reinterpret_cast<EnumPackages>(slot(pk, enum_slot));
+                const char* label = enum_slot == 35 ? "slot 35 (IXPackageImpl2::XPackageEnumeratePackages)"
+                                                    : "slot 39 (IXPackageImpl3::XPackageEnumeratePackages)";
+                // Parameter validation: null callback and out-of-range kind/scope -> E_INVALIDARG.
+                check(enum_fn(pk, 0, 0, nullptr, nullptr) == E_INVALIDARG &&
+                          enum_fn(pk, 3, 0, nullptr, collect) == E_INVALIDARG &&
+                          enum_fn(pk, 0, 3, nullptr, collect) == E_INVALIDARG,
+                      label);
+
+                // Default Game enumeration (ThisOnly, no MicrosoftGame.Config).
+                EnumCtx game_default{};
+                check(enum_fn(pk, 0, 0, &game_default, collect) == S_OK && game_default.all_non_null &&
+                          game_default.items.size() == 1 && game_default.items[0].id == a &&
+                          game_default.items[0].kind == 0 && game_default.items[0].version.major == 1 &&
+                          game_default.items[0].version.minor == 0 && game_default.items[0].version.build == 0 &&
+                          game_default.items[0].version.revision == 0 && !game_default.items[0].installing &&
+                          game_default.items[0].index == 0 && game_default.items[0].count == 1 &&
+                          !game_default.items[0].age_restricted && game_default.items[0].title_id.empty(),
+                      enum_slot == 35 ? "slot 35 Game/ThisOnly reports current process package offline"
+                                      : "slot 39 Game/ThisOnly reports current process package offline");
+
+                // Content (kind=1) and PublisherContent (kind=2) with no LEONIDA_CONTENT_PACKAGES -> 0 items, S_OK.
+                EnumCtx empty_content{};
+                EnumCtx empty_related{};
+                EnumCtx empty_pub{};
+                check(enum_fn(pk, 1, 0, &empty_content, collect) == S_OK && empty_content.items.empty() &&
+                          enum_fn(pk, 1, 1, &empty_related, collect) == S_OK && empty_related.items.empty() &&
+                          enum_fn(pk, 2, 2, &empty_pub, collect) == S_OK && empty_pub.items.empty(),
+                      enum_slot == 35 ? "slot 35 Content/PublisherContent return 0 items when unconfigured"
+                                      : "slot 39 Content/PublisherContent return 0 items when unconfigured");
+            }
+
+            // Game enumeration with LEONIDA_PACKAGE_ID + MicrosoftGame.Config metadata across scopes.
+            const std::string enum_game = std::string(tmp) + "leonida_xpackage_enum_test";
+            CreateDirectoryA(enum_game.c_str(), nullptr);
+            const std::string enum_cfg = enum_game + "\\MicrosoftGame.Config";
+            if (std::ofstream f(enum_cfg, std::ios::binary); f) {
+                f << "<Game configVersion=\"1\">\n"
+                     "  <Identity Name=\"FallbackName\" Publisher=\"CN=Fallback\" Version=\"2.4.6.8\"/>\n"
+                     "  <TitleId> 1a2b3c4d </TitleId>\n"
+                     "  <StoreId> 9NBLGGH4NNS1 </StoreId>\n"
+                     "  <ShellVisuals DefaultDisplayName=\"Enum Test Game\" Description=\"Offline package\" "
+                     "PublisherDisplayName=\"Enum Test Studio\"/>\n"
+                     "</Game>\n";
+            }
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", enum_game.c_str());
+            SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", "EnumGameId_123456789012345678901");
+            for (int enum_slot : {35, 39}) {
+                const auto enum_fn = reinterpret_cast<EnumPackages>(slot(pk, enum_slot));
+                for (uint32_t scope : {0u, 1u, 2u}) {
+                    EnumCtx meta{};
+                    const HRESULT hr = enum_fn(pk, 0, scope, &meta, collect);
+                    check(hr == S_OK && meta.all_non_null && meta.items.size() == 1 &&
+                              meta.items[0].id == "EnumGameId_123456789012345678901" &&
+                              meta.items[0].version.major == 2 && meta.items[0].version.minor == 4 &&
+                              meta.items[0].version.build == 6 && meta.items[0].version.revision == 8 &&
+                              meta.items[0].display_name == "Enum Test Game" &&
+                              meta.items[0].description == "Offline package" &&
+                              meta.items[0].publisher == "Enum Test Studio" &&
+                              meta.items[0].store_id == "9NBLGGH4NNS1" && meta.items[0].title_id == "1A2B3C4D",
+                          enum_slot == 35 ? "slot 35 Game populates XPackageDetails from MicrosoftGame.Config"
+                                          : "slot 39 Game populates XPackageDetails from MicrosoftGame.Config");
+                }
+            }
+            DeleteFileA(enum_cfg.c_str());
+            RemoveDirectoryA(enum_game.c_str());
+            SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
+            SetEnvironmentVariableA("LEONIDA_PACKAGE_ID", nullptr);
+
+            // Content enumeration from LEONIDA_CONTENT_PACKAGES: multiple packages, dedup, skip process id,
+            // stop-on-false callback, and mount compatibility with slot 23.
+            const std::string content_env =
+                std::string(a) + "=C:\\IgnoredGame;DLC_A_12345678901234567890123456=C:\\DlcA;"
+                "DLC_B_12345678901234567890123456=C:\\DlcB;DLC_A_12345678901234567890123456=C:\\DlcADup";
+            SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", content_env.c_str());
+            for (int enum_slot : {35, 39}) {
+                const auto enum_fn = reinterpret_cast<EnumPackages>(slot(pk, enum_slot));
+                EnumCtx all_dlc{};
+                check(enum_fn(pk, 1, 1, &all_dlc, collect) == S_OK && all_dlc.all_non_null &&
+                          all_dlc.items.size() == 2 &&
+                          all_dlc.items[0].id == "DLC_A_12345678901234567890123456" &&
+                          all_dlc.items[0].kind == 1 && all_dlc.items[0].index == 0 && all_dlc.items[0].count == 2 &&
+                          !all_dlc.items[0].installing && !all_dlc.items[0].age_restricted &&
+                          all_dlc.items[0].title_id.empty() &&
+                          all_dlc.items[1].id == "DLC_B_12345678901234567890123456" &&
+                          all_dlc.items[1].kind == 1 && all_dlc.items[1].index == 1 && all_dlc.items[1].count == 2 &&
+                          all_dlc.items[1].title_id.empty(),
+                      enum_slot == 35 ? "slot 35 Content enumerates LEONIDA_CONTENT_PACKAGES with index/count"
+                                      : "slot 39 Content enumerates LEONIDA_CONTENT_PACKAGES with index/count");
+
+                // Callback returning false stops enumeration early and still returns S_OK.
+                EnumCtx stop_early{};
+                stop_early.keep_going = false;
+                check(enum_fn(pk, 1, 0, &stop_early, collect) == S_OK && stop_early.items.size() == 1 &&
+                          stop_early.items[0].id == "DLC_A_12345678901234567890123456" &&
+                          stop_early.items[0].index == 0 && stop_early.items[0].count == 2,
+                      enum_slot == 35 ? "slot 35 stops enumeration when callback returns false"
+                                      : "slot 39 stops enumeration when callback returns false");
+
+                // Enumerated content package identifier mounts via slot 23 (XPackageMount).
+                uint64_t m = 0;
+                const HRESULT mhr = reinterpret_cast<Mount>(slot(pk, 23))(pk, all_dlc.items[0].id.c_str(), &m);
+                check(mhr == S_OK && m != 0,
+                      enum_slot == 35 ? "slot 35 enumerated content package mounts via slot 23"
+                                      : "slot 39 enumerated content package mounts via slot 23");
+                if (m) reinterpret_cast<CloseMount>(slot(pk, 26))(pk, m);
+            }
+            SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
+        }
         const GUID chain[] = {
             package_cls,
             {0x3720de07, 0xe8e4, 0x44a3, {0xad, 0x32, 0xb3, 0x59, 0xe8, 0xad, 0xbe, 0x55}},
