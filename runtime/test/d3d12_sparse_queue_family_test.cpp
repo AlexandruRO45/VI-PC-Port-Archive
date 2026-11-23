@@ -3,6 +3,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include "../shims/d3d12_com.h"
+#include "vk_test_device.h"
 #include <wrl/client.h>
 #include <algorithm>
 #include <cstdint>
@@ -150,9 +151,17 @@ int main() {
         ComPtr<ID3D12Device> device;
         const HRESULT created = rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device));
         if (FAILED(created) || !device) {
-            // As the other layer tests do: a machine with no Vulkan driver has nothing to check here.
-            std::printf("SKIP: no Vulkan device (hr=0x%08lx)\n", static_cast<unsigned long>(created));
-            return 77;
+            // The layer answers E_FAIL both for a machine without Vulkan and for a device it failed to set up, so
+            // the host is asked directly which of the two this is. Only a host with nothing to run on is a skip: a
+            // host where Vulkan works, or a setup that was asked for and is missing (LEONIDA_VK_VALIDATION without
+            // the layer, a LEONIDA_VK_DEVICE that matches nothing), stays the failure it was. The probe runs on this
+            // path alone, so the API dump of a run that passes holds the layer's calls and no others.
+            vktest::Device host;
+            if (host.initialize() == vktest::DeviceStatus::unavailable) {
+                std::printf("SKIP: no Vulkan device (hr=0x%08lx)\n", static_cast<unsigned long>(created));
+                return 77;
+            }
+            ok(FAILED(created) ? created : E_FAIL, "Leonida create_vulkan_device_standalone");
         }
         if (!rt::d3d12::device_sparse_buffer_tiles(device.Get())) {
             std::puts("SKIP Leonida sparse_buffer_tiles not supported");
