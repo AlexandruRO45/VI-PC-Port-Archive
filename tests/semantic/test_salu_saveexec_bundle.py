@@ -635,6 +635,25 @@ class TestSaveExecDivergenceFlags_nor(unittest.TestCase):
             self.assertEqual(d_val, old_exec)
             self.assertEqual(scc, int(new_exec != 0))
 
+class TestSaveExecTranslator_nor(unittest.TestCase):
+    def test_translator_spirv_emission(self):
+        prog = [
+            "v_mbcnt_lo_u32_b32 v1, -1, 0",
+            "v_mbcnt_hi_u32_b32 v1, -1, v1",
+            "s_mov_b32 exec_lo, 0x12345678",
+            "s_mov_b32 exec_hi, 0x9ABCDEF0",
+            "s_mov_b32 s10, 0x55555555",
+            "s_mov_b32 s11, 0xAAAAAAAA",
+            "s_nor_saveexec_b64 s[6:7], s[10:11]",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_saveexec_nor_bundle", prog, fssm=saveexec_run.fssm())
+        self.assertIsInstance(spv, str)
+        self.assertIn("OpCapability Shader", spv)
+
+    def test_translator_hardware_runner(self):
+        saveexec_run.check(self, "nor")
+
 
 if __name__ == "__main__":
     unittest.main()
