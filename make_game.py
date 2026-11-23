@@ -1056,10 +1056,10 @@ def ensure_submodule() -> None:
 def exe_mismatch(version: dict, exe: str, full: bool) -> str:
     """Why `exe` is not the executable the manifest describes, or "" when it is or the manifest does not say.
 
-    `expected_exe_size` and `expected_exe_sha256` are optional: a copy bought before the executable shipped has no
-    such file, and the runtime stage can still be built from it. When the manifest records them, a different size
-    fails either way (a truncated copy cannot be run); the hash is compared only with --full, the mode that reads
-    every file.
+    `expected_exe_size` and `expected_exe_sha256` are optional: a package that does not contain the executable (an
+    older copy) has nothing to compare, and the runtime stage can still be built from its other files. When the
+    manifest records them, a different size fails either way (a truncated copy cannot be run); the hash is compared
+    only with --full, the mode that reads every file.
     """
     size = version.get("expected_exe_size")
     if size is not None:
@@ -1069,7 +1069,7 @@ def exe_mismatch(version: dict, exe: str, full: bool) -> str:
     digest = version.get("expected_exe_sha256")
     if full and digest:
         actual = file_sha256(exe)
-        if actual != digest:
+        if actual != digest.lower():
             return f"{version['expected_exe']} has sha256 {actual[:12]}, the manifest has {digest[:12]}."
     return ""
 

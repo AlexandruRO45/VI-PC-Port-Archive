@@ -262,6 +262,30 @@ class GameCheckTest(PreflightTestBase):
                         make_game.check(game_dir, full=True)
             self.assertIn("Executable found and its sha256 matches.", stdout_buf.getvalue())
 
+    def test_full_check_without_a_recorded_hash_still_checks_the_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_dir, game_dir = self.synthetic_with_exe(tmp, expected_exe_size=256)
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py"):
+                    with mock.patch("sys.stdout", stdout_buf):
+                        make_game.check(game_dir, full=True)
+            self.assertIn("Executable found.", stdout_buf.getvalue())
+            self.assertNotIn("sha256 matches", stdout_buf.getvalue())
+
+    def test_full_check_accepts_an_uppercase_recorded_hash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe_bytes = b"x" * 256
+            manifest_dir, game_dir = self.synthetic_with_exe(
+                tmp, exe_bytes, expected_exe_size=256,
+                expected_exe_sha256=hashlib.sha256(exe_bytes).hexdigest().upper())
+            stdout_buf = io.StringIO()
+            with mock.patch.object(make_game, "VERSIONS", manifest_dir):
+                with mock.patch.object(make_game, "py"):
+                    with mock.patch("sys.stdout", stdout_buf):
+                        make_game.check(game_dir, full=True)
+            self.assertIn("Executable found and its sha256 matches.", stdout_buf.getvalue())
+
     def test_full_check_rejects_a_different_executable_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest_dir, game_dir = self.synthetic_with_exe(
