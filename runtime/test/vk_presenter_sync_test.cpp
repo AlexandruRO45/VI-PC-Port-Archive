@@ -70,6 +70,7 @@ std::atomic<bool> observe_capture{false};
 std::atomic<bool> saw_capture_waw{false};
 std::atomic<std::uint32_t> capture_copies{0};
 std::atomic<std::uint32_t> capture_waw_barriers{0};
+std::atomic<std::uint32_t> capture_host_barriers{0};
 std::atomic<bool> check_swapchain_destroy{false};
 std::atomic<bool> destroy_entered{false};
 std::atomic<bool> submit_entered{false};
@@ -126,17 +127,35 @@ VKAPI_ATTR void VKAPI_CALL cmd_pipeline_barrier(VkCommandBuffer cb, VkPipelineSt
                                                 std::uint32_t mem_count, const VkMemoryBarrier* mem,
                                                 std::uint32_t buf_count, const VkBufferMemoryBarrier* buf,
                                                 std::uint32_t img_count, const VkImageMemoryBarrier* img) {
-    if (observe_capture.load(std::memory_order_relaxed) && (src_stage & VK_PIPELINE_STAGE_TRANSFER_BIT) &&
-        (dst_stage & VK_PIPELINE_STAGE_TRANSFER_BIT)) {
-        for (std::uint32_t i = 0; i < buf_count; ++i) {
-            if ((buf[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
-                (buf[i].dstAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT))
-                saw_capture_waw.store(true, std::memory_order_relaxed);
+    if (observe_capture.load(std::memory_order_relaxed)) {
+        if ((src_stage & VK_PIPELINE_STAGE_TRANSFER_BIT) && (dst_stage & VK_PIPELINE_STAGE_TRANSFER_BIT)) {
+            for (std::uint32_t i = 0; i < buf_count; ++i) {
+                if ((buf[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                    (buf[i].dstAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT))
+                    saw_capture_waw.store(true, std::memory_order_relaxed);
+            }
+            for (std::uint32_t i = 0; i < mem_count; ++i) {
+                if ((mem[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                    (mem[i].dstAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT))
+                    saw_capture_waw.store(true, std::memory_order_relaxed);
+            }
         }
-        for (std::uint32_t i = 0; i < mem_count; ++i) {
-            if ((mem[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
-                (mem[i].dstAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT))
-                saw_capture_waw.store(true, std::memory_order_relaxed);
+        // read_back() reads the capture buffer on the host after the frame fence, and a fence alone makes no device
+        // write visible to the host: each capture copy needs a TRANSFER_WRITE -> HOST_READ barrier after it. A buffer
+        // barrier or a global memory barrier both do; one counts only once a copy is recorded ahead of it.
+        if ((src_stage & VK_PIPELINE_STAGE_TRANSFER_BIT) && (dst_stage & VK_PIPELINE_STAGE_HOST_BIT)) {
+            bool to_host = false;
+            for (std::uint32_t i = 0; i < buf_count; ++i) {
+                to_host |= (buf[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                           (buf[i].dstAccessMask & VK_ACCESS_HOST_READ_BIT);
+            }
+            for (std::uint32_t i = 0; i < mem_count; ++i) {
+                to_host |= (mem[i].srcAccessMask & VK_ACCESS_TRANSFER_WRITE_BIT) &&
+                           (mem[i].dstAccessMask & VK_ACCESS_HOST_READ_BIT);
+            }
+            if (to_host && capture_host_barriers.load(std::memory_order_relaxed) <
+                               capture_copies.load(std::memory_order_relaxed))
+                capture_host_barriers.fetch_add(1, std::memory_order_relaxed);
         }
     }
     real_barrier(cb, src_stage, dst_stage, flags, mem_count, mem, buf_count, buf, img_count, img);
@@ -328,6 +347,7 @@ int main() {
         driver::saw_capture_waw.store(false);
         driver::capture_copies.store(0);
         driver::capture_waw_barriers.store(0);
+        driver::capture_host_barriers.store(0);
         driver::observe_capture.store(true);
         EXPECT(presenter.present(1, true) == VK_SUCCESS);
         EXPECT(presenter.present(1, true) == VK_SUCCESS);
@@ -336,11 +356,12 @@ int main() {
         driver::observe_capture.store(false);
         EXPECT(driver::capture_copies.load() == 4);
         EXPECT(driver::capture_waw_barriers.load() == 4);
+        EXPECT(driver::capture_host_barriers.load() == 4);
 
         EXPECT(presenter.read_back(pixels, &ext, &fmt));
         const bool bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
         EXPECT(presenter_capture_matches_clear(pixels, ext.width, ext.height, bgra));
-        std::printf("presenter sync: capture-buffer WAW barriers (4/4) and full-frame read_back ok\n");
+        std::printf("presenter sync: capture-buffer WAW (4/4) and HOST_READ (4/4) barriers, full-frame read_back ok\n");
 
         // 2b. A Present behind held work shows what that work draws (queue_holds.h). The render waits for a gate with
         //     no submitted Signal, so the queue holds it; the presents are queued behind it instead of blitting the
