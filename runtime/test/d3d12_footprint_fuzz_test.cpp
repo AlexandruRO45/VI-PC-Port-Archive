@@ -132,7 +132,8 @@ int main(int argc, char** argv) {
         return 77;
     }
     unsigned asked = 0, wrong = 0, gap_count = 0, hosts_disagree = 0, host_wraps = 0, shown = 0;
-    for (unsigned seed = start; seed < start + seeds; ++seed) {
+    for (unsigned run_index = 0; run_index < seeds; ++run_index) {  // counted from 0: start + seeds may wrap
+        const unsigned seed = start + run_index;
         std::mt19937_64 rng(seed);
         for (unsigned c = 0; c < cases; ++c) {
             D3D12_RESOURCE_DESC d{};
