@@ -234,5 +234,110 @@ class TestVAlignbyteB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.rf.vgprs[4], 0xDDEEFF00)
 
 
+class SIMDState:
+    def __init__(self, num_lanes: int = 32, exec_mask: int = 0xFFFFFFFF):
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count {num_lanes}, must be 32 or 64")
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.vgprs = [[0] * num_lanes for _ in range(256)]
+        self.sgprs = [0] * 106
+
+    def read_lane(self, op: Operand, lane: int) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index][lane] & MASK32
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK32
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+
+class SIMDInterpreter:
+    @staticmethod
+    def execute(state: SIMDState, inst: VAlignbyteB32Instruction) -> list[int]:
+        results = []
+        for lane in range(state.num_lanes):
+            lane_active = (state.exec_mask >> lane) & 1
+            if lane_active:
+                s0 = state.read_lane(inst.src0, lane)
+                s1 = state.read_lane(inst.src1, lane)
+                s2 = state.read_lane(inst.src2, lane)
+                res = ref_alignbyte(s0, s1, s2)
+                state.vgprs[inst.dst.index][lane] = res
+                results.append(res)
+            else:
+                results.append(state.vgprs[inst.dst.index][lane])
+        return results
+
+
+class TestVAlignbyteB32SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_wave32_full_exec(self):
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        for i in range(32):
+            state.vgprs[1][i] = 0x12345678
+            state.vgprs[2][i] = 0x9ABCDEF0
+            state.vgprs[3][i] = i % 4
+        inst = VAlignbyteB32Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        for i in range(32):
+            expected = ref_alignbyte(0x12345678, 0x9ABCDEF0, i % 4)
+            self.assertEqual(res[i], expected)
+            self.assertEqual(state.vgprs[0][i], expected)
+
+    def test_simd_wave32_divergent_mask(self):
+        mask = 0x55555555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        for i in range(32):
+            state.vgprs[0][i] = 0xDEADBEEF
+            state.vgprs[1][i] = 0x8899AABB
+            state.vgprs[2][i] = 0x11223344
+            state.vgprs[3][i] = 1
+        inst = VAlignbyteB32Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        expected_active = ref_alignbyte(0x8899AABB, 0x11223344, 1)
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(res[i], expected_active)
+                self.assertEqual(state.vgprs[0][i], expected_active)
+            else:
+                self.assertEqual(res[i], 0xDEADBEEF)
+                self.assertEqual(state.vgprs[0][i], 0xDEADBEEF)
+
+    def test_simd_wave64_partial_exec(self):
+        mask = 0x00000000FFFFFFFF
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        for i in range(64):
+            state.vgprs[0][i] = 0xBAADF00D
+            state.vgprs[1][i] = 0xA1B2C3D4
+            state.vgprs[2][i] = 0xE5F60718
+            state.vgprs[3][i] = 2
+        inst = VAlignbyteB32Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        expected_active = ref_alignbyte(0xA1B2C3D4, 0xE5F60718, 2)
+        for i in range(64):
+            if i < 32:
+                self.assertEqual(res[i], expected_active)
+            else:
+                self.assertEqual(res[i], 0xBAADF00D)
+
+
 if __name__ == "__main__":
     unittest.main()
