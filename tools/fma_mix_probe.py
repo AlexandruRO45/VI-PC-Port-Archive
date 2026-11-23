@@ -299,7 +299,18 @@ def hw_lines(case):
 def run_hw(oracle, cases=CASES):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(c), 32, 1, 1, raw=True, mode=HW_MODE) for c in cases], words=1)
-    return [None if isinstance(w, str) else w[0] for w in got], [w for w in got if isinstance(w, str)]
+    if len(got) != len(cases):
+        raise RuntimeError(f"the oracle returned {len(got)} results for {len(cases)} kernels")
+    words, rejected = [], []
+    for c, w in zip(cases, got):
+        if isinstance(w, str):
+            words.append(None)
+            rejected.append(w)
+        elif w is None or len(w) < 1:
+            raise RuntimeError(f"case {c.name}: the oracle returned no result word ({w!r})")
+        else:
+            words.append(w[0])
+    return words, rejected
 
 
 # ---- driver ----
@@ -319,7 +330,10 @@ def main(argv=None):
     ap.add_argument("--build", help="the runtime build folder holding vk_compute_test (for --oracle vulkan)")
     ap.add_argument("--hw-arch", help="GPU architecture to assemble for (default: detected; LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(tokens) or "" in tokens:
+        ap.error("--oracle must name at least one side (translator, hw, vulkan)")
+    sides = set(tokens) - {"translator"}
     if sides - {"hw", "vulkan"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw', 'vulkan'}))}")
     if "vulkan" in sides and not a.build:

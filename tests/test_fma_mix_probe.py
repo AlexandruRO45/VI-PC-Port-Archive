@@ -153,7 +153,8 @@ class Command(unittest.TestCase):
     def test_unknown_side_and_missing_build_are_usage_errors(self):
         import contextlib
         import io
-        for argv in (["--oracle", "gpu"], ["--oracle", "vulkan"]):
+        for argv in (["--oracle", "gpu"], ["--oracle", "vulkan"], ["--oracle", ""],
+                     ["--oracle", "   "], ["--oracle", "translator,"], ["--oracle", ",hw"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as cm:
                     probe.main(argv)
@@ -166,6 +167,53 @@ class Command(unittest.TestCase):
             rc = probe.main(["--oracle", "vulkan", "--build", empty])
         self.assertEqual(rc, 77)
         self.assertIn("vk_compute_test is not built", buf.getvalue())
+
+    def test_hw_side_readings_and_truncated_or_empty_oracle_results_exit_2(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from hw_oracle import runner
+
+        single_words = [[word(c, BY_HAND[c.name][0])] for c in probe.CASES]
+        double_words = [[word(c, BY_HAND[c.name][1])] for c in probe.CASES]
+
+        for responses, want_rc, want_text in (
+            (single_words, 0, "all sides follow single rounding"),
+            (double_words, 1, "sides disagree"),
+        ):
+            with self.subTest(want_text=want_text):
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.return_value = responses
+                buf = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=ora), contextlib.redirect_stdout(buf):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, want_rc, buf.getvalue())
+                self.assertIn(want_text, buf.getvalue())
+                ora.close.assert_called_once()
+
+        # Truncating after G used to drop trailing control case H via zip() and exit 0.
+        trunc = single_words[:-1]
+        none_entry = list(single_words)
+        none_entry[-1] = None
+        empty_entry = list(single_words)
+        empty_entry[-1] = []
+
+        for responses, match in (
+            (trunc, "the oracle returned 7 results for 8 kernels"),
+            ([], "the oracle returned 0 results for 8 kernels"),
+            (none_entry, "case H: the oracle returned no result word (None)"),
+            (empty_entry, "case H: the oracle returned no result word ([])"),
+        ):
+            with self.subTest(match=match):
+                ora = mock.MagicMock(device="fake", arch="gfx1030")
+                ora.run.return_value = responses
+                buf = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=ora), contextlib.redirect_stdout(buf):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, buf.getvalue())
+                self.assertIn("harness error:", buf.getvalue())
+                self.assertIn(match, buf.getvalue())
+                ora.close.assert_called_once()
 
 
 if __name__ == "__main__":
