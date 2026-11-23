@@ -244,5 +244,20 @@ class SCbranchExeczTranslatorTests(unittest.TestCase):
         val = run_cs_branch(spv)
         self.assertEqual(val, 9)  # Fallthrough executes s_mov_b32 s20, 9
 
+# -----------------------------------------------------------------------------
+# Opcode 3: s_cbranch_scc0
+# -----------------------------------------------------------------------------
+
+def ref_oracle_scc0(scc: int) -> bool:
+    return (scc & 1) == 0
+
+
+class SCbranchScc0OracleTests(unittest.TestCase):
+    def test_scc_cleared(self):
+        self.assertTrue(ref_oracle_scc0(0))
+
+    def test_scc_set(self):
+        self.assertFalse(ref_oracle_scc0(1))
+
 if __name__ == '__main__':
     unittest.main()
