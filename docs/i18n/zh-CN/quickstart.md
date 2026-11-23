@@ -95,8 +95,9 @@ python -I make_game.py --wave64-emulate auto              # auto（默认）、o
 ```
 
 阶段顺序：`check` → `shaders` → `assets` → `runtime` → `pipelines`。`pipelines` 阶段在你的 GPU 驱动上创建每个
-翻译后的着色器并检查能否编译，报告必须跳过的着色器，并把管线缓存保存到 `--out` 里的 `pipeline_cache.bin`；
-runtime 目前还不加载这个缓存，所以它不会加快首次启动。
+翻译后的着色器并检查能否编译，报告必须跳过的着色器，并把管线缓存保存到 `--out` 里的 `pipeline_cache.bin`。
+把该文件放到 `gta6rt.exe` 旁边后，runtime 会在文件头部与 Vulkan 设备匹配时把它载入自己的 `VkPipelineCache`，
+所以下次启动不会重新编译这些着色器。
 
 构建会记录产出结果所用的 `llvm-mc` 命令和版本、翻译器源码，以及资源解码器（`third_party/rpf9-explorer` 的
 commit 和 `tools/rpf9dump` 的源码）。其中任何一项改变时，只重做受影响的步骤（反汇编、翻译，或该归档的模型和

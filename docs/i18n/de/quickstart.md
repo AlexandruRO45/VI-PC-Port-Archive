@@ -125,8 +125,9 @@ Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → 
 - **`--work`**: am besten ein Laufwerk mit mindestens 400 GB freiem Platz angeben. Die Stufe `shaders` dauert am
   längsten und nutzt standardmäßig die Hälfte der CPU-Threads (änderbar mit `--jobs`).
 - **`pipelines`**: erstellt jeden übersetzten Shader auf deinem GPU-Treiber, prüft, dass er kompiliert, meldet die
-  übersprungenen und speichert einen Pipeline-Cache in `pipeline_cache.bin` in `--out`. Die Runtime lädt diesen
-  Cache noch nicht, er beschleunigt den ersten Start also nicht.
+  übersprungenen und speichert einen Pipeline-Cache in `pipeline_cache.bin` in `--out`. Liegt die Datei neben
+  `gta6rt.exe`, lädt die Runtime sie beim Start in ihren `VkPipelineCache`, sofern ihr Header zum Vulkan-Gerät
+  passt, sodass ein späterer Start die Shader nicht erneut kompiliert.
 - **Fallback-Optionen** für Geräte, denen eine Vulkan-Funktion fehlt; sie werden neben den übersetzten Shadern
   gespeichert, und eine Änderung übersetzt sie neu: `--no-float-controls`, `--bary-fallback` (ohne
   `VK_KHR_fragment_shader_barycentric`), `--texel-offset-fallback` (ohne `VK_KHR_maintenance8`) und `--mesh-compute`

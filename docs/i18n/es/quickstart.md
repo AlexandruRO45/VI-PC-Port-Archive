@@ -107,8 +107,9 @@ Las etapas se ejecutan en este orden: `check` → `shaders` → `assets` → `ru
 
 La traducción de shaders es la etapa más larga; por defecto usa la mitad de los hilos del procesador (ajustable
 con `--jobs`). La etapa `pipelines` comprueba que el controlador de su GPU puede crear los shaders traducidos e
-informa de los que debe omitir. Guarda `pipeline_cache.bin` en `--out`, pero el runtime todavía no carga esa
-caché, así que no acelera el primer arranque.
+informa de los que debe omitir. Guarda `pipeline_cache.bin` en `--out`; junto a `gta6rt.exe` el runtime lo carga
+en su `VkPipelineCache` cuando la cabecera coincide con el dispositivo Vulkan, así que el siguiente arranque no
+vuelve a compilar esos shaders.
 
 `--wav` está desactivado por defecto, porque el WAV PCM de 16 bits ocupa varias veces más que el Ogg Opus.
 Cuando se activa, decodifica los Ogg Opus a `work/assets/audio/wav` después de exportar los bancos de audio;
