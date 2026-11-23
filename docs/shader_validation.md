@@ -282,10 +282,10 @@ RDNA4 (Radeon RX 9070, gfx1201, driver 26.11.2, `rocm-sdk-core` 10.0.0 clang): 1
 
 #### RDNA2 integer rows (`tools/int_hw_probe.py`, SHADER-137)
 
-`tools/int_hw_probe.py` runs 87 hand-written cases across 19 integer groups (both wave32 and wave64) natively on
-an AMD GPU through `tools/hw_oracle` and compares every output word against `tools/rdna2spirv.py` +
-`tests/semantic/spirv_mini_interp.py` (with scalar ops run twice, SCC preset to 0 and 1, so SCC written vs kept is
-observed directly).
+`tools/int_hw_probe.py` runs 186 hand-written cases across 26 integer groups (both wave32 and wave64; `--list-groups`
+prints the groups and their case counts) natively on an AMD GPU through `tools/hw_oracle` and compares every output
+word against `tools/rdna2spirv.py` + `tests/semantic/spirv_mini_interp.py` (with scalar ops run twice, SCC preset to 0
+and 1, so SCC written vs kept is observed directly). The runs quoted below were made when the tool had 87 cases.
 
 Measured on an **AMD Radeon 680M (gfx1035, RDNA2)**, Windows 11 (`10.0.26300`), AMD driver `26.5.1`
 (`32.0.21043.7012`, `amdhip64_6.dll`), conda-forge `clang 22.1.8` + `lld 23.1.6` (`--oracle both --wave both`):
