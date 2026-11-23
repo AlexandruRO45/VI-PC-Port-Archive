@@ -46,6 +46,7 @@ import sys
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
 import bink_index  # noqa: E402
 import gamedata_index  # noqa: E402
 import gamedata_xml  # noqa: E402
@@ -371,21 +372,24 @@ def main(argv=None):
         if not os.path.exists(path):
             print(f"bink_names: error: {path}: no such file or directory", file=sys.stderr)
             return 2
-    if a.out and any(bink_index.same_output_path(p, a.out) for p in inputs):
+    if a.out and any(same_report_path(p, a.out) for p in inputs):
         ap.error("--out must not overwrite an input")
     if a.out and os.path.isdir(a.out):
         ap.error(f"--out is a folder, not a report file: {a.out}")
     if a.out:
+        parent = os.path.dirname(os.path.abspath(a.out))
+        if parent and not os.path.isdir(parent):
+            ap.error(f"{parent} is not a folder, so {a.out} cannot be written")
         for folder in [p for p in [a.source, *a.mount] if os.path.isdir(p)]:
             manifest = os.path.join(folder, "index.json")
-            if bink_index.same_output_path(a.out, manifest):
+            if same_report_path(a.out, manifest):
                 ap.error(f"--out is reserved for the carve manifest: {a.out}")
             if os.path.isfile(a.out):
                 for root, _dirs, names in os.walk(folder):
                     for name in names:
                         if name.lower().endswith((".json", ".csv")):
                             continue
-                        if bink_index.same_output_path(os.path.join(root, name), a.out):
+                        if same_report_path(os.path.join(root, name), a.out):
                             ap.error(f"--out would overwrite an input file: {a.out}")
 
     try:

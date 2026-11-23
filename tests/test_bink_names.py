@@ -9,11 +9,14 @@ import io
 import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import report_paths  # noqa: E402
 
 
 def load_module():
@@ -621,6 +624,205 @@ class TestReportErrors(unittest.TestCase):
                     self.assertIn(bad_csv, err)
                     self.assertIn("row 2", err)
                     self.assertFalse(os.path.exists(out))
+
+
+class TestReportPathsGuards(unittest.TestCase):
+    """--out path collisions, case-folding alias guards, and directory preflighting."""
+
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(names_mod.same_report_path, report_paths.same_report_path)
+
+    def test_refuses_out_overwriting_source_archive_directly_and_via_dot_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            stream_bytes = make_stream(1280, 720, 40)
+            with open(archive, "wb") as fh:
+                fh.write(stream_bytes)
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            for target in (archive, os.path.join(tmp, ".", "test.rpf"), os.path.join(tmp, "sub", "..", "test.rpf")):
+                with self.subTest(target=target):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            names_mod.main([archive, "--mount", xml, "--out", target])
+                        self.assertEqual(cm.exception.code, 2)
+                        self.assertIn("--out must not overwrite an input", err.getvalue())
+                    with open(archive, "rb") as fh:
+                        self.assertEqual(fh.read(), stream_bytes)
+
+    def test_refuses_out_overwriting_source_index_directly_and_via_dot_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = os.path.join(tmp, "index.csv")
+            csv_text = ("source,offset,size,width,height,frames\n"
+                        "a.rpf,0,0x100,1280,720,100\n")
+            with open(index, "w", encoding="utf-8") as fh:
+                fh.write(csv_text)
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            for target in (index, os.path.join(tmp, ".", "index.csv")):
+                with self.subTest(target=target):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            names_mod.main([index, "--mount", xml, "--out", target])
+                        self.assertEqual(cm.exception.code, 2)
+                        self.assertIn("--out must not overwrite an input", err.getvalue())
+                    with open(index, "r", encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), csv_text)
+
+    def test_refuses_out_overwriting_mount_xml_directly_and_via_dot_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            xml = os.path.join(tmp, "list.xml")
+            xml_text = mount_xml(["f/a.bk2"])
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(xml_text)
+
+            for target in (xml, os.path.join(tmp, ".", "list.xml")):
+                with self.subTest(target=target):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            names_mod.main([archive, "--mount", xml, "--out", target])
+                        self.assertEqual(cm.exception.code, 2)
+                        self.assertIn("--out must not overwrite an input", err.getvalue())
+                    with open(xml, "r", encoding="utf-8") as fh:
+                        self.assertEqual(fh.read(), xml_text)
+
+    def test_refuses_out_case_folding_alias_on_folding_volume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            stream_bytes = make_stream(1280, 720, 40)
+            with open(archive, "wb") as fh:
+                fh.write(stream_bytes)
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            alias = os.path.join(tmp, "TEST.RPF")
+            with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath), \
+                    mock.patch.object(report_paths, "_same_resolved_name", return_value=True):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        names_mod.main([archive, "--mount", xml, "--out", alias])
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn("--out must not overwrite an input", err.getvalue())
+
+    def test_refuses_out_reserved_for_carve_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "streams")
+            mount_dir = os.path.join(tmp, "mounts")
+            os.mkdir(src_dir)
+            os.mkdir(mount_dir)
+            with open(os.path.join(src_dir, "one.bk2"), "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            with open(os.path.join(mount_dir, "list.xml"), "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            for folder in (src_dir, mount_dir):
+                for manifest in (os.path.join(folder, "index.json"), os.path.join(folder, ".", "index.json")):
+                    with self.subTest(folder=folder, manifest=manifest):
+                        err = io.StringIO()
+                        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                            with self.assertRaises(SystemExit) as cm:
+                                names_mod.main([src_dir, "--mount", mount_dir, "--out", manifest])
+                            self.assertEqual(cm.exception.code, 2)
+                            self.assertIn("--out is reserved for the carve manifest", err.getvalue())
+                        self.assertFalse(os.path.exists(manifest))
+
+    def test_refuses_out_overwriting_carved_file_in_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir = os.path.join(tmp, "streams")
+            mount_dir = os.path.join(tmp, "mounts")
+            os.mkdir(src_dir)
+            os.mkdir(mount_dir)
+            stream_file = os.path.join(src_dir, "one.bk2")
+            stream_bytes = make_stream(1280, 720, 40)
+            with open(stream_file, "wb") as fh:
+                fh.write(stream_bytes)
+            with open(os.path.join(mount_dir, "list.xml"), "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            for target in (stream_file, os.path.join(src_dir, ".", "one.bk2")):
+                with self.subTest(target=target):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaises(SystemExit) as cm:
+                            names_mod.main([src_dir, "--mount", mount_dir, "--out", target])
+                        self.assertEqual(cm.exception.code, 2)
+                        self.assertIn("--out would overwrite an input file", err.getvalue())
+                    with open(stream_file, "rb") as fh:
+                        self.assertEqual(fh.read(), stream_bytes)
+
+    def test_refuses_out_as_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    names_mod.main([archive, "--mount", xml, "--out", tmp])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("--out is a folder, not a report file", err.getvalue())
+
+    def test_refuses_out_missing_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            bad_out = os.path.join(tmp, "missing_sub", "names.csv")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    names_mod.main([archive, "--mount", xml, "--out", bad_out])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("is not a folder, so", err.getvalue())
+                self.assertIn("cannot be written", err.getvalue())
+
+    def test_distinct_out_writes_csv_and_json_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 40))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8") as fh:
+                fh.write(mount_xml(["f/a.bk2"]))
+
+            csv_out = os.path.join(tmp, "report.csv")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = names_mod.main([archive, "--mount", xml, "--out", csv_out])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(csv_out))
+            with open(csv_out, "r", encoding="utf-8") as fh:
+                header = fh.readline()
+                self.assertIn("source,offset,size,path,confidence", header)
+
+            json_out = os.path.join(tmp, "report.json")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = names_mod.main([archive, "--mount", xml, "--out", json_out])
+            self.assertEqual(rc, 0)
+            self.assertTrue(os.path.isfile(json_out))
+            with open(json_out, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                self.assertIn("summary", data)
+                self.assertIn("streams", data)
 
 
 if __name__ == "__main__":
