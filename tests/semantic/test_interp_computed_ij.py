@@ -18,8 +18,10 @@ Refused instead of guessed (Unsupported, naming the pattern): a source that is n
 written, or a pristine copy in the wrong role, is the #1224 guard's refusal (interp_pair_src, at
 emission); here: a computed pair whose p1 partial is rewritten or read between the ops (its hardware value P10*I is then
 observable), one whose ops are not in a single basic block (the captured I would not dominate the p2), a
-dangling op without its partner, and any computed pair under --bary-fallback, which has no PerVertexKHR
-inputs. A pristine pair (v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
+dangling op without its partner, any computed pair under --bary-fallback (no PerVertexKHR), and a
+computed pair on an f16-halves attr under --f16-interp-fallback (those attrs are smooth decoded-half
+inputs; f32-only computed pairs still take PerVertexKHR there, SHADER-1274). A pristine pair
+(v0/v1 nothing writes) keeps the interpolated-input read: no PerVertexKHR.
 
 Pipodi's straight-line scan over the corpus found the affected 213 PS (upper bound; issue #1218,
 comment 7076614458); the classification and counts are in docs/design.md's SHADER-177 row.
@@ -297,14 +299,29 @@ class ComputedIJRefusals(unittest.TestCase):
         finally:
             rdna2spirv.BARY_FALLBACK = old
 
-    def test_computed_pair_under_f16_interp_fallback(self):
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs to
-        # weight with a computed pair (same regime as --bary-fallback)
+    def test_computed_pair_under_f16_interp_fallback_keeps_f32(self):
+        # SHADER-1274: --f16-interp-fallback only drops PerVertexKHR for f16-halves attrs.
+        # An f32-only computed pair still translates (PerVertexKHR on that attr).
+        old = rdna2spirv.F16_HALVES
+        rdna2spirv.F16_HALVES = True
+        try:
+            spv = support.translate_lines("ps_ij_f16fb", [
+                "v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm",
+            ])
+            self.assertIn("OpDecorate %in_attr0 PerVertexKHR", spv)
+            self.assertNotIn("%in_f16h", spv)
+        finally:
+            rdna2spirv.F16_HALVES = old
+
+    def test_computed_f16_pair_under_f16_interp_fallback_refused(self):
+        # A computed pair on an f16-halves attr has no PerVertexKHR words to weight with.
         old = rdna2spirv.F16_HALVES
         rdna2spirv.F16_HALVES = True
         try:
             self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
-                         "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                         "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v2, v1, attr0.x, v2",
                          "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
                         "computed I/J pair under --f16-interp-fallback")
         finally:

@@ -956,11 +956,11 @@ def run_suite(a, work: str) -> int:
     for fname in asm_files:
         name = os.path.splitext(fname)[0]
         spv = os.path.join(spirv_dir, f"{name}.spv")
-        if name == "ps_ij_computed" and (bary_fallback() or f16_interp_fallback()):
-            # Before the .spv check: without PerVertexKHR inputs the translator refuses a computed I/J pair, so there
-            # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
+        if name == "ps_ij_computed" and bary_fallback():
+            # Before the .spv check: --bary-fallback has no PerVertexKHR, so there is no .spv.
+            # --f16-interp-fallback alone still builds it (SHADER-1274).
             results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
-                                        "no --bary-fallback / --f16-interp-fallback)"))
+                                        "no --bary-fallback)"))
             continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))

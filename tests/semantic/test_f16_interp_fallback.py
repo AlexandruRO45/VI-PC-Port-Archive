@@ -175,6 +175,19 @@ class FallbackPixelShader(unittest.TestCase):
         self.assertNotIn("%in_f16h", spv)
         self.assertNotIn("f16_halves", meta)
 
+    def test_f32_computed_ij_still_translates(self):
+        """SHADER-1274: enabling the flag must not refuse an f32-only computed I/J pair that
+        translates without it (PerVertexKHR stays on that attr; f16 halves are unused)."""
+        lines = ["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                 "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                 "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]
+        spv_off, _ = translate("ps_ij_off", lines, fallback=False)
+        spv_on, meta = translate("ps_ij_on", lines, fallback=True)
+        self.assertIn("OpDecorate %in_attr0 PerVertexKHR", spv_off)
+        self.assertIn("OpDecorate %in_attr0 PerVertexKHR", spv_on)
+        self.assertNotIn("f16_halves", meta)
+        self.assertNotIn("%in_f16h", spv_on)
+
 
 class FallbackVertexShader(unittest.TestCase):
     def test_exports_decoded_halves(self):

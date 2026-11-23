@@ -15862,10 +15862,12 @@ def interp_ij_analysis(insns, g):
     whose ops are not in one basic block (the captured I would not dominate the p2), whose shared
     partial register -- the f32 vdst, or the f16 p2's fourth operand naming the p1's vdst -- is written
     between the ops, or read between them by anything but a p2's partial operand, any computed site
-    under --bary-fallback or --f16-interp-fallback (neither has PerVertexKHR inputs), and a computed v_interp_*_f32 on a 16-bit-flagged
-    interpolant (which half the 32-bit op reads is not established). Over the corpus all of these are
-    empty: 213 PS hold computed pairs, every pair sits in one block, and no partial is touched
-    between the ops.
+    under --bary-fallback (no PerVertexKHR inputs at all), under --f16-interp-fallback when the
+    computed pair's attribute is itself an f16-halves read (those attrs are smooth decoded-half
+    inputs, not PerVertexKHR; SHADER-1274: f32-only computed pairs still take PerVertexKHR under
+    that flag), and a computed v_interp_*_f32 on a 16-bit-flagged interpolant (which half the
+    32-bit op reads is not established). Over the corpus all of these are empty: 213 PS hold
+    computed pairs, every pair sits in one block, and no partial is touched between the ops.
 
     Returns the set of attribute numbers the computed pairs need in g.per_vertex."""
     P1 = ("v_interp_p1_f32", "v_interp_p1ll_f16", "v_interp_p1lv_f16")
@@ -16064,9 +16066,13 @@ def interp_ij_analysis(insns, g):
         attrs.add(s["attr"])
     if attrs and BARY_FALLBACK:
         raise Unsupported("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
-    if attrs and F16_HALVES:
-        # --f16-interp-fallback reads decoded halves from the producer: no per-vertex inputs either
-        raise Unsupported("computed I/J pair under --f16-interp-fallback: no PerVertexKHR inputs")
+    # --f16-interp-fallback only drops PerVertexKHR for attrs in f16_halves (decoded-half smooth
+    # inputs). A computed pair on an f32-only attr still needs PerVertexKHR and must keep
+    # translating (SHADER-1274). Overlap with f16_halves has no per-vertex words to weight.
+    if attrs and F16_HALVES and (attrs & g.f16_halves):
+        raise Unsupported(
+            "computed I/J pair under --f16-interp-fallback: f16 attrs have no PerVertexKHR inputs"
+        )
     return attrs
 
 
@@ -16665,13 +16671,17 @@ def translate(path):
                 attr_reads[op].update(arg["a"] for arg in ins["args"] if arg["k"] == "attr")
         f16_read = attr_reads["v_interp_p1ll_f16"] | attr_reads["v_interp_p1lv_f16"] | attr_reads["v_interp_p2_f16"]
         mixed_f32 = attr_reads["v_interp_mov_f32"] & (attr_reads["v_interp_p1_f32"] | attr_reads["v_interp_p2_f32"])
-        if mixed_f32 and (BARY_FALLBACK or F16_HALVES):
+        # --bary-fallback has no PerVertexKHR at all. --f16-interp-fallback still allows PerVertexKHR
+        # for non-f16 attrs (SHADER-1274), so mixed flat+interp f32 is fine there.
+        if mixed_f32 and BARY_FALLBACK:
             raise Unsupported("flat and interpolated reads of one f32 attribute need per-vertex inputs")
         mov_delta = {x["a"] for i in insns if base_op(i["op"]) == "v_interp_mov_f32"
                      and any(x.get("k") == "interp" and x.get("t") in ("p10", "p20") for x in i["args"])
                      for x in i["args"] if x["k"] == "attr"}
-        if F16_HALVES:      # decoded halves from the producer: no per-vertex inputs (and no barycentrics)
+        if F16_HALVES:
+            # f16 reads take decoded-half smooth inputs; mixed_f32 / mov p10/p20 still need PerVertexKHR.
             g.f16_halves = f16_read
+            g.per_vertex = mixed_f32 | mov_delta
         elif not BARY_FALLBACK:
             # A smooth input alone cannot supply P0 for a MOV reading the same location.
             g.per_vertex = f16_read | mixed_f32 | mov_delta
