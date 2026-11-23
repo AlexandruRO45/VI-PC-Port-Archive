@@ -110,6 +110,10 @@ int main() {
           "XGameEventWrite succeeds offline");
     check(at<EventWrite>(events, 3)(events, nullptr, "scid", "session", nullptr, nullptr, nullptr) == E_INVALIDARG,
           "an event without a name is refused");
+    check(at<EventWrite>(events, 3)(events, nullptr, nullptr, "session", "event", nullptr, nullptr) == E_INVALIDARG,
+          "an event without a service config ID is refused");
+    check(at<EventWrite>(events, 3)(events, nullptr, "scid", nullptr, "event", nullptr, nullptr) == E_INVALIDARG,
+          "an event without a session ID is refused");
     check(rt::shims::xgameruntime_offline_game_events() == 2, "two events were counted");
 
     // ---- XGameUi ----
@@ -129,6 +133,27 @@ int main() {
     async = XAsyncBlock{};
     check(at<Dialog>(ui, 3)(ui, &async, "t", "c", "OK", nullptr, nullptr, 3, 0) == E_INVALIDARG,
           "a default button past Third is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, nullptr, "c", "OK", nullptr, nullptr, 0, 0) == E_INVALIDARG,
+          "a null title is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", nullptr, "OK", nullptr, nullptr, 0, 0) == E_INVALIDARG,
+          "null content is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", "c", nullptr, nullptr, nullptr, 0, 0) == E_INVALIDARG,
+          "a null first button is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", "c", "OK", nullptr, "Third", 0, 0) == E_INVALIDARG,
+          "a third button without a second is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", "c", "OK", nullptr, nullptr, 0, 3) == E_INVALIDARG,
+          "a cancel button past Third is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", "c", "OK", nullptr, nullptr, 1, 0) == E_INVALIDARG,
+          "a missing default button is refused");
+    async = XAsyncBlock{};
+    check(at<Dialog>(ui, 3)(ui, &async, "t", "c", "OK", nullptr, nullptr, 0, 1) == E_INVALIDARG,
+          "a missing cancel button is refused");
     async = XAsyncBlock{};
     check(at<ErrorDialog>(ui, 14)(ui, &async, static_cast<HRESULT>(0x80830003), "save") == S_OK && finished(&async) &&
               at<AsyncOnly>(ui, 15)(ui, &async) == S_OK,

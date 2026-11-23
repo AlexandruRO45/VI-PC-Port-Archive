@@ -113,9 +113,9 @@ bool log_every_event() {
 
 // 3: HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
 //                            const char* eventName, const char* dimensionsJson, const char* measurementsJson)
-HRESULT STDMETHODCALLTYPE event_write(void*, XUserHandle, const char*, const char*, const char* name,
+HRESULT STDMETHODCALLTYPE event_write(void*, XUserHandle, const char* scid, const char* session, const char* name,
                                       const char* dimensions, const char* measurements) {
-    if (!name) return E_INVALIDARG;
+    if (!scid || !session || !name) return E_INVALIDARG;
     const long n = g_events.fetch_add(1);
     if (log_every_event())
         std::fprintf(stderr, "[rt] game event %s dimensions=%s measurements=%s\n", name, dimensions ? dimensions : "",
@@ -185,11 +185,14 @@ HRESULT CALLBACK error_dialog_provider(XAsyncOp op, const XAsyncProviderData* da
 // (docs/runtime_imports.md). The dialog is "answered" with its default button.
 HRESULT STDMETHODCALLTYPE ui_message_dialog_async(void*, XAsyncBlock* async, const char* title, const char* content,
                                                   const char* first, const char* second, const char* third,
-                                                  XGameUiMessageDialogButton default_button, XGameUiMessageDialogButton) {
+                                                  XGameUiMessageDialogButton default_button,
+                                                  XGameUiMessageDialogButton cancel_button) {
     if (!async) return E_POINTER;
     const auto button = static_cast<uint32_t>(default_button);
-    if (button > 2) return E_INVALIDARG;
+    const auto cancel = static_cast<uint32_t>(cancel_button);
     const char* labels[] = {first, second, third};
+    if (!title || !content || !first || (third && !second) || button > 2 || cancel > 2 || !labels[button] ||
+        !labels[cancel]) return E_INVALIDARG;
     std::fprintf(stderr, "[rt] game dialog: \"%s\": %s [buttons: %s%s%s%s%s; answered: %s]\n", title ? title : "",
                  content ? content : "", first ? first : "", second ? " / " : "", second ? second : "",
                  third ? " / " : "", third ? third : "", labels[button] ? labels[button] : "(default)");
