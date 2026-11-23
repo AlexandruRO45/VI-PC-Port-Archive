@@ -198,8 +198,17 @@ static int run(int argc, char** argv) {
         }
         out_words = uint32_t(n);
     }
-    std::ifstream f(argv[1], std::ios::binary);
-    std::vector<char> code((std::istreambuf_iterator<char>(f)), {});
+    // Read the module before Vulkan starts, so a missing or truncated file is reported here instead of reaching
+    // vkCreateShaderModule with codeSize 0 (invalid usage; RADV crashes with SIGSEGV). Same check as vk_store_test.
+    std::vector<char> code;
+    {
+        std::ifstream f(argv[1], std::ios::binary);
+        code.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    if (code.size() < 20 || code.size() % 4) {
+        std::fprintf(stderr, "%s: not a SPIR-V module\n", argv[1]);
+        return 2;
+    }
     uint32_t local[3];
     const uint32_t spirv_version = spirv_local_size(code, local);
     gipa = load_vulkan();

@@ -1237,6 +1237,14 @@ if(TARGET Vulkan::Headers)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
+    # A missing or truncated module is rejected before Vulkan starts (no GPU needed), not passed on to the driver.
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_truncated.spv" "0302")
+    add_test(NAME vk_compute_test_missing_spv
+             COMMAND vk_compute_test "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_missing.spv" 1 dump)
+    add_test(NAME vk_compute_test_truncated_spv
+             COMMAND vk_compute_test "${CMAKE_CURRENT_BINARY_DIR}/vk_compute_test_truncated.spv" 1 dump)
+    set_tests_properties(vk_compute_test_missing_spv vk_compute_test_truncated_spv PROPERTIES
+                         PASS_REGULAR_EXPRESSION "not a SPIR-V module")
     # The XDXR BVH builder: the GPU writes every case, then tools/xdxr_bvh.py validates and traces them.
     set(LEONIDA_XDXR_OUT "${CMAKE_CURRENT_BINARY_DIR}/xdxr_build_cases")
     file(MAKE_DIRECTORY "${LEONIDA_XDXR_OUT}")
