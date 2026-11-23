@@ -1382,6 +1382,43 @@ def _extract_glb_skin_joint_names(
     return joint_names
 
 
+def _read_glb_png(doc: dict, bin_chunk: bytes, info: object, *, path: str, slot: str) -> bytes | None:
+    """Recover a supported material slot's embedded PNG, without opening image or buffer URIs."""
+    if info is None:
+        return None
+
+    def invalid(detail):
+        return PedAssembleError(f"{path}: {slot}: {detail}")
+
+    def entry(table, index):
+        rows = doc.get(table, [])
+        if (not isinstance(rows, list) or type(index) is not int or not 0 <= index < len(rows)
+                or not isinstance(rows[index], dict)):
+            raise invalid(f"invalid {table} index {index!r}")
+        return rows[index]
+
+    if not isinstance(info, dict):
+        raise invalid("texture reference must be an object")
+    texture = entry("textures", info.get("index"))
+    if "source" not in texture:
+        return None
+    image = entry("images", texture["source"])
+    if image.get("mimeType") != "image/png" or "uri" in image:
+        return None
+    view = entry("bufferViews", image.get("bufferView"))
+    buffer_index = view.get("buffer", 0)
+    buffer = entry("buffers", buffer_index)
+    if buffer_index != 0 or "uri" in buffer:
+        return None
+    start, length = view.get("byteOffset", 0), view.get("byteLength")
+    declared = buffer.get("byteLength")
+    if any(type(value) is not int or value < 0 for value in (start, length, declared)):
+        raise invalid("invalid embedded PNG buffer bounds")
+    if start + length > declared or start + length > len(bin_chunk):
+        raise invalid("embedded PNG bufferView exceeds buffer 0")
+    return bin_chunk[start:start + length]
+
+
 def read_glb_parts(path: str) -> list[MeshPart]:
     """Read mesh parts from a binary glTF 2.0 (``.glb``) file (always Y-up)."""
     with open(path, "rb") as f:
@@ -1524,6 +1561,13 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                     alpha_mode=str(gm.get("alphaMode", "OPAQUE")),
                     alpha_cutoff=float(gm["alphaCutoff"]) if "alphaCutoff" in gm else None,
                     double_sided=bool(gm.get("doubleSided", False)),
+                    base_color_png=_read_glb_png(
+                        doc, bin_chunk, pbr.get("baseColorTexture"), path=path, slot="baseColorTexture"),
+                    normal_png=_read_glb_png(
+                        doc, bin_chunk, gm.get("normalTexture"), path=path, slot="normalTexture"),
+                    metallic_roughness_png=_read_glb_png(
+                        doc, bin_chunk, pbr.get("metallicRoughnessTexture"),
+                        path=path, slot="metallicRoughnessTexture"),
                 )
             parts.append(MeshPart(
                 name=pname,
