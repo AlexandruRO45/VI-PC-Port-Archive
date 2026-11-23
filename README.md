@@ -137,7 +137,7 @@ translates every shader again. A `disasm` folder that is a symlink is refused wh
 ```powershell
 python -I make_game.py --find                          # list the copies found on this PC
 python -I make_game.py --pick                          # choose the game folder in a folder dialog
-python -I make_game.py --check                         # check your copy, build nothing
+python -I make_game.py --check                         # check your copy, including DLL hashes
 python -I make_game.py --check --full-check            # also compare SHA-256 of every file (slow)
 python -I make_game.py --game "D:\path\to\your\package" --out "D:\Games\Leonida" --work "E:\leonida-work"
 python -I make_game.py --stages shaders,assets         # only some stages

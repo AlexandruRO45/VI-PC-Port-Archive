@@ -19,7 +19,8 @@ everything it makes under --out. The only thing it downloads is the third_party/
 it is missing. Never share what it makes.
 
 Stages (each skips work that is already done, so a stopped build continues where it left off):
-    check     always first: file names and sizes against game/<version>.json (add --full-check for SHA-256, slow)
+    check     always first: file names, sizes, and DLL hashes against game/<version>.json
+              (add --full-check to hash every file, slow)
     shaders   carve shaders.rpf, unpack the native RDNA2 code, disassemble, translate to SPIR-V; then the same for the
               compute programs inside amd_fidelityfx_upscaler_xbox.dll and XboxBvhBuilder.dll
     assets    models (OBJ), texture dictionaries and texture pools (DDS), audio banks (AWC; --wav adds PCM WAV)
@@ -1066,6 +1067,13 @@ def check(game: str, full: bool) -> dict:
             print(f"  missing  {rel}"); bad += 1
         elif os.path.getsize(p) != info["size"]:
             print(f"  wrong size  {rel}"); bad += 1
+        elif not full and rel.lower().endswith(".dll"):
+            try:
+                digest = file_sha256(p)
+            except OSError as error:
+                fail(f"Could not hash {rel}: {error}")
+            if digest != info["sha256"].lower():
+                print(f"  wrong SHA-256  {rel}"); bad += 1
     if bad:
         fail(f"{bad} file(s) missing or different. Use a complete, unmodified copy of version {v['version']}.")
     if full:

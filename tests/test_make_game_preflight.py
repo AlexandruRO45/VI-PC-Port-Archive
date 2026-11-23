@@ -210,6 +210,30 @@ class GameCheckTest(PreflightTestBase):
             self.assertIn("all files present", stdout_buf.getvalue())
             self.assertIn("Executable found.", stdout_buf.getvalue())
 
+    def test_default_check_verifies_dll_hash_without_hashing_archives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dll = os.path.join(tmp, "module.DLL")
+            with open(dll, "wb") as f:
+                f.write(b"original")
+            with open(os.path.join(tmp, "archive.rpf"), "wb") as f:
+                f.write(b"archive")
+            version = {
+                "title": "Synthetic",
+                "version": "1",
+                "expected_exe": "missing.exe",
+                "files": {
+                    "module.DLL": {"size": 8, "sha256": make_game.file_sha256(dll).upper()},
+                    "archive.rpf": {"size": 7, "sha256": "0" * 64},
+                },
+            }
+            with mock.patch.object(make_game, "load_version", return_value=version), \
+                 mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+                self.assertEqual(make_game.check(tmp, full=False), version)
+                with open(dll, "wb") as f:
+                    f.write(b"modified")
+                self.assert_fails(make_game.check, tmp, full=False, match="1 file(s) missing or different")
+                self.assertIn("wrong SHA-256  module.DLL", output.getvalue())
+
     def test_check_missing_files_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest_dir = os.path.join(tmp, "manifests")
