@@ -118,5 +118,68 @@ class TestVBfeU32Reference(unittest.TestCase):
                 self.assertEqual(res, ref_bfe_u32(s0, s1, s2))
 
 
+class RegType(enum.Enum):
+    VGPR = "vgpr"
+    SGPR = "sgpr"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index: int = 0
+    val: int = 0
+
+    def format(self) -> str:
+        if self.reg_type == RegType.VGPR:
+            return f"v{self.index}"
+        elif self.reg_type == RegType.SGPR:
+            return f"s{self.index}"
+        return f"{self.val:#x}"
+
+
+@dataclasses.dataclass(frozen=True)
+class VBfeU32Inst:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def emit_asm(self) -> str:
+        return f"v_bfe_u32 {self.dst.format()}, {self.src0.format()}, {self.src1.format()}, {self.src2.format()}"
+
+
+class TestVBfeU32AST(unittest.TestCase):
+    """Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self):
+        inst = VBfeU32Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        self.assertEqual(inst.emit_asm(), "v_bfe_u32 v0, v1, v2, v3")
+
+    def test_ast_with_literals(self):
+        inst = VBfeU32Inst(
+            dst=Operand(RegType.VGPR, 5),
+            src0=Operand(RegType.VGPR, 6),
+            src1=Operand(RegType.IMM, 0, 8),
+            src2=Operand(RegType.IMM, 0, 16),
+        )
+        self.assertEqual(inst.emit_asm(), "v_bfe_u32 v5, v6, 0x8, 0x10")
+
+    def test_ast_immutability(self):
+        inst = VBfeU32Inst(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            inst.dst = Operand(RegType.VGPR, 4)  # type: ignore
+
+
 if __name__ == '__main__':
     unittest.main()
