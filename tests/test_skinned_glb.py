@@ -517,6 +517,30 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.normalise_weights(bytes(broken), j1, w0, w1, 3, 2, [1, 3], 4)
 
+    def test_palette_resolver_rejects_a_drawable_that_is_not_an_object(self):
+        for drawable in (["not", "an", "object"], "drawable", 7, False):
+            with self.subTest(drawable=drawable):
+                with self.assertRaisesRegex(skinned_glb.SkinError, "no drawable object"):
+                    skinned_glb.PaletteResolver({"drawable": drawable}, {})
+
+    def test_palette_resolver_rejects_a_skeleton_that_is_not_a_list(self):
+        for skeleton in ("root", 3, {"root": {}}, {}):
+            with self.subTest(skeleton=skeleton):
+                with self.assertRaisesRegex(skinned_glb.SkinError, "drawable skeleton must be a list"):
+                    skinned_glb.PaletteResolver({"drawable": {"skeleton": skeleton}}, {})
+
+    def test_palette_resolver_rejects_a_non_object_drawable_bone(self):
+        for bone in (["not", "an", "object"], "Helper", 7):
+            with self.subTest(bone=bone):
+                with self.assertRaisesRegex(skinned_glb.SkinError, "drawable bone has no fields"):
+                    skinned_glb.PaletteResolver({"drawable": {"skeleton": [bone]}}, {})
+
+    def test_palette_resolver_still_accepts_a_missing_skeleton(self):
+        for component in ({}, {"drawable": None}, {"drawable": {}}, {"drawable": {"skeleton": None}}):
+            with self.subTest(component=component):
+                resolver = skinned_glb.PaletteResolver(component, {})
+                self.assertEqual((resolver.own_skeleton, resolver.own_by_name, resolver.by_hash), ([], {}, {}))
+
     def test_zero_weight_padding_joint_index_outside_local_palette_is_zeroed(self):
         j0, j1, w0, w1 = _streams()
         padded_j1 = bytearray(j1)
