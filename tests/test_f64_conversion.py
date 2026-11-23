@@ -13,6 +13,8 @@ from listing import translate_listing
 
 FIXTURE = TEST_DIR / "fixtures" / "f64_conversion.asm"
 
+from f64_store_shape import PREFIXES, assert_stored_to_vgpr  # noqa: E402
+
 
 class F64ConversionTest(unittest.TestCase):
     def test_output_modifiers(self):
@@ -29,10 +31,11 @@ class F64ConversionTest(unittest.TestCase):
             ("clamp div:2", 0x3F000000, True),
         )
         with tempfile.TemporaryDirectory() as directory:
-            for modifiers, scale_bits, clamp in cases:
-                with self.subTest(modifiers=modifiers):
-                    spv = translate_listing(Path(directory), f"{body} {modifiers}".rstrip())
-                    self.check_conversion(spv, scale_bits, clamp)
+            for prefix_name, prefix in PREFIXES:
+                for modifiers, scale_bits, clamp in cases:
+                    with self.subTest(exec=prefix_name, modifiers=modifiers):
+                        spv = translate_listing(Path(directory), f"{prefix}{body} {modifiers}".rstrip())
+                        self.check_conversion(spv, scale_bits, clamp)
 
     def check_conversion(self, spv, scale_bits, clamp):
         def result(instruction):
@@ -48,10 +51,7 @@ class F64ConversionTest(unittest.TestCase):
         if clamp:
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
-        dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
-        old_word = result(rf"OpLoad %uint {dest}")
-        masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+        assert_stored_to_vgpr(self, spv, word, 3)
 
 
 if __name__ == "__main__":
