@@ -454,6 +454,126 @@ class TestDSMinF32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.get_vgpr(VGPR(0)), HALF_F32)
         self.assertEqual(self.lds.read_dword(0x34), NEG_HALF_F32)
 
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+
+    def __init__(self, lds: LDSMemory, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.lds = lds
+        self.exec_mask = (1 << wave_size) - 1
+        self.lanes = [ScalarThreadState(lds) for _ in range(wave_size)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool((self.exec_mask >> lane_id) & 1)
+
+
+class SIMDDSInterpreter:
+    """Multi-lane SIMD interpreter modeling divergence and atomic address clashes."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.lds = lds
+
+    def execute_wave(
+        self,
+        wave: SIMDWaveState,
+        inst: DSMinF32Instruction,
+        arbitration_order: Optional[List[int]] = None,
+    ) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * wave.wave_size
+        active_lanes = [i for i in range(wave.wave_size) if wave.is_lane_active(i)]
+
+        order = [i for i in arbitration_order if i in active_lanes] if arbitration_order is not None else active_lanes
+
+        for lane_id in order:
+            lane_state = wave.lanes[lane_id]
+            addr = lane_state.get_vgpr(inst.vaddr)
+            data = lane_state.get_vgpr(inst.vdata0)
+
+            old_val, new_val = self.lds.atomic_min_f32(addr, data, offset=inst.offset, rtn=inst.is_return)
+
+            if inst.is_return and inst.vdst is not None:
+                assert old_val is not None
+                lane_state.set_vgpr(inst.vdst, old_val)
+                results[lane_id] = old_val
+
+        return results
+
+
+class TestDSMinF32SIMDDivergenceAndExecMask(unittest.TestCase):
+    """Part 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = SIMDDSInterpreter(self.lds)
+
+    def test_divergent_addresses_wave32(self) -> None:
+        wave = SIMDWaveState(self.lds, wave_size=32)
+        inst = DSMinF32Instruction.parse("ds_min_rtn_f32 v5, v1, v2")
+
+        for i in range(32):
+            init_val = f32_to_bits(10.0 + i)
+            data_val = f32_to_bits(5.0 + i * 0.1)
+            self.lds.write_dword(i * 4, init_val)
+            wave.lanes[i].set_vgpr(VGPR(1), i * 4)
+            wave.lanes[i].set_vgpr(VGPR(2), data_val)
+
+        results = self.interp.execute_wave(wave, inst)
+
+        for i in range(32):
+            expected_old = f32_to_bits(10.0 + i)
+            expected_new = f32_to_bits(5.0 + i * 0.1)
+            self.assertEqual(results[i], expected_old)
+            self.assertEqual(wave.lanes[i].get_vgpr(VGPR(5)), expected_old)
+            self.assertEqual(self.lds.read_dword(i * 4), expected_new)
+
+    def test_exec_masking_wave64(self) -> None:
+        lds = LDSMemory(size_bytes=8192)
+        interp = SIMDDSInterpreter(lds)
+        wave = SIMDWaveState(lds, wave_size=64)
+        mask = 0
+        for i in range(0, 64, 2):
+            mask |= (1 << i)
+        wave.exec_mask = mask
+
+        inst = DSMinF32Instruction.parse("ds_min_rtn_f32 v3, v1, v2")
+        for i in range(64):
+            lds.write_dword(i * 4, TEN_F32)
+            wave.lanes[i].set_vgpr(VGPR(1), i * 4)
+            wave.lanes[i].set_vgpr(VGPR(2), TWO_F32)
+            wave.lanes[i].set_vgpr(VGPR(3), 0xCAFE)
+
+        results = interp.execute_wave(wave, inst)
+
+        for i in range(64):
+            if i % 2 == 0:
+                self.assertEqual(results[i], TEN_F32)
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(3)), TEN_F32)
+                self.assertEqual(lds.read_dword(i * 4), TWO_F32)
+            else:
+                self.assertIsNone(results[i])
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(3)), 0xCAFE)
+                self.assertEqual(lds.read_dword(i * 4), TEN_F32)
+
+    def test_address_clash_convergence(self) -> None:
+        inst = DSMinF32Instruction.parse("ds_min_f32 v1, v2")
+        lane_vals = [100.0, -5.0, 3.2, -50.5, 0.0, -0.0, 15.0, -100.0] + [float(i) for i in range(24)]
+        global_min_bits = f32_to_bits(-100.0)
+
+        for order in [list(range(32)), list(reversed(range(32)))]:
+            lds = LDSMemory(size_bytes=1024)
+            interp = SIMDDSInterpreter(lds)
+            wave = SIMDWaveState(lds, wave_size=32)
+
+            lds.write_dword(0x40, f32_to_bits(1000.0))
+            for i in range(32):
+                wave.lanes[i].set_vgpr(VGPR(1), 0x40)
+                wave.lanes[i].set_vgpr(VGPR(2), f32_to_bits(lane_vals[i]))
+
+            interp.execute_wave(wave, inst, arbitration_order=order)
+            self.assertEqual(lds.read_dword(0x40), global_min_bits)
+
 
 if __name__ == '__main__':
     unittest.main()
