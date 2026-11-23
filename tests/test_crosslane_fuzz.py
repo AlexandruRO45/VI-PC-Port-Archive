@@ -392,6 +392,16 @@ class Counts(unittest.TestCase):
                 self.assertIn("--start-index", result.stderr)
                 self.assertNotIn("unrecognized arguments", result.stderr)
 
+    def test_help_width_preserves_replay_arguments(self):
+        command = ("python -I tools/crosslane_fuzz.py --seed 7 --ops 24 --wave both "
+                   "--dpp --start-index 159 --programs 3")
+        for columns in (80, 100, 120):
+            with self.subTest(columns=columns), mock.patch.dict(os.environ, {"COLUMNS": str(columns)}):
+                result = self.run_tool("--help")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # Wrapping between arguments is harmless; wrapping inside --start-index changes argv.
+                self.assertIn(f" {command} ", " " + " ".join(result.stdout.split()) + " ")
+
     def test_start_index_selects_the_same_program_sources(self):
         def sources(count, *offset):
             argv = [TOOL, "--exe", sys.executable, "--programs", str(count), "--wave", "both",
