@@ -87,6 +87,41 @@ class TimecyclePairsTests(unittest.TestCase):
             self.assertEqual(data["modifiers"]["plain"], 2)
             self.assertEqual(data["second_number"]["count"], 7)
 
+    def write_carve(self, tmp, files):
+        """A synthetic carve directory: one row per stream in index.json, its bytes in <off>.bin."""
+        rows = []
+        for name, data in files:
+            with open(os.path.join(tmp, name), "wb") as f:
+                f.write(data)
+            rows.append({"off": int(name[:12], 16), "stored": len(data), "size": len(data)})
+        with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump({"summary": {"archive": "synthetic", "files": len(rows)}, "files": rows}, f)
+
+    def test_carve_dir_reads_document_without_declaration(self):
+        # A complete document with no XML declaration is a "text" stream, not "decl", so
+        # _iter_source_docs used to drop it: the same bytes read fine as a plain .xml file.
+        # docs/gamedata.md:689 counts complete documents of that shape in the corpus.
+        declless = SYNTH_MOD.split(b"\n", 1)[1]
+        self.assertFalse(declless.lstrip().startswith(b"<?xml"))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_carve(tmp, [("000000001000.bin", declless)])
+            docs = tp.load_documents([tmp])
+            self.assertEqual([r for r, _ in docs], ["timecycle_modifier_data"])
+            summary = tp.summarize_documents(docs)
+            self.assertEqual(summary["modifier_docs"], 1)
+            self.assertEqual(summary["modifiers"], {"total": 3, "plain": 2, "axis": 1})
+
+    def test_carve_dir_ignores_streams_that_are_not_timecycle_documents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_carve(tmp, [
+                ("000000001000.bin", SYNTH_MOD),                    # declared document: the "decl" branch
+                ("000000002000.bin", b"<synth_other_root/>"),       # standalone, but not a target root
+                ("000000003000.bin", b"\x00\x01\x02\x03"),          # binary row, no tags
+                ("000000004000.bin", b"just some text, no tags."),  # text row, no tags
+            ])
+            docs = tp.load_documents([tmp])
+            self.assertEqual([r for r, _ in docs], ["timecycle_modifier_data"])
+
     def test_cli_validation_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             in_xml = os.path.join(tmp, "mod.xml")

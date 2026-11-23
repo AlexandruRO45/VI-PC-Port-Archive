@@ -53,6 +53,12 @@ def _iter_source_docs(source) -> list[tuple[str, bytes]]:
                 docs.append((root, blob))
             i = j
         else:
+            # A complete document can lack the XML declaration: its stream reads as "text",
+            # not "decl", yet the plain .xml file path reads those same bytes as a document.
+            # gamedata_index.build_rows groups such a stream as xml the same way.
+            root = gi.xml_root(data)
+            if root in TARGET_ROOTS and gi.standalone_xml(data):
+                docs.append((root, data))
             i += 1
     return docs
 
