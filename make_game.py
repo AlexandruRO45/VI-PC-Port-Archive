@@ -1766,8 +1766,10 @@ def pipeline_check_exe(runtime_build: str | None = None) -> str | None:
     """Find the checker for this host, using a supplied Windows build before the local Windows build."""
     build = os.path.join(ROOT, "runtime", "build")
     if os.name == "nt":
-        windows_builds = (runtime_build, build) if runtime_build else (build,)
-        found = [os.path.join(d, "vk_pipeline_check.exe") for d in windows_builds]
+        found = [os.path.join(runtime_build, "vk_pipeline_check.exe")] if runtime_build else []
+        # The wrapper builds directly in build; Visual Studio adds a configuration directory.
+        found.extend(os.path.join(build, config, "vk_pipeline_check.exe")
+                     for config in ("", "RelWithDebInfo", "Release", "MinSizeRel", "Debug"))
     else:
         found = [os.path.join(build, "linux", "vk_pipeline_check"), os.path.join(build, "vk_pipeline_check")]
     return next((p for p in found if os.path.isfile(p)), None)

@@ -450,6 +450,19 @@ class PipelineCheckExeTest(unittest.TestCase):
                 pass
             self.assertEqual(self.exe("nt", supplied), bundled)
 
+    def test_windows_finds_local_visual_studio_configurations_in_order(self):
+        # Add the least-preferred configuration first to check each fallback.
+        with tempfile.TemporaryDirectory() as supplied:
+            for config in ("Debug", "MinSizeRel", "Release", "RelWithDebInfo"):
+                with self.subTest(config=config):
+                    os.mkdir(os.path.join(self.build, config))
+                    checker = self.touch(config, "vk_pipeline_check.exe")
+                    self.assertEqual(self.exe("nt"), checker)
+                    self.assertEqual(self.exe("nt", supplied), checker)
+            self.assertIsNone(self.exe("posix", supplied))
+            flat = self.touch("vk_pipeline_check.exe")
+            self.assertEqual(self.exe("nt"), flat)
+
     def test_pipelines_off_windows_runs_the_linux_build(self):
         exe = self.touch("linux", "vk_pipeline_check")
         self.touch("vk_pipeline_check.exe")
