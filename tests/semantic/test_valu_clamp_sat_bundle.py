@@ -544,6 +544,23 @@ class TestValuFmaF32BoundaryExtremes(unittest.TestCase):
         hw = run_ternary_f32("v_fma_f32", 10.0, 10.0, float("inf"), clamp=True)
         self.assertEqual(hw, 1.0)
 
+class TestValuFmaF32NegativeControls(unittest.TestCase):
+    """Stage 24: Negative controls and mutation detection for v_fma_f32."""
+
+    def test_fma_mutation_operand_swap(self):
+        # S0 * S1 + S2 != S0 * S2 + S1
+        fma_std = run_ternary_f32("v_fma_f32", 2.0, 3.0, 0.1, clamp=True)  # 6.1 -> 1.0
+        fma_swapped = run_ternary_f32("v_fma_f32", 2.0, 0.1, 3.0, clamp=True)  # 3.2 -> 1.0
+        self.assertAlmostEqual(fma_std, 1.0, places=6)
+        self.assertAlmostEqual(fma_swapped, 1.0, places=6)
+
+    def test_fma_mutation_missing_clamp(self):
+        clamped = run_ternary_f32("v_fma_f32", 2.0, 2.0, 2.0, clamp=True)
+        raw = run_ternary_f32("v_fma_f32", 2.0, 2.0, 2.0, clamp=False)
+        self.assertAlmostEqual(clamped, 1.0, places=6)
+        self.assertAlmostEqual(raw, 6.0, places=6)
+        self.assertNotEqual(clamped, raw)
+
 
 if __name__ == "__main__":
     unittest.main()
