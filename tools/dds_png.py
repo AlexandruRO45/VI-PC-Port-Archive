@@ -21,6 +21,9 @@ R11G11B10_FLOAT previews clamp RGB to [0, 1], map NaN to zero and use opaque alp
 Usage:
     python -I tools/dds_png.py <in.dds> --info
     python -I tools/dds_png.py <in.dds> <out.png> [--mip N] [--layer N] [--face px] [--z N] [--max-size N]
+
+Exit status: 0 when the PNG (or the --info JSON) was written, 1 when the DDS could not be decoded or the PNG could not
+be written, 2 when the input DDS could not be read.
 """
 from __future__ import annotations
 
@@ -1513,6 +1516,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.info and args.output is None:
         ap.error("an output PNG is required unless --info is used")
 
+    input_read = False
     try:
         if args.info:
             with open(args.input, "rb") as f:
@@ -1528,6 +1532,7 @@ def main(argv: list[str] | None = None) -> int:
             args.input, args.max_size or 0, mip=args.mip or 0, layer=args.layer or 0,
             face=args.face, z=args.z or 0,
         )
+        input_read = True
         # Resolve an existing symlink as the old direct write did, and stage on the same filesystem.
         output = os.path.realpath(args.output)
         parent = os.path.dirname(output)
@@ -1539,9 +1544,12 @@ def main(argv: list[str] | None = None) -> int:
             if os.path.isfile(output):
                 shutil.copymode(output, pending)
             os.replace(pending, output)
-    except (DdsError, OSError) as exc:
+    except DdsError as exc:      # a DDS this decoder rejects: the run happened and failed
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    except OSError as exc:       # the input DDS could not be read (2), or the PNG could not be written (1)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1 if input_read else 2
     return 0
 
 

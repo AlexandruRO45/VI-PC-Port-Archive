@@ -1147,6 +1147,39 @@ class CliTests(unittest.TestCase):
             self.assertIn("FourCC", err.getvalue())
             self.assertFalse(os.path.exists(dst))
 
+    def test_cli_missing_input_is_exit_2_where_a_rejected_dds_stays_1(self):
+        """An input that is not there never opened a file, so it is 2; a DDS this decoder rejects stays 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "no-such.dds")
+            dst = os.path.join(tmp, "out.png")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(dds.main([src, dst]), 2)
+            self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+            self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+            self.assertIn(os.path.basename(src), err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertFalse(os.path.exists(dst))
+            # The same run at --info: the header read is the input read too.
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(dds.main([src, "--info"]), 2)
+            self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+            # A file that is there and is not a DDS this decoder supports keeps 1.
+            with open(os.path.join(tmp, "in.dds"), "wb") as f:
+                f.write(dds_buffer(4, 4, flags=DDPF_FOURCC, fourcc=b"XXXX"))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(dds.main([os.path.join(tmp, "in.dds"), dst]), 1)
+            self.assertIn("FourCC", err.getvalue())
+            # The success path is untouched: a real DDS writes the same PNG bytes as before.
+            payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
+            with open(os.path.join(tmp, "good.dds"), "wb") as f:
+                f.write(dds_buffer(8, 8, flags=DDPF_FOURCC, fourcc=b"DXT1", payload=payload))
+            self.assertEqual(dds.main([os.path.join(tmp, "good.dds"), dst]), 0)
+            with open(dst, "rb") as f:
+                self.assertTrue(f.read().startswith(b"\x89PNG\r\n\x1a\n"))
+
     def test_cli_rejects_negative_max_size(self):
         payload = bc1_block(0xFFFF, 0x0000, [0, 0, 0, 0]) * 4
         with tempfile.TemporaryDirectory() as tmp:
