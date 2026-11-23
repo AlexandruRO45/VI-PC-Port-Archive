@@ -1,4 +1,6 @@
 """Tests for tools/spirv_opt.py (sound basic-block SPIR-V peephole optimizer, #884)."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -415,6 +417,52 @@ class SpirvOptTests(unittest.TestCase):
                 opt = f.read()
         _validate(opt)
         self.assertEqual(support.mrt0_words(opt), [42] * 4)
+
+    def test_cli_missing_input_is_one_error_line(self):
+        # A src the tool cannot open is a diagnostic, not a traceback: the run has nothing to optimize.
+        with tempfile.TemporaryDirectory() as d:
+            dst = os.path.join(d, "out.spvasm")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = spirv_opt.main([os.path.join(d, "nope.spvasm"), "-o", dst])
+        self.assertEqual(rc, 2)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("ERROR: cannot read "), lines[0])
+        self.assertFalse(os.path.exists(dst))
+
+    def test_cli_output_it_cannot_write_is_one_error_line(self):
+        # A directory named by --out fails at the write; that must not become a traceback either.
+        raw = support.translate_lines("ps_opt_cli_err", [
+            "v_mov_b32_e32 v1, 42",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = os.path.join(d, "in.spvasm"), os.path.join(d, "outdir")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(raw)
+            os.makedirs(dst)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = spirv_opt.main([src, "-o", dst])
+        self.assertEqual(rc, 2)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("ERROR: cannot write "), lines[0])
+
+    def test_cli_input_that_is_not_utf8_text_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "in.spvasm")
+            with open(src, "wb") as f:
+                f.write(b"\xff\xfe\x00OpCapability Shader\n")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = spirv_opt.main([src, "-o", os.path.join(d, "out.spvasm")])
+        self.assertEqual(rc, 2)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("is not UTF-8 text", lines[0])
 
 
 if __name__ == "__main__":
