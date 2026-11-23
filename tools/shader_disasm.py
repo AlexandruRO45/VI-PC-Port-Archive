@@ -93,7 +93,14 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # Feed llvm-mc one dword (instruction) per line, not all bytes space-joined on one giant line: when an
+    # instruction is invalid, llvm-mc echoes the whole input line in the error, so a space-joined program
+    # (gigabytes for the pipeline library) makes stderr explode (BUILD-3020, found by Jadiac5).
+    lines = []
+    for i in range(0, len(code), 4):
+        dword = code[i:i + 4]
+        lines.append(" ".join(f"0x{b:02x}" for b in dword))
+    text = "\n".join(lines)
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
