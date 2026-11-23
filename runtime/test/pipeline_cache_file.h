@@ -10,6 +10,9 @@
 #include <system_error>
 
 #ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #include <thread>
 #include <windows.h>
 #endif
@@ -24,7 +27,13 @@ inline std::error_code write_pipeline_cache_file(const std::filesystem::path& de
         staged = destination;
         staged += ".tmp." + std::to_string(stamp) + "." + std::to_string(attempt);
 #ifdef _WIN32
-        file = _wfopen(staged.c_str(), L"wbx");
+        // The static UCRT of some SDKs rejects the C11 'x' mode character in _wfopen (invalid-parameter fast-fail),
+        // so request the exclusion by flag and wrap the handle. A refused existing file reports EEXIST, as _open
+        // documents. _O_BINARY is explicit: _open defaults to text mode, which would rewrite the cache bytes.
+        const int handle =
+            _wopen(staged.wstring().c_str(), _O_WRONLY | _O_BINARY | _O_CREAT | _O_EXCL, _S_IREAD | _S_IWRITE);
+        file = (handle >= 0) ? _fdopen(handle, "wb") : nullptr;
+        if (!file && handle >= 0) _close(handle);
 #else
         file = std::fopen(staged.c_str(), "wbx");
 #endif
