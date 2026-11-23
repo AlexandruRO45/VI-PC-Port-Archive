@@ -57,6 +57,18 @@ class Sampling(unittest.TestCase):
         self.assertTrue(all(sampled >= min(10, size) for size, sampled in per.values()))
         self.assertEqual(sum(sampled for _, sampled in per.values()), len(picked))
 
+    def test_rounding_down_still_gives_n(self):
+        # two strata of 50: n * 50 / 100 = 12.5 rounds to 12 in each, which used to give 24 of the 25 asked for
+        ps = {f"a{i}": meta() for i in range(50)}
+        ps.update({f"b{i}": meta(bindings=(0,)) for i in range(50)})
+        self.assertEqual(len(ps_sweep.pick_sample(ps, 25, 7)[0]), 25)
+        # a stratum capped at its size leaves its share to the others
+        ps = {f"a{i}": meta() for i in range(2)}
+        ps.update({f"b{i}": meta(bindings=(0,)) for i in range(98)})
+        picked, per = ps_sweep.pick_sample(ps, 99, 7)
+        self.assertEqual(len(picked), 99)
+        self.assertEqual(per[(False, "none", "structured")], (2, 2))
+
     def test_fixed_seed_is_stable_and_seed_matters(self):
         ps = {k: v for k, v in synthetic_index().items() if v["stage"] == "ps"}
         first = ps_sweep.pick_sample(ps, 40, 7)[0]

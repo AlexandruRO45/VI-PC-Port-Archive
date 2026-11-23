@@ -57,6 +57,11 @@ def pick_sample(ps, n, seed):
         if alloc[big] <= min(10, len(groups[big])):
             break
         alloc[big] -= 1
+    # Rounding down (12.5 -> 12 twice) or a stratum taken whole can leave fewer than n: give the rest to the
+    # strata furthest below their proportional share.
+    while sum(alloc.values()) < min(n, total):
+        room = [s for s in sorted(alloc, key=str) if alloc[s] < len(groups[s])]
+        alloc[max(room, key=lambda s: n * len(groups[s]) / total - alloc[s])] += 1
     rng = random.Random(seed)
     picked = []
     for s in sorted(groups, key=str):
