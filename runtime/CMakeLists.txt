@@ -2903,6 +2903,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_readback_stages_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_readback_stages COMMAND replay_readback_stages_test)
+    # KHR TLAS ARRAY_OF_POINTERS preparation must not return early before trailing commands or query planning (no GPU).
+    add_executable(replay_khr_tlas_tail_test test/replay_khr_tlas_tail_test.cpp)
+    target_link_libraries(replay_khr_tlas_tail_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_khr_tlas_tail_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_khr_tlas_tail COMMAND replay_khr_tlas_tail_test)
     # emit of an enhanced texture barrier: no heap allocation for one layout piece, one barrier for each piece (no GPU).
     add_executable(replay_texture_barrier_test test/replay_texture_barrier_test.cpp)
     target_link_libraries(replay_texture_barrier_test PRIVATE Vulkan::Headers)
