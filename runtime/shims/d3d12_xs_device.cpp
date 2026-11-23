@@ -407,6 +407,7 @@ HRESULT WINAPI dxgi_get_private_data(void* self, const GUID* name, UINT* size, v
 }
 HRESULT WINAPI dxgi_get_parent(void* self, const IID* riid, void** out) {
     note_dxgi("XboxIDXGIDevice::GetParent");
+    if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, the null IID included
     if (!riid) return E_POINTER;
     return dxgi_adapter(dxgi_owner(self), *riid, out);
 }

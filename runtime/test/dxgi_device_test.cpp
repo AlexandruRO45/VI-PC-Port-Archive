@@ -115,6 +115,12 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
         void* none = reinterpret_cast<void*>(1);
         EXPECT(FAILED(dxgi->GetParent(__uuidof(ID3D12Device), &none)) && !none);
         EXPECT(dxgi->GetParent(__uuidof(IDXGIAdapter), nullptr) == E_POINTER);
+        // A null IID is E_POINTER and, as on every failure (_COM_Outptr_), the output is cleared. The C++ method
+        // takes the IID by reference, so the call goes through IDXGIObject::GetParent's slot (6) directly.
+        using GetParentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGIDevice1*, const IID*, void**);
+        const auto get_parent = reinterpret_cast<GetParentFn>((*reinterpret_cast<void***>(dxgi.p))[6]);
+        none = reinterpret_cast<void*>(1);
+        EXPECT(get_parent(dxgi.p, nullptr, &none) == E_POINTER && !none);
     }
     {
         // Whose adapter it is. The layer's own stops at IDXGIAdapter3 and its parent is the layer's factory, which
