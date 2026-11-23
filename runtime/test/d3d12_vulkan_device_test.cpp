@@ -6564,7 +6564,10 @@ int main() {
                 Ref<ID3D12Device10> device10;
                 Ref<ID3D12Resource> one, two;
                 EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device4.p))));
-                EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
+                // The proxy routes slots 78/79/80 to the Xbox HLE methods (SetFrameIntervalX and the rest, PR #6935),
+                // shadowing the PC Device10/11 entries a PC caller would reach, so the Device10 call goes to the
+                // inner device. Device4's CreateReservedResource1 (slot 55) is below the routed range and forwards.
+                EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&device10.p))));
                 EXPECT(SUCCEEDED(device4->CreateReservedResource1(&tiled_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
