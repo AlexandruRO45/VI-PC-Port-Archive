@@ -347,5 +347,51 @@ class TestRegisterAliasing(unittest.TestCase):
         self.assertEqual(words[0], f32_to_u32(-0.75))
 
 
+@dataclass
+class MantissaClassification:
+    is_zero: bool = False
+    is_normalized: bool = False
+    is_inf_or_nan: bool = False
+
+
+def classify_mantissa(val: int) -> MantissaClassification:
+    val &= MASK32
+    e = (val >> 23) & 0xFF
+    if (val & 0x7FFFFFFF) == 0:
+        return MantissaClassification(is_zero=True)
+    elif e == 126:
+        return MantissaClassification(is_normalized=True)
+    elif e == 255:
+        return MantissaClassification(is_inf_or_nan=True)
+    return MantissaClassification()
+
+
+class TestConditionCodesAndStatus(unittest.TestCase):
+    def test_vcc_and_scc_preservation(self):
+        # v_frexp_mant_f32 is a VALU instruction and must not clobber SCC or VCC
+        interp = ScalarInterpreter()
+        interp.state.scc = 1
+        interp.state.vcc = 0xFEEDFACE12345678
+        interp.state.vgprs[1] = f32_to_u32(2.0)
+
+        insn = VFrexpMantF32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+        )
+        interp.step(insn)
+        self.assertEqual(interp.state.scc, 1)
+        self.assertEqual(interp.state.vcc, 0xFEEDFACE12345678)
+
+    def test_mantissa_classification(self):
+        c_norm = classify_mantissa(ref_frexp_mant_f32(f32_to_u32(5.0)))
+        self.assertTrue(c_norm.is_normalized)
+
+        c_zero = classify_mantissa(ref_frexp_mant_f32(0))
+        self.assertTrue(c_zero.is_zero)
+
+        c_inf = classify_mantissa(ref_frexp_mant_f32(0x7F800000))
+        self.assertTrue(c_inf.is_inf_or_nan)
+
+
 if __name__ == "__main__":
     unittest.main()
