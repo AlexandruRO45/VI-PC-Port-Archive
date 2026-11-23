@@ -180,5 +180,73 @@ class TestSymbolicAST(unittest.TestCase):
             Operand.vgpr(256)
 
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.vcc = 0
+        self.scc = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index]
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index]
+        else:
+            return op.literal_val
+
+    def write_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def __init__(self, state: Optional[ScalarRegisterState] = None):
+        self.state = state if state is not None else ScalarRegisterState()
+
+    def step(self, insn: VFrexpMantF32Instruction) -> int:
+        u0 = self.state.read_operand(insn.src0)
+        res = ref_frexp_mant_f32(u0)
+        self.state.write_vgpr(insn.dst.index, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step(self):
+        interp = ScalarInterpreter()
+        interp.state.vgprs[1] = f32_to_u32(4.0)
+
+        insn = VFrexpMantF32Instruction(
+            dst=Operand.vgpr(0),
+            src0=Operand.vgpr(1),
+        )
+        res = interp.step(insn)
+        self.assertEqual(res, f32_to_u32(0.5))
+        self.assertEqual(interp.state.vgprs[0], f32_to_u32(0.5))
+
+    def test_scalar_interpreter_chaining(self):
+        interp = ScalarInterpreter()
+        interp.state.vgprs[1] = f32_to_u32(8.0)
+
+        # Step 1: 8.0 -> 0.5
+        insn1 = VFrexpMantF32Instruction(dst=Operand.vgpr(0), src0=Operand.vgpr(1))
+        interp.step(insn1)
+        self.assertEqual(interp.state.vgprs[0], f32_to_u32(0.5))
+
+        # Step 2: 0.5 -> 0.5 (idempotent for normalized mantissas in [0.5, 1.0))
+        insn2 = VFrexpMantF32Instruction(dst=Operand.vgpr(2), src0=Operand.vgpr(0))
+        res2 = interp.step(insn2)
+        self.assertEqual(res2, f32_to_u32(0.5))
+        self.assertEqual(interp.state.vgprs[2], f32_to_u32(0.5))
+
+    def test_scalar_interpreter_matches_translator(self):
+        lines = [
+            "v_mov_b32 v1, 0x41000000",  # 8.0
+            "v_frexp_mant_f32 v0, v1",
+            "v_frexp_mant_f32 v2, v0",
+        ]
+        words = run_ps_frexp_mant_f32(lines)
+        self.assertEqual(words[0], f32_to_u32(0.5))
+
+
 if __name__ == "__main__":
     unittest.main()
