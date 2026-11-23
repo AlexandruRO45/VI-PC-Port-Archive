@@ -262,8 +262,8 @@ The translated shaders take 144 bytes of push constants: s0..s31, then the heap 
 `maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
 `vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
 AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
+7600's iGPU on 24.10.24); newer ones report 256 (a Radeon 610M on 26.11.2, the Ryzen 5 7600's iGPU on
+32.0.21042.62), where these tests run without the variable below. RADV reports more on the same chips.
 
 To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
 `run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
@@ -280,8 +280,8 @@ The translated shaders take 144 bytes of push constants: s0..s31, then the heap 
 `maxPushConstantsSize` is 128, Vulkan's minimum, can't take that, so the texture tests and every test drawn through
 `vk_harness` skip there (`unsupported: need 144 push constant bytes, device has 128`); `vulkaninfo` shows the limit.
 AMD's older Windows drivers report 128 on RDNA2 iGPUs (Radeon 680M on 22.40.84.06, 610M on 24.10.16.14, the Ryzen 5
-7600's iGPU on 24.10.24); 26.11.2 reports 256 on a Radeon 610M, where these tests run without the variable below.
-RADV reports more on the same chips.
+7600's iGPU on 24.10.24); newer ones report 256 (a Radeon 610M on 26.11.2, the Ryzen 5 7600's iGPU on
+32.0.21042.62), where these tests run without the variable below. RADV reports more on the same chips.
 
 To run them anyway, set `LEONIDA_PC_TAIL_UBO=1` **for both `build.py` and `check.py`** (or for
 `run_gpu_tests.py`). The shaders are then translated with `--pc-tail-ubo`: s0..s31 stay in 128 push-constant bytes,
