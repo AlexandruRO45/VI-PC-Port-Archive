@@ -165,7 +165,7 @@ Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.d
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
 
-The seven `xmem.dll` imports are served now (see the `xmem.dll` notes above), so the same dry run lists 23.
+Since then the seven `xmem.dll` imports (see the `xmem.dll` notes above) and `D3D12ConfigureVirtualMemoryX` have been served. The same dry run at `main` `dde82f27e` (Wine 11.22, clang-cl cross-build) lists **22**, exactly the five DLLs with no shim: `AcpHal.dll` 9, `chad.dll` 5, `xapu.dll` 5, `xg_xs.dll` 2 and `XCRDAPI.dll` 1. The executable's row now reads shim 61, host 432, module 72; the four package DLLs' rows are unchanged.
 
 `--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
 `DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and

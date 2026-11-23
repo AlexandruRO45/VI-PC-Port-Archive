@@ -1,8 +1,8 @@
 # The audio coprocessor, texture layout and DirectStorage imports: how the retail executable calls them (RT-5)
 
-`gta6rt --dry-run` leaves 30 of `game_scarlett_master.exe`'s imports unimplemented
-(the section on the retail executable in `docs/runtime_imports.md`, #6715). Eight are `xmem.dll` and `d3d12_xs.dll` and are
-in [`xmem_exe_calls.md`](xmem_exe_calls.md). The other 22 are the audio coprocessor (`AcpHal.dll`, `xapu.dll`,
+`gta6rt --dry-run` first left 30 of `game_scarlett_master.exe`'s imports unimplemented
+(the section on the retail executable in `docs/runtime_imports.md`, #6715). Eight were `xmem.dll` and `d3d12_xs.dll`; they are
+in [`xmem_exe_calls.md`](xmem_exe_calls.md) and are served now, so the dry run lists the 22 below. The other 22 are the audio coprocessor (`AcpHal.dll`, `xapu.dll`,
 `chad.dll`: 19), the texture layout library (`xg_xs.dll`: 2) and DirectStorage (`XCRDAPI.dll`: 1). No public
 documentation of the audio functions exists, so this page records, from the file alone, how the executable calls them:
 how many call sites each has, the constants those sites pass, and how each site uses the result. Nothing was run, and no
