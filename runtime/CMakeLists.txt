@@ -148,6 +148,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       shims/registry.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/presentx_capture.cpp
     )
     target_link_libraries(root_sig_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
     target_compile_definitions(root_sig_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -172,6 +173,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
         shims/registry.cpp
         shims/d3d12_xs.cpp
         shims/d3d12_xs_device.cpp
+        shims/presentx_capture.cpp
       )
       target_link_libraries(device_proxy_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY} ${DXGI_LIBRARY})
       target_compile_definitions(device_proxy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -506,6 +508,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/presentx_capture.cpp
     )
     target_include_directories(pe_loader_test PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -622,6 +625,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/presentx_capture.cpp
     )
     target_include_directories(test_pe_loader_bounds PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src
