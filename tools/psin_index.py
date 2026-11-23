@@ -416,6 +416,9 @@ def main():
     except OSError as e:
         print(f"ERROR: {a.src}: {e}", file=sys.stderr)
         return 2
+    if os.path.isfile(a.src) and not records:   # a file that holds no PSIN: name it, don't report "0 PSIN files"
+        print(f"ERROR: {a.src}: not a PSIN container", file=sys.stderr)
+        return 2
     summary = summarize(records)
     if a.json:
         json.dump({"files": records, "summary": summary}, sys.stdout, indent=1)
