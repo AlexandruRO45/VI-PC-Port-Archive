@@ -142,6 +142,22 @@ class InstancedGlbTest(unittest.TestCase):
         self.assertEqual(len(gltf["meshes"]), 1)
         self.assertEqual(st["instances"], 2)
 
+    def test_scaled_instance_rotations_match_reference(self):
+        def build(scale, mode):
+            meshes = [{"primitives": [tri_prim()],
+                       "instances": [((0, 0, 0), (0, 0, scale, scale), (1, 1, 1))]}]
+            return glb_writer.build_instanced_glb(meshes, mode=mode)
+
+        for mode in ("gpu", "nodes"):
+            expected = build(1.0, mode)
+            for scale in (1e200, sys.float_info.max, 1e-160, 1e-200, math.ulp(0.0)):
+                with self.subTest(mode=mode, scale=scale):
+                    self.assertEqual(build(scale, mode), expected)
+            for scale in (0.0, math.inf, math.nan):
+                with self.subTest(mode=mode, invalid=scale):
+                    with self.assertRaisesRegex(glb_writer.GlbError, "finite non-zero quaternion"):
+                        build(scale, mode)
+
     def test_indexed_material_is_preserved_in_both_instancing_modes(self) -> None:
         primitive = {
             "positions": [(0, 0, 0), (1, 0, 0), (0, 1, 0)],
