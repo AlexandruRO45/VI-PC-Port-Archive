@@ -327,36 +327,40 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
             if r.returncode != 0 or "error:" in r.stderr:
                 continue
             raw = bytearray()
+            asm_insns = []
             for ln in r.stdout.splitlines():
                 if "; encoding:" not in ln or ln.lstrip().startswith("."):
                     continue
                 ins = shader_ir.parse_line(ln)
                 if ins and ins["enc"]:
                     raw.extend(bytes.fromhex(ins["enc"]))
+                    asm_insns.append(ins)
             dcmd = [mc, "-disassemble", "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-show-encoding"]
             if mattr:
                 dcmd.append("-mattr=" + mattr)
             dr = subprocess.run(dcmd, input=" ".join(f"0x{b:02x}" for b in raw), text=True, capture_output=True)
             llvm_insns = []
-            pc = 0
             for ln in dr.stdout.splitlines():
                 if "; encoding:" not in ln or ln.lstrip().startswith("."):
                     continue
                 ins = shader_ir.parse_line(ln)
                 if ins and ins["enc"]:
-                    ins["pc"] = pc
-                    pc += len(ins["enc"]) // 2
                     llvm_insns.append(ins)
             dec = rdna2_decode.decode_bytes(bytes(raw), wave32=wave32)
             self.assertEqual(dec["invalid"], 0, path)
             self.assertEqual(len(dec["insns"]), len(llvm_insns), path)
-            for li, di in zip(llvm_insns, dec["insns"]):
-                self.assertEqual(di["enc"], li["enc"], path)
-                self.assertEqual(norm_op(di["op"]), norm_op(li["op"]), path)
+            self.assertEqual(len(dec["insns"]), len(asm_insns), path)
+            for ai, li, di in zip(asm_insns, llvm_insns, dec["insns"]):
+                # Compare against the assembled encoding: llvm-mc 21's disassembler fails to round-trip
+                # SDWA inline float constants on integer-source ops (e.g. v_cvt_f16_u16_sdwa v5, 1.0 prints
+                # 0x3c00 and re-encodes a bogus 12-byte 0xff literal). Fall back to the assembled insn then.
+                ref = li if li["enc"] == ai["enc"] else ai
+                self.assertEqual(di["enc"], ai["enc"], path)
+                self.assertEqual(norm_op(di["op"]), norm_op(ref["op"]), path)
                 self.assertEqual([norm_arg(x, di["op"]) for x in di["args"]],
-                                 [norm_arg(x, li["op"]) for x in li["args"]],
-                                 f"{path}: {li['op']}")
-                self.assertEqual(sorted(di["mods"]), sorted(li["mods"]), f"{path}: {li['op']}")
+                                 [norm_arg(x, ref["op"]) for x in ref["args"]],
+                                 f"{path}: {ref['op']}")
+                self.assertEqual(sorted(di["mods"]), sorted(ref["mods"]), f"{path}: {ref['op']}")
                 checked += 1
         self.assertGreater(checked, 5000)
 
