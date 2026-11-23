@@ -298,6 +298,29 @@ runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together 
 compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
 `bufferDeviceAddress` and `shaderInt64` instead.
 
+## Mesh pass coverage (TEST-362)
+
+`ms_coverage` is the standalone no-game check from #1889: one hand-written RDNA2 mesh shader and its pixel shader,
+a synthetic six-vertex drawable, hand-built descriptors, and a CPU projection of the same triangles. It needs no
+game files and no executable. It is built and run by `run_gpu_tests.py`; `build.py` cannot build `ms_*` fixtures.
+
+```powershell
+python -I scripts\run_gpu_tests.py --build runtime\build --filter ms_coverage --work work\mesh
+```
+
+The mesh shader reads a 4-dword V# from heap VA `0x1000` (`s[8:9]` points at it) and fetches six vertices at
+`0x2000`; the pixel shader reads an 8-dword T# at `0x100` (`s[0:1]`), written by `VKH_TEX_RGBA`. `vk_harness` writes
+a stencil mask through `VKH_COVERAGE_MASK`: one byte per pixel, `1` for a rasterized fragment and `0` for an
+untouched pixel. The mask is independent of the fragment colour, so a shader writing `(-1,-1,-1,-1)` is still
+counted as covered. `tools/mesh_pass_coverage.py` projects the same vertices on the CPU, snaps them to the device's
+subpixel grid (default 8 bits, ties to the even grid coordinate), and reports IoU, missing and extra pixels. The
+test requires IoU 1.0.
+
+The expected values are in `runtime/test/shaders/ms_coverage.asm`'s header: the rectangle covers 52×52 pixels of
+the 64×64 viewport. The real game drawable, its MS/PS from the carve index, and the pass-by-pass chain are a
+separate follow-up that needs a package (`docs/first_light.md` shows the model/VS/PS path; this test deliberately
+uses synthetic inputs only).
+
 ## Without a GPU: Mesa llvmpipe
 
 Mesa's llvmpipe is a software Vulkan driver (`mesa-vulkan-drivers` on Debian and Ubuntu). CI runs the suite on it

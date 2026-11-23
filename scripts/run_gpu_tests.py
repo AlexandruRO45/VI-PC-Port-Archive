@@ -88,6 +88,38 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+# TEST-362: one synthetic drawable, six vertices in NDC, two triangles. The mesh shader fetches them through a
+# 4-dword V# at heap VA 0x1000 (base 0x2000, stride 16, six records, structured) and the CPU projection uses the
+# same vertices. The rectangle's edges are 0.1 px from any pixel centre, well outside the 1/256 subpixel grid.
+COVERAGE_VERTICES = [(-0.8, -0.8, 0.0, 1.0), (0.8, -0.8, 0.0, 1.0), (0.8, 0.8, 0.0, 1.0),
+                     (-0.8, -0.8, 0.0, 1.0), (0.8, 0.8, 0.0, 1.0), (-0.8, 0.8, 0.0, 1.0)]
+COVERAGE_TRIANGLES = [(0, 1, 2), (3, 4, 5)]
+COVERAGE_SIZE = 64
+
+
+def coverage_fixture(directory: str) -> tuple[str, str, str]:
+    """Write the synthetic vertex blob's heap words, texture and CPU triangles; return their paths."""
+    words = {0x1000: 0x2000,                    # V# BASE_ADDRESS = console VA 0x2000
+             0x1004: 16 << 16,                  # BASE_ADDRESS_HI = 0, STRIDE = 16
+             0x1008: len(COVERAGE_VERTICES),    # NUM_RECORDS
+             0x100c: 1 << 28}                   # OOB_SELECT = structured
+    for i, vertex in enumerate(COVERAGE_VERTICES):
+        for j, value in enumerate(vertex):
+            words[0x2000 + 16 * i + 4 * j] = struct.unpack("<I", struct.pack("<f", value))[0]
+    heap = ",".join(f"0x{addr:x}=0x{word:x}" for addr, word in sorted(words.items()))
+    texture = os.path.join(directory, "ms_coverage.rgba")
+    with open(texture, "wb") as f:
+        f.write(struct.pack("<II", 2, 2))
+        f.write(bytes([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]))
+    triangles = os.path.join(directory, "ms_coverage.triangles.json")
+    projected = [[[((COVERAGE_VERTICES[i][0] + 1.0) * 0.5) * COVERAGE_SIZE,
+                   ((COVERAGE_VERTICES[i][1] + 1.0) * 0.5) * COVERAGE_SIZE]
+                  for i in triangle] for triangle in COVERAGE_TRIANGLES]
+    with open(triangles, "w", encoding="utf-8") as f:
+        json.dump(projected, f)
+    return heap, texture, triangles
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
@@ -583,6 +615,7 @@ DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_textur
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
               SIGNED_MIP_TEST: "vs_ids.asm",
+              "ms_coverage": ("ps_texture_sample.asm", "ps_coverage_clear.asm"),
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
@@ -591,8 +624,9 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     build = list(asm_files)
     for f in asm_files:
         extra = DRAWN_WITH.get(shader_source(os.path.splitext(f)[0]))
-        if extra and extra not in build:
-            build.append(extra)
+        for name in (extra if isinstance(extra, (list, tuple)) else (extra,)):
+            if name and name not in build:
+                build.append(name)
     if TEXTURE_MIP_TEST + ".asm" in asm_files:
         for name in TEXTURE_MIP_DEPENDENCIES:
             if name + ".asm" not in build:
@@ -740,7 +774,7 @@ def run_suite(a, work: str) -> int:
                 (b"ISG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
                 (b"OSG1", make_sig_chunk([(1, 3, 0, 0xF, 0xF), (0, 3, 1, 0xF, 0xF)])),
             ])
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack", "ms_coverage"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
@@ -1225,6 +1259,7 @@ def run_suite(a, work: str) -> int:
                 continue
             const_wants = {
                 "ps_clip_color": (0x3E800000, 0x3F000000, 0x3F400000, 0x3F800000),
+                "ps_coverage_clear": (0xBF800000, 0xBF800000, 0xBF800000, 0xBF800000),
                 "ps_ops": (0x48804300, 5, 7, 0xBFFFFFFC),
                 "ps_ops2": (0xABCD4400, 0x46001234, 0xBFFFFFFA, 7),
                 "ps_ops3": (0xBFFFFFFA, 0x44660066, 0x44AABBCC, 16),
@@ -1384,6 +1419,53 @@ def run_suite(a, work: str) -> int:
             else:
                 ok, detail = check_clip_half(raw, 0.5, 1.0)
                 results.append((name, ok, detail))
+        elif name == "ms_coverage":
+            # TEST-362: one synthetic drawable through a hand-built V# and T#, judged by a stencil coverage mask.
+            # The second run writes the clear sentinel on every fragment, so the mask, not the colour, decides.
+            heap, texture, triangles = coverage_fixture(raw_dir)
+            base_env = mesh_env(spirv_dir, name, gfx_env)
+            base_env.update(VKH_HEAP=heap, VKH_SGPRS="0x100,0,0,0,0,0,0,0,0x1000,0",
+                            VKH_TEX_RGBA=texture, VKH_TSHARP_VA="0x100",
+                            VKH_SSHARP="0x92,0xc00000,0x14500000,0")
+            tool = os.path.join(ROOT, "tools", "mesh_pass_coverage.py")
+            details, ok_all = [], True
+            for label, fs_name, mask_name in (
+                ("texture", "ps_texture_sample.spv", "ms_coverage.mask"),
+                ("clear-colour", "ps_coverage_clear.spv", "ms_coverage_clear.mask"),
+            ):
+                raw = os.path.join(raw_dir, f"{name}.{label}.raw")
+                mask = os.path.join(raw_dir, mask_name)
+                Path(mask).unlink(missing_ok=True)
+                env = dict(base_env, VKH_COVERAGE_MASK=mask)
+                rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, os.path.join(spirv_dir, fs_name),
+                                                      raw, str(COVERAGE_SIZE), str(COVERAGE_SIZE)], env=env)
+                if rc == UNSUPPORTED:
+                    details.append(f"{label}: {unsupported_skip(msg)}")
+                    ok_all = False
+                    continue
+                if rc != 0:
+                    details.append(f"{label}: {msg}")
+                    ok_all = False
+                    continue
+                if not os.path.isfile(mask):
+                    details.append(f"{label}: vk_harness wrote no coverage mask")
+                    ok_all = False
+                    continue
+                if label == "clear-colour":
+                    with open(raw, "rb") as source:
+                        pixels = list(struct.iter_unpack("<4f", source.read()))
+                    if any(pixel != (-1.0, -1.0, -1.0, -1.0) for pixel in pixels):
+                        details.append(f"{label}: readback is not the clear sentinel")
+                        ok_all = False
+                        continue
+                compare = subprocess.run([sys.executable, "-I", tool, triangles, mask,
+                                          str(COVERAGE_SIZE), str(COVERAGE_SIZE),
+                                          "--raw", raw, "--min-iou", "1.0"],
+                                         capture_output=True, text=True)
+                detail = (compare.stdout.strip() or compare.stderr.strip())
+                details.append(f"{label}: {detail}")
+                ok_all = ok_all and compare.returncode == 0
+            results.append((name, ok_all, "; ".join(details)))
         elif name == "vs_base_ids":
             # Zero-based v0 / v3 (the hardware's VS input VGPRs): drawn with firstVertex 16 and firstInstance 7,
             # ps_flat must still see vertex 0 of instance 0 (0x101), as check.py checks.

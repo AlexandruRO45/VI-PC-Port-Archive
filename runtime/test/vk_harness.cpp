@@ -11,6 +11,9 @@
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
 //   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
 //                                "0=0"), so a test can read what the pixel shader stored or atomically added.
+//   VKH_COVERAGE_MASK=<file>     writes W*H stencil bytes after the draw (1 = a fragment was rasterized at the pixel,
+//                                0 = untouched). Independent of the fragment colour, so a shader writing
+//                                (-1,-1,-1,-1) still counts as covered. Not with --mesh-group-readback.
 //   VKH_DRAW_MESH=<file> + VKH_VERTEX_LAYOUT=0:3f,1:2f
 //                                draws an indexed mesh instead of the 3-vertex triangle. The file is u32
 //                                vertex_count, u32 index_count, vertex_count*stride bytes, index_count u32
@@ -136,7 +139,8 @@ static bool read_mesh(const char* path, uint32_t stride, std::vector<uint8_t>& v
 int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr, "usage: vk_harness vs.spv fs.spv out.raw [w h [clip-test-s0 clip-test-s1]]\n"
-                             "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n");
+                             "       vk_harness ms.spv fs.spv out.raw --mesh-group-readback X Y Z\n"
+                             "       VKH_COVERAGE_MASK=<file> also writes one stencil byte per pixel\n");
         return 2;
     }
     const bool group_readback = argc > 4 && !std::strcmp(argv[4], "--mesh-group-readback");
@@ -166,6 +170,12 @@ int main(int argc, char** argv) {
     uint32_t pc[38] = {};
     const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
     if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
+    const char* coverage_mask_path = std::getenv("VKH_COVERAGE_MASK");
+    if (coverage_mask_path && !*coverage_mask_path) coverage_mask_path = nullptr;
+    if (coverage_mask_path && group_readback) {
+        std::fprintf(stderr, "VKH_COVERAGE_MASK cannot be combined with --mesh-group-readback\n");
+        return 2;
+    }
     VertexAttr vertex_attrs[8];
     uint32_t vertex_attr_count = 0, vertex_stride = 0;
     if (draw_mesh_path) {
@@ -550,32 +560,46 @@ int main(int argc, char** argv) {
     VkSubpassDescription sd{}; sd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sd.colorAttachmentCount = 1; sd.pColorAttachments = &ar;
     VkAttachmentReference stencil_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-    if (group_readback) {
+    VkImage stencil_img = VK_NULL_HANDLE;
+    const bool coverage = coverage_mask_path != nullptr;
+    const bool want_stencil = group_readback || coverage;
+    if (want_stencil) {
         LOADI(vkGetPhysicalDeviceFormatProperties);
         auto& ds = attachments[1];
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                          (coverage ? VK_FORMAT_FEATURE_TRANSFER_SRC_BIT : 0);
         for (auto format : {VK_FORMAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
             VkFormatProperties fp;
             vkGetPhysicalDeviceFormatProperties(pd, format, &fp);
-            if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            if ((fp.optimalTilingFeatures & need) == need) {
                 ds.format = format;
                 break;
             }
         }
         if (!ds.format) { std::fprintf(stderr, "no stencil attachment format\n"); return 1; }
-        VkImage stencil;
         VkImageAspectFlags aspects = VK_IMAGE_ASPECT_STENCIL_BIT;
         if (ds.format != VK_FORMAT_S8_UINT) aspects |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (attachment(ds.format, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, aspects, stencil, views[1])) return 1;
+        const VkImageUsageFlags ds_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                           (coverage ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0);
+        if (attachment(ds.format, ds_usage, aspects, stencil_img, views[1])) return 1;
         ds.samples = VK_SAMPLE_COUNT_1_BIT;
         ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.finalLayout = stencil_ref.layout;
+        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ds.stencilStoreOp = coverage ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        ds.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ds.finalLayout = coverage ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : stencil_ref.layout;
         sd.pDepthStencilAttachment = &stencil_ref;
     }
     VkRenderPassCreateInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    rpi.attachmentCount = group_readback ? 2 : 1; rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
+    rpi.attachmentCount = want_stencil ? 2 : 1; rpi.pAttachments = attachments; rpi.subpassCount = 1; rpi.pSubpasses = &sd;
     VkSubpassDependency copy_dep{0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                 VK_ACCESS_TRANSFER_READ_BIT};
+    if (coverage) {
+        copy_dep.srcStageMask |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        copy_dep.srcAccessMask |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    }
     rpi.dependencyCount = 1; rpi.pDependencies = &copy_dep;
     VkRenderPass rp; CHECK(vkCreateRenderPass(dev, &rpi, nullptr, &rp));
     VkFramebufferCreateInfo fbi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
@@ -692,13 +716,22 @@ int main(int argc, char** argv) {
     gpi.pVertexInputState = mesh ? nullptr : &vin; gpi.pInputAssemblyState = mesh ? nullptr : &ia;
     gpi.pViewportState = &vps; gpi.pRasterizationState = &rs; gpi.pMultisampleState = &ms; gpi.pColorBlendState = &cb;
     VkPipelineDepthStencilStateCreateInfo ds_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    if (group_readback) {
-        // Pixel i starts at stencil i. Every triangle decrements it, but only the i-th sees zero and writes color.
+    if (group_readback || coverage) {
         ds_state.stencilTestEnable = VK_TRUE;
         auto& face = ds_state.front;
-        face.compareOp = VK_COMPARE_OP_EQUAL;
         face.compareMask = face.writeMask = 0xff;
-        face.failOp = face.passOp = VK_STENCIL_OP_DECREMENT_AND_WRAP;
+        if (coverage) {
+            // Every rasterized fragment replaces the cleared 0 with 1. The fragment colour is irrelevant.
+            face.compareOp = VK_COMPARE_OP_ALWAYS;
+            face.failOp = VK_STENCIL_OP_KEEP;
+            face.depthFailOp = VK_STENCIL_OP_KEEP;
+            face.passOp = VK_STENCIL_OP_REPLACE;
+            face.reference = 1;
+        } else {
+            // Pixel i starts at stencil i. Every triangle decrements it, but only the i-th sees zero and writes color.
+            face.compareOp = VK_COMPARE_OP_EQUAL;
+            face.failOp = face.passOp = VK_STENCIL_OP_DECREMENT_AND_WRAP;
+        }
         ds_state.back = face;
         gpi.pDepthStencilState = &ds_state;
     }
@@ -795,6 +828,20 @@ int main(int argc, char** argv) {
     bai.memoryTypeIndex = memtype(br.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory bmem; CHECK(vkAllocateMemory(dev, &bai, nullptr, &bmem));
     CHECK(vkBindBufferMemory(dev, buf, bmem, 0));
+    VkBuffer coverage_buf = VK_NULL_HANDLE;
+    VkDeviceMemory coverage_bmem = VK_NULL_HANDLE;
+    if (coverage) {
+        VkBufferCreateInfo cbi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        cbi.size = VkDeviceSize(W) * H; cbi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        CHECK(vkCreateBuffer(dev, &cbi, nullptr, &coverage_buf));
+        VkMemoryRequirements cbr; vkGetBufferMemoryRequirements(dev, coverage_buf, &cbr);
+        VkMemoryAllocateInfo cbai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        cbai.allocationSize = cbr.size;
+        cbai.memoryTypeIndex = memtype(cbr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        CHECK(vkAllocateMemory(dev, &cbai, nullptr, &coverage_bmem));
+        CHECK(vkBindBufferMemory(dev, coverage_buf, coverage_bmem, 0));
+    }
     std::vector<uint8_t> mesh_vertices;
     std::vector<uint32_t> mesh_indices;
     VkBuffer vbo = VK_NULL_HANDLE, ibo = VK_NULL_HANDLE;
@@ -1080,6 +1127,12 @@ int main(int argc, char** argv) {
     vkCmdEndRenderPass(cmd);
     VkBufferImageCopy reg{}; reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; reg.imageExtent = {W, H, 1};
     vkCmdCopyImageToBuffer(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+    if (coverage) {
+        VkBufferImageCopy creg{};
+        creg.imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, 0, 0, 1};
+        creg.imageExtent = {W, H, 1};
+        vkCmdCopyImageToBuffer(cmd, stencil_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, coverage_buf, 1, &creg);
+    }
     // Make the image copy and any shader writes to the heap visible to the host after the queue wait.
     VkMemoryBarrier readback{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     readback.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1095,6 +1148,13 @@ int main(int argc, char** argv) {
     output.write(static_cast<const char*>(p), std::streamsize(bi.size));
     output.close();
     if (!output) { std::fprintf(stderr, "failed to write %s\n", argv[3]); return 1; }
+    if (coverage) {
+        void* cp; CHECK(vkMapMemory(dev, coverage_bmem, 0, VkDeviceSize(W) * H, 0, &cp));
+        std::ofstream cf(coverage_mask_path, std::ios::binary);
+        cf.write(static_cast<const char*>(cp), std::streamsize(W) * H);
+        cf.close();
+        if (!cf) { std::fprintf(stderr, "failed to write %s\n", coverage_mask_path); return 1; }
+    }
     if (const char* dump = std::getenv("VKH_HEAP_DUMP"); dump && *dump && heap_map) {
         std::ofstream hf(dump, std::ios::binary);
         hf.write(static_cast<const char*>(heap_map), heap_bytes);
