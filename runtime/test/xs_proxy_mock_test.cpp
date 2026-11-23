@@ -237,6 +237,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (info1 && count > 0) info1[0] = {0, 0x10000, 0x40000};
                 return a1;
             }
+            case 14:                                                         // CreateDescriptorHeap(desc, riid, out)
+                if (a1) m->array[14][0] = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)->NumDescriptors;
+                break;
             default: break;
         }
         return S_OK;
@@ -1291,6 +1294,31 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
+// Slot 14: a shader-visible CBV/SRV/UAV heap past the PC device's limit (the mock reports none, so 1,000,000) is
+// made at the limit; a CPU-only heap of the same size is passed as asked.
+int check_view_heap_cap() {
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, false);
+    EXPECT(device);
+    D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1245184,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    void* made = nullptr;
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 1 && mock->array[14][0] == D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2);
+    EXPECT(heap.NumDescriptors == 1245184);   // the title's description is left as it was
+    heap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 2 && mock->array[14][0] == 1245184);
+    heap = {D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    raw(device, 14, word(&heap), word(&heap_iid), word(&made));
+    EXPECT(mock->calls[14] == 3 && mock->array[14][0] == 4096);   // within the limit: unchanged
+    EXPECT(release(device) == 0);
+    std::printf("%s: a shader-visible view heap past the PC limit is made at the limit; others pass as asked\n",
+                g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1302,7 +1330,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() ||
         check_open_shared() || check_alloc_failures() || check_allocators() || check_xbox_slots() ||
-        check_custom_heap_properties() || check_placed_resource_x())
+        check_custom_heap_properties() || check_placed_resource_x() || check_view_heap_cap())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
