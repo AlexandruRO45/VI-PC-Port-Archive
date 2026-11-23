@@ -26,6 +26,7 @@ and the descriptor's `samples` counts interleaved samples across those packet ch
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
 For 16-bit PCM copies of the Ogg Opus files, run tools/audio_wav.py on the output (make_game.py does it with --wav).
+Usage: `python -I tools/awc_opus.py --help` lists the options.
 """
 import argparse
 import functools
@@ -64,6 +65,8 @@ def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> 
             lacing.append(255)
             n -= 255
         lacing.append(n)
+    if len(lacing) > 255:
+        raise ValueError("packet needs more than 255 Ogg segments")
     hdr = struct.pack("<4sBBqIIIB", b"OggS", 0, flags, granule, serial, seq, 0, len(lacing)) + bytes(lacing)
     body = b"".join(packets)
     page = bytearray(hdr + body)
