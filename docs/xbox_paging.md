@@ -20,6 +20,10 @@ vk_xbox_paging_test.cpp` checks it on a real device.
 - **Ordering**: `VulkanQueue::bind_sparse_ordered` submits the bind on the queue's timeline as `bind_tiles` does for
   D3D12 tiled resources. It waits for everything the queue submitted before it, and the next submission waits for
   it, which is the console's GPU-timeline order for these calls.
+- **Lifetimes**: a region's pages come from one `PagePool`, which outlives it, and one `PageMapper` changes it.
+  Destroying a region gives back the mappings it still holds. A call refuses pages its pool has taken back, but a
+  title that releases a page on one thread while mapping it on another is freeing memory it still uses, as it would
+  be on the console.
 - Only `D3D12XBOX_PAGE_MAPPING_RANGE_TYPE` 0 (incrementing page indices) is documented publicly (the
   Xbox-GDK-Samples AdvancedESRAM README). Other range types are refused until a call site shows them.
 
