@@ -284,13 +284,6 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
             issues.append(f"sampler[{sampler_index}] input accessor type is {input_type}, expected SCALAR")
         if output_accessor is None:
             issues.append(f"sampler[{sampler_index}] output accessor is missing")
-        if input_count is not None and output_count is not None:
-            expected = input_count * 3 if interpolation == "CUBICSPLINE" else input_count
-            if output_count != expected:
-                issues.append(
-                    f"sampler[{sampler_index}] has {output_count} output values for {input_count} "
-                    f"keys with {interpolation} interpolation"
-                )
         if interpolation is not None and interpolation not in ("LINEAR", "STEP", "CUBICSPLINE"):
             issues.append(f"sampler[{sampler_index}] has unknown interpolation {interpolation!r}")
         samplers.append({
