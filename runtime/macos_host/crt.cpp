@@ -199,7 +199,7 @@ void* crt_memcpy(void* d, const void* s, uint64_t n) { return std::memcpy(d, s, 
 void* crt_memmove(void* d, const void* s, uint64_t n) { return std::memmove(d, s, n); }
 void* crt_memset(void* d, int32_t c, uint64_t n) { return std::memset(d, c, n); }
 
-// ---- vcruntime140: exceptions are not handled yet (run_tiny_game_eh), std::exception copies are ----
+// ---- vcruntime140: throw and the frame handlers are in eh.cpp ----
 struct ExceptionData {
     const char* what;
     bool do_free;
@@ -212,8 +212,6 @@ void std_exception_destroy(ExceptionData* d) {
     if (d->do_free) free(const_cast<char*>(d->what));
     *d = {nullptr, false};
 }
-[[noreturn]] void cxx_throw(void*, void*) { unsupported("C++ throw (exception handling is not implemented)"); }
-[[noreturn]] void eh_handler() { unsupported("an SEH/C++ frame handler was entered"); }
 [[noreturn]] void current_exception() { unsupported("__current_exception"); }
 
 // ---- msvcp140: std::thread ----
@@ -270,8 +268,7 @@ Exports crt_exports() {
         EXPORT_AS("api-ms-win-crt-math-l1-1-0.dll", "__setusermatherr", noop_p),
         EXPORT_AS("api-ms-win-crt-locale-l1-1-0.dll", "_configthreadlocale", return0_i),
         EXPORT_AS("api-ms-win-crt-filesystem-l1-1-0.dll", "remove", crt_remove),
-        EXPORT_AS(VC, "_CxxThrowException", cxx_throw), EXPORT_AS(VC, "__C_specific_handler", eh_handler),
-        EXPORT_AS(VC, "__CxxFrameHandler3", eh_handler), EXPORT_AS(VC, "__current_exception", current_exception),
+        EXPORT_AS(VC, "__current_exception", current_exception),
         EXPORT_AS(VC, "__current_exception_context", current_exception),
         EXPORT_AS(VC, "__std_exception_copy", std_exception_copy),
         EXPORT_AS(VC, "__std_exception_destroy", std_exception_destroy),
@@ -280,6 +277,7 @@ Exports crt_exports() {
         EXPORT_AS(VC, "strstr", crt_strstr),
         EXPORT_AS(CPP, "?_Throw_Cpp_error@std@@YAXH@Z", throw_cpp_error),
         EXPORT_AS(CPP, "?_Xlength_error@std@@YAXPEBD@Z", xlength_error),
+        EXPORT_AS(CPP, "?_Xout_of_range@std@@YAXPEBD@Z", xlength_error),
         EXPORT_AS(CPP, "_Cnd_do_broadcast_at_thread_exit", noop), EXPORT_AS(CPP, "_Thrd_id", thrd_id),
         EXPORT_AS(CPP, "_Thrd_join", thrd_join),
         EXPORT_AS("xgameruntime.dll", "XGameRuntimeInitialize", xgame_init),

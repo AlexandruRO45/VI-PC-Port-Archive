@@ -87,6 +87,7 @@ void close_object(Object* o);
 using Exports = std::vector<std::pair<std::string, void*>>;  // "dll!name" -> ms_abi entry
 Exports kernel32_exports();
 Exports crt_exports();
+Exports eh_exports();
 
 }  // namespace host
 

@@ -13,7 +13,7 @@ mkdir -p "$OUT"
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest.exe"
 "$LLD/lld-link" /nologo /entry:mainCRTStartup /subsystem:console /nodefaultlib /fixed \
   "$OUT/guest.obj" "$OUT/kernel32.lib" /out:"$OUT/guest_fixed.exe"
-/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra host.cpp kernel32.cpp crt.cpp -o "$OUT/macos_host"
+/usr/bin/clang++ -arch x86_64 -std=c++17 -O1 -Wall -Wextra host.cpp kernel32.cpp crt.cpp eh.cpp -o "$OUT/macos_host"
 
 # Leonida's own stand-in game (runtime/test/fixtures/tiny_game.cpp), built as runtime/CMakeLists.txt builds it,
 # when an xwin splat is there (docs/testing.md).
@@ -27,3 +27,5 @@ $CL /I../../third_party/xtaskqueue/Include /c $FIX/xgameruntime_stub.cpp /Fo"$OU
   "$OUT/xgameruntime_stub.obj" /out:"$OUT/xgameruntime.dll" /implib:"$OUT/xgameruntime.lib"
 $CL /c $FIX/tiny_game.cpp /Fo"$OUT/tiny_game.obj"
 "$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/tiny_game.obj" "$OUT/xgameruntime.lib" /out:"$OUT/tiny_game.exe"
+$CL /c guest/eh_probe.cpp /Fo"$OUT/eh_probe.obj"
+"$LLD/lld-link" /nologo /winsysroot:"$XWIN_DIR" "$OUT/eh_probe.obj" /out:"$OUT/eh_probe.exe"

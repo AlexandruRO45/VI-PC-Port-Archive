@@ -269,7 +269,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: macos_host <image.exe> [guest arguments...]\n");
         return 64;
     }
-    for (auto* list : {&kernel32_exports, &crt_exports})
+    for (auto* list : {&kernel32_exports, &crt_exports, &eh_exports})
         for (auto& [name, fn] : (*list)()) g_exports[name] = fn;
 
     const char* slash = std::strrchr(argv[1], '/');
