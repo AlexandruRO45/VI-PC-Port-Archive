@@ -328,5 +328,27 @@ class TestVDivFmasF32SIMD(unittest.TestCase):
                 self.assertEqual(bits_to_f32(wave.vgprs[lane][0]), 0.0)
 
 
+def run_hw_div_fmas_f32(s0: float, s1: float, s2: float, vcc_zero: bool = True) -> float:
+    lines = [
+        f"v_mov_b32 v0, {f32_to_bits(s0):#x}",
+        f"v_mov_b32 v1, {f32_to_bits(s1):#x}",
+        f"v_mov_b32 v2, {f32_to_bits(s2):#x}",
+        f"s_mov_b64 vcc, {0 if vcc_zero else -1}",
+        "v_div_fmas_f32 v0, v0, v1, v2",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines("ps_div_fmas_hw", lines)
+    return bits_to_f32(support.mrt0_words(spv)[0])
+
+
+class TestVDivFmasF32HardwareTranslator(unittest.TestCase):
+    """Translator hardware integration tests for v_div_fmas_f32."""
+
+    def test_translator_vcc_zero(self):
+        self.assertEqual(run_hw_div_fmas_f32(2.0, 3.0, 4.0, True), 10.0)
+        self.assertEqual(run_hw_div_fmas_f32(5.0, 2.0, -3.0, True), 7.0)
+
+
 if __name__ == "__main__":
     unittest.main()
