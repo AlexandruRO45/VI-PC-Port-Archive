@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer  # noqa: E402
+import _smh_groom_native  # noqa: E402
 
 SYS_BASE = 0x50000000
 GPU_BASE = 0x60000000
@@ -913,6 +914,9 @@ def generate_strands(
         - ``bary``: ``list[tuple[float, float, float]]`` barycentric weights
     """
     roots = scatter(groom, count, strand_class, density_scale, region_mask, max_strands)
+    native_result = _smh_groom_native.blend_strands(groom, roots, max_strands, pcg_float)
+    if native_result is not None:
+        return native_result
     r_tri = roots["tri"]
     r_culled = roots["culled"]
     r_bary = roots["bary"]
@@ -1314,6 +1318,63 @@ def to_glb(
             gltf_materials.append(mat)
         return part_mat_index[part]
 
+    def emit_primitive(
+        part: int,
+        pos_bytes: bytes | memoryview,
+        vmin: list[float],
+        vmax: list[float],
+        vert_count: int,
+        nrm_bytes: bytes | memoryview | None,
+        index_groups: Iterable[tuple[bytes | memoryview, int]],
+        idx_comp: int,
+        mode: int,
+        double_sided: bool,
+    ) -> None:
+        pos_bv = glb_writer._append_buffer_view(
+            bin_buf, buffer_views, pos_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
+        )
+        pos_acc = len(accessors)
+        accessors.append({
+            "bufferView": pos_bv,
+            "componentType": glb_writer.COMPONENT_FLOAT,
+            "count": vert_count,
+            "type": "VEC3",
+            "min": vmin,
+            "max": vmax,
+        })
+        attributes: dict[str, int] = {"POSITION": pos_acc}
+        if nrm_bytes is not None:
+            nrm_bv = glb_writer._append_buffer_view(
+                bin_buf, buffer_views, nrm_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
+            )
+            nrm_acc = len(accessors)
+            accessors.append({
+                "bufferView": nrm_bv,
+                "componentType": glb_writer.COMPONENT_FLOAT,
+                "count": vert_count,
+                "type": "VEC3",
+            })
+            attributes["NORMAL"] = nrm_acc
+
+        for idx_bytes, count in index_groups:
+            idx_bv = glb_writer._append_buffer_view(
+                bin_buf, buffer_views, idx_bytes, target=glb_writer.TARGET_ELEMENT_ARRAY_BUFFER,
+            )
+            idx_acc = len(accessors)
+            accessors.append({
+                "bufferView": idx_bv,
+                "componentType": idx_comp,
+                "count": count,
+                "type": "SCALAR",
+            })
+            primitives.append({
+                "attributes": attributes,
+                "indices": idx_acc,
+                "material": get_material(part, double_sided=double_sided),
+                "mode": mode,
+                "extras": {"shaderIndex": part, "part": PART_NAMES[part]},
+            })
+
     def append_primitive(
         part: int,
         verts: list[tuple[float, float, float]],
@@ -1326,54 +1387,15 @@ def to_glb(
             return
         conv_verts = _convert_up(verts, up)
         pos_bytes, vmin, vmax = _pack_vec3(conv_verts)
-        pos_bv = glb_writer._append_buffer_view(
-            bin_buf, buffer_views, pos_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
-        )
-        pos_acc = len(accessors)
-        accessors.append({
-            "bufferView": pos_bv,
-            "componentType": glb_writer.COMPONENT_FLOAT,
-            "count": len(conv_verts),
-            "type": "VEC3",
-            "min": vmin,
-            "max": vmax,
-        })
-        attributes: dict[str, int] = {"POSITION": pos_acc}
+        nrm_bytes = None
         if normals is not None and len(normals) == len(conv_verts):
             conv_nrm = [
                 glb_writer._normalize3(*n) for n in _convert_up(normals, up)
             ]
             nrm_bytes, _ = glb_writer._pack_f32(conv_nrm, 3)
-            nrm_bv = glb_writer._append_buffer_view(
-                bin_buf, buffer_views, nrm_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
-            )
-            nrm_acc = len(accessors)
-            accessors.append({
-                "bufferView": nrm_bv,
-                "componentType": glb_writer.COMPONENT_FLOAT,
-                "count": len(conv_nrm),
-                "type": "VEC3",
-            })
-            attributes["NORMAL"] = nrm_acc
-
         idx_bytes, idx_comp = _pack_scalar_indices(indices, len(conv_verts))
-        idx_bv = glb_writer._append_buffer_view(
-            bin_buf, buffer_views, idx_bytes, target=glb_writer.TARGET_ELEMENT_ARRAY_BUFFER,
-        )
-        idx_acc = len(accessors)
-        accessors.append({
-            "bufferView": idx_bv,
-            "componentType": idx_comp,
-            "count": len(indices),
-            "type": "SCALAR",
-        })
-        primitives.append({
-            "attributes": attributes,
-            "indices": idx_acc,
-            "material": get_material(part, double_sided=double_sided),
-            "mode": mode,
-            "extras": {"shaderIndex": part, "part": PART_NAMES[part]},
-        })
+        emit_primitive(part, pos_bytes, vmin, vmax, len(conv_verts), nrm_bytes,
+                       ((idx_bytes, len(indices)),), idx_comp, mode, double_sided)
 
     def append_polylines(
         part: int,
@@ -1382,6 +1404,14 @@ def to_glb(
         radius: float,
     ) -> None:
         if not polylines:
+            return
+        packed = _smh_groom_native.pack_geometry(polylines, live, geometry, radius, up)
+        if packed is not None:
+            mode = {"curves": MODE_LINES, "line-strip": MODE_LINE_STRIP}.get(geometry, MODE_TRIANGLES)
+            idx_comp = (glb_writer.COMPONENT_UNSIGNED_SHORT if packed.index_width == 2
+                        else glb_writer.COMPONENT_UNSIGNED_INT)
+            emit_primitive(part, packed.positions, packed.lo, packed.hi, packed.vertex_count,
+                           packed.normals, packed.index_groups(), idx_comp, mode, geometry == "ribbons")
             return
         if geometry == "curves":
             verts, idx = build_lines(polylines, live)
@@ -1402,39 +1432,15 @@ def to_glb(
                 return
             conv_verts = _convert_up(all_verts, up)
             pos_bytes, vmin, vmax = _pack_vec3(conv_verts)
-            pos_bv = glb_writer._append_buffer_view(
-                bin_buf, buffer_views, pos_bytes, target=glb_writer.TARGET_ARRAY_BUFFER,
+            vert_count = len(conv_verts)
+            idx_comp = (glb_writer.COMPONENT_UNSIGNED_SHORT if vert_count <= 65535
+                        else glb_writer.COMPONENT_UNSIGNED_INT)
+            index_groups = (
+                (_pack_scalar_indices(list(range(start_v, start_v + n_live)), vert_count)[0], n_live)
+                for start_v, n_live in ranges
             )
-            pos_acc = len(accessors)
-            accessors.append({
-                "bufferView": pos_bv,
-                "componentType": glb_writer.COMPONENT_FLOAT,
-                "count": len(conv_verts),
-                "type": "VEC3",
-                "min": vmin,
-                "max": vmax,
-            })
-            mat_idx = get_material(part)
-            for start_v, n_live in ranges:
-                strip_idx = list(range(start_v, start_v + n_live))
-                idx_bytes, idx_comp = _pack_scalar_indices(strip_idx, len(conv_verts))
-                idx_bv = glb_writer._append_buffer_view(
-                    bin_buf, buffer_views, idx_bytes, target=glb_writer.TARGET_ELEMENT_ARRAY_BUFFER,
-                )
-                idx_acc = len(accessors)
-                accessors.append({
-                    "bufferView": idx_bv,
-                    "componentType": idx_comp,
-                    "count": n_live,
-                    "type": "SCALAR",
-                })
-                primitives.append({
-                    "attributes": {"POSITION": pos_acc},
-                    "indices": idx_acc,
-                    "material": mat_idx,
-                    "mode": MODE_LINE_STRIP,
-                    "extras": {"shaderIndex": part, "part": PART_NAMES[part]},
-                })
+            emit_primitive(part, pos_bytes, vmin, vmax, vert_count, None, index_groups,
+                           idx_comp, MODE_LINE_STRIP, False)
         elif geometry == "ribbons":
             verts, nrms, idx = build_ribbons(polylines, live, width=radius * 2.0)
             append_primitive(part, verts, nrms, idx, mode=MODE_TRIANGLES, double_sided=True)
