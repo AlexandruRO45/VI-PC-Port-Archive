@@ -259,5 +259,38 @@ class TestVSadU16ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.vgprs[0], 71)
 
 
+def step_simd_sad_u16(wave: WaveState, instr: Instruction) -> None:
+    if instr.opcode != "v_sad_u16":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    for lane in range(wave.wave_size):
+        if (wave.exec_mask >> lane) & 1:
+            s0 = wave.read_lane_u32(lane, instr.src0)
+            s1 = wave.read_lane_u32(lane, instr.src1)
+            s2 = wave.read_lane_u32(lane, instr.src2)
+            wave.write_lane_u32(lane, instr.dst.index_or_val, ref_sad_u16(s0, s1, s2))
+
+
+class TestVSadU16SIMD(unittest.TestCase):
+    """SIMD multi-lane divergence and dual-half handling for v_sad_u16."""
+
+    def test_simd_dual_half_divergence(self):
+        wave = WaveState(wave_size=32)
+        wave.exec_mask = 0x0000FFFF
+        for lane in range(32):
+            wave.vgprs[lane][1] = 0x00200064
+            wave.vgprs[lane][2] = 0x00100032
+            wave.vgprs[lane][3] = 0
+            wave.vgprs[lane][0] = 777
+
+        instr = Instruction("v_sad_u16", Operand.vgpr(0), Operand.vgpr(1), Operand.vgpr(2), Operand.vgpr(3))
+        step_simd_sad_u16(wave, instr)
+
+        for lane in range(32):
+            if lane < 16:
+                self.assertEqual(wave.vgprs[lane][0], 66)
+            else:
+                self.assertEqual(wave.vgprs[lane][0], 777)
+
+
 if __name__ == "__main__":
     unittest.main()
