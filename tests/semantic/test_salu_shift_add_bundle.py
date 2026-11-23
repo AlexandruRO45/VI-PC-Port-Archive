@@ -324,6 +324,21 @@ class TestSPackLhB32B16Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 0xABCD1234)
 
+def ref_s_pack_ll_b32_b16(src0: int, src1: int) -> int:
+    """Reference mathematical oracle for s_pack_ll_b32_b16 -> D = {S1[15:0], S0[15:0]}."""
+    lo = src0 & 0xFFFF
+    hi = (src1 & 0xFFFF) << 16
+    return lo | hi
+
+
+class TestSPackLlB32B16Oracle(unittest.TestCase):
+    def test_basic_packing(self) -> None:
+        self.assertEqual(ref_s_pack_ll_b32_b16(0x1234, 0x5678), 0x56781234)
+        self.assertEqual(ref_s_pack_ll_b32_b16(0xFFFF1234, 0xEEEE5678), 0x56781234)
+
+    def test_high_halves_ignored(self) -> None:
+        self.assertEqual(ref_s_pack_ll_b32_b16(0xCAFE0001, 0xBABE0002), 0x00020001)
+
 
 if __name__ == "__main__":
     unittest.main()
