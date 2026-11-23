@@ -670,6 +670,21 @@ def rgba_probes_for_mesh(
     return pool
 
 
+# Vulkan guarantees maxImageDimension2D >= 4096; a larger first-light image only costs readback time.
+MAX_IMAGE_SIDE = 4096
+
+
+def image_side(text: str) -> int:
+    """argparse type for --width/--height: a whole number of pixels in 1..MAX_IMAGE_SIDE."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a whole number of pixels, got {text!r}") from None
+    if not 1 <= value <= MAX_IMAGE_SIDE:
+        raise argparse.ArgumentTypeError(f"expected 1..{MAX_IMAGE_SIDE}, got {value}")
+    return value
+
+
 def check_image(data: bytes, manifest: dict) -> dict:
     """The readback oracle: exact shape, coverage window, a clear corner and the centre UV.
 
@@ -680,6 +695,9 @@ def check_image(data: bytes, manifest: dict) -> dict:
             raise AssertionError(f"{field} must contain exactly four RGBA values")
 
     width, height = manifest["width"], manifest["height"]
+    for field, value in (("width", width), ("height", height)):
+        if type(value) is not int or value <= 0:
+            raise AssertionError(f"manifest {field} must be a positive integer, got {value!r}")
 
     def pixel_offset(point, field: str) -> int:
         if (
@@ -915,8 +933,8 @@ def main(argv=None) -> int:
         "--dds",
         help="an exported DDS texture (e.g. BCPack-decoded TTPF albedo) to bind via set-0 T# and sampler S#",
     )
-    ap.add_argument("--width", type=int, default=128)
-    ap.add_argument("--height", type=int, default=128)
+    ap.add_argument("--width", type=image_side, default=128, help=f"image width, 1..{MAX_IMAGE_SIDE} (default 128)")
+    ap.add_argument("--height", type=image_side, default=128, help=f"image height, 1..{MAX_IMAGE_SIDE} (default 128)")
     ap.add_argument(
         "--min-coverage",
         type=float,

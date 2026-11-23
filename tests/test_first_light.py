@@ -499,6 +499,24 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
 
+    def test_rejects_a_manifest_size_that_is_not_a_positive_integer(self):
+        for field in ("width", "height"):
+            for bad in (0, -4, 4.0, True, "4", None):
+                with self.subTest(field=field, value=bad):
+                    with self.assertRaisesRegex(AssertionError, f"manifest {field} must be a positive integer"):
+                        check_image(b"", self.manifest | {field: bad})
+
+
+class ImageSizeArgumentTests(unittest.TestCase):
+    def test_width_and_height_outside_the_range_are_usage_errors(self):
+        for flag in ("--width", "--height"):
+            for bad in ("0", "-8", "4097", "1.5", "x"):
+                with self.subTest(flag=flag, value=bad):
+                    with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as stop:
+                        fl.main(["--game", ".", flag, bad])
+                    self.assertEqual(stop.exception.code, 2)
+                    self.assertIn(flag, err.getvalue())
+
 
 class ProbeCoordinateTests(unittest.TestCase):
     rgba = (0.25, 0.75, 0.0, 1.0)
