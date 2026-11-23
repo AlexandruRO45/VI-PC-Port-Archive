@@ -482,5 +482,27 @@ class VMax3I32TranslatorIntegrationTests(unittest.TestCase):
         min_res = ref_min3_i32(a, b, c)
         self.assertNotEqual(max_res, min_res)
 
+def ref_med3_i32(a: int, b: int, c: int) -> int:
+    """RDNA2 v_med3_i32: signed 32-bit integer median of 3 values."""
+    vals = sorted([i32(a), i32(b), i32(c)])
+    return u32(vals[1])
+
+
+class VMed3I32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_med3_i32."""
+
+    def test_basic_ordering(self):
+        self.assertEqual(ref_med3_i32(10, 20, 30), 20)
+        self.assertEqual(ref_med3_i32(30, 10, 20), 20)
+        self.assertEqual(ref_med3_i32(20, 30, 10), 20)
+
+    def test_signed_values(self):
+        self.assertEqual(i32(ref_med3_i32(u32(-50), 0, 50)), 0)
+        self.assertEqual(i32(ref_med3_i32(u32(-20), u32(-10), u32(-30))), -20)
+
+    def test_duplicates(self):
+        self.assertEqual(ref_med3_i32(5, 5, 10), 5)
+        self.assertEqual(ref_med3_i32(10, 5, 10), 10)
+
 if __name__ == "__main__":
     unittest.main()
