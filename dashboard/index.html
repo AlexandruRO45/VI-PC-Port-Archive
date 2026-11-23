@@ -1152,16 +1152,29 @@ function parseReadme(text) {
   if (!sec) throw new Error('The README has no "Project status" section');
   const bold = sec.body.match(/\*\*([^*]+)\*\*/);
   const table = parseTables(sec.body)[0] || [];
+  // Merges have left the same row in the table more than once; each copy would count as one more stage.
+  const seen = new Set();
   const rows = table.map(r => {
     const vals = Object.values(r);
     return { what: plain(r.What ?? vals[0]), status: (r.Status ?? vals[1] ?? '').trim() };
-  });
+  }).filter(r => { const k = r.what.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
   const h4 = text.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i);
   return { headline: bold ? plain(bold[1]) : '', tagline: h4 ? plain(h4[1]) : '', rows };
 }
 
+/**
+ * Claimed items written as one line (since 2026-11-23): "SHADER-661 `owner` · ASSET-19 `owner` (waits for …) · …".
+ * Returns rows shaped like the table's: { ID, Owner, Status }.
+ */
+function parseClaimLine(body) {
+  const rows = [];
+  for (const m of body.matchAll(/(?:^|·)\s*([A-Z]+-\d+) `([^`]+)`(?: \(([^)]*)\))?/gm)) rows.push({ ID: m[1], Owner: m[2], Status: m[3] || '' });
+  return rows;
+}
+
 function parseWorkBlock(body) {
-  const rows = (parseTables(body)[0] || []);
+  const table = parseTables(body)[0];
+  const rows = table && table.length ? table : parseClaimLine(body);
   const plus = body.match(/Plus (\d+) with a PR/i);
   const recent = (body.match(/Recently done:\s*(.+)/i) || [])[1] || '';
   const done = [...recent.matchAll(/([A-Z]+-\d+) \(#(\d+)/g)].map(m => ({ id: m[1], pr: m[2] }));
@@ -1630,9 +1643,48 @@ async function copySummary() {
 // rounds and what followed them) and the open PR count.
 let latestCoord = null;
 let latestCoordNo = null;
+let latestCoordRecent = [];    // [{ number, created, closed }] (ms), the current coordination issue and the ones before it
 let latestCommits = [];
 let latestOpenPrs = null;
 let latestActivity = null;
+
+const COORD_TITLE_RE = /coordinating who works on what/i;
+const COORD_MOVED_RE = /moved to #(\d+)/i;
+const COORD_HOPS = 4;          // "moved to #N" links followed in one load
+const COORD_RECENT = 8;        // coordination issues asked for, newest first
+const pickCoord = d => ({ ...pickIssue(d), state: d.state, created_at: d.created_at, closed_at: d.closed_at });
+
+/**
+ * The coordination issue moves to a new number every 15 to 30 minutes: the old one is closed and its title ends in
+ * "(moved to #N)". Search lists the newest, but its index can trail behind, so the page follows the "moved to" links
+ * through the core API, and starts from the number it saw last when search has nothing newer or fails.
+ * Returns { issue, recent }, recent being the issues search and the links named, newest first.
+ */
+async function findCoordination() {
+  const known = Number(store.get('coordNo')) || 0;
+  let found = [];
+  try {
+    const r = await api(searchQ('is:issue "Coordinating who works on what" in:title') + `&sort=created&order=desc&per_page=${COORD_RECENT}`,
+      d => (d.items || []).filter(i => COORD_TITLE_RE.test(i.title)).map(pickCoord), 'coord');
+    found = r.data;
+  } catch (e) {
+    if (!known) throw e;
+    console.warn('[dashboard] coordination search failed; following the saved issue', e);
+  }
+  let issue = found.reduce((a, i) => (!a || i.number > a.number ? i : a), null);
+  if (!issue || known > issue.number) issue = (await api(`/repos/${REPO}/issues/${known}`, pickCoord, 'coordIssue')).data;
+  for (let hop = 0; hop < COORD_HOPS && issue.state === 'closed'; hop++) {
+    const next = Number((issue.title.match(COORD_MOVED_RE) || issue.body.match(COORD_MOVED_RE) || [])[1]);
+    if (!next || next <= issue.number) break;
+    found = [issue, ...found];
+    issue = (await api(`/repos/${REPO}/issues/${next}`, pickCoord, 'coordIssue')).data;
+  }
+  store.set('coordNo', issue.number);
+  const byNo = new Map([...found, issue].map(i => [i.number, {
+    number: i.number, created: Date.parse(i.created_at) || 0, closed: i.closed_at ? Date.parse(i.closed_at) : 0,
+  }]));
+  return { issue, recent: [...byNo.values()].sort((a, b) => b.number - a.number) };
+}
 
 /**
  * The status tier: README, coordination issue, activity. Calls for data that rarely changes answer from the cache
@@ -1642,8 +1694,7 @@ async function loadStatus() {
   const since = new Date(Date.now() - 864e5).toISOString().slice(0, 13) + ':00:00Z';
   const [readmeR, coordR, repoR, contribR, commitsR, mergedR, openR, commitCountR] = await Promise.allSettled([
     rawFile('README.md'),
-    api(searchQ('is:issue is:open "Coordinating who works on what" in:title') + '&per_page=5',
-      d => (d.items || []).filter(i => /coordinating who works on what/i.test(i.title)).sort((a, b) => b.number - a.number).slice(0, 1).map(pickIssue), 'coord'),
+    findCoordination(),
     api(`/repos/${REPO}`, d => ({ stars: d.stargazers_count, forks: d.forks_count, watchers: d.subscribers_count }), undefined, { maxAge: SLOW_MS }),
     api(`/repos/${REPO}/contributors?per_page=1&anon=1`, d => d.length, undefined, { maxAge: SLOW_MS }),
     api(`/repos/${REPO}/commits?sha=${encodeURIComponent(BRANCH)}&per_page=100`, d => d.map(c => ({
@@ -1660,12 +1711,14 @@ async function loadStatus() {
   try { m.readme = parseReadme(val(readmeR).data); } catch (e) { showError('#journeyBody', 'Could not read the project status table', readmeR.reason || e); }
 
   let coord = null;
-  const coordIssue = val(coordR) && val(coordR).data[0];
-  if (coordIssue) {
+  const coordFound = val(coordR);
+  if (coordFound) {
+    const coordIssue = coordFound.issue;
     try { coord = parseCoordination(coordIssue.body); } catch (e) { console.error('[dashboard] coordination parse failed', e); }
     $('#claimLink').href = coordIssue.html_url;
     latestCoordNo = coordIssue.number;
-  }
+    latestCoordRecent = coordFound.recent;
+  } else if (!cacheOnly) console.error('[dashboard] coordination issue', coordR.reason);
   latestCoord = coord || latestCoord;
 
   let d3d = null;

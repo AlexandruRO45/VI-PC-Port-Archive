@@ -5,7 +5,8 @@
  * Budget without a token (per network): search 10 a minute, core 60 an hour. One sync a minute while the tab is
  * visible costs 1-2 search calls (the feed), plus one heavier tier at most: status (4 search, 1-2 core) or the merge
  * queue (4 search), each every 5 minutes. Coordination-issue comments (core) are read every minute with a token and
- * every 3 minutes without one. That stays near 40 core calls an hour. */
+ * every 3 minutes without one; after the issue moves to a new number, the old one is read once more to its end.
+ * That stays near 40 core calls an hour. */
 'use strict';
 
 const LIVE_BACKFILL_MS = 60 * 60 * 1000;     // the first sync shows the last hour
@@ -15,6 +16,8 @@ const LIVE_MAX_EVENTS = 300;
 const LIVE_SHOWN = 80;
 const FEED_PAGE = 100;
 const COMMENTS_MS_NO_TOKEN = 3 * 60 * 1000;
+const COMMENTS_PAGE = 100;                   // comments per request, GitHub's maximum
+const COMMENT_ISSUES_MAX = 4;                // coordination issues read per sync: the current one and those just moved
 const MANUAL_MIN_MS = 20 * 1000;             // ↻ at most this often
 const ROUND_GAP_MS = 90 * 1000;              // merges closer together than this belong to one round
 const ROUND_MIN = 5;
@@ -85,7 +88,7 @@ const live = {
   events: [],           // { key, kind, ts, n, title, user, avatar, url }
   keys: new Set(),
   cursor: 0,            // start of the last feed request that GitHub answered (ms)
-  commentsCursor: 0,
+  commentsCursors: {},  // coordination issue number → start of its last comment request GitHub answered (ms)
   commentsAt: 0,
   coveredFrom: 0,       // the feed is complete from here on
   partial: false,       // a sync had more updates than two pages hold
@@ -102,7 +105,7 @@ function restoreLive() {
   live.keys = new Set(live.events.map(e => e.key));
   // A saved cursor older than the backfill window is worth nothing: start from the last hour again.
   live.cursor = now - (saved.cursor || 0) < LIVE_BACKFILL_MS ? saved.cursor : 0;
-  live.commentsCursor = now - (saved.commentsCursor || 0) < LIVE_BACKFILL_MS ? saved.commentsCursor : 0;
+  live.commentsCursors = Object.fromEntries(Object.entries(saved.commentsCursors || {}).filter(([, at]) => now - at < LIVE_BACKFILL_MS));
   live.coveredFrom = live.cursor ? (saved.coveredFrom || 0) : 0;
   live.feedAt = live.cursor ? (saved.feedAt || 0) : 0;
   live.commentsAt = saved.commentsAt || 0;
@@ -110,7 +113,7 @@ function restoreLive() {
 
 function saveLive() {
   store.set('live', {
-    events: live.events, cursor: live.cursor, commentsCursor: live.commentsCursor, coveredFrom: live.coveredFrom,
+    events: live.events, cursor: live.cursor, commentsCursors: live.commentsCursors, coveredFrom: live.coveredFrom,
     feedAt: live.feedAt, commentsAt: live.commentsAt,
   });
 }
@@ -173,11 +176,23 @@ async function syncFeed() {
 
 const pickComment = c => ({ id: c.id, user: c.user ? c.user.login : '', avatar: c.user ? c.user.avatar_url : '', at: c.created_at, url: c.html_url, body: String(c.body || '').slice(0, 600) });
 
-function commentEvent(c) {
+function commentEvent(c, n) {
   const m = c.body.match(COMMAND_RE);
   const kind = m ? COMMAND_KIND[m[1].toLowerCase()] : 'comment';
   const text = m ? m[2] : (c.body.split('\n').find(l => l.trim()) || '');
-  return { key: 'c:' + c.id, kind, ts: Date.parse(c.at), n: latestCoordNo, title: plain(text).slice(0, 180), user: c.user, avatar: c.avatar, url: c.url };
+  return { key: 'c:' + c.id, kind, ts: Date.parse(c.at), n, title: plain(text).slice(0, 180), user: c.user, avatar: c.avatar, url: c.url };
+}
+
+/**
+ * The coordination issues whose comments the feed still needs: the current one, and earlier ones that closed inside
+ * the feed window and were not read to their end yet (the issue moves every 15 to 30 minutes).
+ */
+function commentIssues(now) {
+  const windowStart = now - LIVE_BACKFILL_MS;
+  const cursors = live.commentsCursors;
+  const recent = latestCoordRecent.some(i => i.number === latestCoordNo) ? latestCoordRecent : [{ number: latestCoordNo, created: 0, closed: 0 }];
+  return recent.filter(i => i.number === latestCoordNo
+    || (i.closed >= windowStart && !(cursors[i.number] - LIVE_OVERLAP_MS > i.closed))).slice(0, COMMENT_ISSUES_MAX);
 }
 
 /** Claims and other commands on the coordination issue. Core API, so every 3 minutes without a token. */
@@ -187,10 +202,21 @@ async function syncComments() {
   const every = activeToken() ? SYNC_MS - FEED_SLACK_MS : (attention() === 'active' ? COMMENTS_MS_NO_TOKEN : IDLE_COMMENTS_MS);
   if (now - live.commentsAt < every || !coreSpare()) return;
   live.commentsAt = now;
-  const from = Math.max(live.commentsCursor ? live.commentsCursor - LIVE_OVERLAP_MS : 0, now - LIVE_BACKFILL_MS);
-  const r = await api(`/repos/${REPO}/issues/${latestCoordNo}/comments?since=${iso(from)}&per_page=100`, d => d.map(pickComment), 'live:comments');
-  r.data.forEach(c => addEvent(commentEvent(c)));
-  if (!r.stale) live.commentsCursor = now;
+  const issues = commentIssues(now);
+  const cursors = {};
+  for (const i of issues) {
+    const seen = live.commentsCursors[i.number];
+    // An issue seen for the first time is read from its creation: the page may learn of a move minutes after it.
+    const from = Math.max(seen ? seen - LIVE_OVERLAP_MS : i.created, now - LIVE_BACKFILL_MS);
+    const r = await api(`/repos/${REPO}/issues/${i.number}/comments?since=${iso(from)}&per_page=${COMMENTS_PAGE}`, d => d.map(pickComment), 'live:comments');
+    r.data.forEach(c => addEvent(commentEvent(c, i.number)));
+    // A full page leaves comments unread (oldest come first): the next sync carries on from the last one read.
+    const last = r.data.length >= COMMENTS_PAGE ? Date.parse(r.data[r.data.length - 1].at) : 0;
+    cursors[i.number] = r.stale ? seen : last ? last + LIVE_OVERLAP_MS : now;
+  }
+  // Issues read to their end drop out; their cursor stays so the next sync knows it.
+  for (const [n, at] of Object.entries(live.commentsCursors)) if (!(n in cursors) && now - at < LIVE_BACKFILL_MS) cursors[n] = at;
+  live.commentsCursors = Object.fromEntries(Object.entries(cursors).filter(([, at]) => at));
 }
 
 /** Reverts on main, from the commits the status tier already loaded. */
