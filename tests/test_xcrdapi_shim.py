@@ -27,6 +27,8 @@ class XcrdapiShimTests(unittest.TestCase):
         )
         self.assertIn("if (!ppv) return E_POINTER;", text)
         self.assertIn("if (!riid) return E_INVALIDARG;", text)
+        self.assertIn("return E_NOINTERFACE;", text)
+        self.assertIn("IsEqualIID", text)
         self.assertIn("return E_NOTIMPL;", text)
         self.assertIn("factory_query_interface", text)
         self.assertIn("factory_add_ref", text)

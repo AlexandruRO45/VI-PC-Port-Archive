@@ -71,6 +71,9 @@ int main() {
     void* factory = reinterpret_cast<void*>(uintptr_t{0x5a5a5a5a5a5a5a5aULL});
     check(get_factory(nullptr, &factory) == E_INVALIDARG && factory == nullptr,
           "DStorageGetFactory(nullptr, &out) zeroes out and returns E_INVALIDARG");
+    factory = reinterpret_cast<void*>(uintptr_t{0x5a5a5a5a5a5a5a5aULL});
+    check(get_factory(&IID_NULL, &factory) == E_NOINTERFACE && factory == nullptr,
+          "DStorageGetFactory(&IID_NULL, &out) zeroes out and returns E_NOINTERFACE");
 
     // Valid call returns S_OK and a non-null COM factory stub.
     check(get_factory(&kTestIid, &factory) == S_OK && factory != nullptr,
@@ -85,10 +88,25 @@ int main() {
     const auto add_ref = reinterpret_cast<AddRefRawFn>(vtable[1]);
     const auto release = reinterpret_cast<ReleaseRawFn>(vtable[2]);
 
+    constexpr IID unsupported{}; // IID_NULL
+    void* result = nullptr;
+    const HRESULT hr = qi(factory, &unsupported, &result);
+    std::printf("IID_NULL: hr=%08lx same_factory=%d\n", static_cast<unsigned long>(hr), result == factory);
+    check(hr == E_NOINTERFACE && result == nullptr, "unsupported IID is refused");
+    if (SUCCEEDED(hr) && result == factory) release(factory);
+
+    constexpr IID kUnknownInterface = {0x11111111, 0x2222, 0x3333, {0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb}};
+    void* unknown_out = reinterpret_cast<void*>(uintptr_t{0x1234});
+    check(qi(factory, &kUnknownInterface, &unknown_out) == E_NOINTERFACE && unknown_out == nullptr,
+          "QueryInterface with an unsupported non-null IID zeroes ppv and returns E_NOINTERFACE");
+
     void* qi_out = reinterpret_cast<void*>(uintptr_t{0x1234});
     check(qi(factory, &kTestIid, nullptr) == E_POINTER, "QueryInterface with null ppv returns E_POINTER");
     check(qi(factory, nullptr, &qi_out) == E_INVALIDARG && qi_out == nullptr,
           "QueryInterface with null riid zeroes ppv and returns E_INVALIDARG");
+    check(qi(factory, &kTestIid, &qi_out) == S_OK && qi_out == factory,
+          "QueryInterface(IDStorageFactory) returns S_OK and the factory singleton");
+    check(release(factory) == 1, "Release after QueryInterface(IDStorageFactory) restores reference count to 1");
     check(qi(factory, &IID_IUnknown, &qi_out) == S_OK && qi_out == factory,
           "QueryInterface(IID_IUnknown) returns S_OK and the factory singleton");
 
