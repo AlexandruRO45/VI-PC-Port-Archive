@@ -563,11 +563,13 @@ What is implemented (all of it testable without the game):
   submission ends with a barrier to the host, so a readback buffer holds the GPU's writes once the fence wait
   returns. Children hold a reference to the proxy, not
   the inner device, so `GetDevice` always returns the Xbox-ABI object. Each live D3D12 queue leases a distinct
-  graphics-family `VkQueue`; the standalone device requests up to 16. The queues still share a submit lock for
+  `VkQueue` while one is free (its own type's family first, then the graphics family); the standalone device
+  requests up to 16 per family. The queues still share a submit lock for
   replay state, but Wait-before-Signal between them can make progress (D3D-97), and a batch that waits for a Signal
   not yet submitted is held on the CPU so layouts follow dependency order (section 4.4). Caller-owned Vulkan devices can
   supply additional handles through `VulkanDeviceInfo::command_queues`; without them they retain legacy single-queue
-  behavior. When supplied handles are exhausted, `CreateCommandQueue` fails instead of silently sharing a queue.
+  behavior. When every handle is in use, the new D3D12 queue shares the `VkQueue` that has the fewest D3D12 queues
+  (section 4.4, "More D3D12 queues than Vulkan queues"); it used to fail with `E_OUTOFMEMORY`.
   Dedicated compute/transfer
   *families* would also require resource queue-family ownership handling and remain future work.
 
@@ -2045,6 +2047,39 @@ Pipeline creation:
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
 
+**Implemented (D3D-29): pipeline state streams, mesh PSOs and `DispatchMesh`.**
+- **Device:** `VK_EXT_mesh_shader` with `meshShader` is enabled where the GPU has it (`VulkanDeviceInfo::mesh_shader`).
+  `taskShader` is not enabled, since the corpus has no amplification shaders. `D3D12_OPTIONS7` reports
+  `MeshShaderTier` 1 only then; without the extension it reports `NOT_SUPPORTED` and mesh PSOs are `E_NOTIMPL`.
+- **Streams:** `CreatePipelineState` parses the stream in the d3dx12.h layout: a subobject type, then its
+  description at that description's alignment, each subobject pointer-aligned.
+  - Every type up to `RASTERIZER2` is read.
+  - Missing subobjects take the runtime's defaults: depth test on with `LESS`, back-face culling, no blending, sample
+    mask `0xFFFFFFFF`, one sample.
+  - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
+    a VS stream builds the same PSO as the classic call.
+  - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
+    tessellation or GS, CS with a graphics stage, or no stage at all.
+  - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, separate front and back stencil
+    masks, view instancing.
+  - `RASTERIZER1`/`2`'s float depth bias is truncated to the integer the PSO path takes, with a log.
+- **Mesh PSO:** the MS (`ms` index entry by FSSM hash) and PS on the mesh stage. It has no vertex input or input
+  assembly; the input layout, topology type and strip cut are ignored, as D3D12 ignores them for mesh PSOs. Topology
+  and strides are not dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065/07066). Creation
+  is refused when the index's `max_vertices`/`max_primitives` or the workgroup size exceed the device's
+  `VkPhysicalDeviceMeshShaderPropertiesEXT`.
+- **`DispatchMesh`:** recorded as a `Draw` with `mesh` set; the thread-group counts go in `count`/`instances`/`first`.
+  It takes the same state snapshot as `DrawInstanced`: render targets, root arguments, viewport, scissor, blend
+  factor, stencil references. Replay issues `vkCmdDrawMeshTasksEXT`.
+  - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
+  - **Not recorded:** an empty grid.
+  - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
+- **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
+  Wine), validation-clean.
+  - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
+  - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
+    question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
+
 ## 4. Object model mapping
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
@@ -2702,6 +2737,45 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   `VUID-VkSubmitInfo-pSignalSemaphores-03242`; `vk_presenter_sync_test` and `d3d12_m4_compute_test` (which
   submits the compute list first and releases its PSOs and root signature before the copy that feeds it) fail
   without the Present ordering and the pins.
+- **More D3D12 queues than Vulkan queues** (`pick_queue_slot` in `src/queue_families.h`, `CreateCommandQueue`;
+  test `d3d12_queue_share_test`). A GPU can expose fewer `VkQueue`s than a title creates D3D12 queues: the Intel
+  UHD 770 on Windows and lavapipe have one family with `queueCount` 1, so the second D3D12 queue of any type was
+  refused with `E_OUTOFMEMORY` ("no independent Vulkan queue available") and a title with a DIRECT and a COMPUTE
+  queue stopped at boot (PingasMech, #4863). A new D3D12 queue takes an unused `VkQueue` of its own type's family,
+  then of the graphics family, as before (D3D-97: one `VkQueue` per live D3D12 queue while there are enough, so
+  nothing changes on a GPU with enough queues; an RTX 5080 gives 16 graphics, 8 compute and 2 transfer queues); when
+  every one is in use it shares the one with the fewest D3D12 queues (its own family's first on a tie) and logs that
+  once per type. D3D12 queues on one `VkQueue` stay separate objects: each keeps its own batches in order, its own
+  progress timeline and its own held operations; the `VkQueue` runs their batches one after the other, in the order
+  they reach it, so they lose concurrency, not correctness (as on one family, below). What would break is a GPU
+  wait that no submitted signal satisfies landing on the shared `VkQueue` ahead of the signal it waits for, which
+  never makes progress. The holding above already rules that out: a batch reaches `vkQueueSubmit` only once every
+  fence value it waits for has a *submitted* Signal (earlier on the same `VkQueue`, or on another one) or has been
+  set by the CPU. One case let the CPU half slip: a CPU `Signal` that has to wait behind a queue Signal the GPU has
+  not reached yet (`VUID-VkSemaphoreSignalInfo-value-03259`, applied later by the fence wait thread) never told the
+  held queues, so a queue waiting for that value was held for ever, on separate `VkQueue`s too. The wait thread now
+  reports the value once it has set it, and releases what it satisfies; reporting it earlier, when the CPU called
+  `Signal`, would send the waiting batch ahead of the queue Signal it depends on, which on a shared `VkQueue` never
+  completes. `vkQueueSubmit`, `vkQueueBindSparse`, `vkQueuePresentKHR`, `vkQueueWaitIdle` and the queue labels
+  need the `VkQueue` externally synchronised; every call the layer makes holds the device's one submit lock
+  (`VulkanContext::submit_mutex`), which covers shared `VkQueue`s as it covers the staging queue the first DIRECT
+  queue already shares. A per-`VkQueue` lock (#3841) must key on the `VkQueue` handle, not the D3D12 queue. Costs on
+  a shared `VkQueue`: `GetClockCalibration` without calibrated timestamps and the destruction of a D3D12 queue wait
+  for the other D3D12 queues' submitted work too, and queue debug labels (`BeginEvent`/`EndEvent`) of the D3D12
+  queues interleave on it. Two test settings make the standalone device look like such a GPU, so the sharing path
+  runs anywhere: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (at most N `VkQueue`s per family) and
+  `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` (COMPUTE and COPY in the graphics family); both together are one family with
+  one queue (`docs/testing.md`, "Choosing the GPU"). Only the test executables apply them: the game's device
+  (`d3d12_xs`, `LEONIDA_D3D12=vulkan`) ignores them and says so, so a variable left in the environment cannot put
+  every queue of the game on one `VkQueue` (`run_tiny_frame_queue_test_settings`). Measured on an RTX 5080 (Linux, driver 580.65.06, Wine 11)
+  and on lavapipe, under the validation layer with synchronization validation: `d3d12_queue_share_test` passes
+  with no setting, with one queue per family, with one queue in all and on lavapipe (36 queues, a buffer copied
+  exactly through all of them consumer first and producer first, 9 deferred CPU Signal cases, 4 threads on 9 queues:
+  2,000 iterations with all 9 on one `VkQueue` of the RTX 5080, 80,000 on lavapipe; a fence released right after
+  the GPU passed the queue Signal its deferred CPU Signal waited behind, 900 times per mode, the held batch running
+  every time), 0 validation messages; on main
+  it fails at the 27th queue on the RTX 5080 and at the 2nd on lavapipe, and the first deferred case hangs. The layer
+  half of `d3d12_queue_handover_test` runs its 371 cases exact in all four (on lavapipe main ran 0: one queue).
 - `SetEventOnCompletion(value, hEvent)`: a small wait thread calls `vkWaitSemaphores` and `SetEvent`. Reuse one
   thread with a condition variable; do not create a thread per fence.
 - `GetCompletedValue` is `vkGetSemaphoreCounterValue`; CPU `Signal` is `vkSignalSemaphore`.
@@ -3134,6 +3208,25 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
   a queue without the summation helper), these three commands are refused before helper scratch allocation or
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
+- **Mesh draws during a pipeline-statistics query** (D3D-291). D3D12 allows `DispatchMesh` inside a statistics query
+  and reads its input-assembly, vertex, geometry and tessellation fields as 0. Vulkan forbids `vkCmdDrawMeshTasksEXT`
+  while a query with those counters is active (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's
+  pool has all eleven. So a statistics query that holds a mesh draw is split as above, and a split before a draw stays
+  outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
+  with only clipping invocations and primitives, fragment and compute invocations. A later draw of the other kind ends
+  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
+  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
+  its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
+  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
+  (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
+  `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their
+  shared segments: a draw of the other kind than the open segment's opens a new one, so every query that segment
+  belongs to sums both kinds. `replay_query_predication_test` (cases 15 and 16) checks the split points, the segment
+  kinds and the resolve plan on the CPU. `d3d12_mesh_test` resolves a query around a vertex, two mesh and a vertex
+  draw, one around a mesh draw and one around the two vertex draws: the vertex fields count only the two triangles,
+  and the mixed query has more clipping and pixel-shader invocations than the vertex-only one. On the RX 9060 XT
+  (RADV), the clipping counts add up exactly (2 + 10 = 12).
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
@@ -3334,6 +3427,7 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Binning | The GDK topic index names Xbox binning modes (NDA content) | Should be a no-op if the game uses it only as an optimisation: it changes how a render pass uses on-chip memory, not the result. Log and ignore for the first boot; revisit for performance. **Open** whether the game relies on binning for correctness. |
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
+| Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
