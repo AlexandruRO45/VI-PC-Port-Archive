@@ -1510,6 +1510,7 @@ void destroy_upload_state(void* upload_state) {
 constexpr unsigned kListNotForwarded = ~0u;
 constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
+constexpr unsigned kConsoleOMSetDepthBounds = 70;
 constexpr unsigned kConsoleReset = 139;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
@@ -1520,6 +1521,7 @@ constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 59) return slot - 4;           // PC chain, shifted +4
     if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
+    if (slot == kConsoleOMSetDepthBounds) return 62;  // OMSetDepthBounds(FLOAT, FLOAT): PC GCL1; typed thunk
     if (slot == kConsoleBarrier) return 80;    // D3D12_BARRIER_GROUP (Package; PC GCL7)
     if (slot == kConsoleReset) return 10;      // Reset(allocator, pso): measured on the retail title (Pipodi)
     return kListNotForwarded;
@@ -1769,9 +1771,34 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
     }
 }
 
+// OMSetDepthBounds (console slot 70 -> PC slot 62, ID3D12GraphicsCommandList1) takes FLOAT Min and FLOAT Max, which
+// the Windows x64 ABI passes in XMM1 and XMM2. The all-uint64_t list_slot thunk reads RDX and R8 instead and never
+// forwards the XMM registers, so this slot gets a typed thunk that carries both floats to the real list.
+void WINAPI list_om_set_depth_bounds(ListProxy* self, FLOAT min, FLOAT max) {
+    std::uint32_t min_bits = 0, max_bits = 0;
+    std::memcpy(&min_bits, &min, sizeof(min_bits));
+    std::memcpy(&max_bits, &max, sizeof(max_bits));
+    note_list_slot(kConsoleOMSetDepthBounds, min_bits, max_bits, 0, 0,
+                   self->device->console_layout.load(std::memory_order_relaxed));
+    constexpr unsigned pc = console_to_pc_list_slot(kConsoleOMSetDepthBounds);
+    if (pc >= self->pc_slot_count) {  // the real list stops before ID3D12GraphicsCommandList1; void, so no HRESULT
+        static std::atomic<bool> beyond_warned{false};
+        bool expected = false;
+        if (beyond_warned.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: list slot %u maps to PC slot %u, beyond the real list's %u slots\n",
+                         kConsoleOMSetDepthBounds, pc, self->pc_slot_count);
+        return;
+    }
+    using DepthBoundsFn = void(WINAPI*)(ID3D12GraphicsCommandList*, FLOAT, FLOAT);
+    auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+    reinterpret_cast<DepthBoundsFn>(real_vtable[pc])(self->real, min, max);
+}
+
 template <std::size_t... I>
 void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
+    vtable[kConsoleOMSetDepthBounds] = reinterpret_cast<void*>(&list_om_set_depth_bounds);
 }
 
 void** get_list_vtable() {

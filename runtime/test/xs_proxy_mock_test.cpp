@@ -92,12 +92,15 @@ struct Mock {
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][5];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
+    FLOAT depth_bounds_min;              // list slot 62 (OMSetDepthBounds): the floats as received, typed
+    FLOAT depth_bounds_max;
 };
 
 Mock g_pool[256];
 unsigned g_pool_used = 0;
 
 void** mock_vtable();
+void** mock_list_vtable();
 
 Mock* new_mock(Kind kind) {
     if (g_pool_used == std::size(g_pool)) {
@@ -106,7 +109,7 @@ Mock* new_mock(Kind kind) {
     }
     Mock* m = &g_pool[g_pool_used++];
     std::memset(m, 0, sizeof(*m));
-    m->vtable = mock_vtable();
+    m->vtable = (kind == Kind::list || kind == Kind::command_list) ? mock_list_vtable() : mock_vtable();
     m->kind = kind;
     return m;
 }
@@ -249,6 +252,14 @@ std::uint64_t WINAPI mock_slot(Mock* self, std::uint64_t a1, std::uint64_t a2, s
     }
 }
 
+// PC ID3D12GraphicsCommandList1::OMSetDepthBounds(FLOAT Min, FLOAT Max), slot 62: the floats arrive in XMM1 and
+// XMM2, which the generic word thunk never reads, so the list mocks take this slot typed.
+void WINAPI mock_om_set_depth_bounds(Mock* self, FLOAT min, FLOAT max) {
+    ++self->calls[62];
+    self->depth_bounds_min = min;
+    self->depth_bounds_max = max;
+}
+
 // PC ID3D12Device::CreateCommandList takes six words after `this`, one more than the generic mock thunk declares, so
 // it gets its own entry in the table: the out pointer is a6 (first stack argument on x64) and has to be written.
 HRESULT WINAPI mock_create_command_list(Mock* self, std::uint64_t node_mask, std::uint64_t type,
@@ -278,6 +289,17 @@ void** mock_vtable() {
     static const bool filled = [] {
         fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
         table[12] = reinterpret_cast<void*>(&mock_create_command_list);
+        return true;
+    }();
+    (void)filled;
+    return table;
+}
+
+void** mock_list_vtable() {
+    static void* table[kMockSlots];
+    static const bool filled = [] {
+        fill_mock_vtable(table, std::make_index_sequence<kMockSlots>{});
+        table[62] = reinterpret_cast<void*>(&mock_om_set_depth_bounds);
         return true;
     }();
     (void)filled;
@@ -956,6 +978,62 @@ int check_lists() {
     return 0;
 }
 
+// ---- 9b. OMSetDepthBounds (console list slot 70) ----
+// The retail caller passes only `this` and two floats (XMM1 = Min, XMM2 = Max) through console slot 70. The generic
+// word thunk returned 0 for that slot and never reached the real list; the typed thunk forwards both floats to PC
+// slot 62 (ID3D12GraphicsCommandList1) and drops the call when the real list stops before that interface.
+
+using DepthBoundsFn = void(WINAPI*)(void*, FLOAT, FLOAT);
+
+void depth_bounds(void* list, FLOAT min, FLOAT max) {
+    void* const* vtable = *reinterpret_cast<void* const* const*>(list);
+    reinterpret_cast<DepthBoundsFn>(vtable[70])(list, min, max);
+}
+
+int check_depth_bounds() {
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    for (const bool full_chain : {true, false}) {
+        Mock* mock = nullptr;
+        void* device = make_device(mock, 9, true, true, full_chain);
+        EXPECT(device);
+        void* allocator = nullptr;
+        EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+        void* list = nullptr;
+        EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                         word(&list))) == S_OK);
+        Mock* const real = mock->last_child;
+        EXPECT(xs::is_list_proxy(list) && word(xs::list_proxy_real_list(list)) == word(real));
+        const std::uint64_t hits = xs::list_slot_hits(70);
+        if (full_chain) {
+            // First call (logged) and a second one past the first-call log: both reach PC slot 62 with the floats
+            // intact, including a non-default pair and the D3D12 default pair (0, 1).
+            depth_bounds(list, 0.125f, 0.875f);
+            EXPECT(real->calls[62] == 1 && real->depth_bounds_min == 0.125f && real->depth_bounds_max == 0.875f);
+            depth_bounds(list, 0.0f, 1.0f);
+            EXPECT(real->calls[62] == 2 && real->depth_bounds_min == 0.0f && real->depth_bounds_max == 1.0f);
+            // Min > Max is the title's call to make; the proxy forwards it unchanged.
+            depth_bounds(list, 0.75f, 0.25f);
+            EXPECT(real->calls[62] == 3 && real->depth_bounds_min == 0.75f && real->depth_bounds_max == 0.25f);
+            // No neighbouring PC slot was hit on the way.
+            EXPECT(real->calls[61] == 0 && real->calls[63] == 0 && real->calls[70] == 0);
+            EXPECT(xs::list_slot_hits(70) == hits + 3);
+        } else {
+            // A real list with ID3D12GraphicsCommandList only (60 slots): slot 62 does not exist, so the call is
+            // recorded and dropped, never forwarded past the real vtable.
+            depth_bounds(list, 0.25f, 0.5f);
+            EXPECT(real->calls[62] == 0 && real->depth_bounds_min == 0.0f && real->depth_bounds_max == 0.0f);
+            EXPECT(xs::list_slot_hits(70) == hits + 1);
+        }
+        EXPECT(release(list) == 0 && real->refs == 0);
+        EXPECT(release(allocator) == 0);
+        EXPECT(release(device) == 0 && mock->refs == 0);
+    }
+    std::printf("%s: console list slot 70 reaches PC OMSetDepthBounds with Min/Max intact; a list without "
+                "ID3D12GraphicsCommandList1 drops it\n", g_label);
+    return 0;
+}
+
 // ---- 10. SignalX layout detection ------------------------------------------------------------
 // A fence at queue slot 25 while the layout is still unknown is itself the newer-layout evidence: a title that
 // signals only through SignalX never reaches Signal/Wait at 16/17, so an unanswered SignalX used to return
@@ -1211,7 +1289,7 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
-        check_signalx_detection() || check_list_tail_names())
+        check_depth_bounds() || check_signalx_detection() || check_list_tail_names())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

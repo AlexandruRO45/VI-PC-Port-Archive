@@ -161,12 +161,28 @@ end; on a full buffer they call the vtable method the record stands for (Package
 | 41, 43, 45 | `Set*RootDescriptor*` / table | Package + sibling layer |
 | 48 | `IASetVertexBuffers` | Sibling layer |
 | 51 | `ClearDepthStencilView` | Sibling layer |
+| 70 | `OMSetDepthBounds(FLOAT Min, FLOAT Max)` → PC slot 62 (`ID3D12GraphicsCommandList1`) | **Measured here**: static read of the retail executable — the caller passes only `this` and two floats (XMM1 = Min, XMM2 = Max) and calls it right after every `OMSetRenderTargets`. The floats travel in XMM registers, so the proxy gives this slot a typed thunk; a real list without `ID3D12GraphicsCommandList1` drops the call |
 | 80 | `ExecuteIndirect` | Sibling layer (note: the package measured slot 80 as a console-only call, a `Dispatch`-with-extra-word shape; slot assignments past 61 differ between the two sources — unconfirmed) |
 | 83 | `CopyTextureRegionX` (older layout) | Sibling layer; the package measured a `CopyTextureRegion`-shaped call at slot 85 — consistent with the newer layout (+2) |
 | 108 | `ResolveSubresourceRegion` | Sibling layer |
 | 139 | `Reset(allocator, pso)` → PC slot 10 | **Measured here**: retail 1.0.2.1 (Pipodi) — the title creates a list, `Close`s at slot 9, then calls 139 with `(allocator proxy, 0)` before recording; the proxy unwraps the allocator and forwards to PC `Reset` |
 | 146 | enhanced `Barrier` | **Confirmed here**: Package (console slot 146 takes one `D3D12_BARRIER_GROUP`; PC equivalent is GCL7 slot 80) |
 | 148 | `AllocateUploadMemory` `(size, alignment)`; the returned CPU pointer is the GPU address in unified memory | Package + sibling layer |
+
+Measured but not yet named (**measured here**, retail executable; shapes and call counts only). The
+proxy records these and returns 0 without a PC call, except 146, which it already forwards:
+
+| Slot | Arguments after `this` | When | Reading |
+|---:|---|---|---|
+| 71 | (GPU VA, 32-bit value, 0, 0) | — | writes a value to an address immediately |
+| 72 | (base + index·8 as a GPU VA, 0, 0, stack word = 1) | twice per frame | possibly a GPU timestamp write (hypothesis) |
+| 74 | (GPU VA, 7, value, stack word = 1) | — | — |
+| 75 | one bool | — | derived from a flag of the render-target description and cached by the caller |
+| 126 | (count, pointer to an array of 2 dwords) | — | a pair of masks extracted from bit fields; possibly stencil masks (hypothesis) |
+| 131 | (`0xc3c0`, `0x80020000`, …) | once, at list creation | — |
+| 132 | (`0x700000`, …) | once, at list creation | — |
+| 142 | one 64-bit value, default −1 | — | cached by the caller |
+| 146 | (count, array) | — | a barrier group the renderer context fills; routed to PC `Barrier` (row above) |
 
 Layout shift on the list tail (sibling layer): from `CopyTextureRegionX` on, methods sit two slots
 later in the newer layout — newer→older pairs 85→83, 86→84, 87→85, 90→88, 91→89, 92→90, 95→93,
