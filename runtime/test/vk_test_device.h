@@ -9,6 +9,7 @@
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
 #include "vk_device_pick.h"
+#include "vk_validation.h"
 #include "../src/subgroup_size.h"
 
 #include <algorithm>
@@ -263,6 +264,9 @@ public:
         }
         instance_info.enabledExtensionCount = std::uint32_t(instance_extensions.size());
         instance_info.ppEnabledExtensionNames = instance_extensions.data();
+        if (validation) {
+            leonida::vk_test::enable_portability_enumeration(instance_proc, instance_info, instance_extensions);
+        }
         VkResult result = create_instance(&instance_info, nullptr, &instance);
         if (result == VK_ERROR_INCOMPATIBLE_DRIVER) return DeviceStatus::unavailable;
         if (result != VK_SUCCESS) return failure("vkCreateInstance", result);
@@ -539,6 +543,11 @@ public:
         enabled = enable;
         std::vector<const char*> device_extensions;
         v13_.add_extensions(device_extensions);
+        if (validation && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, "VK_KHR_portability_subset") == 0;
+            })) {
+            leonida::vk_test::add_unique_name(device_extensions, "VK_KHR_portability_subset");
+        }
         conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
         });

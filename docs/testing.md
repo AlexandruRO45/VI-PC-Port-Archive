@@ -48,8 +48,10 @@ This page collects the setup steps and the problems testers have run into so far
     Running the GPU tests needs a Vulkan loader and a compatible driver.
   - Linux: CMake 3.24+, GCC or Clang, and the Vulkan headers and loader. The headers should be recent enough
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
-  - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
-    load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead.
+  - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools` (add
+    `vulkan-validationlayers` for `LEONIDA_VK_VALIDATION=1`, which needs the Vulkan loader rather than direct MoltenVK:
+    `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib VK_LAYER_PATH=/opt/homebrew/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d LEONIDA_VULKAN_LOADER=/opt/homebrew/lib/libvulkan.1.dylib`).
+    By default the test programs load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead.
 
 ## Build the test programs
 

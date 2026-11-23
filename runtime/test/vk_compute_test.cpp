@@ -306,6 +306,7 @@ static int run(int argc, char** argv) {
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pNext = &f2;
     if (fma.supported()) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &fma_extension; }
+    validation.prepare_device(gipa, inst, pd, dci);
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, nullptr, &dev));
 #define LOADD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
