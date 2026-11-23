@@ -450,5 +450,28 @@ class TestSMulHiI32Validation(unittest.TestCase):
             hi = ref_s_mul_hi_i32(a, b)
             self.assertLessEqual(hi, 0x3FFFFFFF)
 
+def ref_s_mul_hi_u32(s0: int, s1: int) -> int:
+    """High 32 bits of 64-bit unsigned integer product."""
+    a = u32(s0)
+    b = u32(s1)
+    prod = a * b
+    return (prod >> 32) & MASK32
+
+
+class TestSMulHiU32Oracle(unittest.TestCase):
+    def test_oracle_small_product(self) -> None:
+        self.assertEqual(ref_s_mul_hi_u32(100, 200), 0)
+
+    def test_oracle_exact_2_32_boundary(self) -> None:
+        # 0x80000000 * 2 = 0x100000000 -> high 32 bits is 1
+        self.assertEqual(ref_s_mul_hi_u32(0x80000000, 2), 1)
+
+    def test_oracle_max_uint32_squared(self) -> None:
+        # (2^32 - 1)^2 = 2^64 - 2^33 + 1 = 0xFFFFFFFE_00000001 -> high 32 bits is 0xFFFFFFFE
+        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0xFFFFFFFF), 0xFFFFFFFE)
+
+    def test_oracle_zero_operands(self) -> None:
+        self.assertEqual(ref_s_mul_hi_u32(0xFFFFFFFF, 0), 0)
+
 if __name__ == "__main__":
     unittest.main()
