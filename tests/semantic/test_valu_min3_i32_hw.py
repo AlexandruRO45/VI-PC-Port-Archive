@@ -217,5 +217,74 @@ class TestVMin3I32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             instr.validate()
 
+# -----------------------------------------------------------------------------
+# Commit 3: Deterministic Scalar Instruction Interpreter
+# -----------------------------------------------------------------------------
+
+@dataclass
+class LaneRegisterState:
+    vgprs: List[int] = field(default_factory=lambda: [0] * 256)
+    sgprs: List[int] = field(default_factory=lambda: [0] * 106)
+
+    def read_operand(self, op: RegOperand) -> int:
+        if op.kind == RegisterKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.kind == RegisterKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.kind == RegisterKind.LITERAL32:
+            return op.index & MASK32
+        raise NotImplementedError(f"Unsupported operand kind: {op.kind}")
+
+    def write_vgpr(self, index: int, val: int) -> None:
+        self.vgprs[index] = val & MASK32
+
+
+class ScalarInterpreter:
+    """Deterministic scalar instruction interpreter executing v_min3_i32 for a single lane."""
+
+    @staticmethod
+    def step(instr: VMin3I32Instruction, state: LaneRegisterState) -> None:
+        instr.validate()
+        s0_val = state.read_operand(instr.src0)
+        s1_val = state.read_operand(instr.src1)
+        s2_val = state.read_operand(instr.src2)
+
+        res = v_min3_i32_oracle(s0_val, s1_val, s2_val)
+        state.write_vgpr(instr.dst.index, res)
+
+
+class TestVMin3I32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for deterministic scalar interpreter execution."""
+
+    def setUp(self):
+        self.state = LaneRegisterState()
+
+    def test_interpreter_step_basic(self):
+        self.state.vgprs[1] = to_u32(-500)
+        self.state.vgprs[2] = to_u32(200)
+        self.state.vgprs[3] = to_u32(-100)
+
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=4),
+            src0=RegOperand(RegisterKind.VGPR, index=1),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.VGPR, index=3)
+        )
+        ScalarInterpreter.step(instr, self.state)
+        self.assertEqual(to_s32(self.state.vgprs[4]), -500)
+
+    def test_interpreter_step_with_sgpr_and_literal(self):
+        self.state.sgprs[10] = to_u32(-10)
+        self.state.vgprs[2] = to_u32(0)
+
+        instr = VMin3I32Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=5),
+            src0=RegOperand(RegisterKind.SGPR, index=10),
+            src1=RegOperand(RegisterKind.VGPR, index=2),
+            src2=RegOperand(RegisterKind.LITERAL32, index=to_u32(-100))
+        )
+        ScalarInterpreter.step(instr, self.state)
+        self.assertEqual(to_s32(self.state.vgprs[5]), -100)
+
 if __name__ == "__main__":
     unittest.main()
