@@ -1,6 +1,6 @@
 """Hand-built SGD5 passes become a link-check manifest: python -I tests/test_sgd5_pass_pipelines.py"""
 import collections
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
@@ -43,7 +43,7 @@ class PassPipelinesTest(unittest.TestCase):
         self.index = [{"offset": o, "file": f"{n}.dxbc", "stage": s, "name": "dup"}
                       for o, n, s in zip(carve, files, STAGES)]
 
-    def run_tool(self, spirv_names=None):
+    def run_tool(self, spirv_names=None, status=0):
         with tempfile.TemporaryDirectory() as folder, patch.object(sgd5_effects, "DATABASES", [self.layout]):
             folder = Path(folder)
             (folder / "a.rpf").write_bytes(self.data)
@@ -57,7 +57,10 @@ class PassPipelinesTest(unittest.TestCase):
                 args += ["--spirv-dir", str(folder / "spv")]
             out = io.StringIO()
             with redirect_stdout(out):
-                self.assertEqual(sgd5_pass_pipelines.main(args), 0)
+                self.assertEqual(sgd5_pass_pipelines.main(args), status)
+            if status:
+                self.assertFalse((folder / "m.json").exists())
+                return None, None, out.getvalue()
             return (json.loads((folder / "m.json").read_text(encoding="utf-8")),
                     json.loads((folder / "p.json").read_text(encoding="utf-8")), out.getvalue())
 
@@ -88,6 +91,13 @@ class PassPipelinesTest(unittest.TestCase):
         manifest, _, summary = self.run_tool(["Vert", "Pix", "Geo"])
         self.assertEqual(self.sets(manifest), [{"vs": "Vert", "ps": "Pix"}])
         self.assertIn("1  skipped: no .spv", summary)
+
+    def test_nothing_left_is_an_error_not_an_empty_manifest(self):
+        # `batch` refuses an empty pipeline list, so the tool fails here instead of handing one over.
+        with redirect_stderr(io.StringIO()) as err:
+            _, _, summary = self.run_tool([], status=1)
+        self.assertIn("2  skipped: no .spv", summary)
+        self.assertIn("no pipeline left", err.getvalue())
 
     def test_only_stage_sets_the_link_check_takes(self):
         # An ms+gs+ps set would make `shader_link_check.py batch` refuse the whole manifest, so it is skipped by rule.

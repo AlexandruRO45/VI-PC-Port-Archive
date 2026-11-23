@@ -130,11 +130,16 @@ def main(argv=None):
         index = json.load(f)
     rows, counts = census(args.archive, index)
     pipelines = pipelines_from(rows, counts, args.spirv_dir)
-    write_json(args.out, {"version": 1, "pipelines": pipelines})
+    if pipelines:
+        # `shader_link_check.py batch` refuses an empty list, so an empty manifest is never written.
+        write_json(args.out, {"version": 1, "pipelines": pipelines})
     if args.passes:
         write_json(args.passes, [{k: v for k, v in r.items() if k != "keys"} for r in rows])
     for key, value in sorted(counts.items()):
         print(f"{value:8d}  {key}")
+    if not pipelines:
+        print(f"error: no pipeline left to write; {args.out} not written", file=sys.stderr)
+        return 1
     return 0
 
 
