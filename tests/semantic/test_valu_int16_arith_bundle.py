@@ -162,6 +162,15 @@ class TestVAddU16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0xFFFF)
         self.assertEqual(state.vgpr[1], 0xFFFF)
 
+class TestVAddU16EdgeCases(unittest.TestCase):
+    def test_zero_identity(self):
+        self.assertEqual(ref_v_add_u16(0, 1234), 1234)
+        self.assertEqual(ref_v_add_u16(1234, 0), 1234)
+
+    def test_maximum_unsigned_overflow(self):
+        self.assertEqual(ref_v_add_u16(0xFFFF, 0xFFFF), 0xFFFE)
+        self.assertEqual(ref_v_add_u16(0xFFFF, 0xFFFF, clamp=True), 0xFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
