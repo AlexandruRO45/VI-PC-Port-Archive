@@ -553,9 +553,11 @@ jobs:
         if: ${{ !cancelled() && steps.macos-build.outcome == 'success' }}
         shell: bash
         run: |
-          export LEONIDA_VULKAN_LOADER="$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib"
-          export VK_DRIVER_FILES="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          loader="$(brew --prefix vulkan-loader)"
+          prefix="$(brew --prefix)"
           layers="$(brew --prefix vulkan-validationlayers)"
+          export LEONIDA_VULKAN_LOADER="$loader/lib/libvulkan.1.dylib"
+          export VK_DRIVER_FILES="$prefix/etc/vulkan/icd.d/MoltenVK_icd.json"
           export VK_LAYER_PATH="$layers/share/vulkan/explicit_layer.d"
           export DYLD_FALLBACK_LIBRARY_PATH="$layers/lib${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
           # Run directly: CTest treats the self-test's skip (77) as a successful step.
