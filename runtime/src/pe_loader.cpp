@@ -543,8 +543,9 @@ QueryThreadFn query_thread_fn() {
 }
 
 // NtGetNextThread walks only this process's threads, one handle per call. TH32CS_SNAPTHREAD below lists every thread
-// in the system and Thread32Next has to walk them all; on Windows 11 a dry run of the retail executable measured
-// 6-10 ms for the snapshot and 23-32 ms for the walk per mapped TLS module (three modules at startup). NtGetNextThread
+// in the system and Thread32Next has to walk them all; on Windows 11 an instrumented dry run of the retail executable
+// measured 6-10 ms for the snapshot and 23-32 ms for the walk per mapped TLS module (three modules at startup).
+// NtGetNextThread
 // is not in the documented API set, so a missing export or a refused call falls back to the Toolhelp walk.
 // LEONIDA_LOADER_TOOLHELP=1 forces the fallback for a test or a Wine diagnosis.
 using NextThreadFn = LONG(NTAPI*)(HANDLE, HANDLE, ACCESS_MASK, ULONG, ULONG, PHANDLE);
@@ -641,10 +642,13 @@ void install_on_existing_threads(Module& m) {
     std::vector<Candidate>& candidates = found.list;
     const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
 
-    // Only this process's threads: NtGetNextThread returns a handle for each, and the calling thread's is kept too
-    // (skipped below) because it is the cursor for the next call. A call that fails part way falls back to Toolhelp.
+    // Only this process's threads: NtGetNextThread returns a handle for each, and every handle is kept as both the
+    // candidate and the cursor for the next call. The calling thread is skipped below because install_thread_block
+    // already gave it the module's copy. A call that fails part way falls back to Toolhelp.
     struct ThreadHandle {
-        HANDLE value = nullptr;
+        explicit ThreadHandle(HANDLE handle) : value(handle) {}
+        ThreadHandle(const ThreadHandle&) = delete;
+        ThreadHandle& operator=(const ThreadHandle&) = delete;
         ~ThreadHandle() {
             if (value) CloseHandle(value);
         }
@@ -653,6 +657,7 @@ void install_on_existing_threads(Module& m) {
             value = nullptr;
             return released;
         }
+        HANDLE value = nullptr;
     };
     bool complete = false;
     if (const NextThreadFn next = next_thread_fn()) {
@@ -665,9 +670,15 @@ void install_on_existing_threads(Module& m) {
                 if (thread) CloseHandle(thread);
                 break;
             }
-            // The local owner closes the returned handle if the candidate vector cannot grow.
+            // The local owner closes the returned handle if the candidate vector cannot grow. A handle with no
+            // readable thread id makes the walk incomplete: the calling thread would not be recognised and skipped.
             ThreadHandle owner{thread};
-            candidates.push_back({GetThreadId(thread), thread});
+            const DWORD id = GetThreadId(thread);
+            if (!id) {
+                status = 0;
+                break;
+            }
+            candidates.push_back({id, thread});
             owner.release();
             current = thread;
         }
