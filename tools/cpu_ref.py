@@ -797,12 +797,18 @@ def main(argv=None):
     if args.parse_only:
         try:
             return _print_parse_report(args.listing)
+        except FileNotFoundError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
         except (CpuRefError, OSError) as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
 
     try:
         result = run(args.listing, inputs)
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     except (CpuRefError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

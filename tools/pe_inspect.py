@@ -477,6 +477,9 @@ def main(argv: list[str] | None = None) -> int:
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
     for img in a.image:
+        if not os.path.exists(img):
+            print(f"{img}: does not exist", file=sys.stderr)
+            return 2
         search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
         key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
         if key in seen_paths:

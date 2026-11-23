@@ -32,9 +32,9 @@ FAILED = []                    # (path, first stderr line) for shaders that prod
 MC = mc_command()
 
 
-def fail(msg: str) -> "None":
+def fail(msg: str, code: int = 1) -> "None":
     print(f"ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def positive_int(text: str) -> int:
@@ -169,7 +169,7 @@ def main():
         except (OSError, ValueError) as e:
             fail(f"cannot list shaders in {a.src}: {e}")
     else:
-        fail(f"{a.src} is not a file or folder")
+        fail(f"{a.src} is not a file or folder", code=2)
     if not files:
         fail(f"no .fssm files in {a.src}")
     files = files[: a.limit] if a.limit else files

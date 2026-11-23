@@ -500,6 +500,13 @@ def main() -> int:
     ap.add_argument("--json", help="write the decoded header and grid summary to this JSON")
     a = ap.parse_args()
 
+    if not os.path.exists(a.carve_dir):
+        print(f"error: {a.carve_dir}: does not exist", file=sys.stderr)
+        return 2
+    if not os.path.isdir(a.carve_dir):
+        print(f"error: {a.carve_dir}: not a directory", file=sys.stderr)
+        return 2
+
     try:
         if a.json:
             check_report_path(a.json, a.carve_dir)

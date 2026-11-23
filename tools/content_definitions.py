@@ -205,6 +205,11 @@ def main() -> int:
         counts["groups"] += len(doc.change_set_groups)
 
     for path in args.inputs:
+        if not os.path.exists(path):
+            print(f"ERROR: {path} does not exist", file=sys.stderr)
+            return 2
+
+    for path in args.inputs:
         try:
             if os.path.isdir(path):
                 for _, _, doc in carve_documents(path):

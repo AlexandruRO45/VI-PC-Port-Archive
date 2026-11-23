@@ -324,6 +324,8 @@ def main() -> int:
         try:
             with open(a.input, "rb") as f:
                 magic = f.read(8)
+        except FileNotFoundError as e:
+            ap.exit(2, f"{a.input}: {e.strerror or e}\n")
         except OSError as e:
             raise SystemExit(f"{a.input}: {e.strerror or e}")
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":

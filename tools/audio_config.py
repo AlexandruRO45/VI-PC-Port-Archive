@@ -263,7 +263,7 @@ def main():
         ap.error("require 1 <= min-ms <= max-ms")
 
     if not os.path.exists(a.src):
-        sys.exit(f"{a.src}: does not exist")
+        ap.exit(2, f"{a.src}: does not exist\n")
     if a.join and not os.path.isdir(a.src):
         ap.error("--join applies to a directory, not a single file")
     try:

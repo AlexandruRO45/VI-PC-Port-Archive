@@ -237,6 +237,9 @@ def main():
         pass  # A missing or inaccessible path is handled by the normal read/write error path.
     if same_path:
         ap.error("output must not overwrite the source image")
+    if not os.path.exists(a.image):
+        print(f"ERROR: {a.image} does not exist", file=sys.stderr)
+        return 2
     try:
         with open(a.image, "rb") as f:
             data = f.read()

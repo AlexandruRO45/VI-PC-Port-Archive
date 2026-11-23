@@ -298,7 +298,7 @@ class DisasmInputTest(unittest.TestCase):
 
     def test_a_missing_source_is_an_error(self):
         p = self.run_tool(os.path.join(self.dir, "nope"), "--out", os.path.join(self.dir, "out"))
-        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn("is not a file or folder", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
 

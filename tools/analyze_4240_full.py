@@ -284,12 +284,12 @@ def main() -> int:
     for path in args.inputs:
         if not os.path.exists(path):
             print(f"ERROR: {path} does not exist", file=sys.stderr)
-            status = 1
+            status = 2
             continue
         if not os.path.isfile(path):
             # A folder passed for an archive used to reach open() and end the whole run with PermissionError.
             print(f"ERROR: {path} is not a file", file=sys.stderr)
-            status = 1
+            status = 2
             continue
         print(f"Processing {path}...")
         try:
@@ -297,7 +297,8 @@ def main() -> int:
         except ValueError as e:
             # A truncated archive or a bad data offset otherwise looks like an empty successful scan.
             print(f"ERROR: {e}", file=sys.stderr)
-            status = 1
+            if status == 0:
+                status = 1
             continue
         all_stats.append(stats)
         
