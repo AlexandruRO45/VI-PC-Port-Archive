@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py` and `tools/cf_diff.py`.
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py` and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
 
 ## Why `spirv-val` is not enough
 
