@@ -172,7 +172,6 @@ static int run(int argc, char** argv) {
     // "words64": the same, with the two r64 uint images of the 64-bit image atomics.
     const bool wide_mode = argc > 2 && !std::strcmp(argv[2], "words64");
     const bool words_mode = wide_mode || (argc > 2 && !std::strcmp(argv[2], "words"));
-    const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
     const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
