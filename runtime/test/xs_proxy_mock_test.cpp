@@ -1259,7 +1259,8 @@ int check_placed_resource_x() {
     EXPECT(g_committed.riid == &kResourceIid);
     EXPECT(release(resource) == 0);
 
-    // A render-target texture in a PC state keeps the state and its clear value; the layout becomes UNKNOWN.
+    // A render-target texture keeps its clear value; the state word is a console barrier layout, so it is created in
+    // COMMON (5c539c2b7), and only a value above 0xFF is a legacy resource state that is kept.
     D3D12_RESOURCE_DESC target = buffer;
     target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     target.Width = 64;
@@ -1270,12 +1271,16 @@ int check_placed_resource_x() {
                       word(&kResourceIid), word(&resource))) == S_OK);
     EXPECT(mock->calls[27] == 2 && g_committed.desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     EXPECT(g_committed.desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN);
-    EXPECT(g_committed.state == D3D12_RESOURCE_STATE_RENDER_TARGET && g_committed.clear == &clear);
+    EXPECT(g_committed.state == D3D12_RESOURCE_STATE_COMMON && g_committed.clear == &clear);
+    EXPECT(release(resource) == 0);
+    EXPECT(hr_of(raw6(device, 133, kVa, word(&target), D3D12_RESOURCE_STATE_COPY_DEST, 0, word(&kResourceIid),
+                      word(&resource))) == S_OK);
+    EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_COPY_DEST);
     EXPECT(release(resource) == 0);
     // The same texture in the all-ones state is created in COMMON.
     EXPECT(hr_of(raw6(device, 133, kVa, word(&target), 0xFFFFFFFFu, 0, word(&kResourceIid), word(&resource))) ==
            S_OK);
-    EXPECT(mock->calls[27] == 3 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
+    EXPECT(mock->calls[27] == 4 && g_committed.state == D3D12_RESOURCE_STATE_COMMON);
     EXPECT(release(resource) == 0);
 
     // Refusals before the device is called; the output is cleared.
@@ -1285,14 +1290,14 @@ int check_placed_resource_x() {
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, 0, word(&resource))) == E_POINTER && !resource);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), 0)) == E_POINTER);
-    EXPECT(mock->calls[27] == 3);
+    EXPECT(mock->calls[27] == 4);
 
     // A failed creation is returned as it is, with no object.
     mock->create_result = E_OUTOFMEMORY;
     resource = reinterpret_cast<void*>(1);
     EXPECT(hr_of(raw6(device, 133, kVa, word(&buffer), 0, 0, word(&kResourceIid), word(&resource))) ==
            E_OUTOFMEMORY);
-    EXPECT(!resource && mock->calls[27] == 4);
+    EXPECT(!resource && mock->calls[27] == 5);
     mock->create_result = S_OK;
 
     EXPECT(release(device) == 0 && mock->refs == 0);
