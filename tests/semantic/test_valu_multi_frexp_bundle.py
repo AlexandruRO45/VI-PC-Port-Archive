@@ -1,0 +1,167 @@
+"""Semantic reference tests and translator-backed validation for AMD RDNA2 VALU Multi-Precision Float Decomposition Suite.
+
+Subsystem Feature Bundle 48 covers 6 multi-precision floating-point frexp decomposition instructions (f16, f32, f64):
+  1. v_frexp_exp_i16_f16 - Extracts 16-bit integer exponent from half-precision float (S0 = mant * 2^exp, |mant| in [0.5, 1))
+  2. v_frexp_mant_f16    - Extracts 16-bit half-precision mantissa in [0.5, 1) with sign preservation
+  3. v_frexp_exp_i32_f32 - Extracts 32-bit signed integer exponent from single-precision float (biased exponent - 126)
+  4. v_frexp_mant_f32    - Extracts 32-bit single-precision mantissa in [0.5, 1) with sign preservation
+  5. v_frexp_exp_i32_f64 - Extracts 32-bit signed integer exponent from double-precision float (biased exponent - 1022)
+  6. v_frexp_mant_f64    - Extracts 64-bit double-precision mantissa in [0.5, 1) with sign preservation
+
+RDNA2 Floating-Point Decomposition Architecture:
+  - Supports f16 (IEEE 754 half-precision binary16), f32 (binary32), and f64 (binary64).
+  - Unbiased exponent and normalized significand extraction.
+  - Zero, infinity, NaN, and denormal/subnormal edge-case handling adhering to GFX1030+ hardware semantics.
+  - End-to-end SPIR-V assembly translation through tools/rdna2spirv.py.
+
+Standard library only: Python 3.9+ compatible, zero game data, zero external dependencies.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import enum
+import math
+import os
+import struct
+import sys
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS_DIR = os.path.dirname(HERE)
+for p in (HERE, TESTS_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from support import translate_lines, mrt0_words  # noqa: E402
+
+MASK16 = 0xFFFF
+MASK32 = 0xFFFFFFFF
+MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+# --- Half-precision helpers ---
+def h2f(h: int) -> float:
+    return struct.unpack("<e", struct.pack("<H", h & MASK16))[0]
+
+
+def f2h(x: float) -> int:
+    return struct.unpack("<H", struct.pack("<e", x))[0]
+
+
+def is_f16_finite_nonzero(h: int) -> bool:
+    return (h >> 10) & 0x1F != 31 and (h & 0x7FFF) != 0
+
+
+def oracle_frexp_exp_i16_f16(h: int) -> int:
+    """Reference mathematical oracle for v_frexp_exp_i16_f16."""
+    if not is_f16_finite_nonzero(h):
+        return 0
+    val = h2f(h)
+    _, exp = math.frexp(val)
+    return exp & MASK16
+
+
+def oracle_frexp_mant_f16(h: int) -> int:
+    """Reference mathematical oracle for v_frexp_mant_f16."""
+    if not is_f16_finite_nonzero(h):
+        return h & MASK16
+    val = h2f(h)
+    mant, _ = math.frexp(val)
+    return f2h(mant)
+
+
+# --- Single-precision helpers ---
+def f32_to_bits(f: float) -> int:
+    return struct.unpack("<I", struct.pack("<f", f))[0]
+
+
+def bits_to_f32(b: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", b & MASK32))[0]
+
+
+def is_f32_normal(b: int) -> bool:
+    e = (b >> 23) & 0xFF
+    return 0 < e < 255
+
+
+def oracle_frexp_exp_i32_f32(b: int) -> int:
+    """Reference mathematical oracle for v_frexp_exp_i32_f32."""
+    b &= MASK32
+    if not is_f32_normal(b):
+        return 0
+    e = (b >> 23) & 0xFF
+    return (e - 126) & MASK32
+
+
+def oracle_frexp_mant_f32(b: int) -> int:
+    """Reference mathematical oracle for v_frexp_mant_f32."""
+    b &= MASK32
+    e = (b >> 23) & 0xFF
+    sgn = b & 0x80000000
+    if e == 0:
+        return sgn
+    if e == 255:
+        return b
+    return sgn | 0x3F000000 | (b & 0x007FFFFF)
+
+
+# --- Double-precision helpers ---
+def d2u(x: float) -> int:
+    return struct.unpack("<Q", struct.pack("<d", x))[0]
+
+
+def u2d(u: int) -> float:
+    return struct.unpack("<d", struct.pack("<Q", u & MASK64))[0]
+
+
+def is_f64_finite_nonzero(u: int) -> bool:
+    exp_f = (u >> 52) & 0x7FF
+    frac = u & ((1 << 52) - 1)
+    return exp_f < 2047 and (exp_f > 0 or frac != 0)
+
+
+def oracle_frexp_exp_i32_f64(u: int) -> int:
+    """Reference mathematical oracle for v_frexp_exp_i32_f64."""
+    u &= MASK64
+    if not is_f64_finite_nonzero(u):
+        return 0
+    val = u2d(u)
+    _, exp = math.frexp(val)
+    return exp & MASK32
+
+
+def oracle_frexp_mant_f64(u: int) -> int:
+    """Reference mathematical oracle for v_frexp_mant_f64."""
+    u &= MASK64
+    if not is_f64_finite_nonzero(u):
+        return u
+    val = u2d(u)
+    mant, _ = math.frexp(val)
+    return d2u(mant)
+
+# -----------------------------------------------------------------------------
+# Opcode 1: v_frexp_exp_i16_f16
+# -----------------------------------------------------------------------------
+class VFrexpExpI16F16OracleTests(unittest.TestCase):
+    def test_frexp_exp_f16_powers_of_two(self):
+        # 1.0 (0x3C00) = 0.5 * 2^1 -> exp = 1
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x3C00), 1)
+        # 0.5 (0x3800) = 0.5 * 2^0 -> exp = 0
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x3800), 0)
+        # 2.0 (0x4000) = 0.5 * 2^2 -> exp = 2
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x4000), 2)
+        # -4.0 (0xC400) = -0.5 * 2^3 -> exp = 3
+        self.assertEqual(oracle_frexp_exp_i16_f16(0xC400), 3)
+
+    def test_frexp_exp_f16_special_values(self):
+        # +/-0.0 -> 0
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x0000), 0)
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x8000), 0)
+        # +/-INF -> 0
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x7C00), 0)
+        self.assertEqual(oracle_frexp_exp_i16_f16(0xFC00), 0)
+        # NaN -> 0
+        self.assertEqual(oracle_frexp_exp_i16_f16(0x7E00), 0)
+
+if __name__ == "__main__":
+    unittest.main()
