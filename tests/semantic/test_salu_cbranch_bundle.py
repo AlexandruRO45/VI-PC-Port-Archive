@@ -157,5 +157,30 @@ class SCbranchExecnzScalarInterpreterTests(unittest.TestCase):
         new_pc = step_branch(instr, state)
         self.assertEqual(new_pc, 11)  # 10 + 1
 
+class SCbranchExecnzTranslatorTests(unittest.TestCase):
+    def test_branches_registry(self):
+        self.assertIn("s_cbranch_execnz", rdna2spirv.BRANCHES)
+
+    def test_branch_condition_emission(self):
+        g = rdna2spirv.Gen("cs")
+        cond = rdna2spirv.branch_condition(g, "s_cbranch_execnz")
+        self.assertTrue(g.uses_vote)
+        body = "\n".join(g.body)
+        self.assertIn("OpGroupNonUniformAny", body)
+
+    def test_execution_taken(self):
+        lines = [
+            ("s_mov_b32 s20, 7", 4),
+            ("s_cbranch_execnz 1", 4),
+            ("s_mov_b32 s20, 9", 4),
+            ("v_mov_b32_e32 v6, s20", 4),
+            ("v_lshlrev_b32_e32 v5, 2, v0", 4),
+            ("buffer_store_dword v6, v5, s[0:3], 0 offen", 8),
+            ("s_endpgm", 4),
+        ]
+        spv = translate_cs_branch("cs_cbranch_execnz_taken", lines)
+        val = run_cs_branch(spv)
+        self.assertEqual(val, 7)
+
 if __name__ == '__main__':
     unittest.main()
