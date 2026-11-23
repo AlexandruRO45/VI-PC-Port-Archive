@@ -1537,7 +1537,7 @@ def compute_decoder_digest() -> str:
 decoder_digest = functools.cache(compute_decoder_digest)
 
 
-AWC_OPUS_SOURCES = ("awc_opus.py", "file_mode.py", "pool_workers.py")
+AWC_OPUS_SOURCES = ("awc_opus.py", "file_mode.py", "pool_workers.py", "report_paths.py")
 
 
 def ogg_marker() -> str:
