@@ -333,5 +333,109 @@ class TestValuFrexpMantF64Ast(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[1], 0xBFE00000)  # -0.5
 
+# ---------------------------------------------------------------------------
+# Phase 3: Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarMachineState64:
+    """Scalar architectural machine state for 64-bit VALU operations."""
+
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.sgprs: List[int] = [0] * 106
+
+    def get_vgpr(self, idx: int) -> int:
+        return self.vgprs[idx] & MASK32
+
+    def set_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+    def get_vgpr64(self, idx: int) -> int:
+        lo = self.vgprs[idx] & MASK32
+        hi = self.vgprs[(idx + 1) & 0xFF] & MASK32
+        return (hi << 32) | lo
+
+    def set_vgpr64(self, idx: int, val: int) -> None:
+        u = val & MASK64
+        self.vgprs[idx] = u & MASK32
+        self.vgprs[(idx + 1) & 0xFF] = (u >> 32) & MASK32
+
+    def get_sgpr64(self, idx: int) -> int:
+        lo = self.sgprs[idx] & MASK32
+        hi = self.sgprs[(idx + 1) % len(self.sgprs)] & MASK32
+        return (hi << 32) | lo
+
+    def set_sgpr64(self, idx: int, val: int) -> None:
+        u = val & MASK64
+        self.sgprs[idx] = u & MASK32
+        self.sgprs[(idx + 1) % len(self.sgprs)] = (u >> 32) & MASK32
+
+
+class ScalarInterpreter64:
+    """Deterministic single-lane scalar interpreter for v_frexp_mant_f64."""
+
+    def resolve_source(self, src: Operand64, state: ScalarMachineState64) -> int:
+        if isinstance(src, InlineConstant64):
+            return f64_to_u64(src.val)
+        elif isinstance(src, Register):
+            if src.kind == RegKind.VGPR:
+                return state.get_vgpr64(src.index)
+            else:
+                return state.get_sgpr64(src.index)
+        raise TypeError(f"Unknown operand kind: {type(src)}")
+
+    def step(self, instr: ValuFrexpMantF64Instruction, state: ScalarMachineState64) -> int:
+        src_bits = self.resolve_source(instr.src, state)
+        res_bits = oracle_frexp_mant_f64_bits(
+            src_bits,
+            neg=instr.neg,
+            abs_val=instr.abs_val,
+            clamp=instr.clamp,
+        )
+        state.set_vgpr64(instr.dst.index, res_bits)
+        return res_bits
+
+
+class TestValuFrexpMantF64ScalarInterpreter(unittest.TestCase):
+    """Phase 3: Unit tests for deterministic scalar interpreter."""
+
+    def test_scalar_interpreter_execution(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        # Input: 3.0 in v[2:3] -> mantissa = 0.75 (0x3FE8000000000000)
+        state.set_vgpr64(2, f64_to_u64(3.0))
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], v[2:3]")
+        res_bits = interp.step(inst, state)
+
+        self.assertEqual(res_bits, f64_to_u64(0.75))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.75))
+
+    def test_scalar_interpreter_sgpr_source(self) -> None:
+        state = ScalarMachineState64()
+        interp = ScalarInterpreter64()
+
+        # Input: 2.0 in s[4:5]
+        state.set_sgpr64(4, f64_to_u64(2.0))
+        inst = ValuFrexpMantF64Instruction.parse("v_frexp_mant_f64 v[0:1], s[4:5]")
+        res_bits = interp.step(inst, state)
+
+        self.assertEqual(res_bits, f64_to_u64(0.5))
+        self.assertEqual(state.get_vgpr64(0), f64_to_u64(0.5))
+
+    def test_translator_sgpr_source_execution(self) -> None:
+        """Verify support.translate_lines and mrt0_words execution with SGPR source."""
+        lines = [
+            "s_mov_b32 s4, 0",
+            "s_mov_b32 s5, 0x40000000",  # 2.0
+            "v_frexp_mant_f64 v[0:1], s[4:5]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_frexp_mant_sgpr", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[1], 0x3FE00000)
+        self.assertEqual(words[0], 0x0)
+
 if __name__ == "__main__":
     unittest.main()
