@@ -727,6 +727,7 @@ public:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+    //   - <dir>/exe/index.json, the game executable's embedded FSSM programs, entries named "exe/<name>", likewise.
     // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
     // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
@@ -740,7 +741,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh"}) {
+        for (const char* folder : {"fspx", "bvh", "exe"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;

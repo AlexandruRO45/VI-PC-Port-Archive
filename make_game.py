@@ -1317,6 +1317,7 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     verify_translation_completeness(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    exe_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
 
@@ -1422,6 +1423,7 @@ def fspx_key_clash(spirv: str):
 
 
 BVH_DLL = "XboxBvhBuilder.dll"
+GAME_EXE = "game_scarlett_master.exe"   # embeds 10 console DXBC containers outside shaders.rpf (docs/embedded_shaders.md)
 BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the builder
 # rdna2spirv.py's --max-shared-memory for the builder's programs: 32768, the maxComputeSharedMemorySize of the AMD
 # Windows and Intel drivers (docs/design.md, "Workgroup memory limit"). The constructor creates a pipeline for every
@@ -1458,11 +1460,11 @@ def bvh_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | No
     return extracted, [name for name in extracted if name not in found]
 
 
-def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
+def bvh_report(programs: "tuple[list[str], list[str]]", binary: str = BVH_DLL) -> None:
     """One line with the counts, and one that names every program left without a module. It is printed on every
     run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
     extracted, missing = programs
-    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {BVH_DLL} programs translated")
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {binary} programs translated")
     if missing:
         log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
             f"{'it' if len(missing) == 1 else 'them'}, so that compute pipeline is refused (E_INVALIDARG) and the "
@@ -1470,8 +1472,17 @@ def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
             "prints the instruction each one stops at (docs/embedded_shaders.md, section 4)")
 
 
-def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+def exe_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
                 fallbacks: tuple[str, ...] = ()) -> None:
+    """The DXBC containers embedded in the game executable: the BVH recipe on game_scarlett_master.exe, into
+    <work>/shaders/exe and <work>/shaders/spirv/exe (docs/embedded_shaders.md, section 8)."""
+    bvh_shaders(game, work, mc_signature, jobs, emulate=emulate, fallbacks=fallbacks, binary=GAME_EXE, folder="exe",
+                settings_name="exe_build.json")
+
+
+def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
+                fallbacks: tuple[str, ...] = (), binary: str = BVH_DLL, folder: str = "bvh",
+                settings_name: str = "bvh_build.json") -> None:
     """XboxBvhBuilder.dll's compute programs (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's
     DXBC containers into <work>/shaders/bvh, fssm_unpack.py and shader_disasm.py unpack and disassemble their FSSM
     programs there, as for a shader from shaders.rpf, and rdna2spirv.py translates them into
@@ -1480,25 +1491,25 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 
     The 52 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
     matching bvh_build.json (bvh_settings)."""
-    dll = os.path.join(game, BVH_DLL)
-    unpacked = os.path.join(work, "shaders", "bvh")
-    spirv = os.path.join(work, "shaders", "spirv", "bvh")
+    dll = os.path.join(game, binary)
+    unpacked = os.path.join(work, "shaders", folder)
+    spirv = os.path.join(work, "shaders", "spirv", folder)
     extracted = os.path.join(unpacked, "index.json")
     unpack_index = os.path.join(unpacked, "fssm_index.json")
     translated = os.path.join(spirv, "index.json")
-    settings_file = os.path.join(spirv, "bvh_build.json")
+    settings_file = os.path.join(spirv, settings_name)
     if not os.path.isfile(dll):
         # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
         # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
         drop(translated, settings_file)
-        log(f"shaders: no {BVH_DLL} in the game folder, so no BVH builder programs to translate")
+        log(f"shaders: no {binary} in the game folder, so no {"BVH builder" if folder == "bvh" else "embedded"} programs to translate")
         return
     settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
     programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
     if programs:
-        bvh_report(programs)
+        bvh_report(programs, binary)
         return
-    log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")
+    log(f"shaders: extracting and translating the embedded programs of {binary}")
     drop(translated, settings_file, extracted, unpack_index)
     # pe_shader_containers.py never overwrites a container (a second run would write <module>_NN.dxbc beside the
     # first), and a program that no longer translates must not keep a module from the run before.
@@ -1521,9 +1532,9 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
     programs = bvh_programs(unpacked, spirv)
     if not programs or len(programs[1]) == len(programs[0]):
         drop(translated)   # an empty or unreadable index would read as a finished step
-        fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
+        fail(f"shaders: none of the {binary} programs translated, so their index is not kept. Run the shaders "
              "stage again; if it happens again, the tool output above is why.")
-    bvh_report(programs)
+    bvh_report(programs, binary)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 

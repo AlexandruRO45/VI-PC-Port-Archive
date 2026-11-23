@@ -393,3 +393,17 @@ reason to run again, a second run that leaves no duplicate containers, the repor
 every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
 container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+
+## 8. The executable's own containers
+
+**Build.** The same step, `exe_shaders()`, runs the section 7 recipe on `game_scarlett_master.exe` (the 10 containers
+of section 2), into `<work>/shaders/exe` (extraction, `fssm/`, `disasm/`) and `<work>/shaders/spirv/exe`, with
+`exe_build.json` as its reuse record. It is `bvh_shaders()` with another binary and folder, so every rule of section
+7 applies unchanged: the step is skipped when the executable is not in the game folder, a program without a module
+is reported by name on every run, and none of it feeds or waits on the game's own shaders. The executable's
+containers have no `ILDN` part, so `pe_shader_containers.py` names them `container_NN` in file order; the stage is
+read from `PSV0`.
+
+**Run time.** `ShaderLibrary::load(dir)` also reads `<dir>/exe/index.json` when it is there; its entries are named
+`exe/<name>` and found by `fssm_sha256` like the builder's. `tests/test_exe_shaders_stage.py` runs the extraction on
+a synthetic image (valid containers found, a corrupt one skipped, `container_NN` names) and checks the step's paths.
