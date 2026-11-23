@@ -477,5 +477,22 @@ class VFrexpExpI32F64SimdDivergenceTests(unittest.TestCase):
         # Smallest subnormal 0x0000000000000001 (2^-1074) -> exp = -1073 (0xFFFFFBCF in u32)
         self.assertEqual(oracle_frexp_exp_i32_f64(1), 0xFFFFFBCF)
 
+class VFrexpExpI32F64TranslatorTests(unittest.TestCase):
+    def test_frexp_exp_f64_translation_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0",
+            "v_mov_b32 v1, 0x3FF00000",
+            "v_frexp_exp_i32_f64 v2, v[0:1]",
+            "exp mrt0 v2, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_exp_f64_exec", lines)
+        val = mrt0_words(spv)[0]
+        self.assertEqual(val, 1)
+
+    def test_frexp_exp_f64_syntax_rejection(self):
+        with self.assertRaises(Exception):
+            translate_lines("ps_bad_frexp_exp_f64", ["v_frexp_exp_i32_f64 v0, v[0:1] clamp"])
+
 if __name__ == "__main__":
     unittest.main()
