@@ -72,6 +72,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
         "error": None,
     }
     seen_imports = set()
+    last_event = None
     with _open_text(path) as fh:
         for number, line in enumerate(fh, 1):
             line = line.strip()
@@ -91,6 +92,7 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 if len(trace["bad_line_numbers"]) < limit:
                     trace["bad_line_numbers"].append(number)
                 continue
+            last_event = event
             trace["events"] += 1
             kind = str(event.get("kind"))
             trace["kinds"][kind] = trace["kinds"].get(kind, 0) + 1
@@ -165,8 +167,13 @@ def parse_startup(path: str, limit: int = 10) -> dict:
                 trace["exit"] = event.get("code")
             elif kind == "error":
                 trace["error"] = event.get("what")
-    if trace["events"] == 0:
+    if last_event is None:
         raise TraceError(f"{path} has no valid startup event")
+    seq = last_event.get("seq")
+    trace["last_event"] = {
+        "kind": str(last_event["kind"]),
+        "seq": seq if type(seq) is int else None,
+    }
     return trace
 
 
@@ -287,6 +294,12 @@ def format_text(summary: dict, limit: int) -> str:
             out.append(f"  error: {startup['error']}")
         if startup["exit"] is not None:
             out.append(f"  exit: {startup['exit']}")
+        elif "error" not in startup["kinds"]:
+            line = "  no exit or error event observed"
+            if last := startup.get("last_event"):
+                seq = "" if last["seq"] is None else f" #{last['seq']}"
+                line += f" (last observed: {last['kind']}{seq})"
+            out.append(line)
     d3d12 = summary.get("d3d12")
     if d3d12:
         out.append(f"d3d12 trace: {d3d12['path']}")

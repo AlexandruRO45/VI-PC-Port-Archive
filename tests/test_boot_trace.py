@@ -403,6 +403,7 @@ class BootTraceTests(unittest.TestCase):
             "exit: 0",
         ):
             self.assertIn(needle, text)
+        self.assertNotIn("no exit or error event", text)
 
     def test_failed_file_opens_and_skipped_int3_are_listed(self):
         self.write(
@@ -430,7 +431,8 @@ class BootTraceTests(unittest.TestCase):
         ):
             with self.subTest(phase=phase):
                 last = {"kind": "tls_callback", "module": "fixture.exe", "at": "fixture.exe+0x2200", **fields}
-                self.write(self.startup, [STARTUP[0], first, last])
+                xmem = {"seq": 4, "kind": "xmem_attributes", "api": "XMemVirtualAlloc"}
+                self.write(self.startup, [STARTUP[0], first, last, xmem])
                 with open(self.startup, "a", encoding="utf-8", newline="\n") as f:
                     f.write('{"kind":"tls_callback","at":"truncated')
 
@@ -442,6 +444,7 @@ class BootTraceTests(unittest.TestCase):
                 self.assertEqual(startup["tls_callbacks"], 2)
                 self.assertEqual(startup["bad_lines"], 1)
                 self.assertIsNone(startup["exit"])
+                self.assertEqual(startup["last_event"], {"kind": "xmem_attributes", "seq": 4})
                 self.assertEqual(
                     startup["last_tls_callback"],
                     {"module": "fixture.exe", "at": "fixture.exe+0x2200", "reason": reason},
@@ -449,6 +452,7 @@ class BootTraceTests(unittest.TestCase):
                 text = bt.format_text(summary, 10)
                 self.assertIn("tls callbacks: 2", text)
                 self.assertIn(f"last observed TLS callback: fixture.exe+0x2200 ({phase})", text)
+                self.assertIn("no exit or error event observed (last observed: xmem_attributes #4)", text)
 
 
 if __name__ == "__main__":

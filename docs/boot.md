@@ -101,6 +101,8 @@ Read the startup trace first; the first event that is not the expected one is th
    the final slot for the last observed exception. The trace also includes handled exceptions, so the last
    observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
+   If neither event was recorded, the summary names the last valid event in file order (`last_event` in JSON).
+   It does not infer whether the process crashed, was stopped, or was still running when the trace was read.
 6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
    submission ran the supported commands from a list. The runtime's `[rt]` diagnostic names the command it left out.
    Compare the method's position with the public SDK vtable. An unknown slot is expected until the executable names it
