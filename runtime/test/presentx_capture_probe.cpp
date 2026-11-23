@@ -6,7 +6,8 @@
 //              following 0-plane PresentX must return S_OK and write nothing.
 //   malformed  The same environment, but the routed slot is called with a null plane array, a null ppResources, a
 //              null resource, 3 planes, unreadable (PAGE_NOACCESS) plane/ppResources/resource pointers, a texture
-//              without ALLOW_DISPLAY and a buffer. Each must return E_INVALIDARG, write no file and not fault.
+//              without ALLOW_DISPLAY, a buffer and a foreign object with a readable/executable vtable. Each must
+//              return E_INVALIDARG, write no file and not fault; the foreign object's GetDesc must not be called.
 //   inert      No environment: slot 40 must still return E_NOTIMPL (the old refusal) and no file appears.
 //
 // Each mode is a separate process: the route and capture environment is read once. Needs a Vulkan 1.3 device; skips
@@ -65,6 +66,48 @@ void expected_texel(UINT x, UINT y, std::uint8_t* rgb) {
     rgb[0] = static_cast<std::uint8_t>(10 + x * 10);
     rgb[1] = static_cast<std::uint8_t>(20 + y * 10);
     rgb[2] = static_cast<std::uint8_t>(30 + x + y);
+}
+
+// A readable object with a readable, executable vtable that is NOT a Leonida layer resource. The capture guard must
+// recognise it through the private tag QueryInterface and refuse before calling GetDesc/GetHeapProperties.
+struct ForeignResource {
+    void** vtable;
+};
+unsigned g_foreign_qi_calls = 0, g_foreign_desc_calls = 0, g_foreign_heap_calls = 0;
+
+void WINAPI foreign_noop(void*) {}
+
+HRESULT WINAPI foreign_query_interface(void*, const IID*, void** out) {
+    ++g_foreign_qi_calls;
+    if (out) *out = nullptr;
+    return E_NOINTERFACE;
+}
+
+D3D12_RESOURCE_DESC WINAPI foreign_get_desc(void*) {
+    ++g_foreign_desc_calls;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = kWidth;
+    desc.Height = kHeight;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    return desc;
+}
+
+HRESULT WINAPI foreign_get_heap_properties(void*, D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS*) {
+    ++g_foreign_heap_calls;
+    return S_OK;
+}
+
+void* foreign_vtable[15];
+
+void init_foreign_vtable() {
+    for (void*& entry : foreign_vtable) entry = reinterpret_cast<void*>(&foreign_noop);
+    foreign_vtable[0] = reinterpret_cast<void*>(&foreign_query_interface);
+    foreign_vtable[10] = reinterpret_cast<void*>(&foreign_get_desc);
+    foreign_vtable[14] = reinterpret_cast<void*>(&foreign_get_heap_properties);
 }
 
 struct Device {
@@ -354,6 +397,11 @@ int main(int argc, char** argv) {
         non_display_plane.ppResources = &d.non_display.p;
         XboxPresentPlaneParameters buffer_plane = plane;
         buffer_plane.ppResources = &d.buffer.p;
+        init_foreign_vtable();
+        ForeignResource foreign{foreign_vtable};
+        ID3D12Resource* foreign_resource = reinterpret_cast<ID3D12Resource*>(&foreign);
+        XboxPresentPlaneParameters foreign_plane = plane;
+        foreign_plane.ppResources = &foreign_resource;
 
         int refused = 0;
         const std::uint64_t cases[] = {
@@ -366,14 +414,28 @@ int main(int argc, char** argv) {
             call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&bad_pointer), 0),       // unreadable resource
             call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&non_display_plane), 0),  // no ALLOW_DISPLAY
             call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&buffer_plane), 0),      // not a 2D texture
+            call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&foreign_plane), 0),     // foreign vtable
         };
         for (std::uint64_t result : cases) {
             if (as_hr(result) == E_INVALIDARG) ++refused;
         }
-        EXPECT(refused == 9);
+        EXPECT(refused == 10);
+        EXPECT(g_foreign_qi_calls > 0);
+        EXPECT(g_foreign_desc_calls == 0);
+        EXPECT(g_foreign_heap_calls == 0);
+        // The same foreign object 40 more times: the guard keeps returning E_INVALIDARG and never calls GetDesc, and
+        // the logger suppresses the repeated line (one line per 250 ms per distinct message).
+        for (int i = 0; i < 40; ++i) {
+            EXPECT(as_hr(call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&foreign_plane), 0)) ==
+                   E_INVALIDARG);
+        }
+        EXPECT(g_foreign_qi_calls == 41);
+        EXPECT(g_foreign_desc_calls == 0);
+        EXPECT(g_foreign_heap_calls == 0);
         EXPECT(files_in(directory) == 0);
         VirtualFree(fake, 0, MEM_RELEASE);
-        std::printf("presentx_capture_probe: malformed 9/9 E_INVALIDARG, no files, no crash\n");
+        std::printf("presentx_capture_probe: malformed 10/10 E_INVALIDARG, foreign GetDesc not called, no files, "
+                    "no crash\n");
         return 0;
     }
 

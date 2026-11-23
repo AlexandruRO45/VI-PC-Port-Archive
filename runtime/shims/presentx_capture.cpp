@@ -6,12 +6,14 @@
 // plane's first resource is copied through the queue that presented and written as a PPM.
 #include "presentx_capture.h"
 
+#include "d3d12_object_tags.h"
 #include "xbox_present_types.h"
 
 #include <windows.h>
 
 #include <atomic>
 #include <cerrno>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -104,45 +106,119 @@ struct CapturePlane {
     bool bgra = false;
 };
 
-void refuse(const char* why) {
-    std::fprintf(stderr, "[rt] presentx: PresentX refused: %s; E_INVALIDARG\n", why);
+// A mis-routed slot can call this path at frame rate with plausible-looking arguments. Each distinct refusal line is
+// printed at most once per 250 ms; the same line from repeated mis-routed calls is counted and dropped. Distinct
+// failures (null plane array, foreign object, no ALLOW_DISPLAY, ...) still get their first line, so the throttle does
+// not hide a diagnosis. Only refusal lines are throttled, never the "wrote ..." success line.
+constexpr ULONGLONG kRefusalMinIntervalMs = 250;
+constexpr std::size_t kRefusalEntries = 32;
+
+struct RefusalEntry {
+    std::uint64_t hash = 0;
+    ULONGLONG last_ms = 0;
+    bool used = false;
+};
+
+void log_refusal(const char* format, ...) {
+    char line[384] = {};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+
+    std::uint64_t hash = 1469598103934665603ull;  // FNV-1a
+    for (const char* at = line; *at; ++at) {
+        hash ^= static_cast<unsigned char>(*at);
+        hash *= 1099511628211ull;
+    }
+
+    static std::mutex mutex;
+    static RefusalEntry entries[kRefusalEntries];
+    static unsigned suppressed = 0;
+    unsigned dropped = 0;
+    bool emit = false;
+    {
+        std::lock_guard lock(mutex);
+        const ULONGLONG now = GetTickCount64();
+        RefusalEntry& entry = entries[hash % kRefusalEntries];
+        if (entry.used && entry.hash == hash && now - entry.last_ms < kRefusalMinIntervalMs) {
+            ++suppressed;
+        } else {
+            entry.used = true;
+            entry.hash = hash;
+            entry.last_ms = now;
+            dropped = suppressed;
+            suppressed = 0;
+            emit = true;
+        }
+    }
+    if (!emit) return;
+    if (dropped) std::fprintf(stderr, "[rt] presentx: %u refusal line(s) suppressed\n", dropped);
+    std::fprintf(stderr, "%s\n", line);
 }
 
-// A resource is what the proxy can pass on safely: readable COM memory whose GetDesc (ID3D12Resource slot 10) and
-// GetHeapProperties (slot 14) are executable, a single-sample 2D texture, and a displayable heap. "Committed" is not
-// queryable through ID3D12Resource; ALLOW_DISPLAY is the part the console's PresentX requires and the part checked.
+void refuse(const char* why) {
+    log_refusal("[rt] presentx: PresentX refused: %s; E_INVALIDARG", why);
+}
+
+void refuse_plane(UINT plane_index, const char* why) {
+    log_refusal("[rt] presentx: PresentX plane %u refused: %s; E_INVALIDARG", plane_index, why);
+}
+
+// A resource is what the proxy can pass on safely: readable COM memory whose QueryInterface, GetDesc (ID3D12Resource
+// slot 10) and GetHeapProperties (slot 14) are executable, and which answers the layer's private Resource tag. The tag
+// check is what makes the object ours: an executable vtable alone can belong to another object, and calling its
+// GetDesc would leave `desc` uninitialised. A host runtime resource does not answer kLeonidaResourceTag and is
+// refused. "Committed" is not queryable through ID3D12Resource; ALLOW_DISPLAY is the part the console's PresentX
+// requires and the part checked.
 bool check_resource(ID3D12Resource* resource, UINT plane_index, CapturePlane& out) {
     if (!resource) {
-        std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: null resource; E_INVALIDARG\n", plane_index);
+        refuse_plane(plane_index, "null resource");
         return false;
     }
     if (!readable_range(resource, sizeof(void*))) {
-        std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: resource pointer is not readable committed "
-                             "memory; E_INVALIDARG\n", plane_index);
+        refuse_plane(plane_index, "resource pointer is not readable committed memory");
         return false;
     }
     void* const* vtable = *reinterpret_cast<void* const* const*>(resource);
     if (!readable_range(vtable, 15 * sizeof(void*))) {
-        std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: resource vtable is not readable; "
-                             "E_INVALIDARG\n", plane_index);
+        refuse_plane(plane_index, "resource vtable is not readable");
         return false;
     }
-    if (!executable_pointer(vtable[10]) || !executable_pointer(vtable[14])) {
-        std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: resource vtable has no GetDesc or "
-                             "GetHeapProperties; E_INVALIDARG\n", plane_index);
+    if (!executable_pointer(vtable[0]) || !executable_pointer(vtable[10]) ||
+        !executable_pointer(vtable[14])) {
+        refuse_plane(plane_index, "resource vtable has no QueryInterface, GetDesc or GetHeapProperties");
         return false;
     }
 
-    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    const auto bad_desc = [&](const char* why) {
-        std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: %s; E_INVALIDARG\n", plane_index, why);
+    // The layer's Object::QueryInterface answers its private kTag with the implementation itself (one inheritance
+    // chain; d3d12_com_object.h). This is the same recognition Object::from<T> uses. No ID3D12Resource method is
+    // called unless it succeeds.
+    void* implementation = nullptr;
+    const HRESULT tag_result = resource->QueryInterface(kLeonidaResourceTag, &implementation);
+    if (FAILED(tag_result) || !implementation) {
+        refuse_plane(plane_index, "resource is not a Leonida layer ID3D12Resource");
         return false;
-    };
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return bad_desc("resource is not a 2D texture");
-    if (desc.SampleDesc.Count != 1) return bad_desc("resource is multisampled");
-    if (desc.DepthOrArraySize != 1 || desc.MipLevels < 1) return bad_desc("resource is not a single-slice texture");
-    if (desc.Width == 0 || desc.Height == 0 || desc.Width > 32768 || desc.Height > 32768)
-        return bad_desc("resource size is outside 1..32768");
+    }
+    static_cast<IUnknown*>(implementation)->Release();  // the caller holds its own reference
+
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        refuse_plane(plane_index, "resource is not a 2D texture");
+        return false;
+    }
+    if (desc.SampleDesc.Count != 1) {
+        refuse_plane(plane_index, "resource is multisampled");
+        return false;
+    }
+    if (desc.DepthOrArraySize != 1 || desc.MipLevels < 1) {
+        refuse_plane(plane_index, "resource is not a single-slice texture");
+        return false;
+    }
+    if (desc.Width == 0 || desc.Height == 0 || desc.Width > 32768 || desc.Height > 32768) {
+        refuse_plane(plane_index, "resource size is outside 1..32768");
+        return false;
+    }
 
     bool bgra = false;
     switch (desc.Format) {
@@ -150,15 +226,21 @@ bool check_resource(ID3D12Resource* resource, UINT plane_index, CapturePlane& ou
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: bgra = true; break;
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: bgra = false; break;
-        default: return bad_desc("resource is not BGRA8 or RGBA8");
+        default:
+            refuse_plane(plane_index, "resource is not BGRA8 or RGBA8");
+            return false;
     }
 
     D3D12_HEAP_PROPERTIES properties{};
     D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
-    if (FAILED(resource->GetHeapProperties(&properties, &heap_flags)))
-        return bad_desc("GetHeapProperties failed");
-    if ((heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) == 0)
-        return bad_desc("resource has no D3D12_HEAP_FLAG_ALLOW_DISPLAY");
+    if (FAILED(resource->GetHeapProperties(&properties, &heap_flags))) {
+        refuse_plane(plane_index, "GetHeapProperties failed");
+        return false;
+    }
+    if ((heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) == 0) {
+        refuse_plane(plane_index, "resource has no D3D12_HEAP_FLAG_ALLOW_DISPLAY");
+        return false;
+    }
 
     out.resource = resource;
     out.desc = desc;
@@ -203,22 +285,20 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
     UINT64 row_bytes = 0, total_bytes = 0;
     device->GetCopyableFootprints(&plane.desc, 0, 1, 0, &footprint, &rows, &row_bytes, &total_bytes);
     if (rows == 0 || row_bytes == 0 || total_bytes == 0 || total_bytes > (512ull << 20)) {
-        std::fprintf(stderr, "[rt] presentx: PresentX refused: copy footprint is empty or too large; E_INVALIDARG\n");
+        log_refusal("[rt] presentx: PresentX refused: copy footprint is empty or too large; E_INVALIDARG");
         return E_INVALIDARG;
     }
     const UINT64 row_pitch = footprint.Footprint.RowPitch;
     const UINT64 last_row = static_cast<UINT64>(plane.desc.Height - 1) * row_pitch + row_bytes;
     if (rows < plane.desc.Height || row_pitch < plane.desc.Width * 4 || row_bytes > row_pitch ||
         footprint.Offset > total_bytes || last_row > total_bytes - footprint.Offset) {
-        std::fprintf(stderr,
-                     "[rt] presentx: PresentX refused: readback footprint does not hold the texture "
-                     "(rows=%u height=%u row_pitch=%llu row_bytes=%llu width=%llu offset=%llu total=%llu); "
-                     "E_INVALIDARG\n",
-                     rows, static_cast<unsigned>(plane.desc.Height), static_cast<unsigned long long>(row_pitch),
-                     static_cast<unsigned long long>(row_bytes),
-                     static_cast<unsigned long long>(plane.desc.Width),
-                     static_cast<unsigned long long>(footprint.Offset),
-                     static_cast<unsigned long long>(total_bytes));
+        log_refusal("[rt] presentx: PresentX refused: readback footprint does not hold the texture "
+                    "(rows=%u height=%u row_pitch=%llu row_bytes=%llu width=%llu offset=%llu total=%llu); "
+                    "E_INVALIDARG",
+                    rows, static_cast<unsigned>(plane.desc.Height), static_cast<unsigned long long>(row_pitch),
+                    static_cast<unsigned long long>(row_bytes), static_cast<unsigned long long>(plane.desc.Width),
+                    static_cast<unsigned long long>(footprint.Offset),
+                    static_cast<unsigned long long>(total_bytes));
         return E_INVALIDARG;
     }
 
@@ -239,8 +319,8 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
                                                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                  IID_PPV_ARGS(&readback));
     if (FAILED(hr) || !readback) {
-        std::fprintf(stderr, "[rt] presentx: PresentX refused: readback buffer creation failed (0x%08lX)\n",
-                     static_cast<unsigned long>(hr));
+        log_refusal("[rt] presentx: PresentX refused: readback buffer creation failed (0x%08lX)",
+                    static_cast<unsigned long>(hr));
         if (readback) readback->Release();
         return E_FAIL;
     }
@@ -286,8 +366,7 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
         const ULONGLONG deadline = GetTickCount64() + 30000;
         while (fence->GetCompletedValue() < 1) {
             if (GetTickCount64() > deadline) {
-                std::fprintf(stderr,
-                             "[rt] presentx: PresentX refused: the readback did not complete in 30 s; E_FAIL\n");
+                log_refusal("[rt] presentx: PresentX refused: the readback did not complete in 30 s; E_FAIL");
                 hr = E_FAIL;
                 break;
             }
@@ -303,7 +382,7 @@ HRESULT capture_plane(ID3D12Device* device, ID3D12CommandQueue* queue, const Cap
                                      static_cast<UINT>(plane.desc.Height), footprint.Footprint.RowPitch, plane.bgra);
         readback->Unmap(0, nullptr);
         if (!wrote) {
-            std::fprintf(stderr, "[rt] presentx: PresentX refused: cannot write %s; E_FAIL\n", path.c_str());
+            log_refusal("[rt] presentx: PresentX refused: cannot write %s; E_FAIL", path.c_str());
             break;
         }
         std::fprintf(stderr, "[rt] presentx: wrote %s (%ux%u, %s)\n", path.c_str(),
@@ -376,13 +455,12 @@ HRESULT presentx_capture_present(ID3D12Device* device, ID3D12CommandQueue* queue
             const XboxPresentPlaneParameters& plane = planes[i];
             if (plane.ResourceCount == 0) continue;
             if (!plane.ppResources) {
-                std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: ResourceCount is %u but ppResources "
-                                     "is null; E_INVALIDARG\n", i, plane.ResourceCount);
+                log_refusal("[rt] presentx: PresentX plane %u refused: ResourceCount is %u but ppResources "
+                            "is null; E_INVALIDARG", i, plane.ResourceCount);
                 return E_INVALIDARG;
             }
             if (!readable_range(plane.ppResources, sizeof(ID3D12Resource*))) {
-                std::fprintf(stderr, "[rt] presentx: PresentX plane %u refused: ppResources is not readable "
-                                     "committed memory; E_INVALIDARG\n", i);
+                refuse_plane(i, "ppResources is not readable committed memory");
                 return E_INVALIDARG;
             }
             if (!check_resource(plane.ppResources[0], i, sources[i])) return E_INVALIDARG;
@@ -390,8 +468,8 @@ HRESULT presentx_capture_present(ID3D12Device* device, ID3D12CommandQueue* queue
 
         const std::string directory = capture_directory();
         if (!ensure_directory(directory)) {
-            std::fprintf(stderr, "[rt] presentx: PresentX refused: cannot create capture directory %s; E_FAIL\n",
-                         directory.c_str());
+            log_refusal("[rt] presentx: PresentX refused: cannot create capture directory %s; E_FAIL",
+                        directory.c_str());
             return E_FAIL;
         }
 
@@ -403,7 +481,7 @@ HRESULT presentx_capture_present(ID3D12Device* device, ID3D12CommandQueue* queue
         }
         return S_OK;
     } catch (...) {
-        std::fprintf(stderr, "[rt] presentx: PresentX capture failed with an exception; E_FAIL\n");
+        log_refusal("[rt] presentx: PresentX capture failed with an exception; E_FAIL");
         return E_FAIL;
     }
 }
