@@ -681,3 +681,33 @@ class TestDsSwizzleB32ASTAndScalar(unittest.TestCase):
         ]
         res, _ = run_workgroup_lanes("ps_swiz_rev", lines, lanes=4)
         self.assertEqual(res, [23, 22, 21, 20])
+
+
+# ------------------------------------------------------------------------------
+# ds_swizzle_b32 SIMD Divergence & Quad Permutation
+# ------------------------------------------------------------------------------
+
+class TestDsSwizzleB32SIMDAndProperties(unittest.TestCase):
+    def test_simd_broadcast_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_add_nc_u32 v2, v0, 50",
+            "ds_swizzle_b32 v4, v2 offset:swizzle(BROADCAST,4,0)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_bcast", lines, lanes=4)
+        # Lane 0's value (50) is broadcast to all 4 lanes
+        self.assertEqual(res, [50, 50, 50, 50])
+
+    def test_algebraic_swap_involution_hardware(self):
+        lines = [
+            "v_mbcnt_lo_u32_b32 v0, -1, 0",
+            "v_mov_b32 v2, v0",
+            "ds_swizzle_b32 v3, v2 offset:swizzle(SWAP,1)",
+            "ds_swizzle_b32 v4, v3 offset:swizzle(SWAP,1)",
+            "v_lshlrev_b32 v5, 2, v0",
+            "buffer_store_dword v4, v5, s[0:3], 0 offen",
+        ]
+        res, _ = run_workgroup_lanes("ps_swiz_inv", lines, lanes=4)
+        self.assertEqual(res, [0, 1, 2, 3])
