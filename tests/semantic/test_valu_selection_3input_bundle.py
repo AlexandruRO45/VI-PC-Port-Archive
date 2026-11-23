@@ -331,5 +331,29 @@ class VMed3F32TranslatorIntegrationTests(unittest.TestCase):
         self.assertNotEqual(med_res, min_res)
         self.assertNotEqual(med_res, max_res)
 
+def ref_min3_i32(a: int, b: int, c: int) -> int:
+    """RDNA2 v_min3_i32: signed 32-bit integer minimum of 3 values."""
+    return u32(min(i32(a), i32(b), i32(c)))
+
+
+class VMin3I32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_min3_i32."""
+
+    def test_basic_ordering(self):
+        self.assertEqual(ref_min3_i32(10, 20, 30), 10)
+        self.assertEqual(ref_min3_i32(30, 10, 20), 10)
+        self.assertEqual(ref_min3_i32(20, 30, 10), 10)
+
+    def test_signed_negative_values(self):
+        # -10 is 0xFFFFFFF6, -20 is 0xFFFFFFEC, 5 is 0x5
+        self.assertEqual(i32(ref_min3_i32(u32(-10), u32(-20), 5)), -20)
+        self.assertEqual(i32(ref_min3_i32(u32(-100), 0, 100)), -100)
+
+    def test_boundary_extrema(self):
+        int_min = 0x80000000  # -2147483648
+        int_max = 0x7FFFFFFF  # 2147483647
+        self.assertEqual(ref_min3_i32(int_min, 0, int_max), int_min)
+        self.assertEqual(ref_min3_i32(int_max, -1, int_min), int_min)
+
 if __name__ == "__main__":
     unittest.main()
