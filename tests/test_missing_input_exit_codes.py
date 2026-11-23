@@ -36,6 +36,15 @@ MISSING_INPUT_TOOLS = (
     "psin_index",
     "rpf_probe",
     "world_lights_paths",
+    "bcpack_history_calib",
+    "find_hash_lookup",
+    "heap_index_census",
+    "manifest_verifier",
+    "pe_shader_containers",
+    "ps_interp_modes",
+    "shader_profile",
+    "swizzle_search",
+    "user_sgpr_census",
     "tile_probe",
 )
 
