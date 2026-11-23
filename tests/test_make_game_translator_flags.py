@@ -108,7 +108,7 @@ class FailedShardTest(unittest.TestCase):
                 def wait(self, timeout=None):
                     return 1
 
-            with mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: FailingProc()),                     mock.patch.object(make_game, "py"),                     mock.patch.object(make_game, "log", lambda *a: None),                     self.assertRaises(SystemExit) as cm:
+            with mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: FailingProc()),                     mock.patch.object(make_game.subprocess, "run", lambda *a, **k: mock.Mock(returncode=1)),                     mock.patch.object(make_game, "py"),                     mock.patch.object(make_game, "log", lambda *a: None),                     self.assertRaises(SystemExit) as cm:
                 make_game.translate("disasm", spirv, 2)
             self.assertEqual(cm.exception.code, 1)
             self.assertFalse(os.path.exists(index))

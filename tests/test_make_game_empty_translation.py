@@ -102,6 +102,9 @@ class TranslateLockedIndexTest(unittest.TestCase):
             return real_open(path, mode, *a, **k)
 
         class Exited(Done):
+            def poll(self):
+                return shard_code
+
             def wait(self):
                 return shard_code
 
@@ -109,6 +112,8 @@ class TranslateLockedIndexTest(unittest.TestCase):
         with mock.patch.object(make_game.os, "remove", remove), \
                 mock.patch("builtins.open", opener), \
                 mock.patch.object(make_game.subprocess, "Popen", lambda *a, **k: Exited()), \
+                mock.patch.object(make_game.subprocess, "run", lambda *a, **k: mock.Mock(returncode=1)), \
+                mock.patch.object(make_game, "py"), \
                 mock.patch("sys.stderr", err), \
                 self.assertRaises(SystemExit) as cm:
             if shard_code:

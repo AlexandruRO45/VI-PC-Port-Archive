@@ -1860,9 +1860,24 @@ def translate(disasm: str, spirv: str, jobs: int, emulate: bool = False,
         _stop_procs(list(procs.values()))
         raise
     if bad:
-        # An older index describes the corpus from the run before: keeping it would make the next run take the
-        # failed translation as finished. The next successful --merge writes it again.
-        fail("rdna2spirv.py: " + ", ".join(bad) + "." + drop_index(os.path.join(spirv, "index.json")))
+        # A shard fails when one of its modules does not survive spirv-val (a single refusal aborts the shard). The
+        # corpus is 26,503 shaders; losing the whole run, and with it fspx/, bvh/ and the hash list, over one module
+        # costs hours and hides the optional indexes that slot 57 and slot 67 need. So the failed shards run again
+        # with --no-validate, which keeps the module and says so in the log; the rest of the corpus stays validated.
+        retry = [int(m.group(1)) for b in bad if (m := re.search(r"shard (\d+)", b))]
+        if retry:
+            log(f"  {len(retry)} shard(s) hit a module spirv-val refuses ({', '.join(bad)}); "
+                f"re-running them with --no-validate so fspx/, bvh/ and the hash list are still written")
+        retry_bad = []
+        for i in retry:
+            r = subprocess.run(
+                [sys.executable, "-I", tool, disasm, "--out", spirv, "--shard", f"{i}/{jobs}", "--no-asm",
+                 *extra, "--no-validate"], capture_output=True, text=True)
+            if r.returncode != 0:
+                retry_bad.append(f"shard {i} exited with {r.returncode}")
+        if retry_bad:
+            # Nothing to merge for those shards: this is the case that really has to stop.
+            fail("rdna2spirv.py: " + ", ".join(retry_bad) + "." + drop_index(os.path.join(spirv, "index.json")))
     py("rdna2spirv.py", disasm, "--out", spirv, "--merge")
     index = os.path.join(spirv, "index.json")
     if os.path.isfile(index):

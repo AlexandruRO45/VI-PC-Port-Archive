@@ -40,7 +40,15 @@ class ResumeShardsTest(unittest.TestCase):
                 self.n = int(args[args.index("--shard") + 1].split("/")[1])
                 started.append(self.i)
 
-            def wait(self):
+            def poll(self):
+                # make_game.py polls the shard processes; the work happens once, on the first poll.
+                if self.done:
+                    return self.code
+                self.done = True
+                self.code = self.finish()
+                return self.code
+
+            def finish(self):
                 if self.i in crash:
                     return 1
                 with open(os.path.join(spirv, f"shard{self.i}.json"), "w", encoding="utf-8") as f:
@@ -48,6 +56,9 @@ class ResumeShardsTest(unittest.TestCase):
                 with open(os.path.join(spirv, f"index.part{self.i}.json"), "w", encoding="utf-8") as f:
                     json.dump({"tag": tag, "n": self.n}, f)
                 return 0
+
+            done = False
+            code = None
         with mock.patch.object(make_game.subprocess, "Popen", side_effect=FakeProc), \
                 mock.patch.object(make_game, "py") as py, \
                 mock.patch.object(make_game, "translator_digest", return_value=digest), \
@@ -75,11 +86,27 @@ class ResumeShardsTest(unittest.TestCase):
         self.assertEqual(self.translate(4, tag="b"), [1, 3])
         self.assertEqual([self.tag(i) for i in range(4)], ["a", "b", "a", "b"])
 
-    def test_a_failed_shard_is_retried_alone(self):
-        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+    def retried_shards(self):
+        """The --shard values the --no-validate retry asked for, in order."""
+        return [int(c.args[0][c.args[0].index("--shard") + 1].split("/")[0])
+                for c in make_game.subprocess.run.call_args_list]
+
+    def test_a_shard_with_a_module_the_validator_refuses_is_rerun_without_validation(self):
+        # One shader that spirv-val refuses aborts its whole shard. The stage must not die there: it re-runs that
+        # shard with --no-validate and goes on to fspx/, bvh/ and the hash list.
+        with mock.patch.object(make_game.subprocess, "run",
+                               side_effect=lambda args, **kw: mock.Mock(returncode=0)) as run:
+            started = self.translate(3, tag="a", crash={1})
+            self.assertEqual(started, [0, 1, 2])
+            self.assertEqual([int(c.args[0][c.args[0].index("--shard") + 1].split("/")[0])
+                              for c in run.call_args_list], [1])
+            self.assertIn("--no-validate", run.call_args_list[0].args[0])
+
+    def test_a_shard_that_fails_even_without_validation_still_stops(self):
+        with mock.patch.object(make_game.subprocess, "run",
+                               side_effect=lambda args, **kw: mock.Mock(returncode=1)), \
+                self.assertRaises(SystemExit), mock.patch("sys.stderr"):
             self.translate(3, tag="a", crash={1})
-        self.assertFalse(os.path.exists(self.part(1)))
-        self.assertEqual(self.translate(3, tag="b"), [1])
 
     def test_a_shard_with_a_missing_marker_is_retried_alone(self) -> None:
         self.translate(3, tag="a")
