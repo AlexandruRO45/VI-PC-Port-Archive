@@ -973,7 +973,10 @@ def run_suite(a, work: str) -> int:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
         elif name == "cs_workgroup_yz":
-            rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
+            # A timed repetition increments every populated bin again. Check the first dispatch.
+            bench_env = dict(cs_env or os.environ)
+            bench_env.setdefault("VKC_BENCH", "1")
+            rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=bench_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
                                                     in msg.splitlines(), msg))
         elif name == "cs_lds":

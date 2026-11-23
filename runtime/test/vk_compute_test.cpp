@@ -110,6 +110,9 @@ static bool parse_user_sgprs(const char* s, uint32_t* pc) {
     return true;
 }
 
+static int check_output(const uint32_t* out, const char* expect, uint32_t groups,
+                        uint32_t groups_y, uint32_t groups_z, uint32_t yz_bins, uint32_t origins);
+
 static int run(int argc, char** argv) {
     const bool require_wave64 = argc == 5 && !std::strcmp(argv[4], "--require-wave64");
     if (argc != 4 && !require_wave64) {
@@ -589,6 +592,18 @@ static int run(int argc, char** argv) {
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
+    if (dump_path) {
+        std::ofstream dump(dump_path, std::ios::binary);
+        dump.write(static_cast<const char*>(map), std::streamsize(bytes));
+        dump.close();
+        if (dump.fail()) {
+            std::fprintf(stderr, "VKC_DUMP: could not write %s\n", dump_path);
+            return 1;
+        }
+    }
+
+    const int result = check_output(static_cast<const uint32_t*>(map), argv[3], groups,
+                                    groups_y, groups_z, yz_bins, origins);
     if (const char* b = std::getenv("VKC_BENCH")) {
         std::vector<double> ms;
         for (int i = 0, n = std::atoi(b); i < n; i++) {
@@ -605,20 +620,13 @@ static int run(int argc, char** argv) {
         for (VkDeviceSize i = 0; i < bytes; i++) h = (h ^ static_cast<const unsigned char*>(map)[i]) * 16777619u;
         std::printf("bench out fnv1a: %08x\n", h);
     }
+    return result;
+}
 
-    if (dump_path) {
-        std::ofstream dump(dump_path, std::ios::binary);
-        dump.write(static_cast<const char*>(map), std::streamsize(bytes));
-        dump.close();
-        if (dump.fail()) {
-            std::fprintf(stderr, "VKC_DUMP: could not write %s\n", dump_path);
-            return 1;
-        }
-    }
-
-    const uint32_t* out = static_cast<const uint32_t*>(map);
+static int check_output(const uint32_t* out, const char* expect, uint32_t groups,
+                        uint32_t groups_y, uint32_t groups_z, uint32_t yz_bins, uint32_t origins) {
     uint32_t bad = 0, first_bad = ~0u;
-    if (workgroup_yz) {
+    if (origins) {
         // X is disabled in RSRC2. Both X groups must contribute to each valid (Y,Z) bin.
         // The last column and row catch out-of-range register values without indexing past the buffer.
         for (uint32_t z = 0; z <= groups_z; ++z) {
@@ -649,21 +657,21 @@ static int run(int argc, char** argv) {
         std::printf("single-group origins: %u/%u matched\n", origins - wrong_origins, origins);
         return bad || wrong_origins ? 1 : 0;
     }
-    if (!std::strcmp(argv[3], "mirror64")) {
+    if (!std::strcmp(expect, "mirror64")) {
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
                 uint32_t want = g * 64 + (63 - t), got = out[g * 64 + t];
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
-    if (!std::strcmp(argv[3], "exec64")) {    // runtime/test/shaders/cs_exec64.asm
+    if (!std::strcmp(expect, "exec64")) {    // runtime/test/shaders/cs_exec64.asm
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
                 uint32_t want = (t >= 16 && t < 48) ? 7u : 0u, got = out[g * 64 + t];
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
-    if (!std::strcmp(argv[3], "wavemask")) {  // runtime/test/shaders/cs_wavemask.asm
+    if (!std::strcmp(expect, "wavemask")) {  // runtime/test/shaders/cs_wavemask.asm
         for (uint32_t g = 0; g < groups; g++)
             for (uint32_t t = 0; t < 64; t++) {
                 // lanes 16-47: on again after the parked mask (0x80) and after the one through a VGPR (0x40),
@@ -673,7 +681,7 @@ static int run(int argc, char** argv) {
                 if (got != want) { if (!bad) first_bad = g * 64 + t; bad++; }
             }
     }
-    if (!std::strcmp(argv[3], "bvh")) {
+    if (!std::strcmp(expect, "bvh")) {
         const uint32_t want[8] = {0x68, 0x48, 0x40, 0xFFFFFFFFu, 0xC1200000u, 0xBF800000u, 0xBE800000u, 0xBE800000u};
         for (int i = 0; i < 8; i++) if (out[i] != want[i]) { if (!bad) first_bad = i; bad++; }
         std::printf("bvh out = %08x %08x %08x %08x | %08x %08x %08x %08x\n", out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
