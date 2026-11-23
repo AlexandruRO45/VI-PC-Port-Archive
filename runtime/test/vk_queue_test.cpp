@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -226,37 +227,55 @@ int main() {
     EXPECT(compute.execute(clear_lists) == ReplayResult::unsupported);
     std::printf("copy and compute queues refuse a render-target clear\n");
 
-    // 5. A direct queue runs two lists, then one: the second execution runs only the list it is given. The queue
-    // keeps the entries of a larger execution for the next ones, and must not replay them.
-    for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 41);
-    CommandList fill_mid, read_mid;
-    EXPECT(fill_mid.copy_buffer({mid_id, 0, upload_id, 0, kSize}));
-    EXPECT(fill_mid.close());
-    EXPECT(read_mid.copy_buffer({readback_id, 0, mid_id, 0, kSize}));
-    EXPECT(read_mid.close());
-    const CommandList* both[] = {&fill_mid, &read_mid};
-    EXPECT(direct.execute(both) == ReplayResult::success);
-    EXPECT(direct.signal(fence.semaphore(), 5));
-    EXPECT(fence.wait(5, 5'000'000'000ull));
-    bad = 0;
-    for (std::uint32_t i = 0; i < kSize; ++i) bad += rb[i] != pattern(i, 41);
-    EXPECT(bad == 0);
-    std::memset(rb, 0, kSize);
-    for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, 42);
-    const CommandList* first_only[] = {&fill_mid};
-    EXPECT(direct.execute(first_only) == ReplayResult::success);
-    EXPECT(direct.signal(fence.semaphore(), 6));
-    EXPECT(fence.wait(6, 5'000'000'000ull));
-    const auto* md = static_cast<const std::uint8_t*>(mid_map);
-    std::uint32_t written = 0;
-    bad = 0;
-    for (std::uint32_t i = 0; i < kSize; ++i) {
-        written += rb[i] != 0;
-        bad += md[i] != pattern(i, 42);
-    }
-    std::printf("two lists, then one: %u bad bytes from the one list, %u bytes written by the list left out\n", bad,
-                written);
-    EXPECT(bad == 0 && written == 0);
+    // 5. One direct queue runs 2 lists, then 1, then 2 others (a title's pre pass, then its main pass). Each execution
+    // runs exactly the lists it is given, with their own commands: the queue keeps the entries of a larger execution
+    // for later ones, and must neither replay a list left out nor keep a list's commands where another one goes.
+    // The lists of one execution read only the upload buffer and write different buffers, so they need no barrier.
+    void *c_map = nullptr, *d_map = nullptr;
+    VkBuffer out_c = d.buffer(kSize, usage, &c_map);
+    VkBuffer out_d = d.buffer(kSize, usage, &d_map);
+    EXPECT(out_c && out_d);
+    const ResourceId c_id = 7, d_id = 8;
+    add_buffer(c_id, out_c, kSize);
+    add_buffer(d_id, out_d, kSize);
+    constexpr std::uint32_t kHalf = kSize / 2, kOffset = 4096;
+    CommandList to_mid, to_readback, to_c, to_d;
+    EXPECT(to_mid.copy_buffer({mid_id, 0, upload_id, 0, kSize}));
+    EXPECT(to_readback.copy_buffer({readback_id, 0, upload_id, 0, kSize}));
+    EXPECT(to_c.copy_buffer({c_id, kOffset, upload_id, kOffset, kHalf}));  // a part only: a stale entry shows
+    EXPECT(to_d.copy_buffer({d_id, 0, upload_id, 0, kSize}));
+    EXPECT(to_mid.close() && to_readback.close() && to_c.close() && to_d.close());
+    struct Target {
+        std::uint8_t* bytes;
+        std::uint32_t written_from, written_to;  // what the execution's lists copy into it; the rest stays zero
+    };
+    std::uint64_t value = 4;
+    const auto run = [&](std::span<const CommandList* const> lists, std::uint8_t seed,
+                         const std::array<Target, 4>& targets) {
+        for (std::uint32_t i = 0; i < kSize; ++i) up[i] = pattern(i, seed);
+        for (const auto& t : targets) std::memset(t.bytes, 0, kSize);
+        if (direct.execute(lists) != ReplayResult::success || !direct.signal(fence.semaphore(), ++value) ||
+            !fence.wait(value, 5'000'000'000ull))
+            return ~0u;
+        std::uint32_t wrong = 0;
+        for (const auto& t : targets)
+            for (std::uint32_t i = 0; i < kSize; ++i)
+                wrong += t.bytes[i] != (i >= t.written_from && i < t.written_to ? pattern(i, seed) : 0);
+        return wrong;
+    };
+    auto* mid_bytes = static_cast<std::uint8_t*>(mid_map);
+    auto* c_bytes = static_cast<std::uint8_t*>(c_map);
+    auto* d_bytes = static_cast<std::uint8_t*>(d_map);
+    const CommandList* two[] = {&to_mid, &to_readback};
+    const CommandList* one[] = {&to_mid};
+    const CommandList* two_others[] = {&to_c, &to_d};
+    const std::uint32_t wrong_two =
+        run(two, 41, {{{mid_bytes, 0, kSize}, {rb, 0, kSize}, {c_bytes, 0, 0}, {d_bytes, 0, 0}}});
+    const std::uint32_t wrong_one = run(one, 42, {{{mid_bytes, 0, kSize}, {rb, 0, 0}, {c_bytes, 0, 0}, {d_bytes, 0, 0}}});
+    const std::uint32_t wrong_others = run(
+        two_others, 43, {{{mid_bytes, 0, 0}, {rb, 0, 0}, {c_bytes, kOffset, kOffset + kHalf}, {d_bytes, 0, kSize}}});
+    std::printf("2, then 1, then 2 other lists: %u, %u and %u wrong bytes\n", wrong_two, wrong_one, wrong_others);
+    EXPECT(wrong_two == 0 && wrong_one == 0 && wrong_others == 0);
 
     EXPECT(direct.idle() && compute.idle() && copy.idle());
     if (d.validation) {

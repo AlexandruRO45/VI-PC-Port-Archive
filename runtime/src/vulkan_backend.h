@@ -1713,7 +1713,10 @@ private:
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
         // Never shrunk: a queue that alternates a one-list call with a many-list call (a title's pre pass, then its
         // main pass) would otherwise free the main pass's lists every time and copy every entry in again.
+        // Entries past lists.size() only keep storage: nothing reads them, and the pointers they still hold (the
+        // list, its query heaps and pipelines) may dangle, so their list is cleared until prepare fills it again.
         if (prepared_.size() < lists.size()) prepared_.resize(lists.size());
+        for (std::size_t i = lists.size(); i < prepared_.size(); ++i) prepared_[i].list = nullptr;
         const std::span<PreparedList> prepared(prepared_.data(), lists.size());
         ReplayFunctions replay = context_.replay_;
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
