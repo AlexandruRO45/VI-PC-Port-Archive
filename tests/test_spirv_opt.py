@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -59,6 +60,57 @@ class SpirvOptTests(unittest.TestCase):
         # unused push-constant prologue loads, and duplicate pure expressions).
         self.assertLess(len(opt.splitlines()), len(raw.splitlines()) * 0.5)
         self.assertNotIn("OpLoad %bool %active", opt)
+
+    def test_alias_resolution_requires_a_surviving_definition(self):
+        for aliases in ({"a": "a"}, {"a": "b", "b": "a"}, {"a": "b", "b": "c", "c": "b"}):
+            with self.subTest(aliases=aliases):
+                before = aliases.copy()
+                with self.assertRaises(spirv_opt._CyclicAlias):
+                    spirv_opt._resolve_alias(aliases, "a")
+                self.assertEqual(aliases, before)
+
+        aliases = {"a": "b", "b": "terminal"}
+        self.assertEqual(spirv_opt._resolve_alias(aliases, "a"), "terminal")
+        self.assertEqual(aliases["a"], "terminal")
+        self.assertEqual(spirv_opt._resolve_alias(aliases, "other"), "other")
+
+    def test_cyclic_substitution_preserves_the_function_and_its_names(self):
+        affected_body = (
+            "%affected = OpFunction %void None %fn\n"
+            "%entry_a = OpLabel\n"
+            "%affected_copy = OpCopyObject %uint %one\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        module = (
+            "OpCapability Shader\n"
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %affected "main"\n'
+            "OpExecutionMode %affected LocalSize 1 1 1\n"
+            'OpName %affected_copy "affected copy"\n'
+            'OpName %regular_copy "regular copy"\n'
+            "%void = OpTypeVoid\n%fn = OpTypeFunction %void\n"
+            "%uint = OpTypeInt 32 0\n%one = OpConstant %uint 1\n"
+            + affected_body
+            + "%regular = OpFunction %void None %fn\n"
+            "%entry_b = OpLabel\n"
+            "%regular_copy = OpCopyObject %uint %one\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        resolve = spirv_opt._resolve_alias
+
+        def inject_cycle(aliases, token):
+            if "%affected_copy" in aliases:
+                return resolve({"a": "b", "b": "a"}, "a")
+            return resolve(aliases, token)
+
+        with mock.patch.object(spirv_opt, "_resolve_alias", side_effect=inject_cycle):
+            optimized = spirv_opt.optimize(module)
+        self.assertIn(affected_body, optimized)
+        self.assertIn('OpName %affected_copy "affected copy"', optimized)
+        self.assertNotIn("%regular_copy", optimized)
+        _validate(optimized)
 
     def test_dynamic_register_indexing_preserved_soundly(self):
         # v_movrels_b32 / s_movrels_b32 use dynamic OpAccessChain into %vgpr / %sgpr; optimizer must NOT

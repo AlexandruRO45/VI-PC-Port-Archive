@@ -380,6 +380,27 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
     return None
 
 
+class _CyclicAlias(Exception):
+    """A proposed result replacement chain has no surviving definition."""
+
+
+def _resolve_alias(aliases: dict[str, str], token: str) -> str:
+    target = aliases.get(token)
+    if target is None:
+        return token
+    if target not in aliases:
+        return target
+
+    seen = {token}
+    while target in aliases:
+        if target in seen:
+            raise _CyclicAlias
+        seen.add(target)
+        target = aliases[target]
+    aliases[token] = target
+    return target
+
+
 def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: set[str],
                        const_false: set[str], const_null_elem_zero: dict[str, str],
                        const_type: dict[str, str], const_int_val: dict[str, tuple[str, int, int, int]],
@@ -540,14 +561,6 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
 
         alias: dict[str, str] = {}
 
-        def resolve(tok: str) -> str:
-            cur = tok
-            while cur in alias:
-                cur = alias[cur]
-            if cur != tok:
-                alias[tok] = cur
-            return cur
-
         dead_idx: set[int] = set()
 
         # Scoped dominator-tree tables (maintained via undo logs during iterative DFS).
@@ -578,7 +591,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     continue
 
                 if alias and args:
-                    new_args = [resolve(t) if t.startswith("%") else t for t in args]
+                    new_args = [_resolve_alias(alias, t) if t.startswith("%") else t for t in args]
                     if new_args != args:
                         entry[2] = new_args
                         args = new_args
@@ -941,7 +954,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                 _, op, args, _ = entry
                 if op is None or not args:
                     continue
-                new_args = [resolve(t) if t.startswith("%") else t for t in args]
+                new_args = [_resolve_alias(alias, t) if t.startswith("%") else t for t in args]
                 if new_args != args:
                     entry[2] = new_args
                     changed = True
@@ -1130,12 +1143,18 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
     all_deleted: set[str] = set()
     opt_funcs: dict[int, list[str]] = {}
     for start, end in func_ranges:
-        new_body, deleted = _optimize_function(
-            lines[start:end], const_ids, const_true, const_false,
-            const_null_elem_zero, const_type, const_int_val, int_const_by_val,
-            int_type_info, readonly_global_vars, glsl_sets, decorated_ids,
-            max_passes=max_passes,
-        )
+        body = lines[start:end]
+        try:
+            new_body, deleted = _optimize_function(
+                body, const_ids, const_true, const_false,
+                const_null_elem_zero, const_type, const_int_val, int_const_by_val,
+                int_type_info, readonly_global_vars, glsl_sets, decorated_ids,
+                max_passes=max_passes,
+            )
+        except _CyclicAlias:
+            # A cyclic substitution cannot justify deleting definitions from this function.
+            opt_funcs[start] = body
+            continue
         opt_funcs[start] = new_body
         all_deleted.update(deleted)
 
