@@ -332,30 +332,33 @@ def compare(after, plan, reference, src, hdr):
             mask[o:o + n] = b"\x01" * n
     for a, b in plan["seeded"]:
         mask[a:b] = b"\x01" * (b - a)
-    if not plan.get("boxes_run", True):    # a --leaf-count run: what it does not write stays untouched
-        reference = bytes(reference[i] if mask[i] else FILL for i in range(size))
+    # expected: the reference where a record or a seeded range is, the fill elsewhere (built with slices)
     expected = bytearray(bytes([FILL]) * size)
-    for i in range(size):
-        if mask[i]:
-            expected[i] = reference[i]
-    unmodelled = sum(1 for i in range(size) if not mask[i] and reference[i] not in (0, FILL))
+    for name, offsets, n in (("leaves", leaves, 64), ("box32", b32, 128), ("box16", b16, 64), ("parents", parents, 4)):
+        for o in offsets:
+            expected[o:o + n] = reference[o:o + n]
+    for a, b in plan["seeded"]:
+        expected[a:b] = reference[a:b]
+    if plan.get("boxes_run", True):        # a --leaf-count run models only what it writes
+        unmodelled = sum(1 for i, r in enumerate(reference[:size]) if r not in (0, FILL) and not mask[i])
+    else:
+        unmodelled = 0
     shadow = bytearray(size + DST_SLACK)
     for d in plan["dispatches"]:
         if d.get("padded"):
             a, b = d["shadow"]
             shadow[a:min(b, size + DST_SLACK)] = b"\x01" * (min(b, size + DST_SLACK) - a)
-    stray = [i for i in range(size) if not mask[i] and got[i] != FILL]
+    diffs = [i for i, (g, e) in enumerate(zip(got, expected)) if g != e]          # one pass over the structure
+    stray = [i for i in diffs if not mask[i]]                                     # expected is FILL there
     tail = bytes(after[dst + size:dst + size + DST_SLACK])
     stray_tail = [size + i for i, b in enumerate(tail) if b != FILL]
     out["stray_bytes"] = len(stray) + len(stray_tail)
     out["stray_bytes_in_padded_shadow"] = sum(1 for i in stray + stray_tail if shadow[i])
     out["structure_bytes"] = size
     # bytes a padded group's extra lanes wrote outside every record are counted above, not as differences
-    artefact = [not mask[i] and shadow[i] for i in range(size)]
-    out["structure_bytes_differ"] = sum(1 for i in range(size) if got[i] != expected[i] and not artefact[i])
-    out["structure_words_differ"] = sum(
-        1 for w in range(size // 4)
-        if any(got[k] != expected[k] and not artefact[k] for k in range(4 * w, 4 * w + 4)))
+    real = [i for i in diffs if mask[i] or not shadow[i]]
+    out["structure_bytes_differ"] = len(real)
+    out["structure_words_differ"] = len({i // 4 for i in real if i < size // 4 * 4})
     out["reference_bytes_not_modelled"] = unmodelled
     return out
 
@@ -451,7 +454,9 @@ def run(plan, image, reference, src, hdr, spirv, vkc, work, *, validation=True, 
             break
     result = compare(heap, plan, reference, src, hdr)
     result["outside_bytes_changed"] = outside_changes(initial, heap, plan)
+    # structure_bytes_differ also covers seeded leaves and the header, which no record count sees (Envyre, #8082)
     ok = (not failed and all(result[k]["differ"] == 0 for k in ("leaves", "box32", "box16", "parents"))
+          and result["structure_bytes_differ"] == 0
           and result["stray_bytes"] == result["stray_bytes_in_padded_shadow"] and result["outside_bytes_changed"] == 0)
     return {"ok": ok, "steps": steps, "result": result}
 
@@ -547,6 +552,12 @@ def main(argv=None):
     for s in rep["steps"]:
         print("%-17s %-26s groups %-5d %-10s %s" % (s["program"], s["what"], s["groups"], s["status"], s["detail"]))
     r = rep["result"]
+    if not any(s["status"] == "ok" for s in rep["steps"]):
+        print("nothing compared: the chain stopped before any dispatch finished")
+        report.update(rep)
+        if a.json:
+            Path(a.json).write_text(json.dumps(report, indent=1), encoding="utf-8", newline="\n")
+        return 1
     if plan["leaves_seeded"]:
         print("leaves   seeded from the CPU reference (LeafRehydration not run)")
     for k in ("leaves", "box32", "box16", "parents"):

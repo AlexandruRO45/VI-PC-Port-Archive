@@ -433,6 +433,24 @@ class Runs(Base):
         self.assertEqual(rep["result"]["box16"]["match"], 600)
         self.assertNotIn("LeafRehydration", [c[0] for c in calls])
 
+    def test_seed_leaves_box_dispatch_that_corrupts_a_seeded_leaf_fails(self):
+        # Envyre on #8082: no record count sees a seeded leaf, so `ok` must also require structure_bytes_differ == 0
+        plan, image, ref = G.build_plan(self.blas, self.geoms, seed_leaves=True)
+        hdr = R.Header(self.blas)
+        at = plan["dst_va"] + hdr.offset_to_elements + 64 * 5
+
+        def corrupt(i, program, heap):
+            if i == 0:
+                heap[at] ^= 0xFF
+        run, _ = fake_runner(corrupt)
+        work = Path(self.tmp.name) / "seedbad"
+        work.mkdir()
+        rep = G.run(plan, image, ref, self.blas[:hdr.total_bytes], hdr, self.spirv, "vkc", work, validation=False,
+                    timeout=5, runner=run)
+        self.assertFalse(rep["ok"], rep["result"])
+        self.assertEqual(rep["result"]["structure_bytes_differ"], 1)
+        self.assertEqual(rep["result"]["box32"]["differ"] + rep["result"]["box16"]["differ"], 0)
+
     def test_leaf_count_ladder(self):
         hdr = R.Header(self.blas)
         for count, groups in ((0, 1), (1, 1), (181, 1), (2048, 1)):
