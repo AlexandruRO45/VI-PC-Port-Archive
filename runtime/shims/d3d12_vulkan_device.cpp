@@ -949,11 +949,17 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            // The console title makes A8_UNORM textures the PC runtime would refuse (the retail executable's RVA
+            // 0x34413f asks for one and stops when the size is refused). They are stored as R8_UNORM like the 2D
+            // shader-resource ones; a depth-stencil or multisampled one is still refused.
+            if (desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return {};
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)))
+                log_once("A8_UNORM beyond a 2D shader resource is stored as R8_UNORM; a render target or UAV write "
+                         "of alpha lands in R only where the view swizzles; resource flags",
+                         int(desc.Flags));
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||
@@ -1918,9 +1924,14 @@ public:
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
-        if (!address || !desc_.Width || (start & (alignment - 1)) || desc_.Width > UINT64_MAX - alignment)
-            return E_INVALIDARG;
-        const VkDeviceSize bytes = (desc_.Width + alignment - 1) & ~(alignment - 1);
+        if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        // The console title places small buffers anywhere inside its pages (a 16-byte UAV at an address ending in
+        // 0xfc0, measured on the retail executable): the import covers the aligned pages around the buffer, and the
+        // buffer is bound at its offset in them when the driver's buffer alignment allows it.
+        const std::uintptr_t base = start & ~static_cast<std::uintptr_t>(alignment - 1);
+        const VkDeviceSize offset = start - base;
+        void* const import_address = reinterpret_cast<void*>(base);
+        const VkDeviceSize bytes = (offset + desc_.Width + alignment - 1) & ~(alignment - 1);
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -1937,15 +1948,16 @@ public:
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        if (offset % (requirements.alignment ? requirements.alignment : 1)) return E_NOTIMPL;
         if (device_.get_host_pointer_properties(device_.info.device,
-                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, address,
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, import_address,
                                                 &host) != VK_SUCCESS)
             return E_INVALIDARG;
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        if (!types || bytes < requirements.size) return E_NOTIMPL;
+        if (!types || bytes < offset + requirements.size) return E_NOTIMPL;
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-        import.pHostPointer = address;
+        import.pHostPointer = import_address;
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
@@ -1967,7 +1979,7 @@ public:
             if (memory_) break;
         }
         if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
         mapped_ = address;
         va_ = start;
         if (need_bda && vk.vkGetBufferDeviceAddress) {

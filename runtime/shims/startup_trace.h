@@ -221,6 +221,13 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            if (info.ContextRecord) {
+                const CONTEXT& c = *info.ContextRecord;
+                f += ",\"regs\":" + quote("rax=" + hex(c.Rax) + " rbx=" + hex(c.Rbx) + " rcx=" + hex(c.Rcx) +
+                                          " rdx=" + hex(c.Rdx) + " rsi=" + hex(c.Rsi) + " rdi=" + hex(c.Rdi) +
+                                          " r8=" + hex(c.R8) + " r9=" + hex(c.R9) + " r14=" + hex(c.R14) +
+                                          " r15=" + hex(c.R15) + " rsp=" + hex(c.Rsp));
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
             // A write to address 0 is how the title's watchdog stops the process when a thread stops making progress

@@ -1222,7 +1222,16 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                              reinterpret_cast<void**>(a2)));
     } else {
         note_child_slot<K>(Slot);
-        if (Slot >= self->slot_count) {
+        // Queue slot 35 is the console's ExecuteCommandLists(count, lists, ...) (PR #7286; the retail title submits
+        // its first frame's lists with (1, lists, 1, 0x100000000), the last two words unread here). It takes slot
+        // 10's path, so probes are dropped and placed descriptor heaps synced as for slot 10.
+        // Queue slot 18 is GetTimestampFrequency(UINT64*) on the console, not GetDesc (measured at the retail
+        // executable's RVA 0x24841a6: an 8-byte out and an HRESULT, the value used as 1 / frequency); PC GetDesc
+        // wrote 16 bytes there, over the caller's saved RBX. It goes to the PC's slot 16.
+        constexpr unsigned Fwd = (K == ChildKind::queue && Slot == 35)   ? 10u
+                                 : (K == ChildKind::queue && Slot == 18) ? 16u
+                                                                         : Slot;
+        if (Fwd >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
                                                                             std::memory_order_relaxed)) {
@@ -1240,7 +1249,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         // ExecuteCommandLists(count, lists): command-list probes never reach the real queue.
         std::uint64_t kept[64];
-        if constexpr (K == ChildKind::queue && Slot == 10) {
+        if constexpr (K == ChildKind::queue && Fwd == 10) {
             if (const auto hook = g_before_execute.load(std::memory_order_acquire)) hook();  // placed heaps -> arena
             const auto count = static_cast<std::uint32_t>(a1);
             const auto* lists = reinterpret_cast<void* const*>(a2);
@@ -1273,7 +1282,9 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Fwd]);
+        if constexpr (K == ChildKind::queue && Slot == 35)
+            return fn(self->real, static_cast<std::uint32_t>(a1), a2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         return fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
     }
 }
@@ -2094,6 +2105,18 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                      xbox_flags, state);
     }
     const HRESULT hr = handler(self->real, va, pc_desc, *riid, out);
+    if (FAILED(hr)) {
+        static std::atomic<unsigned> failed{0};
+        if (failed.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133 failed 0x%08lx: va=%p dimension %d %llux%ux%u mips %u format %u "
+                         "samples %u xbox layout 0x%x xbox flags 0x%x\n",
+                         static_cast<unsigned long>(hr), va, static_cast<int>(pc_desc.Dimension),
+                         static_cast<unsigned long long>(pc_desc.Width), pc_desc.Height,
+                         static_cast<unsigned>(pc_desc.DepthOrArraySize), static_cast<unsigned>(pc_desc.MipLevels),
+                         static_cast<unsigned>(pc_desc.Format), pc_desc.SampleDesc.Count,
+                         static_cast<unsigned>(xbox_desc->Layout), xbox_flags);
+    }
     // Slot 70 makes buffer views from addresses in this range (proxy_buffer_view_at_address).
     if (SUCCEEDED(hr) && *out && pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         auto* const resource = static_cast<ID3D12Resource*>(*out);  // riid is IID_ID3D12Resource
@@ -2232,8 +2255,36 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             pc_descs[i].Layout = pc_descs[i].Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
                                      ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                      : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            // Console flag bits above the PC's (0x100000, 0x200000, ... as slot 127 sees) are not PC flags.
+            pc_descs[i].Flags =
+                static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc_descs[i].Flags) & 0x7ffu);
         }
         *info = device->real->GetResourceAllocationInfo(static_cast<UINT>(args[0]), count, pc_descs.get());
+        if (info->SizeInBytes == ~0ull) {
+            // A console texture format the PC device cannot make a UAV of (B5G5R5A1 on NVIDIA): ask without UAV, as
+            // the layer cannot make such a texture with storage usage either.
+            bool any = false;
+            for (UINT i = 0; i < count; ++i)
+                if (pc_descs[i].Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                    (pc_descs[i].Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+                    pc_descs[i].Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    any = true;
+                }
+            if (any) *info = device->real->GetResourceAllocationInfo(static_cast<UINT>(args[0]), count, pc_descs.get());
+        }
+        if (info->SizeInBytes == ~0ull) {
+            static std::atomic<unsigned> refused{0};
+            if (refused.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 25 refused: dimension %d %llux%ux%u mips %u format %u samples %u "
+                                     "xbox layout 0x%x xbox flags 0x%x\n",
+                             static_cast<int>(xbox_descs[0].Dimension),
+                             static_cast<unsigned long long>(xbox_descs[0].Width), xbox_descs[0].Height,
+                             static_cast<unsigned>(xbox_descs[0].DepthOrArraySize),
+                             static_cast<unsigned>(xbox_descs[0].MipLevels),
+                             static_cast<unsigned>(xbox_descs[0].Format), xbox_descs[0].SampleDesc.Count,
+                             static_cast<unsigned>(xbox_descs[0].Layout),
+                             static_cast<unsigned>(xbox_descs[0].Flags));
+        }
         return reinterpret_cast<std::uint64_t>(ret);
     } else if constexpr (Slot == 108) {
         // GetResourceAllocationInfo1(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1), a struct
