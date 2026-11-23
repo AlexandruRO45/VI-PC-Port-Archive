@@ -341,12 +341,17 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
 
     DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
     if (host_type == 0) host_type = MEM_RESERVE | MEM_COMMIT;
+    if ((host_type & MEM_RESERVE) && (host_type & (MEM_RESET | MEM_RESET_UNDO))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
     const DWORD host_prot = host_protect(protect);
 
     const bool commit = (host_type & MEM_COMMIT) != 0;
     const bool new_placeholder = (host_type & MEM_RESERVE_PLACEHOLDER) != 0;
     const bool replace = (host_type & MEM_REPLACE_PLACEHOLDER) != 0;
-    const bool window = page_mode != 0 && !commit && !new_placeholder;
+    const bool window = page_mode != 0 && !commit && !new_placeholder && (host_type & MEM_RESERVE) != 0 &&
+                        (host_type & (MEM_RESET | MEM_RESET_UNDO)) == 0;
     if ((new_placeholder || replace || window || page_mode == kXmemLargePages) && !placeholder_api().available()) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;

@@ -258,6 +258,20 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
         check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
     }
 
+    void* const reset_region = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0,
+                                             PAGE_READWRITE);
+    check(reset_region != nullptr, "allocate committed 64 KiB region for reset");
+    if (reset_region) {
+        check(virtual_alloc(reset_region, kPage64k, MEM_RESET | kXmem64kPages, 0, PAGE_READWRITE) == reset_region,
+              "MEM_RESET with 64 KiB pages succeeds on committed memory");
+        SetLastError(ERROR_SUCCESS);
+        void* const invalid = virtual_alloc(reset_region, kPage64k, MEM_RESET | MEM_RESERVE | kXmem64kPages, 0,
+                                            PAGE_READWRITE);
+        check(invalid == nullptr && GetLastError() == ERROR_INVALID_PARAMETER,
+              "MEM_RESET combined with MEM_RESERVE fails with ERROR_INVALID_PARAMETER");
+        check(VirtualFree(reset_region, 0, MEM_RELEASE), "release the reset region");
+    }
+
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
     MEMORY_BASIC_INFORMATION mbi{};
     void* const pool = virtual_alloc(nullptr, SIZE_T{8} << 30, MEM_RESERVE | 0x20400000, 0x21, PAGE_READWRITE);
