@@ -18,7 +18,8 @@
 // The loader matches imports by exact DLL name, so GetCommandLineA/W and ExitProcess are served under every name a
 // title can import them by: kernel32.dll (the classic import libraries), kernelbase.dll, and the API sets that the
 // umbrella libraries a GDK title links (OneCore_apiset.lib, mincore.lib) bind them to. The retail package's own DLLs
-// import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll.
+// import ExitProcess from api-ms-win-core-processthreads-l1-1-0.dll. ntdll's RtlExitUserProcess, which a title can import or
+// get through GetProcAddress, ends the process with the same detach on native Windows, so it takes the same way out.
 #include <windows.h>
 
 #include <atomic>
@@ -433,6 +434,7 @@ SHIM_TABLE(process,
     EXIT_PROCESS("kernel32.dll"),
     EXIT_PROCESS("kernelbase.dll"),
     EXIT_PROCESS("api-ms-win-core-processthreads-l1-1-0.dll"),
+    {"ntdll.dll", "RtlExitUserProcess", reinterpret_cast<void*>(&game_exit_process)},  // VOID NTAPI (NTSTATUS)
     COMMAND_LINE("kernel32.dll"),
     COMMAND_LINE("kernelbase.dll"),
     COMMAND_LINE("api-ms-win-core-processenvironment-l1-1-0.dll"),

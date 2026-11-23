@@ -28,6 +28,14 @@ extern "C" __declspec(allocate(".CRT$XLB")) PIMAGE_TLS_CALLBACK detach_exe_point
         std::abort();
     }
     if (!std::strcmp(exit_mode, "TerminateProcess")) TerminateProcess(GetCurrentProcess(), 23);
+    if (!std::strcmp(exit_mode, "RtlExitUserProcess")) {
+        // Looked up at run time, as a title that reaches ntdll directly would; not through ExitProcess.
+        using RtlExitUserProcess = void(NTAPI*)(LONG);
+        const auto rtl_exit = reinterpret_cast<RtlExitUserProcess>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlExitUserProcess")));
+        if (rtl_exit) rtl_exit(23);
+        ExitProcess(99);  // not found: fail the exit-code check
+    }
     ExitProcess(23);
 }
 DWORD WINAPI idle_worker(void*) {

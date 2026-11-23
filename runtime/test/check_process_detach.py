@@ -70,7 +70,8 @@ def main():
     parser.add_argument('--guest', required=True)
     parser.add_argument('--evidence', type=Path)
     args = parser.parse_args()
-    modes = ('return', 'exit', '_exit', '_Exit', 'quick_exit', 'ExitProcess', 'TerminateProcess', 'abort')
+    modes = ('return', 'exit', '_exit', '_Exit', 'quick_exit', 'ExitProcess', 'RtlExitUserProcess', 'TerminateProcess',
+             'abort')
     cases = [(s, m) for s in ('entry', 'entry_with_worker', 'worker_exit') for m in modes]
     cases += [('reentry', 'ExitProcess')]
     cases += [('racing_exit', 'ExitProcess')] * 20
