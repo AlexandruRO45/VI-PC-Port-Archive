@@ -148,8 +148,23 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
         if (d < 0 || d >= 30) return false;
         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
         if (in.failed() || distance > out.size() || out.size() + length > limit) return false;
-        const std::size_t from = out.size() - distance;
-        for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+        if (length < 32) {  // avoid resize/copy overhead for short matches
+            const std::size_t from = out.size() - distance;
+            for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+            continue;
+        }
+        const std::size_t start = out.size();
+        out.resize(start + length);
+        auto* dest = out.data() + start;  // resize may have reallocated
+        std::size_t copied = std::min(distance, length);
+        std::memcpy(dest, dest - distance, copied);
+        // Overlapping matches repeat bytes just written (RFC 1951, 3.2.3). Grow the initialized prefix;
+        // each individual copy is disjoint, even when the match's distance is one byte.
+        while (copied < length) {
+            const std::size_t count = std::min(copied, length - copied);
+            std::memcpy(dest + copied, dest, count);
+            copied += count;
+        }
     }
 }
 

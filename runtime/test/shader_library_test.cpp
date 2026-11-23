@@ -248,6 +248,84 @@ int fspx_checks() {
     return 0;
 }
 
+// A stored history followed by a fixed-Huffman match, encoded from RFC 1951 section 3.2.
+// This chooses the distance and length explicitly; a compressor could choose different matches.
+std::vector<std::uint8_t> match_stream(unsigned distance, unsigned length,
+                                       const std::vector<std::uint8_t>& expected) {
+    std::vector<std::uint8_t> stream = {0x78, 0x01, 0x00};
+    for (unsigned v : {distance, distance ^ 0xffffu}) {
+        stream.push_back(std::uint8_t(v));
+        stream.push_back(std::uint8_t(v >> 8));
+    }
+    stream.insert(stream.end(), expected.begin(), expected.begin() + distance);
+    unsigned used = 0;
+    const auto bit = [&](unsigned v) {
+        if (!used) stream.push_back(0);
+        stream.back() |= std::uint8_t((v & 1) << used);
+        used = (used + 1) % 8;
+    };
+    const auto bits = [&](unsigned v, unsigned count, bool huffman) {
+        for (unsigned i = 0; i < count; ++i) bit(v >> (huffman ? count - 1 - i : i));
+    };
+    bits(3, 3, false);  // BFINAL=1, BTYPE=01
+    unsigned code, extra = 0, value = 0;
+    if (length == 258) code = 285;
+    else if (length <= 10) code = 254 + length;
+    else {
+        extra = 1;
+        while (length >= 3 + (1u << (extra + 3))) ++extra;
+        value = length - (3 + (1u << (extra + 2)));
+        code = 261 + 4 * extra + (value >> extra);
+    }
+    bits(code < 280 ? code - 256 : code - 280 + 0xc0, code < 280 ? 7 : 8, true);
+    bits(value, extra, false);
+    extra = 0;
+    if (distance <= 4) code = distance - 1;
+    else {
+        extra = 1;
+        while (distance > (1u << (extra + 2))) ++extra;
+        code = 2 * (extra + 1) + (((distance - 1) >> extra) & 1);
+    }
+    bits(code, 5, true);
+    bits(distance - 1, extra, false);
+    bits(0, 7, true);  // EOB 256
+    std::uint32_t a = 1, b = 0;
+    for (const auto byte : expected) {
+        a = (a + byte) % 65521;
+        b = (b + a) % 65521;
+    }
+    const std::uint32_t checksum = b << 16 | a;
+    for (int shift = 24; shift >= 0; shift -= 8) stream.push_back(std::uint8_t(checksum >> shift));
+    return stream;
+}
+
+int match_copy_checks() {
+    // Every length, small overlap periods, the fast-path boundary, length ~= distance, and the 32 KiB window.
+    for (unsigned distance : {1u, 2u, 3u, 7u, 31u, 32u, 33u, 257u, 258u, 32768u}) {
+        for (unsigned length = 3; length <= 258; ++length) {
+            std::vector<std::uint8_t> expected(distance + length);
+            for (unsigned i = 0; i < expected.size(); ++i)
+                expected[i] = std::uint8_t((i % distance) * 37 + 11);
+            const auto stream = match_stream(distance, length, expected);
+            std::vector<std::uint8_t> out;
+            CHECK(leonida::zlib_inflate(stream, out, expected.size()) && out == expected);
+            // Reuse capacity as well as growing a fresh vector; reject the match before exceeding the cap.
+            CHECK(leonida::zlib_inflate(stream, out, expected.size()) && out == expected);
+            CHECK(!leonida::zlib_inflate(stream, out, expected.size() - 1) && out.size() == distance);
+            // Shorten the stored history by one: this distance now reaches before the beginning.
+            auto bad_distance = stream;
+            bad_distance.erase(bad_distance.begin() + 7 + distance - 1);
+            const unsigned shorter = distance - 1;
+            bad_distance[3] = std::uint8_t(shorter);
+            bad_distance[4] = std::uint8_t(shorter >> 8);
+            bad_distance[5] = std::uint8_t(~shorter);
+            bad_distance[6] = std::uint8_t(~shorter >> 8);
+            CHECK(!leonida::zlib_inflate(bad_distance, out) && out.size() == shorter);
+        }
+    }
+    return 0;
+}
+
 // Stored blocks at their 16-bit length boundary, including a fixed -> stored -> fixed transition.
 // The mixed stream starts with the fixed literal 'A' and ends with the existing fixed sample. Its first
 // stored header shares a byte with the preceding EOB, exercising align(). Checksums: Python zlib.adler32.
@@ -362,6 +440,7 @@ int main() {
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
 
+    CHECK(match_copy_checks() == 0);
     CHECK(stored_block_checks() == 0);
 
     Json json;
