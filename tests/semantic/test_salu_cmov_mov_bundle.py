@@ -290,6 +290,25 @@ class TestSCmovkI32AST(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 999)
 
+class TestSCmovkI32SignAndGating(unittest.TestCase):
+    def test_sign_boundaries(self) -> None:
+        # 0x7FFF is max positive 16-bit
+        self.assertEqual(ref_s_cmovk_i32(1, 0x7FFF, 0), 0x7FFF)
+        # 0x8000 is min negative 16-bit (-32768)
+        self.assertEqual(ref_s_cmovk_i32(1, 0x8000, 0), 0xFFFF8000)
+
+    def test_translator_sign_extension(self) -> None:
+        body = [
+            "s_cmp_eq_u32 2, 2",
+            "s_mov_b32 s4, 0",
+            "s_cmovk_i32 s4, -32768",
+            "v_mov_b32_e32 v1, s4",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_cmovk_sign")
+        for l in range(32):
+            self.assertEqual(results[l], 0xFFFF8000)
+
 
 if __name__ == "__main__":
     unittest.main()
