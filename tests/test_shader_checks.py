@@ -887,6 +887,35 @@ class Wave32LaneDumps(unittest.TestCase):
         self.assertIn("stdout may have been lost", problem)
         self.assertIn("device: RTX 5080", problem)
 
+    def test_exit_zero_with_only_a_subgroup_line_names_the_missing_dump(self):
+        out = "compute subgroup size: 32\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertIn("no result line from vk_compute_test", problem)
+        self.assertIn('expected "out[0..7] = <8 words>"', problem)
+
+    def test_a_truncated_dump_line_is_malformed_not_lost(self):
+        out = "out[0..7] = truncated\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_store", "1", "dump", expected_words=check.CS_STORE)
+        self.assertIn("malformed result line from vk_compute_test", problem)
+        self.assertIn('"out[0..7]" needs 8 decimal words', problem)
+        self.assertNotIn("stdout may have been lost", problem)
+
+    def test_a_prefixed_mismatch_count_is_not_called_a_lost_stdout(self):
+        out = "1 groups x 64: 2 mismatches\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_ballot", "1", "mismatch")
+        self.assertIn("2 mismatches", problem)
+        self.assertNotIn("stdout may have been lost", problem)
+
+    def test_a_workgroup_mismatch_count_is_not_called_a_lost_stdout(self):
+        out = "2x3x4 workgroup Y/Z: 2 mismatches\n"
+        with patch.object(check, "run", return_value=(0, out)):
+            problem = check.compute_test("tools", "spirv", "cs_workgroup", "1", "workgroup_yz")
+        self.assertIn("2x3x4 workgroup Y/Z: 2 mismatches", problem)
+        self.assertNotIn("stdout may have been lost", problem)
+
     def test_lane_dumps_request_32_lanes(self):
         # #774: like run_gpu_tests.py, so an 8..32 device (Intel ANV) doesn't judge the dump at a narrower size.
         for name in check.WAVE32_LANE_DUMPS:

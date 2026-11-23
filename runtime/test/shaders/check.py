@@ -946,9 +946,24 @@ def compute_test(tools, spirv, name, groups, mode, *, require_wave64=False, expe
         if m and m.group(1) == "0":
             return ""
     # An exit-0 run with no result line used to print only the last stderr line ("device: ..."),
-    # which looks like a test failure rather than a lost stdout. Say so explicitly (#166).
-    if code == 0 and not re.search(r"^(?:out\[0\.\.7\]|\d+ mismatches|compute subgroup size:)", out, re.MULTILINE):
-        return failure(code, out.rstrip() + "\n(no result line from vk_compute_test; stdout may have been lost)", 3)
+    # which looks like a test failure rather than a lost stdout. Name the line the mode expects, and
+    # call a dump line that is present but unreadable malformed rather than lost (#166).
+    if code == 0:
+        if mode == "workgroup_yz":
+            if not re.search(r"^2x3x4 workgroup Y/Z: \d+ mismatches$", out, re.MULTILINE):
+                return failure(code, out.rstrip() + "\n(no result line from vk_compute_test: expected "
+                               "\"2x3x4 workgroup Y/Z: <n> mismatches\"; stdout may have been lost)", 3)
+        elif expected_words is not None:
+            m = re.search(r"^out\[0\.\.7\] = (.*)$", out, re.MULTILINE)
+            if m is None:
+                return failure(code, out.rstrip() + "\n(no result line from vk_compute_test: expected "
+                               "\"out[0..7] = <8 words>\"; stdout may have been lost)", 3)
+            if not re.fullmatch(r"(?:[0-9]+ ){7}[0-9]+", m.group(1)):
+                return failure(code, out.rstrip() + "\n(malformed result line from vk_compute_test: "
+                               "\"out[0..7]\" needs 8 decimal words)", 3)
+        elif not re.search(r"\d+ mismatches", out):
+            return failure(code, out.rstrip() + "\n(no result line from vk_compute_test: expected "
+                           "\"<n> mismatches\"; stdout may have been lost)", 3)
     return failure(code, out, 2)
 
 
