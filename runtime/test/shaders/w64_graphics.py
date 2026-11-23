@@ -173,6 +173,10 @@ def _gs_a_ring(i):                                             # gs_w64_* fixtur
     return (i, 3 * i + 1, 77, 0)
 
 
+def _gs_a_bpermute(i):
+    return (i ^ 1, 3 * (i ^ 1) + 7, i, i >> 1)                 # ds_bpermute from lane ^ 1: the pair's other triangle
+
+
 VS_ENV = {"VKH_SGPRS": "0,0,65536,0x30000000", "VKH_HEAP": "0=0"}
 VS_VERTICES = 960        # 15 rows of 64 vertices: several waves at either size, and partial ones
 VS_RECORDS = 0x1000 // 4  # heap word of vertex 0's record (4 words per vertex); below it, the atomic's counter and slots
@@ -210,6 +214,7 @@ FIXTURES = {
     "vs_w64_c_readlane": ("C", _c_readlane, VS_ENV),
     "vs_w64_c_lane_id": ("C", _vs_c_lane_id, VS_ENV),
     "gs_w64_a_ring": ("A", _gs_a_ring, GS_ENV),
+    "gs_w64_a_bpermute": ("A", _gs_a_bpermute, GS_ENV),
     "gs_w64_c_lane_id": ("C", _vs_c_lane_id, GS_ENV),
 }
 

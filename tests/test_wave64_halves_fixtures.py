@@ -59,6 +59,7 @@ EXPECT = {
     "vs_w64_c_readlane": ("C", ["cross-lane"], None),
     "vs_w64_c_lane_id": ("C", ["lane-id"], None),
     "gs_w64_a_ring": ("A", [], []),
+    "gs_w64_a_bpermute": ("A", [], []),
     "gs_w64_c_lane_id": ("C", ["lane-id"], None),
 }
 
