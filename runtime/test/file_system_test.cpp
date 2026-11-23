@@ -805,6 +805,55 @@ int main() {
                   "CreateFile2(MAXIMUM_ALLOWED) opens a read-only overlay copy for reading");
             if (h_ro2 != INVALID_HANDLE_VALUE) ::CloseHandle(h_ro2);
             setattr_w(L"GAME:\\data\\max_ro.txt", FILE_ATTRIBUTE_NORMAL);
+
+            // The same when the ACL refuses writing rather than the read-only attribute: an entry that denies
+            // FILE_WRITE_DATA fails the read-and-write attempt with ERROR_ACCESS_DENIED, and the open as asked gets
+            // the rest. Only where the host enforces that entry on a direct open.
+            write_path(package / "data" / "max_acl.txt", "pkg-max");
+            const HANDLE h_up = create_w(L"GAME:\\data\\max_acl.txt", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                                         nullptr);
+            if (h_up != INVALID_HANDLE_VALUE) ::CloseHandle(h_up);
+            const std::wstring acl_copy = (overlay / "data" / "max_acl.txt").wstring();
+            check(std::filesystem::exists(acl_copy), "a write-open makes the overlay copy of max_acl.txt");
+            PACL old_dacl = nullptr;
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            bool denied = false;
+            if (GetNamedSecurityInfoW(acl_copy.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr,
+                                      &old_dacl, nullptr, &sd) == ERROR_SUCCESS) {
+                EXPLICIT_ACCESS_W deny{};
+                deny.grfAccessPermissions = FILE_WRITE_DATA;
+                deny.grfAccessMode = DENY_ACCESS;
+                deny.grfInheritance = NO_INHERITANCE;
+                BuildTrusteeWithNameW(&deny.Trustee, const_cast<LPWSTR>(L"CURRENT_USER"));
+                PACL new_dacl = nullptr;
+                if (SetEntriesInAclW(1, &deny, old_dacl, &new_dacl) == ERROR_SUCCESS) {
+                    denied = SetNamedSecurityInfoW(const_cast<LPWSTR>(acl_copy.c_str()), SE_FILE_OBJECT,
+                                                   DACL_SECURITY_INFORMATION, nullptr, nullptr, new_dacl,
+                                                   nullptr) == ERROR_SUCCESS;
+                    LocalFree(new_dacl);
+                }
+            }
+            const HANDLE probe = ::CreateFileW(acl_copy.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                               OPEN_EXISTING, 0, nullptr);
+            const bool write_denied = probe == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED;
+            if (probe != INVALID_HANDLE_VALUE) ::CloseHandle(probe);
+            if (denied && write_denied) {
+                const HANDLE h_acl = create_w(L"GAME:\\data\\max_acl.txt", MAXIMUM_ALLOWED, 0, nullptr,
+                                              OPEN_EXISTING, 0, nullptr);
+                check(h_acl != INVALID_HANDLE_VALUE && read_handle(h_acl) == "pkg-max",
+                      "CreateFileW(MAXIMUM_ALLOWED) opens an overlay copy whose ACL denies writing, for reading");
+                if (h_acl != INVALID_HANDLE_VALUE) ::CloseHandle(h_acl);
+                const HANDLE h_acl2 = create2(L"GAME:\\data\\max_acl.txt", MAXIMUM_ALLOWED, 0, OPEN_EXISTING, &ext);
+                check(h_acl2 != INVALID_HANDLE_VALUE && read_handle(h_acl2) == "pkg-max",
+                      "CreateFile2(MAXIMUM_ALLOWED) opens an overlay copy whose ACL denies writing, for reading");
+                if (h_acl2 != INVALID_HANDLE_VALUE) ::CloseHandle(h_acl2);
+            } else {
+                std::printf("SKIP could not deny writing the overlay copy through its ACL\n");
+            }
+            if (denied)
+                SetNamedSecurityInfoW(const_cast<LPWSTR>(acl_copy.c_str()), SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION, nullptr, nullptr, old_dacl, nullptr);
+            if (sd) LocalFree(sd);
         }
 
         // FindFirstFileExW merges package + overlay and honours FindExInfoBasic & FindExSearchLimitToDirectories.
