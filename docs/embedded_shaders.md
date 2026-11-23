@@ -393,3 +393,20 @@ reason to run again, a second run that leaves no duplicate containers, the repor
 every run and the failure when nothing translates. `shader_library_test` covers the `bvh/` index (found by the
 container's program hash, counted apart, a broken or missing index beside the others) and `d3d12_compute_test`
 creates a pipeline through slot 62 whose only translation is in `<shaders>/bvh/index.json`.
+
+### Compile time against the title's limit, and the pipeline cache
+
+**Status: measured on two machines, 2026-11-23.** The title creates the builder's pipelines one after another through
+slot 62 on one thread, and a second title thread takes a write access violation at address 0 in the title's own code
+about 30 s after the first slot 62 call. HYPOTHESIS: that thread is the title's hang check; the function was not read.
+A driver that needs longer than that for the 52 modules stops the boot there:
+
+| GPU (driver) | `vk_pipeline_check <work>/shaders/spirv/bvh`, first compile | Boot without a cache |
+|---|---|---|
+| RTX 4050 Laptop (NVIDIA 592.82) | 52 ok, 34.6 s in total with `--jobs 1`; `LoadInstances` 17.0 s | 3 of 3 stop about 28 s after the first slot 62 call |
+| RX 9070 XT (AMD 32.0.32029.2010), reported in #7333 | `LoadInstances` alone 57.3 s | 7 of 7 stop during the 32nd pipeline, 29-30 s after the first |
+
+The driver's own disk cache did not get either machine past it. The runtime seeds its Vulkan pipeline cache from
+`pipeline_cache.bin` beside `gta6rt.exe`, so `make_game.py`'s pipelines stage puts these 52 programs into that file
+before the corpus. With the cache written that way (5.6 MB for the 52), the RTX 4050 boot no longer stalls in slot 62:
+`vk_pipeline_check --cache-feedback` reports 52 of 52 hits, and the boot went on to 12,002 D3D12 calls.
