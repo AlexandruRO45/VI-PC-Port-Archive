@@ -752,6 +752,18 @@ void check_run_time_load() {
                   (std::strcmp(locale, "zz-ZZ") == 0 || std::strcmp(locale, "xx-YY") == 0) &&
                   reinterpret_cast<Locale>(slot(pk, 11))(pk, 3, locale) == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER),
               "slot 11 gives one of the package's declared locales, not the host's; a short buffer is refused");
+        if (FILE* f = std::fopen((game + "\\MicrosoftGame.Config").c_str(), "wb")) {
+            std::fputs("<Game><Resources><Resource Language=\"en-US\"/><Resource Language=\"fr-CA\"/></Resources></Game>",
+                       f);
+            std::fclose(f);
+        }
+        for (const char* configured : {"fr-CA", "en-US"}) {
+            check(SetEnvironmentVariableA("LEONIDA_LOCALE", configured) != 0 &&
+                      reinterpret_cast<Locale>(slot(pk, 11))(pk, sizeof(locale), locale) == S_OK &&
+                      std::strcmp(locale, configured) == 0,
+                  "slot 11 selects the configured console locale from the package");
+        }
+        SetEnvironmentVariableA("LEONIDA_LOCALE", nullptr);
         DeleteFileA((game + "\\MicrosoftGame.Config").c_str());
         RemoveDirectoryA(game.c_str());
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);

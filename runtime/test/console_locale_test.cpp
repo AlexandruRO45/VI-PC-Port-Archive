@@ -49,7 +49,11 @@ int main() {
           "undersized buffer");
     check(fn && fn(nullptr, 0) == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER, "null buffer");
 
-    check(SetEnvironmentVariableW(L"LEONIDA_LOCALE", L"fr_CA!") != 0, "set malformed locale");
+    constexpr wchar_t sort_name[] = L"de-DE_phoneb";
+    const LCID sort_lcid = LocaleNameToLCID(sort_name, LOCALE_ALLOW_NEUTRAL_NAMES);
+    check(sort_lcid && sort_lcid != LOCALE_CUSTOM_DEFAULT && sort_lcid != LOCALE_CUSTOM_UNSPECIFIED,
+          "Windows accepts the sort name");
+    check(SetEnvironmentVariableW(L"LEONIDA_LOCALE", sort_name) != 0, "set sort name");
     check_locale("kernel32.dll", L"en-US", 0x0409);
     check(SetEnvironmentVariableW(L"LEONIDA_LOCALE", L"zz-ZZ") != 0, "set unsupported locale");
     check_locale("kernel32.dll", L"en-US", 0x0409);

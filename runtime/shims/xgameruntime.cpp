@@ -34,6 +34,7 @@
 #include <XAsyncProvider.h>
 #include <XTaskQueue.h>
 
+#include "console_locale.h"
 #include "file_system.h"
 #include "shims.h"
 
@@ -1033,17 +1034,16 @@ std::vector<std::string> package_locales() {
 }
 
 // XPackageGetUserLocale(size_t localeSize, char* locale): of the locales the package declares, the one closest to
-// the user's (the same name, else the same language, else the first declared). Microsoft's contract: "If no locale
+// the configured console locale (same name, else same language, else first declared). Microsoft's contract: "If no locale
 // information is declared for the package, this function succeeds but does not return a user locale". The host's
 // locale is never handed out as the package's.
 HRESULT STDMETHODCALLTYPE pkg_user_locale(void*, size_t size, char* locale) {
     if (!locale || !size) return E_INVALIDARG;
     const std::vector<std::string> declared = package_locales();
     if (declared.empty()) return S_OK;
-    wchar_t wide[LOCALE_NAME_MAX_LENGTH] = {};
+    const auto console = rt::console_locale();
     char user[LOCALE_NAME_MAX_LENGTH * 4] = "";
-    if (GetUserDefaultLocaleName(wide, LOCALE_NAME_MAX_LENGTH) > 0)
-        WideCharToMultiByte(CP_UTF8, 0, wide, -1, user, static_cast<int>(sizeof(user)), nullptr, nullptr);
+    WideCharToMultiByte(CP_UTF8, 0, console.name, -1, user, static_cast<int>(sizeof(user)), nullptr, nullptr);
     const auto language = [](const std::string& name) { return name.substr(0, name.find('-')); };
     const auto same = [](const std::string& a, const std::string& b) { return _stricmp(a.c_str(), b.c_str()) == 0; };
     const std::string* pick = &declared.front();
