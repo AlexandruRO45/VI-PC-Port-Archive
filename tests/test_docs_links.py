@@ -1,4 +1,4 @@
-"""Every relative Markdown link and heading anchor in the repository resolves.
+"""Every relative Markdown link and heading anchor in the repository resolves, and every code fence closes.
 
     python -I tests/test_docs_links.py
 
@@ -27,6 +27,32 @@ EXTERNAL = ("http://", "https://", "mailto:", "tel:", "data:")
 def strip_fences(text):
     """Drop fenced code blocks: headings and links inside them are not rendered."""
     return FENCE.sub("", text)
+
+
+def unclosed_fences(text):
+    """Line numbers of the opening fences a page never closes.
+
+    A closing fence carries no info string, so a line with one (` ```powershell `) inside an open block is a new
+    opener and the page left the previous block unclosed: the rest of the page renders as code.
+    """
+    problems = []
+    opener = None
+    for number, line in enumerate(text.splitlines(), 1):
+        marker = line.strip()
+        if not marker.startswith("```"):
+            continue
+        info = marker[3:].strip()
+        if opener is None:
+            if info:
+                opener = number
+        elif info:                    # a second opener: the previous block has no closing fence
+            problems.append(opener)
+            opener = number
+        else:
+            opener = None
+    if opener is not None:
+        problems.append(opener)
+    return problems
 
 
 def slug(heading):
@@ -156,6 +182,13 @@ class RepositoryLinksTest(unittest.TestCase):
         problems = broken_links(ROOT, files)
         self.assertEqual(problems, [],
                          "\n".join(f"{page}: {link} ({why})" for page, link, why in problems))
+
+    def test_the_checker_flags_a_fence_a_page_never_closes(self):
+        # The shape runtime/README.md had: a second opener where the first block's closing fence belongs.
+        self.assertEqual(unclosed_fences("```powershell\nexample\n```powershell\n```\n"), [1])
+        self.assertEqual(unclosed_fences("```powershell\nexample\n"), [1])
+        self.assertEqual(unclosed_fences("# Title\n\n```powershell\nexample\n```\n\n## Next\n"), [])
+        self.assertEqual(unclosed_fences("```\nplain\n```\n"), [])
 
     def test_the_checker_flags_a_missing_file_and_a_bad_anchor(self):
         with tempfile.TemporaryDirectory() as tmp:
