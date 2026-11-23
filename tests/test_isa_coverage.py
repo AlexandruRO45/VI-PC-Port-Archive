@@ -175,6 +175,21 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(bom.returncode, 0, bom.stderr)
         self.assertEqual(json.loads(bom.stdout), json.loads(plain.stdout))
 
+    def test_invalid_utf8_reports_the_absolute_file_byte(self):
+        prefix = "# synthetic marker: café\n".encode("utf-8")
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "translator.py")
+            for bom in (b"", b"\xef\xbb\xbf"):
+                with self.subTest(bom=bom):
+                    with open(source, "wb") as stream:
+                        stream.write(bom + prefix + b"\xff")
+                    result = self.run_translator(source)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    offset = len(bom + prefix)
+                    self.assertIn(f"at byte {offset})".encode("ascii"), result.stderr)
+                    self.assertNotIn(b"synthetic marker", result.stderr)
+
     def test_invalid_translator_syntax_reports_the_source_line(self):
         source = _fixture("# fixture\nif :\n", ".py")
         self.addCleanup(os.unlink, source)
