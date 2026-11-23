@@ -96,9 +96,10 @@ Read the startup trace first; the first event that is not the expected one is th
    TLS index. The summary shows the address and phase of the last observed TLS callback
    (`last_tls_callback` in JSON). The loader records it before invoking the callback, so the record gives no
    completion result. The loader's own TLS is checked by `run_tiny_game_tls`.
-4. **`exception`** — code, `at`, access/address and the stack frames. The loader's vectored handler only records,
-   so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it reserves
-   the final slot for the last observed exception. The trace also includes handled exceptions, so the last
+4. **`exception`** — code, `at`, access/address, the register set (`rax`, `rcx`, `rdx`, `r8`, `r9`, `rsp` and
+   `rbp`, from the same `CONTEXT` the frames come from) and the stack frames. The loader's vectored handler only
+   records, so the process behaviour is the same with or without the trace. When the report reaches `--limit`, it
+   reserves the final slot for the last observed exception. The trace also includes handled exceptions, so the last
    observation alone does not establish what caused the run to stop.
 5. **`exit` / `error`** — a clean exit is not a correct frame; continue to the D3D12 trace.
 6. **D3D12 trace** — the `failed`, `unsupported`, `refused` and `partial` lines name the method. A `partial`
