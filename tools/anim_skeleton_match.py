@@ -90,6 +90,10 @@ def compare_sets(skel_tokens: set[str], anim_per_stream: list[set[str]]) -> dict
 
 
 def _check_input(ap, label: str, path: str) -> None:
+    if not path or not path.strip():
+        ap.error(f"{label} path must not be empty")
+    if "\x00" in path:
+        ap.error(f"{label} path contains NUL byte")
     if not os.path.exists(path):
         ap.error(f"{label} not found: {path}")
     if os.path.isdir(path):
@@ -102,10 +106,15 @@ def _check_input(ap, label: str, path: str) -> None:
 
 
 def _check_output(ap, out_path: str, inputs: tuple[str, ...]) -> None:
+    if not out_path or not out_path.strip():
+        ap.error("--out path must not be empty")
+    if "\x00" in out_path:
+        ap.error("--out path contains NUL byte")
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    if out_path.endswith(seps) or os.path.isdir(out_path):
+        ap.error(f"--out is a directory: {out_path}")
     if any(same_report_path(out_path, inp) for inp in inputs):
         ap.error("--out must not overwrite an input archive")
-    if os.path.isdir(out_path):
-        ap.error(f"--out is a directory: {out_path}")
     parent = os.path.dirname(os.path.abspath(out_path))
     if not os.path.isdir(parent):
         ap.error(f"--out parent directory does not exist: {parent}")
@@ -119,7 +128,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     _check_input(ap, "packs", a.packs)
     _check_input(ap, "anim", a.anim)
-    if a.out:
+    if a.out is not None:
         _check_output(ap, a.out, (a.packs, a.anim))
     try:
         packs = scan_archive_skel(a.packs)
@@ -132,7 +141,7 @@ def main(argv=None):
     summary["anim_streams"] = anim["streams"]
     text = json.dumps(summary, indent=2)
     print(text)
-    if a.out:
+    if a.out is not None:
         try:
             with open(a.out, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text + "\n")

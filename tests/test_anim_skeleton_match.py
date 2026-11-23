@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +61,31 @@ class SkeletonMatchTests(unittest.TestCase):
                 with self.subTest(bad_in=bad_in), self.assertRaises(SystemExit) as cm:
                     asm.main([bad_in, anim_p])
                 self.assertEqual(cm.exception.code, 2)
+
+    def test_cli_rejects_empty_whitespace_nul_and_trailing_sep_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            packs_p = os.path.join(tmp, "packs.rpf")
+            anim_p = os.path.join(tmp, "anim.rpf")
+            with open(packs_p, "wb") as f:
+                f.write(b"RPF9" + bytes(12) + zlib.compress(b"SKEL_ROOT\x00" + b"A" * 128))
+            with open(anim_p, "wb") as f:
+                f.write(b"RPF9" + bytes(12) + zlib.compress(b"SKEL_ROOT\x00" + b"B" * 128))
+            bad_cases = [
+                ("empty_out", [packs_p, anim_p, "--out", ""]),
+                ("whitespace_out", [packs_p, anim_p, "--out", "   "]),
+                ("nul_out", [packs_p, anim_p, "--out", os.path.join(tmp, "bad\x00.json")]),
+                ("trailing_sep_out", [packs_p, anim_p, "--out", os.path.join(tmp, "sub") + os.sep]),
+                ("nul_packs", [os.path.join(tmp, "bad\x00.rpf"), anim_p]),
+                ("nul_anim", [packs_p, os.path.join(tmp, "bad\x00.rpf")]),
+                ("empty_packs", ["", anim_p]),
+                ("whitespace_anim", [packs_p, "   "]),
+            ]
+            with mock.patch.object(asm, "scan_archive_skel", side_effect=AssertionError("should not scan")) as scan_mock:
+                for label, argv in bad_cases:
+                    with self.subTest(label=label), self.assertRaises(SystemExit) as cm:
+                        asm.main(argv)
+                    self.assertEqual(cm.exception.code, 2)
+                scan_mock.assert_not_called()
 
 
 if __name__ == "__main__":
