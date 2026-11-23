@@ -80,6 +80,11 @@ cmake --build runtime/build/linux --parallel
 
 On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 
+If `file "$(command -v cmake)"` says x86_64 (a CMake running under Rosetta) while Homebrew and MoltenVK are arm64, the
+programs build as x86_64 and fail with "incompatible architecture" when they load MoltenVK. Add
+`-DCMAKE_APPLE_SILICON_PROCESSOR=arm64` to the first command (or install an arm64 CMake) and delete a build folder
+that was already configured, since CMake keeps the value in its cache.
+
 The test programs and `scripts/run_gpu_tests.py` should come from the same commit. Some checks tolerate an older
 binary (`unpinned_subgroup_skip`), but mixing them can report false failures in the compute tests: 28 `cs_*`
 failures on both an RTX 5070 Ti Laptop and a Radeon 610M with the `426023a` script and `48ad23f` binaries, where
