@@ -17727,10 +17727,12 @@ def write_index(path, index):
         tmp = None
     finally:
         if tmp is not None:
+            # The staging file may have inherited a read-only destination's mode; make it
+            # deletable first, or Windows strands it beside the index when replace fails.
+            # Keep chmod and unlink separate so a chmod failure never skips unlink.
             with suppress(OSError):
-                # The staging file may have inherited a read-only destination's mode; make it
-                # deletable first, or Windows strands it beside the index when replace fails.
                 os.chmod(tmp, 0o600)
+            with suppress(OSError):
                 os.unlink(tmp)
 
 

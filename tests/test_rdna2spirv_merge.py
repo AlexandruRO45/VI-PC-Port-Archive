@@ -381,6 +381,27 @@ class WriteIndexStagingTest(unittest.TestCase):
             self.assertEqual(dest.read_text(encoding="utf-8"), "{}\n")
             self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["index.json"])
 
+    def test_failed_replace_still_unlinks_when_cleanup_chmod_fails(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "index.json"
+            real_chmod = os.chmod
+            chmod_calls = 0
+
+            def fail_cleanup_chmod(p, mode):
+                nonlocal chmod_calls
+                chmod_calls += 1
+                if chmod_calls == 2:
+                    raise PermissionError("cleanup chmod denied")
+                return real_chmod(p, mode)
+
+            with mock.patch.object(R.os, "chmod", side_effect=fail_cleanup_chmod), \
+                    mock.patch.object(R, "replace_retry", side_effect=PermissionError("locked")):
+                with self.assertRaises(PermissionError):
+                    R.write_index(str(dest), {"a": 1})
+            self.assertEqual(chmod_calls, 2)
+            self.assertEqual(list(Path(d).iterdir()), [])
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_new_and_replaced_index_preserve_posix_bits(self):
         import file_mode
