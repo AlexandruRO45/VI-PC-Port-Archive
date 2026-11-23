@@ -36,6 +36,10 @@ Proje henüz erken aşamadadır: **oyun şu an açılmıyor**.
   - AMDGPU destekli yerel `llvm-mc.exe` derlemek için depo kök dizininde PowerShell'den `.\scripts\build_llvm_mc.ps1`
     betiğini çalıştırın (`git` ve aşağıdaki Visual Studio C++ araçları gerekir). Betik kullanıcınız için `LLVM_MC`
     ortam değişkenini ayarlar; geçerli olması için yeni bir terminal açın.
+  - Daha hızlı bir yol: [conda](https://docs.conda.io/) kullanıyorsanız `conda install -c conda-forge llvm-tools`
+    (Windows derlemesi AMDGPU hedefini içerir; [`docs/testing.md`](../../testing.md) 23.1.6 sürümünü kullandı), ardından
+    `LLVM_MC` değişkenini kurduğu `llvm-mc.exe` dosyasının tam yoluna ayarlayın (ortam etkinleştirildikten sonra
+    `where.exe llvm-mc` yolunu gösterir; PowerShell'de çıplak `where` komutu `Where-Object` demektir).
   - Alternatif olarak WSL (Ubuntu) içinde `llvm-21` kurup `make_game.py` çalıştıracağınız PowerShell oturumunda
     `LLVM_MC` değişkenini tam komut olarak ayarlayın:
 
