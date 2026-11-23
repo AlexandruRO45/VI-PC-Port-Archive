@@ -820,6 +820,10 @@ if(BUILD_TESTING)
     target_link_options(startup_trace_test PRIVATE /OPT:NOREF)
     add_dependencies(startup_trace_test gta6rt_tls_host)
     add_test(NAME startup_trace COMMAND startup_trace_test)
+    add_test(NAME startup_trace_creation COMMAND "${CMAKE_COMMAND}"
+      "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
+      "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_trace_creation.cmake")
   endif()
 
   if(TARGET device_proxy_test)

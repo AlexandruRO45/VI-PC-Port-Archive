@@ -21,7 +21,10 @@
 #pragma once
 
 #include <windows.h>
-#include <set>
+#include <fcntl.h>
+#include <io.h>
+#include <share.h>
+#include <sys/stat.h>
 
 #include <atomic>
 #include <cerrno>
@@ -30,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include "shims.h"
@@ -235,14 +239,28 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 
 inline void close();
 
-// Creates the trace file and installs the exception handler. The file must not exist yet ("x" mode): the trace is
+// Creates the trace file and installs the exception handler. The file must not exist yet: the trace is
 // opened before the loader reads anything, so overwriting would let `--trace` destroy an input, such as the image
 // itself. Returns false if the file exists or cannot be created; `error`, when given, receives the errno.
 inline bool open(const wchar_t* path, int* error = nullptr) {
     {
         const std::lock_guard lock(detail::mutex());
         if (detail::file) return true;
-        const errno_t e = _wfopen_s(&detail::file, path, L"wxb");
+        // Some supported static UCRT builds reject fopen's "x" mode through the invalid-parameter handler,
+        // terminating the process before it can report an error. Low-level exclusive creation has the same
+        // atomic no-overwrite contract without relying on that mode-string extension.
+        int fd = -1;
+        const errno_t e = _wsopen_s(&fd, path, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
+                                   _SH_DENYNO, _S_IREAD | _S_IWRITE);
+        if (e == 0) {
+            detail::file = _wfdopen(fd, L"wb");
+            if (!detail::file) {
+                const int stream_error = errno;
+                _close(fd);
+                if (error) *error = stream_error ? stream_error : EINVAL;
+                return false;
+            }
+        }
         if (e != 0 || !detail::file) {
             detail::file = nullptr;
             if (error) *error = e ? e : EINVAL;
