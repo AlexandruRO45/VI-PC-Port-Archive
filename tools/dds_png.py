@@ -1479,6 +1479,12 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--info takes only an input DDS")
     if not args.info and args.output is None:
         ap.error("an output PNG is required unless --info is used")
+    if not os.path.exists(args.input):
+        print(f"ERROR: {args.input}: does not exist", file=sys.stderr)
+        return 2
+    if os.path.isdir(args.input):
+        print(f"ERROR: {args.input} is not a file", file=sys.stderr)
+        return 2
 
     try:
         if args.info:
