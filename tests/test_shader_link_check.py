@@ -542,6 +542,20 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(reflect.call_count, 2)
 
+    def test_batch_manifest_with_utf8_bom_is_accepted(self):
+        with self.manifest.open("w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"version": 1, "pipelines": [{"name": "bom", "vs": "vertex", "ps": "pixel"}]}, f)
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_malformed_batch_manifest_with_utf8_bom_is_clean_error(self):
+        with self.manifest.open("w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        result = self.run_batch()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("shader_link_check: error:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
