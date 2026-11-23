@@ -1,4 +1,6 @@
 """Tests for tools/spirv_opt.py (sound basic-block SPIR-V peephole optimizer, #884)."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -415,6 +417,32 @@ class SpirvOptTests(unittest.TestCase):
                 opt = f.read()
         _validate(opt)
         self.assertEqual(support.mrt0_words(opt), [42] * 4)
+
+    def test_cli_io_failures_are_one_error_line(self):
+        raw = support.translate_lines("ps_opt_io", [
+            "v_mov_b32_e32 v1, 42",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = spirv_opt.main([os.path.join(d, "missing.spvasm"), "-o", os.path.join(d, "out.spvasm")])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot read", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+
+            src = os.path.join(d, "in.spvasm")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write(raw)
+            folder = os.path.join(d, "folder")
+            os.makedirs(folder)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = spirv_opt.main([src, "-o", folder])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":
