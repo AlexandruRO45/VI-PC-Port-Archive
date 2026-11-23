@@ -494,6 +494,125 @@ class ArchiveTest(unittest.TestCase):
         rows, summary = anim_index.scan_dir(folder)
         self.assertEqual([r["offset"] for r in rows], [0x1000, 0x1100, 0x1200])
 
+    def test_directory_takes_stored_sizes_and_span_from_the_carve_index(self):
+        """BUILD-1613: with rpf9_carve.py's index.json, compressed_bytes and the span are the carve's, not the
+        inflated lengths on disk."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        payloads = (move(), page(), names())
+        offsets = [0x1000 + i * 0x100 for i in range(3)]
+        for offset, payload in zip(offsets, payloads):
+            with open(os.path.join(folder, f"{offset:012x}.bin"), "wb") as f:
+                f.write(payload)
+        stored = [17, 23, 31]
+        index = {"summary": {"files": 3, "compressed_bytes": sum(stored), "span": 0x400, "zero_padding": 5,
+                             "unread_bytes": 7},
+                 "files": [{"off": o, "stored": n, "size": len(p)} for o, n, p in zip(offsets, stored, payloads)]}
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual([r["stored"] for r in rows], stored)
+        self.assertEqual([r["size"] for r in rows], [len(p) for p in payloads])
+        self.assertEqual(summary["compressed_bytes"], sum(stored))
+        self.assertEqual(summary["inflated_bytes"], sum(len(p) for p in payloads))
+        self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (0x400, 5, 7))
+        self.assertEqual(summary["readable_fraction"], round(sum(stored) / 0x400, 6))
+        self.assertEqual(sum(a["stored"] for a in summary["signatures"].values()), sum(stored))
+
+    def test_directory_with_part_of_a_carve_keeps_its_own_totals(self):
+        """A folder holding only some of the carve's streams keeps their stored sizes but not the whole carve's
+        span and padding, which would leave the missing streams' bytes unaccounted for (Kev-Ball, #5184)."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        payloads = (move(), page())
+        offsets = (0x1000, 0x1100)
+        with open(os.path.join(folder, f"{offsets[0]:012x}.bin"), "wb") as f:
+            f.write(payloads[0])
+        index = {"summary": {"span": 0x400, "zero_padding": 5, "unread_bytes": 7},
+                 "files": [{"off": o, "stored": n, "size": len(p)} for o, n, p in zip(offsets, (17, 23), payloads)]}
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual([r["stored"] for r in rows], [17])
+        self.assertEqual(summary["compressed_bytes"], 17)
+        self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (17, 0, 0))
+        self.assertEqual(summary["readable_fraction"], 1.0)
+
+    def test_directory_carve_index_rows_follow_the_continuation_rules(self):
+        """The same row rules as #5175's continuation spans (kacper-serewis, #5184): a duplicated offset drops the
+        whole index, an unusable row is skipped (its file keeps its length and the carve totals are not used), and
+        only the carver's own file name matches a row."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        payloads = (move(), page())
+        offsets = (0x1000, 0x1100)
+        names_on_disk = [f"{offsets[0]:012x}.bin", f"{offsets[1]:012x}.bin"]
+        for name, payload in zip(names_on_disk, payloads):
+            with open(os.path.join(folder, name), "wb") as f:
+                f.write(payload)
+        rows_ok = [{"off": o, "stored": n, "size": len(p)} for o, n, p in zip(offsets, (17, 23), payloads)]
+        summary_ok = {"span": 0x400, "zero_padding": 5, "unread_bytes": 7}
+
+        def run(files):
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"summary": summary_ok, "files": files}, f)
+            return anim_index.scan_dir(folder)
+
+        rows, summary = run(rows_ok + [dict(rows_ok[0])])                       # one offset listed twice
+        self.assertEqual([r["stored"] for r in rows], [len(p) for p in payloads])
+        self.assertEqual(summary["span"], sum(len(p) for p in payloads))
+        rows, summary = run(rows_ok + [{"off": 0x1200, "stored": "9", "size": 1}])   # an extra unusable row
+        self.assertEqual([r["stored"] for r in rows], [17, 23])
+        self.assertEqual((summary["span"], summary["zero_padding"]), (40, 0))
+        os.rename(os.path.join(folder, names_on_disk[1]), os.path.join(folder, f"{offsets[1]:012x}_page.bin"))
+        rows, summary = run(rows_ok)                                            # a renamed file is not the row's
+        self.assertEqual([r["stored"] for r in rows], [17, len(payloads[1])])
+        self.assertEqual(summary["span"], 17 + len(payloads[1]))
+
+    def test_directory_of_a_carve_with_no_streams_keeps_its_span(self):
+        """A carve window holding only padding lists no files; its folder reports the carve's span and padding, as
+        the archive run does (whattheflop, #5184)."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"summary": {"files": 0, "span": 7, "zero_padding": 7, "unread_bytes": 0},
+                       "files": [], "unread": []}, f)
+        rows, summary = anim_index.scan_dir(folder)
+        self.assertEqual(rows, [])
+        self.assertEqual((summary["span"], summary["zero_padding"], summary["unread_bytes"]), (7, 7, 0))
+
+    def test_directory_ignores_a_damaged_carve_index(self):
+        """A carve index.json that is not one (a list, 1e400, a negative or text size, another carve's sizes) is not
+        used, and is not a traceback: every file keeps its length on disk, as without an index."""
+        folder = os.path.join(self.root, "carved")
+        os.makedirs(folder)
+        payloads = (move(), page())
+        offsets = (0x1000, 0x1100)
+        for offset, payload in zip(offsets, payloads):
+            with open(os.path.join(folder, f"{offset:012x}.bin"), "wb") as f:
+                f.write(payload)
+        good = [{"off": 0x1000, "stored": 9}]
+        cases = ['[{"off": 4096, "stored": 16}]',
+                 '{"files": [{"off": 1e400, "stored": 9}], "summary": {"span": 100}}',
+                 '{"files": [{"off": 4096, "stored": 1e400}], "summary": {"span": 100}}',
+                 '{"files": [{"off": 4096, "stored": -1}], "summary": {"span": 100}}',
+                 '{"files": [{"off": "4096", "stored": 9}], "summary": {"span": 100}}',
+                 '{"files": [{"off": 4096, "stored": true}], "summary": {"span": 100}}',
+                 json.dumps({"files": good, "summary": {"span": 1e400}}),
+                 json.dumps({"files": good + [{"off": 0x1100}]}),
+                 # another carve's index: the offsets match, the inflated sizes don't
+                 json.dumps({"files": [{"off": o, "stored": 9, "size": len(p) + 1} for o, p in zip(offsets, payloads)],
+                             "summary": {"span": 100}}),
+                 "{not json"]
+        for text in cases:
+            with self.subTest(index=text):
+                with open(os.path.join(folder, "index.json"), "w", encoding="utf-8") as f:
+                    f.write(text)
+                rows, summary = anim_index.scan_dir(folder)
+                self.assertEqual([r["stored"] for r in rows], [len(p) for p in payloads])
+                self.assertEqual(summary["span"], sum(len(p) for p in payloads))
+                self.assertEqual((summary["zero_padding"], summary["unread_bytes"]), (0, 0))
+
     def test_scan_rpf_closes_mmap_on_invalid_start(self):
         with tracked_mmaps() as created:
             with self.assertRaisesRegex(ValueError, "outside the archive"):

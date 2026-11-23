@@ -450,9 +450,58 @@ def scan_rpf(path, start=None, limit=None, progress=None):
     return rows, summary
 
 
+def _carve_index(path):
+    """rpf9_carve.py's index.json in `path`: ({file name: (stored, size)}, totals, clean).
+
+    Rows follow the rules #5175's _carve_spans uses for the continuation spans, so both readers see the same
+    files: a row whose `off`, `stored` and `size` are not non-negative integers (stored > 0) is skipped, a file is
+    the carver's own name for its offset (`<off:012x>.bin`, or `.bk2` for Bink), and an index that lists one
+    offset twice can't say which stored size is meant, so none of it is used. `totals` is the carve's
+    (span, zero padding, unread bytes) when its summary has them as non-negative integers, else None; `clean`
+    says every row was used."""
+    index_path = os.path.join(path, "index.json")
+    if not os.path.isfile(index_path):
+        return {}, None, False
+    try:
+        with open(index_path, "rb") as f:  # json.load decodes UTF-8 bytes itself
+            index = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return {}, None, False
+    rows = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(rows, list):
+        return {}, None, False
+    spans, seen, clean = {}, set(), True
+    for row in rows:
+        values = (row.get("off"), row.get("stored"), row.get("size")) if isinstance(row, dict) else (None,) * 3
+        if any(type(v) is not int for v in values) or values[0] < 0 or values[1] <= 0 or values[2] < 0:
+            clean = False
+            continue
+        offset, stored, size = values
+        if offset in seen:
+            return {}, None, False
+        seen.add(offset)
+        for ext in (".bin", ".bk2"):
+            spans[f"{offset:012x}{ext}"] = stored, size
+    summary = index.get("summary")
+    totals = None
+    if isinstance(summary, dict):
+        values = (summary.get("span"), summary.get("zero_padding", 0), summary.get("unread_bytes", 0))
+        if all(type(v) is int and v >= 0 for v in values):
+            totals = values
+    return spans, totals, clean and len(seen) == len(rows)
+
+
 def scan_dir(path, progress=None):
-    """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible."""
-    rows, span = [], 0
+    """Index already-carved files. An offset is taken from a leading hexadecimal file name when possible.
+
+    With rpf9_carve.py's index.json in the folder, a file's stored (compressed) size and the carve's span, zero
+    padding and unread bytes come from it, so compressed_bytes and readable_fraction mean what they mean in
+    archive mode. Without it, a file's stored size can only be its length on disk (the inflated size). A file
+    the index doesn't list under its own name, or lists with another inflated size, keeps its length. The carve's
+    totals describe the whole carve, so they are used only when the folder holds exactly the files it lists, each
+    matched, and every row was usable; a partial copy keeps the matched files' stored sizes and its own span."""
+    carve_spans, carve_totals, carve_clean = _carve_index(path)
+    rows, offsets, stored_total, all_matched = [], [], 0, True
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
         # rpf9_carve.py's index.json and any .csv report sit next to the streams; they are not payloads.
@@ -462,9 +511,18 @@ def scan_dir(path, progress=None):
             data = f.read()
         m = re.match(r"([0-9a-fA-F]{6,})", name)
         offset = int(m.group(1), 16) if m else len(rows)
-        span += len(data)
-        rows.append(classify(data, offset, len(data)))
-    summary = summarise(rows, span, 0, 0)
+        listed = carve_spans.get(name)
+        matched = listed is not None and listed[1] == len(data)
+        stored = listed[0] if matched else len(data)
+        all_matched = all_matched and matched
+        offsets.append(offset)
+        stored_total += stored
+        rows.append(classify(data, offset, stored))
+    listed_offsets = {int(n[:12], 16) for n in carve_spans}
+    if carve_totals and carve_clean and all_matched and sorted(offsets) == sorted(listed_offsets):
+        summary = summarise(rows, *carve_totals)
+    else:
+        summary = summarise(rows, stored_total, 0, 0)
     summary["mode"] = "directory"
     summary["directory"] = path
     if progress:
