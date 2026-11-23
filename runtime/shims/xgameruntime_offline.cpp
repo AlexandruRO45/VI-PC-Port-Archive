@@ -50,6 +50,7 @@ using XUserHandle = void*;
 // XGameErr.h values, from the GDK "Error codes" page.
 constexpr HRESULT E_GAMESTREAMING_NOT_INITIALIZED = static_cast<HRESULT>(0x89245400);
 constexpr HRESULT E_GAMESTREAMING_CLIENT_NOT_CONNECTED = static_cast<HRESULT>(0x89245401);
+constexpr HRESULT E_GAMESTREAMING_NO_DATACENTER = static_cast<HRESULT>(0x89245403);
 
 constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
@@ -293,11 +294,12 @@ const GUID kStreamingInterfaces[] = {
 
 std::mutex g_streaming_mutex;
 uint64_t g_next_token = 1;
+std::atomic<bool> g_streaming_initialized{false};
 
 // 3: HRESULT XGameStreamingInitialize()
-HRESULT STDMETHODCALLTYPE streaming_initialize(void*) { return S_OK; }
+HRESULT STDMETHODCALLTYPE streaming_initialize(void*) { g_streaming_initialized.store(true); return S_OK; }
 // 4: void XGameStreamingUninitialize()
-void STDMETHODCALLTYPE streaming_uninitialize(void*) {}
+void STDMETHODCALLTYPE streaming_uninitialize(void*) { g_streaming_initialized.store(false); }
 // 5: bool XGameStreamingIsStreaming(): no client is ever connected.
 bool STDMETHODCALLTYPE streaming_is_streaming(void*) { return false; }
 // 9: uint32_t XGameStreamingGetClientCount()
@@ -339,17 +341,17 @@ HRESULT STDMETHODCALLTYPE streaming_register_properties(void*, uint64_t, XTaskQu
 HRESULT STDMETHODCALLTYPE streaming_dimensions(void*, uint64_t, uint32_t* width, uint32_t* height) {
     if (width) *width = 0;
     if (height) *height = 0;
-    return client_not_connected<8>(nullptr);
+    return g_streaming_initialized.load() ? E_GAMESTREAMING_CLIENT_NOT_CONNECTED : E_GAMESTREAMING_NOT_INITIALIZED;
 }
 size_t STDMETHODCALLTYPE streaming_location_size(void*) { return 0; }
 HRESULT STDMETHODCALLTYPE streaming_location(void*, size_t size, char* name) {
     if (size && name) name[0] = 0;
-    return client_not_connected<16>(nullptr);
+    return g_streaming_initialized.load() ? E_GAMESTREAMING_NO_DATACENTER : E_GAMESTREAMING_NOT_INITIALIZED;
 }
 HRESULT STDMETHODCALLTYPE streaming_session(void*, uint64_t, size_t size, char* session, size_t* used) {
     if (size && session) session[0] = 0;
     if (used) *used = 0;
-    return client_not_connected<32>(nullptr);
+    return g_streaming_initialized.load() ? E_GAMESTREAMING_CLIENT_NOT_CONNECTED : E_GAMESTREAMING_NOT_INITIALIZED;
 }
 
 // 11: XGameStreamingConnectionState XGameStreamingGetConnectionState(XGameStreamingClientId client): 0, the first

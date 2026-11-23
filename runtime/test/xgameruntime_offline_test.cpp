@@ -143,6 +143,23 @@ int main() {
               query(&kStreamingClass, kStreamingImpl3, &streaming3) == S_OK && streaming3 == streaming,
           "XGameStreamingImpl for its class id and IXGameStreamingImpl3");
     if (!streaming) return 1;
+    using RegisterProperties = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+    using Dimensions = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, uint32_t*, uint32_t*);
+    using LocationSize = size_t (STDMETHODCALLTYPE*)(void*);
+    using Location = HRESULT (STDMETHODCALLTYPE*)(void*, size_t, char*);
+    using Session = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*, size_t*);
+    constexpr HRESULT not_initialized = static_cast<HRESULT>(0x89245400);
+    constexpr HRESULT not_connected = static_cast<HRESULT>(0x89245401);
+    constexpr HRESULT no_datacenter = static_cast<HRESULT>(0x89245403);
+    uint32_t pre_width = 99, pre_height = 99;
+    char pre_location[8] = "present", pre_session[8] = "present";
+    size_t pre_used = 99;
+    auto check_uninitialized = [&]() {
+        check(at<Dimensions>(streaming, 8)(streaming, 0, &pre_width, &pre_height) == not_initialized, "dimensions require initialization");
+        check(at<Location>(streaming, 16)(streaming, sizeof(pre_location), pre_location) == not_initialized, "location requires initialization");
+        check(at<Session>(streaming, 32)(streaming, 0, sizeof(pre_session), pre_session, &pre_used) == not_initialized, "session requires initialization");
+    };
+    check_uninitialized();
     check(at<NoArgs>(streaming, 3)(streaming) == S_OK, "XGameStreamingInitialize succeeds");
     check(!at<Bool>(streaming, 5)(streaming), "XGameStreamingIsStreaming is false");
     check(at<Count>(streaming, 9)(streaming) == 0, "no streaming clients");
@@ -154,21 +171,19 @@ int main() {
     check(FAILED(at<NoArgs>(streaming, 10)(streaming)) && !at<Bool>(streaming, 21)(streaming),
           "a per-client call fails as an HRESULT and reads false as a bool");
 
-    using RegisterProperties = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
-    using Dimensions = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, uint32_t*, uint32_t*);
-    using LocationSize = size_t (STDMETHODCALLTYPE*)(void*);
-    using Location = HRESULT (STDMETHODCALLTYPE*)(void*, size_t, char*);
-    using Session = HRESULT (STDMETHODCALLTYPE*)(void*, uint64_t, size_t, char*, size_t*);
     token = {};
     check(at<RegisterProperties>(streaming, 6)(streaming, 0, nullptr, nullptr, reinterpret_cast<void*>(&on_state), &token) == static_cast<HRESULT>(0x89245401) && token.token == 0, "disconnected client properties registration fails without a token");
     uint32_t width = 99, height = 99;
-    check(FAILED(at<Dimensions>(streaming, 8)(streaming, 0, &width, &height)) && width == 0 && height == 0, "offline dimensions are cleared");
+    check(at<Dimensions>(streaming, 8)(streaming, 0, &width, &height) == not_connected && width == 0 && height == 0, "offline dimensions are cleared");
     check(at<LocationSize>(streaming, 15)(streaming) == 0, "offline location size is zero");
     char location[8] = "present";
-    check(FAILED(at<Location>(streaming, 16)(streaming, sizeof(location), location)) && location[0] == 0, "offline location is empty");
+    check(at<Location>(streaming, 16)(streaming, sizeof(location), location) == no_datacenter && location[0] == 0, "offline location is empty");
     char session[8] = "present";
     size_t session_used = 99;
-    check(FAILED(at<Session>(streaming, 32)(streaming, 0, sizeof(session), session, &session_used)) && session[0] == 0 && session_used == 0, "offline session is empty");
+    check(at<Session>(streaming, 32)(streaming, 0, sizeof(session), session, &session_used) == not_connected && session[0] == 0 && session_used == 0, "offline session is empty");
+
+    at<void (STDMETHODCALLTYPE*)(void*)>(streaming, 4)(streaming);
+    check_uninitialized();
 
     // ---- XDisplay ----
     void* display = nullptr;
