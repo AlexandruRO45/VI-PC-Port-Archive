@@ -335,6 +335,44 @@ class TestDsPermuteB32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 300 + l)
 
+def ref_ds_bpermute_b32(
+    addrs: list[int],
+    datas: list[int],
+    offset: int = 0,
+    exec_mask: int = MASK32,
+    old_dst: list[int] | None = None,
+) -> list[int]:
+    """Reference mathematical oracle for backward (gather) permute ds_bpermute_b32."""
+    out = [0] * 32
+    for d in range(32):
+        if not (exec_mask & (1 << d)):
+            out[d] = old_dst[d] if old_dst is not None else 0
+        else:
+            s = ((addrs[d] + offset) // 4) % 32
+            if exec_mask & (1 << s):
+                out[d] = datas[s]
+            else:
+                out[d] = 0
+    return out
+
+
+class TestDsBPermuteB32Oracle(unittest.TestCase):
+    def test_bpermute_rotate_oracle(self) -> None:
+        addrs = [l * 4 for l in range(32)]
+        datas = [l * 15 for l in range(32)]
+        # offset = 4 means destination d reads from s = (d + 1) % 32
+        out = ref_ds_bpermute_b32(addrs, datas, offset=4)
+        for d in range(32):
+            self.assertEqual(out[d], datas[(d + 1) % 32])
+
+    def test_bpermute_broadcast_oracle(self) -> None:
+        # All destinations point to lane 7's address (28)
+        addrs = [28] * 32
+        datas = [99 + l for l in range(32)]
+        out = ref_ds_bpermute_b32(addrs, datas, offset=0)
+        for d in range(32):
+            self.assertEqual(out[d], datas[7])
+
 
 if __name__ == "__main__":
     unittest.main()
