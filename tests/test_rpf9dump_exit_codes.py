@@ -66,22 +66,51 @@ def run(*args):
 
 @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires a built rpf9dump")
 class Rpf9dumpExitCodeTest(unittest.TestCase):
+    def setUp(self):
+        if sys.platform.startswith("linux"):
+            cache_home = self.enterContext(tempfile.TemporaryDirectory())
+            self.enterContext(patch.dict(os.environ, {"XDG_DATA_HOME": cache_home}))
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the Linux .NET cache path")
     def test_unwritable_recovery_cache_does_not_block_texture_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             src = root / "textures.rpf"
             texture_dictionary_rpf(src)
+            baseline = run("textures", src, root / "baseline")
+            self.assertEqual(baseline.returncode, 0, baseline.stdout + baseline.stderr)
             cache = root / "RpfPreview"
             cache.touch()
             with patch.dict(os.environ, {"XDG_DATA_HOME": str(root)}):
                 result = run("textures", src, root / "out")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("could not write the textures recovery index cache", result.stderr)
+            self.assertIn(f"warning: could not write the textures recovery index cache for {src}: ", result.stderr)
             sub = root / "out" / "textures" / "textures"
-            self.assertTrue((sub / "manifest.json").is_file())
+            expected = root / "baseline" / "textures" / "textures"
+            self.assertEqual((sub / "manifest.json").read_bytes(), (expected / "manifest.json").read_bytes())
             dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
             self.assertEqual(dds.read_bytes()[:4], b"DDS ")
+            self.assertEqual(dds.read_bytes(), (expected / dds.relative_to(sub)).read_bytes())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses Linux cache permissions")
+    def test_permission_denied_cache_does_not_block_model_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "empty.rpf"
+            src.write_bytes(b"9FPR" + bytes(4092))  # no model candidates
+            cache = root / "RpfPreview"
+            cache.mkdir(mode=0o500)
+            try:
+                if os.access(cache, os.W_OK):
+                    self.skipTest("current user can write a read-only directory")
+                with patch.dict(os.environ, {"XDG_DATA_HOME": str(root)}):
+                    result = run("models", src, root / "out")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"warning: could not write the models recovery index cache for {src}: ", result.stderr)
+                self.assertTrue((root / "out" / "empty" / "models" / "manifest.json").is_file())
+                self.assertEqual(list(cache.iterdir()), [])
+            finally:
+                cache.chmod(0o700)
 
     def test_failed_xma_write_exits_nonzero_and_rerun_completes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,8 +141,12 @@ class Rpf9dumpExitCodeTest(unittest.TestCase):
             dds = sub / "dictionary_at_0000000000001010" / "000_probe.dds"
             blocker = Path(str(dds) + ".partial")
             blocker.mkdir(parents=True)          # the write of this one DDS fails
+            if sys.platform.startswith("linux"):
+                (Path(os.environ["XDG_DATA_HOME"]) / "RpfPreview").touch()
             failed = run("textures", src, root / "out")
             self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            if sys.platform.startswith("linux"):
+                self.assertIn(f"could not write the textures recovery index cache for {src}", failed.stderr)
             self.assertFalse(dds.exists(), failed.stdout)          # the blocked write must not have succeeded
             self.assertFalse((sub / "manifest.json").exists(), failed.stdout)
             self.assertFalse((sub / "manifest.json.partial").exists())
