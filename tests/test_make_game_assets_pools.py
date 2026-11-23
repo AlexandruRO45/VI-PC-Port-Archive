@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import shutil
 import unittest
 from unittest import mock
 
@@ -156,6 +157,32 @@ class AssetsPoolsTest(unittest.TestCase):
         self.assertIn("bcpack-calibration.json", stderr.getvalue())
         self.assertNotIn("Traceback", stderr.getvalue())
 
+
+    def test_a_symlinked_pool_folder_stops_the_build_with_one_error_line(self):
+        # A pool folder that is a link (symlink or NTFS junction) must be reported as one ERROR line, not
+        # handed to shutil.rmtree (which raises "Cannot call rmtree on a symbolic link").
+        p = self.pool("data/ttdb/pool.ttpf")
+        pool_dir = os.path.join(self.out, "ttpf", "pool")
+        self.run_assets("d1")
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        os.makedirs(elsewhere, exist_ok=True)
+        with open(os.path.join(elsewhere, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+            f.write("d1\n")
+        # Replace the real pool folder with a link to elsewhere.
+        shutil.rmtree(pool_dir)
+        try:
+            os.symlink(elsewhere, pool_dir, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symbolic links are not available here")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            self.run_assets("d2")
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn("ERROR:", stderr.getvalue())
+        self.assertIn("symlink", stderr.getvalue().lower())
+        self.assertNotIn("Traceback", stderr.getvalue())
+        # The link and its target must be left intact.
+        self.assertTrue(os.path.islink(pool_dir))
 
 if __name__ == "__main__":
     unittest.main()
