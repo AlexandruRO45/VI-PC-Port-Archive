@@ -713,6 +713,10 @@ int main(int argc, char** argv) {
         }
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR}; pi.swapchainCount = 1; pi.pSwapchains = &swap; pi.pImageIndices = &idx;
         const VkResult pres = vkQueuePresentKHR(q, &pi);
+        if (pres != VK_SUCCESS && pres != VK_ERROR_OUT_OF_DATE_KHR && pres != VK_SUBOPTIMAL_KHR) {
+            std::fprintf(stderr, "vkQueuePresentKHR failed (%d)\n", int(pres));
+            return 1;
+        }
         if ((pres == VK_ERROR_OUT_OF_DATE_KHR || pres == VK_SUBOPTIMAL_KHR || acq == VK_SUBOPTIMAL_KHR) && !last_frame) {
             const int made = make_swap();
             if (made < 0) { std::fprintf(stderr, "cannot recreate the swapchain\n"); return 1; }
