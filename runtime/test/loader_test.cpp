@@ -319,22 +319,29 @@ void test_failed_reserved_map_preserves_reservation() {
         return failed(what, "the synthetic preferred range could not be reserved");
     }
 
-    wchar_t old_value[64] = {};
-    const DWORD old_length = GetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", old_value, 64);
+    struct Restore {
+        void* reservation;
+        std::wstring old_value;
+        bool had_value = false;
+        ~Restore() {
+            SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", had_value ? old_value.c_str() : nullptr);
+            VirtualFree(reservation, 0, MEM_RELEASE);
+        }
+    } restore{reservation, {}, false};
+    SetLastError(ERROR_SUCCESS);
+    const DWORD old_length = GetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", nullptr, 0);
+    restore.had_value = old_length != 0 || GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+    if (old_length) {
+        restore.old_value.resize(old_length);
+        const DWORD copied = GetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", restore.old_value.data(), old_length);
+        if (copied >= old_length) return failed(what, "the prior reservation setting changed while reading it");
+        restore.old_value.resize(copied);
+    }
     wchar_t marker[64] = {};
     std::swprintf(marker, 64, L"%llx:%llx", static_cast<unsigned long long>(preferred),
                   static_cast<unsigned long long>(reservation_size));
-    SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", marker);
-
-    struct Restore {
-        uint64_t base;
-        DWORD old_length;
-        wchar_t* old_value;
-        ~Restore() {
-            SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", old_length && old_length < 64 ? old_value : nullptr);
-            VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
-        }
-    } restore{preferred, old_length, old_value};
+    if (!SetEnvironmentVariableW(L"LEONIDA_BASE_RESERVED", marker))
+        return failed(what, "the synthetic reservation setting could not be installed");
     const auto path = write_image_as(bad, "reserved_map_retry.dll");
     try {
         rt::Loader loader(g_dir);
@@ -675,6 +682,9 @@ std::vector<uint8_t> make_init_image() {
 
 void test_failed_existing_thread_tls_record_rolls_back() {
     const char* what = "a failed existing-thread TLS record rolls the map back for retry";
+    auto image = make_init_image();
+    const uint64_t preferred = nt_of(image)->OptionalHeader.ImageBase;
+    const auto path = write_image_as(image, "tls_record_retry.dll");
     std::atomic<bool> ready{false};
     std::atomic<bool> stop{false};
     std::atomic<bool> probe{false};
@@ -697,9 +707,6 @@ void test_failed_existing_thread_tls_record_rolls_back() {
     });
     while (!ready.load(std::memory_order_acquire)) Sleep(0);
 
-    auto image = make_init_image();
-    const uint64_t preferred = nt_of(image)->OptionalHeader.ImageBase;
-    const auto path = write_image_as(image, "tls_record_retry.dll");
     bool ok = false;
     std::string why;
     try {
