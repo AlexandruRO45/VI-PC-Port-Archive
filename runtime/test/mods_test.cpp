@@ -6,6 +6,10 @@
 #include <fstream>
 #include <string>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 int g_checks = 0, g_failures = 0;
@@ -108,6 +112,34 @@ int main() {
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
     std::filesystem::remove_all(dir);
+
+    // A folder name the ANSI code page cannot hold (U+4E2D is in no single-byte code page): path::string() threw
+    // there, before main's try, and ended gta6rt. The name now comes through as UTF-8, like the names in mod.json.
+#ifdef _WIN32
+    if (GetACP() == CP_UTF8) {
+        std::printf("SKIP non-ANSI folder names: the ANSI code page is UTF-8, which holds every name\n");
+    } else
+#endif
+    {
+        const auto wide_dir = std::filesystem::temp_directory_path() / "leonida_mods_test_wide";
+        std::filesystem::remove_all(wide_dir);
+        write(wide_dir / L"a_mod_\u4E2D" / "mod.json", R"({"archetype_swaps":[{"from":"cs_mandy","to":"cs_monalisa"}]})");
+        write(wide_dir / L"b_broken_\u4E2D" / "mod.json", "{not json");
+        write(wide_dir / "c_plain" / "mod.json", "{}");
+        LoadResult wide;
+        bool threw = false;
+        try {
+            wide = load_mods(wide_dir);
+        } catch (...) {
+            threw = true;
+        }
+        check(!threw, "a mod folder with a non-ANSI name does not throw out of load_mods");
+        check(wide.mods.size() == 2 && wide.mods[0].name == "a_mod_\xE4\xB8\xAD" && wide.mods[1].name == "c_plain",
+              "the non-ANSI folder's mod loads under its UTF-8 name, and the folders after it still load");
+        check(wide.errors.size() == 1 && wide.errors[0].rfind("b_broken_\xE4\xB8\xAD: ", 0) == 0,
+              "a broken manifest in a non-ANSI folder is reported under the UTF-8 name");
+        std::filesystem::remove_all(wide_dir);
+    }
 
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

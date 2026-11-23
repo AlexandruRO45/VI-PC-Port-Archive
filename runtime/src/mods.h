@@ -190,11 +190,15 @@ inline LoadResult load_mods(const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) return result;
     std::vector<std::filesystem::path> folders;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
-        if (entry.is_directory(ec)) folders.push_back(entry.path());
+    // The error_code increment: the range-for's operator++ throws when the listing fails part way, and load_mods
+    // runs in main before its try (main.cpp), so a throw here ends gta6rt.
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        if (std::error_code entry_ec; it->is_directory(entry_ec)) folders.push_back(it->path());
     std::sort(folders.begin(), folders.end());
     for (const auto& folder : folders) {
-        const std::string name = folder.filename().string();
+        // UTF-8, like the names in mod.json: path::string() throws on a character the ANSI code page lacks (RT-84).
+        const std::u8string utf8 = folder.filename().u8string();
+        const std::string name(reinterpret_cast<const char*>(utf8.data()), utf8.size());
         std::ifstream f(folder / "mod.json", std::ios::binary);
         if (!f) continue;  // a folder without a manifest is not a mod (notes, assets of another tool)
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
