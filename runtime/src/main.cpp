@@ -10,12 +10,13 @@
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
-// Every mode takes --log FILE: everything the loader and the title print to stdout and stderr is appended to FILE
-// instead. Proton's default launch (Steam, `proton run`, umu) starts the program through its steam.exe, which gives
-// it no console, so without --log nothing the loader says reaches the player.
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
+//
+// Every mode takes --log FILE: everything the loader and the title print to stdout and stderr is appended to FILE
+// instead. Proton's default launch (Steam, `proton run`, umu) starts the program through its steam.exe, which gives
+// it no console, so without --log nothing the loader says reaches the player.
 //
 // --game-dir is also where a title's GAME: paths read from; anything it writes or deletes goes to the overlay
 // (--overlay, default <game-dir>/overlay) so the package is never modified (shims/file_system.cpp).
