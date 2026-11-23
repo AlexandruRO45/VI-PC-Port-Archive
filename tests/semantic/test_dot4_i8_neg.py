@@ -247,6 +247,12 @@ class Dot4I8NegSemanticTests(unittest.TestCase):
             ("ps_dot4c_neg_hi", "v_dot4c_i32_i8 v8, v1, v2 neg_hi:[0,1,0]", "v_dot4c_i32_i8 neg"),
             ("ps_dot4_neg_bad_len", "v_dot4_i32_i8 v8, v1, v2, v3 neg_lo:[1,0]", "v_dot4_i32_i8 neg"),
             ("ps_dot4_neg_bad_val", "v_dot4_i32_i8 v8, v1, v2, v3 neg_hi:[0,2,0]", "v_dot4_i32_i8 neg"),
+            ("ps_dot4_neg_non_int", "v_dot4_i32_i8 v8, v1, v2, v3 neg_lo:[1,x,0]", "v_dot4_i32_i8 neg"),
+            ("ps_dot4_neg_too_many", "v_dot4_i32_i8 v8, v1, v2, v3 neg_hi:[1,0,0,0]", "v_dot4_i32_i8 neg"),
+            ("ps_dot4_dup_neg_lo", "v_dot4_i32_i8 v8, v1, v2, v3 neg_lo:[1,0,0] neg_lo:[0,1,0]", "v_dot4_i32_i8 neg"),
+            ("ps_dot4_dup_neg_hi", "v_dot4_i32_i8 v8, v1, v2, v3 neg_hi:[1,0,0] neg_hi:[0,1,0]", "v_dot4_i32_i8 neg"),
+            ("ps_dot4_dup_op_sel", "v_dot4_i32_i8 v8, v1, v2, v3 op_sel:[0,0,0] op_sel:[1,0,0]", "v_dot4_i32_i8 op_sel"),
+            ("ps_dot4_dup_op_sel_hi", "v_dot4_i32_i8 v8, v1, v2, v3 op_sel_hi:[1,1,1] op_sel_hi:[0,1,1]", "v_dot4_i32_i8 op_sel"),
         ):
             with self.subTest(name=name):
                 lines = [

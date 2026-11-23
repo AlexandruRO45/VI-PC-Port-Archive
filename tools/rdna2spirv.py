@@ -11513,24 +11513,32 @@ class Gen:
             # neg_lo/neg_hi on v_dot4_i32_i8 act as float sign-bit modifiers on the integer dwords: for S0 and S1,
             # neg_lo[k] flips bit 15 and neg_hi[k] flips bit 31; for S2 (addend), neg_hi[2] clears bit 31 and neg_lo[2]
             # then flips bit 31.
-            def bits(name, default):
-                m = next((m for m in mods if m.startswith(name + ":")), None)
-                return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
+            def bits(name, default, kind):
+                matches = [m for m in mods if m.startswith(name + ":")]
+                if not matches:
+                    return default
+                if len(matches) > 1:
+                    raise Unsupported(f"{op} {kind}")
+                m = matches[0]
+                prefix = name + ":["
+                if not (m.startswith(prefix) and m.endswith("]")):
+                    raise Unsupported(f"{op} {kind}")
+                parts = [v.strip() for v in m[len(prefix):-1].split(",")]
+                if len(parts) != 3 or any(v not in ("0", "1") for v in parts):
+                    raise Unsupported(f"{op} {kind}")
+                return [int(v) for v in parts]
             is_vop3p = op == "v_dot4_i32_i8"
             has_opsel = any(m.startswith("op_sel") for m in mods)
             has_neg = any(m.startswith(("neg_lo", "neg_hi")) for m in mods)
             has_clamp = "clamp" in mods
             if not is_vop3p and (has_opsel or has_neg or has_clamp):
                 raise Unsupported(op + (" clamp" if has_clamp else " neg" if has_neg else " op_sel"))
-            sel = bits("op_sel", [0, 0, 0])
-            selhi = bits("op_sel_hi", [1, 1, 1])
-            nlo = bits("neg_lo", [0, 0, 0])
-            nhi = bits("neg_hi", [0, 0, 0])
-            if (len(sel) != 3 or len(selhi) != 3 or sel[2] != 0 or selhi[2] != 1
-                    or any(b not in (0, 1) for b in sel + selhi)):
+            sel = bits("op_sel", [0, 0, 0], "op_sel")
+            selhi = bits("op_sel_hi", [1, 1, 1], "op_sel")
+            nlo = bits("neg_lo", [0, 0, 0], "neg")
+            nhi = bits("neg_hi", [0, 0, 0], "neg")
+            if sel[2] != 0 or selhi[2] != 1:
                 raise Unsupported(op + " op_sel")
-            if len(nlo) != 3 or len(nhi) != 3 or any(b not in (0, 1) for b in nlo + nhi):
-                raise Unsupported(op + " neg")
             x, y = self.src_u(a[1]), self.src_u(a[2])
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
             if is_vop3p:
