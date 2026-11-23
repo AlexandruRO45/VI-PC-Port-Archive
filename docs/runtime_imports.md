@@ -80,6 +80,15 @@ The six unique Xbox-specific imports (eight consumer/import pairs) are exactly t
 The video path (`Bink2Scarlett.dll`), the BVH builder and the FidelityFX upscaler therefore all go through the
 two shim DLLs that already exist. `libHttpClient.GDK.dll` and `XCurl.dll` import only desktop APIs.
 
+`xmem.dll!XMemTransferMemory` is not imported by any of these DLLs, but a Series executable calls it during startup
+(reported in [#5934](https://github.com/ItsNotRexed/Leonida/issues/5934#issuecomment-7101779516)). Its GDK reference
+page is an NDA topic, but Microsoft's public [NetRumble](https://github.com/microsoft/XBOX-MonoGame-NetRumble/blob/203255e785f2ab2671a9d83b724eaa14d5b07414/console/NetRumble.Bootstrap/Main.cpp#L135-L145)
+sample and FNA's [NativeAOT-Xbox](https://github.com/FNA-XNA/NativeAOT-Xbox/blob/b9dc547afd0e05f45764d670ec49e0ac7997a301/Bootstrap/Main.cpp#L117-L124)
+bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))` with a `size_t` in multiples of
+2 MiB, to move budget from the title's memory partition to the system's. A PC has no such partition, so the shim
+returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
+and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.
@@ -105,6 +114,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   or two threads opening the same file never leave a truncated copy under its name; a delete of a
   package file leaves an empty marker under `<overlay>\.gta6rt-deleted`, which reads and listings treat as gone. The
   package is never written.
+- `DeleteFileA/W` checks the visible file's `FILE_ATTRIBUTE_READONLY`: a read-only package file with no overlay is
+  refused with `ERROR_ACCESS_DENIED` before writing a deletion marker. An overlay copy supplies its own attributes,
+  so a writable overlay can still be deleted when the package file underneath is read-only. The native A/W controls
+  in `file_system_test` cover these cases and mixed hidden, system and archive attributes.
 - Reads prefer the overlay copy and then the package. `FindFirstFile` merges the two folders, the overlay winning on a
   name, and hides deleted names, the marker folder and the copy folder.
 - A path that climbs above `GAME:` with `..`, or names another drive, fails with `ERROR_INVALID_NAME`, so a title
@@ -186,12 +199,13 @@ pseudo-handle, and `GetProcAddress` on it resolves through the registry. A name 
 with `ERROR_PROC_NOT_FOUND` and is logged once. Every other module goes to the host unchanged.
 
 `runtime/shims/xgameruntime.cpp` serves the five entry points. The initializers succeed offline and log the GDK
-version and mode once. `QueryApiImpl` serves `XThreadingImpl` and `XErrorImpl` (below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`,
-`XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs'
-layout (below); for any other class it logs
+version and mode once. `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`, `XSystemImpl`,
+`XPersistentLocalStorageImpl`, `XPackageImpl`, `XGameImpl`, `XGameRuntimeFeatureImpl` and `XSystemAnalyticsImpl`
+(below), and `XUserImpl`, `XGameSaveImpl`, `XStoreImpl`, `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`,
+`XDisplayImpl` and `XUserDeviceImpl` from xgameruntime-docs' layout (below); for any other class it logs
 the class and interface id and returns `0x80070032`, the documented error for a class the runtime doesn't provide, so
 the first boot with the executable lists the classes to implement next. `xgameruntime_test` drives this path through
-the api-set binding `XCurl.dll` uses, and calls the two classes slot by slot.
+the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` serves slot by slot.
 
 `XCurl.dll` has a second way in. One of its functions reads `HKLM\Microsoft\GamingServices` value
 `ServiceRetryTimeout`, then `LoadLibraryExW(L"gameplatformservices.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)` and
@@ -326,6 +340,21 @@ The executable's first boot confirms them, or names the slots that differ.
 
 `xgameruntime_offline_test` drives the five classes; `xgameruntime_offline_hdr` runs it again with
 `LEONIDA_HDR=1`.
+
+Two more classes are served from `tools/gdk_runtime_calls.py`'s measurement of `libHttpClient.GDK.dll` (it finds the
+thunks in the code without running it and prints, per class, the interface id asked for, the slots called and the
+argument count each passes after `this`). Their thunks are in the DLL but nothing in it calls them; a title linked with
+the same `xgameruntime.lib` gets the same thunks. Every slot is the function at that position of xgameruntime-docs'
+layout with the documented argument count, and each behaves as Microsoft's reference page for that function says
+(`runtime/shims/xgameruntime.cpp` cites both):
+
+| Class | Interface asked for | Slots (args after `this`) | Offline behaviour |
+|---|---|---|---|
+| `XGameRuntimeFeatureImpl` | its class id | 3 `XGameRuntimeIsFeatureAvailable` (1, returns `bool`) | True when `QueryApiImpl` serves the class the feature's functions go through (whichever `xgameruntime*.cpp` serves it) and the feature is documented for Windows: today XAsync, XAsyncProvider, XTaskQueue, XThread, XError, XGame, XGameSave, XGameUI, XNetworking, XPackage, XPersistentLocalStorage, XStore, XSystem, XUser, XGameEvent, XGameStreaming. False for XDisplay (served, but documented for the consoles only), for the classes not served (XAccessibility and XSpeechSynthesizer, XAppCapture, XGameInvite, XLauncher) and for values past the enum |
+| `XSystemAnalyticsImpl` | its class id | 3 `XSystemGetAnalyticsInfo` (1: the result's address, as MSVC passes a returned struct to a member function) | The named export's `XSystemAnalyticsInfo` |
+
+Not served yet, though `libHttpClient.GDK.dll` has thunks for them: `XAccessibilityImpl` (slots 3-21) and
+`XLauncherImpl` (3-5), among others.
 
 Which classes the package's GDK modules reference, from a byte search for the class and interface GUIDs that
 xgameruntime-docs lists (16-byte in-memory form, every `.dll` of the package; counts only, nothing else read):
