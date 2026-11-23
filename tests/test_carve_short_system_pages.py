@@ -83,6 +83,7 @@ class ShortSystemPagesTest(unittest.TestCase):
                         self.assertEqual((folder / f"{row['off']:012x}.bin").read_bytes(), page)
                     archive = self.joined_cli(source)
                     carved = self.joined_cli(folder)
+                    self.assertEqual(archive["resources"], carved["resources"])
                     for report in (archive, carved):
                         self.assertEqual(report["summary"]["joined_resources"], 1)
                         self.assertEqual(report["summary"]["zlib_streams"], len(pages))
@@ -92,6 +93,47 @@ class ShortSystemPagesTest(unittest.TestCase):
                     for field in ("by_kind", "page_shapes", "primary_vertices", "primary_triangles",
                                   "all_lod_vertices", "all_lod_triangles"):
                         self.assertEqual(carved["summary"][field], archive["summary"][field])
+
+    def test_indexed_folder_rejects_omitted_stream_before_graphics(self):
+        pages = model_pages()
+        data, offsets = compressed_pages([*pages[:-1], b"x" * 47, pages[-1]])
+        source, folder, index = self.carve(data)
+        self.assertNotIn(offsets[-2], [row["off"] for row in index["files"]])
+        for path in (source, folder):
+            output = self.root / "interrupted.json"
+            run = subprocess.run([sys.executable, "-I", str(ROOT / "tools/restofworld_model_join.py"),
+                                  str(path), str(output), "--quiet"], capture_output=True)
+            self.assertEqual(run.returncode, 1, run.stderr)
+            report = json.loads(output.read_bytes())
+            self.assertEqual(report["summary"]["joined_resources"], 0)
+            self.assertEqual(report["summary"]["unjoined_candidates"], 1)
+        self.assertTrue(joiner._aliases_input(folder / "index.json", folder))
+        (folder / "index.json").unlink()
+        self.assertTrue(joiner._aliases_input(folder / "index.json", folder))
+        self.assertEqual(self.joined_cli(folder)["summary"]["joined_resources"], 1)
+
+    def test_indexed_folder_checks_padding_before_graphics(self):
+        pages = model_pages()
+        data, offsets = compressed_pages(pages)
+        end = offsets[-2] + len(zlib.compress(pages[-2]))
+        self.assertLess(end, offsets[-1])
+        for replacement in (b"!", bytes(17)):
+            with self.subTest(replacement=replacement):
+                source, folder, _ = self.carve(data[:end] + replacement + data[end + 1:])
+                for path in (source, folder):
+                    scan = joiner.scan_dir if path == folder else joiner.scan_rpf
+                    self.assertEqual(scan(str(path))[1]["joined_resources"], 0)
+
+    def test_invalid_index_cannot_restore_file_order_join(self):
+        _, folder, index = self.carve(compressed_pages(model_pages())[0])
+        for change in ({"stored": 0}, {"off": 0}, {"pre": "00"}, {"size": 65}):
+            with self.subTest(change=change):
+                original = index["files"][1].copy()
+                index["files"][1].update(change)
+                (folder / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+                with self.assertRaises(ValueError):
+                    joiner.scan_dir(folder)
+                index["files"][1] = original
 
     def test_unrelated_short_streams_and_files_keep_the_cutoff(self):
         pages = model_pages()

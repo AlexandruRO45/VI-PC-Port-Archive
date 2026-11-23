@@ -244,8 +244,8 @@ class ModelSystemPages:
     """Track the existing model-map exception to the 64-byte scanned-stream cutoff.
 
     Only a map readable in the first, full-sized model page establishes a run. Callers supply their
-    existing framing checks; archive scans require adjacent, zero-padded streams, while folder joins
-    already treat their ordered files as contiguous. No payload is retained.
+    framing checks. Archive and indexed-folder scans check recorded boundaries; loose folders
+    treat their ordered files as contiguous. No payload is retained.
     """
 
     def __init__(self):
@@ -1044,6 +1044,36 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     return resources, summary
 
 
+def _carve_rows(path):
+    """Read physical stream boundaries in the order recorded by rpf9_carve."""
+    try:
+        fh = open(os.path.join(path, "index.json"), encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    with fh:
+        index = json.load(fh)
+    rows = index.get("files") if isinstance(index, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("index.json requires a files array")
+    result = {}
+    last_end = 0
+    for row in rows:
+        if not isinstance(row, dict) or any(type(row.get(k)) is not int for k in ("off", "size", "stored")):
+            raise ValueError("invalid stream dimensions in index.json")
+        off, size, stored = row["off"], row["size"], row["stored"]
+        if off < last_end or min(size, stored) <= 0:
+            raise ValueError("overlapping or invalid stream in index.json")
+        last_end = off + stored
+        bink = row.get("type") == "bink2"
+        pre = row.get("pre")
+        if not bink and (not isinstance(pre, str) or
+                         len(pre) != 2 * min(16, off) or not re.fullmatch(r"[0-9a-fA-F]*", pre)):
+            raise ValueError("invalid predecessor bytes in index.json")
+        name = f"{off:012x}." + ("bk2" if bink else "bin")
+        result[name] = (off, size, stored, b"" if bink else bytes.fromhex(pre))
+    return result
+
+
 def scan_dir(path, max_inflate=MAX_INFLATE):
     """Join already-carved `.bin` / `.bk2` stream files in offset order."""
     t0 = time.time()
@@ -1051,21 +1081,36 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     files = []
     skipped = 0
     system_pages = ModelSystemPages()
-    for name in sorted(os.listdir(path)):
+    rows = _carve_rows(path)
+    previous_end = 0
+    names = rows if rows is not None else sorted(os.listdir(path))
+    for name in names:
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or not (name.endswith(".bin") or name.endswith(".bk2")):
+        if rows is None and (not os.path.isfile(full) or not name.endswith((".bin", ".bk2"))):
             continue
         fsize = os.path.getsize(full)
+        if rows is None:
+            match = re.match(r"([0-9a-fA-F]{6,})", name)
+            off = int(match.group(1), 16) if match else len(streams)
+            stored, gap, gap_zero, pre16_zero = fsize, 0, True, True
+        else:
+            off, size, stored, pre = rows[name]
+            if size != fsize:
+                raise ValueError(f"{name}: size differs from index.json")
+            gap = off - previous_end
+            gap_zero = gap == 0 or (gap <= len(pre) and not any(pre[-gap:]))
+            pre16_zero = pre == bytes(16)
+        adjacent = rows is None or (off == ((previous_end + 15) & ~15) and gap_zero)
+        root_framed = rows is None or ((off & 0xFFF) == 0x10 and pre16_zero)
         if name.endswith(".bin") and fsize > max_inflate:
             skipped += 1
             system_pages.reset()
             continue
-        minimum = 64 if name.endswith(".bk2") else system_pages.minimum_size(True)
+        minimum = 64 if name.endswith(".bk2") else system_pages.minimum_size(adjacent)
         if fsize < minimum:
             system_pages.reset()
             continue
-        match = re.match(r"([0-9a-fA-F]{6,})", name)
-        off = int(match.group(1), 16) if match else len(streams)
+        previous_end = off + stored
         with open(full, "rb") as fh:
             head = fh.read(32)
             # The carver writes raw video as .bk2; a compressed .bin payload can also start with KB2.
@@ -1073,20 +1118,20 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
             if fsize % 65536 == 0 and not is_bink:
                 # Inspect the model header and map without copying a full page just for this metadata pass.
                 with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                    system_pages.accept(data, adjacent=True, root_framed=True)
+                    system_pages.accept(data, adjacent=adjacent, root_framed=root_framed)
             else:
                 system_pages.reset()
         if fsize >= 64 and is_bink and len(head) >= 0x1C:
             streams.append({
                 "stream_index": len(streams),
                 "offset": off,
-                "stored": fsize,
+                "stored": stored,
                 "size": fsize,
                 "kind": "bink2",
-                "gap_len": 0,
-                "gap_zero": True,
+                "gap_len": gap,
+                "gap_zero": gap_zero,
                 "align4k_plus16": (off & 0xFFF) == 0x10,
-                "pre16_zero": True,
+                "pre16_zero": pre16_zero,
                 "zero_prefix": False,
                 "is_0drp": False,
                 "u64_at_8": 0,
@@ -1097,13 +1142,13 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         streams.append({
             "stream_index": len(streams),
             "offset": off,
-            "stored": fsize,
+            "stored": stored,
             "size": fsize,
             "kind": "zlib",
-            "gap_len": 0,
-            "gap_zero": True,
+            "gap_len": gap,
+            "gap_zero": gap_zero,
             "align4k_plus16": (off & 0xFFF) == 0x10,
-            "pre16_zero": True,
+            "pre16_zero": pre16_zero,
             "zero_prefix": head[:8] == b"\x00" * 8,
             "is_0drp": len(head) >= 0x14 and head[0x10:0x14] == b"0DRP",
             "u64_at_8": struct.unpack_from("<Q", head, 8)[0] if len(head) >= 16 else 0,
@@ -1121,7 +1166,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
                 cache[s_idx] = fh.read()
         return cache[s_idx]
 
-    resources, stats = join_streams(streams, get_payload, require_archive_framing=False)
+    resources, stats = join_streams(streams, get_payload, require_archive_framing=rows is not None)
     summary = _summarise(resources, streams, stats, "directory", path, skipped, time.time() - t0)
     return resources, summary
 
@@ -1196,7 +1241,14 @@ def _aliases_input(out_path, source_path):
             return True
     except OSError:
         pass
-    if os.path.isdir(source_path) and os.path.isfile(out_path):
+    if os.path.isdir(source_path):
+        index_path = os.path.join(source_path, "index.json")
+        if os.path.normcase(os.path.realpath(out_path)) == os.path.normcase(os.path.realpath(index_path)):
+            return True
+        if not os.path.isfile(out_path):
+            return False
+        if os.path.isfile(index_path) and os.path.samefile(out_path, index_path):
+            return True
         src_root = os.path.normcase(os.path.abspath(source_path))
         target = os.path.normcase(os.path.abspath(out_path))
         if os.path.dirname(target) == src_root and target.endswith((".bin", ".bk2")):
