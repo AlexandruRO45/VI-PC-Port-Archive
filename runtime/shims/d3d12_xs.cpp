@@ -184,6 +184,20 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<void*>(vulkan));
         return result(method, S_OK);
     }
+#else
+    // The xwin cross build does not find the Vulkan headers by itself, and without them this build has no Vulkan
+    // device. Say so once: otherwise the variable changes nothing and the run quietly uses the host's device, which
+    // under Wine fails inside this call and reads like a device problem rather than a build one.
+    {
+        static std::atomic<bool> backend_missing_logged{false};
+        char backend[16] = {};
+        size_t backend_length = 0;
+        if (getenv_s(&backend_length, backend, "LEONIDA_D3D12") == 0 && std::strcmp(backend, "vulkan") == 0 &&
+            !backend_missing_logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: LEONIDA_D3D12=vulkan is set, but this build has no Vulkan device "
+                         "(configure with -DLEONIDA_VULKAN_HEADERS_FETCH=ON); using the host D3D12 device\n");
+    }
 #endif
 
     static auto create = reinterpret_cast<CreateDeviceFn>(host("D3D12CreateDevice"));
