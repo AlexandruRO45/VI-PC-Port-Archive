@@ -1623,6 +1623,12 @@ constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleReset = 139;
 constexpr unsigned kConsoleBarrier = 146;
 constexpr unsigned kConsoleAllocateUpload = 148;
+// The list methods that take CPU descriptor handles, at their console slots (the PC chain shifted +4).
+constexpr unsigned kConsoleOMSetRenderTargets = 50;     // PC 46
+constexpr unsigned kConsoleClearDepthStencilView = 51;  // PC 47: a FLOAT argument, list_clear_dsv
+constexpr unsigned kConsoleClearRenderTargetView = 52;  // PC 48
+constexpr unsigned kConsoleClearUavUint = 53;           // PC 49
+constexpr unsigned kConsoleClearUavFloat = 54;          // PC 50
 
 constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot <= 26) return slot;               // PC order, measured
@@ -1866,6 +1872,32 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                         self->real, a1, a2, reinterpret_cast<std::uint64_t>(self->so_scratch.data()), a4, a5,
                         a6, a7, a8, a9, a10, a11, a12, a13, a14);
                 }
+            } else if constexpr (Slot == kConsoleOMSetRenderTargets) {
+                // OMSetRenderTargets(count, render target handles, single range, depth-stencil handle): the
+                // title's CPU descriptor handles, translated in copies as device slots 17-24 translate theirs
+                // (#7021). A single range is one handle, its start. A count past the PC limit is passed unchanged
+                // for the PC list to refuse.
+                const auto* rts = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+                const auto* ds = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4);
+                const UINT count = static_cast<UINT>(a1);
+                const UINT handles = rts ? (static_cast<BOOL>(a3) ? (count ? 1u : 0u) : count) : 0u;
+                if (handles <= D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) {
+                    D3D12_CPU_DESCRIPTOR_HANDLE rt_copy[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+                    for (UINT i = 0; i < handles; ++i) rt_copy[i] = translate_cpu_handle(self->device, rts[i]);
+                    D3D12_CPU_DESCRIPTOR_HANDLE ds_copy{};
+                    if (ds) ds_copy = translate_cpu_handle(self->device, *ds);
+                    return reinterpret_cast<ForwardFn>(real_vtable[pc])(
+                        self->real, a1, rts ? reinterpret_cast<std::uint64_t>(rt_copy) : 0, a3,
+                        ds ? reinterpret_cast<std::uint64_t>(&ds_copy) : 0, a5, a6, a7, a8, a9, a10, a11, a12, a13,
+                        a14);
+                }
+            } else if constexpr (Slot == kConsoleClearRenderTargetView) {
+                // ClearRenderTargetView(handle, color, rect count, rects): the handle is passed by value.
+                a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a1)}).ptr;
+            } else if constexpr (Slot == kConsoleClearUavUint || Slot == kConsoleClearUavFloat) {
+                // ClearUnorderedAccessView{Uint,Float}(GPU handle, CPU handle, resource, values, rect count,
+                // rects): the CPU handle is the second argument.
+                a2 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)}).ptr;
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 UnwrappedArray heaps;
                 if (!heaps.fill(a2, a1)) return 0;  // void on the PC side; the call simply does not happen
@@ -1884,10 +1916,28 @@ void fill_list_vtable(void** vtable, std::index_sequence<I...>) {
     ((vtable[I] = reinterpret_cast<void*>(&list_slot<static_cast<unsigned>(I)>) ), ...);
 }
 
+// ClearDepthStencilView(handle, flags, depth, stencil, rect count, rects) takes its FLOAT depth in the fourth
+// register position (after `this`), which x64 passes in XMM3: the integer thunk could not keep it, so this slot gets a
+// thunk with the method's own signature. The
+// handle is the title's CPU descriptor handle, translated as the other list methods translate theirs.
+void WINAPI list_clear_dsv(ListProxy* self, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags, FLOAT depth,
+                           UINT8 stencil, UINT rect_count, const D3D12_RECT* rects) {
+    note_list_slot(kConsoleClearDepthStencilView, view.ptr, static_cast<std::uint64_t>(flags), stencil, rect_count,
+                   self->device->console_layout.load(std::memory_order_relaxed));
+    constexpr unsigned pc = console_to_pc_list_slot(kConsoleClearDepthStencilView);
+    if (pc >= self->pc_slot_count) return;
+    using Fn = void(WINAPI*)(IUnknown*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                             const D3D12_RECT*);
+    auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+    reinterpret_cast<Fn>(real_vtable[pc])(self->real, translate_cpu_handle(self->device, view), flags, depth,
+                                          stencil, rect_count, rects);
+}
+
 void** get_list_vtable() {
     static void** vtable = [] {
         static void* storage[kListSlots];
         fill_list_vtable(storage, std::make_index_sequence<kListSlots>{});
+        storage[kConsoleClearDepthStencilView] = reinterpret_cast<void*>(&list_clear_dsv);
         return storage;
     }();
     return vtable;

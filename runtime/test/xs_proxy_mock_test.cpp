@@ -1337,6 +1337,145 @@ static void no_dialogs() {
     SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 }
 
+// ---- List methods that take CPU descriptor handles translate the title's handles (#7021's ranges) ----
+//
+// A descriptor heap at a title address (the heap hook) makes the title's CPU handles point into the title's memory;
+// the device's view slots translate them (check_descriptor_heap_hooks), and the list methods that take them must too:
+// OMSetRenderTargets, ClearDepthStencilView, ClearRenderTargetView and ClearUnorderedAccessView{Uint,Float} at
+// console list slots 50-54 (PC 46-50). OMSetRenderTargets passes arrays and ClearDepthStencilView a FLOAT, so those
+// two are caught with typed functions in a copy of the mock list's vtable; the other three are plain words.
+
+struct ListHandleCapture {
+    unsigned om_calls;
+    UINT om_count;
+    BOOL om_single;
+    SIZE_T om_rts[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool om_has_ds;
+    SIZE_T om_ds;
+    unsigned dsv_calls;
+    SIZE_T dsv_handle;
+    UINT dsv_flags;
+    FLOAT dsv_depth;
+    UINT8 dsv_stencil;
+    UINT dsv_rects;
+} g_list_handles;
+
+void WINAPI capture_om_set_render_targets(void*, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single,
+                                          const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    ++g_list_handles.om_calls;
+    g_list_handles.om_count = count;
+    g_list_handles.om_single = single;
+    const UINT n = rts ? (single ? (count ? 1u : 0u) : count) : 0u;
+    for (UINT i = 0; i < n && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) g_list_handles.om_rts[i] = rts[i].ptr;
+    g_list_handles.om_has_ds = ds != nullptr;
+    g_list_handles.om_ds = ds ? ds->ptr : 0;
+}
+
+void WINAPI capture_clear_depth_stencil_view(void*, D3D12_CPU_DESCRIPTOR_HANDLE view, D3D12_CLEAR_FLAGS flags,
+                                             FLOAT depth, UINT8 stencil, UINT rects, const D3D12_RECT*) {
+    ++g_list_handles.dsv_calls;
+    g_list_handles.dsv_handle = view.ptr;
+    g_list_handles.dsv_flags = static_cast<UINT>(flags);
+    g_list_handles.dsv_depth = depth;
+    g_list_handles.dsv_stencil = stencil;
+    g_list_handles.dsv_rects = rects;
+}
+
+int check_list_cpu_handles() {
+    g_heap_hook = {};
+    g_list_handles = {};
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+    const IID gcl_iid = __uuidof(ID3D12GraphicsCommandList);
+    const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 9, true, true, true);
+    EXPECT(device);
+
+    // A heap at a title address: its handles translate to the mock heap's own CPU start (the translation is by range,
+    // the same for every heap type).
+    constexpr SIZE_T kTitleBase = 0x66660000ull;
+    g_heap_hook.next_ptr = reinterpret_cast<void*>(kTitleBase);
+    D3D12_DESCRIPTOR_HEAP_DESC desc{};
+    desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    desc.NumDescriptors = 8;
+    desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    void* heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&heap_iid), word(&heap)))) && heap);
+    EXPECT(raw(heap, 9) == kTitleBase);
+
+    void* allocator = nullptr;
+    EXPECT(hr_of(raw(device, 9, 0, word(&allocator_iid), word(&allocator))) == S_OK);
+    void* list = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, word(allocator), 0, word(&gcl_iid),
+                     word(&list))) == S_OK);
+    Mock* const real = mock->last_child;
+    EXPECT(real && real->kind == Kind::list && xs::is_list_proxy(list));
+
+    const SIZE_T off2 = 2 * kMockDescriptorInc;
+    const SIZE_T off5 = 5 * kMockDescriptorInc;
+    constexpr SIZE_T kOutside = 0x12340000ull;  // in no range: passed as it is
+
+    // ClearRenderTargetView(handle, color, rect count, rects): console 52, PC 48; the handle is a value.
+    const FLOAT color[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    raw(list, 52, kTitleBase + off2, word(color), 0, 0);
+    EXPECT(real->calls[48] == 1 && real->args[48][0] == kMockHeapCpuStart + off2 && real->args[48][1] == word(color));
+    raw(list, 52, kOutside, word(color), 0, 0);
+    EXPECT(real->calls[48] == 2 && real->args[48][0] == kOutside);
+
+    // ClearUnorderedAccessView{Uint,Float}(GPU handle, CPU handle, resource, values, rect count, rects): console 53
+    // and 54, PC 49 and 50; only the CPU handle is translated.
+    const UINT values[4] = {1, 2, 3, 4};
+    raw(list, 53, 0xAAAA0000ull, kTitleBase + off5, 0xBBBB0000ull, word(values), 0);
+    EXPECT(real->calls[49] == 1 && real->args[49][0] == 0xAAAA0000ull &&
+           real->args[49][1] == kMockHeapCpuStart + off5 && real->args[49][2] == 0xBBBB0000ull);
+    raw(list, 54, 0xAAAA0000ull, kTitleBase + off2, 0xBBBB0000ull, word(values), 0);
+    EXPECT(real->calls[50] == 1 && real->args[50][1] == kMockHeapCpuStart + off2);
+
+    // OMSetRenderTargets and ClearDepthStencilView through typed captures (PC 46 and 47).
+    void** const saved_vtable = real->vtable;
+    void* vtable_copy[kMockSlots];
+    std::memcpy(vtable_copy, saved_vtable, sizeof(vtable_copy));
+    vtable_copy[46] = reinterpret_cast<void*>(&capture_om_set_render_targets);
+    vtable_copy[47] = reinterpret_cast<void*>(&capture_clear_depth_stencil_view);
+    real->vtable = vtable_copy;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rts[2] = {{kTitleBase + off2}, {kOutside}};
+    const D3D12_CPU_DESCRIPTOR_HANDLE ds{kTitleBase + off5};
+    raw(list, 50, 2, word(rts), FALSE, word(&ds));
+    EXPECT(g_list_handles.om_calls == 1 && g_list_handles.om_count == 2 && !g_list_handles.om_single);
+    EXPECT(g_list_handles.om_rts[0] == kMockHeapCpuStart + off2 && g_list_handles.om_rts[1] == kOutside);
+    EXPECT(g_list_handles.om_has_ds && g_list_handles.om_ds == kMockHeapCpuStart + off5);
+    EXPECT(rts[0].ptr == kTitleBase + off2);  // the title's array is not written
+    // A single range: only its start is a handle; no depth-stencil view.
+    const D3D12_CPU_DESCRIPTOR_HANDLE start{kTitleBase + off5};
+    raw(list, 50, 3, word(&start), TRUE, 0);
+    EXPECT(g_list_handles.om_calls == 2 && g_list_handles.om_count == 3 && g_list_handles.om_single);
+    EXPECT(g_list_handles.om_rts[0] == kMockHeapCpuStart + off5 && !g_list_handles.om_has_ds);
+
+    // ClearDepthStencilView keeps its FLOAT depth and translates its handle.
+    using ClearDsvFn = void(WINAPI*)(void*, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT,
+                                     const D3D12_RECT*);
+    void* const* list_vtable = *reinterpret_cast<void* const* const*>(list);
+    reinterpret_cast<ClearDsvFn>(list_vtable[51])(list, D3D12_CPU_DESCRIPTOR_HANDLE{kTitleBase + off2},
+                                                  D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.375f, 7, 0,
+                                                  nullptr);
+    EXPECT(g_list_handles.dsv_calls == 1 && g_list_handles.dsv_handle == kMockHeapCpuStart + off2);
+    EXPECT(g_list_handles.dsv_flags == (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL) &&
+           g_list_handles.dsv_depth == 0.375f && g_list_handles.dsv_stencil == 7 && g_list_handles.dsv_rects == 0);
+    real->vtable = saved_vtable;
+
+    EXPECT(release(list) == 0);
+    EXPECT(release(allocator) == 0);
+    EXPECT(release(heap) == 0);
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    std::printf("%s: list slots 50-54 translate the title's CPU descriptor handles (OMSetRenderTargets arrays and "
+                "single ranges, both clears, both UAV clears); ClearDepthStencilView keeps its FLOAT depth\n",
+                g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1348,7 +1487,8 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
-        check_signalx_detection() || check_list_tail_names() || check_descriptor_heap_hooks())
+        check_signalx_detection() || check_list_tail_names() || check_descriptor_heap_hooks() ||
+        check_list_cpu_handles())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
