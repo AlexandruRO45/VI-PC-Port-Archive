@@ -5078,12 +5078,16 @@ class Gen:
         the array shrinks to the RSRC2 allocation and its accesses are bounds-checked (lds_access), as hardware checks
         them. %x_buf is already sized to the workgroup, so when even the allocation does not fit, assemble refuses
         the shader."""
-        if not self.cs:
-            return
-        room = (MAX_SHARED_BYTES - (0 if self.bar_counts_in_lds(lds_used=True) else self.x_buf_bytes())) // 4
-        if self.lds_bound is None and self.lds_dwords > room >= max(self.lds_declared, 1):
-            self.lds_dwords = self.lds_bound = self.lds_declared
-            self.cu(self.lds_declared)
+        if self.cs:
+            room = (MAX_SHARED_BYTES - (0 if self.bar_counts_in_lds(lds_used=True) else self.x_buf_bytes())) // 4
+            if self.lds_bound is None and self.lds_dwords > room >= max(self.lds_declared, 1):
+                self.lds_dwords = self.lds_bound = self.lds_declared
+                self.cu(self.lds_declared)
+        elif self.ms and MESH_COMPUTE:
+            room = (MAX_SHARED_BYTES - self.x_buf_bytes() - 4) // 4
+            if self.lds_bound is None and self.lds_need and self.lds_dwords > room >= self.lds_need:
+                self.lds_dwords = self.lds_bound = self.lds_need
+                self.cu(self.lds_need)
 
     def x_split(self):
         """End the current segment here: the rest of the block runs as a new segment in the next round."""
@@ -15059,6 +15063,16 @@ def assemble(gen):
             types += [f"%lds_arr = OpTypeArray %uint {gen.cu(gen.lds_dwords)}",
                       "%_ptr_WG_lds = OpTypePointer Workgroup %lds_arr", "%_ptr_WG_uint = OpTypePointer Workgroup %uint"]
             gvars += ["%lds = OpVariable %_ptr_WG_lds Workgroup"]
+        if msc:
+            # --mesh-compute emits GLCompute, so its Workgroup memory (LDS + %x_buf + 4-byte %ms_counts) is subject
+            # to maxComputeSharedMemorySize (e.g. 48 KiB on Pascal).
+            lds_b = 4 * max(gen.lds_dwords, gen.lds_need, 1) if gen.uses_lds else 0
+            x_b = gen.x_buf_bytes()
+            wg = lds_b + x_b + 4
+            if wg > MAX_SHARED_BYTES:
+                x_part = f" + wave64 exchange {x_b} B" if x_b else ""
+                raise Unsupported(f"MS (--mesh-compute) workgroup memory {wg} B (LDS {lds_b} B{x_part} + "
+                                  f"ms_counts 4 B) over maxComputeSharedMemorySize {MAX_SHARED_BYTES} B")
     if gen.emulate:
         types += [f"%x_arr = OpTypeArray %uint {gen.cu(x_sink + 1)}",
                   "%_ptr_WG_x_arr = OpTypePointer Workgroup %x_arr", "%_ptr_WG_uint_x = OpTypePointer Workgroup %uint"]
@@ -16565,6 +16579,7 @@ def translate(path):
                     continue
                 if k in ("offset", "offset0", "offset1"):
                     need = max(need, ds_const_extent(ins["op"], k, int(v, 0)))
+        g.lds_need = need
         n = 16
         while n < need:
             n *= 2
