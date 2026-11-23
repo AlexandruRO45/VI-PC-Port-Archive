@@ -257,6 +257,196 @@ WORKFLOW_RULES = (
 # git
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Look-alike letters, submodule sources, pull request text, pinned actions, the maintainer override
+
+# Letters of other scripts that render like a Latin letter in common fonts: the part of Unicode's confusables list
+# that has a Latin twin. They are listed as code points, so this file contains none of them.
+LATIN_LOOKALIKES = frozenset(map(chr, (
+    # Cyrillic: A B E K M H O P C T X S I J Y h Q W, a e o p c y x s i j h l d q w y
+    0x0410, 0x0412, 0x0415, 0x041A, 0x041C, 0x041D, 0x041E, 0x0420, 0x0421, 0x0422, 0x0425, 0x0405, 0x0406,
+    0x0408, 0x04AE, 0x04BA, 0x051A, 0x051C, 0x0430, 0x0435, 0x043E, 0x0440, 0x0441, 0x0443, 0x0445, 0x0455,
+    0x0456, 0x0458, 0x04BB, 0x04CF, 0x0501, 0x051B, 0x051D, 0x04AF,
+    # Greek: A B E Z H I K M N O P T Y X, o v i k p
+    0x0391, 0x0392, 0x0395, 0x0396, 0x0397, 0x0399, 0x039A, 0x039C, 0x039D, 0x039F, 0x03A1, 0x03A4, 0x03A5,
+    0x03A7, 0x03BF, 0x03BD, 0x03B9, 0x03BA, 0x03C1,
+    # Armenian: o u h n
+    0x0585, 0x057D, 0x0570, 0x0578,
+)))
+IDENTIFIER = re.compile(r"[^\W\d_]\w*")
+
+
+def spelled(text):
+    """Text with every non-ASCII letter as \\uXXXX, so a log shows which letters are not Latin."""
+    return "".join(ch if ch.isascii() else chr(92) + "u%04x" % ord(ch) for ch in text)
+
+
+def script_of(ch):
+    if ch.isascii():
+        return "LATIN" if ch.isalpha() else ""
+    import unicodedata
+    return unicodedata.name(ch, "").split(" ", 1)[0]
+
+
+def lookalike_findings(path, number, text):
+    """A code identifier with a letter that only looks Latin: password spelled with a Cyrillic a is another name."""
+    if text.isascii() or not is_code(path):
+        return []
+    for token in IDENTIFIER.findall(text):
+        if token.isascii():
+            continue
+        letters = [ch for ch in token if ch.isalpha()]
+        twins = [ch for ch in letters if ch in LATIN_LOOKALIKES]
+        fullwidth = [ch for ch in letters if 0xFF21 <= ord(ch) <= 0xFF5A]
+        if not twins and not fullwidth:
+            continue
+        latin = [ch for ch in letters if script_of(ch) == "LATIN"]
+        foreign = [ch for ch in letters if script_of(ch) != "LATIN"]
+        # It reads as a Latin name when every letter that isn't Latin looks Latin. `GUEST_` and a Cyrillic word with
+        # a letter that has no Latin twin is plainly Cyrillic; a word that is all twins is often real Cyrillic text
+        # (a Russian UI string), so that is only listed.
+        reads_latin = all(ch in LATIN_LOOKALIKES or 0xFF21 <= ord(ch) <= 0xFF5A for ch in foreign)
+        if not reads_latin:
+            continue
+        level = BLOCK if latin or fullwidth else REVIEW
+        import unicodedata
+        names = ", ".join(sorted({"U+%04X %s" % (ord(ch), unicodedata.name(ch, "?")) for ch in twins + fullwidth}))
+        return [Finding(path, number, level, "lookalike-letters",
+                        "the name %s is spelled with letters that only look Latin (%s), so it is not the name it "
+                        "reads as" % (spelled(token), names), spelled(text))]
+    return []
+
+
+GITHUB_SUBMODULE = re.compile(r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/|\.\.?/)", re.I)
+
+
+def gitmodules_findings(path, number, text):
+    if path.lower() != ".gitmodules":
+        return []
+    url = re.match(r"^\s*url\s*=\s*(\S+)", text, re.I)
+    if url and not GITHUB_SUBMODULE.match(url.group(1)):
+        return [Finding(path, number, BLOCK, "submodule-host",
+                        "a submodule fetched from outside github.com over https or ssh; every submodule here is on "
+                        "GitHub, where its history can be read", text)]
+    if re.match(r"^\s*update\s*=\s*!", text, re.I):
+        return [Finding(path, number, BLOCK, "submodule-command",
+                        "a submodule update that runs a shell command", text)]
+    return []
+
+
+# What a pull request's text says to the agents and maintainers reading it.
+APPROVAL_CLAIM = re.compile(
+    r"\b(?:pre-?approved|already\s+(?:been\s+)?(?:reviewed|approved|audited|vetted)|approved\s+by\s+(?:the\s+)?"
+    r"(?:maintainer|owner|admin|coordinator)s?|safe\s+to\s+(?:auto-?)?merge|merge\s+(?:this\s+|it\s+)?(?:without|"
+    r"before)\s+(?:a\s+|any\s+)?(?:review|ci|checks?|testing)|(?:skip|bypass|ignore|disable)\s+(?:the\s+)?(?:code\s+)?"
+    r"(?:review|security|checks?|ci|scan)|no\s+review\s+(?:is\s+)?(?:needed|required)|security-reviewed)\b", re.I)
+TEXT_RULES = tuple(r for r in ALL_TEXT_RULES if r[0] in ("credential", "agent-instructions")) + (
+    ("approval-claim", REVIEW, APPROVAL_CLAIM,
+     "claims the change is approved or asks for review to be skipped; only a maintainer's own review approves"),)
+
+
+def check_text(where, text):
+    """Findings for text that is not a file: a pull request's title or description, a commit message."""
+    found = []
+    for number, line in enumerate((text or "").splitlines(), 1):
+        if HIDDEN_BIDI.search(line) or HIDDEN_ZERO_WIDTH.search(line):
+            found.append(Finding(where, number, BLOCK, "hidden-unicode",
+                                 "an invisible or bidirectional control character changes what the text appears to "
+                                 "say", line))
+        for rule, level, pattern, message in TEXT_RULES:
+            if pattern.search(line):
+                found.append(Finding(where, number, level, rule, message, line))
+    return found
+
+
+def commit_messages(repo, old, new, limit=500):
+    """[(sha, message)] of the commits in old..new (all of new's history when old is the empty tree)."""
+    span = [new] if old == EMPTY_TREE else [old + ".." + new]
+    out = git(repo, "log", "--no-color", "--no-show-signature", "-n", str(limit), "--format=%H%x00%B%x1e", *span, "--")
+    commits = []
+    for record in out.decode("utf-8", "replace").split("\x1e"):
+        sha, _, message = record.strip("\n").partition("\x00")
+        if sha:
+            commits.append((sha, message))
+    return commits
+
+
+# `uses: owner/repo[/path]@<40 hex> # v1.2.3`
+PINNED_USE = re.compile(r"^\s*(?:-\s*)?uses\s*:\s*['\"]?([A-Za-z0-9][\w.-]*)/([A-Za-z0-9_][\w.-]*)(?:/[^\s'\"@]*)?"
+                        r"@([0-9a-f]{40})['\"]?\s*(?:#\s*(\S+))?")
+RELEASE_TAG = re.compile(r"^[A-Za-z0-9][\w.+-]{0,99}$")
+ACTION_REMOTE = "https://github.com/{owner}/{repo}.git"
+
+
+def tag_commit(url, tag):
+    """The commit a tag of a remote repository points at (peeled), or None when there is no such tag."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never", GIT_ASKPASS="")
+    result = subprocess.run(["git", "-c", "credential.helper=", "ls-remote", "--tags", "--", url,
+                             "refs/tags/" + tag, "refs/tags/" + tag + "^{}"],
+                            capture_output=True, env=env, timeout=60)
+    if result.returncode != 0:
+        raise GitError("git ls-remote %s: %s" % (url, result.stderr.decode("utf-8", "replace").strip()))
+    refs = dict(reversed(line.split("\t", 1)) for line in result.stdout.decode().splitlines() if "\t" in line)
+    return refs.get("refs/tags/" + tag + "^{}") or refs.get("refs/tags/" + tag)
+
+
+def check_pins(pins, remote=ACTION_REMOTE):
+    """Each pinned action line the pull request adds names the commit its `# vX.Y.Z` comment says it does."""
+    found = []
+    seen = {}
+    for path, number, owner, repo, sha, tag, text in pins:
+        where = "%s/%s" % (owner, repo)
+        if not tag:
+            found.append(Finding(path, number, REVIEW, "pin-without-version",
+                                 "a pinned action without a `# vX.Y.Z` comment, so nobody can tell which release "
+                                 "it is meant to be", text))
+            continue
+        if not RELEASE_TAG.match(tag):
+            found.append(Finding(path, number, REVIEW, "pin-without-version",
+                                 "the comment after the pin is not a release tag", text))
+            continue
+        key = (owner.lower(), repo.lower(), tag)
+        if key not in seen:
+            try:
+                seen[key] = (tag_commit(remote.format(owner=owner, repo=repo), tag), None)
+            except (GitError, subprocess.TimeoutExpired, OSError) as error:
+                seen[key] = (None, str(error) or "timed out")
+        actual, error = seen[key]
+        if error:
+            found.append(Finding(path, number, REVIEW, "pin-unverified",
+                                 "could not read the tags of %s to check this pin: %s" % (where, error[:200]), text))
+        elif actual is None:
+            found.append(Finding(path, number, BLOCK, "pin-tag-mismatch",
+                                 "%s has no tag %s, so the comment does not say what this commit is" % (where, tag),
+                                 text))
+        elif actual != sha:
+            found.append(Finding(path, number, BLOCK, "pin-tag-mismatch",
+                                 "%s %s is commit %s, not the %s pinned here; the comment hides which code runs"
+                                 % (where, tag, actual, sha), text))
+    return found
+
+
+# A maintainer who has read a change marks that exact commit as reviewed with a label named for it. The label names
+# the commit, so a push after the review is not covered by it, and a fork can't add labels to its own pull request.
+OVERRIDE_LABEL = re.compile(r"^security-reviewed:([0-9a-f]{7,40})$")
+
+
+def override_label(event):
+    """The `security-reviewed:<head sha>` label of the pull request in a GitHub event, if it names its head."""
+    pr = event.get("pull_request") if isinstance(event, dict) else None
+    if not isinstance(pr, dict):
+        return None
+    head = str((pr.get("head") or {}).get("sha") or "")
+    if not re.match(r"^[0-9a-f]{40}$", head):
+        return None
+    for label in pr.get("labels") or []:
+        name = label.get("name") if isinstance(label, dict) else None
+        match = OVERRIDE_LABEL.match(name or "")
+        if match and head.startswith(match.group(1)):
+            return name
+    return None
+
+
 class GitError(Exception):
     pass
 
@@ -337,13 +527,21 @@ def added_lines(repo, old, new, path):
 
 
 class Finding:
-    __slots__ = ("path", "line", "level", "rule", "message", "text")
+    """One finding. `path` is a file, or `<pull request title>` / `<commit 0123abcd message>` for text that isn't."""
+    __slots__ = ("path", "line", "level", "rule", "message", "text", "overridden")
 
     def __init__(self, path, line, level, rule, message, text=""):
         self.path, self.line, self.level, self.rule, self.message, self.text = path, line, level, rule, message, text
+        self.overridden = False
 
     def key(self):
         return (0 if self.level == BLOCK else 1, self.path, self.line or 0, self.rule)
+
+    def in_file(self):
+        return not self.path.startswith("<")
+
+    def fails(self):
+        return self.level == BLOCK and not self.overridden
 
 
 def visible(text, limit=200):
@@ -422,6 +620,8 @@ def check_line(path, number, text):
         level = REVIEW if path.lower().startswith("docs/i18n/") else BLOCK
         found.append(Finding(path, number, level, "hidden-unicode",
                              "an invisible character (zero-width, soft hyphen or BOM) hides what the line says", text))
+    found += lookalike_findings(path, number, text)
+    found += gitmodules_findings(path, number, text)
     rules = list(ALL_TEXT_RULES)
     if is_code(path):
         rules += CODE_RULES
@@ -436,11 +636,51 @@ def check_line(path, number, text):
     return found
 
 
-def scan(repo, base, head):
-    """(findings, number of files looked at)."""
+def safe_relative(path):
+    """The path if it can be written under another folder as it is: relative, no `..`, no drive, no `.git`."""
+    parts = path.split("/")
+    if not path or path.startswith("/") or re.match(r"^[A-Za-z]:", path) or "\\" in path or \
+            any(p in ("", ".", "..") or p.lower() == ".git" or ":" in p for p in parts):
+        return None
+    return path
+
+
+def export_changed(repo, base, head, out_dir):
+    """Write the text files the change adds or modifies under out_dir, as data for Gitleaks.
+
+    Only regular files are written (no symbolic links or submodules), from git objects, under their repository
+    path; nothing is checked out and nothing written is ever run. Returns the number of files written."""
+    old = merge_base(repo, resolve(repo, base), resolve(repo, head)) if base != EMPTY_TREE else EMPTY_TREE
+    new = resolve(repo, head)
+    os.makedirs(out_dir, exist_ok=True)
+    written = 0
+    for status, _old_mode, new_mode, _old_sha, new_sha, path in changed_files(repo, old, new):
+        rel = safe_relative(path)
+        if status == "D" or new_mode not in ("100644", "100755") or rel is None:
+            continue
+        if blob_size(repo, new_sha) > MAX_SCAN_BYTES:
+            continue
+        data = blob(repo, new_sha)
+        if b"\0" in data[:8192]:
+            continue
+        target = os.path.join(out_dir, *rel.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+        written += 1
+    return written
+
+
+def scan(repo, base, head, check_tags=False, action_remote=ACTION_REMOTE, messages=True, external=None):
+    """(findings, number of files looked at).
+
+    `external` is a list of findings from another scanner (Gitleaks) on the exported files; only those on a
+    line the change adds are kept, with that line as their text."""
     old = merge_base(repo, resolve(repo, base), resolve(repo, head)) if base != EMPTY_TREE else EMPTY_TREE
     new = resolve(repo, head)
     findings = []
+    pins = []
+    added = {}  # path -> {line number: text}
     entries = changed_files(repo, old, new)
     for status, old_mode, new_mode, _old_sha, new_sha, path in entries:
         gone = status == "D"
@@ -456,6 +696,11 @@ def scan(repo, base, head):
             continue
         per_rule = {}
         for number, text in added_lines(repo, old, new, path):
+            added.setdefault(path, {})[number] = text
+            if is_workflow(path) and not text.lstrip().startswith("#"):
+                pin = PINNED_USE.match(text)
+                if pin:
+                    pins.append((path, number) + pin.groups() + (text,))
             for finding in check_line(path, number, text):
                 count = per_rule.get(finding.rule, 0) + 1
                 per_rule[finding.rule] = count
@@ -466,8 +711,219 @@ def scan(repo, base, head):
                 level = next(f.level for f in findings if f.path == path and f.rule == rule)
                 findings.append(Finding(path, None, level, rule, "%d more lines like this in the file" %
                                         (count - MAX_PER_RULE_AND_FILE)))
+    if messages:
+        for sha, message in commit_messages(repo, old, new):
+            findings += check_text("<commit %s message>" % sha[:12], message)
+    if check_tags:
+        findings += check_pins(pins, action_remote)
+    seen = set()
+    for finding in external or ():
+        if not finding.in_file():
+            findings.append(finding)  # a scanner that did not run, reported as such
+            continue
+        text = added.get(finding.path, {}).get(finding.line)
+        key = (finding.path, finding.line, finding.rule)
+        if text is not None and key not in seen:
+            seen.add(key)
+            finding.text = text
+            findings.append(finding)
     findings.sort(key=Finding.key)
     return findings, len(entries)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Semgrep rules: what malicious code does, matched on the syntax tree, so renaming a variable or splitting a line
+# doesn't hide it the way it hides from the line rules above. They live here as data rather than as a .yml file in
+# the repository: Windows antivirus quarantines a rule file that reads like the code it looks for, which would break
+# a contributor's checkout. --write-semgrep-rules writes them out for the workflow. Written for this repository, so
+# no registry rules, no login, no download and no rule licence. ERROR blocks; WARNING is listed for the reviewer.
+
+
+def _either(*patterns):
+    return {"pattern-either": [{"pattern": p} for p in patterns]}
+
+
+def _not(*patterns):
+    return [{"pattern-not": p} for p in patterns]
+
+
+SEMGREP_RULES = [
+    {"id": "decode-then-run", "languages": ["python"], "severity": "ERROR", "mode": "taint",
+     "message": "decoded, decompressed or unpickled data reaches exec, eval or a shell; this is how a payload hides",
+     "pattern-sources": [_either(
+         "base64.$F(...)",
+         "binascii.$F(...)",
+         "codecs.decode(...)",
+         "zlib.decompress(...)",
+         "lzma.decompress(...)",
+         "bz2.decompress(...)",
+         "gzip.decompress(...)",
+         "bytes.fromhex(...)",
+         "marshal.loads(...)",
+         "pickle.loads(...)")],
+     "pattern-sinks": [_either(
+         "exec(...)",
+         "eval(...)",
+         "compile(...)",
+         "__import__(...)",
+         "os.system(...)",
+         "os.popen(...)",
+         "subprocess.$F(...)",
+         "types.FunctionType(...)")]},
+    {"id": "environment-to-network", "languages": ["python"], "severity": "ERROR", "mode": "taint",
+     "message": "an environment variable (where CI keeps tokens) is sent over the network",
+     "pattern-sources": [_either(
+         "os.environ",
+         "os.environ[...]",
+         "os.environ.get(...)",
+         "os.getenv(...)")],
+     "pattern-sinks": [_either(
+         "urllib.request.urlopen(...)",
+         "urllib.request.Request(...)",
+         "requests.$M(...)",
+         "http.client.$C(...).request(...)",
+         "$S.sendall(...)",
+         "$S.sendto(...)")]},
+    {"id": "run-built-code", "languages": ["python"], "severity": "WARNING",
+     "message": "runs code built at run time (exec, eval, a shell command made from a variable, a dynamic import)",
+     "patterns": [_either(
+         "exec($X, ...)",
+         "eval($X, ...)",
+         "__import__($X, ...)",
+         "importlib.import_module($X, ...)",
+         "getattr(__builtins__, $X)",
+         "getattr(builtins, $X)",
+         "subprocess.$F($X, ..., shell=True, ...)",
+         "os.system($X)")] + _not(
+         'exec("...", ...)',
+         'eval("...", ...)',
+         '__import__("...", ...)',
+         'importlib.import_module("...", ...)',
+         'subprocess.$F("...", ..., shell=True, ...)',
+         'os.system("...")')},
+    {"id": "js-decode-then-run", "languages": ["javascript"], "severity": "ERROR", "mode": "taint",
+     "message": "decoded data reaches eval, Function or a child process; this is how a payload hides",
+     "pattern-sources": [_either(
+         "atob(...)",
+         'Buffer.from($X, "base64")',
+         'Buffer.from($X, "hex")',
+         "String.fromCharCode(...)",
+         "unescape(...)")],
+     "pattern-sinks": [_either(
+         "eval(...)",
+         "Function(...)",
+         "new Function(...)",
+         "setTimeout($CODE, ...)",
+         "$CP.exec(...)",
+         "$CP.execSync(...)")]},
+    {"id": "js-run-built-code", "languages": ["javascript"], "severity": "WARNING",
+     "message": "runs code built at run time, or starts a process from JavaScript",
+     "patterns": [_either(
+         "eval($X)",
+         "new Function(...)",
+         'require("child_process")',
+         'require("node:child_process")',
+         'import $M from "child_process"',
+         'import $M from "node:child_process"',
+         'import { ... } from "child_process"',
+         'import { ... } from "node:child_process"')] + _not('eval("...")')},
+    {"id": "js-environment-to-network", "languages": ["javascript"], "severity": "ERROR", "mode": "taint",
+     "message": "an environment variable (where CI keeps tokens) is sent over the network",
+     "pattern-sources": [{"pattern": "process.env"}],
+     "pattern-sinks": [_either(
+         "fetch(...)",
+         "$H.request(...)",
+         "new WebSocket(...)")]},
+]
+
+
+def write_semgrep_rules(path):
+    """Write SEMGREP_RULES as a Semgrep config (JSON, which Semgrep reads as YAML)."""
+    import json
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"rules": SEMGREP_RULES}, f, indent=1)
+        f.write("\n")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Results of Semgrep and Gitleaks. Their reports are untrusted too: a pull request controls the paths and lines in them.
+
+
+def tool_path(path, root):
+    """A scanner's path for an exported file, back to its repository path (or None when it is outside the export)."""
+    path = str(path or "").replace("\\", "/")
+    root = root.replace("\\", "/").rstrip("/")
+    if root and path.startswith(root + "/"):
+        path = path[len(root) + 1:]
+    while path.startswith("./"):
+        path = path[2:]
+    return safe_relative(path)
+
+
+def read_semgrep(path, root=""):
+    """Findings from `semgrep --json`. A rule with severity ERROR blocks; the others are listed for review."""
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            report = json.load(f)
+        results = report["results"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return [Finding("<semgrep>", None, REVIEW, "scanner-did-not-run",
+                        "Semgrep's results could not be read (%s); its rules did not check this change" %
+                        type(error).__name__)]
+    found = []
+    for result in results if isinstance(results, list) else ():
+        try:
+            rel = tool_path(result["path"], root)
+            line = int(result["start"]["line"])
+            extra = result.get("extra") or {}
+            rule = str(result["check_id"]).rsplit(".", 1)[-1]
+            message = str(extra.get("message") or rule).strip()
+            level = BLOCK if str(extra.get("severity", "")).upper() == "ERROR" else REVIEW
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        if rel:
+            found.append(Finding(rel, line, level, "semgrep:" + re.sub(r"[^\w.-]", "", rule)[:60], message[:300]))
+    return found
+
+
+def read_gitleaks(path, root=""):
+    """Findings from a Gitleaks JSON report (written with --redact, so the secret itself is never in it)."""
+    import json
+    try:
+        with open(path, encoding="utf-8") as f:
+            report = json.load(f)
+        if not isinstance(report, list):
+            raise TypeError("not a list")
+    except (OSError, ValueError, TypeError) as error:
+        return [Finding("<gitleaks>", None, REVIEW, "scanner-did-not-run",
+                        "Gitleaks's results could not be read (%s); it did not check this change" %
+                        type(error).__name__)]
+    found = []
+    for leak in report:
+        try:
+            rel = tool_path(leak["File"], root)
+            line = int(leak["StartLine"])
+            rule = re.sub(r"[^\w.-]", "", str(leak.get("RuleID") or "secret"))[:60]
+            what = str(leak.get("Description") or rule)[:120]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if rel:
+            found.append(Finding(rel, line, BLOCK, "gitleaks:" + rule,
+                                 "Gitleaks finds a secret here (%s); revoke it, and keep credentials out of the "
+                                 "repository" % what))
+    return found
+
+
+def read_event(path):
+    """The pull request title, description and override label from a GitHub event file (all of it untrusted text)."""
+    import json
+    with open(path, encoding="utf-8") as f:
+        event = json.load(f)
+    pr = event.get("pull_request") if isinstance(event, dict) else None
+    if not isinstance(pr, dict):
+        return "", "", None
+    return str(pr.get("title") or ""), str(pr.get("body") or ""), override_label(event)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -478,10 +934,14 @@ def location(finding):
     return finding.path + (":%d" % finding.line if finding.line else "")
 
 
+def level_of(finding):
+    return finding.level + (" (overridden)" if finding.overridden else "")
+
+
 def plain_lines(findings):
     lines = []
     for f in findings:
-        lines.append("%s: %s %s: %s" % (visible(location(f), 300), f.level, f.rule, f.message))
+        lines.append("%s: %s %s: %s" % (visible(location(f), 300), level_of(f), f.rule, f.message))
         if f.text:
             lines.append("    > " + visible(f.text))
     return lines
@@ -497,33 +957,41 @@ def escape_property(s):
 
 def annotation(finding):
     """A GitHub workflow command; every piece of pull request text in it is escaped so it cannot start another."""
-    kind = "error" if finding.level == BLOCK else "warning"
-    props = "file=" + escape_property(finding.path)
-    if finding.line:
-        props += ",line=%d" % finding.line
-    props += ",title=" + escape_property("%s %s" % (finding.level, finding.rule))
-    message = finding.message + ("\n" + visible(finding.text) if finding.text else "")
-    return "::%s %s::%s" % (kind, props, escape_data(message))
+    kind = "error" if finding.fails() else "warning"
+    props = []
+    if finding.in_file():
+        props.append("file=" + escape_property(finding.path))
+        if finding.line:
+            props.append("line=%d" % finding.line)
+    where = "" if finding.in_file() else visible(location(finding), 120) + ": "
+    props.append("title=" + escape_property("%s %s" % (level_of(finding), finding.rule)))
+    message = where + finding.message + ("\n" + visible(finding.text) if finding.text else "")
+    return "::%s %s::%s" % (kind, ",".join(props), escape_data(message))
 
 
 def cell(s):
     return html.escape(s, quote=True).replace("|", "&#124;").replace("`", "&#96;").replace("\n", " ")
 
 
-def summary(findings, files):
+def summary(findings, files, override=None):
     blocks = sum(f.level == BLOCK for f in findings)
     reviews = len(findings) - blocks
     out = ["## PR security scan", ""]
+    if override:
+        out += ["A maintainer marked this head commit as reviewed with the label <code>%s</code>: the `block` findings "
+                "below are listed but do not fail the check. A push after the review needs a new label." %
+                cell(override), ""]
     if not findings:
         out.append("Nothing to report in %d changed file%s." % (files, "" if files == 1 else "s"))
         return "\n".join(out) + "\n"
-    out.append("%d to fix (`block`), %d to read before merging (`review`), in %d changed file%s. "
-               "The check never runs the pull request's code; see `scripts/check_pr_security.py`."
-               % (blocks, reviews, files, "" if files == 1 else "s"))
+    out.append("%d to fix (`block`), %d to read before merging (`review`), in %d changed file%s and the pull "
+               "request's text. The check never runs the pull request's code; see `scripts/check_pr_security.py`. "
+               "A maintainer who has read a `block` finding and accepts it adds the label "
+               "`security-reviewed:<head sha>`." % (blocks, reviews, files, "" if files == 1 else "s"))
     out += ["", "| Level | Rule | Where | What | Line |", "|---|---|---|---|---|"]
     for f in findings:
         out.append("| %s | %s | <code>%s</code> | %s | %s |" % (
-            f.level, f.rule, cell(visible(location(f), 300)), cell(f.message),
+            level_of(f), f.rule, cell(visible(location(f), 300)), cell(f.message),
             "<code>%s</code>" % cell(visible(f.text, 160)) if f.text else ""))
     return "\n".join(out) + "\n"
 
@@ -537,32 +1005,80 @@ def main(argv=None):
     parser.add_argument("--strict", action="store_true", help="exit 1 for review findings too")
     parser.add_argument("--github", action="store_true",
                         help="also print GitHub Actions annotations and write $GITHUB_STEP_SUMMARY")
+    parser.add_argument("--github-event", metavar="PATH",
+                        help="a pull_request event file ($GITHUB_EVENT_PATH): scan its title and description, and "
+                             "honour a security-reviewed:<head sha> label")
+    parser.add_argument("--check-action-tags", action="store_true",
+                        help="check that each pinned action the change adds is the commit its # vX.Y.Z comment names "
+                             "(reads the action repository's tags with git ls-remote)")
+    parser.add_argument("--export", metavar="DIR",
+                        help="only write the text files the change adds or modifies under DIR, for Gitleaks, and exit")
+    parser.add_argument("--gitleaks-json", metavar="FILE", help="add a Gitleaks JSON report on the exported files")
+    parser.add_argument("--semgrep-json", metavar="FILE", help="add Semgrep's --json results on the exported files")
+    parser.add_argument("--write-semgrep-rules", metavar="FILE",
+                        help="only write this script's Semgrep rules to FILE, and exit (BASE and HEAD are ignored)")
+    parser.add_argument("--tool-root", default="", metavar="PATH",
+                        help="the folder the exported files were under when Gitleaks read them (e.g. /src)")
+    parser.add_argument("--action-remote", default=ACTION_REMOTE, metavar="TEMPLATE",
+                        help="where an action's repository is, with {owner} and {repo} (default: %(default)s)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
         except (AttributeError, ValueError):
             pass
+    override = None
+    if args.write_semgrep_rules:
+        write_semgrep_rules(args.write_semgrep_rules)
+        print("| wrote %d Semgrep rules" % len(SEMGREP_RULES))
+        return 0
+    if args.export:
+        try:
+            written = export_changed(args.repo, args.base, args.head, args.export)
+        except (GitError, OSError) as error:
+            print("check_pr_security: %s" % visible(str(error), 2000), file=sys.stderr)
+            return 2
+        print("| wrote %d changed text file%s for the other scanners" % (written, "" if written == 1 else "s"))
+        return 0
+    external = []
+    if args.semgrep_json:
+        external += read_semgrep(args.semgrep_json, args.tool_root)
+    if args.gitleaks_json:
+        external += read_gitleaks(args.gitleaks_json, args.tool_root)
     try:
-        findings, files = scan(args.repo, args.base, args.head)
+        findings, files = scan(args.repo, args.base, args.head, args.check_action_tags, args.action_remote,
+                               external=external)
+        if args.github_event:
+            title, body, override = read_event(args.github_event)
+            findings = check_text("<pull request title>", title) + check_text("<pull request description>", body) + \
+                findings
     except GitError as error:
         print("check_pr_security: %s" % visible(str(error), 2000), file=sys.stderr)
         return 2
+    except (OSError, ValueError) as error:
+        print("check_pr_security: %s" % visible(str(error), 2000), file=sys.stderr)
+        return 2
+    if override:
+        for finding in findings:
+            if finding.level == BLOCK:
+                finding.overridden = True
     # Every printed line starts with a fixed prefix or a workflow command this script built, so a file name or a
     # line of the pull request can never be read by the runner as a command of its own.
     for line in plain_lines(findings):
         print("| " + line)
     blocks = sum(f.level == BLOCK for f in findings)
-    print("| %d block, %d review, %d changed file%s" % (blocks, len(findings) - blocks, files,
-                                                       "" if files == 1 else "s"))
+    failing = sum(f.fails() for f in findings)
+    print("| %d block%s, %d review, %d changed file%s" % (
+        blocks, " (overridden by %s)" % visible(override, 80) if override and blocks else "", len(findings) - blocks,
+        files, "" if files == 1 else "s"))
     if args.github:
         for finding in findings:
             print(annotation(finding))
         path = os.environ.get("GITHUB_STEP_SUMMARY")
         if path:
             with open(path, "a", encoding="utf-8", newline="\n") as out:
-                out.write(summary(findings, files))
-    if blocks or (args.strict and findings):
+                out.write(summary(findings, files, override))
+    if failing or (args.strict and findings):
         return 1
     return 0
 

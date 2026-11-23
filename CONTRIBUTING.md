@@ -11,11 +11,17 @@ Thanks for helping. A few rules keep the project safe to host:
   comments.
 - **Nothing that hides or fetches code.** Every pull request is scanned by `scripts/check_pr_security.py`
   (`.github/workflows/pr-security.yml`, which reads the pull request and never runs it). It fails on hidden Unicode
-  controls, a download piped into a shell, decoded data run as code, compiled executables, credentials, Xbox Live or
-  Rockstar domains, and in workflows on unpinned actions, `pull_request_target`, secrets, write permissions,
-  outsider text in `${{ }}` and pushes from CI. Network calls, package installs, submodule changes, files that run
-  by being present (`conftest.py`, `.vscode/`, `Directory.Build.props`) and edits to `AGENTS.md` are listed for the
-  reviewer. Run it before you push: `python -I scripts/check_pr_security.py origin/main HEAD`.
+  controls, names spelled with letters that only look Latin, a download piped into a shell, decoded data run as
+  code, compiled executables, credentials, Xbox Live or Rockstar domains, submodules from outside GitHub, and in
+  workflows on unpinned actions, a pin whose `# vX.Y.Z` comment names another commit, `pull_request_target`,
+  secrets, write permissions, outsider text in `${{ }}` and pushes from CI. Network calls, package installs,
+  submodule changes, files that run by being present (`conftest.py`, `.vscode/`, `Directory.Build.props`), edits to
+  `AGENTS.md`, and a title, description or commit message that claims approval or addresses coding agents are listed
+  for the reviewer. CI also runs Semgrep (the rules are in the script, `SEMGREP_RULES`) and Gitleaks on the changed
+  files, offline in pinned containers, and reports what they find on added lines the same way. Run the line checks
+  before you push: `python -I scripts/check_pr_security.py origin/main HEAD`. A maintainer
+  who has read a `block` finding and accepts it adds the label `security-reviewed:<head sha>`; it covers that commit
+  only.
 
 ## Before you start
 

@@ -1,8 +1,14 @@
 name: PR security
 
-# Scans the lines each pull request adds with scripts/check_pr_security.py: hidden Unicode, downloads piped into a
-# shell, unpinned actions, workflows that get secrets or write access, compiled executables, credentials, and (as
-# warnings for the reviewer) network calls, changed submodules and edits to the files coding agents follow.
+# Scans the lines each pull request adds with scripts/check_pr_security.py: hidden Unicode, letters that only look
+# Latin, downloads piped into a shell, unpinned actions or pins that don't match their version comment, workflows
+# that get secrets or write access, submodules from outside GitHub, compiled executables, credentials, and (as
+# warnings for the reviewer) network calls, changed submodules and edits to the files coding agents follow. The pull
+# request's title, description and commit messages are scanned too, read from the event file, never from `${{ }}`.
+#
+# A maintainer who has read a `block` finding and accepts it adds the label `security-reviewed:<head sha>` (7 or more
+# hex digits of the head commit). The label names that commit, so a push after the review fails again until a new
+# label names the new head; adding or removing a label runs the scan again.
 #
 # This is the one workflow here on pull_request_target, and it is safe only as long as it never runs the pull
 # request: pull_request_target checks out the base branch, so the workflow and the scanner are the reviewed copies on
@@ -12,7 +18,7 @@ name: PR security
 # and tests/test_check_pr_security.py checks these properties of this file.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions: {}
 
@@ -23,7 +29,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -36,13 +42,17 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          COMMITS: ${{ github.event.pull_request.commits }}
         run: |
           url="https://github.com/${GITHUB_REPOSITORY}.git"
           fetch() { git -c protocol.version=2 fetch --quiet --no-tags --no-recurse-submodules "$@"; }
-          # The test merge GitHub keeps for the pull request: first parent the base, second the head. Two commits
-          # deep is all the scan needs. A pull request that conflicts has none, and one that was just pushed can
-          # still have the previous one; then fetch the history without file contents and use the merge base.
-          if fetch --depth=2 "$url" "+refs/pull/${PR_NUMBER}/merge:refs/pr/merge" &&
+          case "$COMMITS" in ''|*[!0-9]*) COMMITS=250 ;; esac
+          [ "$COMMITS" -le 500 ] || COMMITS=500
+          # The test merge GitHub keeps for the pull request: first parent the base, second the head, and behind
+          # the head the pull request's own commits, whose messages are scanned. A pull request that conflicts has
+          # none, and one that was just pushed can still have the previous one; then fetch the history without file
+          # contents and use the merge base.
+          if fetch --depth=$((COMMITS + 2)) "$url" "+refs/pull/${PR_NUMBER}/merge:refs/pr/merge" &&
              [ "$(git rev-parse refs/pr/merge^2)" = "$HEAD_SHA" ]; then
             echo "SCAN_BASE=$(git rev-parse refs/pr/merge^1)" >> "$GITHUB_ENV"
             echo "SCAN_HEAD=$(git rev-parse refs/pr/merge)" >> "$GITHUB_ENV"
@@ -55,5 +65,35 @@ jobs:
             echo "SCAN_BASE=$BASE_SHA" >> "$GITHUB_ENV"
             echo "SCAN_HEAD=$HEAD_SHA" >> "$GITHUB_ENV"
           fi
+      # Semgrep and Gitleaks read the changed files in containers pinned by digest, with no network, a read-only file
+      # system and no token. The files are written out from git objects as data, and Semgrep's rules come out of the
+      # base branch's scripts/check_pr_security.py (kept there, not as a rule file antivirus quarantines on Windows).
+      # Their reports (Gitleaks redacts secrets) go back through the scanner, which keeps only the lines the pull
+      # request adds. A tool that fails leaves no report, and the scan lists that for the reviewer.
+      - name: Write the changed files out as data
+        run: python3 -I scripts/check_pr_security.py --export "$RUNNER_TEMP/pr-files" "$SCAN_BASE" "$SCAN_HEAD"
+      - name: Semgrep, offline
+        run: >-
+          mkdir -p "$RUNNER_TEMP/tool-out" "$RUNNER_TEMP/semgrep-rules" &&
+          python3 -I scripts/check_pr_security.py --write-semgrep-rules "$RUNNER_TEMP/semgrep-rules/pr-security.yml"
+          "$SCAN_BASE" "$SCAN_HEAD" &&
+          docker run --rm --network none --read-only --tmpfs /tmp --user "$(id -u):$(id -g)" --env HOME=/tmp
+          --volume "$RUNNER_TEMP/pr-files:/src:ro" --volume "$RUNNER_TEMP/semgrep-rules:/rules:ro"
+          --volume "$RUNNER_TEMP/tool-out:/out" --workdir /src
+          semgrep/semgrep@sha256:2e45517a85e13a9cca14a2a00df6bb48affd66b8ebfae1b0991cd57578362fb0
+          semgrep scan --config /rules/pr-security.yml --metrics=off --disable-version-check --no-git-ignore --quiet
+          --json --output /out/semgrep.json .
+          || echo "::warning::Semgrep did not finish"
+      - name: Gitleaks, offline
+        run: >-
+          mkdir -p "$RUNNER_TEMP/tool-out" &&
+          docker run --rm --network none --read-only --user "$(id -u):$(id -g)"
+          --volume "$RUNNER_TEMP/pr-files:/src:ro" --volume "$RUNNER_TEMP/tool-out:/out"
+          zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          dir /src --redact --no-banner --exit-code 0 --report-format json --report-path /out/gitleaks.json
+          || echo "::warning::Gitleaks did not finish"
       - name: Scan what the pull request adds
-        run: python3 -I scripts/check_pr_security.py --github "$SCAN_BASE" "$SCAN_HEAD"
+        run: >-
+          python3 -I scripts/check_pr_security.py --github --github-event "$GITHUB_EVENT_PATH" --check-action-tags
+          --semgrep-json "$RUNNER_TEMP/tool-out/semgrep.json" --gitleaks-json "$RUNNER_TEMP/tool-out/gitleaks.json"
+          --tool-root /src "$SCAN_BASE" "$SCAN_HEAD"
