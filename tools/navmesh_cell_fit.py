@@ -110,11 +110,9 @@ def mesh_row(b):
 
 def measure(archive, hashes=None, min_fraction=0.9, static_every=0):
     meshes, static, hash_hits, scanned, n_static = [], [], 0, 0, 0
-    orig = nd.decode_navmesh
 
-    def wrapped(b, nstreams, stats, deep):
+    def observe_tile(b):
         nonlocal hash_hits, scanned, n_static
-        row, chk = orig(b, nstreams, stats, deep)
         flags = nd._u32(b, 0x10)
         if not flags & 4 and static_every:
             n_static += 1
@@ -130,13 +128,8 @@ def measure(archive, hashes=None, min_fraction=0.9, static_every=0):
                 r = mesh_row(b)
                 if r is not None:
                     meshes.append(r)
-        return row, chk
 
-    nd.decode_navmesh = wrapped
-    try:
-        nd.scan(archive, rows=[])
-    finally:
-        nd.decode_navmesh = orig
+    nd.scan(archive, on_navmesh=observe_tile)
     control = summarise_control(static, min_fraction) if static_every else None
     return summarise(meshes, min_fraction), scanned, hash_hits, control
 

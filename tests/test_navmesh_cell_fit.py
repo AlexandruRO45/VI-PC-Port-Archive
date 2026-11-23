@@ -2,9 +2,15 @@
 No game files."""
 import os
 import sys
+import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from threading import Event
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_navmesh_decode import build_0drp, build_navmesh, make_rpf  # noqa: E402
 import navmesh_cell_fit as cf  # noqa: E402
 
 
@@ -44,6 +50,89 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("wagon01"), h)
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
+
+
+class GatedPath:
+    """Hold the real scanner at its first filesystem access until the test releases it."""
+
+    def __init__(self, path):
+        self.path = path
+        self.entered = Event()
+        self.resume = Event()
+
+    def __fspath__(self):
+        self.entered.set()
+        if not self.resume.wait(10):
+            raise TimeoutError("waiting to resume navmesh scan")
+        return os.fspath(self.path)
+
+
+class ScanIsolation(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.archive = root / "one.rpf"
+        self.carve = root / "two"
+        self.carve.mkdir()
+        self.tile = build_navmesh(flags=7)[0]
+        make_rpf(self.archive, [self.tile])
+        for i, blob in enumerate([self.tile, *build_0drp(), self.tile], start=1):
+            (self.carve / f"{i:012x}.bin").write_bytes(blob)
+
+    def test_measurements_and_plain_scan_are_independent(self):
+        decoder = cf.nd.decode_navmesh
+        self.addCleanup(setattr, cf.nd, "decode_navmesh", decoder)
+        one, two = cf.measure(self.archive), cf.measure(self.carve)
+        self.assertEqual((one[0]["meshes"], one[1]), (1, 1))
+        self.assertEqual((two[0]["meshes"], two[1]), (2, 2))
+        self.assertIs(cf.nd.decode_navmesh, decoder)
+
+        first, second = GatedPath(self.archive), GatedPath(self.carve)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            try:
+                a = workers.submit(cf.measure, first)
+                self.assertTrue(first.entered.wait(10))
+                b = workers.submit(cf.measure, second)
+                self.assertTrue(second.entered.wait(10))
+                during_both = cf.nd.decode_navmesh
+                plain = cf.nd.scan(self.carve)
+                # Finish the older call while the newer call is still inside scan.
+                first.resume.set()
+                result_a = a.result(timeout=10)
+                during_second = cf.nd.decode_navmesh
+                second.resume.set()
+                result_b = b.result(timeout=10)
+            finally:
+                first.resume.set()
+                second.resume.set()
+
+        self.assertEqual(plain["resources"]["navmesh"]["resources"], 2)
+        self.assertEqual((result_a, result_b), (one, two))
+        self.assertIs(during_both, decoder)
+        self.assertIs(during_second, decoder)
+        self.assertIs(cf.nd.decode_navmesh, decoder)
+
+    def test_observer_preserves_results_and_propagates_errors(self):
+        failure = RuntimeError("observer failed")
+
+        def fail(tile):
+            raise failure
+
+        for path, count in ((self.archive, 1), (self.carve, 2)):
+            with self.subTest(path=path):
+                original = cf.nd.decode_navmesh
+                before_rows, after_rows, tiles = [], [], []
+                before = cf.nd.scan(path, None, None, True, before_rows)
+                with self.assertRaises(RuntimeError) as raised:
+                    cf.nd.scan(path, on_navmesh=fail)
+                self.assertIs(raised.exception, failure)
+                self.assertIs(cf.nd.decode_navmesh, original)
+                after = cf.nd.scan(path, None, None, True, after_rows, on_navmesh=tiles.append)
+                self.assertEqual(tiles, [self.tile] * count)
+                self.assertEqual(before_rows, after_rows)
+                del before["elapsed_s"], after["elapsed_s"]
+                self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

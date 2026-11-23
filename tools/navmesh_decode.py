@@ -784,14 +784,18 @@ def new_stats():
     }
 
 
-def scan(path, start=None, limit=None, deep=False, rows=None):
-    """Decode every resource in an RPF9 archive or carved directory. Returns the summary dict."""
+def scan(path, start=None, limit=None, deep=False, rows=None, *, on_navmesh=None):
+    """Decode every resource in an RPF9 archive or carved directory. Returns the summary dict.
+
+    If supplied, on_navmesh(tile_bytes) runs after each navmesh tile is decoded.
+    Exceptions from the callback propagate to the caller.
+    """
     if os.path.isdir(path):
-        return _scan_dir(path, deep, rows)
-    return _scan_rpf(path, start, limit, deep, rows)
+        return _scan_dir(path, deep, rows, on_navmesh)
+    return _scan_rpf(path, start, limit, deep, rows, on_navmesh)
 
 
-def _scan_dir(path, deep, rows):
+def _scan_dir(path, deep, rows, on_navmesh):
     t0 = time.time()
     stats = new_stats()
     classes, checks, carver = {}, {}, Counter()
@@ -822,7 +826,7 @@ def _scan_dir(path, deep, rows):
             pending = next(stream, None)
         data = bytes(buf)
         complete = is_complete(cls, data, len(parts))
-        row, chk = _decode(cls, data, len(head), len(parts), stats, deep)
+        row, chk = _decode(cls, data, len(head), len(parts), stats, deep, on_navmesh)
         _record(classes, checks, cls, parts, data, complete, chk)
         if rows is not None:
             row.update({"offset": s, "class": cls, "streams": len(parts), "stored": None,
@@ -832,7 +836,7 @@ def _scan_dir(path, deep, rows):
     return _summary(path, "directory", None, None, carver, classes, checks, stats, time.time() - t0)
 
 
-def _scan_rpf(path, start, limit, deep, rows):
+def _scan_rpf(path, start, limit, deep, rows, on_navmesh):
     t0 = time.time()
     stats = new_stats()
     classes, checks, carver = {}, {}, Counter()
@@ -875,7 +879,7 @@ def _scan_rpf(path, start, limit, deep, rows):
                     pending = next(stream, None)
                 data = bytes(buf)
                 complete = is_complete(cls, data, len(parts))
-                row, chk = _decode(cls, data, len(head), len(parts), stats, deep)
+                row, chk = _decode(cls, data, len(head), len(parts), stats, deep, on_navmesh)
                 _record(classes, checks, cls, parts, data, complete, chk)
                 if rows is not None:
                     row.update({"offset": s, "class": cls, "streams": len(parts),
@@ -907,11 +911,14 @@ def _account(m, carver, last, s, used, inflated, end):
     return max(last, s + used)
 
 
-def _decode(cls, buf, len0, nstreams, stats, deep):
+def _decode(cls, buf, len0, nstreams, stats, deep, on_navmesh):
     if cls == "0drp":
         return decode_7a(buf, len0, nstreams, stats["0drp"])
     if cls == "navmesh":
-        return decode_navmesh(buf, nstreams, stats["navmesh"], deep)
+        result = decode_navmesh(buf, nstreams, stats["navmesh"], deep)
+        if on_navmesh is not None:
+            on_navmesh(buf)
+        return result
     if cls == "grid":
         return decode_grid(buf, nstreams, stats["grid"], deep)
     if cls == "psin":
