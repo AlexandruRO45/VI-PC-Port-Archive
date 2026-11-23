@@ -152,6 +152,56 @@ test('a WebGL startup error replaces the fly prompt and preserves the original e
     assert.equal(attributes.get('role'), 'alert');
 });
 
+test('the viewer replaces the HUD only when its displayed values change', () => {
+    const updates = [];
+    const hud = { set innerHTML(value) { updates.push(value); } };
+    const position = { x: 0, y: 0, z: 0, fromArray([x, y, z]) { Object.assign(this, { x, y, z }); } };
+    const camera = { position, quaternion: { setFromEuler() {} }, getWorldDirection() {} };
+    let drawFrame;
+    let framesDrawn = 0;
+    let streamed = 0;
+    const renderStats = { calls: 4, triangles: 2000 };
+    const renderer = {
+        info: { render: renderStats },
+        setAnimationLoop(callback) { drawFrame = callback; },
+        render() { ++framesDrawn; },
+    };
+    const loopStart = viewerModule.indexOf('// ---------- main loop ----------');
+    assert.ok(loopStart >= 0);
+    vm.runInNewContext(viewerModule.slice(loopStart), {
+        camera, renderer, document: { getElementById: () => hud }, location: { hash: '' },
+        world: { spawn: [0, 0, 0], chunks: [] }, parseCamHash: () => null,
+        pitch: 0, yaw: 0, speed: 10, keys: new Set(), scene: {}, live: new Map(), inflight: 0, failed: 0,
+        stream() { ++streamed; },
+        THREE: {
+            Clock: class { getDelta() { return 1 / 16; } },
+            Euler: class {},
+            Vector3: class { crossVectors() { return this; } normalize() { return this; } lengthSq() { return 0; } },
+        },
+    });
+
+    drawFrame();
+    assert.match(updates.at(-1), /pos 0\.0, 0\.0, 0\.0/);
+    for (let i = 0; i < 8; ++i) drawFrame();
+    assert.equal(updates.length, 2);
+    assert.match(updates.at(-1), /16 fps/);
+    for (let i = 0; i < 18; ++i) drawFrame();
+    assert.equal(updates.length, 2);
+    position.x = 0.01;
+    drawFrame();
+    assert.equal(updates.length, 2);
+    position.x = 1;
+    drawFrame();
+    assert.equal(updates.length, 3);
+    assert.match(updates.at(-1), /pos 1\.0, 0\.0, 0\.0/);
+    renderStats.calls = 5;
+    drawFrame();
+    assert.equal(updates.length, 4);
+    assert.match(updates.at(-1), /draw calls 5/);
+    assert.equal(streamed, 30);
+    assert.equal(framesDrawn, 30);
+});
+
 async function freecamFixture(requestPointerLock = async () => { throw new Error('pointer lock unavailable'); }) {
     const windowEvents = new Map(), canvasEvents = new Map(), documentEvents = new Map();
     const helpMessages = [];
