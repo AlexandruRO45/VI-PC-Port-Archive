@@ -285,7 +285,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | variable | default | effect |
 |---|---|---|
 | `LEONIDA_DS_TRIGGERS` | `rumble` | DualSense trigger effects: `off`, `rumble` or `resistance` (above) |
-| `LEONIDA_DS_TRIGGER_GAIN` | `1` | scales the trigger level before it becomes an effect, 0..4 (`nan` keeps the default) |
+| `LEONIDA_DS_TRIGGER_GAIN` | `1` | scales the trigger level before it becomes an effect, 0..4 (a value that is not a number, such as `nan` or `abc`, is logged and keeps the default) |
 | `LEONIDA_DS_TRIGGER_FREQ` | `30` | vibration frequency of the `rumble` mode, 1..255 |
 | `LEONIDA_DS_LIGHTBAR` | unset | `RRGGBB` (hex) sets the DualSense/DualShock 4 lightbar when the pad connects; `off` turns it dark; unset keeps SDL's player colour |
 | `LEONIDA_RUMBLE` | `1` | `0` turns all rumble, trigger and force-feedback output off |
@@ -293,7 +293,7 @@ line is logged when it takes effect); tracking goes on underneath, so clearing i
 | `LEONIDA_PROMPTS_SWITCH_MS` | `300` | shortest time between two changes of the active input family, 0..2000 ms |
 | `LEONIDA_GAMEINPUT_THREAD` | `1` | `0` stops the background poll thread; only `rt::gameinput::poll()` then reads the pads (tests) |
 | `LEONIDA_KEYBOARD_PAD` | `off` | `1` adds the [keyboard pad](#keyboard-pad), read while this process has focus; `always` reads keys whatever has focus |
-| `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 (`nan` keeps the default) |
+| `LEONIDA_MOUSE_SENSITIVITY` | `1` | scales how far the mouse moves the keyboard pad's right stick, 0.1..10 (a value that is not a number, such as `nan` or `abc`, is logged and keeps the default) |
 
 SDL's own hints (`SDL_JOYSTICK_*`, see SDL's `SDL_hints.h`) also apply, for example `SDL_JOYSTICK_HIDAPI_PS5=0` to
 leave a DualSense to the generic driver, or `SDL_GAMECONTROLLERCONFIG` to add a mapping for an unknown pad.

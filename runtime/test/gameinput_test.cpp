@@ -743,20 +743,27 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     set_env("LEONIDA_MOUSE_SENSITIVITY", "0");
     rt::gameinput::reload_config();
     check(approx(rt::gameinput::config().mouse_sensitivity, 0.1f), "keyboard pad: mouse sensitivity clamps to 0.1");
-    // A value that is not a finite number keeps the default: NaN passes std::clamp unchanged, and with a NaN
-    // sensitivity the mouse moved the right stick by lround(NaN), which is not the default's distance (MSVC: 0).
-    for (const char* bad : {"nan", "-nan", "NAN(ind)"}) {
+    // A value that is not a number keeps the default. NaN passes std::clamp unchanged, and with a NaN sensitivity the
+    // mouse moved the right stick by lround(NaN), which is not the default's distance (MSVC: 0). Text that does not
+    // parse as a number ("abc", "high", "2x") went through atof to 0 or a prefix, which turned the trigger gain off.
+    for (const char* bad : {"nan", "-nan", "NAN(ind)", "abc", "high", "", "  ", "2x"}) {
         set_env("LEONIDA_MOUSE_SENSITIVITY", bad);
         set_env("LEONIDA_DS_TRIGGER_GAIN", bad);
         rt::gameinput::reload_config();
         check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
-              "keyboard pad: a NaN mouse sensitivity or trigger gain keeps the default 1");
+              "keyboard pad: a mouse sensitivity or trigger gain that is not a number keeps the default 1");
         g_cursor_x += 10;
         rt::gameinput::poll();
         check(approx(pad_state(input, kb).rightThumbstickX, 10240 / 32767.0f),
-              "keyboard pad: with a NaN sensitivity the mouse moves the stick as with the default");
+              "keyboard pad: with a sensitivity that is not a number the mouse moves the stick as with the default");
         settle();
     }
+    // Whitespace around a number is allowed.
+    set_env("LEONIDA_MOUSE_SENSITIVITY", " 2 ");
+    set_env("LEONIDA_DS_TRIGGER_GAIN", " 2 ");
+    rt::gameinput::reload_config();
+    check(rt::gameinput::config().mouse_sensitivity == 2.0f && rt::gameinput::config().ds_trigger_gain == 2.0f,
+          "keyboard pad: whitespace around a mouse sensitivity or trigger gain is ignored");
     set_env("LEONIDA_DS_TRIGGER_GAIN", nullptr);
     set_env("LEONIDA_MOUSE_SENSITIVITY", "inf");
     rt::gameinput::reload_config();

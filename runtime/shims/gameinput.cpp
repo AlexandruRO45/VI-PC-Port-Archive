@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -139,13 +140,17 @@ std::string env(const char* name) {
     return s;
 }
 
-// A float variable clamped to [lo, hi]; `value` (the default) is kept when the text is not a finite number. NaN
-// compares false, so std::clamp would hand it through, and every product with it would be NaN too.
+// A float variable clamped to [lo, hi]; `value` (the default) is kept when the text is not a number: text that does
+// not parse as one whole number (whitespace around it is allowed), or NaN. atof would turn "abc" into 0, and NaN
+// compares false, so std::clamp would hand it through and every product with it would be NaN too. Infinities clamp.
 void read_float(const char* name, float lo, float hi, float& value) {
     const std::string text = env(name);
     if (text.empty()) return;
-    const double v = std::atof(text.c_str());
-    if (std::isnan(v)) {
+    char* end = nullptr;
+    const double v = std::strtod(text.c_str(), &end);
+    const bool parsed = end != text.c_str();
+    while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (!parsed || *end != '\0' || std::isnan(v)) {
         std::fprintf(stderr, "[rt] gameinput: %s=%s is not a number, using %g\n", name, text.c_str(), value);
         return;
     }
