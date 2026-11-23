@@ -140,9 +140,10 @@ The CPU oracle (`check_image`) samples the decoded `R8G8B8A8_UNORM` texture bili
 `centre_uv` and each `uv_probes` entry and requires the GPU readback to match within `0.02` (rejecting the
 magenta unbound-texture fallback and wrong-colour probes). Verified on Windows 11 with an NVIDIA GeForce RTX 3060
 (driver 621.24, Vulkan 1.4.357): **12,804/16,384 (0.781)** covered. Without `LEONIDA_FIRST_LIGHT_DIR`,
-`python -I tests/test_first_light.py -v` runs **46 tests: 42 passed, 4 skipped** (the 3 package-gated
+`python -I tests/test_first_light.py -v` runs **46 tests in 12 classes: 42 passed, 4 skipped** (the 3 package-gated
 `FirstLightTests` require `LEONIDA_FIRST_LIGHT_DIR`, and `test_harness_rejects_wrapped_tsharp_va_overflow` needs a
-built `vk_harness`; the 4 `OracleTests` and the other 11 `TexturedOracleTests` run without a package). With
+built `vk_harness`; the other 42, in `OracleTests`, `TexturedOracleTests`, `CameraTests`, `ProbeCoordinateTests`,
+`ProbeDepthTests`, `RunFolderTests`, `ReadObjTests` and four smaller classes, run without a package). With
 `LEONIDA_FIRST_LIGHT_DIR` set against a local package run (and `vk_harness` built) none of the 46 is skipped.
 
 ```sh

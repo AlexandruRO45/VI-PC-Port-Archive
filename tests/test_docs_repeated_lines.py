@@ -62,6 +62,13 @@ class RepeatedLines(unittest.TestCase):
         ])
         self.assertEqual(repeated_lines(text), [(1, 2)])
 
+    def test_window_boundary(self):
+        a = "The disassembly count is unchanged: the same 42 programs have no invalid word, and"
+        filler = ["filler line %d" % i for i in range(WINDOW)]
+        # WINDOW lines apart (WINDOW - 1 lines between them) and exactly WINDOW + 1 apart: only the first is flagged.
+        self.assertEqual(repeated_lines("\n".join([a, *filler[:WINDOW - 1], a])), [(1, WINDOW + 1)])
+        self.assertEqual(repeated_lines("\n".join([a, *filler, a])), [])
+
     def test_docs_have_no_repeated_neighbouring_lines(self):
         found = []
         for path in markdown_files():
