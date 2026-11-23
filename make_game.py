@@ -2825,10 +2825,11 @@ def main() -> int:
             a.pc_tail_ubo = True
     fallbacks = fallback_flags(a) if "shaders" in stages else ()
     overlap = True
-    a.jobs = leonida_tui.clamp_jobs(a.jobs)
+    # An explicit --jobs is used as given (positive_int already refuses 0); only the setup screen's slider is
+    # bounded by the CPU count.
     use_tui = leonida_tui.tui_eligible(a.no_tui)
     if use_tui:
-        cfg = leonida_tui.run_setup(a.jobs, default_overlap=True)
+        cfg = leonida_tui.run_setup(leonida_tui.clamp_jobs(a.jobs), default_overlap=True)
         a.jobs = leonida_tui.clamp_jobs(cfg.jobs)
         overlap = cfg.overlap
     preflight(stages, work, a.wav, runtime_build, emulate=emulate, keep_emulated=keep_emulated,

@@ -32,11 +32,18 @@ SPIRV_VAL = shutil.which("spirv-val")
 FSSM = bytes(0x138) + struct.pack("<4I", 0x88 | (12 << 1), 32, 1, 1)
 
 
-def translate(lines, *, emulate=False):
+# A shader that never writes EXEC has every lane active, so the translator folds the guard to %true
+# (`exec_static_true`, tests/semantic/test_active_cache.py).  This EXEC write keeps the guard a real
+# `OpLoad %bool %active`, the case these tests check; s12 is past the T# in s[4:11].
+EXEC_WRITE = "s_mov_b32 exec_lo, s12"
+
+
+def translate(lines, *, emulate=False, exec_write=True):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_img_atomic_guard", lines + ["s_endpgm"], fssm=FSSM)
+        prologue = [EXEC_WRITE] if exec_write else []
+        return support.translate_lines("cs_img_atomic_guard", prologue + lines + ["s_endpgm"], fssm=FSSM)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -206,6 +213,17 @@ class ImageAtomicsGuardTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(rdna2spirv.Unsupported):
                     translate(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0", bad])
+
+    def test_guard_folds_to_true_without_exec_write(self):
+        # With no EXEC writer every lane is active: the atomic stays in its own block, entered on %true.
+        spv = translate([
+            "v_mov_b32_e32 v0, 5", "v_mov_b32_e32 v1, 1", "v_mov_b32_e32 v2, 2",
+            "image_atomic_add v0, v[1:2], s[4:11] dmask:0x1 dim:SQ_RSRC_IMG_2D unorm",
+        ], exec_write=False)
+        validate_spirv(spv)
+        self.assertNotIn("OpLoad %bool %active", spv)
+        self.assertRegex(spv, r"OpBranchConditional %true (%\w+_do) ")
+        self.assertIn("OpAtomicIAdd %uint ", spv)
 
 
 if __name__ == "__main__":

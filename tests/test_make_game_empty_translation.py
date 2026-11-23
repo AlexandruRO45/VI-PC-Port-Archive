@@ -102,7 +102,10 @@ class TranslateLockedIndexTest(unittest.TestCase):
             return real_open(path, mode, *a, **k)
 
         class Exited(Done):
-            def wait(self):
+            def poll(self):
+                return shard_code
+
+            def wait(self, timeout=None):
                 return shard_code
 
         err = io.StringIO()

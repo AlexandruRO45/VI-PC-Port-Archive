@@ -286,8 +286,16 @@ class BadCarveIndexTest(unittest.TestCase):
         self.assert_one_error(self.run_tool(folder), "index.json", "row 0", "'off'", "'stored'")
 
     def test_missing_file_names_what_is_wrong(self):
+        # A missing input follows the tools' shared convention (tests/test_missing_input_exit_codes.py, #6701):
+        # one ERROR line and exit 2, not the exit 1 of a bad carve.
         folder = self.make_folder()
-        self.assert_one_error(self.run_tool(os.path.join(folder, "nope.rpf")), "nope.rpf", "no such file or folder")
+        result = self.run_tool(os.path.join(folder, "nope.rpf"))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        lines = result.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertTrue(lines[0].startswith("ERROR:"), lines[0])
+        self.assertIn("nope.rpf", lines[0])
+        self.assertIn("no such file or folder", lines[0])
 
     def test_reads_carve_index_with_utf8_bom(self):
         folder = tempfile.mkdtemp()

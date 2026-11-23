@@ -20,7 +20,13 @@ SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    # bink_index refuses a named file that is not a Bink 2 stream (#6917, #6925), so the source is a minimal
+    # stream (header layout as in tests/test_bink_index.py) whose payload is the sentinel.
+    body = SENTINEL
+    header = bytearray(0x2C)
+    header[0:4] = b"KB2n"
+    struct.pack_into("<10I", header, 4, 0x2C + 4 + 4 + len(body) - 8, 1, len(body), 1, 320, 240, 30, 1, 0x40013, 0)
+    return bytes(header) + b"\x00\x05\xe9\x87" + bytes(4) + body
 
 
 def make_rpf(payload, head_size=0x40):
