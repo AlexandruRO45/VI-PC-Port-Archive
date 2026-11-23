@@ -13119,6 +13119,9 @@ class Gen:
         """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
         time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
         (UNORM/SNORM/FLOAT convert from the float bits the shader wrote). Missing components are 0.
+        A 1_5_5_5_UNORM image may have no float view: where the GPU cannot store to A1R5G5B5 the runtime backs it
+        with R16_UINT and binds that in the uint class. So after the float store such a T# also stores the texel
+        packed (pack_1555_unorm) through the uint view; the view the runtime did not bind is the 1x1 fallback.
         With d16, enabled components are packed two 16-bit values per consecutive VGPR (low half first): IEEE f16
         widened to f32 for float/norm views, zero-extended u16 for UINT views, and sign-extended i16 for SINT views."""
         # Cube storage images are bound as 6-layer 2D arrays (runtime/src/vulkan_bindless.h).
@@ -13191,7 +13194,7 @@ class Gen:
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
-        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
+        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3", "p", "pe")}
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
@@ -13215,12 +13218,48 @@ class Gen:
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
         write(0, v4f)
+        fmt, packed_fmt = self.tmp(), self.tmp()
+        self.emit(f"{fmt} = OpBitFieldUExtract %uint {t1} {self.cu(20)} {self.cu(9)}")
+        self.emit(f"{packed_fmt} = OpIEqual %bool {fmt} {self.cu(self.FORMAT_1_5_5_5_UNORM)}")
+        self.emit(f"OpSelectionMerge {L['pe']} None")
+        self.emit(f"OpBranchConditional {packed_fmt} {L['p']} {L['pe']}")
+        self.emit(f"{L['p']} = OpLabel")
+        v4p = self.tmp()
+        self.emit(f"{v4p} = OpCompositeConstruct %v4uint_st {self.pack_1555_unorm(fv)} "
+                  f"{self.cu(0)} {self.cu(0)} {self.cu(0)}")
+        write(1, v4p)
+        self.emit(f"OpBranch {L['pe']}")
+        self.emit(f"{L['pe']} = OpLabel")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")
         self.emit(f"{L['e2']} = OpLabel")
         self.emit(f"OpBranch {L['end']}")
         self.emit(f"{L['end']} = OpLabel")
+
+    FORMAT_1_5_5_5_UNORM = next(k for k, name in GFX10_FORMATS.items() if name == "GFX10_FORMAT_1_5_5_5_UNORM")
+
+    def pack_1555_unorm(self, comps):
+        """The 16-bit texel (a uint id) of four float components in VK_FORMAT_A1R5G5B5_UNORM_PACK16's layout:
+        component 0 in bits 14:10, 1 in 9:5, 2 in 4:0 and 3 in bit 15, where a float store through an A1R5G5B5
+        view puts them. Each is clamped to [0, 1] (a NaN becomes 0) and rounded to nearest: trunc(x * max + 0.5)."""
+        zero, one, half, f31 = (self.tof(self.cu(bits)) for bits in (0, 0x3F800000, 0x3F000000, 0x41F80000))
+        word = None
+        for comp, (top, shift) in zip(comps, ((f31, 10), (f31, 5), (f31, 0), (one, 15))):
+            lo, clamped, scaled, biased, level, field = (self.tmp() for _ in range(6))
+            self.emit(f"{lo} = OpExtInst %float %glsl NMax {comp} {zero}")
+            self.emit(f"{clamped} = OpExtInst %float %glsl NMin {lo} {one}")
+            self.emit(f"{scaled} = OpFMul %float {clamped} {top}")
+            self.emit(f"{biased} = OpFAdd %float {scaled} {half}")
+            self.emit(f"{level} = OpConvertFToU %uint {biased}")
+            self.emit(f"{field} = OpShiftLeftLogical %uint {level} {self.cu(shift)}")
+            if word is None:
+                word = field
+            else:
+                merged = self.tmp()
+                self.emit(f"{merged} = OpBitwiseOr %uint {word} {field}")
+                word = merged
+        return word
 
     def resinfo_words(self, img, level, array_query, word3):
         """[width, height, depth, levels] (int ids) of image_get_resinfo for the uint mip level `level`, as RDNA2

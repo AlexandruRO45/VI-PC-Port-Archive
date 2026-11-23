@@ -209,7 +209,9 @@ def texels(line: str) -> dict[str, list[int | None]]:
             src[res] = src[args[0]]
         elif op == "OpBitcast" and args[0] in consts:
             consts[res] = consts[args[0]]
-        elif op == "OpCompositeConstruct" and ty in ("%v4float", "%v4uint_st", "%v4int_st"):
+        elif op == "OpCompositeConstruct" and ty in ("%v4float", "%v4uint_st", "%v4int_st") and ty not in out:
+            # The first of each type is the view's texel; a later %v4uint_st is the packed 1_5_5_5 texel
+            # (test_image_store_1555.py).
             out[ty] = [src[x][1] if x in src and src[x][0] == "v" else consts.get(x) for x in args]
     return out
 

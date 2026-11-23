@@ -26,6 +26,10 @@ PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 CS_EPILOGUE = ["s_endpgm"]
 CLASS_TYPES = {0: "%v4float", 1: "%v4uint_st", 2: "%v4int_st"}
 CUBE_BINDINGS = {"%stv0_1": 11, "%stv1_1": 12, "%stv2_1": 13}
+# What an image_store writes: one texel a view class, and a 1_5_5_5_UNORM T#'s texel packed through the uint view
+# (test_image_store_1555.py).
+STORE_WRITES = sorted([(CLASS_TYPES[c], f"%stv{c}_1", "%v3int") for c in range(3)]
+                      + [(CLASS_TYPES[1], "%stv1_1", "%v3int")])
 
 
 def cs_fssm(threads=64):
@@ -122,7 +126,7 @@ class CubeImageStore(unittest.TestCase):
                 m = Module(translate_stage(stage, [
                     "image_store v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm"
                 ]))
-                self.assertEqual(sorted(m.writes()), sorted((CLASS_TYPES[c], f"%stv{c}_1", "%v3int") for c in range(3)))
+                self.assertEqual(sorted(m.writes()), STORE_WRITES)
                 for var, binding in CUBE_BINDINGS.items():
                     self.assertEqual(m.bindings.get(var), binding)
                 for c, st in enumerate(("%float", "%uint", "%int")):
@@ -158,7 +162,7 @@ class CubeImageStore(unittest.TestCase):
                                         "a16" if a16 else "", "d16" if d16 else "") if x)
             with self.subTest(dmask=hex(dmask), a16=a16, d16=d16, extra=extra):
                 m = Module(translate_stage("cs", [f"image_store {vdata_reg(dmask, d16)}, {addr}, s[0:7] {mods}"]))
-                self.assertEqual(sorted(m.writes()), sorted((CLASS_TYPES[c], f"%stv{c}_1", "%v3int") for c in range(3)))
+                self.assertEqual(sorted(m.writes()), STORE_WRITES)
                 if d16:
                     self.assertIn("UnpackHalf2x16", m.text)
                     self.assertIn("OpBitFieldUExtract", m.text)
@@ -229,7 +233,7 @@ class CubeImageLoadCoherent(unittest.TestCase):
                     "image_store v[0:3], v[4:6], s[0:7] dmask:0xf dim:SQ_RSRC_IMG_CUBE unorm glc",
                 ]))
                 order = [op for _, op, _ in m.ops if op in ("OpImageRead", "OpImageWrite")]
-                self.assertEqual(order, ["OpImageRead"] * 3 + ["OpImageWrite"] * 3)
+                self.assertEqual(order, ["OpImageRead"] * 3 + ["OpImageWrite"] * 4)
                 self.assertEqual({v for _, v, _ in m.reads()}, set(CUBE_BINDINGS))
                 self.assertEqual({v for _, v, _ in m.writes()}, set(CUBE_BINDINGS))
                 self.assertEqual(m.coherent, set(CUBE_BINDINGS))
@@ -299,8 +303,7 @@ class LlvmMcRoundTrip(unittest.TestCase):
                 spvasm = translate_stage("cs", [insn, "s_waitcnt vmcnt(0)"])
                 m = Module(spvasm)
                 if insn.startswith("image_store"):
-                    self.assertEqual(sorted(m.writes()),
-                                     sorted((CLASS_TYPES[c], f"%stv{c}_1", "%v3int") for c in range(3)))
+                    self.assertEqual(sorted(m.writes()), STORE_WRITES)
                 else:
                     self.assertEqual(sorted(m.reads()),
                                      sorted((CLASS_TYPES[c], f"%stv{c}_1", "%v3int") for c in range(3)))

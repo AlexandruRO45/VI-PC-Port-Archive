@@ -656,6 +656,7 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
+                 "cs_b5g5r5a1_store": "d3d12_b5g5r5a1_store_test",
                  "ps_live_width": "w64_graphics.py"}
 
 

@@ -26,6 +26,8 @@ EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
 DIMS = {"2D": ("v[4:5]", 0), "2D_ARRAY": ("v[4:6]", 1), "CUBE": ("v[4:6]", 1),
         "3D": ("v[4:6]", 2), "1D": ("v4", 3)}
 CLASS_TYPES = {0: "%v4float", 1: "%v4uint_st", 2: "%v4int_st"}       # storage view class -> texel type
+# An image_store also writes a 1_5_5_5_UNORM T#'s texel packed through the uint view (test_image_store_1555.py).
+PACKED_WRITE = (CLASS_TYPES[1], "%stv1_0")
 
 
 def translate(lines):
@@ -90,12 +92,12 @@ class CoherentReadModifyWrite(unittest.TestCase):
         reads, writes = m.reads(), m.writes()
         # One read per numeric class, each from that class's storage view, with that class's texel type.
         self.assertEqual(sorted(reads), sorted((CLASS_TYPES[c], f"%stv{c}_0") for c in range(3)))
-        self.assertEqual(sorted(writes), sorted((CLASS_TYPES[c], f"%stv{c}_0") for c in range(3)))
+        self.assertEqual(sorted(writes), sorted([(CLASS_TYPES[c], f"%stv{c}_0") for c in range(3)] + [PACKED_WRITE]))
         self.assertNotIn("OpImageFetch", m.text)                 # nothing reads through the sampled arrays
         self.assertEqual(m.chains_into("%images") + m.chains_into("%itx"), [])
         # Every read comes before every write (the read-modify-write order).
         order = [op for _, op, _ in m.ops if op in ("OpImageRead", "OpImageWrite")]
-        self.assertEqual(order, ["OpImageRead"] * 3 + ["OpImageWrite"] * 3)
+        self.assertEqual(order, ["OpImageRead"] * 3 + ["OpImageWrite"] * 4)
 
     def test_storage_views_are_coherent_and_the_read_feature_is_declared(self):
         text = rmw()

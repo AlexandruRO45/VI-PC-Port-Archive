@@ -19,8 +19,8 @@ Design rules (see tests/semantic/README.md):
     zero-initialised; run_workgroup shares them between its invocations, as a workgroup does (one invocation
     alone has its own). 32-bit atomics on them (and on Function variables) are read-combine-write like the
     physical-storage-buffer ones. OpControlBarrier is a point every invocation of run_workgroup must reach
-    together (run_fragment refuses it). Images are rejected, except OpImageFetch on an image array that
-    run_workgroup's `resources` binds (with the StorageBuffer descriptor hash table the translator probes).
+    together (run_fragment refuses it). Images are rejected, except OpImageFetch and OpImageWrite on an image array
+    that run_workgroup's `resources` binds (with the StorageBuffer descriptor hash table the translator probes).
   * A default run sees zero push constants, no inputs and empty memory, so tests that do not care about them
     keep the old behaviour.
 
@@ -520,8 +520,10 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
 
     `resources` binds descriptor-set variables by name: a StorageBuffer variable whose block is one runtime array
     of words takes a list of those words; a UniformConstant array of images takes a list with one entry per
-    descriptor index, each a function (coordinate, lod) -> the 4-tuple OpImageFetch returns. A descriptor variable
-    left out stays declared but cannot be accessed (OpAccessChain into it raises)."""
+    descriptor index, each a function (coordinate, lod) -> the 4-tuple OpImageFetch returns, or for a storage image
+    an object whose store(coordinate, texel) OpImageWrite calls with the texel's four components (floats, or the
+    words of an integer texel). A descriptor variable left out stays declared but cannot be accessed (OpAccessChain
+    into it raises)."""
     inputs = inputs or {}
     resources = resources or {}
     push_constants = list(push_constants or [])
@@ -835,6 +837,13 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             if kind[0] != "vec" or len(texel) != kind[2]:
                 raise UnsupportedConstruct(f"OpImageFetch texel {texel!r} does not fit {a[0]}")
             values[res] = texel
+        elif op == "OpImageWrite":
+            image = val(a[0])
+            if not hasattr(image, "store"):
+                raise UnsupportedConstruct(f"OpImageWrite to an image no resource binds for stores: {line}")
+            if len(a) != 3:
+                raise UnsupportedConstruct(f"OpImageWrite with image operands: {line}")
+            image.store(val(a[1]), tuple(val(a[2])))
         elif op == "OpStore":
             p = pointers[a[0]]
             if p[0] == "pc":

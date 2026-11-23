@@ -410,9 +410,10 @@ What is implemented (all of it testable without the game):
     `{R16_UINT, A1R5G5B5_UNORM_PACK16}` in its format list (`Format::uint_backed`). Unlike `R9G9B9E5`, render
     targets are kept: RTVs and clears go through an `A1R5G5B5` attachment view, SRVs through an `A1R5G5B5`
     sampled view, and the UAV's storage view is `R16_UINT` in `as_uint`. SRV and UAV descriptors name the texture's
-    own T# format (`1_5_5_5_UNORM`, 134), so a shader store needs the translator to pack the 5-5-5-1 bits for that
-    view; until it does, `CheckFeatureSupport` does not advertise the typed UAV. Multisampled UAV textures are still
-    refused (`d3d12_b5g5r5a1_uav_test`);
+    own T# format (`1_5_5_5_UNORM`, 134), and the translator's `image_store` packs the 5-5-5-1 bits for that view
+    ([design.md](design.md), "Packed 1_5_5_5 image stores"; `d3d12_b5g5r5a1_store_test` dispatches a translated
+    store and reads the packed texels back). `CheckFeatureSupport` does not advertise the typed UAV yet.
+    Multisampled UAV textures are still refused (`d3d12_b5g5r5a1_uav_test`);
   - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
     keep all four bytes (WARP writes the clear's alpha into the X byte too), and shader views read alpha as 1. Its
     typeless family is its own, so views to or from `B8G8R8A8` are refused, unless the texture's castable-format
