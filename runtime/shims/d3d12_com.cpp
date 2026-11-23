@@ -758,7 +758,9 @@ public:
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
-            if (!compute_pipeline_ || !compute_.layout) return check(false);
+            // No compute PSO: a no-op, as for Dispatch (D3D-482; the host runtime runs it with its no-op pipeline state).
+            if (!compute_pipeline_) return;
+            if (!compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
         }

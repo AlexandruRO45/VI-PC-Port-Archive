@@ -13,14 +13,44 @@ template<class T> struct Ref {
     T* operator->() const { return p; }
 };
 
-enum class Call { draw, indexed, dispatch };
+enum class Call { draw, indexed, dispatch, indirect_dispatch };
 struct Case { const char* name; Call call; bool zero; };
 
-void record(ID3D12GraphicsCommandList* list, const Case& test) {
+// ExecuteIndirect(DISPATCH) needs a command signature and an argument buffer of the same device.
+struct Indirect {
+    Ref<ID3D12CommandSignature> signature;
+    Ref<ID3D12Resource> arguments;
+};
+
+bool make_indirect(ID3D12Device* dev, Indirect& out) {
+    D3D12_INDIRECT_ARGUMENT_DESC argument{};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+    const D3D12_COMMAND_SIGNATURE_DESC sig{sizeof(D3D12_DISPATCH_ARGUMENTS), 1, &argument, 0};
+    if (FAILED(dev->CreateCommandSignature(&sig, nullptr, IID_PPV_ARGS(&out.signature.p)))) return false;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    const D3D12_HEAP_PROPERTIES upload{D3D12_HEAP_TYPE_UPLOAD};
+    if (FAILED(dev->CreateCommittedResource(&upload, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                            nullptr, IID_PPV_ARGS(&out.arguments.p)))) return false;
+    UINT* words = nullptr;
+    if (FAILED(out.arguments->Map(0, nullptr, reinterpret_cast<void**>(&words)))) return false;
+    words[0] = words[1] = words[2] = 1;  // one 1x1x1 group
+    out.arguments->Unmap(0, nullptr);
+    return true;
+}
+
+void record(ID3D12GraphicsCommandList* list, const Case& test, const Indirect& indirect) {
     switch (test.call) {
     case Call::draw: list->DrawInstanced(test.zero ? 0 : 3, 1, 0, 0); break;
     case Call::indexed: list->DrawIndexedInstanced(test.zero ? 0 : 3, 1, 0, 0, 0); break;
     case Call::dispatch: list->Dispatch(test.zero ? 0 : 1, 1, 1); break;
+    case Call::indirect_dispatch:
+        list->ExecuteIndirect(indirect.signature.p, test.zero ? 0 : 1, indirect.arguments.p, 0, nullptr, 0);
+        break;
     }
 }
 
@@ -32,12 +62,14 @@ HRESULT close_case(ID3D12Device* dev, const Case& test) {
     hr = dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
                                 IID_PPV_ARGS(&list.p));
     if (FAILED(hr)) return hr;
-    record(list.p, test);
+    Indirect indirect;
+    if (test.call == Call::indirect_dispatch && !make_indirect(dev, indirect)) return E_FAIL;
+    record(list.p, test, indirect);
     return list->Close();
 }
 
 // Recording a legal null-PSO operation must not discard subsequent useful GPU work.
-bool submit_copy_after_no_pso(ID3D12Device* dev) {
+bool submit_copy_after_no_pso(ID3D12Device* dev, bool nonzero = false) {
     constexpr UINT64 bytes = 256;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -69,8 +101,14 @@ bool submit_copy_after_no_pso(ID3D12Device* dev) {
         FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p)))) return false;
     // Submit only zero-work operations: native WARP can accept a nonzero null-PSO draw at Close
     // but a subsequent actual draw may remove the device, so do not exercise that undefined GPU path.
-    list->DrawInstanced(0, 1, 0, 0);
-    list->Dispatch(0, 1, 1);
+    // With `nonzero` (the layer only), real null-PSO work: the D3D12 runtime runs it with its no-op pipeline state
+    // on an RTX 3060 Ti (NVIDIA 610.88, debug layer: "The runtime will use a default no-op pipeline state"), where
+    // WARP removes the device, so WARP is not asked.
+    Indirect indirect;
+    if (nonzero && !make_indirect(dev, indirect)) return false;
+    list->DrawInstanced(nonzero ? 3 : 0, 1, 0, 0);
+    list->Dispatch(nonzero ? 1 : 0, 1, 1);
+    if (nonzero) list->ExecuteIndirect(indirect.signature.p, 1, indirect.arguments.p, 0, nullptr, 0);
     list->CopyBufferRegion(dst.p, 0, src.p, 0, bytes);
     if (FAILED(list->Close())) return false;
     ID3D12CommandList* submitted[] = {list.p};
@@ -121,6 +159,8 @@ int main() {
         {"DrawInstanced zero", Call::draw, true},
         {"DrawIndexedInstanced zero", Call::indexed, true},
         {"Dispatch zero", Call::dispatch, true},
+        {"ExecuteIndirect(DISPATCH)", Call::indirect_dispatch, false},
+        {"ExecuteIndirect(DISPATCH) zero", Call::indirect_dispatch, true},
     };
     unsigned failures = 0;
     for (const auto& c : cases) {
@@ -136,6 +176,9 @@ int main() {
     const bool layer_copy = submit_copy_after_no_pso(layer.p);
     std::printf("null PSO then CopyBufferRegion: WARP=%u layer=%u\n", warp_copy, layer_copy);
     if (!warp_copy || !layer_copy) ++failures;
+    const bool layer_work = submit_copy_after_no_pso(layer.p, true);
+    std::printf("null-PSO draw, dispatch and ExecuteIndirect, then CopyBufferRegion (layer): %u\n", layer_work);
+    if (!layer_work) ++failures;
     std::printf("null PSO cases=%zu failures=%u validation=%u\n", std::size(cases), failures,
                 vk.validation_errors());
     return (failures || vk.validation_errors()) ? 1 : 0;
