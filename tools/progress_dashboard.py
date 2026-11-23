@@ -121,10 +121,10 @@ def scrub(text, limit=240):
     a file name outside the repository can be a carved shader's name."""
     if not text:
         return ""
-    line = text.strip().splitlines()[-1] if text.strip() else ""
+    # Only the start of a very long line can show (limit), and the space rule below looks ahead word by word.
+    line = (text.strip().splitlines()[-1] if text.strip() else "")[:max(4096, 4 * limit)]
 
-    def shown(m):
-        path = m.group(0)
+    def shown(path):
         if os.name != "nt" and re.match(r"(?i)[a-z]:[\\/]", path):
             # A drive-letter path is relative to the current folder elsewhere, so realpath would put it inside the
             # repository and print it whole (user name and file name included): it is never one of ours here.
@@ -134,21 +134,65 @@ def scrub(text, limit=240):
             return "." if rel == "." else rel
         return "<path>"
 
-    # Match the known checkout prefix before the generic patterns stop at whitespace.
+    # A path in quotes (File "D:\My Work\x.py", a repr's 'D:\x') runs to its closing quote, whatever it holds: spaces,
+    # commas, apostrophes (D:\work\Team'\x), any number of words. In single quotes an apostrophe followed by a letter
+    # or a separator is still inside.
+    def quoted(start):
+        return (rf'(?<!\w)"(?P<dq>{start}[^"\r\n]*)"'
+                rf"|(?<!\w)'(?P<sq>{start}(?:[^'\r\n]|'(?=[\w\\/]))*)'(?![\w\\/])")
+
+    # Outside quotes a folder name can hold spaces (D:\My Work, D:\New folder (2), C:\Users\Jane Q Doe, a, b): the
+    # path goes on across a space while the next word has a separator, or a later one has and isn't a repository path
+    # (docs/x.md), with only words without a separator in between - else the rest of the path, file name included,
+    # would show. So prose followed by a relative path that isn't the repository's (and module/sub/x.py) is hidden
+    # too: it reads the same as a folder name with spaces. Never into a new absolute path (quoted or not) or a URL.
+    # An apostrophe is part of a path between a letter and a letter or separator (C:\Users\O'Connor, D:\work\Team'\x),
+    # or when a separator follows it in the same word (D:\Team 'draft'\x).
+    new = r"(?![\"']?(?i:[a-z]:)?[\\/~]|[^\s'\"]*://)"
+    repo = rf"(?!{top_level_names(ROOT)}[\\/])"
+    apos = r"(?:(?<=\w)'(?=[\w\\/])|'(?=[^\s\"]*[\\/]))"
+    word = rf"(?:[^\s'\"\\/]|{apos})+"
+    has_sep = rf"(?:[^\s'\"]|{apos})*[\\/]"
+    rest = (rf"(?:[^\s'\"]|{apos}|[ \t]{new}"
+            rf"(?={has_sep}|(?:{word}[ \t])+{new}{repo}{has_sep}))*")
+    # The checkout's own path first, whole, however many words its folder names have (D:\dev folder\Leonida copy),
+    # on Windows in any case and slash style.
+    parts = [re.escape(p) for p in re.split(r"[\\/]+", ROOT.rstrip("\\/")) if p]
+    checkout = r"[\\/]+".join(parts)
     if os.name == "nt":
-        root = r"[\\/]".join(re.escape(part) for part in re.split(r"[\\/]", ROOT))
-        checkout = rf"(?i:(?<![\w/\\]){root})"
-    else:
-        checkout = rf"(?<![\w.:/~]){re.escape(ROOT)}"
-    # Consume a same-prefix sibling too, so shown() can redact its entire path.
-    checkout_path = rf"{checkout}[^\s'\"]*"
-    drive_path = r"(?i:\b[a-z]:[\\/][^\s'\"]*)"
-    posix_path = r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*"
-    line = re.sub(rf"{checkout_path}|{drive_path}|{posix_path}", shown, line)
+        checkout = f"(?i:{checkout})"
+    elif ROOT.startswith("/"):
+        checkout = "/" + checkout
+    start = rf"(?:{checkout}|(?i:[a-z]:[\\/])|/(?=[^\s/'\"]))"
+
+    def replace(show):
+        def one(m):
+            if m.group("dq") is not None:
+                return '"' + show(m.group("dq")) + '"'
+            if m.group("sq") is not None:
+                return "'" + show(m.group("sq")) + "'"
+            return show(m.group(0))
+        return one
+
+    # One pass, so a path that ends where the checkout's begins still sees a new absolute path there.
+    line = re.sub(rf"{quoted(start)}|(?<![\w.:/\\~]){checkout}{rest}|(?i:\b[a-z]:[\\/]){rest}"
+                  rf"|(?<![\w.:/~])/[^\s/'\"]{rest}", replace(shown), line)
     if HOME and len(HOME) > 3:
         line = line.replace(HOME, "~")
-    line = re.sub(r"~[\\/][^\s'\"]*", "<path>", line)
+    tilde = r"~[\\/]"
+    line = re.sub(rf"{quoted(tilde)}|{tilde}{rest}", replace(lambda path: "<path>"), line)
     return line[:limit]
+
+
+def top_level_names(root):
+    """A regex group of the names at the top of `root` (case-insensitive on Windows); one that matches nothing if the
+    folder can't be listed."""
+    try:
+        names = sorted(os.listdir(root), key=len, reverse=True)
+    except OSError:
+        names = []
+    group = "|".join(re.escape(n) for n in names) or r"(?!)"
+    return f"(?i:{group})" if os.name == "nt" else f"(?:{group})"
 
 
 def inside(child, parent):

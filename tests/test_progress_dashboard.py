@@ -379,6 +379,74 @@ class Scrub(unittest.TestCase):
         self.assertEqual(pd.scrub("in " + os.path.join(pd.HOME, "work", f"{SENTINEL}.fssm")), "in <path>")
         self.assertEqual(pd.scrub(f"C:{sep}work{sep}{SENTINEL}_a.fssm, C:{sep}{SENTINEL}_b.fssm"), "<path> <path>")
 
+    def test_a_folder_with_a_space_hides_the_rest_of_the_path(self):
+        for line in (f"Error: D:\\My Work\\carve\\{SENTINEL}.fssm line 3",
+                     f"Error: D:\\New folder (2)\\{SENTINEL}.fssm",
+                     f"cannot open C:/Users/Jane Q Doe/out/{SENTINEL}.fssm",
+                     f"Error: /mnt/My Work/carve/{SENTINEL}.fssm line 3",
+                     f"in ~/My Work/{SENTINEL}.fssm",
+                     f"Error: D:\\Leonida tools\\{SENTINEL}.fssm"):  # last word of the folder is a repository name
+            with self.subTest(line=line):
+                self.assertNotIn(SENTINEL, pd.scrub(line))
+        self.assertEqual(pd.scrub(f"Error: D:\\My Work\\carve\\{SENTINEL}.fssm line 3"), "Error: <path> line 3")
+        # Negative controls: prose after a path stays (as on main, which also drops the , ; or : glued to the path),
+        # a repository path a word or two later stays, and two paths in a row stay two paths.
+        for line, want in ((f"see /tmp/{SENTINEL}.json now, then fix docs/x.md", "see <path> now, then fix docs/x.md"),
+                           (f"Error: D:\\a\\{SENTINEL}.fssm, see docs/x.md", "Error: <path> see docs/x.md"),
+                           (f"failed: /tmp/{SENTINEL}.json; edit tools/y.py", "failed: <path> edit tools/y.py"),
+                           (f"wrote C:\\out\\{SENTINEL}.json and docs/b.md", "wrote <path> and docs/b.md"),
+                           (f"error in C:\\w\\{SENTINEL}.py: expected tools/b.py", "error in <path> expected tools/b.py"),
+                           (f"moved /a/{SENTINEL}.txt into tests/c.py", "moved <path> into tests/c.py"),
+                           (f"see /a/{SENTINEL}.txt https://x.y/z", "see <path> https://x.y/z")):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+        self.assertEqual(pd.scrub(f"copy D:\\a\\{SENTINEL}.fssm D:\\b\\{SENTINEL}.fssm"), "copy <path> <path>")
+        self.assertEqual(pd.scrub(f"copy D:\\a\\{SENTINEL}.fssm to D:\\b\\{SENTINEL}.fssm"), "copy <path> to <path>")
+        self.assertEqual(pd.scrub(f"copy /a/{SENTINEL}.fssm /b/{SENTINEL}.fssm"), "copy <path> <path>")
+        self.assertEqual(pd.scrub(f"copy /a/{SENTINEL}.fssm ~/b/{SENTINEL}.fssm"), "copy <path> <path>")
+
+    def test_an_apostrophe_in_a_folder_name_hides_the_rest_of_the_path(self):
+        for line, want in ((f"Failed D:\\Users\\O'Connor\\My Work\\{SENTINEL}.fssm line 4", "Failed <path> line 4"),
+                           (f"Failed D:\\Users\\O'Connor\\{SENTINEL}.fssm line 4", "Failed <path> line 4"),
+                           (f"in C:\\Users\\Jane O'Neil\\{SENTINEL}.fssm", "in <path>"),
+                           (f"Error: /home/o'neil/w/{SENTINEL}.fssm bad", "Error: <path> bad"),
+                           (f"in ~/Bob's files/{SENTINEL}.fssm", "in <path>")):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+        # Negative controls: a quote around a path still ends it, and an apostrophe in the prose after one stays.
+        for line, want in ((f"opened 'D:\\out\\{SENTINEL}.json' ok", "opened '<path>' ok"),
+                           (f"opened \"D:\\Users\\O'Connor\\{SENTINEL}.json\" ok", 'opened "<path>" ok'),
+                           (f"can't open D:\\a\\{SENTINEL}.json, it's gone", "can't open <path> it's gone"),
+                           (f"see '/tmp/{SENTINEL}.json' and docs/x.md", "see '<path>' and docs/x.md")):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+
+    def test_a_quoted_path_runs_to_its_closing_quote(self):
+        for line, want in ((f'File "D:\\work\\Team\'\\{SENTINEL}.fssm", line 3', 'File "<path>", line 3'),
+                           (f'File "D:\\work\\Team \'draft\'\\{SENTINEL}.fssm", line 3', 'File "<path>", line 3'),
+                           (f'File "/mnt/a, b; c: d e f/{SENTINEL}.py", line 3', 'File "<path>", line 3'),
+                           (f"open('D:\\Team'\\{SENTINEL}.json')", "open('<path>')"),
+                           (f'in "~/My Work, v2/{SENTINEL}.fssm"', 'in "<path>"')):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+        # Negative controls: the quotes stay, two quoted paths stay two, prose in quotes is not a path.
+        for line, want in ((f"['D:\\a\\{SENTINEL}.json','E:\\b.json']", "['<path>','<path>']"),
+                           (f"{{'path': '/tmp/{SENTINEL}.json', 'n': 1}}", "{'path': '<path>', 'n': 1}"),
+                           (f'"D:\\a b\\{SENTINEL}.py" and "docs/x.md"', '"<path>" and "docs/x.md"'),
+                           (f"to /tmp/{SENTINEL}.json now, 'C:\\a b\\c.py'", "to <path> now, '<path>'"),
+                           ("said 'fix tools/a.py' twice", "said 'fix tools/a.py' twice")):
+            with self.subTest(line=line):
+                self.assertEqual(pd.scrub(line), want)
+
+    def test_a_folder_name_of_many_words_or_with_a_comma(self):
+        for line in (f"Error: /mnt/a b c d e/carve/{SENTINEL}.fssm",
+                     f"Error: D:\\Games\\GTA VI Backup 2025 Final v2\\{SENTINEL}.fssm line 3",
+                     f"Error: /mnt/a, b/carve/{SENTINEL}.fssm",
+                     f"Error: D:\\Smith; John\\{SENTINEL}.fssm"):
+            with self.subTest(line=line):
+                self.assertNotIn(SENTINEL, pd.scrub(line))
+        self.assertEqual(pd.scrub(f"Error: /mnt/a, b/carve/{SENTINEL}.fssm: gone"), "Error: <path> gone")
+
     def test_paths_inside_the_repository_become_relative(self):
         line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
         self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
@@ -400,6 +468,21 @@ class Scrub(unittest.TestCase):
                 if os.name == "nt":
                     alternate = os.path.join(checkout.swapcase(), "tools", "text_tables.py").replace("\\", "/")
                     self.assertEqual(pd.scrub(f"Error: {alternate} line 3"), "Error: tools/text_tables.py line 3")
+
+    def test_a_sibling_named_after_the_checkout_plus_a_word(self):
+        # <checkout> copy\x: the checkout's own path matches first, so the rest of the sibling has to stay with it.
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "Checkout with spaces [1]")
+            os.makedirs(os.path.join(checkout, "tools"))
+            with mock.patch.object(pd, "ROOT", checkout):
+                for line, want in ((f"Error: {os.path.join(checkout + ' copy', SENTINEL)}.fssm line 3",
+                                    "Error: <path> line 3"),
+                                   (f"Error: {os.path.join(checkout + ' copy', 'sub', SENTINEL)}.fssm",
+                                    "Error: <path>"),
+                                   (f'File "{os.path.join(checkout + " copy", SENTINEL)}.py", line 3',
+                                    'File "<path>", line 3')):
+                    with self.subTest(line=line):
+                        self.assertEqual(pd.scrub(line), want)
 
     def test_urls_and_relative_paths_stay(self):
         self.assertEqual(pd.scrub("see https://github.com/ItsNotRexed/Leonida/issues/1"),
