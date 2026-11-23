@@ -406,5 +406,19 @@ class CliTest(unittest.TestCase):
         self.assertIn("does not exist", out.stderr)
 
 
+class SystemKindConstants(unittest.TestCase):
+    """DXIL SemanticKind 28/29 are barycentrics/shading-rate; 25/26 are tessellation factors."""
+
+    def test_barycentrics_and_shading_rate_are_system_inputs(self):
+        self.assertEqual(ps_interp_modes.SYSTEM_KINDS[28], "barycentrics")
+        self.assertEqual(ps_interp_modes.SYSTEM_KINDS[29], "shading-rate")
+        for kind in (28, 29):
+            self.assertEqual(ps_interp_modes.interp_class(kind, 2), ("system", 0))
+
+    def test_tessellation_kinds_are_not_system_inputs(self):
+        self.assertNotIn(25, ps_interp_modes.SYSTEM_KINDS)
+        self.assertNotIn(26, ps_interp_modes.SYSTEM_KINDS)
+
+
 if __name__ == "__main__":
     unittest.main()

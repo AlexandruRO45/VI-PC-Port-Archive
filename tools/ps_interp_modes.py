@@ -76,7 +76,8 @@ import fssm_header  # noqa: E402
 # DXIL::SemanticKind values that reach the shader as system inputs, not parameter-cache
 # interpolation (names from dxc include/dxc/DXIL/DxilConstants.h).
 SYSTEM_KINDS = {1: "vertex-id", 2: "instance-id", 12: "sample-index", 13: "front-face",
-                14: "coverage", 15: "inner-coverage", 25: "barycentrics", 26: "shading-rate"}
+                14: "coverage", 15: "inner-coverage", 28: "barycentrics", 29: "shading-rate"}
+# DXIL::SemanticKind 25/26 are TessFactor/InsideTessFactor, not barycentrics/shading-rate.
 
 # (kind class, mode) -> (class name, SPI_PS_INPUT_ENA bit).  Mode numbers are
 # DXIL::InterpolationMode ("must match D3D_INTERPOLATION_MODE"); bit numbers and names are
