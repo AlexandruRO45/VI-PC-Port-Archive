@@ -44,8 +44,8 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 
 - **Votre propre copie** du paquet Xbox Series, version `1.0.2.1` : le dossier qui contient `MicrosoftGame.Config` et
   les archives `.rpf`, sous forme de fichiers lisibles sur le disque.
-- **Windows 10/11 x64**, avec environ **350 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
-  disque avec `--work`.
+- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail (un export complet des ressources
+  pèse à lui seul environ 337 Go avant l'etape audio). Ils peuvent aller sur un autre disque avec `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (cochez « Add python.exe to PATH » à l'installation).
 - [SDK .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [SDK Vulkan](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` et `vulkaninfo`).
@@ -96,8 +96,8 @@ vérifie les prérequis et l'espace libre, et liste d'un coup tout ce qui manque
 ### Peu d'espace disque
 
 L'espace indiqué plus haut correspond à la compilation complète. Pour *lancer* le portage,
-`--stages check,shaders,runtime` a besoin d'environ 30 Go ; l'étape `assets`, qui prend presque tout le reste, ne sert
-qu'aux outils de ressources, et `--wav` ajoute plusieurs fois la taille de l'Ogg Opus. `--work` et `--out` peuvent être sur un autre disque. Le runtime lit le paquet sur
+`--stages check,shaders,runtime` a besoin d'environ 30 Go ; l'étape `assets` (~370 Go) ne sert qu'aux outils de
+ressources, et `--wav` ajoute plusieurs fois la taille de l'Ogg Opus. `--work` et `--out` peuvent être sur un autre disque. Le runtime lit le paquet sur
 place : si son disque est en lecture seule, passez `gta6rt --overlay <dossier accessible en écriture>` (c'est une
 option de `gta6rt`, pas de `make_game.py`). Ne supprimez pas les fichiers `.s` de `work/shaders/dxbc/disasm` : sans
 eux et sans `work/shaders/spirv/index.json`, l'étape `shaders` peut sembler terminée avec zéro shader.
@@ -133,7 +133,7 @@ encore ce cache.
 - **Ce qui est refait automatiquement** : la compilation enregistre la commande et la version de `llvm-mc`, les
   sources du traducteur et le décodeur des ressources (`third_party/rpf9-explorer` et `tools/rpf9dump`). Si l'un
   d'eux change, seule l'étape concernée est refaite (désassemblage, traduction ou export des modèles et textures).
-- **`--work`** : choisissez un disque avec au moins 350 Go libres. La traduction des shaders est l'étape la plus
+- **`--work`** : choisissez un disque avec au moins 400 Go libres. La traduction des shaders est l'étape la plus
   longue ; elle utilise par défaut la moitié des threads du processeur (réglable avec `--jobs`).
 - **`--wav`** : désactivé par défaut, car le WAV PCM 16 bits est plusieurs fois plus volumineux que l'Ogg Opus.
 - **Linux et Wine/Proton** : `make_game.py` fonctionne aussi sous Linux. L'étape `pipelines` utilise
