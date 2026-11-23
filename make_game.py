@@ -85,10 +85,8 @@ def fail(msg: str) -> "None":
 def require_folder(flag: str, path: str) -> None:
     """Fail before any work when a destination, or its nearest existing parent, is a file: os.makedirs would
     raise a traceback later, and with a separate --work the build reported success without creating --out."""
-    if os.path.lexists(path) and not os.path.isdir(path):
-        fail(f"{flag} is not a folder: {path}")
     probe = os.path.abspath(path)
-    while not os.path.exists(probe):
+    while not os.path.lexists(probe):
         parent = os.path.dirname(probe)
         if parent == probe:
             fail(f"{flag} cannot be created: {path}")

@@ -91,13 +91,28 @@ class DestinationTests(unittest.TestCase):
             err = io.StringIO()
             ctx = (patch.object(make_game.os, "makedirs", side_effect=OSError("invalid path"))
                    if os.name != "nt" else contextlib.nullcontext())
-            with ctx, patch.object(make_game, "visual_cpp_tools_ok", return_value=True), \
-                 patch.object(make_game, "log"), contextlib.redirect_stderr(err):
+            with ctx, patch.object(make_game, "log"), contextlib.redirect_stderr(err):
                 with self.assertRaises(SystemExit) as raised:
-                    make_game.preflight(tmp, bad_work, ["runtime"], False)
+                    make_game.preflight([], bad_work)
             self.assertEqual(raised.exception.code, 1)
             self.assertIn("ERROR: cannot create", err.getvalue())
             self.assertNotIn("Traceback", err.getvalue())
+
+    def test_path_under_broken_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = os.path.join(tmp, "broken_link")
+            try:
+                os.symlink(os.path.join(tmp, "missing_target"), broken)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            for target in (broken, os.path.join(broken, "sub")):
+                with self.subTest(target=target):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        with self.assertRaises(SystemExit) as raised:
+                            make_game.require_folder("--work", target)
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertIn("--work is not a folder", err.getvalue())
 
 
 if __name__ == "__main__":
