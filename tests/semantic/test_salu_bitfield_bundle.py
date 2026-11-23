@@ -69,5 +69,99 @@ class TestSBfeU32Reference(unittest.TestCase):
         self.assertEqual(scc, 0)
 
 
+class RegType(enum.Enum):
+    SGPR = "s"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index_or_val: int
+    is_64bit: bool = False
+
+    @classmethod
+    def sgpr32(cls, idx: int) -> Operand:
+        if not (0 <= idx < 106):
+            raise ValueError(f"SGPR index out of range: {idx}")
+        return cls(RegType.SGPR, idx, False)
+
+    @classmethod
+    def sgpr64(cls, idx: int) -> Operand:
+        if not (0 <= idx < 105):
+            raise ValueError(f"64-bit SGPR pair index out of range: {idx}")
+        return cls(RegType.SGPR, idx, True)
+
+    @classmethod
+    def imm32(cls, val: int) -> Operand:
+        return cls(RegType.IMM, val & MASK32, False)
+
+    @classmethod
+    def imm64(cls, val: int) -> Operand:
+        return cls(RegType.IMM, val & MASK64, True)
+
+
+@dataclasses.dataclass
+class Instruction:
+    opcode: str
+    dst: Operand
+    src0: Operand
+    src1: Operand
+
+
+class SaluState:
+    def __init__(self) -> None:
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+        self.scc: int = 0
+
+    def read_u32(self, op: Operand) -> int:
+        if op.reg_type == RegType.IMM:
+            return op.index_or_val & MASK32
+        return self.sgprs[op.index_or_val] & MASK32
+
+    def read_u64(self, op: Operand) -> int:
+        if op.reg_type == RegType.IMM:
+            return op.index_or_val & MASK64
+        lo = self.sgprs[op.index_or_val] & MASK32
+        hi = self.sgprs[op.index_or_val + 1] & MASK32
+        return (hi << 32) | lo
+
+    def write_u32(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+
+    def write_u64(self, idx: int, val: int) -> None:
+        self.sgprs[idx] = val & MASK32
+        self.sgprs[idx + 1] = (val >> 32) & MASK32
+
+def step_scalar_bfe_u32(state: SaluState, instr: Instruction) -> None:
+    if instr.opcode != "s_bfe_u32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    src0 = state.read_u32(instr.src0)
+    ctl = state.read_u32(instr.src1)
+    val, scc = ref_bfe_u32(src0, ctl)
+    state.write_u32(instr.dst.index_or_val, val)
+    state.scc = scc
+
+
+class TestSBfeU32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for s_bfe_u32."""
+
+    def test_ast_construction_and_bounds(self):
+        instr = Instruction("s_bfe_u32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
+        self.assertEqual(instr.opcode, "s_bfe_u32")
+        self.assertEqual(instr.dst.index_or_val, 2)
+        with self.assertRaises(ValueError):
+            Operand.sgpr32(106)
+
+    def test_scalar_interpreter_execution(self):
+        state = SaluState()
+        state.write_u32(0, 0xAABBCCDD)
+        state.write_u32(1, 8 | (8 << 16))
+        instr = Instruction("s_bfe_u32", Operand.sgpr32(2), Operand.sgpr32(0), Operand.sgpr32(1))
+        step_scalar_bfe_u32(state, instr)
+        self.assertEqual(state.sgprs[2], 0xCC)
+        self.assertEqual(state.scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
