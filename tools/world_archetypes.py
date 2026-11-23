@@ -302,7 +302,10 @@ def main(argv=None):
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    try:
+        doc = run(a.path, a.start, a.limit, a.check_extents)
+    except (OSError, ValueError) as e:  # world_index raises ValueError for a --start outside the data area
+        ap.error(str(e))
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
         with open(a.out, "w", encoding="utf-8", newline="\n") as f:
