@@ -23,6 +23,16 @@ class BufferBoundsProbeTests(unittest.TestCase):
                               capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 77, proc.stderr or proc.stdout)
 
+    def test_nonnumeric_waves_are_usage_errors(self):
+        for waves in ("invalid", "32,invalid", "32.0", "32,64x"):
+            with self.subTest(waves=waves):
+                result = subprocess.run(
+                    [sys.executable, "-I", PROBE, "--waves", waves],
+                    capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--waves", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_bad_waves(self):
         proc = subprocess.run([sys.executable, "-I", PROBE, "--waves", "16"],
                               capture_output=True, text=True, check=False)
