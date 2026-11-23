@@ -169,13 +169,11 @@ class TestDivFixupF32(unittest.TestCase):
             "v_mov_b32 v2, 0x3f800000",
             "v_div_fixup_f32 v4, v1, v2, 0x7fc00022",
             "buffer_store_dword v4, off, s[0:3], 0 offset:8",
-            # null destination discards result cleanly without disturbing v4
-            "v_mov_b32 v4, 0x12345678",
-            "v_div_fixup_f32 null, v1, v2, v2",
-            "buffer_store_dword v4, off, s[0:3], 0 offset:12",
+            # (A `null` destination is not here: LLVM refuses `v_div_fixup_f32 null, ...` for gfx1030, the
+            # destination field of a VALU instruction is a VGPR, and the translator refuses it too.)
         ]
-        _, words = _run_body(body, 4)
-        self.assertEqual(words, [0xBF400000, 0xBF800000, 0x7FC00022, 0x12345678])
+        _, words = _run_body(body, 3)
+        self.assertEqual(words, [0xBF400000, 0xBF800000, 0x7FC00022])
 
     def test_inactive_lane_preserves_dst(self):
         body = [
