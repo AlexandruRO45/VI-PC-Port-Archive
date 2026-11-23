@@ -618,7 +618,17 @@ struct DeviceState {
         return pipeline_cache_handle;
     }
 
-    QueueClock clock;  // what every queue's GetClockCalibration uses
+    QueueClock clock;  // device-wide entry points for queue calibration
+    std::vector<VkQueueFamilyProperties> queue_family_properties;
+
+    QueueClock queue_clock(std::uint32_t family) const {
+        QueueClock result = clock;
+        if (family < queue_family_properties.size())
+            result.timestamp_valid_bits = queue_family_properties[family].timestampValidBits;
+        if (!result.timestamp_valid_bits) result.calibrated = nullptr;
+        return result;
+    }
+
     PFN_vkGetPhysicalDeviceFormatProperties2 format_properties2 = nullptr;
     // True when VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 lacks native STORAGE_IMAGE but mutable R32_UINT+{R32_UINT,E5B9G9R9}
     // is supported, so R9G9B9E5_SHAREDEXP UAV textures are backed by R32_UINT with separate storage/sampled views.
@@ -4910,18 +4920,22 @@ public:
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
         query_luid_and_clock(get_device);
-        // Timestamps: what the one VkQueue every D3D12 queue submits to can write.
+        // The period is device-wide. Each D3D12 queue uses the valid bits of its selected Vulkan family.
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
-        std::vector<VkQueueFamilyProperties> families(family_count);
+        auto& families = state_.queue_family_properties;
+        families.resize(family_count);
         queue_families(info.physical, &family_count, families.data());
+        families.resize(family_count);
+        if (state_.queue_clock(info.queue_family).timestamp_valid_bits ||
+            (!info.compute_queues.empty() && state_.queue_clock(info.compute_family).timestamp_valid_bits) ||
+            (!info.copy_queues.empty() && state_.queue_clock(info.copy_family).timestamp_valid_bits))
+            state_.context->set_timestamp_period(properties.limits.timestampPeriod);
         if (info.queue_family < family_count) {
             const auto& family = families[info.queue_family];
-            if (family.timestampValidBits)
-                state_.context->set_timestamp_period(properties.limits.timestampPeriod);
             // MoltenVK (1.4.2 and 1.4.3 measured) resolves a timestamp before the write that precedes it lands, unless
             // something orders the two (docs/d3d12_vulkan.md section 4.6).
             const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
@@ -5408,7 +5422,7 @@ public:
         if (state_.info.command_queues.empty())
             return d3d12_trace::result(method, create_command_queue(*state_.context, state_.info.queue,
                                                                      state_.info.queue_family, *desc, riid, out,
-                                                                     identity(), state_.clock));
+                                                                     identity(), state_.queue_clock(state_.info.queue_family)));
         // A VkQueue of the type's own family first, then the graphics family; shared when every one is in use.
         const bool compute = desc->Type == D3D12_COMMAND_LIST_TYPE_COMPUTE;
         const bool copy = desc->Type == D3D12_COMMAND_LIST_TYPE_COPY;
@@ -5440,7 +5454,7 @@ public:
         const VkQueue queue = own_pool ? own_queues[slot] : state_.info.command_queues[slot];
         const std::uint32_t family = own_pool ? own_family : state_.info.queue_family;
         return d3d12_trace::result(method, create_command_queue(*state_.context, queue, family, *desc, riid, out,
-                                                                 identity(), state_.clock, std::move(lease)));
+                                                                 identity(), state_.queue_clock(family), std::move(lease)));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
@@ -8046,16 +8060,6 @@ private:
         if (!state_.luid.LowPart && !state_.luid.HighPart) log_once("the Vulkan driver reports no device LUID;", 0);
 
         state_.clock.get_device_proc = get_device;
-        const auto families_of = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-            info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-        if (families_of) {
-            std::uint32_t count = 0;
-            families_of(info.physical, &count, nullptr);
-            std::vector<VkQueueFamilyProperties> families(count);
-            families_of(info.physical, &count, families.data());
-            if (info.queue_family < count)
-                state_.clock.timestamp_valid_bits = families[info.queue_family].timestampValidBits;
-        }
         if (!info.calibrated_timestamps) return;
         // The KHR names first; the EXT ones are aliases with the same signatures.
         auto domains_of = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(

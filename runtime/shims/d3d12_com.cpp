@@ -1569,14 +1569,14 @@ public:
                          name(last_result_));
     }
 
-    // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
+    // A timestamp needs a queue family that can write it and the heap type for the list.
     bool timestamps_fit(const GraphicsCommandList& list) {
         namespace h = leonida::d3d12_query_heap;
         const auto other = list.type() == D3D12_COMMAND_LIST_TYPE_COPY ? h::timestamp : h::copy_queue_timestamp;
         for (const auto& command : list.commands().commands()) {
             const auto range = leonida::query_range(command);
             if (range.count && range.type == leonida::d3d12_query::timestamp &&
-                context_.query_heap_type(range.heap) == other)
+                (!clock_.timestamp_valid_bits || context_.query_heap_type(range.heap) == other))
                 return false;
         }
         return true;
@@ -1632,13 +1632,11 @@ public:
         return d3d12_trace::result(method, S_OK);
     }
 
-    // Ticks per second of the timestamps EndQuery writes: one tick is timestampPeriod nanoseconds. Every D3D12
-    // queue of the device shares one VkQueue, so they share one frequency. E_FAIL when that queue has no
-    // timestamps (timestampValidBits 0), as D3D12 reports for a queue that does not support them.
+    // One tick is timestampPeriod nanoseconds on every family that supports timestamp writes.
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* frequency) override {
         if (!frequency) return E_INVALIDARG;
         const double period = context_.timestamp_period();
-        if (!(period > 0)) return E_FAIL;
+        if (!clock_.timestamp_valid_bits || !(period > 0)) return E_FAIL;
         *frequency = static_cast<UINT64>(1e9 / period + 0.5);
         return S_OK;
     }
@@ -1661,6 +1659,7 @@ public:
     // and the CPU one is QueryPerformanceCounter's, both read at about the same moment.
     HRESULT STDMETHODCALLTYPE GetClockCalibration(UINT64* gpu, UINT64* cpu) override {
         if (!gpu || !cpu) return E_INVALIDARG;
+        if (!clock_.timestamp_valid_bits) return E_FAIL;
         if (clock_.calibrated) {
             VkCalibratedTimestampInfoKHR domains[2]{{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR},
                                                     {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR}};
@@ -1694,7 +1693,7 @@ private:
     // microseconds). It stalls the queue, which is acceptable for a call profilers make once per capture.
     HRESULT submitted_calibration(UINT64& gpu, UINT64& cpu) {
         std::lock_guard lock(mutex_);
-        if (!clock_.timestamp_valid_bits || !clock_.get_device_proc || !create_stamp()) return E_FAIL;
+        if (!clock_.get_device_proc || !create_stamp()) return E_FAIL;
         auto& vk = context_.vk;
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;

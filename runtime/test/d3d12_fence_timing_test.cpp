@@ -9,6 +9,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
+#include "../src/vulkan_replay.h"
 
 #include <dxgi1_4.h>
 
@@ -331,10 +332,76 @@ HRESULT wrap(ID3D12Device* inner, Ref<ID3D12Device>& device) {
     return hr;
 }
 
+PFN_vkGetInstanceProcAddr timing_instance_proc = nullptr;
+PFN_vkGetPhysicalDeviceQueueFamilyProperties timing_get_families = nullptr;
+std::uint32_t family_without_timestamps = 0;
+
+VKAPI_ATTR void VKAPI_CALL queue_families_without_copy_timestamps(
+    VkPhysicalDevice physical, std::uint32_t* count, VkQueueFamilyProperties* properties) {
+    timing_get_families(physical, count, properties);
+    if (properties && family_without_timestamps < *count) properties[family_without_timestamps].timestampValidBits = 0;
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL timing_proc(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties") == 0)
+        return reinterpret_cast<PFN_vkVoidFunction>(queue_families_without_copy_timestamps);
+    return timing_instance_proc(instance, name);
+}
+
+int check_copy_queue_without_timestamps(const vktest::Device& d, double gpu_frequency) {
+    if (d.copy_family == d.family) {
+        std::puts("copy queue timestamp regression: skipped (no dedicated Vulkan copy family)");
+        return 0;
+    }
+    timing_instance_proc = d.instance_proc;
+    timing_get_families = d.instance_fn<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+        "vkGetPhysicalDeviceQueueFamilyProperties");
+    family_without_timestamps = d.copy_family;
+    rt::d3d12::VulkanDeviceInfo info{};
+    info.get_instance_proc = timing_proc;
+    info.instance = d.instance;
+    info.physical = d.physical;
+    info.device = d.device;
+    info.queue = d.queue;
+    info.queue_family = d.family;
+    info.command_queues = d.queues;
+    info.copy_family = d.copy_family;
+    info.copy_queues = {d.copy_queue};
+    Ref<ID3D12Device> device;
+    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&device.p))));
+
+    D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    Ref<ID3D12CommandQueue> direct, copy;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&direct.p))));
+    queue_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&copy.p))));
+    UINT64 frequency = 0, gpu = 0, cpu = 0;
+    EXPECT(direct->GetTimestampFrequency(&frequency) == S_OK && frequency == UINT64(gpu_frequency + 0.5));
+    EXPECT(copy->GetTimestampFrequency(&frequency) == E_FAIL);
+    EXPECT(copy->GetClockCalibration(&gpu, &cpu) == E_FAIL);
+    EXPECT(check_calibration(direct.p, gpu_frequency, "direct queue with timestamp-less copy family") == 0);
+
+    const D3D12_QUERY_HEAP_DESC heap_desc{D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, 1, 0};
+    Ref<ID3D12QueryHeap> heap;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(queue_desc.Type, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, queue_desc.Type, allocator.p, nullptr, IID_PPV_ARGS(&list.p))));
+    list->EndQuery(heap.p, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    copy->ExecuteCommandLists(1, lists);
+    EXPECT(rt::d3d12::last_execute_result(copy.p) == leonida::ReplayResult::invalid_query);
+    std::puts("copy queue timestamp regression: frequency, calibration and timestamp write refused");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     vktest::Device d;
+    d.all_queue_types = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
@@ -412,6 +479,7 @@ int main() {
         EXPECT(check_luid(standalone.p) == 0);
     }
 
+    EXPECT(check_copy_queue_without_timestamps(d, gpu_frequency) == 0);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

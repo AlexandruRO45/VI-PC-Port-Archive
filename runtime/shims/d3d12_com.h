@@ -36,8 +36,8 @@ namespace rt::d3d12 {
 
 // How a queue answers GetClockCalibration. With `calibrated` (vkGetCalibratedTimestampsKHR or its EXT alias, on a
 // device whose time domains include DEVICE and QUERY_PERFORMANCE_COUNTER) both clocks are read in one call. Without
-// it, the queue writes a timestamp query and reads QueryPerformanceCounter around it; that needs `get_device_proc`
-// and a queue family with timestamp_valid_bits > 0. With neither, GetClockCalibration fails.
+// it, the queue writes a timestamp query and reads QueryPerformanceCounter around it using `get_device_proc`.
+// Both paths require timestamp_valid_bits > 0 on the queue's Vulkan family.
 struct QueueClock {
     PFN_vkGetCalibratedTimestampsKHR calibrated = nullptr;
     PFN_vkGetDeviceProcAddr get_device_proc = nullptr;
