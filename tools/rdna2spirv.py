@@ -6723,6 +6723,11 @@ class Gen:
         op, a, mods = base_op(ins["op"]), ins["args"], ins["mods"]
         if op in NOOPS or op.startswith("s_waitcnt"):
             return
+        if op.startswith("s_") and any(x["k"] == "vgpr" for x in a):
+            # The scalar ALU and the scalar memory unit have no path to the vector registers: no SOP1/SOP2/SOPK/
+            # SOPC/SOPP/SMEM operand is a VGPR. Such a line is not encodable, and used to be translated as if it
+            # read or wrote the VGPR (62 of the 143 SOP1/SOP2/SOPK ops took `v8` as the destination).
+            raise Unsupported(f"{op} names a VGPR (a scalar instruction cannot access one)")
         if op == "s_sendmsg" and a and self.stage == "gs":
             t = a[0].get("t", "")
             if "GS_OP_EMIT" in t:
