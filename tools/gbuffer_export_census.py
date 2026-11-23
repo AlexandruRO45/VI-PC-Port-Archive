@@ -28,15 +28,26 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rdna2spirv import output_signature_full  # noqa: E402
+from rdna2spirv import VOP3_TWO_DESTS, base_op, output_signature_full  # noqa: E402
 
 SV_TARGET = 64   # D3D_NAME_TARGET
 INV255 = "0x3b808081"
 REG = re.compile(r"^([sv])(\d+)$|^([sv])\[(\d+):(\d+)\]$")
 LABEL = re.compile(r"^\S.*:\s*$")
 BRANCH = re.compile(r"^s_(cbranch|branch|setpc|swappc)")
-NO_DEST = ("exp", "s_cbranch", "s_branch", "s_waitcnt", "s_endpgm", "s_nop", "buffer_store", "image_store",
-           "global_store", "ds_write", "<label>")
+# Opcodes whose first operand is not a register they write: exports, branches and scalar housekeeping, stores,
+# and the compares, which write SCC (s_cmp, s_cmpk, s_bitcmp), VCC or an SGPR mask (v_cmp, handled in `written`)
+# or EXEC (v_cmpx, any form: GFX10 has no destination operand).  The list follows rdna2spirv.reg_reads_writes
+# (`reads_all`) and feature_scan.NO_SDST.
+NO_DEST = ("exp", "s_cbranch", "s_branch", "s_waitcnt", "s_endpgm", "s_nop", "s_setpc", "s_sendmsg", "s_barrier",
+           "s_dcache", "s_icache", "s_gl1_inv", "s_setprio", "s_sleep", "s_ttrace", "s_setreg", "s_inst_prefetch",
+           "s_round_mode", "s_denorm_mode", "s_clause", "s_trap", "s_wakeup", "s_code_end", "s_atc_probe",
+           "s_setkill", "s_incperflevel", "s_decperflevel", "s_version", "s_set_gpr_idx",
+           "s_cmp", "s_bitcmp", "v_cmpx", "v_nop",
+           "buffer_store", "tbuffer_store", "image_store", "global_store", "flat_store", "scratch_store",
+           "s_store", "s_buffer_store", "ds_write", "<label>")
+ATOMIC = ("buffer_atomic", "global_atomic", "flat_atomic", "image_atomic")
+DS_RETURNS = ("ds_read", "ds_load", "ds_swizzle", "ds_permute", "ds_bpermute", "ds_append", "ds_consume")
 SUFFIX = re.compile(r"_e(32|64)$")
 
 
@@ -67,9 +78,24 @@ def parse(lines):
 
 
 def written(op, ops):
-    if op.startswith(NO_DEST) or not ops:
+    """The s/v registers an instruction writes (VCC, EXEC, SCC and M0 are not tracked).
+
+    The first operand is the destination except for: the opcodes of NO_DEST; `v_cmp_*`, which names an SGPR mask
+    destination only in the three-operand form (`_e64`, sdwa) and writes VCC in `_e32`, where the first printed
+    operand is `vcc_lo` or a source; atomics and `ds_*` without a returned value (`glc`, `_rtn`); and the VOP3b
+    forms with a second SGPR destination (rdna2spirv.VOP3_TWO_DESTS: the carry or `v_div_scale` flag)."""
+    if not ops or op.startswith(NO_DEST):
         return set()
-    return regs(ops[0])
+    if op.startswith("v_cmp"):
+        return regs(ops[0]) if len(ops) >= 3 and not op.endswith("_e32") else set()
+    if op.startswith(ATOMIC):
+        return regs(ops[0]) if any("glc" in o.split() for o in ops) else set()
+    if op.startswith("ds_") and "_rtn" not in op and not op.startswith(DS_RETURNS):
+        return set()
+    dest = regs(ops[0])
+    if base_op(op) in VOP3_TWO_DESTS and len(ops) >= 4:
+        dest |= regs(ops[1])
+    return dest
 
 
 def last_writer(ins, idx, reg):
