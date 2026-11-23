@@ -158,6 +158,17 @@ class TestSLshl2AddU32AST(unittest.TestCase):
         expr = SLshl2AddU32Expr(20, 10)
         self.assertEqual(expr.eval(), (90, 0))
 
+class TestSLshl2AddU32OverflowAndSCC(unittest.TestCase):
+    def test_shifted_out_bits_set_scc(self) -> None:
+        # High 2 bits shifted out
+        res, scc = ref_s_lshl_add_u32(2, 0x80000000, 0)
+        self.assertEqual((res, scc), (0, 1))
+
+    def test_boundary_no_overflow(self) -> None:
+        # 0x3FFFFFFF << 2 = 0xFFFFFFFC; + 3 = 0xFFFFFFFF -> no overflow
+        res, scc = ref_s_lshl_add_u32(2, 0x3FFFFFFF, 3)
+        self.assertEqual((res, scc), (0xFFFFFFFF, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
