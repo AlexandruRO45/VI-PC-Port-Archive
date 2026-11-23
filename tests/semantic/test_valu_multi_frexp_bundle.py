@@ -427,5 +427,26 @@ class VFrexpMantF32TranslatorTests(unittest.TestCase):
         with self.assertRaises(Exception):
             translate_lines("ps_bad_frexp_mant_f32", ["v_frexp_mant_f32"])
 
+# -----------------------------------------------------------------------------
+# Opcode 5: v_frexp_exp_i32_f64
+# -----------------------------------------------------------------------------
+class VFrexpExpI32F64OracleTests(unittest.TestCase):
+    def test_frexp_exp_f64_powers_of_two(self):
+        # 1.0d (0x3FF0000000000000) -> 1
+        self.assertEqual(oracle_frexp_exp_i32_f64(0x3FF0000000000000), 1)
+        # 0.5d (0x3FE0000000000000) -> 0
+        self.assertEqual(oracle_frexp_exp_i32_f64(0x3FE0000000000000), 0)
+        # 2.0d (0x4000000000000000) -> 2
+        self.assertEqual(oracle_frexp_exp_i32_f64(0x4000000000000000), 2)
+        # -4.0d (0xC010000000000000) -> 3
+        self.assertEqual(oracle_frexp_exp_i32_f64(0xC010000000000000), 3)
+
+    def test_frexp_exp_f64_special_values(self):
+        # 0.0d -> 0
+        self.assertEqual(oracle_frexp_exp_i32_f64(0), 0)
+        # INF / NaN -> 0
+        self.assertEqual(oracle_frexp_exp_i32_f64(0x7FF0000000000000), 0)
+        self.assertEqual(oracle_frexp_exp_i32_f64(0x7FF8000000000000), 0)
+
 if __name__ == "__main__":
     unittest.main()
