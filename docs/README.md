@@ -66,6 +66,7 @@ method, scope and caveats. No game data is included.
 | [gameinput.md](gameinput.md) | The GameInput shim on SDL3: `GameInputCreate` and the v0 `IGameInput`/`IGameInputDevice`/`IGameInputReading`/`IGameInputDispatcher` surface on any SDL gamepad, DualSense adaptive-trigger approximation and lightbar; 77 checks on virtual joysticks, not yet tried on a real pad. |
 | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
 | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
+| [rx6600.md](rx6600.md) | AMD Radeon RX 6600 on Windows 10 (Adrenalin 25.10.30.02): standalone `vk_store_test`/`vk_xdxr_build_test` runs from the `runtime-windows` artifact, and the driver-reset note for heavy runs. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
