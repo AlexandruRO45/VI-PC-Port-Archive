@@ -16,8 +16,8 @@ A compressed file hides those magics from both checks, so the script looks insid
 each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
 a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
 under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the check run long.
-7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
-reported as archives that can't be checked.
+7-Zip, Zstandard, RAR, LZ4 and Microsoft Cabinet files, which it can't open, archives that fail to open and archives
+over the budget are reported as archives that can't be checked.
 
 Prints one line per match, `<path>: <format>` (`<format> in <archive> (<member>)` for a match inside an archive), and
 exits 1 if there is any. Standard library only, no game files.
@@ -118,6 +118,9 @@ OPAQUE = (
     ("7-Zip archive", b"7z\xbc\xaf\x27\x1c"),
     ("Zstandard stream", b"\x28\xb5\x2f\xfd"),
     ("RAR archive", b"Rar!\x1a\x07"),
+    ("LZ4 stream", b"\x04\x22\x4d\x18"),
+    ("LZ4 stream", b"\x02\x21\x4c\x18"),  # the legacy frame, `lz4 -l`
+    ("Microsoft Cabinet archive", b"MSCF\0\0\0\0"),  # the signature and reserved1, so text starting "MSCF" passes
 )
 MAX_DEPTH = 3  # an archive inside an archive inside an archive; deeper ones are reported as unchecked
 # What looking into one file may cost: the bytes decompressed or copied out of its archives in all, and the archive

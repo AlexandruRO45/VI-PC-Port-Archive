@@ -77,6 +77,7 @@ PASSED = [
     ("metadata.txt", b"METADATA ADAT later in the line\n"),
     ("bones.md", b"# SKEL_HEAD, MoVE and SCRP name formats; none of them starts this file\n"),
     ("riff.bin", b"RIFF" + bytes(4) + b"AVI LIST"),
+    ("cabinet.md", b"MSCF is how a cabinet starts; this file is text\n"),
     ("empty.txt", b""),
     ("mz_past_end.txt", pe_header(0x80)[:0x40]),  # e_lfanew points past the end of the file
     ("mz_cut_signature.txt", pe_header(0x300)[:-2]),  # only "PE" of the signature is there
@@ -138,6 +139,11 @@ CAUGHT_IN_ARCHIVES = [
     ("a.bin", b"7z\xbc\xaf\x27\x1c" + bytes(26), "7-Zip archive (contents can't be checked)"),
     ("b.bin", b"\x28\xb5\x2f\xfd" + bytes(12), "Zstandard stream (contents can't be checked)"),
     ("c.bin", b"Rar!\x1a\x07\x01\x00" + bytes(8), "RAR archive (contents can't be checked)"),
+    ("d.bin", b"\x04\x22\x4d\x18" + bytes(12), "LZ4 stream (contents can't be checked)"),
+    ("e.bin", b"\x02\x21\x4c\x18" + bytes(12), "LZ4 stream (contents can't be checked)"),
+    ("f.bin", b"MSCF" + bytes(32), "Microsoft Cabinet archive (contents can't be checked)"),
+    ("cab.zip", zipped({"x.txt": b"MSCF" + bytes(32)}),
+     "Microsoft Cabinet archive (contents can't be checked) in zip archive (x.txt)"),
     ("broken.bin", b"PK\x03\x04" + bytes(40), "zip archive that can't be opened (contents can't be checked)"),
     ("broken.gz", b"\x1f\x8b\x09\x00" + bytes(12), "gzip stream that can't be opened (contents can't be checked)"),
     # broken.gz names compression method 9, which isn't deflate; deep.bin is a DDS under four gzip layers
