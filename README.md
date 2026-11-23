@@ -103,6 +103,7 @@ The control-flow CPU translator supports [source-built string memory transfers](
 | D3D12 and ray tracing | Compare the CPU reference, custom BVH shader and DXR on another adapter. Record the driver and native wave width. | `ctest --preset dev -R '^bvh_(differential\|wave64)_hardware$' -V` |
 | Upscaler memory accounting | Compare [post-query counter writes](docs/experiments.md#upscaler-working-set-counter-updates) on success and failure. | `ctest --preset dev --no-tests=error -R 'working_set_delta$'` |
 | Windows runtime | Add a source-built allocation case with a measurable Windows result. | `ctest --preset dev -R 'era_heap\|desktop_memory_query'` |
+| XMem tools memory | Run a source-built caller against TRUE and FALSE recording providers, and compare the recorded outcome and next path natively and under `pe_map`. | `ctest --preset dev --no-tests=error -R '^cpu_native_xmem_tools$' -V` |
 | PE tooling | Reproduce an import-resolution edge case with a DLL or EXE built from source. | `ctest --preset dev --no-tests=error -R 'static_exe_intake\|conditional_import_paths\|bundled_export_forwarders'` |
 | Build and documentation | Try the first build from a clean clone. Identify the first missing prerequisite or unclear instruction. | Use the three-test command above. |
 
