@@ -7,7 +7,7 @@ through the translator and compares the four child words. The rule they follow i
 tracing row: near/far planes picked by the sign of the inverse direction, NaN skipped in the max/min of the
 three, all-NaN a miss, sort key max(tnear, 0) through the network (0,2) (1,3) (0,1) (2,3) (1,2).
 
-241 of the 338 measured cases, plus 50 rounding cases (below): the empty-box set (BOX32 and BOX16), the NaN set, the multi-NaN and
+241 of the 338 measured cases, plus 50 rounding cases and 21 subnormal cases (below): the empty-box set (BOX32 and BOX16), the NaN set, the multi-NaN and
 other-bound rows of the NaN grid on four rays, every measured tie order, planes on the origin, and the
 cs_bvh scene root. No game data.
 
@@ -910,6 +910,54 @@ ROUNDING = [
     ('random 39', (-0.8545389771461487, 0.20930621027946472, -67108864.0), (5.0, 3.0, 1.2999999523162842), (0.20000000298023224, 0.3333333432674408, 0.7692307829856873), 206488832.0,
      (-258111040.0, -154866624.0, 3.0), (774333056.0, 464599840.0, -1.0), False),
 ]
+
+# (label, origin, direction, inverse direction, extent, min, max, words) measured on the RX 6900 XT; the other
+# three children are the far boxes. Subnormal box bounds, origins, inverse directions and slab results all act as
+# zero on the hardware.
+SUBNORMAL = [
+    ('product underflows to zero on the far plane', (0.0, -1.0, 0.0), (1.0, 1.0, 1.0), (1.1757814768776277e-38, 1.0, 1.0), 1e+30,
+     (-1e+30, 0.0, -1e+30), (1.1757813367477812e-38, 1e+30, 1e+30), [MISS, MISS, MISS, MISS]),
+    ('control: far plane exactly 0', (0.0, -1.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, 0.0, -1e+30), (0.0, 1e+30, 1e+30), [0x50, 0x48, 0x58, MISS]),
+    ('negative subnormal box bound 0x80000001', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1.401298464324817e-45, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('negative subnormal box bound 0x80000010', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-2.2420775429197073e-44, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('negative subnormal box bound 0x80400000', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-5.877471754111438e-39, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('negative subnormal box bound 0x807fffff', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1.1754942106924411e-38, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('control: box bound -FLT_MIN', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1.1754943508222875e-38, 1e+30, 1e+30), [0x50, 0x48, 0x58, MISS]),
+    ('negative subnormal product 0x9b400001 * 0x24400003', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (4.163337334961072e-17, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1.588186902319558e-22, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('negative subnormal product 0x9c000001 * 0x22ffffff', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (6.938893490316922e-18, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-4.235165241142481e-22, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('negative subnormal product 0x9a2aaaab * 0x25555557', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.850371928290091e-16, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-3.529304052074372e-23, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('negative subnormal product -FLT_MIN * 0.5', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (0.5, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1.1754943508222875e-38, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('control: far t -1e-30', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, -1e+30, -1e+30), (-1e-30, 1e+30, 1e+30), [0x50, 0x48, 0x58, MISS]),
+    ('negative subnormal inverse direction 0x80000005', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (-7.006492321624085e-45, 1.0, 1.0), 1e+30,
+     (-1.0, -1e+30, -1e+30), (1.0, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('subnormal box bound 0x00000001 minus origin 1', (1.0, 0.0, 0.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0), 1e+30,
+     (1.401298464324817e-45, 1.0, -1e+30), (1e+30, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('subnormal box bound 0x007fffff minus origin 1', (1.0, 0.0, 0.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0), 1e+30,
+     (1.1754942106924411e-38, 1.0, -1e+30), (1e+30, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('control: box bound 0 minus origin 1', (1.0, 0.0, 0.0), (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0), 1e+30,
+     (0.0, 1.0, -1e+30), (1e+30, 1e+30, 1e+30), [0x40, MISS, MISS, MISS]),
+    ('subnormal inverse direction 0x00000005', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (7.006492321624085e-45, 1.0, 1.0), 1e+30,
+     (-1e+30, 1e-15, -1e+30), (1.2676506002282294e+30, 1e+30, 1e+30), [MISS, MISS, MISS, MISS]),
+    ('subnormal inverse direction 0x00400000', (0.0, 0.0, 0.0), (1.0, 1.0, 1.0), (5.877471754111438e-39, 1.0, 1.0), 1e+30,
+     (-1e+30, 1e-15, -1e+30), (1.2676506002282294e+30, 1e+30, 1e+30), [MISS, MISS, MISS, MISS]),
+    ('subnormal origin 0x00000001', (1.401298464324817e-45, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, 2.0, -1e+30), (2.0, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('subnormal origin 0x007fffff', (1.1754942106924411e-38, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, 2.0, -1e+30), (2.0, 1e+30, 1e+30), [0x40, 0x48, 0x50, 0x58]),
+    ('control: origin FLT_MIN', (1.1754943508222875e-38, 0.0, 0.0), (1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 1e+30,
+     (-1e+30, 2.0, -1e+30), (2.0, 1e+30, 1e+30), [0x50, 0x48, 0x58, MISS]),
+]
 FAR = (5.0e9, 5.0e9, 5.0e9, 6.0e9, 6.0e9, 6.0e9)
 
 
@@ -930,6 +978,13 @@ class MeasuredRounding(unittest.TestCase):
                 mem = node("box32", [0x40, 0x48, 0x50, 0x58], [(*lo, *hi), FAR, FAR, FAR])
                 got = list(mrt0_words(rounding_shader(o, d, inv, ext), memory=mem))
                 self.assertEqual(got, [0x40 if hit else MISS, MISS, MISS, MISS])
+
+    def test_subnormals_flush_to_zero(self):
+        for label, o, d, inv, ext, lo, hi, words in SUBNORMAL:
+            with self.subTest(label):
+                mem = node("box32", [0x40, 0x48, 0x50, 0x58], [(*lo, *hi), FAR, FAR, FAR])
+                self.assertEqual(list(mrt0_words(rounding_shader(o, d, inv, ext), memory=mem)), words)
+
 
 if __name__ == "__main__":
     unittest.main()
