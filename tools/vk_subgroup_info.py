@@ -1,6 +1,7 @@
 """Ask the Vulkan driver whether this PC's GPU can run 64-wide compute and mesh subgroups.
 
     python -I tools/vk_subgroup_info.py          # prints one JSON line, exit 0 if a device answered, 1 if not
+    python -I tools/vk_subgroup_info.py --stage-caps  # includes the stage masks and workgroup limit
 
 make_game.py uses it to choose between native wave64 translation and --wave64-emulate. It talks to the system's
 Vulkan implementation through ctypes (standard library only), so it works before the runtime stage has built anything.
@@ -31,10 +32,21 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+barycentric_fallback is true for Intel's open-source Mesa driver (ANV). SHADER-925 found that Mesa ANV 26.2.5
+advertises fragmentShaderBarycentric but returns a zero BaryCoordKHR.i for translated pixel shaders on Intel Arc B580;
+the pass-through geometry-shader fallback is correct there. The builder therefore selects --bary-fallback for ANV
+until the driver issue is fixed. It is also true for gfx90c iGPUs (Renoir, Lucienne, Cezanne, Barcelo; GCN 5) under
+AMD's proprietary Windows driver: #5933 found that driver 31.0.21921.13001 on a Vega 8 (PCI 1002:15E7) advertises
+fragmentShaderBarycentric but returns a wrong third BaryCoordKHR component (about 0.99 where a small value is
+expected) in ps_bary, ps_persp_bary and ps_ij_computed, while the fallback passes and RADV on RDNA 3.5 passes natively.
+The check keys on the PCI device ID and the driver ID, not on the driver version, so a fixed driver would still take
+the fallback (correct, one geometry-shader stage slower); LEONIDA_BARY_FALLBACK=0 turns it off.
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
 """
+import argparse
 import ctypes
 import json
 import os
@@ -53,6 +65,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
 VK_DRIVER_ID_MOLTENVK = 14
+VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
 # Navi 10, Navi 14, and Navi 12 PCI IDs from Linux amdgpu's chipset table.
@@ -63,6 +76,10 @@ RDNA1_DEVICE_IDS = (0x7310, 0x7312, 0x7318, 0x7319, 0x731A, 0x731B, 0x731E, 0x73
 # crash reports from 0x13C0, 0x164E, 0x73BF (RX 6800) and 0x73DF (RX 6700).
 RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x1435, 0x1435), (0x1681, 0x1681),
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
+# gfx90c (GCN 5) iGPUs: the CHIP_RENOIR entries of Linux amdgpu's chipset table (amdgpu_drv.c), i.e. Renoir, Lucienne,
+# Cezanne and Barcelo. #5933's wrong BaryCoordKHR was measured on 0x15E7 (Vega 8 of a Ryzen 7 5825U). Other GCN 5
+# parts (Raven/Picasso gfx902, Vega 10/12/20 cards) are a different GPU and are not tested, so they are not listed.
+GFX90C_DEVICE_IDS = (0x15E7, 0x1636, 0x1638, 0x164C)
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
@@ -160,6 +177,20 @@ def rdna2_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
             and any(lo <= device_id <= hi for lo, hi in RDNA2_DEVICE_IDS))
 
 
+def gfx90c_amd_windows(vendor_id: int, device_id: int, driver_id: int) -> bool:
+    """A gfx90c (GCN 5) iGPU under AMD's proprietary (Windows) driver, whose native BaryCoordKHR is wrong (#5933)."""
+    return (vendor_id == AMD_VENDOR_ID and driver_id == VK_DRIVER_ID_AMD_PROPRIETARY
+            and device_id in GFX90C_DEVICE_IDS)
+
+
+def barycentric_fallback(vendor_id: int, device_id: int, driver_id: int) -> bool:
+    """Drivers that expose native barycentrics but return wrong BaryCoordKHR values for translated pixel shaders:
+    Mesa ANV (BaryCoordKHR.i zero on Intel Arc, SHADER-925) and AMD's Windows driver on gfx90c (wrong third
+    component, #5933)."""
+    return (driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+            or gfx90c_amd_windows(vendor_id, device_id, driver_id))
+
+
 def physical_devices(vk, instance):
     # The list can grow between the count and fetch. Recount, with a bound for a changing driver.
     for _ in range(3):
@@ -204,7 +235,7 @@ def device_rank(device_type: int, vendor_id: int) -> int:
     return (0 if vendor_id == MICROSOFT_VENDOR_ID else 10) + type_rank
 
 
-def query() -> dict:
+def query(*, stage_caps=False) -> dict:
     """The answer for the device the runtime would pick; raises RuntimeError with the reason when there is none."""
     if sys.maxsize <= 2**32:
         # the struct sizes below are the 64-bit ones, and 32-bit Windows Vulkan is stdcall, not CDLL's cdecl
@@ -286,7 +317,8 @@ def query() -> dict:
                 chosen_rank = rank
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
-                          sg.requiredSubgroupSizeStages, bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
+                          sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
+                          bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
@@ -298,8 +330,8 @@ def query() -> dict:
                     "the runtime needs matches"
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        (name, subgroup_size, supported_stages, lo, hi, required_stages, sgc, per_vertex,
-         max_push_constants_size, vendor, device, driver) = chosen
+        (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -308,7 +340,7 @@ def query() -> dict:
         default_64 = subgroup_size == 64
         compute64 = compute_supported and (default_64 or (can_require_64 and compute_required))
         mesh64 = mesh_supported and (default_64 or (can_require_64 and mesh_required))
-        return {
+        result = {
             "device": name,
             "subgroup_size": subgroup_size,
             "min_subgroup_size": lo,
@@ -321,6 +353,7 @@ def query() -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "barycentric_fallback": barycentric_fallback(vendor, device, driver),
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,
@@ -329,13 +362,18 @@ def query() -> dict:
                                   and device in RDNA1_DEVICE_IDS),
             "rdna2_amd_windows": rdna2_amd_windows(vendor, device, driver),
         }
+        if stage_caps:
+            result.update(supported_subgroup_stages=supported_stages,
+                          required_subgroup_size_stages=required_stages,
+                          max_compute_workgroup_subgroups=max_workgroup_subgroups)
+        return result
     finally:
         vk.vkDestroyInstance(inst, None)
 
 
-def main() -> int:
+def main(*, stage_caps=False) -> int:
     try:
-        print(json.dumps(query()))
+        print(json.dumps(query(stage_caps=stage_caps)))
         return 0
     except Exception as e:      # any failure means "unknown": the caller falls back to emulation
         print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
@@ -347,4 +385,6 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--stage-caps", action="store_true", help="include raw subgroup stage masks and limits")
+    sys.exit(main(stage_caps=parser.parse_args().stage_caps))

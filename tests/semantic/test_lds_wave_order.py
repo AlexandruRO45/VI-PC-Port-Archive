@@ -63,7 +63,7 @@ def lds_events(spv):
             events.append("wg")
         elif (m := re.match(r"OpStore (%\w+) ", s)) and m.group(1) in ptrs:
             events.append("w")
-        elif (m := re.match(r"%\w+ = OpLoad %uint (%\w+)$", s)) and m.group(1) in ptrs:
+        elif (m := re.match(r"%\w+ = OpLoad %uint (%\w+)(?: Volatile)?$", s)) and m.group(1) in ptrs:
             events.append("r")
         elif (m := re.match(r"%\w+ = OpAtomic\w+ %uint (%\w+) ", s)) and m.group(1) in ptrs:
             events.append("a")
