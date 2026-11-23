@@ -474,5 +474,57 @@ class TestSNorB64Aliasing(unittest.TestCase):
         self.assertEqual(state.get_sgpr_pair(2), (~val) & MASK64)
         self.assertEqual(state.scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+
+class TestSNorB64ConditionCodes(unittest.TestCase):
+    """Unit tests for SCC flag generation under s_nor_b64."""
+
+    def test_scc_cleared_strictly_when_zero(self):
+        # Must be exactly 0 (S0 | S1 == ALL64)
+        d, scc = s_nor_b64_oracle(ALL64, 0)
+        self.assertEqual(d, 0)
+        self.assertEqual(scc, 0)
+
+    def test_scc_set_for_any_single_bit(self):
+        for bit in (0, 1, 15, 16, 31, 32, 47, 48, 63):
+            with self.subTest(bit=bit):
+                # An input mask that has 1s everywhere EXCEPT `bit` will leave `bit` as 1 after NOR(mask, 0)
+                mask = ALL64 & ~(1 << bit)
+                d, scc = s_nor_b64_oracle(mask, 0)
+                self.assertEqual(d, 1 << bit)
+                self.assertEqual(scc, 1)
+
+    def test_scc_transitions_state_machine(self):
+        state = ScalarHardwareState()
+        instr = SNorB64Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=6, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=2, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=4, size_bits=64)
+        )
+
+        # 1. 0 -> 0 transition (NOR(ALL64, 0) = 0)
+        state.scc = 0
+        state.set_sgpr_pair(2, ALL64)
+        state.set_sgpr_pair(4, 0)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+        # 2. 0 -> 1 transition (NOR(0, 0) = ALL64)
+        state.set_sgpr_pair(2, 0)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 3. 1 -> 1 transition (NOR(1, 0) = ALL64 - 1)
+        state.set_sgpr_pair(2, 1)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+        # 4. 1 -> 0 transition
+        state.set_sgpr_pair(2, ALL64)
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
