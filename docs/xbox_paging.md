@@ -75,4 +75,5 @@ it.
 - Wiring into `d3d12_xs_device` once the slots are measured from a real run.
 - Wiring `xbox_physical.h` to `XMemAllocatePhysicalPages` and `XMemMapPhysicalPages[Scatter]` once a call site shows
   their arguments.
+- Freeing physical pages: `PhysicalPageStore` commits pages but has no free yet, so its capacity only fills.
 - The `XALLOC_ATTRIBUTES` layout that tells `XMemAlloc` to hand out physical pages is not public.

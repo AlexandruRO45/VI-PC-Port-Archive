@@ -5,7 +5,8 @@
 // dirty, and taking the dirty list write-protects it again; CPU writes reach the GPU after an upload, read through
 // the arena; a GPU write reaches the CPU half after a readback; no validation errors (LEONIDA_VK_VALIDATION=1).
 // Measurements (INFO): cost of a first write to a clean page (the fault); upload cost per page.
-// No device or no sparse residency for buffers: SKIP, exit 77. Windows only.
+// No device, no sparse residency for buffers, or less than 64 GiB of sparse address space: SKIP, exit 77. Windows
+// only.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
 #include "../src/xbox_paging.h"
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 using namespace leonida;
@@ -131,6 +133,14 @@ int main() {
         std::printf("SKIP: no sparse residency for buffers on the graphics queue\n");
         return 77;
     }
+    VkPhysicalDeviceProperties dev_props{};
+    d.instance_fn<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(d.physical, &dev_props);
+    constexpr VkDeviceSize kArena = 64ull << 30;
+    if (dev_props.limits.sparseAddressSpaceSize < kArena) {
+        std::printf("SKIP: %llu bytes of sparse address space, the test needs 64 GiB\n",
+                    static_cast<unsigned long long>(dev_props.limits.sparseAddressSpaceSize));
+        return 77;
+    }
     VkPhysicalDeviceMemoryProperties mem_props{};
     d.instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(d.physical,
                                                                                                   &mem_props);
@@ -138,9 +148,12 @@ int main() {
     VulkanQueue queue(context, d.queue, d.family);
     EXPECT(context.loaded() && queue.ok());
 
+    // The pool is made after the arena (it needs the arena's memory types) but must outlive it.
+    std::optional<PagePool> pool_storage;
     PagedRegion region;
-    EXPECT(region.create(d.device, d.device_proc, 64ull << 30));
-    PagePool pool(d.device, d.device_proc, pick_page_memory_type(mem_props, region.memory_type_bits()));
+    EXPECT(region.create(d.device, d.device_proc, kArena));
+    PagePool& pool =
+        pool_storage.emplace(d.device, d.device_proc, pick_page_memory_type(mem_props, region.memory_type_bits()));
     PageMapper mapper(region, pool);
     const SubmitBinds submit = [&](VkBuffer buffer, std::span<const VkSparseMemoryBind> binds) {
         return queue.bind_sparse_ordered(buffer, binds);
