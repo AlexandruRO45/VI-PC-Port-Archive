@@ -532,6 +532,20 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(animation["samplers"][0]["interpolation"], "LINEAR")
             self.assertEqual(animation["issues"], [])
 
+    def test_animation_target_node_is_optional_but_must_be_an_index_when_present(self):
+        gltf = animated_gltf()
+        target = gltf["animations"][0]["channels"][0]["target"]
+        del target["node"]
+        result = self.run_bytes(glb(gltf))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("targets=0", result.stdout)
+        self.assertNotIn("issue:", result.stdout)
+
+        target["node"] = None
+        result = self.run_bytes(glb(gltf))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("issue: channel[0] has no valid target node", result.stdout)
+
     def test_animation_reference_issues_are_reported(self):
         gltf = animated_gltf()
         gltf["animations"][0]["channels"] = [

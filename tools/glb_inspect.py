@@ -310,12 +310,12 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
         node = _entry(gltf, "nodes", node_index)
         if sampler_index is None or sampler_index >= len(raw_samplers):
             issues.append(f"channel[{channel_index}] has no valid sampler")
-        if node_index is None:
-            issues.append(f"channel[{channel_index}] has no target node")
-        elif node is None:
-            issues.append(f"channel[{channel_index}] targets missing node {node_index}")
-        else:
+        if node is not None:
             target_nodes.add(node_index)
+        elif node_index is not None:
+            issues.append(f"channel[{channel_index}] targets missing node {node_index}")
+        elif "node" in target:
+            issues.append(f"channel[{channel_index}] has no valid target node")
         if path is None:
             issues.append(f"channel[{channel_index}] has no target path")
         elif path not in ("translation", "rotation", "scale", "weights"):
