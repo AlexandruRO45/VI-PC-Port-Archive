@@ -254,6 +254,47 @@ class RadvOracleWithoutGpu(unittest.TestCase):
         with self.assertRaisesRegex(P.Unavailable, "unsupported architecture.*GFX1201"):
             self._oracle("AMD Radeon RX 9070 XT (RADV GFX1201) (subgroup 32..64)")
 
+    def test_json_output_ends_with_trailing_newline(self):
+        """The --json output must end with \\n so tools like jq see a terminated line."""
+        import json
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        for name in ("vk_harness", "vs.spv", "ps.spv"):
+            open(os.path.join(d.name, name), "wb").close()
+        asm_path = os.path.join(d.name, "ps.s")
+        with open(asm_path, "w") as f:
+            f.write("s_endpgm\n")
+        bins = [(32, b"k" * 32, _radv(RadvBinary.CODE, stage=0, next_stage=4)), (32, b"q" * 32, _radv(RadvBinary.CODE))]
+
+        def fake(exe, vs, ps, out_raw, size, env):
+            out_bin = env.get("VKH_BINARY_OUT")
+            if out_bin is not None:
+                P.write_binaries(out_bin, bins)
+            with open(out_raw, "wb") as f:
+                f.write(bytes(16 * size[0] * size[1]))
+            return type("R", (), {"returncode": 0, "stderr": "device: AMD Radeon Graphics (RADV RAPHAEL_MENDOCINO) (subgroup 32..64)\n"})()
+
+        old_harness, P.run_harness = P.run_harness, fake
+        self.addCleanup(setattr, P, "run_harness", old_harness)
+
+        # assemble() needs AMD clang; return the raw bytes directly to bypass it
+        old_assemble, P.assemble = P.assemble, lambda lines, mcpu, wave64, work: b"s_endpgm"
+        self.addCleanup(setattr, P, "assemble", old_assemble)
+
+        json_path = os.path.join(d.name, "out.json")
+        exit_code = P.main(["--build", d.name, "--asm", asm_path, "--vs",
+                            os.path.join(d.name, "vs.spv"), "--ps",
+                            os.path.join(d.name, "ps.spv"),
+                            "--size", "2", "1", "--json", json_path])
+        self.assertEqual(exit_code, 0)
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = f.read()
+        self.assertTrue(data.endswith("\n"), "JSON output must end with a trailing newline")
+        parsed = json.loads(data)
+        self.assertIn("device", parsed)
+        self.assertIn("pixels", parsed)
+
 
 class Cli(unittest.TestCase):
     def test_nothing_to_do_is_a_usage_error(self):
