@@ -143,7 +143,7 @@ td .minibar { width: 64px; margin-right: 8px; }
   <div class="card"><table id="metrics"><thead><tr><th>Metric</th><th>Value</th><th>Numerator / denominator</th><th>Formula</th></tr></thead><tbody></tbody></table></div>
   <h3 id="trendH">Trend <small>one point per snapshot</small></h3>
   <div class="card"><svg id="trend" width="100%" height="236" role="img" aria-label="Metrics per snapshot"></svg>
-    <div class="note">A hollow point means the metric's formula changed there; the line breaks because the values on either side are not comparable.</div></div>
+    <div class="note">Missing values leave gaps. A hollow point marks a formula change and starts a new line segment.</div></div>
   <h3 id="mergedH" hidden>Latest merges into main <small id="mergedSub"></small></h3>
   <div class="card" id="merged" hidden></div>
   <h3 id="mineH" hidden>Your claims and pull requests <small id="mineSub"></small></h3>
@@ -417,9 +417,24 @@ function trend() {
   const xs = (i) => (HIST.length < 2 ? (L + W - R) / 2 : L + (i * (W - L - R)) / (HIST.length - 1)), ys = (v) => T + (1 - v) * (H - T - B);
   for (const v of [0, 0.5, 1]) { svg.append(mk("line", { x1: L, x2: W - R, y1: ys(v), y2: ys(v), stroke: css("line") })); const t = mk("text", { x: L - 6, y: ys(v) + 4, "text-anchor": "end", fill: css("ink3"), "font-size": 10 }); t.textContent = v * 100 + "%"; svg.append(t); }
   ids.forEach((id, k) => {
-    let d = "", prevF = null;
-    HIST.forEach((h, i) => { const m = h.metrics[id]; if (!m || m.v === null) { prevF = null; return; } const brk = prevF !== null && m.f !== prevF; d += `${d && !brk ? "L" : "M"}${xs(i)},${ys(m.v)}`; prevF = m.f;
-      const c = mk("circle", { cx: xs(i), cy: ys(m.v), r: 3.5, fill: brk ? css("panel") : colors[k], stroke: colors[k], "stroke-width": 2 }); const tt = mk("title", {}); tt.textContent = `${id}: ${pct(m.v)} (${m.n}/${m.d})${brk ? "; formula changed here" : ""}`; c.append(tt); svg.append(c); });
+    let d = "", lastFormula = null, previousSnapshotHasValue = false;
+    HIST.forEach((h, i) => {
+      const m = h.metrics[id];
+      if (!m || m.v === null) {
+        previousSnapshotHasValue = false;
+        return;
+      }
+      const formulaChanged = lastFormula !== null && m.f !== lastFormula;
+      d += `${previousSnapshotHasValue && !formulaChanged ? "L" : "M"}${xs(i)},${ys(m.v)}`;
+      lastFormula = m.f;
+      previousSnapshotHasValue = true;
+      const c = mk("circle", { cx: xs(i), cy: ys(m.v), r: 3.5,
+        fill: formulaChanged ? css("panel") : colors[k], stroke: colors[k], "stroke-width": 2 });
+      const tt = mk("title", {});
+      tt.textContent = `${id}: ${pct(m.v)} (${m.n}/${m.d})${formulaChanged ? "; formula changed here" : ""}`;
+      c.append(tt);
+      svg.append(c);
+    });
     svg.prepend(mk("path", { d, fill: "none", stroke: colors[k], "stroke-width": 2 }));
     const lab = mk("text", { x: L + 4 + (k % 4) * ((W - L) / 4), y: H - 20 + Math.floor(k / 4) * 14, fill: colors[k], "font-size": 10.5 }); lab.textContent = id; svg.append(lab);
   });
