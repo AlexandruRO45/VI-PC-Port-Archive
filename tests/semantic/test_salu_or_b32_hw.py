@@ -483,5 +483,60 @@ class SaluOrB32InterpreterTests(unittest.TestCase):
                 self.assertEqual(out[0], sim.read_reg("s2"))
                 self.assertEqual(out[1], sim.scc)
 
+
+class SaluOrB32SimdDivergenceTests(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking for s_or_b32."""
+
+    def test_wave32_divergence_reconvergence(self):
+        """Simulate divergent branch merging in Wave32 using s_or_b32 on exec_lo."""
+        even_lanes = 0x55555555  # lanes 0, 2, 4, ... 30
+        odd_lanes = 0xAAAAAAAA   # lanes 1, 3, 5, ... 31
+
+        state = ScalarRegisterState()
+        state.write_reg("s0", even_lanes)
+        state.write_reg("s1", odd_lanes)
+        state.execute_s_or_b32("exec_lo", "s0", "s1")
+        self.assertEqual(state.read_reg("exec_lo"), MASK32)
+        self.assertEqual(state.scc, 1)
+
+    def test_wave64_dual_half_masks(self):
+        """Manage 64-bit wavefront execution masks across exec_lo and exec_hi."""
+        state = ScalarRegisterState()
+        state.write_reg("s0", 0x0000FFFF)
+        state.write_reg("s1", 0xFFFF0000)
+        state.write_reg("s2", 0x000000FF)
+        state.write_reg("s3", 0xFFFFFF00)
+
+        state.execute_s_or_b32("exec_lo", "s0", "s1")
+        state.execute_s_or_b32("exec_hi", "s2", "s3")
+
+        self.assertEqual(state.read_reg("exec_lo"), MASK32)
+        self.assertEqual(state.read_reg("exec_hi"), MASK32)
+
+    def test_vcc_condition_accumulation(self):
+        """Accumulate vector condition outcomes into vcc_lo via s_or_b32."""
+        state = ScalarRegisterState()
+        state.write_reg("vcc_lo", 0x00000000)
+        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x0000000F)
+        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x000000F0)
+        state.execute_s_or_b32("vcc_lo", "vcc_lo", 0x00000F00)
+        self.assertEqual(state.read_reg("vcc_lo"), 0x00000FFF)
+
+    def test_translated_exec_mask_manipulation(self):
+        """Translate shader performing s_or_b32 on exec_lo and verify SPIR-V output."""
+        lines = [
+            "s_mov_b32 s0, 0x0000FFFF",
+            "s_mov_b32 s1, 0xFFFF0000",
+            "s_or_b32 exec_lo, s0, s1",
+            "v_mov_b32 v0, exec_lo",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_exec_or_mask", lines)
+        self.assertIn("OpBitwiseOr", spv)
+
 if __name__ == "__main__":
     unittest.main()
