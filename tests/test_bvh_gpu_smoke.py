@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -200,6 +201,16 @@ class Cli(unittest.TestCase):
             with self.assertRaises(SystemExit) as e:
                 smoke.translate(d, d, 32768)
             self.assertIn("XboxBvhBuilder.dll", str(e.exception))
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            previous = '{"previous": true}'
+            path = str(Path(d) / "report.json")
+            Path(path).write_text(previous, encoding="utf-8", newline="\n")
+            with mock.patch.object(smoke, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    smoke.write_json_report(path, {"results": []})
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), previous)
 
 
 if __name__ == "__main__":

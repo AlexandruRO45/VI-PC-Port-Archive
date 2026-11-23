@@ -32,11 +32,16 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REHYDRATION = ("Box16Rehydration", "Box32Rehydration", "LeafRehydration")
@@ -252,6 +257,40 @@ def find_vk_compute_test(build):
     raise SystemExit(f"error: {exe} not found in {build} (build the runtime first)")
 
 
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    text = json.dumps(report, indent=1)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".bvh_gpu_smoke-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run XboxBvhBuilder.dll's translated programs on the GPU (TEST-594).")
     src = ap.add_mutually_exclusive_group(required=True)
@@ -305,9 +344,10 @@ def main(argv=None):
             print(f"checked {r['name']:20} {r['status']:10} {r['detail']}")
         print(f"checked: {sum(r['status'] == 'pass' for r in checked)} of {len(checked)} write exactly what they should")
     if a.json:
-        Path(a.json).write_text(json.dumps({"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
-                                            "heap_bytes": a.heap_bytes, "results": results, "checked": checked},
-                                           indent=1), encoding="utf-8", newline="\n")
+        write_json_report(a.json, {
+            "max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
+            "heap_bytes": a.heap_bytes, "results": results, "checked": checked,
+        })
     ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
     return 0 if ok else 1
 
