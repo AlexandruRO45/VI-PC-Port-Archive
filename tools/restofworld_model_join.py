@@ -84,22 +84,36 @@ class JoinError(ValueError):
     """Raised when a candidate resource fails a structural or cross-page check."""
 
 
+_U16 = struct.Struct("<H").unpack_from
+_U32 = struct.Struct("<I").unpack_from
+_U64 = struct.Struct("<Q").unpack_from
+
+
 def _u16(data, at):
-    if at < 0 or at + 2 > len(data):
-        raise JoinError(f"truncated u16 at +0x{at:x}")
-    return struct.unpack_from("<H", data, at)[0]
+    if at >= 0:
+        try:
+            return _U16(data, at)[0]
+        except struct.error:
+            pass
+    raise JoinError(f"truncated u16 at +0x{at:x}")
 
 
 def _u32(data, at):
-    if at < 0 or at + 4 > len(data):
-        raise JoinError(f"truncated u32 at +0x{at:x}")
-    return struct.unpack_from("<I", data, at)[0]
+    if at >= 0:
+        try:
+            return _U32(data, at)[0]
+        except struct.error:
+            pass
+    raise JoinError(f"truncated u32 at +0x{at:x}")
 
 
 def _u64(data, at):
-    if at < 0 or at + 8 > len(data):
-        raise JoinError(f"truncated u64 at +0x{at:x}")
-    return struct.unpack_from("<Q", data, at)[0]
+    if at >= 0:
+        try:
+            return _U64(data, at)[0]
+        except struct.error:
+            pass
+    raise JoinError(f"truncated u64 at +0x{at:x}")
 
 
 def is_sys_ptr(value):
@@ -293,6 +307,48 @@ def _check_cstring(sys_bytes, ptr_at, skip=0):
     return start + nul + 1
 
 
+_LANE_MASKS = {}
+
+
+def _lane_masks(count):
+    """Per-lane constants for `count` packed 32-bit triangle words held in one integer."""
+    masks = _LANE_MASKS.get(count)
+    if masks is None:
+        if len(_LANE_MASKS) >= 512:
+            _LANE_MASKS.clear()
+        ones = int.from_bytes((1).to_bytes(4, "little") * count, "little")
+        masks = _LANE_MASKS[count] = (ones, ones * 0x7F, ones * 0x80, ones * 0x7FF)
+    return masks
+
+
+def _triangles_in_range(gfx_bytes, at, c_tris, c_idx, c_verts):
+    """True when every packed triangle word of one cluster names that cluster and in-range vertices.
+
+    One integer holds all `c_tris` words as 32-bit lanes. A lane's three 7-bit indices are below `c_verts`
+    exactly when adding `128 - c_verts` to each leaves bit 7 clear; the sum stays below 256 so no carry
+    crosses lanes. A False answer only sends the cluster to `_check_triangles_slow`, which names the error.
+    """
+    ones, m7, m80, m11 = _lane_masks(c_tris)
+    word = int.from_bytes(gfx_bytes[at:at + c_tris * 4], "little")
+    if ((word >> 21) & m11) != c_idx * ones:
+        return False
+    k = (128 - c_verts) * ones
+    bad = ((word & m7) + k) | (((word >> 7) & m7) + k) | (((word >> 14) & m7) + k)
+    return not bad & m80
+
+
+def _check_triangles_slow(gfx_bytes, at, c_tris, c_idx, c_verts):
+    for t_word in struct.unpack_from(f"<{c_tris}I", gfx_bytes, at):
+        if (t_word >> 21) != c_idx:
+            raise JoinError("packed triangle cluster id mismatch")
+        if (
+            (t_word & 0x7F) >= c_verts
+            or ((t_word >> 7) & 0x7F) >= c_verts
+            or ((t_word >> 14) & 0x7F) >= c_verts
+        ):
+            raise JoinError("packed triangle local index out of range")
+
+
 def _validate_meshlet_buffer(gfx_bytes, ib_off, ib_bytes, desc_clusters, desc_tris, desc_refs, desc_binding):
     """Validate a pointed-to meshlet group inside the joined graphics segment."""
     if ib_off < 0 or ib_off + ib_bytes > len(gfx_bytes) or ib_bytes < 32:
@@ -325,10 +381,10 @@ def _validate_meshlet_buffer(gfx_bytes, ib_off, ib_bytes, desc_clusters, desc_tr
 
     acc_refs = 0
     acc_tris = 0
+    records = struct.unpack_from(f"<{clusters * 4}I", gfx_bytes, ib_off + 12)
     for c_idx in range(clusters):
-        rec_at = ib_off + 12 + c_idx * 16
-        packed = _u32(gfx_bytes, rec_at)
-        offsets = _u32(gfx_bytes, rec_at + 4)
+        packed = records[c_idx * 4]
+        offsets = records[c_idx * 4 + 1]
         c_verts = (packed & 0x7F) + 1
         c_tris = ((packed >> 7) & 0xFF) + 1
         v_start = offsets & 0xFFFF
@@ -337,15 +393,9 @@ def _validate_meshlet_buffer(gfx_bytes, ib_off, ib_bytes, desc_clusters, desc_tr
             raise JoinError("meshlet running offsets do not match accumulated counts")
         if c_verts > refs - v_start or c_tris > tris - t_start:
             raise JoinError("meshlet counts exceed group totals")
-        for t_word in struct.unpack_from(f"<{c_tris}I", gfx_bytes, tri_at + t_start * 4):
-            if (t_word >> 21) != c_idx:
-                raise JoinError("packed triangle cluster id mismatch")
-            if (
-                (t_word & 0x7F) >= c_verts
-                or ((t_word >> 7) & 0x7F) >= c_verts
-                or ((t_word >> 14) & 0x7F) >= c_verts
-            ):
-                raise JoinError("packed triangle local index out of range")
+        at = tri_at + t_start * 4
+        if not _triangles_in_range(gfx_bytes, at, c_tris, c_idx, c_verts):
+            _check_triangles_slow(gfx_bytes, at, c_tris, c_idx, c_verts)
         acc_refs += c_verts
         acc_tris += c_tris
 
