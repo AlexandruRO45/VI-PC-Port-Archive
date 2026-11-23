@@ -74,7 +74,12 @@ The tables carry no language field. Each table's language is guessed from the fi
    - A table without a marker keeps the plain `es` or `zh` code.
 
 The table below counts these per-table guesses. Since the nested-archive rule (next section), they are the `guess`
-column of `--tables`.
+column of `--tables`. It comes from the first run in #1485, over 30,349 tables: 14,440 in `data.rpf`, 15,831 in
+`story000.rpf` and 78 in `shared_minigame000.rpf`. Its plain `es`, `zh` and `xx` rows are the sums of the "before"
+counts in the nested-archive table (659 + 553 + 2 = 1,214 plain `es`, and so on). The later reader changes listed
+there (#2129, #2193, #2210 and #3575) bring the count to 30,511. The 162 tables added since (42 in `data.rpf`, 120 in
+`story000.rpf`) are not in this table, and the 23 `data.rpf` tables that #3575 reads differently are counted with
+their old text.
 
 | Language | Tables | Distinct label hashes | Hashes with a second, different text |
 |---|---:|---:|---:|
