@@ -7,6 +7,7 @@
 #include <fnmatch.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <malloc/malloc.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -44,8 +45,13 @@ uint32_t attributes(const struct stat& st) {
 }
 template <typename T> void put(uint8_t* p, size_t off, T v) { std::memcpy(p + off, &v, sizeof v); }
 
-int GetHandleInformation(HANDLE, uint32_t* flags) {  // no handle is inheritable or protected here
-    if (flags) *flags = 0;
+// No handle is inheritable or protected here. Every handle the host hands out is a heap Object or one of
+// GetStdHandle's three, so any other value (d3d12_existing_heap passes 0x1234) is ERROR_INVALID_HANDLE, as on Windows.
+// ponytail: a closed Object whose memory was reused reads as valid again; tells made-up values from real handles only.
+int GetHandleInformation(HANDLE h, uint32_t* flags) {
+    const bool heap_object = h && h != reinterpret_cast<HANDLE>(-1) && malloc_zone_from_ptr(h) && malloc_size(h) >= sizeof(Object);
+    if (!flags || !(heap_object || is_std_handle(h))) return set_last_error(6 /* ERROR_INVALID_HANDLE */), 0;
+    *flags = 0;
     return 1;
 }
 // <path>\<3 prefix chars><hex>.TMP; with unique == 0 a free name is picked and the file created, as on Windows.

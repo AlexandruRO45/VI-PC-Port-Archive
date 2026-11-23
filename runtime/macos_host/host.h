@@ -101,6 +101,7 @@ using ThreadProc = uint32_t(MSABI*)(void*);
 Object* spawn_thread(ThreadProc proc, void* arg);  // nullptr on failure
 uint32_t wait_thread(Object* o);                   // joins; returns the exit code
 void close_object(Object* o);
+bool is_std_handle(const void* h);  // GetStdHandle's three, which are static rather than heap Objects
 [[noreturn]] void exit_thread(uint32_t code);  // from inside a guest thread
 
 // The game image's .pdata unwinder (eh.cpp). Registers are Windows-numbered, gpr[0..15] then rip as gpr[16],

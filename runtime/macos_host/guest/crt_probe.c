@@ -42,7 +42,10 @@ int main(void) {
         return 11;
     LARGE_INTEGER size;
     if (!GetFileSizeEx(f, &size) || size.QuadPart != 7) return 12;
+    DWORD info = 1;
+    if (!GetHandleInformation(f, &info) || info) return 15;
     CloseHandle(f);
+    if (GetHandleInformation(f, &info) || GetLastError() != ERROR_INVALID_HANDLE) return 16;  // closed, as on Windows
     long a = 0;
     long long b = 0;
     double d = 0;
@@ -53,9 +56,8 @@ int main(void) {
         return 13;
     DeleteFileW(L"crt_probe.tmp");
     char tmp[MAX_PATH], name[MAX_PATH];
-    DWORD info = 1;
     if (CompareStringOrdinal(L"abc", -1, L"ABC", -1, TRUE) != CSTR_EQUAL ||
-        CompareStringOrdinal(L"abc", 3, L"abd", 3, FALSE) != CSTR_LESS_THAN || !GetHandleInformation(f, &info) || info ||
+        CompareStringOrdinal(L"abc", 3, L"abd", 3, FALSE) != CSTR_LESS_THAN ||
         !GetTempPathA(MAX_PATH, tmp) || !GetTempFileNameA(tmp, "crt", 0, name) ||
         GetFileAttributesA(name) == INVALID_FILE_ATTRIBUTES || !DeleteFileA(name))
         return 14;
