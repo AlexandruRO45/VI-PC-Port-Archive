@@ -382,6 +382,13 @@ class TestGalleryCommandLine(unittest.TestCase):
 class TestGalleryAssetDirectories(unittest.TestCase):
     """The gallery never writes asset folders into the checkout, and an explicit folder must exist."""
 
+    def _temp_checkout(self, tmp: str) -> str:
+        """A stand-in checkout, so a run cannot see or touch the real one's siblings."""
+        tools = os.path.join(tmp, "Leonida", "tools")
+        os.makedirs(tools)
+        open(os.path.join(tools, "gallery.py"), "w").close()
+        return os.path.join(tmp, "Leonida")
+
     def test_a_missing_explicit_directory_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = os.path.join(tmp, "no_such_assets")
@@ -399,22 +406,41 @@ class TestGalleryAssetDirectories(unittest.TestCase):
                     start_server.assert_not_called()
 
     def test_starting_without_asset_directories_creates_nothing_in_the_checkout(self) -> None:
-        checkout = os.path.dirname(os.path.dirname(os.path.abspath(gallery.__file__)))
-        folders = [os.path.join(checkout, name) for name in ("models", "textures")]
-        existing = [path for path in folders if os.path.exists(path)]
-        if existing:
-            self.skipTest(f"the checkout already has {existing}; nothing to prove here")
         with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(gallery, "__file__", os.path.join(tmp, "Leonida", "tools", "gallery.py")),
             mock.patch.object(gallery.http.server.HTTPServer, "__init__", return_value=None),
             mock.patch.object(gallery.http.server.HTTPServer, "serve_forever"),
             mock.patch.object(sys, "stdout", new_callable=io.StringIO),
         ):
+            checkout = self._temp_checkout(tmp)
+            folders = [os.path.join(checkout, name) for name in ("models", "textures")]
             gallery.start_server(models_dir=None, textures_dir=None, open_browser=False, retry_next_port=False)
 
-        self.assertEqual([path for path in folders if os.path.exists(path)], [],
-                         "starting the gallery created an asset folder inside the checkout")
-        self.assertEqual(gallery.StudioHandler.models_dir, "")
-        self.assertEqual(gallery.StudioHandler.textures_dir, "")
+            self.assertEqual([path for path in folders if os.path.exists(path)], [],
+                             "starting the gallery created an asset folder inside the checkout")
+            self.assertEqual(gallery.StudioHandler.models_dir, "")
+            self.assertEqual(gallery.StudioHandler.textures_dir, "")
+
+    def test_an_existing_checkout_folder_is_served_however_few_files_it_holds(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(gallery, "__file__", os.path.join(tmp, "Leonida", "tools", "gallery.py")),
+            mock.patch.object(gallery.http.server.HTTPServer, "__init__", return_value=None),
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever"),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+        ):
+            checkout = self._temp_checkout(tmp)
+            models = os.path.join(checkout, "models")
+            textures = os.path.join(checkout, "textures")
+            os.makedirs(models)
+            os.makedirs(os.path.join(textures, "sub"))
+            open(os.path.join(textures, "sub", "a.png"), "w").close()
+
+            gallery.start_server(models_dir=None, textures_dir=None, open_browser=False, retry_next_port=False)
+
+            self.assertEqual(gallery.StudioHandler.models_dir, os.path.abspath(models))
+            self.assertEqual(gallery.StudioHandler.textures_dir, os.path.abspath(textures))
 
 
 if __name__ == "__main__":
