@@ -1324,41 +1324,49 @@ def read_glb_summary(data: bytes) -> dict:
         # Extension chunks are ignored after checking their framing.
         offset = chunk_end
 
-    buf0_limit = bin_bytes
-    buffers = gltf.get("buffers")
-    if isinstance(buffers, list) and buffers:
-        buf0 = buffers[0]
-        if isinstance(buf0, dict):
-            embedded = "uri" not in buf0
-            declared = buf0.get("byteLength", 0 if embedded else None)
+    buffer_limits: list[int] = []
+    if "buffers" in gltf:
+        buffers = gltf["buffers"]
+        if not isinstance(buffers, list):
+            raise GlbError("buffers must be a JSON array")
+        for i, buf_entry in enumerate(buffers):
+            if not isinstance(buf_entry, dict):
+                raise GlbError(f"buffers[{i}] is not an object")
+            embedded = i == 0 and "uri" not in buf_entry
+            declared = buf_entry.get("byteLength", 0 if embedded else None)
             invalid_length = isinstance(declared, bool) or not isinstance(declared, int) or declared < 0
             if embedded and (invalid_length or declared > bin_bytes):
                 raise GlbError(f"buffers[0].byteLength ({declared}) exceeds BIN chunk ({bin_bytes})")
             if invalid_length:
-                raise GlbError("invalid buffers[0].byteLength")
-            buf0_limit = declared
+                raise GlbError(f"invalid buffers[{i}].byteLength")
+            buffer_limits.append(declared)
 
-    buffer_views = gltf.get("bufferViews")
-    if isinstance(buffer_views, list):
+    if "bufferViews" in gltf:
+        buffer_views = gltf["bufferViews"]
+        if not isinstance(buffer_views, list):
+            raise GlbError("bufferViews must be a JSON array")
         for i, bv in enumerate(buffer_views):
             if not isinstance(bv, dict):
                 raise GlbError(f"bufferViews[{i}] is not an object")
-            if bv.get("buffer", 0) == 0:
-                bv_off = bv.get("byteOffset", 0)
-                bv_len = bv.get("byteLength", -1)
-                if (
-                    isinstance(bv_off, bool)
-                    or isinstance(bv_len, bool)
-                    or not isinstance(bv_off, int)
-                    or not isinstance(bv_len, int)
-                    or bv_off < 0
-                    or bv_len < 0
-                ):
-                    raise GlbError(f"invalid byteOffset/byteLength in bufferViews[{i}]")
-                if bv_off + bv_len > buf0_limit:
-                    raise GlbError(
-                        f"bufferViews[{i}] exceeds buffer 0 ({bv_off}+{bv_len} > {buf0_limit})"
-                    )
+            buf_idx = bv.get("buffer")
+            if isinstance(buf_idx, bool) or not isinstance(buf_idx, int) or not (0 <= buf_idx < len(buffer_limits)):
+                raise GlbError(f"bufferViews[{i}] references invalid buffer {buf_idx!r}")
+            bv_off = bv.get("byteOffset", 0)
+            bv_len = bv.get("byteLength", -1)
+            if (
+                isinstance(bv_off, bool)
+                or isinstance(bv_len, bool)
+                or not isinstance(bv_off, int)
+                or not isinstance(bv_len, int)
+                or bv_off < 0
+                or bv_len < 0
+            ):
+                raise GlbError(f"invalid byteOffset/byteLength in bufferViews[{i}]")
+            buf_limit = buffer_limits[buf_idx]
+            if bv_off + bv_len > buf_limit:
+                raise GlbError(
+                    f"bufferViews[{i}] exceeds buffer {buf_idx} ({bv_off}+{bv_len} > {buf_limit})"
+                )
 
     return {
         "version": version,
