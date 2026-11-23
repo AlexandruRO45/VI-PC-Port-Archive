@@ -7,14 +7,24 @@
 
 #include "host.h"
 
+#include <unistd.h>
+
+#include <algorithm>
+#include <mutex>
+#include <vector>
+
 namespace host {
 namespace {
 
 struct Window {
     NSWindow* window;
     CAMetalLayer* layer;
+    uint32_t thread;       // the guest thread that created it
+    bool visible = false;  // shown by ShowWindow or SetWindowPos, as Win32 counts it
 };
 bool g_quit = false;
+std::mutex g_windows_lock;
+std::vector<Window*> g_windows;  // top-level windows in creation order, for EnumWindows
 
 void on_main(void (^block)()) {
     if (pthread_main_np()) block();
@@ -64,8 +74,11 @@ void* create_window(const std::string& title, int32_t w, int32_t h) {
                                                           object:win
                                                            queue:nil
                                                       usingBlock:^(NSNotification*) { g_quit = true; }];
-        made = new Window{win, layer};
+        made = new Window{win, layer, 0};
     }});
+    made->thread = thread_id();
+    std::lock_guard<std::mutex> lock(g_windows_lock);
+    g_windows.push_back(made);
     return made;
 }
 void* CreateWindowExW(uint32_t, const char16_t*, const char16_t* title, uint32_t, int32_t, int32_t, int32_t w,
@@ -76,13 +89,16 @@ void* CreateWindowExA(uint32_t, const char*, const char* title, uint32_t, int32_
                       void*, void*, void*, void*) {
     return create_window(title ? title : "", w, h);
 }
-int ShowWindow(void* hwnd, int32_t) {
+int ShowWindow(void* hwnd, int32_t cmd) {
+    static_cast<Window*>(hwnd)->visible = cmd != 0;  // SW_HIDE
     on_main(^{ [static_cast<Window*>(hwnd)->window makeKeyAndOrderFront:nil]; });
     return 0;
 }
 int DestroyWindow(void* hwnd) {
     auto* w = static_cast<Window*>(hwnd);
     on_main(^{ [w->window orderOut:nil]; });
+    std::lock_guard<std::mutex> lock(g_windows_lock);
+    g_windows.erase(std::remove(g_windows.begin(), g_windows.end(), w), g_windows.end());
     return 1;
 }
 struct Msg {  // MSG
@@ -139,7 +155,7 @@ int SetWindowPos(void* hwnd, void*, int32_t, int32_t, int32_t cx, int32_t cy, ui
             [w->window setContentSize:NSMakeSize(cx / scale, cy / scale)];
             w->layer.drawableSize = CGSizeMake(cx, cy);
         }
-        if (flags & 0x40) [w->window makeKeyAndOrderFront:nil];  // SWP_SHOWWINDOW
+        if (flags & 0x40) w->visible = true, [w->window makeKeyAndOrderFront:nil];  // SWP_SHOWWINDOW
     }});
     return 1;
 }
@@ -153,6 +169,25 @@ int IsIconic(void* hwnd) {
 void* GetForegroundWindow() { return nullptr; }
 void* GetProcessWindowStation() { return nullptr; }  // callers treat "unknown" as interactive
 void* MonitorFromWindow(void*, uint32_t) { return reinterpret_cast<void*>(1); }
+// What finding a process's main window reads: no owners, no tool windows, every window this process's.
+int EnumWindows(int(MSABI* proc)(void*, int64_t), int64_t data) {
+    std::vector<Window*> windows;
+    {
+        std::lock_guard<std::mutex> lock(g_windows_lock);
+        windows = g_windows;
+    }
+    for (Window* w : windows)
+        if (!call_guest(proc, static_cast<void*>(w), data)) break;
+    return 1;
+}
+uint32_t GetWindowThreadProcessId(void* hwnd, uint32_t* pid) {
+    if (pid) *pid = static_cast<uint32_t>(getpid());
+    return static_cast<Window*>(hwnd)->thread;
+}
+int IsWindowVisible(void* hwnd) { return static_cast<Window*>(hwnd)->visible; }
+void* GetWindow(void*, uint32_t) { return nullptr; }
+int64_t GetWindowLongPtrW(void* hwnd, int32_t index) { return GetWindowLongW(hwnd, index); }
+
 // One monitor, the main screen, its rect in pixels.
 int EnumDisplayMonitors(void*, const int32_t*, int(MSABI* proc)(void*, void*, int32_t*, int64_t), int64_t data) {
     __block CGSize px;
@@ -184,7 +219,8 @@ Exports user32_exports() {
             U(RegisterClassW), U(UnregisterClassW), U(AdjustWindowRect), U(AdjustWindowRectEx), U(GetWindowLongW),
             U(SetWindowPos), U(UpdateWindow), U(IsIconic), U(GetForegroundWindow), U(GetProcessWindowStation),
             U(MonitorFromWindow), U(GetMonitorInfoW), U(RegisterClassExA), U(CreateWindowExA), U(PeekMessageA),
-            U(DispatchMessageA), U(DefWindowProcA), U(EnumDisplayMonitors)};
+            U(DispatchMessageA), U(DefWindowProcA), U(EnumDisplayMonitors), U(EnumWindows),
+            U(GetWindowThreadProcessId), U(IsWindowVisible), U(GetWindow), U(GetWindowLongPtrW)};
 }
 
 }  // namespace host

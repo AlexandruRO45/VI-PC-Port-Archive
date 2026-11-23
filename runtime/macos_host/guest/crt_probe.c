@@ -15,6 +15,14 @@ static BOOL CALLBACK count_monitor(HMONITOR m, HDC dc, LPRECT r, LPARAM out) {
     return TRUE;
 }
 
+static BOOL CALLBACK find_window(HWND w, LPARAM out) {
+    DWORD pid = 0;
+    if (GetWindowThreadProcessId(w, &pid) == GetCurrentThreadId() && pid == GetCurrentProcessId() &&
+        IsWindowVisible(w) && !GetWindow(w, GW_OWNER) && !(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW))
+        *(HWND*)out = w;
+    return TRUE;
+}
+
 int main(void) {
     volatile float x = 0.5f;
     if (fabsf(sinf(x) - 0.4794255f) > 1e-6f || fabsf(powf(x, 2.0f) - 0.25f) > 1e-7f) return 1;
@@ -83,5 +91,9 @@ int main(void) {
         return 18;
     LONG width = 0;
     if (!EnumDisplayMonitors(NULL, NULL, count_monitor, (LPARAM)&width) || width <= 0) return 19;
+    HWND made = CreateWindowExA(0, "probe", "probe", WS_OVERLAPPEDWINDOW, 0, 0, 64, 64, NULL, NULL, NULL, NULL), found = NULL;
+    ShowWindow(made, SW_SHOW);
+    if (!made || !EnumWindows(find_window, (LPARAM)&found) || found != made) return 20;  // how a title's main window is found
+    DestroyWindow(made);
     return 0;
 }

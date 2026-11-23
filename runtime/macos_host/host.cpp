@@ -234,6 +234,21 @@ void on_fault(int sig, siginfo_t* info, void* uc) {
         if (guest) _thread_set_tsd_base(reinterpret_cast<uint64_t>(teb));
         return;
     }
+    // LEONIDA_SKIP_INT3 (the diagnostic gta6rt's startup trace offers on Windows): step over a guest int3 and log each
+    // address once. Here rather than through the title's vectored handlers, which the host does not call yet.
+    static const bool skip_int3 = std::getenv("LEONIDA_SKIP_INT3") != nullptr;
+    if (sig == SIGTRAP && guest && skip_int3 && reinterpret_cast<uint8_t*>(rip)[-1] == 0xCC) {  // rip is past it
+        static uint64_t seen[256];  // ponytail: fixed table, addresses past 256 are stepped over without a log line
+        static int seen_count = 0;
+        bool logged = false;
+        for (int i = 0; i < seen_count; ++i) logged |= seen[i] == rip - 1;
+        if (!logged && seen_count < 256) {
+            seen[seen_count++] = rip - 1;
+            std::fprintf(stderr, "host: int3 skipped at 0x%llx\n", rip - 1);
+        }
+        _thread_set_tsd_base(reinterpret_cast<uint64_t>(teb));
+        return;
+    }
     std::fprintf(stderr, "host: signal %d at rip=0x%llx", sig, rip);
     if (g_image && rip >= base && rip < base + 0x10000000) std::fprintf(stderr, " (image+0x%llx)", rip - base);
     std::fprintf(stderr, " addr=%p rsp=0x%llx [rsp]=0x%llx\n", info->si_addr, ss.__rsp,
