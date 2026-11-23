@@ -74,8 +74,10 @@ def f32(x):
 
 def ptr(offset, kind):
     """Node pointer for a record at byte ``offset`` from the BVH start: 64-byte unit index << 3 | type."""
-    if offset % UNIT:
-        raise ValueError(f"node offset {offset:#x} is not 64-byte aligned")
+    if offset < 0 or offset % UNIT:
+        raise ValueError(f"node offset {offset:#x} is negative or not 64-byte aligned")
+    if not 0 <= kind <= 7:
+        raise ValueError(f"invalid node type {kind}")
     p = (offset // UNIT) << 3 | kind
     if p >= INVALID:
         raise ValueError("BVH too large for 32-bit node pointers")
@@ -166,11 +168,13 @@ def _transform_dir(m, d):
 
 def invert_affine(m):
     """Inverse of a 3x4 row-major affine transform."""
+    if any(not math.isfinite(x) for row in m for x in row):
+        raise ValueError("non-finite instance transform")
     a = [row[:3] for row in m]
     det = (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
            - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
            + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
-    if det == 0:
+    if det == 0 or not math.isfinite(det):
         raise ValueError("singular instance transform")
     inv = [[0.0] * 3 for _ in range(3)]
     for r in range(3):
