@@ -12,11 +12,13 @@ Features & specifications:
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import os
 import re
 import struct
 import sys
+from typing import List, Optional
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +33,7 @@ if HERE not in sys.path:
 
 import rdna2spirv  # noqa: E402
 import support  # noqa: E402
+import spirv_mini_interp as si  # noqa: E402
 
 MASK16 = 0xFFFF
 MASK32 = 0xFFFFFFFF
@@ -134,6 +137,53 @@ def apply_f16_input_mod(bits: int, neg: bool = False, abs_val: bool = False) -> 
     return b
 
 
+def run_hw_min3_f16(
+    s0: int,
+    s1: int,
+    s2: int,
+    old_dst: int = 0x12340000,
+    clamp: bool = False,
+    op_sel: list[int] | None = None,
+    name: str = "ps_min3_hw",
+) -> int:
+    """Translates and runs v_min3_f16 via support.translate_lines and support.mrt0_words."""
+    mod = " clamp" if clamp else ""
+    sel = f" op_sel:[{op_sel[0]},{op_sel[1]},{op_sel[2]},{op_sel[3]}]" if op_sel else ""
+    lines = [
+        f"v_mov_b32_e32 v0, {old_dst:#x}",
+        f"s_mov_b32 s0, {s0:#x}",
+        f"s_mov_b32 s1, {s1:#x}",
+        f"s_mov_b32 s2, {s2:#x}",
+        f"v_min3_f16 v0, s0, s1, s2{mod}{sel}",
+        "exp mrt0 v0, v0, v0, v0 done vm",
+        "s_endpgm",
+    ]
+    spv = support.translate_lines(name, lines)
+    return support.mrt0_words(spv)[0]
+
+
+def run_hw_min3_f16_custom(
+    inst: str,
+    old_dst: int = 0x12340000,
+    sgprs: dict[str, int] | None = None,
+    vgprs: dict[str, int] | None = None,
+    name: str = "ps_min3_custom",
+) -> int:
+    """Translates and runs custom assembly setup through support.translate_lines and support.mrt0_words."""
+    lines = [f"v_mov_b32_e32 v0, {old_dst:#x}"]
+    if sgprs:
+        for reg, val in sgprs.items():
+            lines.append(f"s_mov_b32 {reg}, {val:#x}")
+    if vgprs:
+        for reg, val in vgprs.items():
+            lines.append(f"v_mov_b32_e32 {reg}, {val:#x}")
+    lines.append(inst)
+    lines.append("exp mrt0 v0, v0, v0, v0 done vm")
+    lines.append("s_endpgm")
+    spv = support.translate_lines(name, lines)
+    return support.mrt0_words(spv)[0]
+
+
 class TestValuMin3F16Oracle(unittest.TestCase):
     """Commit 1: Reference mathematical oracle and architectural model."""
 
@@ -143,17 +193,53 @@ class TestValuMin3F16Oracle(unittest.TestCase):
         self.assertEqual(ref_min3_f16(POS_HALF, POS_ONE, POS_TWO), POS_HALF)
         self.assertEqual(ref_min3_f16(NEG_ONE, NEG_TWO, POS_HALF), NEG_TWO)
 
+        hw1 = run_hw_min3_f16(POS_ONE, POS_TWO, POS_HALF, name="ps_or_bo1")
+        self.assertEqual(hw1, 0x12343800)
+        hw2 = run_hw_min3_f16(POS_TWO, POS_HALF, POS_ONE, name="ps_or_bo2")
+        self.assertEqual(hw2, 0x12343800)
+        hw3 = run_hw_min3_f16(POS_HALF, POS_ONE, POS_TWO, name="ps_or_bo3")
+        self.assertEqual(hw3, 0x12343800)
+        hw4 = run_hw_min3_f16(NEG_ONE, NEG_TWO, POS_HALF, name="ps_or_bo4")
+        self.assertEqual(hw4, 0x1234C000)
+
     def test_signed_zeros(self):
         self.assertEqual(ref_min3_f16(POS_ZERO, NEG_ZERO, POS_ONE), NEG_ZERO)
         self.assertEqual(ref_min3_f16(POS_ZERO, POS_ZERO, NEG_ZERO), NEG_ZERO)
         self.assertEqual(ref_min3_f16(POS_ZERO, POS_ZERO, POS_ZERO), POS_ZERO)
         self.assertEqual(ref_min3_f16(NEG_ZERO, NEG_ZERO, NEG_ZERO), NEG_ZERO)
 
+        hw1 = run_hw_min3_f16(POS_ZERO, NEG_ZERO, POS_ONE, name="ps_or_sz1")
+        self.assertEqual(hw1, 0x12348000)
+        hw2 = run_hw_min3_f16(POS_ZERO, POS_ZERO, NEG_ZERO, name="ps_or_sz2")
+        self.assertEqual(hw2, 0x12348000)
+        hw3 = run_hw_min3_f16(POS_ZERO, POS_ZERO, POS_ZERO, name="ps_or_sz3")
+        self.assertEqual(hw3, 0x12340000)
+        hw4 = run_hw_min3_f16(NEG_ZERO, NEG_ZERO, NEG_ZERO, name="ps_or_sz4")
+        self.assertEqual(hw4, 0x12348000)
+
     def test_nan_suppression(self):
         self.assertEqual(ref_min3_f16(QNAN_CANONICAL, POS_ONE, POS_TWO), POS_ONE)
         self.assertEqual(ref_min3_f16(POS_TWO, QNAN_CANONICAL, POS_ONE), POS_ONE)
+        self.assertEqual(ref_min3_f16(POS_TWO, POS_ONE, QNAN_CANONICAL), POS_ONE)
         self.assertEqual(ref_min3_f16(QNAN_CANONICAL, QNAN_ALT, POS_THREE), POS_THREE)
+        self.assertEqual(ref_min3_f16(POS_THREE, QNAN_CANONICAL, QNAN_ALT), POS_THREE)
+        self.assertEqual(ref_min3_f16(QNAN_CANONICAL, POS_THREE, QNAN_ALT), POS_THREE)
         self.assertTrue(is_nan16(ref_min3_f16(QNAN_CANONICAL, QNAN_ALT, SNAN)))
+
+        hw1 = run_hw_min3_f16(QNAN_CANONICAL, POS_ONE, POS_TWO, name="ps_or_nan1")
+        self.assertEqual(hw1, 0x12343C00)
+        hw2 = run_hw_min3_f16(POS_TWO, QNAN_CANONICAL, POS_ONE, name="ps_or_nan2")
+        self.assertEqual(hw2, 0x12343C00)
+        hw3 = run_hw_min3_f16(POS_TWO, POS_ONE, QNAN_CANONICAL, name="ps_or_nan3")
+        self.assertEqual(hw3, 0x12343C00)
+        hw4 = run_hw_min3_f16(QNAN_CANONICAL, QNAN_ALT, POS_THREE, name="ps_or_nan4")
+        self.assertEqual(hw4, 0x12344200)
+        hw5 = run_hw_min3_f16(POS_THREE, QNAN_CANONICAL, QNAN_ALT, name="ps_or_nan5")
+        self.assertEqual(hw5, 0x12344200)
+        hw6 = run_hw_min3_f16(QNAN_CANONICAL, POS_THREE, QNAN_ALT, name="ps_or_nan6")
+        self.assertEqual(hw6, 0x12344200)
+        hw7 = run_hw_min3_f16(QNAN_CANONICAL, QNAN_ALT, SNAN, name="ps_or_nan7")
+        self.assertEqual(hw7, 0x12347E00)
 
     def test_clamping(self):
         self.assertEqual(ref_min3_f16(POS_TWO, POS_THREE, POS_FOUR, clamp=True), POS_ONE)
@@ -161,14 +247,17 @@ class TestValuMin3F16Oracle(unittest.TestCase):
         self.assertEqual(ref_min3_f16(QNAN_CANONICAL, QNAN_ALT, SNAN, clamp=True), POS_ZERO)
         self.assertEqual(ref_min3_f16(POS_HALF, POS_ONE, POS_TWO, clamp=True), POS_HALF)
 
+        hw1 = run_hw_min3_f16(POS_TWO, POS_THREE, POS_FOUR, clamp=True, name="ps_or_cl1")
+        self.assertEqual(hw1, 0x12343C00)
+        hw2 = run_hw_min3_f16(NEG_ONE, POS_HALF, POS_TWO, clamp=True, name="ps_or_cl2")
+        self.assertEqual(hw2, 0x12340000)
+        hw3 = run_hw_min3_f16(POS_HALF, POS_ONE, POS_TWO, clamp=True, name="ps_or_cl3")
+        self.assertEqual(hw3, 0x12343800)
+
 
 # -----------------------------------------------------------------------------
 # Commit 2: Symbolic AST opcode definitions and typed expressions
 # -----------------------------------------------------------------------------
-from dataclasses import dataclass
-from typing import Optional, List
-
-
 @dataclass
 class F16Operand:
     reg: str
@@ -256,6 +345,14 @@ class TestValuMin3F16AST(unittest.TestCase):
         self.assertEqual(ast.src2.reg, "s2")
         self.assertFalse(ast.clamp)
 
+        spv = support.translate_lines("ps_ast_basic", [
+            "v_mov_b32_e32 v0, 0",
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpExtInst %float %glsl NMin", spv)
+
     def test_ast_parsing_op_sel_and_modifiers(self):
         ast = VMin3F16AST.parse("v_min3_f16 v5, -|v0|, s1, 0x3c00 clamp op_sel:[1, 0, 0, 1]")
         self.assertEqual(ast.dst_reg, "v5")
@@ -266,6 +363,15 @@ class TestValuMin3F16AST(unittest.TestCase):
         self.assertTrue(ast.clamp)
         self.assertTrue(ast.src2.is_literal)
         self.assertEqual(ast.src2.literal_value, 0x3C00)
+
+        spv = support.translate_lines("ps_ast_mod", [
+            "v_mov_b32_e32 v5, 0",
+            "v_min3_f16 v5, -|v0|, s1, 0x3c00 clamp op_sel:[1, 0, 0, 1]",
+            "exp mrt0 v5, v5, v5, v5 done vm",
+            "s_endpgm",
+        ])
+        self.assertIn("OpExtInst %float %glsl NMin", spv)
+        self.assertIn("FClamp", spv)
 
 
 # -----------------------------------------------------------------------------
@@ -314,6 +420,9 @@ class TestValuMin3F16ScalarInterpreter(unittest.TestCase):
         out = mach.execute(ast)
         self.assertEqual(out, 0x12343800)
 
+        hw = run_hw_min3_f16(0x3C00, 0x4000, 0x3800, old_dst=0x12345678, name="ps_sc_basic")
+        self.assertEqual(hw, 0x12343800)
+
     def test_scalar_interpreter_high_half_write(self):
         mach = ScalarF16Machine()
         mach.vgprs["v0"] = 0x12345678
@@ -323,6 +432,9 @@ class TestValuMin3F16ScalarInterpreter(unittest.TestCase):
         ast = VMin3F16AST.parse("v_min3_f16 v0, s0, s1, s2 op_sel:[0, 0, 0, 1]")
         out = mach.execute(ast)
         self.assertEqual(out, 0x3C005678)
+
+        hw = run_hw_min3_f16(0x40003C00, 0x4200, 0x4400, old_dst=0x12345678, op_sel=[0, 0, 0, 1], name="ps_sc_hi")
+        self.assertEqual(hw, 0x3C005678)
 
 
 # -----------------------------------------------------------------------------
@@ -387,6 +499,11 @@ class TestValuMin3F16SimdDivergence(unittest.TestCase):
             else:
                 self.assertEqual(res[lane], 0xAAAA0000 + lane)
 
+        res1 = run_hw_min3_f16(POS_ONE, POS_HALF, POS_FOUR, old_dst=0xAAAA0000, name="ps_simd_w32_1")
+        self.assertEqual(res1, 0xAAAA3800)
+        res2 = run_hw_min3_f16(POS_TWO, POS_HALF, POS_FOUR, old_dst=0xAAAA0001, name="ps_simd_w32_2")
+        self.assertEqual(res2, 0xAAAA3800)
+
     def test_wave64_divergence(self):
         wave = SimdF16Wave(64)
         wave.exec_mask = 0x00000000_FFFFFFFF  # lower 32 lanes active only
@@ -402,6 +519,9 @@ class TestValuMin3F16SimdDivergence(unittest.TestCase):
                 self.assertEqual(res[lane], 0xDEAD3800)
             else:
                 self.assertEqual(res[lane], 0xDEAD0000)
+
+        hw = run_hw_min3_f16(POS_ONE, POS_TWO, POS_HALF, old_dst=0xDEAD0000, name="ps_simd_w64")
+        self.assertEqual(hw, 0xDEAD3800)
 
 
 # -----------------------------------------------------------------------------
@@ -419,6 +539,14 @@ class TestValuMin3F16RegisterAliasing(unittest.TestCase):
         out = mach.execute(ast)
         self.assertEqual(out, 0x55553C00)
 
+        hw = run_hw_min3_f16_custom(
+            "v_min3_f16 v0, v0, s1, s2",
+            old_dst=0x55554000,
+            sgprs={"s1": 0x3C00, "s2": 0x4200},
+            name="ps_al_src0",
+        )
+        self.assertEqual(hw, 0x55553C00)
+
     def test_dst_aliases_src1_and_src2(self):
         mach = ScalarF16Machine()
         mach.vgprs["v0"] = 0xAAAA4200  # lo=3.0, hi=0xAAAA
@@ -427,6 +555,14 @@ class TestValuMin3F16RegisterAliasing(unittest.TestCase):
         out = mach.execute(ast)
         self.assertEqual(out, 0xAAAA4200)
 
+        hw = run_hw_min3_f16_custom(
+            "v_min3_f16 v0, s0, v0, v0",
+            old_dst=0xAAAA4200,
+            sgprs={"s0": 0x4400},
+            name="ps_al_src12",
+        )
+        self.assertEqual(hw, 0xAAAA4200)
+
     def test_all_operands_same_register_high_low(self):
         mach = ScalarF16Machine()
         mach.vgprs["v0"] = (POS_HALF << 16) | POS_TWO  # lo=2.0, hi=0.5
@@ -434,6 +570,14 @@ class TestValuMin3F16RegisterAliasing(unittest.TestCase):
         out = mach.execute(ast)
         # min(2.0, 0.5, 0.5) = 0.5 -> written to hi, lo preserved as 2.0
         self.assertEqual(out, (POS_HALF << 16) | POS_TWO)
+
+        init_val = (POS_HALF << 16) | POS_TWO
+        hw = run_hw_min3_f16_custom(
+            "v_min3_f16 v0, v0, v0, v0 op_sel:[0, 1, 1, 1]",
+            old_dst=init_val,
+            name="ps_al_all",
+        )
+        self.assertEqual(hw, init_val)
 
 
 # -----------------------------------------------------------------------------
@@ -458,6 +602,24 @@ class TestValuMin3F16ConditionCodes(unittest.TestCase):
         self.assertEqual(scc_after, 1)
         self.assertEqual(vcc_after, 0xFFFFFFFFFFFFFFFF)
 
+        lines = [
+            "s_mov_b32 s0, 0x3C00",
+            "s_mov_b32 s1, 0x4000",
+            "s_mov_b32 s2, 0x3800",
+            "s_mov_b32 s3, 1",
+            "s_cmp_eq_u32 s3, 1",  # sets SCC to 1
+            "v_mov_b32_e32 v0, 0",
+            "v_min3_f16 v0, s0, s1, s2",
+            "s_cselect_b32 s5, 0xCAFE, 0xBEEF",  # reads SCC
+            "v_mov_b32_e32 v1, s5",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cc_check", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, POS_HALF)
+        self.assertEqual(words[1], 0xCAFE)
+
 
 # -----------------------------------------------------------------------------
 # Commit 7: IEEE 754 boundary extremes, subnormals, and NaN handling
@@ -471,15 +633,44 @@ class TestValuMin3F16Ieee754Boundaries(unittest.TestCase):
         self.assertEqual(ref_min3_f16(POS_INF, POS_INF, POS_INF), POS_INF)
         self.assertEqual(ref_min3_f16(NEG_INF, NEG_INF, POS_INF), NEG_INF)
 
+        hw1 = run_hw_min3_f16(POS_INF, POS_ONE, POS_TWO, name="ps_bnd_inf1")
+        self.assertEqual(hw1, 0x12343C00)
+        hw2 = run_hw_min3_f16(NEG_INF, POS_ONE, POS_TWO, name="ps_bnd_inf2")
+        self.assertEqual(hw2, 0x1234FC00)
+        hw3 = run_hw_min3_f16(POS_INF, POS_INF, POS_INF, name="ps_bnd_inf3")
+        self.assertEqual(hw3, 0x12347C00)
+        hw4 = run_hw_min3_f16(NEG_INF, NEG_INF, POS_INF, name="ps_bnd_inf4")
+        self.assertEqual(hw4, 0x1234FC00)
+
     def test_subnormals(self):
         self.assertEqual(ref_min3_f16(POS_MIN_SUBNORM, POS_MAX_SUBNORM, POS_MIN_NORMAL), POS_MIN_SUBNORM)
         self.assertEqual(ref_min3_f16(NEG_MIN_SUBNORM, NEG_MAX_SUBNORM, NEG_ZERO), NEG_MAX_SUBNORM)
         self.assertEqual(ref_min3_f16(POS_MIN_SUBNORM, NEG_MIN_SUBNORM, POS_ZERO), NEG_MIN_SUBNORM)
 
+        hw1 = run_hw_min3_f16(POS_MIN_SUBNORM, POS_MAX_SUBNORM, POS_MIN_NORMAL, name="ps_bnd_sub1")
+        self.assertEqual(hw1, 0x12340001)
+        hw2 = run_hw_min3_f16(NEG_MIN_SUBNORM, NEG_MAX_SUBNORM, NEG_ZERO, name="ps_bnd_sub2")
+        self.assertEqual(hw2, 0x123483FF)
+        hw3 = run_hw_min3_f16(POS_MIN_SUBNORM, NEG_MIN_SUBNORM, POS_ZERO, name="ps_bnd_sub3")
+        self.assertEqual(hw3, 0x12348001)
+
     def test_nans_and_gradual_underflow(self):
         self.assertEqual(ref_min3_f16(QNAN_CANONICAL, POS_MIN_SUBNORM, POS_ONE), POS_MIN_SUBNORM)
         self.assertEqual(ref_min3_f16(SNAN, QNAN_ALT, NEG_MAX_NORMAL), NEG_MAX_NORMAL)
         self.assertTrue(is_nan16(ref_min3_f16(SNAN, QNAN_CANONICAL, QNAN_ALT)))
+
+        hw1 = run_hw_min3_f16(QNAN_CANONICAL, POS_MIN_SUBNORM, POS_ONE, name="ps_bnd_nan1")
+        self.assertEqual(hw1, 0x12340001)
+        hw2 = run_hw_min3_f16(SNAN, QNAN_ALT, NEG_MAX_NORMAL, name="ps_bnd_nan2")
+        self.assertEqual(hw2, 0x1234FBFF)
+        hw3 = run_hw_min3_f16(SNAN, QNAN_CANONICAL, QNAN_ALT, name="ps_bnd_nan3")
+        self.assertEqual(hw3, 0x12347E00)
+        hw4 = run_hw_min3_f16(NEG_QNAN, POS_TWO, POS_THREE, name="ps_bnd_nan4")
+        self.assertEqual(hw4, 0x12344000)
+        hw5 = run_hw_min3_f16(POS_FOUR, NEG_QNAN, POS_THREE, name="ps_bnd_nan5")
+        self.assertEqual(hw5, 0x12344200)
+        hw6 = run_hw_min3_f16(POS_FOUR, POS_THREE, NEG_QNAN, name="ps_bnd_nan6")
+        self.assertEqual(hw6, 0x12344200)
 
 
 # -----------------------------------------------------------------------------
@@ -497,16 +688,47 @@ class TestValuMin3F16NegativeAndMutation(unittest.TestCase):
             VMin3F16AST.parse("v_max3_f16 v0, s0, s1, s2")
 
     def test_mutation_detection_operator_swap(self):
-        # Sabotage: replace min with max
-        def buggy_min3(a, b, c):
-            return max(a, b, c)
-        self.assertNotEqual(buggy_min3(1, 2, 3), 1)
+        # Mutate translated SPIR-V replacing NMin with NMax: must diverge from correct minimum
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            "s_mov_b32 s0, 0x3C00",  # 1.0
+            "s_mov_b32 s1, 0x4000",  # 2.0
+            "s_mov_b32 s2, 0x3800",  # 0.5
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_swap", lines)
+        normal_res = support.mrt0_words(spv)[0] & MASK16
+        self.assertEqual(normal_res, POS_HALF)
+
+        mutated_spv = spv.replace("glsl NMin", "glsl NMax")
+        mutated_res = support.mrt0_words(mutated_spv)[0] & MASK16
+        self.assertEqual(mutated_res, POS_TWO)
+        self.assertNotEqual(normal_res, mutated_res)
 
     def test_mutation_detection_signed_zero_loss(self):
-        # Sabotage: float equality treats +0.0 == -0.0
-        def buggy_zero_min(a, b):
-            return a if a < b else b
-        self.assertNotEqual(ref_min2_f16(POS_ZERO, NEG_ZERO), POS_ZERO)
+        # Verify hardware translation orders -0.0 < +0.0
+        res = run_hw_min3_f16(POS_ZERO, NEG_ZERO, POS_ONE, name="ps_mut_sz")
+        self.assertEqual(res & MASK16, NEG_ZERO)
+
+    def test_mutation_detection_nmin_to_fmin_nan_rejection(self):
+        # Mutate translated SPIR-V replacing NMin with FMin: FMin with NaN operand is undefined/rejected
+        lines = [
+            "v_mov_b32_e32 v0, 0",
+            f"s_mov_b32 s0, {QNAN_CANONICAL:#x}",
+            f"s_mov_b32 s1, {POS_ONE:#x}",
+            f"s_mov_b32 s2, {POS_TWO:#x}",
+            "v_min3_f16 v0, s0, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_mut_fmin", lines)
+        self.assertEqual(support.mrt0_words(spv)[0] & MASK16, POS_ONE)
+
+        mutated_spv = spv.replace("glsl NMin", "glsl FMin")
+        with self.assertRaises(si.UnsupportedConstruct):
+            support.mrt0_words(mutated_spv)
 
 
 class TestValuMin3F16Translator(unittest.TestCase):
@@ -554,6 +776,23 @@ class TestValuMin3F16Translator(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, POS_ONE)
 
+    def test_translator_nan_permutations(self):
+        # NaN in operand 1
+        res1 = run_hw_min3_f16(POS_TWO, QNAN_CANONICAL, POS_ONE, name="ps_tr_nan_p1")
+        self.assertEqual(res1 & MASK16, POS_ONE)
+        # NaN in operand 2
+        res2 = run_hw_min3_f16(POS_TWO, POS_ONE, QNAN_CANONICAL, name="ps_tr_nan_p2")
+        self.assertEqual(res2 & MASK16, POS_ONE)
+        # NaN in operands 0 and 1
+        res3 = run_hw_min3_f16(QNAN_CANONICAL, QNAN_ALT, POS_THREE, name="ps_tr_nan_p3")
+        self.assertEqual(res3 & MASK16, POS_THREE)
+        # NaN in operands 1 and 2
+        res4 = run_hw_min3_f16(POS_THREE, QNAN_CANONICAL, QNAN_ALT, name="ps_tr_nan_p4")
+        self.assertEqual(res4 & MASK16, POS_THREE)
+        # NaN in operands 0 and 2
+        res5 = run_hw_min3_f16(QNAN_CANONICAL, POS_THREE, QNAN_ALT, name="ps_tr_nan_p5")
+        self.assertEqual(res5 & MASK16, POS_THREE)
+
     def test_translator_clamp(self):
         lines = [
             "v_mov_b32_e32 v0, 0",
@@ -581,6 +820,20 @@ class TestValuMin3F16Translator(unittest.TestCase):
         spv = support.translate_lines("ps_min3_opsel", lines)
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x3800AAAA)
+
+    def test_translator_input_modifiers(self):
+        lines = [
+            "v_mov_b32_e32 v0, 0x12340000",
+            "s_mov_b32 s0, 0x3C00",  # 1.0 -> -|1.0| = -1.0 (0xBC00)
+            "s_mov_b32 s1, 0x4000",  # 2.0
+            "s_mov_b32 s2, 0x4200",  # 3.0
+            "v_min3_f16 v0, -|s0|, s1, s2",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_min3_mods", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0x1234BC00)
 
 
 if __name__ == "__main__":
