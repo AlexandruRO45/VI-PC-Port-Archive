@@ -82,6 +82,19 @@ class InterpreterTests(unittest.TestCase):
                                   "%x = OpCompositeExtract %float %u 1\n"
                                   "%res = OpBitcast %uint %x\n"), 0x40000000)                   # 2.0f
 
+    def test_negate_is_the_sign_bit(self):
+        # OpFNegate flips the sign and leaves every other bit alone, so a NaN that came from a bit pattern keeps
+        # its payload and its signalling bit instead of being quieted to 0xFFC00000 (issue #509's rule).
+        self.assertEqual(run_word("%s = OpIAdd %uint %cInf %c1\n"          # 0x7F800001, a signalling NaN
+                                  "%f = OpBitcast %float %s\n"
+                                  "%n = OpFNegate %float %f\n"
+                                  "%res = OpBitcast %uint %n\n"), 0xFF800001)
+        self.assertEqual(run_word("%f = OpBitcast %float %cInf\n"
+                                  "%n = OpFNegate %float %f\n"
+                                  "%res = OpBitcast %uint %n\n"), 0xFF800000)   # -inf, not a NaN
+        self.assertEqual(run_word("%n = OpFNegate %float %f1\n"
+                                  "%res = OpBitcast %uint %n\n"), 0xBF800000)   # -1.0
+
     def test_float_sign_operations_use_result_width(self):
         # The low word in 1 + 2**-30 and the finite magnitude 2**130 both need binary64.
         text = """\

@@ -1040,8 +1040,14 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             else:
                 values[res] = fma_f32(x, y, z)
         elif op == "OpFNegate":
-            negated = -val(a[1])
-            values[res] = negated if types.t[a[0]] == ("float", 64) else f32(negated)
+            x = val(a[1])
+            if isinstance(x, _F32):
+                # Negation is the sign bit and nothing else, so a NaN that came from a bit pattern keeps its
+                # payload and its signalling bit. `-x` on the float alone would quiet it (issue #509).
+                values[res] = _F32(x.bits ^ 0x80000000)
+            else:
+                negated = -x
+                values[res] = negated if types.t[a[0]] == ("float", 64) else f32(negated)
         elif op == "OpQuantizeToF16":
             # Single-instruction f32 -> f16 -> f32 round to nearest, with the
             # SPIR-V subnormal rule: a magnitude too small for a normal f16
