@@ -755,6 +755,29 @@ class SymbolTests(unittest.TestCase):
             {2: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 1}},
         )
 
+    def test_parse_output_handles_an_empty_function_line_before_the_unknown_location(self):
+        # MSVC's LLVM 21 prints an empty function line, then `??:0:0`, for an unresolved address. Two of them
+        # before two resolved addresses must not shift the pairing or drop the last address.
+        text = "\n??:0:0\n\n??:0:0\nframe_a\nC:\\src\\a.cpp:1:0\nframe_b\nC:\\src\\b.cpp:2:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2, 3, 4]),
+            {
+                3: {"function": "frame_a", "file": "C:\\src\\a.cpp", "line": 1},
+                4: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 2},
+            },
+        )
+
+    def test_parse_output_tells_a_separator_blank_from_an_empty_function_line(self):
+        # A separator blank follows a resolved record; the empty function line sits immediately before `??:0:0`.
+        text = "frame_a\nC:\\src\\a.cpp:1:0\n\n\n??:0:0\nframe_b\nC:\\src\\b.cpp:2:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2, 3]),
+            {
+                1: {"function": "frame_a", "file": "C:\\src\\a.cpp", "line": 1},
+                3: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 2},
+            },
+        )
+
     def test_parse_output_keeps_a_public_symbol_without_line_info(self):
         text = "pub_only\n??:0:0\nframe_b\nC:\\src\\b.cpp:1:0\n"
         self.assertEqual(

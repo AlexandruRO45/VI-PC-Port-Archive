@@ -361,15 +361,23 @@ def parse_symbolizer_output(text: str, addresses: list[int]) -> dict[int, dict]:
     With `--no-inlines` one address prints at most one frame, in two steps: a function line, then an optional
     `file:line:column` line. The parser walks those two states per address. A function without line information
     prints no location, so the next line already belongs to the next address. An address the symbolizer cannot
-    resolve prints `??`, which is dropped instead of being reported as a function name.
+    resolve prints `??`, or an empty function line (MSVC's LLVM 21 does this), followed by `??:0:0`; both are
+    dropped instead of being reported as a function name. Records may be separated by blank lines, so blanks at
+    the start of a record are skipped, and a record that starts with a location line is an unresolved address.
     """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    lines = [line.rstrip("\r") for line in text.splitlines()]
     results, position = {}, 0
     for address in addresses:
+        while position < len(lines) and not lines[position].strip():
+            position += 1  # record separator, or the empty function line of an unresolved address
         if position >= len(lines):
             break  # fewer results than addresses: keep what was printed
+        if SYMBOL_LOCATION.match(lines[position]):
+            # An unresolved address whose function line was empty prints only its `??:0:0` line.
+            position += 1
+            continue
         # State 1: the function line for this address.
-        function = lines[position]
+        function = lines[position].strip()
         position += 1
         if function == "??":
             # An unresolved address may still print its `??:0:0` line; consume it so the next
