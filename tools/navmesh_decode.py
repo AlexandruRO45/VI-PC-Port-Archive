@@ -63,6 +63,7 @@ BASE = 0x50000000
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 HEX_PREFIX = re.compile(r"^(?:0[xX])?([0-9a-fA-F]{6,})(?:[^0-9a-zA-Z]|$)")
 CHUNK = 1 << 20
+FIRST_CHUNK = 1 << 14    # most streams are a few KiB; the read window doubles up to CHUNK for the large ones
 MIN_STREAM = 64          # the carver's threshold; shorter streams are only accepted as continuations
 MAX_STREAMS = 16
 MAX_INFLATE = 256 << 20  # refuse to inflate a single stream or assembled resource past this size
@@ -158,13 +159,15 @@ def inflate_at(m, start, size, cap=MAX_INFLATE):
     """Inflate one zlib stream within [start, size). Returns (data, stored_bytes) or None."""
     d = zlib.decompressobj()
     parts, total, pos, pending = [], 0, start, b""
+    window = FIRST_CHUNK
     try:
         while not d.eof:
             if not pending:
                 if pos >= size:
                     return None
-                pending = m[pos:min(pos + CHUNK, size)]
+                pending = m[pos:min(pos + window, size)]
                 pos += len(pending)
+                window = min(window << 1, CHUNK)
             out = d.decompress(pending, cap + 1 - total)
             pending = d.unconsumed_tail
             total += len(out)
@@ -709,12 +712,21 @@ def decode_grid(b, nstreams, stats, deep):
 
 def _grid_values(b, groups, entries):
     seen = bytearray(entries)
+    unpack = struct.Struct("<32Q").unpack_from
     for g in range(groups):
         base = 0x60 + GRID_GROUP * g
-        for k, c in enumerate(b[base:base + 16]):
-            if c < 0x80:
-                value = _u64(b, base + 16 + 16 * k + 8)
-                if value is None or value >= entries or seen[value]:
+        ctrl = b[base:base + 16]
+        if max(ctrl) >= 0x80:
+            slots = unpack(b, base + 16)
+            for k, c in enumerate(ctrl):
+                if c < 0x80:
+                    value = slots[2 * k + 1]
+                    if value >= entries or seen[value]:
+                        return False
+                    seen[value] = 1
+        else:                        # all 16 slots occupied
+            for value in unpack(b, base + 16)[1::2]:
+                if value >= entries or seen[value]:
                     return False
                 seen[value] = 1
     return all(seen)
@@ -723,11 +735,14 @@ def _grid_values(b, groups, entries):
 def _grid_slots(b, groups):
     """{key: value} of every occupied slot (call after _grid_values has accepted the table)."""
     keys = {}
+    unpack = struct.Struct("<32Q").unpack_from
     for g in range(groups):
         base = 0x60 + GRID_GROUP * g
-        for k, c in enumerate(b[base:base + 16]):
+        ctrl = b[base:base + 16]
+        slots = unpack(b, base + 16)
+        for k, c in enumerate(ctrl):
             if c < 0x80:
-                keys[_u64(b, base + 16 + 16 * k)] = _u64(b, base + 16 + 16 * k + 8)
+                keys[slots[2 * k]] = slots[2 * k + 1]
     return keys
 
 
@@ -736,28 +751,44 @@ def _grid_octree(keys):
     if 1 not in keys:
         return False
     for key in keys:
-        if key == 0 or (key.bit_length() - 1) % 3 or (key != 1 and key >> 3 not in keys):
+        if (key.bit_length() - 1) % 3:       # also rejects key 0
             return False
-    return True
+    parents = {key >> 3 for key in keys}
+    parents.discard(0)                       # the root's "parent"
+    return parents <= keys.keys()
 
 
 GRID_INNER = 0x0000FF00  # payload of every node that has children
 GRID_LEAF_KIND = {0x01: "low_byte_01", 0x03: "low_byte_03"}
 
 
+def _u32_table(b, o, n):
+    """The n little-endian u32 words at o (a view on little-endian hosts, so no int objects are built)."""
+    view = memoryview(b)[o:o + 4 * n]
+    if sys.byteorder == "little":
+        return view.cast("I")
+    return struct.unpack_from("<%dI" % n, b, o)
+
+
 def _grid_payloads(b, payload, keys, stats):
     """Inner nodes carry 0x0000ff00; count leaf payloads by low byte and every key by depth."""
     inner = {key >> 3 for key in keys if key != 1}
-    words = {key: _u32(b, payload + 4 * value) for key, value in keys.items()}
+    table = _u32_table(b, payload, len(keys))
+    try:
+        words = {key: table[value] for key, value in keys.items()}
+    finally:
+        if isinstance(table, memoryview):
+            table.release()
     if any(words[key] != GRID_INNER for key in inner):
         return False
     stats["inner_nodes"] += len(inner)
+    stats["key_depth"].update((key.bit_length() - 1) // 3 for key in words)
+    leaf_kind = GRID_LEAF_KIND.get
+    leaves = Counter()
     for key, word in words.items():
-        stats["key_depth"][(key.bit_length() - 1) // 3] += 1
-        if key in inner:
-            continue
-        kind = "ff00" if word == GRID_INNER else GRID_LEAF_KIND.get(word & 0xFF, "other")
-        stats["leaf_payload"][kind] += 1
+        if key not in inner:
+            leaves["ff00" if word == GRID_INNER else leaf_kind(word & 0xFF, "other")] += 1
+    stats["leaf_payload"].update(leaves)
     return True
 
 
