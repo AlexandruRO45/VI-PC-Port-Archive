@@ -26,6 +26,7 @@ prints counts only: documents read, roots, the elements each convention covered,
 documents that are not well-formed XML (tail-only or truncated carves), with the reason. ``--out DIR`` writes one JSON
 file per document: those files hold the game's data and stay on the local machine (CONTRIBUTING.md). Standard
 library only.
+Usage: `python -I tools/gamedata_reader.py --help` lists the options.
 """
 import argparse
 import io
@@ -322,6 +323,11 @@ def main(argv=None):
           f"{s['registered']['roots']} roots, {s['registered']['types']} types")
     if a.out:
         print(f"wrote {s['documents']} JSON files to {a.out} (game data: keep them local)")
+    if not s["documents"] and s["not_well_formed"]:
+        # Nothing parsed. A corpus with some truncated tails still reads the rest and stays 0; a run that read
+        # nothing at all cannot tell "no documents here" from "every document was broken", so the exit code says it.
+        print(f"ERROR: no document could be read; {s['not_well_formed']} not well-formed", file=sys.stderr)
+        return 1
     return 0
 
 
