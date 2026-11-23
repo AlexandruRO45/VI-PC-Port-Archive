@@ -370,6 +370,15 @@ class RejectTests(unittest.TestCase):
         summary = mp.summarise_page(data, "x")
         self.assertIn("unknown chunk", summary["error"])
 
+    def test_data_inside_the_last_chunk_is_an_error(self):
+        # a group with no meshlets ends at +12; a nonzero byte there used to send the walk back to +0 forever (#5600)
+        empty = struct.pack("<3I", 0x80000000, 0, 0)
+        with self.assertRaises(mp.PageError):
+            mp.parse_page(empty + struct.pack("<I", 1))
+        # padded to 16 bytes it is a valid chunk and the walk goes on
+        kinds = [c["kind"] for c in mp.parse_page(empty + b"\0" * 4 + group([(4, 3)]))]
+        self.assertEqual(kinds, ["group", "group"])
+
     def test_other_data_after_padding_stops(self):
         # mesh chunks, zero padding to a 256-byte boundary, then other data (story000's 256 KiB mixed pages)
         mesh = page(other_block(10), group([(10, 8)]))

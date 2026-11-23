@@ -510,11 +510,16 @@ def parse_page(data):
     chunks = []
     pos = 0
     while True:
+        last = pos  # end of the chunk before, 0 at the start
         while pos < len(data) and data[pos] == 0:
             pos += 1
         if pos >= len(data):
             break
         pos &= ~15
+        if pos < last:
+            # rounding down landed inside the chunk just parsed: walking on from there would read it again, forever
+            # for a group with no meshlets (#5600)
+            raise PageError(f"data follows the chunk that ends at +0x{last:x} without 16-byte alignment")
         while _u32(data, pos) == 0:
             pos += 4
         if pos % 16:
