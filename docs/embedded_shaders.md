@@ -140,7 +140,7 @@ that expands to `FSSM` ([fssm_crosscheck.md](fssm_crosscheck.md)). On all 52 con
 |---|---|
 | `tools/fssm_unpack.py` | **52/52** decompress to a valid `FSSM` blob (716 B to 101,320 B, median 2,200 B) |
 | `tools/shader_disasm.py --mcpu gfx1013` | **52/52** disassemble; 42 with no invalid word, 10 with invalid words in the code |
-| `tools/rdna2spirv.py` | **52** translate (`main` `8575d36e`, after #1864); 51 translated and passed `spirv-val` at `49475796` |
+| `tools/rdna2spirv.py` | **52** translate and pass `spirv-val` (`main` `8575d36e`, after #1864); 51 did at `49475796` |
 
 When this page was first written, 42 translated and 10 stopped at four rules. Three of those rules have landed since
 (`427c1376`, from #1968), and the fifth has landed too (#1864):
@@ -178,7 +178,7 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
 ## 5. What this changes
 
 * **The RT builder does not need a DXIL path for the console code.** Its programs are RDNA2 `FSSM`, and all 52
-  translate with the translator the project uses for the game's 26,503 shaders (51 were also checked with `spirv-val`). The bitcode in
+  translate and pass `spirv-val` with the translator the project uses for the game's 26,503 shaders. The bitcode in
   the same container is a second representation (the one the PC-compiler experiment measured); it is not what
   the console runtime executes.
 * **The missing rules were small.** `global_atomic_fmax`/`fmin` (6 programs),
