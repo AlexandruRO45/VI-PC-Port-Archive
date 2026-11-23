@@ -313,5 +313,23 @@ class TestSaluXnorSaveexecB32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(scc, 0)
         self.assertEqual(self.rf.scc, 0)
 
+# --- Section 4: SIMD Multi-Lane Divergence and EXEC Masking ---
+
+class TestSaluXnorSaveexecB32SimdExecution(unittest.TestCase):
+    """Commit 4: SIMD multi-lane divergence and 32/64-bit EXEC masking tests."""
+
+    def test_wave64_exec_hi_preservation(self) -> None:
+        """EXEC_HI must remain strictly untouched across s_xnor_saveexec_b32."""
+        hi_patterns = [0x000000FF, 0xAAAAAAAA, 0x12345678, 0xFFFFFFFF]
+        for hi in hi_patterns:
+            with self.subTest(hi=hex(hi)):
+                hw_lo, hw_hi, hw_scc, _ = run_salu_xnor_saveexec_b32(0x55555555, 0x0000000F, hi)
+                self.assertEqual(hw_hi, hi)
+
+    def test_divergent_lane_mask_update(self) -> None:
+        hw_lo, _, hw_scc, _ = run_salu_xnor_saveexec_b32(0x0000FFFF, 0x000000FF, 0x000000FF)
+        self.assertEqual(hw_lo, 0xFFFF00FF)
+        self.assertEqual(hw_scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
