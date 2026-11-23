@@ -354,6 +354,17 @@ class TestVCvtU16F16SIMD(unittest.TestCase):
         # Large positive saturated to 65535
         self.assertEqual(ref_v_cvt_u16_f16(float_to_f16_bits(70000.0)), 65535)
 
+class TestVCvtU16F16Translator(unittest.TestCase):
+    def test_translator_cvt_u16_f16_execution(self) -> None:
+        body = [
+            "v_mov_b32_e32 v1, 0x5140",  # 42.0h
+            "v_cvt_u16_f16_e32 v2, v1",
+            "buffer_store_dword v2, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_cvt_u16_f16")
+        for l in range(32):
+            self.assertEqual(results[l] & 0xFFFF, 42)
+
 
 if __name__ == "__main__":
     unittest.main()
