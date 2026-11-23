@@ -17935,6 +17935,17 @@ def _depth_arg(text):
     return value
 
 
+def _shared_memory_arg(text):
+    """--max-shared-memory BYTES: nonnegative cap on compute workgroup memory."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return value
+
+
 def _out_inside_input(src, out):
     """True when --out is the input folder or a folder inside it: translating there writes among the inputs.
 
@@ -18007,7 +18018,7 @@ def main():
                     help="16-bit interpolation without PerVertexKHR inputs, for devices that can't compile them "
                          "(MoltenVK): VS and mesh params also export their f16 halves decoded to f32, which the PS "
                          "reads as ordinary interpolated inputs (metadata: f16_halves)")
-    ap.add_argument("--max-shared-memory", type=int, default=MAX_SHARED_BYTES, metavar="BYTES",
+    ap.add_argument("--max-shared-memory", type=_shared_memory_arg, default=MAX_SHARED_BYTES, metavar="BYTES",
                     help="cap on a compute shader's workgroup memory, its LDS plus what --wave64-emulate adds "
                          "(default %(default)s, the 64 KiB hard cap): over it the LDS array shrinks to the program's "
                          "need, or the shader is refused (Unsupported). The device's own maxComputeSharedMemorySize "

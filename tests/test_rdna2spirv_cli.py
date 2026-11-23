@@ -600,5 +600,32 @@ class PopsInvocationInterlock(unittest.TestCase):
         self.assertEqual(spv.count("OpEndInvocationInterlockEXT"), 0)
 
 
+class MaxSharedMemoryArg(unittest.TestCase):
+    """--max-shared-memory rejects negative or non-integer values as CLI usage errors."""
+
+    def test_negative_and_non_integer_values_exit_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            in_dir = os.path.join(tmp, "in")
+            os.mkdir(in_dir)
+            src = os.path.join(in_dir, "cs_zero.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; cs_zero  code 0x0..0x4 (synthetic), gfx1013, 0 invalid words\n\ts_endpgm\n")
+            for bad in ("-1", "-65536", "abc"):
+                out = os.path.join(tmp, f"out_{bad}")
+                with self.subTest(bad=bad):
+                    p = subprocess.run([sys.executable, "-I", TOOL, src, "--out", out,
+                                        "--assembler", "python", "--no-validate",
+                                        "--max-shared-memory", bad],
+                                       capture_output=True, text=True, errors="replace")
+                    self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                    self.assertIn("usage:", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_zero_and_positive_values_are_accepted(self):
+        self.assertEqual(rdna2spirv._shared_memory_arg("0"), 0)
+        self.assertEqual(rdna2spirv._shared_memory_arg("32768"), 32768)
+
+
 if __name__ == "__main__":
     unittest.main()
