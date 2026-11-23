@@ -168,6 +168,14 @@ class AssetsPoolsTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(d, make_game.DECODER_RECORD)), d)
         self.assertEqual([src for src, _ in self.run_assets("d2")], [a, b])
 
+    def test_remove_tree_still_deletes_a_plain_export_folder_whole(self):
+        # The link case must not turn into "leave the old export in place": a real folder goes completely.
+        folder = os.path.join(self.out, "ttpf", "pool")
+        self.stub(os.path.join(folder, "000000_old.dds"))
+        make_game._remove_tree(folder)
+        self.assertFalse(os.path.exists(folder))
+
+
     def test_a_broken_calibration_profile_stops_the_build_with_one_error_line(self):
         # The profile is hand-written, so a typo must name the file in one ERROR line, not raise a JSONDecodeError.
         self.pool("data/ttdb/pool.ttpf")
