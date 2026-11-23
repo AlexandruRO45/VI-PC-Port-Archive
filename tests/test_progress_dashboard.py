@@ -220,6 +220,16 @@ class Scrub(unittest.TestCase):
         self.assertEqual(pd.scrub("in " + os.path.join(pd.HOME, "work", f"{SENTINEL}.fssm")), "in <path>")
         self.assertEqual(pd.scrub(f"C:{sep}work{sep}{SENTINEL}_a.fssm, C:{sep}{SENTINEL}_b.fssm"), "<path> <path>")
 
+    def test_unc_paths_lose_server_share_and_file_name(self):
+        self.assertEqual(pd.scrub(f"\\\\fileserver\\games\\work\\{SENTINEL}.fssm"), "<path>")
+        self.assertEqual(pd.scrub(f"open \\\\?\\UNC\\fileserver\\games\\{SENTINEL}.fssm"), "open <path>")
+        self.assertEqual(pd.scrub(f"open \\\\?\\C:\\work\\{SENTINEL}.fssm"), "open <path>")
+        self.assertEqual(pd.scrub(f"open //fileserver/games/work/{SENTINEL}.fssm"), "open <path>")
+        self.assertEqual(pd.scrub(f"FAIL: cannot read \\\\fileserver\\games\\{SENTINEL}.fssm (errno 2), retry"),
+                         "FAIL: cannot read <path> (errno 2), retry")
+        err = OSError(2, "No such file or directory", f"\\\\fileserver\\games\\{SENTINEL}.fssm")
+        self.assertEqual(pd.scrub(str(err)), "[Errno 2] No such file or directory: '<path>'")
+
     def test_paths_inside_the_repository_become_relative(self):
         line = "Error: " + os.path.join(ROOT, "tools", "text_tables.py") + " line 3"
         self.assertEqual(pd.scrub(line), "Error: tools/text_tables.py line 3")
@@ -227,6 +237,7 @@ class Scrub(unittest.TestCase):
     def test_urls_and_relative_paths_stay(self):
         self.assertEqual(pd.scrub("see https://github.com/ItsNotRexed/Leonida/issues/1"),
                          "see https://github.com/ItsNotRexed/Leonida/issues/1")
+        self.assertEqual(pd.scrub("fetch https://fileserver/games/work failed"), "fetch https://fileserver/games/work failed")
         self.assertEqual(pd.scrub("tests/test_x.py failed"), "tests/test_x.py failed")
 
 

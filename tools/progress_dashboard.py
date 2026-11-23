@@ -118,6 +118,10 @@ def scrub(text, limit=240):
             return "." if rel == "." else rel
         return "<path>"
 
+    # UNC first (\\server\share, \\?\UNC\..., \\?\C:\..., //server/share), whole: the drive and POSIX rules below
+    # would replace only part of it and leave the server and share names. Not through realpath, which would reach for
+    # the server on Windows. After ":" it is a URL and stays. Two or more slashes: an exception's repr doubles them.
+    line = re.sub(r"(?<![\w.:/\\])[\\/]{2,}[^\s\\/'\"][^\s'\"]*", "<path>", line)
     line = re.sub(r"(?i)\b[a-z]:[\\/][^\s'\"]*", shown, line)
     line = re.sub(r"(?<![\w.:/~])/[^\s/'\"][^\s'\"]*", shown, line)
     if HOME and len(HOME) > 3:
