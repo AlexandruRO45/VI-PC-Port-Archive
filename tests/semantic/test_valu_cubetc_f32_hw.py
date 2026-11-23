@@ -320,5 +320,57 @@ class TestSignedZeroAndBoundaries(unittest.TestCase):
         val = self._eval_words(POS_ZERO_BITS, NEG_ZERO_BITS, POS_ZERO_BITS)
         self.assertEqual(u32_to_f32(val), 0.0)
 
+class TestModifiersAndClamp(unittest.TestCase):
+    """Input modifiers (|src|, -src) and output clamp modifier."""
+
+    def test_input_modifiers_abs(self):
+        prog = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v0, v1, |v2|, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_abs_s1", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xbfe00000)   # -1.75f
+
+    def test_input_modifiers_neg(self):
+        prog = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xbfe00000",   # -1.75f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 v0, v1, -v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_cubetc_neg_s1", prog)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], 0xbfe00000)   # -1.75f
+
+    def test_output_clamp_modifier(self):
+        prog1 = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0xc0200000",   # -2.5f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv1 = support.translate_lines("ps_cubetc_clamp_hi", prog1)
+        self.assertEqual(support.mrt0_words(spv1)[0], 0x3f800000)   # 1.0f
+
+        prog2 = [
+            "v_mov_b32 v1, 0x40800000",   # 4.0f
+            "v_mov_b32 v2, 0x40200000",   # 2.5f
+            "v_mov_b32 v3, 0x3f000000",   # 0.5f
+            "v_cubetc_f32 clamp v0, v1, v2, v3",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv2 = support.translate_lines("ps_cubetc_clamp_lo", prog2)
+        self.assertEqual(support.mrt0_words(spv2)[0], 0x00000000)   # 0.0f
+
 if __name__ == "__main__":
     unittest.main()
