@@ -5688,7 +5688,8 @@ public:
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
-        auto* heap = new DescriptorHeap(state_, *desc);
+        auto* heap = new (std::nothrow) DescriptorHeap(state_, *desc);
+        if (!heap) return d3d12_trace::result(method, E_OUTOFMEMORY);
         heap->attach_device(identity());
         if (!heap->ok()) {
             heap->Release();
