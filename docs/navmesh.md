@@ -565,6 +565,16 @@ are authoring/build-time inputs to that partition:
   a repeated point, or a boundary that crosses, touches itself or doubles back. Nonpositive or nonfinite
   horizontal extents also make the pair ambiguous.
 
+  | Unique outgoing match (directed slots) | Same winding | Opposite winding | Ambiguous |
+  |---|---:|---:|---:|
+  | Same direction | 61,128 | 592 | 9,614,904 |
+  | Reversed | 448,891,156 | 11,896 | 110,534 |
+
+  Across the whole archive, only 592 same-direction slots have demonstrably opposite winding. Of the
+  61,720 same-direction slots with classifiable rings, 61,128 have the same winding. The remaining
+  9,614,904 slots admit no conclusion from this projection. Reversed slots overwhelmingly join rings
+  of the same winding.
+
 - `tools/navmesh_nodes.py` (stdlib-only) counts the polygon flag bits under the lane-graph nodes
   ([above](#polygon-flags-under-the-lane-graph)). It reads `navmeshes.rpf` and `levels.rpf` and writes counts only.
 
