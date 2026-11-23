@@ -130,6 +130,38 @@ OpFunctionEnd
 """
 
 
+@pytest.mark.skipif(not all(shutil.which(tool) for tool in ("spirv-as", "spirv-val")),
+                    reason="needs SPIRV-Tools on PATH")
+def test_grouped_descriptor_annotations_resolve_per_variable(tmp_path):
+    source = SAMPLE_FRAGMENT.replace(
+        "OpDecorate %images DescriptorSet 0\n"
+        "OpDecorate %images Binding 0\n"
+        "OpDecorate %samplers DescriptorSet 0\n"
+        "OpDecorate %samplers Binding 1\n"
+        "OpDecorate %foreign_samplers DescriptorSet 1\n"
+        "OpDecorate %foreign_samplers Binding 1",
+        "%set_zero = OpDecorationGroup\n"
+        "OpDecorate %set_zero DescriptorSet 0\n"
+        "OpGroupDecorate %set_zero %images %samplers\n"
+        "OpDecorate %images Binding 0\n"
+        "%binding_one = OpDecorationGroup\n"
+        "OpDecorate %binding_one Binding 1\n"
+        "OpGroupDecorate %binding_one %samplers %foreign_samplers\n"
+        "OpDecorate %foreign_samplers DescriptorSet 1",
+    )
+    out = m.rewrite(source, m.capacities())
+    for file, text in (("source.spv", source), ("metal.spv", out)):
+        module = tmp_path / file
+        subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", module],
+                       input=text, text=True, check=True)
+        subprocess.run(["spirv-val", "--target-env", "vulkan1.2", module], check=True)
+    assert "OpDecorate %images DescriptorSet 0" in out
+    assert "OpDecorate %samplers Binding 4096" in out
+    assert "%samplers = OpVariable %msl_ptr_b1 UniformConstant" in out
+    assert "OpDecorate %foreign_samplers Binding 1" in out
+    assert "%foreign_samplers = OpVariable %samplers_ptr UniformConstant" in out
+
+
 @pytest.mark.skipif(not all(shutil.which(tool) for tool in ("spirv-as", "spirv-dis", "spirv-val")),
                     reason="needs SPIRV-Tools on PATH")
 @pytest.mark.parametrize("resource,binding,depth", [

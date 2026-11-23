@@ -59,10 +59,43 @@ def _fresh_id(base, used):
     return cand
 
 
+def _expand_descriptor_groups(lines):
+    """Make grouped DescriptorSet and Binding decorations explicit per variable."""
+    uses = {}
+    for index, line in enumerate(lines):
+        match = re.match(r"\s*OpGroupDecorate\s+(%\w+)\s+([^;]+)", line)
+        if match:
+            uses[index] = (match[1], match[2].split())
+    if not uses:
+        return lines
+
+    by_group = {group: [] for group, _ in uses.values()}
+    grouped_lines = set()
+    for index, line in enumerate(lines):
+        match = re.match(r"\s*OpDecorate\s+(%\w+)\s+(DescriptorSet|Binding)\s+(\d+)\s*(?:;.*)?$", line)
+        if match and match[1] in by_group:
+            by_group[match[1]].append((match[2], match[3]))
+            grouped_lines.add(index)
+    if not grouped_lines:
+        return lines
+
+    out = []
+    for index, line in enumerate(lines):
+        if index in grouped_lines:
+            continue
+        out.append(line)
+        if index in uses:
+            group, targets = uses[index]
+            for target in targets:
+                for decoration, value in by_group[group]:
+                    out.append(f"OpDecorate {target} {decoration} {value}")
+    return out
+
+
 def rewrite(text, counts):
     """Rewrite the disassembly (spirv-dis --raw-id is not needed; names are kept) of one module."""
     ids = metal_ids(counts)
-    lines = text.splitlines()
+    lines = _expand_descriptor_groups(text.splitlines())
     sets, binds = {}, {}
     for ln in lines:
         m = re.match(r"\s*OpDecorate (%\S+) DescriptorSet (\d+)$", ln)
