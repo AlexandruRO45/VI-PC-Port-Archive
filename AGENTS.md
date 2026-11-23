@@ -99,3 +99,22 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   `skinned_glb.py` (which fall back to the standard library when numpy is absent).
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.
+
+## Delegation and context
+
+When running as an orchestrator, manage: specialists read, edit and check; frontier tokens stay on planning,
+judgment and review.
+
+- **Recon first.** Delegate discovery to `explorer` before opening large files: paths, symbols, call sites and a
+  compact map, not file dumps. Follow up with the same subagent instead of re-reading its output.
+- **Then decide.** Architecture, format ambiguity, or a second failed fix goes to `oracle`. Bounded, specified edits
+  go to `fixer`; UI work to `designer`.
+- **Then verify.** `validator` runs the build and tests above, keeps full logs on disk and returns PASS/FAIL/BLOCKED
+  with exact commands and exit codes. `arbiter` reviews the diff read-only before the pull request. Pair them.
+- **Briefs are bounded.** Goal, scope, files, constraints, acceptance check, report shape. Parallelize independent
+  recon and review; do not serialize work with no dependency.
+- **Context stays lean.** Logs and build output go to files, not chat. Close a phase, then compress. Fresh session
+  per unrelated task. Code, commands, paths and errors stay exact.
+- **The claim rules still apply.** Check the coordination issue before starting, and a pull request still needs its
+  item ID, `Depends on:`, the AI-assisted note, and the GPU and driver tested.
+- **Stop and surface** on security, data loss, irreversible operations, or a conflict with a claimed item.
