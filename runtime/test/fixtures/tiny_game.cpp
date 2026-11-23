@@ -185,6 +185,17 @@ int main(int argc, char** argv) {
         std::signal(SIGABRT, SIG_DFL);
         std::abort();
     }
+    // For tiny_game_wer_test: the process's error mode as the exit code (43 when Windows Error Reporting is off for
+    // it, SEM_NOGPFAULTERRORBOX; 44 when it is on), and an unhandled access violation like a title's own crash.
+    if (has_arg(argc, argv, "error-mode")) {
+        std::fflush(stdout);
+        std::exit((GetErrorMode() & SEM_NOGPFAULTERRORBOX) ? 43 : 44);
+    }
+    if (has_arg(argc, argv, "crash")) {
+        std::fflush(stdout);
+        volatile int* nowhere = nullptr;
+        *nowhere = 1;
+    }
 
     std::printf("tiny_game: %s\n", g_failures ? "FAILED" : "OK");
     std::fflush(stdout);

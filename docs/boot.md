@@ -78,6 +78,10 @@ Useful switches:
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_WER=1` reports a crashed run to Windows Error Reporting, for a WER dump. By default gta6rt keeps crashes
+  out of WER (`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`): each WER report of a crashed run left a
+  process with no threads that kept `runtime\build\gta6rt.exe` open, so the next build failed with LNK1168. The exit
+  code is the exception's code either way.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").

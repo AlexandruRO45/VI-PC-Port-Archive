@@ -679,6 +679,11 @@ if(BUILD_TESTING)
     target_compile_definitions(tiny_game_abort_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_abort_test PRIVATE /W4 /permissive- /utf-8)
     add_dependencies(tiny_game_abort_test gta6rt tiny_game)
+    # A crashed run is kept out of Windows Error Reporting, which would leave gta6rt.exe locked (LNK1168).
+    add_executable(tiny_game_wer_test test/tiny_game_wer_test.cpp)
+    target_compile_definitions(tiny_game_wer_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+    target_compile_options(tiny_game_wer_test PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(tiny_game_wer_test gta6rt tiny_game)
     add_test(NAME pe_loader COMMAND pe_loader_test "$<TARGET_FILE:tiny_dll>" "$<TARGET_FILE:tiny_exe>")
 
     # Synthetic, hand-built images through Loader::load: range checks, wrapping RVAs, import-table termination and
@@ -1118,6 +1123,7 @@ if(BUILD_TESTING)
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     add_test(NAME run_tiny_game_abort_exit_codes COMMAND tiny_game_abort_test
              "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
+    add_test(NAME run_tiny_game_wer COMMAND tiny_game_wer_test "$<TARGET_FILE:gta6rt>" "$<TARGET_FILE:tiny_game>")
     # Without relocations it can only run at 0x140000000 (base_reservation.h), so passing means it got there; the
     # game's exact exit code comes back through the relaunch.
     add_test(NAME run_tiny_game_fixed COMMAND gta6rt --run $<TARGET_FILE:tiny_game_fixed> -- hello 42)

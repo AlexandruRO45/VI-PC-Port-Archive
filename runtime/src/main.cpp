@@ -58,7 +58,20 @@ int usage() {
 
 }  // namespace
 
+// A title that ends in an unhandled exception would otherwise be reported to Windows Error Reporting. Each report
+// leaves the ended run behind as a process with no threads that Stop-Process cannot end, and it keeps gta6rt.exe
+// open, so the next build fails to link it (LNK1168) until the file is renamed or the machine restarts. With these
+// two flags the run ends at once with the exception's code as its exit code, as before. Set first, so a relaunched
+// gta6rt (base_reservation.h) inherits it. LEONIDA_WER=1 keeps the system default, for a WER dump of a crash.
+static void keep_crashes_out_of_wer() {
+    wchar_t value[8] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_WER", value, 8);
+    if (n == 1 && value[0] == L'1') return;
+    SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+}
+
 int wmain(int argc, wchar_t** argv) {
+    keep_crashes_out_of_wer();
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;
