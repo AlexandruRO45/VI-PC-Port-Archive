@@ -490,5 +490,22 @@ class VSubCoCiU32TranslatorIntegrationTests(unittest.TestCase):
         d1, _ = ref_sub_co_ci_u32(10, 5, 1)
         self.assertNotEqual(d0, d1)
 
+class VSubrevCoCiU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_subrev_co_ci_u32."""
+
+    def test_basic_reverse_subtraction_with_borrow_in(self):
+        d, b = ref_subrev_co_ci_u32(20, 50, 0)
+        self.assertEqual(d, 30)
+        self.assertEqual(b, 0)
+
+        d2, b2 = ref_subrev_co_ci_u32(20, 50, 1)
+        self.assertEqual(d2, 29)
+        self.assertEqual(b2, 0)
+
+    def test_borrow_in_overflow(self):
+        d, b = ref_subrev_co_ci_u32(1, 0, 1)
+        self.assertEqual(d, 0xFFFFFFFE)
+        self.assertEqual(b, 1)
+
 if __name__ == "__main__":
     unittest.main()
