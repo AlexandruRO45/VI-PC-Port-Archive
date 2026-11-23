@@ -287,7 +287,21 @@ jobs:
           retention-days: 7
           if-no-files-found: error
       - name: CPU runtime tests
-        run: ctest --test-dir runtime/build --output-on-failure
+        shell: pwsh
+        run: |
+          $inventory = Get-Content -LiteralPath runtime/build/ctest.json -Raw | ConvertFrom-Json
+          $gameinput = @($inventory.tests | Where-Object name -CEQ 'gameinput')
+          if ($gameinput.Count -ne 1) {
+            throw "CTest must list one gameinput test, found $($gameinput.Count)"
+          }
+          $test = $gameinput[0]
+          if ($test.properties | Where-Object { $_.name -eq 'DISABLED' -and $_.value -eq $true }) {
+            throw 'CTest gameinput test is disabled'
+          }
+          if (!$test.command -or !(Test-Path -LiteralPath $test.command[0] -PathType Leaf)) {
+            throw 'CTest gameinput executable is missing'
+          }
+          ctest --test-dir runtime/build --output-on-failure
 
   # Runs the Windows build's tests under Wine, so a change that breaks the loader on Linux (through Wine or Proton)
   # shows up. The required ones are the loader and the stand-in game run end to end; the table in the job summary
