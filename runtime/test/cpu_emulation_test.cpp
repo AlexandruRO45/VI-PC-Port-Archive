@@ -294,15 +294,79 @@ void test_live(const ce::Host& host) {
 }
 }  // namespace
 
-int main() {
+// The site table: a first hit is reported once, hits and ticks add up per address, and the snapshot is sorted by hits.
+// Synthetic addresses in a range no code uses, so the live tests' own sites do not mix in.
+void test_sites() {
+    const uint64_t a = 0x7FFF00001000ull, b = 0x7FFF00002000ull;
+    check(ce::record_site(ce::Op::clwb, a, 10), "first hit of a site");
+    check(!ce::record_site(ce::Op::clwb, a, 30), "second hit of a site");
+    check(ce::record_site(ce::Op::insertq_imm, b, 5), "first hit of another site");
+    for (int i = 0; i < 4; ++i) ce::record_site(ce::Op::insertq_imm, b, 5);
+    check(!ce::record_site(ce::Op::clwb, 0, 1), "address 0 is not a site");
+    static ce::SiteSnapshot snap[ce::kMaxSites];
+    const std::size_t n = ce::snapshot_sites(snap, ce::kMaxSites);
+    const ce::SiteSnapshot* sa = nullptr;
+    const ce::SiteSnapshot* sb = nullptr;
+    std::size_t ia = 0, ib = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (snap[i].address == a) sa = &snap[i], ia = i;
+        if (snap[i].address == b) sb = &snap[i], ib = i;
+    }
+    check(sa && sa->op == ce::Op::clwb && sa->hits == 2 && sa->ticks == 40, "site a: kind, hits and ticks");
+    check(sb && sb->op == ce::Op::insertq_imm && sb->hits == 5 && sb->ticks == 25, "site b: kind, hits and ticks");
+    check(sa && sb && ib < ia, "snapshot puts the site with more hits first");
+}
+
+// After test_live on a host that lacks CLWB, its two CLWB sites are in the table with one hit each per run.
+void test_live_sites(const ce::Host& host) {
+    if (host.clwb) return;
+    static ce::SiteSnapshot snap[ce::kMaxSites];
+    const std::size_t n = ce::snapshot_sites(snap, ce::kMaxSites);
+    std::size_t clwb_sites = 0;
+    for (std::size_t i = 0; i < n; ++i)
+        if (snap[i].op == ce::Op::clwb && snap[i].address < 0x7FFF00000000ull) ++clwb_sites;
+    check(clwb_sites >= 2, "the emulated CLWB sites are counted per address");
+}
+
+// --bench: the cost of one emulated instruction, the whole #UD round trip (kernel dispatch, the vectored handler,
+// the return), against the same loop with a 4-byte NOP in its place. Prints nanoseconds per instruction; checks
+// nothing, so a slow machine cannot fail the test.
+//   mov ecx, N; loop: <4 bytes>; dec ecx; jnz loop; ret       (the 4 bytes: clwb [rdx] or nop dword [rax+0])
+double ns_per_iteration(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint32_t iterations, void* line) {
+    Code loop({0xB9, uint8_t(iterations), uint8_t(iterations >> 8), uint8_t(iterations >> 16),
+               uint8_t(iterations >> 24), b0, b1, b2, b3, 0xFF, 0xC9, 0x75, 0xF8, 0xC3});
+    LARGE_INTEGER f, t0, t1;
+    QueryPerformanceFrequency(&f);
+    DWORD ex = 0;
+    QueryPerformanceCounter(&t0);
+    const bool ok = run(loop, nullptr, line, &ex);
+    QueryPerformanceCounter(&t1);
+    if (!ok) return -1;
+    return double(t1.QuadPart - t0.QuadPart) * 1e9 / double(f.QuadPart) / iterations;
+}
+
+void bench(const ce::Host& host) {
+    alignas(64) static uint8_t line[64];
+    const uint32_t n = 200000;
+    const double nop = ns_per_iteration(0x0F, 0x1F, 0x40, 0x00, n, line);
+    const double wb = ns_per_iteration(0x66, 0x0F, 0xAE, 0x32, n, line);
+    std::printf("bench: %u iterations; nop %.1f ns, clwb (%s) %.1f ns per iteration; the emulation costs %.0f ns "
+                "per instruction\n", n, nop, path(host.clwb), wb, wb - nop);
+}
+
+int main(int argc, char** argv) {
+    const bool want_bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     test_decode();
     test_bits();
     test_apply();
+    test_sites();
     const ce::Host host = ce::detect_host();
     std::printf("host: SSE4a %d, MONITORX %d, CLZERO %d, CLWB %d\n", host.sse4a, host.monitorx, host.clzero,
                 host.clwb);
     check(ce::install(), "install the handler");
     test_live(host);
+    test_live_sites(host);
+    if (want_bench) bench(host);
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;

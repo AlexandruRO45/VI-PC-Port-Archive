@@ -25,6 +25,7 @@
 #include <map>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "base_reservation.h"
@@ -55,6 +56,46 @@ int usage() {
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
                  "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
     return 2;
+}
+
+// Per-site counts of the emulated Zen 2 instructions (src/cpu_emulation.h). The startup trace gets one
+// `cpu_emulated` event per new site; the summary goes to stderr at a normal exit, and every N seconds with
+// LEONIDA_CPU_EMU_STATS=N, so a run that ends in a crash still leaves its last counts behind.
+const char* cpu_site_where(uint64_t address, char* buffer, std::size_t size) {
+    try {
+        const std::string s = rt::shims::module_offset(address);
+        std::snprintf(buffer, size, "%s", s.c_str());
+        return buffer;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void cpu_site_traced(rt::cpu_emulation::Op op, uint64_t address) {
+    rt::startup_trace::event("cpu_emulated", "\"instruction\":" + rt::startup_trace::quote(rt::cpu_emulation::name(op)) +
+                                                 ",\"at\":" + rt::startup_trace::quote(rt::startup_trace::where(address)));
+}
+
+void start_cpu_stats_reporter() {
+    wchar_t text[16] = {};
+    const DWORD n = GetEnvironmentVariableW(L"LEONIDA_CPU_EMU_STATS", text, 16);
+    if (n == 0 || n >= 16) return;
+    const unsigned long seconds = std::wcstoul(text, nullptr, 10);
+    if (seconds == 0) return;
+    std::thread([seconds] {
+        uint64_t last = 0;
+        for (;;) {
+            Sleep(static_cast<DWORD>(seconds * 1000));
+            static rt::cpu_emulation::SiteSnapshot snap[rt::cpu_emulation::kMaxSites];
+            const std::size_t count = rt::cpu_emulation::snapshot_sites(snap, rt::cpu_emulation::kMaxSites);
+            uint64_t hits = 0;
+            for (std::size_t i = 0; i < count; ++i) hits += snap[i].hits;
+            if (hits == last) continue;
+            last = hits;
+            rt::cpu_emulation::report_sites(stderr, &cpu_site_where);
+            std::fflush(stderr);
+        }
+    }).detach();
 }
 
 }  // namespace
@@ -159,6 +200,8 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, "[rt] cpu: this CPU lacks%s%s%s%s; the game's uses are emulated (docs/cpu_features.md)\n",
                      host.sse4a ? "" : " SSE4a", host.clzero ? "" : " CLZERO", host.monitorx ? "" : " MONITORX",
                      host.clwb ? "" : " CLWB");
+    rt::cpu_emulation::new_site_hook().store(&cpu_site_traced);
+    start_cpu_stats_reporter();
     if (!rt::cpu_emulation::install())
         std::fprintf(stderr, "[rt] cpu: AddVectoredExceptionHandler failed (error %lu); instructions this CPU lacks "
                              "will stop the game\n", GetLastError());
@@ -256,6 +299,7 @@ int wmain(int argc, wchar_t** argv) {
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();
+        rt::cpu_emulation::report_sites(stderr, &cpu_site_where);
         rt::startup_trace::event("exit", "\"code\":" + std::to_string(code));
         std::fflush(stdout);
         std::fflush(stderr);

@@ -138,6 +138,7 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 #include <psapi.h>
 
 #include <atomic>
+#include <utility>
 #include <cstdio>
 
 namespace rt::cpu_emulation {
@@ -232,6 +233,107 @@ inline std::size_t readable(uint64_t addr, std::size_t want) {
     return got;
 }
 
+// Per-site statistics (docs/cpu_features.md, "Which sites a boot reaches"). Every emulated instruction is counted
+// against the address it sits at, with the time the handler spent on it (TSC ticks, from the handler's entry to its
+// return: the kernel's exception dispatch before and after is not in it; cpu_emulation_test --bench measures the
+// whole round trip). A fixed open-addressing table, filled with compare-and-swap, so the handler never allocates or
+// locks; the executable has 41 such sites (docs/cpu_features.md), far below kMaxSites. A site that does not fit is
+// still emulated and only counted in dropped_sites().
+struct Site {
+    std::atomic<uint64_t> address{0};  // the instruction's first byte; 0 = free slot
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> ticks{0};
+    std::atomic<uint8_t> op{0};
+};
+inline constexpr std::size_t kMaxSites = 256;
+
+inline Site* sites() {
+    static Site table[kMaxSites];
+    return table;
+}
+
+inline std::atomic<uint64_t>& dropped_sites() {
+    static std::atomic<uint64_t> n{0};
+    return n;
+}
+
+// Called once for each new site, from the handler, so it should stay short; unset by
+// default. gta6rt points it at the startup trace.
+using NewSiteHook = void (*)(Op op, uint64_t address);
+inline std::atomic<NewSiteHook>& new_site_hook() {
+    static std::atomic<NewSiteHook> hook{nullptr};
+    return hook;
+}
+
+// Counts one emulation of `op` at `address`. Returns true when this is the site's first hit.
+inline bool record_site(Op op, uint64_t address, uint64_t ticks) {
+    if (!address) return false;
+    std::size_t i = std::size_t((address * 0x9E3779B97F4A7C15ull) >> 56) % kMaxSites;
+    for (std::size_t probe = 0; probe < kMaxSites; ++probe, i = (i + 1) % kMaxSites) {
+        Site& s = sites()[i];
+        uint64_t seen = s.address.load(std::memory_order_acquire);
+        bool first = false;
+        if (seen == 0) {
+            if (s.address.compare_exchange_strong(seen, address, std::memory_order_acq_rel)) {
+                s.op.store(uint8_t(op), std::memory_order_relaxed);
+                seen = address;
+                first = true;
+            }
+        }
+        if (seen != address) continue;
+        s.hits.fetch_add(1, std::memory_order_relaxed);
+        s.ticks.fetch_add(ticks, std::memory_order_relaxed);
+        return first;
+    }
+    dropped_sites().fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+struct SiteSnapshot {
+    Op op = Op::none;
+    uint64_t address = 0, hits = 0, ticks = 0;
+};
+
+// The sites seen so far, most hits first.
+inline std::size_t snapshot_sites(SiteSnapshot* out, std::size_t capacity) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < kMaxSites && n < capacity; ++i) {
+        const Site& s = sites()[i];
+        const uint64_t address = s.address.load(std::memory_order_acquire);
+        if (!address) continue;
+        out[n++] = {Op(s.op.load(std::memory_order_relaxed)), address, s.hits.load(std::memory_order_relaxed),
+                    s.ticks.load(std::memory_order_relaxed)};
+    }
+    for (std::size_t a = 1; a < n; ++a)  // insertion sort: a few dozen entries
+        for (std::size_t b = a; b > 0 && out[b].hits > out[b - 1].hits; --b) std::swap(out[b], out[b - 1]);
+    return n;
+}
+
+// Writes one line per site and a total line to `f`. `where` formats an address (module+offset); null prints it raw.
+// Prints nothing when no instruction was emulated.
+inline void report_sites(std::FILE* f, const char* (*where)(uint64_t address, char* buffer, std::size_t size)) {
+    static SiteSnapshot snap[kMaxSites];
+    const std::size_t n = snapshot_sites(snap, kMaxSites);
+    if (!n) return;
+    uint64_t hits = 0, ticks = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        char buffer[160];
+        const char* at = where ? where(snap[i].address, buffer, sizeof buffer) : nullptr;
+        if (!at) {
+            std::snprintf(buffer, sizeof buffer, "%p", reinterpret_cast<void*>(snap[i].address));
+            at = buffer;
+        }
+        std::fprintf(f, "[rt] cpu: %-16s %s: %llu hits, %llu handler ticks each\n", name(snap[i].op), at,
+                     static_cast<unsigned long long>(snap[i].hits),
+                     static_cast<unsigned long long>(snap[i].hits ? snap[i].ticks / snap[i].hits : 0));
+        hits += snap[i].hits;
+        ticks += snap[i].ticks;
+    }
+    std::fprintf(f, "[rt] cpu: %zu emulated site(s), %llu hits, %llu handler ticks in all%s\n", n,
+                 static_cast<unsigned long long>(hits), static_cast<unsigned long long>(ticks),
+                 dropped_sites().load() ? " (some hits fell outside the site table)" : "");
+}
+
 inline uint64_t& lo(CONTEXT* c, int r) { return c->FltSave.XmmRegisters[r].Low; }
 inline uint64_t hi(const CONTEXT* c, int r) { return uint64_t(c->FltSave.XmmRegisters[r].High); }
 
@@ -289,6 +391,7 @@ inline bool apply(const Decoded& d, CONTEXT* c, EXCEPTION_RECORD* fault = nullpt
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    const uint64_t t0 = __rdtsc();
     CONTEXT* c = info->ContextRecord;
     uint8_t code[15] = {};
     // The CPU fetched this instruction from RIP's page, so only bytes past that page need a (slow) query; the
@@ -311,9 +414,12 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
         r->ExceptionInformation[1] = fault.ExceptionInformation[1];
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    const uint64_t at = c->Rip - d.length;
     if (count(d.op).fetch_add(1, std::memory_order_relaxed) == 0)
         std::fprintf(stderr, "[rt] cpu: this CPU has no %s; emulating it (first at %p)\n", name(d.op),
-                     reinterpret_cast<void*>(c->Rip - d.length));
+                     reinterpret_cast<void*>(at));
+    if (record_site(d.op, at, __rdtsc() - t0))
+        if (const NewSiteHook hook = new_site_hook().load(std::memory_order_acquire)) hook(d.op, at);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
