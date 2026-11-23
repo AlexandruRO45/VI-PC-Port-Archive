@@ -66,10 +66,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import operator
 import os
 import struct
 import sys
 import tempfile
+from array import array
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
@@ -103,6 +105,8 @@ PACKED_INDEX_FORMAT = 0x8C  # R32G32B32A32_UINT, 16-byte element, index in bits 
 WEIGHT_FORMAT = 0x26  # R8G8B8A8_UNORM
 COMPONENT_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
 TYPE_COMPONENTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT4": 16}
+
+_LOW_NIBBLE = bytes(v & 0x0F for v in range(256))
 
 # RAGE Z-up -> glTF Y-up: (x, y, z) -> (x, z, -y).
 _YUP = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
@@ -238,6 +242,11 @@ def _stream_bytes(blob: bytes, base: int, offset: int, size: int, slot: int) -> 
 
 def _unpack_packed_joints(data: bytes, slot: int) -> bytes:
     """Convert four packed u32 joint words per vertex to four u8 indices."""
+    if not len(data) % 16:
+        # Little-endian words: byte 0 is the low index byte and the low nibble of byte 1
+        # holds bits 8-11, so a 12-bit index fits u8 exactly when that nibble is zero.
+        if not any(data[1::4].translate(_LOW_NIBBLE)):
+            return data[0::4]
     out = bytearray()
     for at in range(0, len(data), 16):
         for word in struct.unpack_from("<4I", data, at):
@@ -591,6 +600,55 @@ def own_parent_name(record, own_skeleton) -> str | None:
 
 
 # --------------------------------------------------------------------- weights
+_NONZERO_TO_ONE = bytes(0 if v == 0 else 1 for v in range(256))
+_NONZERO_TO_FF = bytes(0 if v == 0 else 0xFF for v in range(256))
+
+
+def _normalise_weights_columns(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
+                               local_bones: int, local_to_joint: list[int]) -> dict | None:
+    """Column-wise stdlib normalisation; None when a stream needs the per-vertex error pass.
+
+    Produces byte-identical rows to the per-vertex loop: weights are ``weight / total``
+    rounded once to float32 and a joint index is remapped only where its weight is nonzero.
+    """
+    jcols = [j0[k::4] for k in range(4)] + [j1[k::4] for k in range(4)]
+    wcols = [w0[k::4] for k in range(4)] + [w1[k::4] for k in range(4)]
+    totals = array("H", map(sum, zip(*wcols)))  # at most 8 * 255 per vertex
+    if min(totals) <= 0:
+        return None
+    if local_bones < 256:
+        outside = bytes(1 if v >= local_bones else 0 for v in range(256))
+        weighted = _NONZERO_TO_ONE
+        for jcol, wcol in zip(jcols, wcols):
+            bad = (int.from_bytes(jcol.translate(outside), "little")
+                   & int.from_bytes(wcol.translate(weighted), "little"))
+            if bad:
+                return None
+    lookup = [local_to_joint[v] if v < local_bones else 0 for v in range(256)]
+    low = bytes(v & 0xFF for v in lookup)
+    high = bytes(v >> 8 for v in lookup)
+    row_mask = _NONZERO_TO_FF
+    out = {"sum_min": min(totals) / 255.0, "sum_max": max(totals) / 255.0}
+    for half in (0, 1):  # one half at a time keeps the transient copies small
+        joints = bytearray(8 * count)
+        floats = array("f", bytes(16 * count))
+        for column in range(4):
+            slot = 4 * half + column
+            jcol, wcol = jcols[slot], wcols[slot]
+            jcols[slot] = None
+            keep = int.from_bytes(wcol.translate(row_mask), "little")
+            for offset, table in ((0, low), (1, high)):
+                masked = int.from_bytes(jcol.translate(table), "little") & keep
+                joints[2 * column + offset::8] = masked.to_bytes(count, "little")
+            floats[column::4] = array("f", map(operator.truediv, wcol, totals))
+            wcols[slot] = None
+        if sys.byteorder != "little":
+            floats.byteswap()
+        out[f"j{half}"] = bytes(joints)
+        out[f"w{half}"] = floats.tobytes()
+    return out
+
+
 def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
                       local_bones: int, local_to_joint: list[int],
                       joint_count: int | None = None) -> dict:
@@ -651,6 +709,10 @@ def normalise_weights(j0: bytes, j1: bytes, w0: bytes, w1: bytes, count: int,
             "sum_max": float(totals.max()) / 255.0,
         }
 
+    fast = _normalise_weights_columns(j0, j1, w0, w1, count, local_bones, local_to_joint)
+    if fast is not None:
+        return fast
+    # An invalid stream is reported by the per-vertex pass, which names the first bad vertex's error.
     j0_out, j1_out, w0_out, w1_out = bytearray(), bytearray(), bytearray(), bytearray()
     sum_min, sum_max = math.inf, -math.inf
     for vertex in range(count):
@@ -722,6 +784,13 @@ def accessor_bytes(gltf: dict, bin_data: bytes, index: int) -> tuple[bytes, dict
         raise SkinError(f"accessor {index} is outside the BIN chunk")
     if stride == element:
         packed = bin_data[start:start + element * count]
+    elif count >= 32:
+        # Gather one byte column of the interleaved rows at a time (same bytes as per-row slices).
+        packed_rows = bytearray(element * count)
+        last = (count - 1) * stride + 1
+        for column in range(element):
+            packed_rows[column::element] = bin_data[start + column:start + column + last:stride]
+        packed = bytes(packed_rows)
     else:
         packed = b"".join(bin_data[start + i * stride:start + i * stride + element]
                          for i in range(count))
@@ -756,9 +825,15 @@ class _GlbBuilder:
             padding = bytes((-element_size) % 4)
             if padding:
                 # Accessors are read as tightly packed bytes, but glTF vertex rows must align to four bytes.
-                payload = b"".join(payload[i:i + element_size] + padding
-                                   for i in range(0, len(payload), element_size))
                 stride = element_size + len(padding)
+                if len(payload) % element_size == 0 and len(payload) >= 32 * element_size:
+                    rows = bytearray(len(payload) // element_size * stride)
+                    for column in range(element_size):
+                        rows[column::stride] = payload[column::element_size]
+                    payload = bytes(rows)
+                else:
+                    payload = b"".join(payload[i:i + element_size] + padding
+                                       for i in range(0, len(payload), element_size))
         entry = {
             "bufferView": self.view(payload, target, stride=stride),
             "componentType": component_type,
