@@ -291,6 +291,30 @@ def listings(src):
         return sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
 
 
+def check_report_inputs(ap, files, outputs):
+    # Every selected listing already exists. A new report cannot alias one, and existing
+    # reports can share one stat per listing, including when a symlink or hard link is involved.
+    existing = []
+    for flag, path in outputs:
+        if path:
+            try:
+                existing.append((flag, path, os.stat(path)))
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                ap.error(f"cannot inspect {flag} {path}: {e}")
+    if not existing:
+        return
+    for source in files:
+        try:
+            source_stat = os.stat(source)
+        except OSError as e:
+            ap.error(f"cannot inspect input listing {source}: {e}")
+        for flag, path, report_stat in existing:
+            if os.path.samestat(report_stat, source_stat):
+                ap.error(f"{flag} {path} would overwrite input listing {source}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
@@ -307,6 +331,7 @@ def main(argv=None):
     if a.json and a.index_out and same_report_path(a.json, a.index_out):
         ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
     files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
+    check_report_inputs(ap, files, (("--json", a.json), ("--index-out", a.index_out)))
     jobs = pool_workers.process_workers(max(1, a.jobs))
     if jobs == 1 or len(files) < 64:
         records = scan_many(files)

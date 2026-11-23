@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 import warnings
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -190,6 +192,36 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(P.main([os.path.join(ROOT, "no-such-folder-here")]), 2)
         finally:
             sys.stderr = stderr
+
+    def test_reports_refuse_selected_listing_aliases(self):
+        for flag, other_flag in (("--json", "--index-out"), ("--index-out", "--json")):
+            for hard_link in (False, True):
+                with self.subTest(flag=flag, hard_link=hard_link), tempfile.TemporaryDirectory() as tmp:
+                    disasm = Path(tmp) / "disasm"
+                    disasm.mkdir()
+                    write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+                    source = disasm / "ps_table32.s"
+                    original = source.read_bytes()
+                    out = source
+                    if hard_link:
+                        out = Path(tmp) / "alias.json"
+                        try:
+                            os.link(source, out)
+                        except OSError as e:
+                            self.skipTest(f"hard links unavailable: {e}")
+                    other = Path(tmp) / "other.json"
+                    other.write_bytes(b"existing report")
+                    stderr = io.StringIO()
+                    with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                        try:
+                            result = P.main([str(disasm), "--jobs", "1", flag, str(out), other_flag, str(other)])
+                        except SystemExit as e:
+                            result = e.code
+                    self.assertEqual(source.read_bytes(), original)
+                    self.assertEqual(other.read_bytes(), b"existing report")
+                    self.assertEqual(result, 2)
+                    self.assertIn(flag, stderr.getvalue())
+                    self.assertIn("input listing", stderr.getvalue())
 
     def test_limit_must_be_positive(self):
         for value in ("0", "-1"):
