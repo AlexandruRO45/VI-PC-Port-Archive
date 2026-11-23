@@ -300,6 +300,19 @@ class TestMovRelS64AST(unittest.TestCase):
         self.assertIn("OpAccessChain", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestMovRelS64Addressing(unittest.TestCase):
+    def test_wrapping_pair(self):
+        sgprs = {127: 0x111, 0: 0x222}
+        lo, hi = model_movrels_b64(127, 0, sgprs)
+        self.assertEqual(lo, 0x111)
+        self.assertEqual(hi, 0x222)
+
+    def test_translator_movrels64_addressing(self):
+        prog = ["s_mov_b32 m0, 0", "s_movrels_b64 s[6:7], s[8:9]", "s_endpgm"]
+        spv = support.translate_lines("cs_movrels64_addr", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpAccessChain", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
