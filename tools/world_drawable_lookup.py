@@ -46,7 +46,7 @@ def lookup(placements, archetypes, names, manifests):
     index = report_rows(names, "files")
     summary = index.get("summary")
     archive = summary.get("archive") if isinstance(summary, dict) else None
-    if not isinstance(archive, str) or not archive:
+    if not isinstance(archive, str) or not archive.strip():
         raise ValueError(f"{names}: missing archive in summary")
     for row in index["files"]:
         offset = row.get("offset")
