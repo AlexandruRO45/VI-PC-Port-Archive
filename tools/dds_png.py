@@ -266,6 +266,11 @@ def _parse_header_internal(
                     f"0x{r_mask:08X}/0x{g_mask:08X}/0x{b_mask:08X}"
                 )
         else:
+            used_bits = 0
+            for mask in masks:
+                if mask & used_bits:
+                    raise DdsError("Invalid 32-bit RGB DDS: overlapping channel masks")
+                used_bits |= mask
             fmt = _CANONICAL_MASKS.get(masks)
             if fmt is None:
                 fmt = "RGBA8" if a_mask != 0 else "RGBX8"

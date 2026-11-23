@@ -387,6 +387,22 @@ class HeaderTests(unittest.TestCase):
                 self.assertEqual(info["dxgi_format"], dxgi)
                 self.assertEqual(info["data_offset"], 148)
 
+    def test_rejects_overlapping_32bit_channels(self):
+        for masks in ((0xff, 0xff, 0xff0000, 0), (0xff, 0xff0, 0xff0000, 0),
+                      (0xff, 0xff00, 0xff0000, 0xf00000)):
+            with self.subTest(masks=masks):
+                data = dds_buffer(1, 1, bytes(4), flags=DDPF_RGB | DDPF_ALPHAPIXELS,
+                                  bit_count=32, masks=masks)
+                with self.assertRaisesRegex(dds.DdsError, "overlapping channel masks"):
+                    dds.parse_dds_header(data)
+                with self.assertRaisesRegex(dds.DdsError, "overlapping channel masks"):
+                    dds.decode_dds(data)
+
+    def test_unused_alpha_mask_can_overlap_rgb(self):
+        data = dds_buffer(1, 1, bytes((1, 2, 3, 4)), flags=DDPF_RGB, bit_count=32,
+                          masks=(0xff, 0xff00, 0xff0000, 0xff))
+        self.assertEqual(dds.decode_dds(data), (1, 1, bytes((1, 2, 3, 255))))
+
     def test_rejects_non_contiguous_mask(self):
         with self.assertRaises(dds.DdsError) as ctx:
             dds.parse_dds_header(
