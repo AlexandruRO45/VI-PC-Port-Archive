@@ -736,5 +736,107 @@ class TestValuRcpF64BoundaryExtremes(unittest.TestCase):
         self.assertIn("FAbs", spv)
         self.assertIn("OpFNegate", spv)
 
+# ---------------------------------------------------------------------------
+# Phase 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# ---------------------------------------------------------------------------
+
+class TestValuRcpF64NegativeControls(unittest.TestCase):
+    """Phase 8: Negative controls and syntax rejection."""
+
+    def test_parse_empty_string(self) -> None:
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("")
+
+    def test_parse_invalid_opcodes(self) -> None:
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f32 v[0:1], v[2:3]")
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_sqrt_f64 v[0:1], v[2:3]")
+
+    def test_parse_invalid_destinations(self) -> None:
+        # Destination must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 v0, v[2:3]")
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 v[0:2], v[2:3]")
+        # Destination cannot be SGPR
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 s[0:1], v[2:3]")
+
+    def test_parse_invalid_source_span(self) -> None:
+        # Register source must be 2 VGPRs
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:2]")
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:4]")
+
+    def test_parse_vop1_modifiers_rejected(self) -> None:
+        # VOP1 encoding does not support clamp
+        with self.assertRaises(ValueError):
+            ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:3] clamp")
+
+    def test_translator_rejects_sgpr_destination(self) -> None:
+        """Verify translator rejects SGPR destination for v_rcp_f64."""
+        lines = [
+            "v_rcp_f64 s[0:1], v[2:3]",
+            "exp mrt0 v0, v1, v0, v1 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Unsupported):
+            support.translate_lines("ps_rcp_f64_bad_dst", lines)
+
+
+class TestValuRcpF64MutationDetection(unittest.TestCase):
+    """Phase 8: Mutation detection to verify test suite catches incorrect implementations."""
+
+    def test_mutant_multiplication_detected(self) -> None:
+        """Mutant: using multiplication instead of reciprocal."""
+        def faulty_rcp(x: float) -> float:
+            return 1.0 * x
+
+        val = 2.0
+        correct = oracle_rcp_f64(val)
+        mutant = faulty_rcp(val)
+        self.assertEqual(correct, 0.5)
+        self.assertEqual(mutant, 2.0)
+        self.assertNotEqual(mutant, correct)
+
+    def test_mutant_numerator_detected(self) -> None:
+        """Mutant: using 2.0 / x instead of 1.0 / x."""
+        def faulty_rcp(x: float) -> float:
+            return 2.0 / x
+
+        val = 2.0
+        correct = oracle_rcp_f64(val)
+        mutant = faulty_rcp(val)
+        self.assertEqual(correct, 0.5)
+        self.assertEqual(mutant, 1.0)
+        self.assertNotEqual(mutant, correct)
+
+    def test_mutant_dropped_clamp_detected(self) -> None:
+        """Mutant: ignoring clamp modifier."""
+        # 1.0 / 0.5 = 2.0, with clamp -> 1.0
+        val = f64_to_u64(0.5)
+        correct_clamped = oracle_rcp_f64_bits(val, clamp=True)
+        unclamped = oracle_rcp_f64_bits(val, clamp=False)
+        self.assertEqual(u64_to_f64(correct_clamped), 1.0)
+        self.assertEqual(u64_to_f64(unclamped), 2.0)
+        self.assertNotEqual(correct_clamped, unclamped)
+
+    def test_mutant_exec_mask_leak_detected(self) -> None:
+        """Mutant: inactive SIMD lane modifies destination register."""
+        state = SIMDState64(num_lanes=32, exec_mask=0x0)
+        interp = SIMDInterpreter64()
+
+        state.set_vgpr64(0, 2, f64_to_u64(2.0))
+        state.set_vgpr64(0, 0, 0x123456789ABCDEF0)
+
+        inst = ValuRcpF64Instruction.parse("v_rcp_f64 v[0:1], v[2:3]")
+        res = interp.step(inst, state)
+
+        self.assertEqual(len(res), 0)
+        # Inactive lane 0 register must remain intact
+        self.assertEqual(state.get_vgpr64(0, 0), 0x123456789ABCDEF0)
+
 if __name__ == "__main__":
     unittest.main()
