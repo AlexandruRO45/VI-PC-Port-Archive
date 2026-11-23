@@ -343,5 +343,24 @@ class RcpF16ConditionCodesTests(unittest.TestCase):
         self.assertEqual(initial_scc, 1)
         self.assertEqual(initial_vcc, 0x1234567890ABCDEF)
 
+class RcpF16Ieee754EdgeCasesTests(unittest.TestCase):
+    def test_subnormal_inputs(self):
+        # 1.0 / subnormal overflows to +inf in half precision
+        res = oracle_rcp_f16(F16_MIN_SUBNORMAL)
+        self.assertEqual(res, F16_POS_INF)
+
+    def test_signed_zero_inversions(self):
+        self.assertEqual(oracle_rcp_f16(F16_POS_ZERO), F16_POS_INF)
+        self.assertEqual(oracle_rcp_f16(F16_NEG_ZERO), F16_NEG_INF)
+
+    def test_infinity_inversions(self):
+        self.assertEqual(oracle_rcp_f16(F16_POS_INF), F16_POS_ZERO)
+        self.assertEqual(oracle_rcp_f16(F16_NEG_INF), F16_NEG_ZERO)
+
+    def test_overflow_and_underflow(self):
+        # Large normal number reciprocal produces small number
+        res = oracle_rcp_f16(F16_MAX_NORMAL)
+        self.assertLess(u16_to_f16(res), 0.001)
+
 if __name__ == "__main__":
     unittest.main()
