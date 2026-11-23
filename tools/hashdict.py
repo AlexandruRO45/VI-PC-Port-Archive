@@ -18,7 +18,13 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
 STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
@@ -69,6 +75,45 @@ def harvest(data: bytes, out: set, minlen: int):
 
 def _raise_scan_error(error):
     raise error
+
+
+def write_json_report(path, report):
+    """Publish a complete regular file, or write directly to a non-regular destination.
+
+    Parent folders are created when missing (same as the previous direct writer).
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".hashdict-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def main():
@@ -216,9 +261,7 @@ def main():
         d.setdefault(f"{joaat(s):08x}", s)
     # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(d, f)
+        write_json_report(a.out, d)
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
         return 2

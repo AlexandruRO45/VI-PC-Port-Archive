@@ -672,6 +672,18 @@ class OutputPathTest(unittest.TestCase):
                 with open(out, "rb") as f:
                     self.assertEqual(f.read(), before)
 
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous":"true"}'
+            path = os.path.join(tmp, "hashes.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(hashdict, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    hashdict.write_json_report(path, {})
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()
