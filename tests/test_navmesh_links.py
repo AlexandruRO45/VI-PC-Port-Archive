@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Unit tests for tools/navmesh_links.py using synthetic navmesh tiles only."""
 
+import contextlib
+import io
 import json
 import os
 import struct
@@ -446,6 +448,20 @@ class NavmeshLinksTest(unittest.TestCase):
                     self.assertEqual(st["special_links"]["total"], 0)
                 if failed_check == "poly_link_chain":
                     self.assertEqual(st["polygons"]["total"], 0)
+
+    def test_cli_start_at_or_past_the_end_is_a_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rpf = os.path.join(tmp, "nav.rpf")
+            make_rpf(rpf, build_tile())
+            size = os.path.getsize(rpf)
+            for start in (size, size + 4096):
+                with self.subTest(start=start):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = nl.main([rpf, "--start", str(start)])
+                    self.assertEqual(rc, 2, err.getvalue())
+                    self.assertIn("past the end", err.getvalue())
+                    self.assertIn(str(size), err.getvalue())
 
     def test_cli_validation_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
