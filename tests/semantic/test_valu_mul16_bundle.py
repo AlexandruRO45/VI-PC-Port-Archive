@@ -335,5 +335,31 @@ class VMadI32I16SimdBoundaryTests(unittest.TestCase):
             expected = (i - 32) * 1000 + 50000
             self.assertEqual(i32(out[i]), expected)
 
+class VMadI32I16TranslatorIntegrationTests(unittest.TestCase):
+    """Translator execution and negative mutation controls for v_mad_i32_i16."""
+
+    def test_spirv_translation_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0xFC18",  # -1000 in i16
+            "v_mov_b32 v1, 2000",
+            "v_mov_b32 v2, 50",
+            "v_mad_i32_i16 v3, v0, v1, v2",
+            "v_mov_b32 v0, v3",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_mad_i32_i16_bundle_int", lines)
+        out = mrt0_words(spv)
+        self.assertEqual(i32(out[0]), -1999950)
+
+    def test_negative_mutation_contrast(self):
+        s0, s1, s2 = u16(-10), 10, 0
+        signed_res = ref_mad_i32_i16(s0, s1, s2)
+        unsigned_res = ref_mad_u32_u16(s0, s1, s2)
+        self.assertNotEqual(signed_res, unsigned_res)
+
 if __name__ == "__main__":
     unittest.main()
