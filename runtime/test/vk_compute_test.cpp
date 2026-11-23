@@ -151,10 +151,10 @@ static int run(int argc, char** argv) {
     }
     // VKC_HEAP_FILE=<path>[@<offset>]: copy a file into the heap so a shader can read a buffer (a BVH, its
     // descriptor blocks and the records) without the test hard-coding it. The offset is a decimal or 0x hex byte
-    // offset (no octal, sign or spaces); addresses the shader sees are Xbox VAs, i.e. heap offsets, as for every
-    // other heap buffer here. Two overlaps to keep in mind: "bvh" mode writes its synthetic scene after this copy,
-    // so a file at 0x100..0x264 is overwritten there, and the output V# starts at heap offset 0, so a file at @0
-    // shares bytes with the dispatch's output.
+    // offset (no octal, sign or spaces) below 4 GiB, the shader's 32-bit heap address space; addresses the shader
+    // sees are Xbox VAs, i.e. heap offsets, as for every other heap buffer here. Two overlaps to keep in mind: "bvh"
+    // mode writes its synthetic scene after this copy, so a file at 0x100..0x264 is overwritten there, and the output
+    // V# starts at heap offset 0, so a file at @0 shares bytes with the dispatch's output.
     const char* heap_file_env = std::getenv("VKC_HEAP_FILE");
     std::string heap_file_path;
     uint64_t heap_file_at = 0;
@@ -174,7 +174,7 @@ static int run(int argc, char** argv) {
             }
             char* end = nullptr;
             const unsigned long long parsed = std::strtoull(body, &end, hex ? 16 : 10);
-            if (end == body || *end || parsed > (1ull << 32) || heap_file_path.empty()) {
+            if (end == body || *end || parsed >= (1ull << 32) || heap_file_path.empty()) {
                 std::fprintf(stderr, "VKC_HEAP_FILE: expected <path>[@<offset>], got \"%s\"\n", heap_file_env);
                 return 2;
             }
