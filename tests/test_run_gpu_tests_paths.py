@@ -194,16 +194,19 @@ class BuildConfigurations(unittest.TestCase):
             self.assertIsNone(run_gpu_tests.find_test_programs(tmp, ".exe"))
 
 
-    def test_relwithdebinfo_is_preferred_over_release(self):
+    def test_newest_configuration_is_preferred_unless_one_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             build = Path(tmp)
-            for config_name in run_gpu_tests.BUILD_CONFIGS:
-                config = build / config_name
+            rel = build / "RelWithDebInfo"
+            release = build / "Release"
+            for config, timestamp in ((rel, 1_700_000_000), (release, 1_700_000_100)):
                 config.mkdir()
                 for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
-                    (config / (tool + ".exe")).touch()
-            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"),
-                             str(build / "RelWithDebInfo"))
+                    executable = config / (tool + ".exe")
+                    executable.touch()
+                    os.utime(executable, (timestamp, timestamp))
+            self.assertEqual(run_gpu_tests.find_test_programs(str(build), ".exe"), str(release))
+            self.assertEqual(run_gpu_tests.find_test_programs(str(rel), ".exe"), str(rel))
 
     def test_extensionless_executables_are_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,10 +237,10 @@ class BuildConfigurations(unittest.TestCase):
                   self.assertRaises(SystemExit) as caught):
                 run_gpu_tests.main()
             message = str(caught.exception)
-            # names the build folder, says the configuration subfolders were searched, and lists what is missing
-            self.assertIn(str(build), message)
-            self.assertIn("RelWithDebInfo", message)
-            self.assertIn("vk_harness" + ext, message)
+            self.assertIn(f"  {rel}: vk_harness{ext}", message.splitlines())
+            all_tools = ", ".join(name + ext for name in run_gpu_tests.TEST_PROGRAMS)
+            for directory in (build, build / "Release", build / "Debug", build / "MinSizeRel"):
+                self.assertIn(f"  {directory}: {all_tools}", message.splitlines())
 
     def test_main_passes_visual_studio_config_directory_to_suite(self):
         ext = ".exe" if os.name == "nt" else ""

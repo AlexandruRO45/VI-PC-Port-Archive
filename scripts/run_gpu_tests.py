@@ -30,8 +30,8 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
 from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
-                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
+from check import (CMPX_CLASS_WORDS, CONFIG_DIRS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+                   TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
@@ -685,8 +685,8 @@ def with_draw_shaders(asm_files: list[str]) -> list[str]:
     return build
 
 
-REQUIRED_TEST_PROGRAMS = ("vk_compute_test", "vk_store_test", "vk_harness")
-BUILD_CONFIGS = ("RelWithDebInfo", "Release")
+REQUIRED_TEST_PROGRAMS = TEST_PROGRAMS
+BUILD_CONFIGS = CONFIG_DIRS
 
 
 def find_test_programs(build: str, ext: str) -> str | None:
@@ -696,10 +696,10 @@ def find_test_programs(build: str, ext: str) -> str | None:
     in the build directory. Visual Studio and other multi-configuration
     generators put them in a configuration subdirectory.
     """
-    candidates = [build, *(os.path.join(build, config) for config in BUILD_CONFIGS)]
-    for directory in candidates:
-        if all(os.path.isfile(os.path.join(directory, name + ext)) for name in REQUIRED_TEST_PROGRAMS):
-            return directory
+    programs = tuple(name + ext for name in REQUIRED_TEST_PROGRAMS)
+    chosen = pick_build_dir(build, programs)
+    if all(os.path.isfile(os.path.join(chosen, name)) for name in programs):
+        return chosen
     return None
 
 
@@ -760,15 +760,9 @@ def main() -> int:
             return 2
 
     ext = ".exe" if os.name == "nt" else ""
-    required = tuple(t + ext for t in TEST_PROGRAMS)
-    a.build = pick_build_dir(a.build, required)
-    missing = [t for t in required if not os.path.isfile(os.path.join(a.build, t))]
-    if missing:
-        sys.exit(not_found_message(a.build, missing))
-    requested_build = a.build
-    resolved_build = find_test_programs(requested_build, ext)
+    resolved_build = find_test_programs(a.build, ext)
     if resolved_build is None:
-        searched = [requested_build, *(os.path.join(requested_build, config) for config in BUILD_CONFIGS)]
+        searched = [a.build, *(os.path.join(a.build, config) for config in BUILD_CONFIGS)]
         details = []
         for directory in searched:
             missing = [name + ext for name in REQUIRED_TEST_PROGRAMS
