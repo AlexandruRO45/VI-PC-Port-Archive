@@ -358,10 +358,58 @@ int main() {
     CHECK(!list.acceleration_structure_postbuild({0x4000, 4, {0x1000}}));
     CHECK(!list.acceleration_structure_postbuild({0, 0, {0x1000}}));
     CHECK(!list.acceleration_structure_postbuild({0x4004, 0, {0x1000}}));
+    CHECK(!list.acceleration_structure_postbuild({0x4004, 1, {0x1000}}));  // TOOLS_VISUALIZATION still 8-byte aligned
+    CHECK(list.acceleration_structure_postbuild({0x4008, 1, {0x1000}}));
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {}}));
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0}}));
     CHECK(!list.acceleration_structure_postbuild({0x4000, 0, {0x1080}}));
+
+    // Overlap & TLAS instance descriptor alignment checks.
+    build = {};
+    build.dst_va = 0x1000;
+    build.scratch_va = 0x1000;  // dst == scratch
+    CHECK(!list.build_acceleration_structure(build));
+    build.scratch_va = 0x2000;
+    build.update = true;
+    build.src_va = 0x2000;  // update src == scratch
+    CHECK(!list.build_acceleration_structure(build));
+    build.src_va = 0x1000;  // in-place update (dst == src) is valid
+    CHECK(list.build_acceleration_structure(build));
+
+    BuildAccelerationStructure tlas{};
+    tlas.is_tlas = true;
+    tlas.dst_va = 0x1000;
+    tlas.scratch_va = 0x2000;
+    tlas.instance_count = 1;
+    tlas.instance_pointers = false;
+    tlas.instances_va = 0;
+    CHECK(!list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5004;
+    CHECK(!list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5008;  // ARRAY requires 16-byte alignment
+    CHECK(!list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5010;
+    CHECK(list.build_acceleration_structure(tlas));
+
+    tlas.instance_pointers = true;
+    tlas.instances_va = 0;
+    CHECK(!list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5004;  // ARRAY_OF_POINTERS requires 8-byte alignment
+    CHECK(!list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5008;
+    CHECK(list.build_acceleration_structure(tlas));
+
+    tlas.instance_count = 0;
+    tlas.instance_pointers = false;
+    tlas.instances_va = 0;
+    CHECK(list.build_acceleration_structure(tlas));
+    tlas.instances_va = 0x5004;  // ignored when instance_count == 0
+    CHECK(list.build_acceleration_structure(tlas));
+
+    for (std::uint32_t mode = 0; mode <= 4; ++mode)
+        CHECK(!list.copy_acceleration_structure({0x1000, 0x1000, mode}));  // in-place copy disallowed
+
     CHECK(list.close());
-    CHECK(list.commands().size() == 7);
+    CHECK(list.commands().size() == 13);
     return 0;
 }

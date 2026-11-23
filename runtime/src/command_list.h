@@ -878,14 +878,22 @@ public:
         return append(indirect);
     }
 
-    // D3D12: acceleration structures and build scratch are 256-byte aligned; postbuild destinations 8-byte aligned.
+    // D3D12: acceleration structures and build scratch are 256-byte aligned and non-overlapping;
+    // TLAS instance descriptors are 16-byte aligned (8-byte for pointer arrays); postbuild destinations 8-byte aligned.
     bool build_acceleration_structure(BuildAccelerationStructure build) {
         if (!build.dst_va || build.dst_va % 256 || !build.scratch_va || build.scratch_va % 256) return false;
-        if (build.update && (!build.src_va || build.src_va % 256)) return false;
+        if (build.dst_va == build.scratch_va) return false;
+        if (build.update && (!build.src_va || build.src_va % 256 || build.src_va == build.scratch_va)) return false;
+        if (build.is_tlas && build.instance_count) {
+            const std::uint64_t inst_align = build.instance_pointers ? 8 : 16;
+            if (!build.instances_va || build.instances_va % inst_align) return false;
+        }
         return append(std::move(build));
     }
     bool copy_acceleration_structure(CopyAccelerationStructure copy) {
-        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 || copy.mode > 4) return false;
+        if (!copy.dst_va || !copy.src_va || copy.dst_va % 256 || copy.src_va % 256 ||
+            copy.dst_va == copy.src_va || copy.mode > 4)
+            return false;
         return append(copy);
     }
     bool acceleration_structure_postbuild(AccelerationStructurePostbuild info) {

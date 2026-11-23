@@ -865,10 +865,13 @@ public:
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
         const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* desc, UINT postbuild_count,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc) return check(false);
         if (postbuild_count && !postbuild) return check(false);
         for (UINT i = 0; i < postbuild_count; ++i) {
-            if (!valid_postbuild_info_type(postbuild[i].InfoType)) return check(false);
+            if (!valid_postbuild_info_type(postbuild[i].InfoType) ||
+                !postbuild[i].DestBuffer || postbuild[i].DestBuffer % 8 != 0)
+                return check(false);
         }
         const auto& in = desc->Inputs;
         if (in.Type != D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL &&
@@ -950,6 +953,7 @@ public:
     void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* desc, UINT count,
         const D3D12_GPU_VIRTUAL_ADDRESS* sources) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || !desc || !count || !sources) return check(false);
         if (!valid_postbuild_info_type(desc->InfoType)) return check(false);
         leonida::AccelerationStructurePostbuild info{};
@@ -962,6 +966,7 @@ public:
     void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS dest,
                                                                D3D12_GPU_VIRTUAL_ADDRESS source,
                                                                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override {
+        if (list_.closed()) return;
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!valid_copy_mode(mode)) return check(false);
         check(list_.copy_acceleration_structure({dest, source, static_cast<std::uint32_t>(mode)}));
