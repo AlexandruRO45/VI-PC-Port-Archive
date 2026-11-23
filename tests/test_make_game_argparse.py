@@ -498,6 +498,8 @@ class WavValidationTest(unittest.TestCase):
             for name in ("audio_manifest.json", "ogg.done", "xma.done"):
                 with open(os.path.join(manifest_dir, name), "w", encoding="utf-8") as f:
                     f.write("{}")
+            with open(os.path.join(xma_dir, make_game.DECODER_RECORD), "w", encoding="utf-8", newline="\n") as f:
+                f.write(make_game.decoder_digest())
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):
                 with patch("make_game.log"):
@@ -526,6 +528,8 @@ class WavValidationTest(unittest.TestCase):
             for name in ("audio_manifest.json", "xma.done"):     # no ogg.done: the Ogg Opus step is still to run
                 with open(os.path.join(audio, name), "w", encoding="utf-8") as f:
                     f.write("{}")
+            with open(os.path.join(audio, "xma", make_game.DECODER_RECORD), "w", encoding="utf-8", newline="\n") as f:
+                f.write(make_game.decoder_digest())
 
             with patch("make_game.rpf9dump", return_value="fake_dump"), patch("make_game.log"), \
                     patch("make_game.py") as mock_py:
@@ -554,6 +558,9 @@ class WavValidationTest(unittest.TestCase):
                     f.write("{}")
             os.makedirs(os.path.join(manifest_dir, "ogg"), exist_ok=True)
             os.makedirs(os.path.join(manifest_dir, "xma"), exist_ok=True)
+            with open(os.path.join(manifest_dir, "xma", make_game.DECODER_RECORD), "w",
+                      encoding="utf-8", newline="\n") as f:
+                f.write(make_game.decoder_digest())
             os.makedirs(game, exist_ok=True)
 
             with patch("make_game.rpf9dump", return_value="fake_dump"):

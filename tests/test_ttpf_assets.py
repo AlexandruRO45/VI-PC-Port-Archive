@@ -31,6 +31,9 @@ class TextureAssets(unittest.TestCase):
         audio.mkdir(parents=True)
         for marker in ("audio_manifest.json", "ogg.done", "xma.done"):
             (audio / marker).touch()
+        (audio / "xma").mkdir()
+        (audio / "xma" / make_game.DECODER_RECORD).write_text(
+            make_game.decoder_digest(), encoding="utf-8", newline="\n")
         self.pool = self.game / "data/pool.ttpf"
         self.pool.parent.mkdir(parents=True)
         self.folder = self.work / "assets/ttpf/pool"

@@ -26,7 +26,9 @@ class AssetsDecoderTest(unittest.TestCase):
         self.models = os.path.join(self.work, "assets", "scene", "models")
         # The later steps of the stage are marked done so only the model and texture loop runs.
         audio = os.path.join(self.work, "assets", "audio")
-        os.makedirs(audio)
+        self.xma_dir = os.path.join(audio, "xma")
+        self.xma_done = os.path.join(audio, "xma.done")
+        os.makedirs(self.xma_dir)
         for name in ("audio_manifest.json", "ogg.done", "xma.done"):
             with open(os.path.join(audio, name), "w"):
                 pass
@@ -36,6 +38,10 @@ class AssetsDecoderTest(unittest.TestCase):
         ran = []
 
         def fake_run(cmd, *a, **k):
+            if cmd[1] == "xma":
+                self.assertFalse(os.path.exists(self.xma_done))
+                ran.append("xma")
+                return
             folder = os.path.join(cmd[3], "scene", cmd[1])
             os.makedirs(folder, exist_ok=True)
             with open(os.path.join(folder, "manifest.json"), "w") as f:
@@ -51,16 +57,30 @@ class AssetsDecoderTest(unittest.TestCase):
         return ran
 
     def test_the_same_decoder_skips_and_another_one_exports_again(self):
-        self.assertEqual(self.export("d1"), ["models", "textures"])
+        self.assertEqual(self.export("d1"), ["models", "textures", "xma"])
         with open(os.path.join(self.models, make_game.DECODER_RECORD), encoding="utf-8") as f:
             self.assertEqual(f.read(), "d1\n")
         self.assertEqual(self.export("d1"), [])
         # A file of the old decoder must not survive: rpf9dump keeps the files it finds.
         with open(os.path.join(self.models, "old.bin"), "w"):
             pass
-        self.assertEqual(self.export("d2"), ["models", "textures"])
+        with open(os.path.join(self.xma_dir, "old.wav"), "wb"):
+            pass
+        self.assertEqual(self.export("d2"), ["models", "textures", "xma"])
         self.assertFalse(os.path.exists(os.path.join(self.models, "old.bin")))
+        self.assertFalse(os.path.exists(os.path.join(self.xma_dir, "old.wav")))
+        self.assertTrue(os.path.isfile(self.xma_done))
         self.assertEqual(self.export("d2"), [])
+
+    def test_an_interrupted_xma_export_keeps_matching_partial_output(self):
+        self.export("d1")
+        os.remove(self.xma_done)
+        partial = os.path.join(self.xma_dir, "synthetic.xma.wav")
+        with open(partial, "wb"):
+            pass
+        self.assertEqual(self.export("d1"), ["xma"])
+        self.assertTrue(os.path.isfile(partial))
+        self.assertTrue(os.path.isfile(self.xma_done))
 
     def test_a_folder_without_the_record_exports_again(self):
         self.export("d1")
@@ -78,7 +98,8 @@ class AssetsDecoderTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.models, "manifest.json")))
         with open(os.path.join(self.models, make_game.DECODER_RECORD), encoding="utf-8") as f:
             self.assertEqual(f.read(), "d1\n")
-        self.assertEqual(self.export("d2"), ["models", "textures"])
+        self.assertTrue(os.path.isfile(self.xma_done))
+        self.assertEqual(self.export("d2"), ["models", "textures", "xma"])
 
     def test_the_digest_follows_the_exporter_sources(self):
         with tempfile.TemporaryDirectory() as tools:

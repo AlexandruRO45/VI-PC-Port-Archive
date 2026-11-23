@@ -707,7 +707,8 @@ def assets_exported(work: str) -> bool:
     xma.done is written with or without ffmpeg, and every run decodes the XMA2 streams that have no .wav yet once
     ffmpeg is on PATH. So with ffmpeg there, a stream still waiting for its .wav means the stage will write again.
     Models, textures and pools made by another decoder (DECODER_RECORD) don't change the answer: assets() removes each
-    such folder before it exports it again, so the new export goes into the space the old one held."""
+    such folder before it exports it again, so the new export goes into the space the old one held. The same applies
+    to the XMA export and the PCM WAVs decoded from it."""
     audio = os.path.join(work, "assets", "audio")
     for name, what in (("ogg.done", "awc_opus.py"), ("xma.done", "rpf9dump xma")):
         try:
@@ -1894,7 +1895,7 @@ def verify_translation_completeness(dxbc: str, spirv: str) -> None:
              "a port built from it would lack them. Fix the translator for that class and translate again")
 
 # ---------------------------------------------------------------- assets
-# Beside each model, texture and pool manifest.json: the decoder_digest() that made it.
+# In each model, texture, texture pool and XMA export directory: the decoder_digest() that made it.
 DECODER_RECORD = "decoder.sha256"
 
 
@@ -2056,7 +2057,9 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
     need_wav = bool(wav)
     xma_dir = os.path.join(out, "audio", "xma")
     xma_done = os.path.join(out, "audio", "xma.done")
-    need_xma = not os.path.isfile(xma_done)
+    xma_record = os.path.join(xma_dir, DECODER_RECORD)
+    xma_stale = read_shader_setting(xma_record) != decoder
+    need_xma = xma_stale or not os.path.isfile(xma_done)
     ff = shutil.which("ffmpeg")
     need_xma_decode = bool(ff)  # decode_xma no-ops when nothing is pending
     total = (len(archive_todo) + len(pool_todo) + len(pool_follow) + int(need_audio) + int(need_ogg)
@@ -2108,6 +2111,17 @@ def assets(game: str, work: str, wav: bool, jobs: int, dump_jobs: int | None = N
         progress.tick(force=True)
     if need_xma:
         log("assets: XMA2 streams")
+        if xma_stale:
+            # Both exporters skip existing streams. Clear the old XMA and decoded PCM together, but only after
+            # the new exporter can be built. Without the completion marker a stopped run can resume this export.
+            get_exporter(work)
+            if os.path.isfile(xma_done):
+                os.remove(xma_done)
+            if os.path.isdir(xma_dir):
+                shutil.rmtree(xma_dir)
+            os.makedirs(xma_dir, exist_ok=True)
+            with open(xma_record, "w", encoding="utf-8", newline="\n") as f:
+                f.write(decoder + "\n")
         dump("xma", os.path.join(game, "audio.rpf"), out)
         mark(xma_done, "rpf9dump xma")
         progress.tick(force=True)

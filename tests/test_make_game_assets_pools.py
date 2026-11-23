@@ -54,6 +54,10 @@ class AssetsPoolsTest(unittest.TestCase):
         the decoder digest for the run (the model and texture stubs get its record, so only the pools can differ)."""
         calls = []
         digest = decoder or make_game.decoder_digest()
+        xma = os.path.join(self.out, "audio", "xma")
+        os.makedirs(xma, exist_ok=True)
+        with open(os.path.join(xma, make_game.DECODER_RECORD), "w", encoding="utf-8", newline="\n") as f:
+            f.write(digest)
         for rel in make_game.MODEL_ARCHIVES:
             stem = os.path.splitext(os.path.basename(rel))[0]
             for mode in ("models", "textures"):
