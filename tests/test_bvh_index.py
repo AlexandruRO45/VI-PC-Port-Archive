@@ -142,6 +142,19 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual((row["hi16"], row["lo16"]), (0x20, 0x10))
         self.assertEqual(row["off_a0"], 0x1234)
 
+    def test_instance208_requires_its_metadata_prefix(self):
+        payload = instance_payload()
+        # The signature fits before the last metadata field, the u32 at 0xA4. A retained prefix must not be
+        # mistaken for the full record just because the inflater reports its real size as 208.
+        for kept in (0, 1, 8, 0x10, 0x38, 0x40, 0x80, 0xA0, 0xA4, 0xA7):
+            with self.subTest(kept=kept):
+                row = bvh_index.classify(payload[:kept], len(payload))
+                self.assertNotEqual(row["kind"], "instance208")
+        expected = bvh_index.classify(payload, len(payload))
+        for kept in (0xA8, 207, 208):
+            with self.subTest(kept=kept):
+                self.assertEqual(bvh_index.classify(payload[:kept], len(payload)), expected)
+
     def test_descriptor(self):
         b = bytearray(160)
         struct.pack_into("<I", b, 8, 0x50000060)
@@ -367,6 +380,33 @@ class ScanTest(unittest.TestCase):
         # Only 128 bytes were kept, so the 0x140-byte header cannot be read; the real size is still reported.
         self.assertEqual(doc["streams"][0]["kind"], "raw")
         self.assertEqual(doc["streams"][0]["size"], full)
+
+    def test_capped_instance_cli_preserves_streams_and_counts(self):
+        payloads = [instance_payload(), b"z" * 5000]
+        path = os.path.join(self.dir, "instances.rpf")
+        with open(path, "wb") as f:
+            f.write(make_rpf(payloads))
+        out = os.path.join(self.dir, "capped.json")
+        for target in (path, self.dir):
+            for cap in (1, 32, 64, 128, 167, 168, 208, 320):
+                with self.subTest(directory=target == self.dir, cap=cap):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(bvh_index.main([target, "--max-inflate", str(cap), "--out", out]), 0)
+                    with open(out, encoding="utf-8") as f:
+                        doc = json.load(f)
+                    rows, summary = doc["streams"], doc["summary"]
+                    self.assertEqual([r["size"] for r in rows], [len(p) for p in payloads])
+                    self.assertEqual(summary["streams"], 2)
+                    self.assertEqual(summary["inflated"], sum(map(len, payloads)))
+                    self.assertEqual(summary["stored"] + summary["zero_padding"] + summary["unread"], summary["span"])
+                    self.assertEqual(rows[1]["kind"], "raw")
+                    if cap < 168:
+                        self.assertNotEqual(rows[0]["kind"], "instance208")
+                    else:
+                        self.assertEqual(rows[0]["kind"], "instance208")
+                        self.assertEqual(rows[0]["hash"], "0123456789abcdef")
+                        self.assertEqual(rows[0]["off_a0"], 0x1234)
+                        self.assertEqual((rows[0]["hi16"], rows[0]["lo16"]), (0x20, 0x10))
 
     def test_cli_rejects_start_or_limit_for_a_directory(self):
         with open(os.path.join(self.dir, "one.rpf"), "wb") as f:
