@@ -130,5 +130,105 @@ class TestVMax3I32ReferenceOracle(unittest.TestCase):
             for perm in itertools.permutations(triple):
                 self.assertEqual(ref_v_max3_i32(*perm), expected)
 
+# ==============================================================================
+# SECTION 2: Symbolic AST Opcode Definitions and Typed Expressions
+# ==============================================================================
+
+class OperandKind(Enum):
+    VGPR = auto()
+    SGPR = auto()
+    IMMEDIATE = auto()
+
+
+@dataclass(frozen=True)
+class Operand:
+    kind: OperandKind
+    value: int
+
+    def __post_init__(self) -> None:
+        if self.kind == OperandKind.VGPR:
+            if not (0 <= self.value <= 255):
+                raise ValueError(f"VGPR index out of range [0, 255]: {self.value}")
+        elif self.kind == OperandKind.SGPR:
+            if not (0 <= self.value <= 105):
+                raise ValueError(f"SGPR index out of range [0, 105]: {self.value}")
+        elif self.kind == OperandKind.IMMEDIATE:
+            if not (-0x80000000 <= self.value <= 0xFFFFFFFF):
+                raise ValueError(f"Immediate value out of 32-bit range: {self.value}")
+
+
+def VGPR(idx: int) -> Operand:
+    return Operand(OperandKind.VGPR, idx)
+
+
+def SGPR(idx: int) -> Operand:
+    return Operand(OperandKind.SGPR, idx)
+
+
+def Immediate(val: int) -> Operand:
+    return Operand(OperandKind.IMMEDIATE, val)
+
+
+@dataclass(frozen=True)
+class VMax3I32Instruction:
+    dst: Operand
+    src0: Operand
+    src1: Operand
+    src2: Operand
+
+    def __post_init__(self) -> None:
+        if self.dst.kind != OperandKind.VGPR:
+            raise TypeError(f"Destination must be a VGPR, got {self.dst.kind}")
+
+    def format_operand(self, op: Operand) -> str:
+        if op.kind == OperandKind.VGPR:
+            return f"v{op.value}"
+        elif op.kind == OperandKind.SGPR:
+            return f"s{op.value}"
+        else:
+            return f"{op.value}"
+
+    def to_assembly(self) -> str:
+        d = self.format_operand(self.dst)
+        s0 = self.format_operand(self.src0)
+        s1 = self.format_operand(self.src1)
+        s2 = self.format_operand(self.src2)
+        return f"v_max3_i32 {d}, {s0}, {s1}, {s2}"
+
+
+class TestVMax3I32AST(unittest.TestCase):
+    """Commit 2: Symbolic AST opcode definitions and typed expressions."""
+
+    def test_ast_construction_and_formatting(self) -> None:
+        """Verify AST correctly formats to valid RDNA2 assembly text."""
+        inst = VMax3I32Instruction(
+            dst=VGPR(0),
+            src0=VGPR(1),
+            src1=SGPR(4),
+            src2=Immediate(-16),
+        )
+        asm = inst.to_assembly()
+        self.assertEqual(asm, "v_max3_i32 v0, v1, s4, -16")
+
+    def test_ast_operand_bounds_validation(self) -> None:
+        """Verify AST rejects out-of-range registers and invalid destinations."""
+        with self.assertRaises(ValueError):
+            VGPR(256)
+        with self.assertRaises(ValueError):
+            VGPR(-1)
+        with self.assertRaises(ValueError):
+            SGPR(106)
+        with self.assertRaises(ValueError):
+            SGPR(-1)
+        with self.assertRaises(ValueError):
+            Immediate(0x1_0000_0000)
+        with self.assertRaises(TypeError):
+            VMax3I32Instruction(dst=SGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+
+    def test_ast_assembly_execution_structure(self) -> None:
+        """Verify assembly generated from AST has the expected syntax."""
+        inst = VMax3I32Instruction(dst=VGPR(0), src0=VGPR(1), src1=VGPR(2), src2=VGPR(3))
+        self.assertTrue(inst.to_assembly().startswith("v_max3_i32 v0, v1, v2, v3"))
+
 if __name__ == "__main__":
     unittest.main()
