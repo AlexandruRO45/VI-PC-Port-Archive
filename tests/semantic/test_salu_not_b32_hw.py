@@ -489,5 +489,42 @@ class TestSaluNotB32RegisterAliasing(unittest.TestCase):
                 self.assertEqual(hw_res, ref_s_not_b32(c))
                 self.assertEqual(hw_scc, ref_s_not_b32_scc(c))
 
+# --- Section 6: Condition Codes, Status Flags, and Carry/Borrow Generation ---
+
+class TestSaluNotB32ConditionCodes(unittest.TestCase):
+    """Commit 6: Condition codes, status flags, and carry/borrow generation tests."""
+
+    def setUp(self) -> None:
+        self.rf = ScalarRegisterFile()
+        self.interp = SaluInterpreter(self.rf)
+
+    def test_scc_set_to_one_for_nonzero_result(self) -> None:
+        """s_not_b32 yields non-zero result for any S0 != 0xFFFFFFFF, setting SCC = 1."""
+        cases = [0x00000000, 0x12345678, 0x80000000, 0x00000001, 0xFFFFFFFE]
+        for c in cases:
+            self.rf.scc = 0
+            self.rf.write_sgpr(0, c)
+            inst = parse_salu_instruction("s_not_b32 s1, s0")
+            self.interp.execute(inst)
+            self.assertEqual(self.rf.scc, 1)
+
+    def test_scc_cleared_to_zero_for_zero_result(self) -> None:
+        """s_not_b32 yields 0 result when S0 == 0xFFFFFFFF, clearing SCC = 0."""
+        self.rf.scc = 1
+        self.rf.write_sgpr(0, 0xFFFFFFFF)
+        inst = parse_salu_instruction("s_not_b32 s1, s0")
+        res = self.interp.execute(inst)
+        self.assertEqual(res, 0)
+        self.assertEqual(self.rf.scc, 0)
+
+    def test_hardware_scc_generation(self) -> None:
+        # Non-zero result -> SCC = 1
+        _, scc1 = run_salu_not_ps(0x00000000)
+        self.assertEqual(scc1, 1)
+
+        # Zero result -> SCC = 0
+        _, scc0 = run_salu_not_ps(0xFFFFFFFF)
+        self.assertEqual(scc0, 0)
+
 if __name__ == "__main__":
     unittest.main()
