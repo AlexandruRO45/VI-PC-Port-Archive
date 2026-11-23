@@ -12,6 +12,7 @@ on an AMD GPU through tools/hw_oracle (``--hw-arch`` selects the architecture) a
 them with the reference; it returns 77 only when that oracle is unavailable. ``--known`` runs
 known divergence probes; a reproduced mismatch intentionally returns 1. A run that compared nothing (every case
 skipped) exits 2.
+Usage: `python -I tools/f64_diff.py --help` lists the options.
 """
 import argparse
 import gc
