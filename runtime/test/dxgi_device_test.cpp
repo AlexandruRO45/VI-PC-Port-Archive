@@ -123,6 +123,22 @@ int check_backend(const char* label, ID3D12Device* device, ID3D12Device* real, b
         const HRESULT hr4 = adapter->QueryInterface(__uuidof(IDXGIAdapter4), reinterpret_cast<void**>(&adapter4.p));
         Ref<IDXGIFactory1> factory;
         EXPECT(adapter->GetParent(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory.p)) == S_OK);
+        Ref<IDXGIFactory5> factory5;
+        EXPECT(factory->QueryInterface(__uuidof(IDXGIFactory5), reinterpret_cast<void**>(&factory5.p)) == S_OK);
+        BOOL tearing = 7;
+        EXPECT(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing)) == S_OK);
+        EXPECT(tearing == TRUE || tearing == FALSE);
+        for (const UINT size : {0u, 2u, 8u}) {
+            tearing = 7;
+            EXPECT(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, size) ==
+                   DXGI_ERROR_INVALID_CALL && tearing == 7);
+            EXPECT(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, size) ==
+                   DXGI_ERROR_INVALID_CALL);
+        }
+        const auto unknown = static_cast<DXGI_FEATURE>(1);
+        EXPECT(factory5->CheckFeatureSupport(unknown, &tearing, sizeof(tearing)) == DXGI_ERROR_INVALID_CALL);
+        EXPECT(tearing == 7);
+        EXPECT(factory5->CheckFeatureSupport(unknown, nullptr, sizeof(tearing)) == DXGI_ERROR_INVALID_CALL);
         Ref<IDXGIAdapter> second;
         const HRESULT second_hr = factory->EnumAdapters(1, &second.p);
         if (vulkan) {

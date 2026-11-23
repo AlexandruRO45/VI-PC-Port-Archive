@@ -1542,9 +1542,11 @@ int main() {
         if (FAILED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
                                                  sizeof(allow_tearing))))
             return fail("IDXGIFactory5::CheckFeatureSupport(ALLOW_TEARING) failed");
-        if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG ||
-            factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) != E_INVALIDARG)
-            return fail("CheckFeatureSupport should reject null data or wrong size with E_INVALIDARG");
+        if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, nullptr, sizeof(BOOL)) != E_INVALIDARG)
+            return fail("CheckFeatureSupport should reject null data with E_INVALIDARG");
+        if (factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing, 2) !=
+            DXGI_ERROR_INVALID_CALL)
+            return fail("CheckFeatureSupport should reject a wrong size with DXGI_ERROR_INVALID_CALL");
         factory5->Release();
 
         // IDXGIFactory6/7 (D3D-2). Every answer below is the host dxgi.dll's (Windows 11, RTX 3070).

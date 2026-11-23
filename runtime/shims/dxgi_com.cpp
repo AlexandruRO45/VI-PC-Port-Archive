@@ -1583,14 +1583,11 @@ public:
 
     // IDXGIFactory5
     HRESULT STDMETHODCALLTYPE CheckFeatureSupport(DXGI_FEATURE feature, void* data, UINT size) override {
-        if (!data) return E_INVALIDARG;
-        if (feature == DXGI_FEATURE_PRESENT_ALLOW_TEARING) {
-            if (size != sizeof(BOOL)) return E_INVALIDARG;
-            std::call_once(tearing_once_, [this] { tearing_supported_ = probe_immediate_present_mode(); });
-            *static_cast<BOOL*>(data) = tearing_supported_ ? TRUE : FALSE;
-            return S_OK;
-        }
-        return E_INVALIDARG;
+        if (feature != DXGI_FEATURE_PRESENT_ALLOW_TEARING || size != sizeof(BOOL)) return DXGI_ERROR_INVALID_CALL;
+        if (!data) return E_INVALIDARG;  // the host writes through it and crashes
+        std::call_once(tearing_once_, [this] { tearing_supported_ = probe_immediate_present_mode(); });
+        *static_cast<BOOL*>(data) = tearing_supported_ ? TRUE : FALSE;
+        return S_OK;
     }
 
     // IDXGIFactory6. The factory has one adapter, so every preference orders the same list. Measured on the host's
