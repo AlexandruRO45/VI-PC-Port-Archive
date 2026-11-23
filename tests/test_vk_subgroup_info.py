@@ -951,8 +951,37 @@ class QueryTest(unittest.TestCase):
                 res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
                 self.assertIs(res["rdna1_amd_windows"], expected)
 
+    def test_memory_properties_ignore_heap_indices_outside_the_array(self):
+        mem = vk_info.VkPhysicalDeviceMemoryProperties()
+        invalid_index = len(mem.memoryHeaps)
+        mem.memoryHeapCount = invalid_index + 1
+        mem.memoryHeaps[0].size = 512 * 1024 * 1024
+        mem.memoryHeaps[0].flags = vk_info.VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+        mem.memoryTypeCount = 2
+        for i, heap_index in enumerate((invalid_index, 0)):
+            mem.memoryTypes[i].heapIndex = heap_index
+            mem.memoryTypes[i].propertyFlags = (
+                vk_info.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+                | vk_info.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                | vk_info.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            )
+        self.assertEqual(vk_info.evaluate_memory(mem), (512, True, 512))
+
+    def test_queries_memory_only_for_selected_device_when_requested(self):
+        devices = (
+            FakeDevice(name="Integrated GPU", device_type=1),
+            FakeDevice(name="Discrete GPU", vram_bytes=512 * 1024 * 1024, rebar_bytes=0),
+        )
+        result, vk = self._run_query(*devices, stage_caps=True)
+        self.assertNotIn("vram_mb", result)
+        self.assertEqual(vk.memory_calls, [])
+        result, vk = self._run_query(*devices, stage_caps=True, memory=True)
+        self.assertEqual(result["device"], "Discrete GPU")
+        self.assertEqual(result["vram_mb"], 512)
+        self.assertEqual(vk.memory_calls, [vk.features_calls[-1]])
+
     def test_rebar_active_when_heap_exceeds_256_mib(self):
-        """Resizable BAR enabled: DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT memory sits in a heap > 256 MiB."""
+        """A coherent host-visible device-local memory type in a heap > 256 MiB satisfies the heuristic."""
         res, _vk = self._run_query(FakeDevice(vram_bytes=8 * 1024 * 1024 * 1024, rebar_bytes=8 * 1024 * 1024 * 1024),
                                    memory=True)
         self.assertEqual(res["vram_mb"], 8192)
@@ -960,7 +989,7 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(res["rebar_heap_mb"], 8192)
 
     def test_rebar_inactive_when_bar_window_is_256_mib(self):
-        """Resizable BAR disabled: BAR window is <= 256 MiB (kBarWindowBytes in runtime/src/vulkan_memory.h)."""
+        """A heap exactly the size of kBarWindowBytes does not satisfy the heuristic."""
         res, _vk = self._run_query(FakeDevice(vram_bytes=8 * 1024 * 1024 * 1024, rebar_bytes=256 * 1024 * 1024),
                                    memory=True)
         self.assertEqual(res["vram_mb"], 8192)

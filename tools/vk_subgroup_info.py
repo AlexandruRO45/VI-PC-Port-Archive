@@ -2,6 +2,11 @@
 
     python -I tools/vk_subgroup_info.py          # prints one JSON line, exit 0 if a device answered, 1 if not
     python -I tools/vk_subgroup_info.py --stage-caps  # includes the stage masks and workgroup limit
+    python -I tools/vk_subgroup_info.py --memory      # includes Vulkan heap metrics for the selected device
+
+With --memory, vram_mb sums device-local heaps in MiB. rebar_heap_mb is the largest device-local heap
+with a coherent host-visible memory type, and rebar_active means it exceeds 256 MiB. These are Vulkan
+heap metrics, so the sum can differ from physical VRAM and the heuristic can be true for shared memory.
 
 make_game.py uses it to choose between native wave64 translation and --wave64-emulate. It talks to the system's
 Vulkan implementation through ctypes (standard library only), so it works before the runtime stage has built anything.
@@ -143,16 +148,17 @@ def evaluate_memory(mem: VkPhysicalDeviceMemoryProperties) -> tuple[int, bool, i
         | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
     )
 
+    heap_count = min(mem.memoryHeapCount, len(mem.memoryHeaps))
     vram_bytes = sum(
         mem.memoryHeaps[i].size
-        for i in range(min(mem.memoryHeapCount, 16))
+        for i in range(heap_count)
         if mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
     )
 
     rebar_heap_bytes = 0
-    for i in range(min(mem.memoryTypeCount, 32)):
+    for i in range(min(mem.memoryTypeCount, len(mem.memoryTypes))):
         mtype = mem.memoryTypes[i]
-        if (mtype.propertyFlags & wanted) == wanted and mtype.heapIndex < mem.memoryHeapCount:
+        if (mtype.propertyFlags & wanted) == wanted and mtype.heapIndex < heap_count:
             heap = mem.memoryHeaps[mtype.heapIndex]
             if heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT:
                 if heap.size > rebar_heap_bytes:
@@ -300,7 +306,6 @@ def query(*, stage_caps=False, memory=False) -> dict:
     vk.vkEnumerateDeviceExtensionProperties.argtypes = [vp, vp, vp, vp]
     vk.vkGetPhysicalDeviceProperties2.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceFeatures2.argtypes = [vp, vp]
-    vk.vkGetPhysicalDeviceMemoryProperties.argtypes = [vp, vp]
     vk.vkGetPhysicalDeviceQueueFamilyProperties.argtypes = [vp, vp, vp]
     vk.vkDestroyInstance.argtypes = [vp, vp]
     app = AppInfo(VK_STRUCTURE_TYPE_APPLICATION_INFO, None, b"leonida-subgroup-info", 1, None, 0, VK_API_VERSION_1_3)
@@ -369,18 +374,14 @@ def query(*, stage_caps=False, memory=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
-                mem = VkPhysicalDeviceMemoryProperties()
-                vk.vkGetPhysicalDeviceMemoryProperties(d, ctypes.byref(mem))
-                vram_mb, rebar_active, rebar_heap_mb = evaluate_memory(mem)
-                chosen = (dev_name,
+                chosen = (d, dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
-                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16),
-                          vram_mb, rebar_active, rebar_heap_mb)
+                          int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
         if chosen is None:
             if device_filter:
                 raise RuntimeError(
@@ -388,9 +389,8 @@ def query(*, stage_caps=False, memory=False) -> dict:
                     "the runtime needs matches"
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
-        (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver,
-         vram_mb, rebar_active, rebar_heap_mb) = chosen
+        (chosen_device, name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
+         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -426,6 +426,10 @@ def query(*, stage_caps=False, memory=False) -> dict:
                           required_subgroup_size_stages=required_stages,
                           max_compute_workgroup_subgroups=max_workgroup_subgroups)
         if memory:
+            vk.vkGetPhysicalDeviceMemoryProperties.argtypes = [vp, vp]
+            mem = VkPhysicalDeviceMemoryProperties()
+            vk.vkGetPhysicalDeviceMemoryProperties(chosen_device, ctypes.byref(mem))
+            vram_mb, rebar_active, rebar_heap_mb = evaluate_memory(mem)
             result.update(vram_mb=vram_mb,
                           rebar_active=rebar_active,
                           rebar_heap_mb=rebar_heap_mb)
@@ -450,6 +454,7 @@ if __name__ == "__main__":
         pass
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--stage-caps", action="store_true", help="include raw subgroup stage masks and limits")
-    parser.add_argument("--memory", action="store_true", help="include VRAM size and Resizable BAR status")
+    parser.add_argument("--memory", action="store_true",
+                        help="include device-local heap sizes and the runtime's host-visible heap heuristic")
     args = parser.parse_args()
     sys.exit(main(stage_caps=args.stage_caps, memory=args.memory))
