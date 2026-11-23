@@ -1130,19 +1130,21 @@ bool copy_destination(LPCWSTR to, bool fail_if_exists, std::filesystem::path& ou
 }
 
 // The source and destination a copy opens, or the error it fails with.
-bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::path& source,
+bool copy_paths(LPCWSTR from, LPCWSTR to, DWORD flags, std::filesystem::path& source,
                 std::filesystem::path& destination, DWORD& error) {
     if (!from || !to) {
         error = ERROR_INVALID_PARAMETER;
         return false;
     }
-    const Target t = read_target(from);
+    // A writable source handle can be passed to the progress callback. Copy up before opening it so callback
+    // writes, like other write opens, cannot reach the package file.
+    const Target t = (flags & COPY_FILE_OPEN_SOURCE_FOR_WRITE) ? write_target(from, true) : read_target(from);
     if (t.error) {
         error = t.error;
         return false;
     }
     source = t.path;
-    return copy_destination(to, fail_if_exists, destination, error);
+    return copy_destination(to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, destination, error);
 }
 
 }  // namespace
@@ -1150,7 +1152,8 @@ bool copy_paths(LPCWSTR from, LPCWSTR to, bool fail_if_exists, std::filesystem::
 BOOL WINAPI copy_file_w(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, fail_if_exists != FALSE, source, destination, error)) return fail_bool(error);
+    const DWORD flags = fail_if_exists ? COPY_FILE_FAIL_IF_EXISTS : 0;
+    if (!copy_paths(from, to, flags, source, destination, error)) return fail_bool(error);
     return ::CopyFileW(source.c_str(), destination.c_str(), fail_if_exists);
 }
 
@@ -1164,8 +1167,7 @@ BOOL WINAPI copy_file_ex_w(LPCWSTR from, LPCWSTR to, LPPROGRESS_ROUTINE progress
                            DWORD flags) {
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, (flags & COPY_FILE_FAIL_IF_EXISTS) != 0, source, destination, error))
-        return fail_bool(error);
+    if (!copy_paths(from, to, flags, source, destination, error)) return fail_bool(error);
     return ::CopyFileExW(source.c_str(), destination.c_str(), progress, data, cancel, flags);
 }
 
@@ -1250,10 +1252,10 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
     if (parameters && parameters->dwSize < sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return E_INVALIDARG;
     const CopyFile2Fn host = host_copy_file2();
     if (!host && !fallback_supports(parameters)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-    const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
+    const DWORD flags = parameters ? parameters->dwCopyFlags : 0;
     std::filesystem::path source, destination;
     DWORD error = 0;
-    if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
+    if (!copy_paths(from, to, flags, source, destination, error)) return HRESULT_FROM_WIN32(error);
     // A cancel flag already set is answered here, for the host's CopyFile2 as well as the fallback: Windows returns
     // ERROR_REQUEST_ABORTED and writes nothing, while Wine reads the flag in neither call (Wine 11.20's CopyFile2 logs
     // "pfCancel is not supported" and copies, dlls/kernelbase/file.c copy_file; Wine 9 has only CopyFileExW).

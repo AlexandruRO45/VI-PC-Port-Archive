@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <initializer_list>
@@ -49,6 +50,7 @@ using MoveFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR);
 using CopyFileWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, BOOL);
 using CopyFileAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, BOOL);
 using CopyFileExWFn = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
+using CopyFileExAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
 using CopyFile2Fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, COPYFILE2_EXTENDED_PARAMETERS*);
 using SetFileAttributesWFn = BOOL(WINAPI*)(LPCWSTR, DWORD);
 using SetFileAttributesAFn = BOOL(WINAPI*)(LPCSTR, DWORD);
@@ -179,6 +181,56 @@ bool host_renames_case(const std::filesystem::path& folder) {
 }
 
 void run_checks(const std::filesystem::path& root);
+
+constexpr DWORD kCopySourceBytes = 65536;
+struct CopySourceWrite {
+    bool attempted = false;
+    bool wrote = false;
+    DWORD error = 0;
+};
+
+void write_copy_source(HANDLE source, CopySourceWrite& result) {
+    if (result.attempted) return;
+    result.attempted = true;
+    // Windows copy callbacks expose asynchronous, unbuffered handles. Supply aligned storage and an OVERLAPPED
+    // operation, and wait for completion before releasing either. A one-byte synchronous write would fail even
+    // when COPY_FILE_OPEN_SOURCE_FOR_WRITE has correctly granted write access.
+    void* bytes = ::VirtualAlloc(nullptr, kCopySourceBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!bytes) { result.error = GetLastError(); return; }
+    std::memset(bytes, 'M', kCopySourceBytes);
+    OVERLAPPED operation{};
+    operation.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!operation.hEvent) {
+        result.error = GetLastError();
+        ::VirtualFree(bytes, 0, MEM_RELEASE);
+        return;
+    }
+    DWORD written = 0;
+    BOOL ok = ::WriteFile(source, bytes, kCopySourceBytes, &written, &operation);
+    DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    if (!ok && error == ERROR_IO_PENDING) {
+        ok = ::GetOverlappedResult(source, &operation, &written, TRUE);
+        error = ok ? ERROR_SUCCESS : GetLastError();
+    }
+    result.wrote = ok && written == kCopySourceBytes;
+    result.error = error;
+    ::CloseHandle(operation.hEvent);
+    ::VirtualFree(bytes, 0, MEM_RELEASE);
+}
+
+DWORD CALLBACK copy_source_progress(LARGE_INTEGER size, LARGE_INTEGER transferred, LARGE_INTEGER, LARGE_INTEGER,
+                                    DWORD, DWORD reason, HANDLE source, HANDLE, LPVOID context) {
+    if (reason == CALLBACK_CHUNK_FINISHED && transferred.QuadPart == size.QuadPart)
+        write_copy_source(source, *static_cast<CopySourceWrite*>(context));
+    return PROGRESS_CONTINUE;
+}
+
+COPYFILE2_MESSAGE_ACTION CALLBACK copy_source_progress2(const COPYFILE2_MESSAGE* message, PVOID context) {
+    if (message->Type == COPYFILE2_CALLBACK_CHUNK_FINISHED &&
+        message->Info.ChunkFinished.uliTotalBytesTransferred.QuadPart == message->Info.ChunkFinished.uliTotalFileSize.QuadPart)
+        write_copy_source(message->Info.ChunkFinished.hSourceFile, *static_cast<CopySourceWrite*>(context));
+    return COPYFILE2_PROGRESS_CONTINUE;
+}
 
 }  // namespace
 
@@ -819,6 +871,74 @@ void run_checks(const std::filesystem::path& root) {
         SetLastError(0);
         check(copy_w(L"GAME:\\misc\\one.txt", L"GAME:\\cache\\one.txt", FALSE) == FALSE && GetLastError() == ERROR_FILE_NOT_FOUND,
               "a deleted name cannot be copied");
+    }
+
+    // COPY_FILE_OPEN_SOURCE_FOR_WRITE grants the progress callback a writable source handle. Console sources must
+    // be copied up before that handle is opened, even though the operation is a copy rather than CreateFile.
+    {
+        const auto copy_ex_a = resolve<CopyFileExAFn>("kernelbase.dll", "CopyFileExA");
+        check(copy_ex_a != nullptr, "CopyFileExA resolves through kernelbase");
+        const bool host_copy2 = ::GetProcAddress(::GetModuleHandleW(L"kernelbase.dll"), "CopyFile2") ||
+                                ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"), "CopyFile2");
+        const std::string original(kCopySourceBytes, 'O'), changed(kCopySourceBytes, 'M'), existing(kCopySourceBytes, 'E');
+        auto invoke = [&](int api, const std::wstring& from, const std::wstring& to, DWORD flags, CopySourceWrite& result) {
+            if (api == 0) return copy_ex_w(from.c_str(), to.c_str(), copy_source_progress, &result, nullptr, flags) != FALSE;
+            if (api == 1) {  // These ANSI cases use only ASCII console paths.
+                const std::string narrow_from = std::filesystem::path(from).string(), narrow_to = std::filesystem::path(to).string();
+                return copy_ex_a && copy_ex_a(narrow_from.c_str(), narrow_to.c_str(), copy_source_progress, &result, nullptr, flags);
+            }
+            COPYFILE2_EXTENDED_PARAMETERS parameters{sizeof(parameters), flags, nullptr, copy_source_progress2, &result};
+            return SUCCEEDED(copy2(from.c_str(), to.c_str(), &parameters));
+        };
+        for (int api = 0; api < 3; ++api) {
+            // Wine 9 has no host CopyFile2: the existing fallback copies the bytes without calling a CopyFile2 callback.
+            const bool has_callback = api != 2 || host_copy2;
+            for (int variant = 0; variant < 3; ++variant) {
+                const bool writable = variant != 0;
+                const std::wstring name = L"source-" + std::to_wstring(api) + L"-" + std::to_wstring(variant) + L".txt";
+                const auto package_source = package / "copy-source" / name, overlay_source = overlay / "copy-source" / name;
+                write_path(package_source, original);
+                if (variant == 2) write_path(overlay_source, existing);
+                CopySourceWrite result;
+                std::printf("copy source case: API %d, variant %d\n", api, variant);
+                check(invoke(api, L"GAME:\\copy-source\\" + name, L"GAME:\\copy-source\\copy-" + name,
+                             writable ? COPY_FILE_OPEN_SOURCE_FOR_WRITE : 0, result), "copy with source callback succeeds");
+                check(result.attempted == has_callback && result.wrote == (has_callback && writable) &&
+                          (!has_callback || writable || result.error == ERROR_ACCESS_DENIED),
+                      "callback source writes require COPY_FILE_OPEN_SOURCE_FOR_WRITE");
+                check(read_path(package_source) == original, "copy callback never changes package bytes");
+                check(writable ? read_path(overlay_source) == (has_callback ? changed : variant == 2 ? existing : original)
+                               : !std::filesystem::exists(overlay_source),
+                      "writable source uses the overlay; ordinary copy does not copy up its source");
+                check(read_path(overlay / "copy-source" / (L"copy-" + name)) == (variant == 2 ? existing : original),
+                      "copy keeps the source bytes that preceded the callback write");
+            }
+            // Explicit host sources keep native write access. W/CopyFile2 cover arbitrary Unicode host paths;
+            // the ANSI route is covered above without depending on the test machine's user-name code page.
+            if (api != 1) {
+                for (const DWORD flags : {0ul, static_cast<DWORD>(COPY_FILE_OPEN_SOURCE_FOR_WRITE)}) {
+                    const std::wstring name = L"host-" + std::to_wstring(api) + L"-" + std::to_wstring(flags) + L".txt";
+                    const auto source = root / name;
+                    write_path(source, original);
+                    CopySourceWrite result;
+                    check(invoke(api, source.wstring(), L"GAME:\\copy-source\\" + name, flags, result),
+                          "copy accepts an absolute host source");
+                    check(result.attempted == has_callback && result.wrote == (has_callback && flags != 0) &&
+                              read_path(source) == (has_callback && flags ? changed : original),
+                          "host source retains native callback write behavior");
+                    check(read_path(overlay / "copy-source" / name) == original, "host-source copy writes the console destination");
+                }
+            }
+            const std::wstring deleted_name = L"deleted-" + std::to_wstring(api) + L".txt";
+            write_path(package / "copy-source" / deleted_name, original);
+            check(delete_w((L"GAME:\\copy-source\\" + deleted_name).c_str()), "hide a source before requesting write access");
+            CopySourceWrite result;
+            check(!invoke(api, L"GAME:\\copy-source\\" + deleted_name, L"GAME:\\copy-source\\copy-" + deleted_name,
+                          COPY_FILE_OPEN_SOURCE_FOR_WRITE, result) && !result.attempted &&
+                      read_path(package / "copy-source" / deleted_name) == original &&
+                      !std::filesystem::exists(overlay / "copy-source" / deleted_name),
+                  "writable-copy source does not resurrect a deleted package file");
+        }
     }
 
     // SetFileAttributes: the overlay copy gets the attributes; the package keeps its own.

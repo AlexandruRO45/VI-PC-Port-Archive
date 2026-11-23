@@ -134,7 +134,9 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   `ERROR_ACCESS_DENIED` (as deleting one does), a move between `GAME:` and a host path with `ERROR_NOT_SAME_DEVICE`, and
   `MOVEFILE_DELAY_UNTIL_REBOOT` with `ERROR_INVALID_PARAMETER`.
 - `CopyFile`, `CopyFileEx` and `CopyFile2` read the source the way a read does and write a `GAME:` destination in the
-  overlay; fail-if-exists counts a name only the package has. Either side can be a host path. `CopyFile2` checks its
+  overlay; fail-if-exists counts a name only the package has. `COPY_FILE_OPEN_SOURCE_FOR_WRITE` instead copies a
+  package source up to the overlay before opening it, so writes through the progress callback's source handle leave
+  the package unchanged. Either side can be a host path, and a host source keeps its native write behavior. `CopyFile2` checks its
   parameter block before preparing the destination: one shorter than `COPYFILE2_EXTENDED_PARAMETERS` is
   `E_INVALIDARG` and writes nothing, as Windows answers. Where the host has no `CopyFile2` (Wine 9, whose loader binds
   the import to a stub that aborts the process), the shim copies with `CopyFileExW` instead: the flags both calls
