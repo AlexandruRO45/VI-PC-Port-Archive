@@ -98,7 +98,9 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertEqual(record, report["runs"]["full"])
             self.assertEqual(record["outcome"], "launch_failed")
             self.assertIsNone(record["returncode"])
-            self.assertEqual(record["cmd"][0], str(bad_loader))
+            # On macOS tempfile's /var/... is a symlink to /private/var/..., and the recorded command holds the
+            # physical path while the test holds the symlinked one; compare resolved paths on every platform.
+            self.assertEqual(Path(record["cmd"][0]).resolve(), bad_loader.resolve())
             self.assertTrue(record["launch_error"])
             for stream in ("stdout", "stderr"):
                 contents = (out / "logs" / f"full.{stream}.log").read_bytes()
