@@ -93,6 +93,21 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         megabytes = re.search(r"run_entry\(void\* entry, std::size_t stack_bytes = (\d+)u << 20\);", shim).group(1)
         self.assertEqual(int(megabytes) << 20, int(reserve))
 
+    def test_the_loader_gets_the_base_cmake_gives_it(self):
+        """The loader's own image must not sit on the mapped EXE's preferred base. The retail executable wants
+        0x140000000 (docs/runtime_imports.md) and has no relocations, pe_loader.cpp fails with "preferred base is
+        taken and the image has no relocations", and Wine loads a host image at its preferred base, which for an x64
+        EXE linked without /BASE is that same 0x140000000. CMake links gta6rt with GTA6RT_HOST_BASE; the fallback has
+        to pass the same base, or a loader built on the fallback path cannot map the title."""
+        cmake = (ROOT / "runtime" / "CMakeLists.txt").read_text(encoding="utf-8")
+        base = re.search(r"set\(GTA6RT_HOST_BASE (/BASE:0x([0-9A-Fa-f]+))\)", cmake)
+        self.assertIsNotNone(base)
+        self.assertNotEqual(int(base.group(2), 16), 0x140000000)
+        self.assertRegex(cmake, r"target_link_options\(gta6rt PRIVATE [^)]*\$\{GTA6RT_HOST_BASE\}")
+        lines = [line for line in self.body.splitlines() if "/Fe:gta6rt.exe" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn(base.group(1).lower(), lines[0].lower())
+
     def test_build_cmd_sets_utf8_codepage_for_ninja_showincludes(self):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("chcp 65001 >nul", text)
