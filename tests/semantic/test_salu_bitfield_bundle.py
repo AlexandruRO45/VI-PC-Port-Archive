@@ -546,5 +546,23 @@ class TestSBfmB32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_bfm_b32(16, 0), 0xFFFF)
 
 
+def ref_bfm_b64(width: int, offset: int) -> int:
+    """Reference mathematical oracle for RDNA2 s_bfm_b64."""
+    w = width & 63
+    o = offset & 63
+    return (((1 << w) - 1) << o) & MASK64
+
+
+class TestSBfmB64Reference(unittest.TestCase):
+    """Reference oracle unit tests for s_bfm_b64."""
+
+    def test_reference_64bit_masks(self):
+        self.assertEqual(ref_bfm_b64(32, 0), 0xFFFFFFFF)
+        self.assertEqual(ref_bfm_b64(16, 32), 0x0000FFFF_00000000)
+
+    def test_reference_zero_width(self):
+        self.assertEqual(ref_bfm_b64(0, 10), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
