@@ -235,5 +235,32 @@ class SXnorB64RegisterAliasingTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr_pair(0), MASK64)
         self.assertEqual(state.scc, 1)
 
+class SXnorB64ConditionCodesTests(unittest.TestCase):
+    def test_scc_nonzero_and_zero_transitions(self):
+        state = ScalarRegisterState()
+        # Non-zero result sets SCC to 1
+        state.set_sgpr_pair(0, 1)
+        state.set_sgpr_pair(2, 1)
+        ast1 = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 4),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast1)
+        self.assertEqual(state.scc, 1)
+
+        # Zero result transitions SCC to 0
+        state.set_sgpr_pair(0, 0x5555555555555555)
+        state.set_sgpr_pair(2, 0xAAAAAAAAAAAAAAAA)
+        ast2 = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 4),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        execute_scalar_xnor_b64(state, ast2)
+        self.assertEqual(state.scc, 0)
+
 if __name__ == "__main__":
     unittest.main()
