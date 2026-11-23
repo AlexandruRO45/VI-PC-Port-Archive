@@ -430,6 +430,18 @@ class Outputs(unittest.TestCase):
             self.assertIn(b"--jobs must be at least 1", r.stderr)
             self.assertFalse(os.path.exists(out))
 
+    def test_a_test_timeout_below_one_is_an_argument_error(self):
+        # subprocess raises TimeoutExpired for a timeout <= 0, and run_one_test records that as a failed
+        # test: --test-timeout -5 used to mark every selected test as "timed out after -5 s" and exit 0.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            r = subprocess.run([sys.executable, "-I", TOOL, "--out", out, "--run-tests",
+                                "--tests", "test_docs_env_vars", "--test-timeout", "-5"],
+                               capture_output=True, cwd=ROOT, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr.decode("utf-8", "replace"))
+            self.assertIn(b"--test-timeout must be at least 1", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
     def test_out_inside_the_repository_is_refused(self):
         r = subprocess.run([sys.executable, "-I", TOOL, "--out", os.path.join(ROOT, "progress_out_test")],
                            capture_output=True, cwd=ROOT, timeout=120)

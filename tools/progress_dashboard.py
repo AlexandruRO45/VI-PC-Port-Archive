@@ -1007,6 +1007,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if args.jobs < 1:
         ap.error("--jobs must be at least 1")
+    if args.test_timeout < 1:
+        ap.error("--test-timeout must be at least 1")
     if args.run_tests and args.tests:
         try:
             args.tests = re.compile(args.tests)
