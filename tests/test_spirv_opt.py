@@ -399,6 +399,43 @@ class SpirvOptTests(unittest.TestCase):
         # Dead OpFAdd must be gone along with its decoration.
         self.assertNotIn("OpFAdd", opt)
 
+    def test_relaxed_load_does_not_replace_full_precision_value(self):
+        raw = """\
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main" %color
+OpExecutionMode %main OriginUpperLeft
+OpDecorate %color Location 0
+OpDecorate %low RelaxedPrecision
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%v4f = OpTypeVector %f32 4
+%ptr_fn = OpTypePointer Function %f32
+%ptr_out = OpTypePointer Output %v4f
+%one = OpConstant %f32 1
+%exact = OpConstant %f32 1.000244140625
+%color = OpVariable %ptr_out Output
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%slot = OpVariable %ptr_fn Function
+OpStore %slot %exact
+%low = OpLoad %f32 %slot
+%full = OpLoad %f32 %slot
+OpStore %slot %one
+%later = OpLoad %f32 %slot
+%rgba = OpCompositeConstruct %v4f %low %full %later %one
+OpStore %color %rgba
+OpReturn
+OpFunctionEnd
+"""
+        _validate(raw)
+        opt = spirv_opt.optimize(raw)
+        _validate(opt)
+        self.assertIn("OpStore %slot %exact", opt)
+        self.assertIn("%low = OpLoad %f32 %slot", opt)
+        self.assertIn("%rgba = OpCompositeConstruct %v4f %low %exact %one %one", opt)
+
     def test_cli_round_trip(self):
         raw = support.translate_lines("ps_opt_cli", [
             "v_mov_b32_e32 v1, 42",

@@ -796,7 +796,9 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                 deleted_ids.add(res)
                                 changed = True
                                 continue
-                            slot_val[slot] = res
+                            # A decorated load can narrow its result's precision.
+                            if res not in decorated_ids:
+                                slot_val[slot] = res
                             last_store.pop(slot, None)
                         else:
                             # Dynamic load from root: protect all pending intra-block stores to root.
