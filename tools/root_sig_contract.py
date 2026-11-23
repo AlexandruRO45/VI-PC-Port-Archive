@@ -159,7 +159,8 @@ def cluster(shaders):
 
 def _load_json(path):
     try:
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig: --rootsig is hand-written, and Notepad/PowerShell 5.1 save a BOM that json.load rejects
+        with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, ValueError) as e:
         reason = getattr(e, "strerror", None) or e
