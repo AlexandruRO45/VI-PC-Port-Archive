@@ -14595,15 +14595,32 @@ def assemble(gen):
     elif gen.bar_rounds:
         gen.control_flow = "barrier rounds"
 
-    def has_loop(items):
+    def has_barrier(items):
+        """True if a block among these items (nested ones too) runs an OpControlBarrier."""
         stack = list(items)
         while stack:
             it = stack.pop()
-            if it[0] == "loop":
-                return True
-            if it[0] == "guard":
+            if it[0] == "block":
+                if any("OpControlBarrier" in l for l in gen.blocks[it[1]] or ()):
+                    return True
+            else:
                 stack.extend(it[2])
         return False
+
+    def has_budgeted_loop(items):
+        """True if some loop gets the --loop-budget check: one with no barrier inside it. Lanes that run out of budget
+        at different trips would leave a loop with an s_barrier while the others wait at it, a deadlock instead of a
+        wrong result, so such loops are left unguarded."""
+        stack = list(items)
+        while stack:
+            it = stack.pop()
+            if it[0] == "loop" and not has_barrier(it[2]):
+                return True
+            if it[0] != "block":
+                stack.extend(it[2])
+        return False
+
+    budget_on = [False]     # only the plain structured form declares %loop_budget (not the --wave64-emulate plan)
 
     def budget_step(body, again, label):
         """Lines for the --loop-budget check at the end of a loop's body: a loop going round again spends one unit
@@ -14648,15 +14665,15 @@ def assemble(gen):
                     v, again = label("l_pc"), label("l_again")
                     body.extend([f"OpBranch {head}", f"{head} = OpLabel", f"OpLoopMerge {end} {cont} None",
                                  f"OpBranch {top}", f"{top} = OpLabel"])
-                    stack.append(("loop_end", it[1], head, cont, end, v, again))
+                    stack.append(("loop_end", it[1], head, cont, end, v, again, budget_on[0] and not has_barrier(it[2])))
                     stack.append(("items", it[2]))
             elif step[0] == "guard_end":
                 body.extend([f"OpBranch {step[1]}", f"{step[1]} = OpLabel"])
             else:
-                _, blk_id, head, cont, end, v, again = step
+                _, blk_id, head, cont, end, v, again, guarded = step
                 body.extend([f"OpBranch {cont}", f"{cont} = OpLabel", f"{v} = OpLoad %uint %pc",
                              f"{again} = OpIEqual %bool {v} {gen.consts[blk_id]}"])
-                if LOOP_BUDGET:
+                if guarded:
                     again = budget_step(body, again, label)
                 body.extend([f"OpBranchConditional {again} {head} {end}", f"{end} = OpLabel"])
 
@@ -14665,7 +14682,8 @@ def assemble(gen):
         # and every natural loop as a loop that repeats while %pc names its header.
         lines = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
                  "%done = OpVariable %_ptr_Function_bool Function %false"]
-        if LOOP_BUDGET and has_loop(tree):
+        if LOOP_BUDGET and has_budgeted_loop(tree):
+            budget_on[0] = True
             lines.append(f"%loop_budget = OpVariable %_ptr_Function_uint Function {gen.cu(LOOP_BUDGET)}")
             nvars = 3
             gen.loop_budget = LOOP_BUDGET
@@ -14737,7 +14755,8 @@ def assemble(gen):
         n = len(gen.blocks)
         lines = ["%pc = OpVariable %_ptr_Function_uint Function %c0",
                  "%done = OpVariable %_ptr_Function_bool Function %false"]
-        if LOOP_BUDGET:
+        dispatch_budget = bool(LOOP_BUDGET) and not any("OpControlBarrier" in l for b in gen.blocks for l in b or ())
+        if dispatch_budget:
             lines.append(f"%loop_budget = OpVariable %_ptr_Function_uint Function {gen.cu(LOOP_BUDGET)}")
             nvars = 3
             gen.loop_budget = LOOP_BUDGET
@@ -14754,7 +14773,7 @@ def assemble(gen):
                  "%sw_merge = OpLabel", "OpBranch %loop_cont", "%loop_cont = OpLabel",
                  "%dn = OpLoad %bool %done"]
         stop = "%dn"
-        if LOOP_BUDGET:
+        if dispatch_budget:
             # A backward jump (the new %pc is not past the block that just ran) takes a unit. With none left the
             # jump is not taken: the loop exits, as it does once the shader is done.
             body += ["%dn_pc = OpLoad %uint %pc", "%dn_back = OpULessThanEqual %bool %dn_pc %pcv"]

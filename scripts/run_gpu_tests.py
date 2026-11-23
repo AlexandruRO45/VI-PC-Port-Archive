@@ -852,12 +852,13 @@ def run_suite(a, work: str) -> int:
     rc, out = 0, ""
     if len(budgeted) < len(disasm_files):
         rc, out = translate_group(work, [p for p in disasm_files if p not in budgeted], [], spirv_dir)
-    for path in budgeted if rc == 0 else []:
+    for path in budgeted:
         name = os.path.basename(path)[:-2]
         own_dir = os.path.join(work, "spirv_" + name)
-        rc, text = translate_group(work, [path], ["--loop-budget", str(LOOP_BUDGET_FIXTURES[name])], own_dir)
+        own_rc, text = translate_group(work, [path], ["--loop-budget", str(LOOP_BUDGET_FIXTURES[name])], own_dir)
         out += text
-        if rc == 0:
+        rc = rc or own_rc
+        if own_rc == 0:
             merge_translation(own_dir, spirv_dir, name)
     print("=== rdna2spirv.py ===")
     print(out)

@@ -12,7 +12,10 @@ tools/rdna2spirv.py and executes the emitted SPIR-V with the workgroup interpret
     python -I tests/semantic/test_loop_budget.py
 """
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,14 +51,33 @@ def runaway_loop(counter="s10", label="spin"):
     return counting_loop(counter, 2, 1, label)
 
 
-def run(program, budget, structured=True, max_steps=200000):
-    """The last word the shader stored for each of its lanes, translated with --loop-budget `budget`."""
+def translate(program, budget, threads=THREADS, emulate=False, structured=True, lds_bytes=0):
+    """(SPIR-V text, Gen) of a program translated with --loop-budget `budget`."""
     old = getattr(rdna2spirv, "LOOP_BUDGET", 0)
     rdna2spirv.LOOP_BUDGET = budget
     try:
-        spv, _gen = _translate_cs("cs_loop_budget", START + program + END, threads=THREADS, structured=structured)
+        return _translate_cs("cs_loop_budget", program, threads=threads, emulate=emulate, structured=structured,
+                             lds_bytes=lds_bytes)
     finally:
         rdna2spirv.LOOP_BUDGET = old
+
+
+def validate(spv):
+    """Run spirv-as and spirv-val on the text (skip the test when SPIRV-Tools is not installed)."""
+    tools = [shutil.which("spirv-as"), shutil.which("spirv-val")]
+    if not all(tools):
+        raise unittest.SkipTest("spirv-as and spirv-val are not on PATH")
+    with tempfile.TemporaryDirectory() as tmp:
+        text, binary = os.path.join(tmp, "m.spvasm"), os.path.join(tmp, "m.spv")
+        with open(text, "w", encoding="utf-8") as f:
+            f.write(spv)
+        subprocess.run([tools[0], "--target-env", "vulkan1.3", text, "-o", binary], check=True, capture_output=True)
+        return subprocess.run([tools[1], "--target-env", "vulkan1.3", binary], capture_output=True, text=True)
+
+
+def run(program, budget, structured=True, max_steps=200000):
+    """The last word the shader stored for each of its lanes, translated with --loop-budget `budget`."""
+    spv, _gen = translate(START + program + END, budget, structured=structured)
     mem = run_compute_workgroup(spv, THREADS, 32, push_constants=VSHARP, max_steps=max_steps)
     return [mem.get(4 * t) for t in range(THREADS)]
 
@@ -81,6 +103,36 @@ class LoopBudgetTests(unittest.TestCase):
     def test_dispatch_loop_form(self):
         self.assertEqual(run(runaway_loop(), 100, structured=False), [200] * THREADS)
         self.assertEqual(run(finite_loop(10), 65536, structured=False), [10] * THREADS)
+
+    def test_wave64_emulation_with_a_budget_is_valid_and_unguarded(self):
+        # the emulation's own schedulers are not guarded; the module must not mention a budget it never declares
+        # a loop of several blocks takes the structured emulation plan, which shares the code that emits a guarded
+        # loop in the plain structured form
+        spin = ["s_mov_b64 s[10:11], exec", "s_mov_b32 s9, 0", "loop:", "s_add_u32 s9, s9, 2", "s_cmp_lg_u32 s9, 6",
+                "s_cbranch_scc1 skip", "v_add_nc_u32_e32 v3, 1, v3", "skip:", "s_cmp_lg_u32 s9, 1",
+                "s_cbranch_scc1 loop"]
+        spv, gen = translate(spin + START + END, 100, threads=128, emulate=True)
+        self.assertEqual(gen.control_flow, "emulated wave64 structured")
+        result = validate(spv)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("%loop_budget", spv)
+
+    def test_a_loop_with_a_barrier_is_left_unguarded(self):
+        # lanes that ran out of budget on different trips would leave the loop while the rest wait at s_barrier
+        barrier_loop = ["s_mov_b32 s8, 0", "loop:", "s_barrier", "s_add_u32 s8, s8, 1", "s_cmp_lt_u32 s8, 5",
+                        "s_cbranch_scc1 loop"]
+        spv, gen = translate(["s_mov_b64 s[10:11], exec"] + START + barrier_loop + END, 100, threads=128,
+                             lds_bytes=512)
+        self.assertEqual(gen.control_flow, "structured")
+        self.assertNotIn("%loop_budget", spv)
+        spv, _gen = translate(START + barrier_loop + END, 100, structured=False)
+        self.assertNotIn("%loop_budget", spv)
+        # a barrier-free loop in the same shader still is
+        spv, _gen = translate(["s_mov_b64 s[10:11], exec"] + START + barrier_loop + runaway_loop() + END, 100,
+                              threads=128, lds_bytes=512)
+        self.assertIn("%loop_budget", spv)
+        result = validate(spv)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
