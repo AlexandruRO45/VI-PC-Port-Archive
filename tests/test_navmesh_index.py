@@ -397,7 +397,7 @@ class NavmeshIndexTest(unittest.TestCase):
 
         try:
             with mock.patch.object(mod.mmap, "mmap", side_effect=tracking_mmap):
-                with self.assertRaises(SystemExit):
+                with self.assertRaises(ValueError):
                     mod.scan_archive(rpf, start=size)
             self.assertEqual(len(created), 1)
             self.assertTrue(created[0].closed)

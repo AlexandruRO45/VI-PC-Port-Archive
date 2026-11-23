@@ -99,7 +99,7 @@ def scan_archive(path, start=None, limit=None):
             if start is None:
                 start = u32(m, 4) or 0
             if not 0 <= start < size:
-                raise SystemExit(f"start {start} is outside {path} ({size} bytes)")
+                raise ValueError(f"start {start} is outside {path} ({size} bytes)")
             end = min(size, start + limit) if limit else size
             rows, total, last, unread, zero = [], 0, start, 0, 0
             total_stored = total_inflated = 0
@@ -340,7 +340,11 @@ def main() -> int:
         if len(magic) < 8 or magic[1:4] != b"FPR" or magic[0] not in b"789":
             print(f"ERROR: {a.input}: not an RPF7/8/9 archive (magic {magic[:4]!r})", file=sys.stderr)
             return 2
-        rows, summary = scan_archive(a.input, a.start, a.limit)
+        try:
+            rows, summary = scan_archive(a.input, a.start, a.limit)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: {a.input}: {e}", file=sys.stderr)
+            return 2
 
     add_distribution(summary, rows)
     written = write_outputs(rows, summary, out_path, a.csv)
