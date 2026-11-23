@@ -391,6 +391,20 @@ class TestVCvtI16F16Oracle(unittest.TestCase):
         self.assertEqual(ref_v_cvt_i16_f16(0xFC00), 0x8000)  # -inf -> -32768
         self.assertEqual(ref_v_cvt_i16_f16(0x7E00), 0x0000)  # NaN -> 0
 
+class CvtI16F16Expr(ASTNode):
+    def __init__(self, src_expr: str) -> None:
+        self.src_expr = src_expr
+
+    def eval(self, f16_bits: int) -> int:
+        return ref_v_cvt_i16_f16(f16_bits)
+
+
+class TestVCvtI16F16AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = CvtI16F16Expr("v0")
+        self.assertEqual(expr.eval(0xC000), 0xFFFE)  # -2
+        self.assertEqual(expr.eval(0x4000), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
