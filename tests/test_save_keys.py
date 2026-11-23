@@ -461,5 +461,49 @@ class ComposeDeterminism(unittest.TestCase):
         self.assertEqual(composed.split()[2], "1")
 
 
+class StagedOutWrite(unittest.TestCase):
+    """`resolve --out` stages through a sibling temp file so a failed publish preserves any previous report."""
+
+    def test_failed_publish_preserves_previous_report_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save = os.path.join(tmp, "save.json")
+            with open(save, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"%s": 1}' % key("AlphaKey"))
+            dic = os.path.join(tmp, "dict.bin")
+            with open(dic, "wb") as f:
+                f.write(b"\0AlphaKey\0")
+            out = os.path.join(tmp, "resolved.json")
+            previous = '{"previous": true}\n'
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+
+            err = io.StringIO()
+            with mock.patch.object(sk, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = sk.main(["resolve", save, "--dict", dic, "--out", out])
+            self.assertEqual(rc, 1)
+            self.assertIn("error: cannot write", err.getvalue())
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".save_keys-")], [])
+
+    def test_successful_publish_writes_json_and_cleans_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            save = os.path.join(tmp, "save.json")
+            with open(save, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"%s": 1}' % key("AlphaKey"))
+            dic = os.path.join(tmp, "dict.bin")
+            with open(dic, "wb") as f:
+                f.write(b"\0AlphaKey\0")
+            out = os.path.join(tmp, "resolved.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = sk.main(["resolve", save, "--dict", dic, "--out", out])
+            self.assertEqual(rc, 0)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {f"{sk.joaat(b'AlphaKey'):08x}": ["AlphaKey"]})
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".save_keys-")], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,9 +27,17 @@ import collections
 import json
 import os
 import re
+import stat
 import struct
 import sys
+import tempfile
 import zlib
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 KEY = re.compile(rb'"\$0x([0-9a-fA-F]{8})"')
 # A whole run of identifier characters. With a bound inside the pattern ({1,80}) a longer name was cut after 81
@@ -325,14 +333,45 @@ def cmd_resolve(a):
             resolved[k] |= hits[k]
     print(f"  total (joaat)    {len(resolved):6} of {len(keys)} keys ({100 * len(resolved) / max(1, len(keys)):.1f}%)")
     if a.out:
+        payload = {"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())}
         try:
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"%08x" % k: sorted(x.decode("latin-1") for x in v) for k, v in sorted(resolved.items())},
-                          f, indent=1)
+            write_json(a.out, payload)
         except OSError as e:
             print(f"error: cannot write {a.out}: {e.strerror or e}", file=sys.stderr)
             return 1
         print(f"wrote {a.out} (local only: it contains game names)")
+
+
+def write_json(path, payload):
+    """Publish a complete regular JSON file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, indent=1)
+        return
+    if mode is not None:
+        # Preserve the direct writer's permission check without truncating the existing report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=os.path.dirname(destination) or ".", prefix=".save_keys-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def main(argv=None):
