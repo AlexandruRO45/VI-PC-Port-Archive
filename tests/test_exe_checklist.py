@@ -100,6 +100,26 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def test_gdk_calls_report_with_utf8_bom_is_accepted(self):
+        report = os.path.join(self.root, "bom.gdk_calls.json")
+        with open(report, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"images": [{"classes": [{"class_id": SAVE_CLASS.upper()}]}]}, f)
+        out = os.path.join(self.root, "checklist_bom.md")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report, "--out", out]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertIn("demo.cpp:3` ASSUMPTION **called**", f.read())
+
+    def test_malformed_gdk_calls_report_with_utf8_bom_is_exit_1(self):
+        report = os.path.join(self.root, "bad_bom.gdk_calls.json")
+        with open(report, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", report]), 1)
+        self.assertIn("cannot read", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)

@@ -118,7 +118,7 @@ def called_classes(paths: list[str]) -> set[str]:
     """The class ids the executable's gdk_runtime_calls reports list (any image in them)."""
     ids = set()
     for p in paths:
-        with open(p, encoding="utf-8") as f:
+        with open(p, encoding="utf-8-sig") as f:
             doc = json.load(f)
         for image in doc.get("images", [doc]):
             for c in image.get("classes", []):
