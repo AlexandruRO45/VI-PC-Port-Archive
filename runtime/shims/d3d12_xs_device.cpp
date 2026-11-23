@@ -1706,6 +1706,21 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return proxy_get_resource_allocation_info(self, a1, a2, a3, a4);
     } else if constexpr (Slot == 26) {
         return proxy_get_custom_heap_properties(self, a1, a2, a3);
+    } else if constexpr (Slot == 57) {
+        note_slot(57);
+        if (a2 > 0x10000 && a3 > 0x10000 && IsEqualIID(*reinterpret_cast<const IID*>(a2), __uuidof(ID3D12PipelineState))) {
+            static std::atomic<bool> logged57{false};
+            if (first_call(logged57)) {
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: slot 57 -> ID3D12Device2::CreatePipelineState (PC slot 47)\n");
+            }
+            using CreatePsoFn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*,
+                                                 void**);
+            auto fn = reinterpret_cast<CreatePsoFn>(self->real_vtable[47]);
+            return hr_to_u64(fn(self->real, reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(a1),
+                                reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
+        }
+        return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 61) {
         note_slot(61);
         static std::atomic<bool> logged61{false};
@@ -1745,6 +1760,18 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             static_cast<D3D12_RESOURCE_STATES>(static_cast<std::uint32_t>(a4)),
             reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5), reinterpret_cast<const IID*>(a6),
             reinterpret_cast<void**>(a7)));
+    } else if constexpr (Slot == 108) {
+        note_slot(108);
+        static std::atomic<bool> logged108{false};
+        if (first_call(logged108)) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 108 (Xbox stand-in) args: a1=0x%llx a2=0x%llx a3=0x%llx a4=0x%llx "
+                         "a5=0x%llx a6=0x%llx\n",
+                         static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+        }
+        return hr_to_u64(S_OK);
     } else if constexpr (Slot == 127) {
         note_slot(127);
         static std::atomic<bool> logged127{false};
