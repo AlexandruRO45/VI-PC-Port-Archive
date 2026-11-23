@@ -604,5 +604,24 @@ class TestAndOrB32Translator(unittest.TestCase):
             actual = run_translated_triop("v_and_or_b32", a, b, c)
             self.assertEqual(actual, expected)
 
+# ---------------------------------------------------------------------------
+# Opcode 6: v_or3_b32 - Reference Oracle
+# ---------------------------------------------------------------------------
+
+def oracle_or3_b32(a: int, b: int, c: int) -> int:
+    return ((a & MASK32) | (b & MASK32) | (c & MASK32)) & MASK32
+
+
+class TestOr3B32Oracle(unittest.TestCase):
+    def test_basic_or3(self) -> None:
+        self.assertEqual(oracle_or3_b32(0x1, 0x2, 0x4), 0x7)
+        self.assertEqual(oracle_or3_b32(0, 0, 0), 0)
+
+    def test_commutativity_and_associativity(self) -> None:
+        a, b, c = 0x10, 0x20, 0x40
+        m = oracle_or3_b32(a, b, c)
+        self.assertEqual(oracle_or3_b32(b, c, a), m)
+        self.assertEqual(oracle_or3_b32(c, a, b), m)
+
 if __name__ == "__main__":
     unittest.main()
