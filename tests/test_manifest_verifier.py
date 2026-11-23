@@ -369,6 +369,25 @@ class TestManifestVerifier(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 mv.verify_manifest(self.game_dir, self.manifest_path, jobs=1)
 
+    def test_empty_manifest_still_fails_on_an_unlistable_folder(self) -> None:
+        # An empty manifest names no folder, so a folder that cannot be listed may hold the files it should list.
+        target = os.path.join(self.root, "locked_target")
+        locked = os.path.join(target, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(locked, "only.bin"), "wb") as f:
+            f.write(b"x")
+        empty = os.path.join(self.root, "empty.json")
+        self.write_manifest(empty, {})
+        scandir = os.scandir
+
+        def scan(path):
+            if path == locked:
+                raise PermissionError(13, "Access is denied", path)
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan), self.assertRaises(PermissionError):
+            mv.verify_manifest(target, empty, jobs=1)
+
     def test_load_manifest_invalid_json(self) -> None:
         bad_json = os.path.join(self.root, "bad.json")
         with open(bad_json, "w", encoding="utf-8") as f:

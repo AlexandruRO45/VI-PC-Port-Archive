@@ -86,9 +86,10 @@ def sha256(path: str, *, expected_size: int | None = None) -> str:
 
 def walk(game_dir: str, *, exclude=None, needed=None):
     # needed: the manifest's paths. A folder that cannot be listed and holds none of them, such as System Volume
-    # Information at a drive root, is skipped; the top folder, or one that holds a listed file, still fails.
+    # Information at a drive root, is skipped; the top folder, one that holds a listed file, or any folder when the
+    # manifest is empty, still fails.
     def scan_failed(error: OSError) -> None:
-        if needed is not None and error.filename is not None:
+        if needed and error.filename is not None:
             rel = os.path.normcase(os.path.relpath(error.filename, game_dir))
             if rel != os.curdir and not any(os.path.normcase(n).startswith(rel + os.sep) for n in needed):
                 return

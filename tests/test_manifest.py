@@ -240,6 +240,27 @@ class ManifestCreateVerifyTest(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(PermissionError):
                     manifest.verify(self.pkg, self.out_manifest, jobs=1)
 
+    def test_verify_with_an_empty_manifest_still_fails_on_an_unlistable_folder(self):
+        # An empty manifest names no folder, so a folder that cannot be listed may hold the files it should list.
+        pkg = os.path.join(self.tmp.name, "locked_pkg")
+        locked = os.path.join(pkg, "locked")
+        os.makedirs(locked)
+        with open(os.path.join(locked, "only.bin"), "wb") as f:
+            f.write(b"x")
+        empty = os.path.join(self.tmp.name, "empty.json")
+        with open(empty, "w", encoding="utf-8", newline="\n") as f:
+            f.write('{"files": {}}')
+        scandir = os.scandir
+
+        def scan(path):
+            if path == locked:
+                raise PermissionError(13, "Access is denied", path)
+            return scandir(path)
+
+        with patch.object(os, "scandir", side_effect=scan), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(PermissionError):
+                manifest.verify(pkg, empty, jobs=1)
+
     def test_verify_detects_missing_file(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)

@@ -162,9 +162,10 @@ def save_cache(path: str, entries: dict[str, dict]) -> None:
 def walk(target_dir: str, *, exclude: str | tuple[str, ...] | None = None, needed=None):
     """Yields (relative_path, absolute_path) using forward slashes, excluding the selected manifest (and cache)."""
     # needed: the manifest's paths. A folder that cannot be listed and holds none of them, such as System Volume
-    # Information at a drive root, is skipped; the top folder, or one that holds a listed file, still fails.
+    # Information at a drive root, is skipped; the top folder, one that holds a listed file, or any folder when the
+    # manifest is empty, still fails.
     def scan_failed(error: OSError) -> None:
-        if needed is not None and error.filename is not None:
+        if needed and error.filename is not None:
             rel = os.path.normcase(os.path.relpath(error.filename, target_dir))
             if rel != os.curdir and not any(os.path.normcase(n).startswith(rel + os.sep) for n in needed):
                 return
@@ -342,7 +343,8 @@ def verify_manifest(
         raise ManifestError(f"target path is not a directory: {target_dir}")
 
     want = load_manifest(manifest_path)
-    have = dict(walk(target_dir, exclude=manifest_path if cache_path is None else (manifest_path, cache_path), needed=want))
+    exclude = manifest_path if cache_path is None else (manifest_path, cache_path)
+    have = dict(walk(target_dir, exclude=exclude, needed=want))
     if not want and have:
         # A cut-short create or a mistyped --manifest would otherwise print OK without checking a file.
         raise ManifestError(f"{manifest_path} lists no files, but {target_dir} holds {len(have)}")
