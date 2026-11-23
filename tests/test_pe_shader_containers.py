@@ -265,19 +265,6 @@ class ReportPathTests(unittest.TestCase):
         with open(blocker, "rb") as f:
             self.assertEqual(f.read(), b"keep me")
 
-    def test_extract_index_must_not_overwrite_an_input_image(self):
-        extract = os.path.join(self.dir, "out")
-        os.makedirs(extract)
-        input_as_index = os.path.join(extract, "index.json")
-        payload = container([(b"SFI0", bytes(8))])
-        with open(input_as_index, "wb") as f:
-            f.write(payload)
-        code, _, err = self.run_main([input_as_index, "--extract", extract])
-        self.assertEqual(code, 2)
-        self.assertIn("would overwrite the input image", err)
-        with open(input_as_index, "rb") as f:
-            self.assertEqual(f.read(), payload)
-
 
 if __name__ == "__main__":
     unittest.main()

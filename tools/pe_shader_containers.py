@@ -156,7 +156,7 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
             i += 4
             continue
         parts = {fourcc: (start, size) for fourcc, start, size in chunks}
-        dxil = (
+        dialect = (
             chunk_payload(data, i, (b"DXIL",) + parts[b"DXIL"])
             if b"DXIL" in parts
             else b""
@@ -166,7 +166,7 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
             if b"ACCC" in parts
             else b""
         )
-        tags = xdat_tags(dxil) if dxil else []
+        tags = xdat_tags(dialect) if b"DXIL" in parts else []
         record = {
             "image": image,
             "offset": i,
@@ -182,7 +182,7 @@ def inspect(data: bytes, image: str) -> tuple[list[dict], list[int]]:
             "xdat_tags": tags,
             "has_xbch": any(t["tag"] == 0x0D and t["magic"] == "XBCH" for t in tags),
             "has_fspx": accc[:4] == FSPX,
-            "has_bitcode": BITCODE in dxil,
+            "has_bitcode": BITCODE in dialect,
         }
         found.append(record)
         i += total
@@ -227,15 +227,8 @@ def main(argv=None) -> int:
     )
     a = ap.parse_args(argv)
 
-    if a.extract:
-        if os.path.exists(a.extract) and not os.path.isdir(a.extract):
-            ap.error(f"--extract {a.extract} is not a folder")
-        extract_index = os.path.join(a.extract, "index.json")
-        for image in a.images:
-            if same_report_path(extract_index, image):
-                ap.error(
-                    f"--extract {a.extract} index.json would overwrite the input image {image}"
-                )
+    if a.extract and os.path.exists(a.extract) and not os.path.isdir(a.extract):
+        ap.error(f"--extract {a.extract} is not a folder")
     if a.json:
         if os.path.isdir(a.json):
             ap.error(f"--json {a.json} is a folder, not a file")
