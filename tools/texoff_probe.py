@@ -134,6 +134,13 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    # GFX12's assembler rejects this probe's image_sample_lz_o lines ("not a valid operand" at the sampler; gfx1030
+    # and gfx1150 take them), whether or not tsharp builds a GFX12 T#.
+    why = asm.family_skip_reason(oracle.arch, ("gfx10", "gfx11"), "the image_sample_lz_o kernel text of this probe")
+    if why:
+        oracle.close()
+        print(f"hardware oracle unavailable: {why}")
+        return 77
     import tsharp
     try:
         tsharp.check_arch(oracle.arch)          # the T# this probe builds; as image_fuzz.py --oracle hw reports it

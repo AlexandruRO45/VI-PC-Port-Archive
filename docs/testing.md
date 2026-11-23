@@ -513,9 +513,10 @@ On RDNA4 (gfx12xx) only part of this runs, and a tool that cannot run there exit
   so the game's MODE cannot be set there.
 - **Exit 77, kernel text of an older family:** `buffer_swizzle_probe.py` and `smem_neg_probe.py` (GFX12 has no
   MUBUF/MTBUF forms; gfx1150 still assembles them), `vcmp16_opsel_probe.py` (raw GFX10 compare opcodes, which GFX11
-  renumbered) and `sampler_lod_probe.py` (GFX10 mip fields); `sdwa_diff.py` (no SDWA after GFX10) and
-  `mad_denorm_probe.py` (`v_mad_f32` is GFX10.1 only).
-- **Exit 77, no GFX12 T#:** `image_fuzz.py` and `texoff_probe.py`.
+  renumbered), `sampler_lod_probe.py` (GFX10 mip fields) and `texoff_probe.py` (GFX12 rejects its
+  `image_sample_lz_o` operands); `sdwa_diff.py` (no SDWA after GFX10) and `mad_denorm_probe.py` (`v_mad_f32` is
+  GFX10.1 only).
+- **Exit 77, no GFX12 T#:** `image_fuzz.py`.
 
 ## Choosing the GPU
 

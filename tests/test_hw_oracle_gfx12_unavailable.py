@@ -5,11 +5,10 @@
 docs/testing.md: a tool that cannot use the hardware oracle prints `hardware oracle unavailable: ...` and exits 77.
 On an RDNA4 card (measured on gfx1200) these ten tools did something else: an uncaught RuntimeError or ValueError, a
 "harness error" exit 2, or rows printed as MISMATCH whose hardware value was the reason text. Their kernels cannot
-run there for one of three reasons, each known before a kernel is assembled:
+run there for one of two reasons, each known before a kernel is assembled:
 
 - every kernel sets the MODE fields IEEE and DX10_CLAMP, which gfx1170+ fixes (asm.modes_skip_reason);
 - the kernel text or raw encoding is written for an older family (asm.family_skip_reason);
-- the T# layout of the family is not built (tsharp.check_arch).
 
 Each tool is run here with a fake oracle that reports gfx1200 and fails the test if a kernel is run. Standard library
 only; no GPU, no AMD tools, no game files.
@@ -42,7 +41,7 @@ TOOLS_UNAVAILABLE_ON_GFX12 = [
     ("sampler_lod_probe", ["--oracle", "hw"], "is written for gfx10"),
     ("buffer_swizzle_probe", ["--oracle", "hw"], "is written for gfx10 and gfx11"),
     ("smem_neg_probe", ["--oracle", "hw"], "is written for gfx10 and gfx11"),
-    ("texoff_probe", ["--oracle", "hw"], "no T# layout for gfx12"),
+    ("texoff_probe", ["--oracle", "hw"], "is written for gfx10 and gfx11"),
 ]
 
 
@@ -136,7 +135,8 @@ class ToolsOnGfx12(unittest.TestCase):
     def test_gfx11_keeps_what_its_assembler_takes(self):
         # gfx1150 has the same fixed-MODE-free descriptor as RDNA2 and still assembles the MUBUF text, but the raw
         # 16-bit compare words and the GFX10 mip fields are not its own.
-        still_run = ("fmisc_diff", "pknorm_probe", "fma_mix_probe", "buffer_swizzle_probe", "smem_neg_probe")
+        still_run = ("fmisc_diff", "pknorm_probe", "fma_mix_probe", "buffer_swizzle_probe", "smem_neg_probe",
+                     "texoff_probe")
         gfx10_only = ("vcmp16_opsel_probe", "sampler_lod_probe")
         for module, argv, _reason in TOOLS_UNAVAILABLE_ON_GFX12:
             if module in still_run:
