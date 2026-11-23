@@ -141,11 +141,21 @@ def measure(archive, hashes=None, min_fraction=0.9, static_every=0):
     return summarise(meshes, min_fraction), scanned, hash_hits, control
 
 
+def _baseline_values(items, cell):
+    """Per-item maximum chance baseline across positive XY extents."""
+    out = []
+    for item in items:
+        vals = [baseline(item["ext"][k], cell) for k in (0, 1) if item["ext"][k] > 0]
+        if vals:
+            out.append(max(vals))
+    return out
+
+
 def summarise_control(tiles, min_fraction=0.9):
     """Static tiles: for each cell size, how many fit it and the mean chance baseline of their step."""
     out = {"tiles": len(tiles), "cells": {}}
     for c in DOC_CELLS + OTHER_CELLS:
-        bases = [max(baseline(t["ext"][k], c) for k in (0, 1) if t["ext"][k] > 0) for t in tiles[:20]]
+        bases = _baseline_values(tiles[:20], c)
         out["cells"][str(c)] = {"fit": sum(1 for t in tiles if t["fit"][c] >= min_fraction),
                                 "baseline_mean": round(sum(bases) / len(bases), 4) if bases else None}
     return out
@@ -163,12 +173,13 @@ def summarise(meshes, min_fraction=0.9):
         if not g:
             out["cells"][str(c)] = {"meshes": 0}
             continue
-        bases = [max(baseline(m["ext"][k], c) for k in (0, 1) if m["ext"][k] > 0) for m in g]
+        bases = _baseline_values(g, c)
         out["cells"][str(c)] = {
             "meshes": len(g),
             "distinct_xy_extents": len({(round(m["ext"][0], 4), round(m["ext"][1], 4)) for m in g}),
             "min_fraction": round(min(m["fit"][c] for m in g), 6),
-            "baseline_max": round(max(bases), 4), "baseline_mean": round(sum(bases) / len(bases), 4),
+            "baseline_max": round(max(bases), 4) if bases else None,
+            "baseline_mean": round(sum(bases) / len(bases), 4) if bases else None,
             "extents_whole_cells": sum(1 for m in g if all(abs(m["ext"][k] / c - round(m["ext"][k] / c)) < 1e-3
                                                            for k in (0, 1))),
             "vertex_counts": dict(sorted(Counter(m["n"] for m in g).items())) if len(g) <= 16 else None,

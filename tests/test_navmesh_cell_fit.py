@@ -45,6 +45,17 @@ class CellFit(unittest.TestCase):
         self.assertIn(cf.nd.joaat_cs("Wagon01.yft"), h)
         self.assertEqual(len(h), 4)
 
+    def test_non_positive_extents_do_not_crash_summaries(self):
+        ext = (0.0, 0.0, 1.0)
+        fit = {c: 1.0 for c in cf.DOC_CELLS + cf.OTHER_CELLS}
+        meshes = [{"n": 4, "ext": ext, "fit": fit}]
+        s = cf.summarise(meshes)
+        self.assertEqual(s["cells"]["0.0625"]["meshes"], 1)
+        self.assertIsNone(s["cells"]["0.0625"]["baseline_max"])
+        self.assertIsNone(s["cells"]["0.0625"]["baseline_mean"])
+        ctrl = cf.summarise_control(meshes)
+        self.assertIsNone(ctrl["cells"]["0.0625"]["baseline_mean"])
+
 
 if __name__ == "__main__":
     unittest.main()
