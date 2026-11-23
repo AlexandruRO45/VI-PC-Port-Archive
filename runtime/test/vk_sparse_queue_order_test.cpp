@@ -97,7 +97,7 @@ bool run(const Case& test) {
         return false;
 
     constexpr ResourceId resource = 1;
-    auto buffer = std::make_shared<SparseBuffer>(context.device(), context.vk.vkDestroyBuffer);
+    auto buffer = std::make_shared<SparseResource>(context.device(), context.vk);
     buffer->buffer = handle<VkBuffer>(1);
     buffer->tile_count = 1;
     buffer->memory_types = 1;
@@ -105,16 +105,19 @@ bool run(const Case& test) {
     binding.buffer = buffer->buffer;
     binding.size = tile_size_in_bytes;
     binding.sparse_buffer = true;
-    context.add_sparse_buffer(resource, binding, buffer);
+    context.add_sparse_resource(resource, binding, buffer);
     const auto heap = test.reject_bind
         ? std::make_shared<const TileHeapAllocation>(TileHeapAllocation{handle<VkDeviceMemory>(1), 0,
                                                                        tile_size_in_bytes, 0})
         : nullptr;
-    const std::array regions{BufferTileRegion{0, 1}};
-    const std::array ranges{BufferTileRange{test.reject_bind ? TileRangeMode::sequential : TileRangeMode::skip, 0, 1}};
+    const std::array regions{TileRegion{0, 1}};
+    const std::array ranges{TileRange{test.reject_bind ? TileRangeMode::sequential : TileRangeMode::skip, 0, 1}};
 
-    queue.wait(gate.semaphore(), first_wait);
-    if (!expect(queue.update_tiles(resource, regions, ranges, [&] { return heap; }),
+    auto wait_pin = std::make_shared<int>(0);
+    const std::weak_ptr<int> retained_wait_pin = wait_pin;
+    queue.wait(gate.semaphore(), first_wait, [&] { return wait_pin; });
+    wait_pin.reset();
+    if (!expect(queue.update_tiles(resource, regions, ranges, [&](bool, std::uint32_t) { return heap; }),
                 "accepted the mapping while the producer was unsignaled"))
         return false;
     queue.marker(DebugMarker::Kind::set, "marker after mapping");
@@ -131,6 +134,7 @@ bool run(const Case& test) {
     if (!test.queued_signal && !expect(queue.signal(done.semaphore(), 1), "accepted the later signal"))
         return false;
     return expect(gate.completed() < first_wait, "producer has not completed on the GPU") &&
+           expect(!retained_wait_pin.expired(), "the forwarded wait stays pinned until its submission completes") &&
            expect(trace.binds == (test.reject_bind ? 1u : 0u) && buffer->mapped.empty(),
                   "the mapping was skipped or its bind failed without changing the map") &&
            expect(trace.submits == 1 && trace.wait_count == 1 && trace.wait_semaphore == gate.semaphore() &&
