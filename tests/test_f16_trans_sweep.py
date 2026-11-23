@@ -242,6 +242,58 @@ class Cli(unittest.TestCase):
             self.assertIn("error:", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
 
+    def test_check_modes_malformed_oracle_results_exit_2(self):
+        good_word = sw.mode_word(sw.MODES["keep16"])
+        bad_returns = [
+            None,
+            [],
+            [[good_word]],
+            [[good_word], [good_word], [good_word]],
+            [None, [good_word]],
+            [[], [good_word]],
+            [[good_word, good_word], [good_word]],
+        ]
+        for ret in bad_returns:
+            with self.subTest(ret=ret), tempfile.TemporaryDirectory() as d:
+                out_path = Path(d) / "report.json"
+                fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+                fake_oracle.run.return_value = ret
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                        redirect_stdout(out), redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+                self.assertEqual(rc, 2)
+                self.assertIn("harness error: MODE probe:", out.getvalue())
+                self.assertFalse(out_path.exists())
+                fake_oracle.close.assert_called_once()
+
+    def test_sweep_malformed_oracle_results_exit_2(self):
+        n_kernels = 65536 // sw.PER_KERNEL
+        words_per_kernel = sw.PER_KERNEL // 2
+        good_kernel = [0] * words_per_kernel
+        bad_returns = [
+            ("none", None),
+            ("short_list", [list(good_kernel) for _ in range(n_kernels - 1)]),
+            ("extra_list", [list(good_kernel) for _ in range(n_kernels + 1)]),
+            ("none_entry", [None] + [list(good_kernel) for _ in range(n_kernels - 1)]),
+            ("short_words", [[0] * (words_per_kernel - 1)] + [list(good_kernel) for _ in range(n_kernels - 1)]),
+        ]
+        for label, ret in bad_returns:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                out_path = Path(d) / "report.json"
+                fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+                fake_oracle.run.return_value = ret
+                out, err = io.StringIO(), io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                        mock.patch.object(sw, "check_modes"), \
+                        mock.patch.object(sw, "reference", return_value=[0] * 65536), \
+                        redirect_stdout(out), redirect_stderr(err):
+                    rc = sw.main(["--ops", "v_exp_f16", "--modes", "keep16", "--waves", "32", "--json", str(out_path)])
+                self.assertEqual(rc, 2)
+                self.assertIn("harness error: v_exp_f16 keep16 wave32", out.getvalue())
+                self.assertFalse(out_path.exists())
+                fake_oracle.close.assert_called_once()
+
 
 class OnHardware(unittest.TestCase):
     @classmethod
