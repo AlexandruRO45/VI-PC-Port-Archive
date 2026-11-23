@@ -502,5 +502,54 @@ class TestVAlignbyteB32IEEE754(unittest.TestCase):
                 self.assertEqual(hw_res, ref_res)
 
 
+class TestVAlignbyteB32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection for v_alignbyte_b32."""
+
+    def test_rejection_of_invalid_syntax(self):
+        lines_missing = [
+            "v_mov_b32 v1, 1",
+            "v_alignbyte_b32 v0, v1",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_alignbyte_err", lines_missing)
+
+    def test_rejection_of_out_of_bounds_register(self):
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, 256)
+        with self.assertRaises(ValueError):
+            Operand(RegType.VGPR, -1)
+        with self.assertRaises(ValueError):
+            Operand(RegType.SGPR, 106)
+
+    def test_mutation_detection_wrong_mask(self):
+        def bad_oracle_mask7(s0, s1, sel):
+            shift = (sel & 7) * 8
+            concat = ((s0 & MASK32) << 32) | (s1 & MASK32)
+            return (concat >> shift) & MASK32
+
+        s0, s1 = 0xDEADBEEF, 0xCAFEBABE
+        self.assertNotEqual(ref_alignbyte(s0, s1, 4), bad_oracle_mask7(s0, s1, 4))
+
+    def test_mutation_detection_swapped_words(self):
+        def bad_oracle_swapped(s0, s1, sel):
+            shift = (sel & 3) * 8
+            concat = ((s1 & MASK32) << 32) | (s0 & MASK32)
+            return (concat >> shift) & MASK32
+
+        s0, s1 = 0x8899AABB, 0x11223344
+        self.assertNotEqual(ref_alignbyte(s0, s1, 1), bad_oracle_swapped(s0, s1, 1))
+
+    def test_mutation_detection_left_shift(self):
+        def bad_oracle_lshift(s0, s1, sel):
+            shift = (sel & 3) * 8
+            concat = ((s0 & MASK32) << 32) | (s1 & MASK32)
+            return (concat << shift) & MASK32
+
+        s0, s1 = 0x8899AABB, 0x11223344
+        self.assertNotEqual(ref_alignbyte(s0, s1, 1), bad_oracle_lshift(s0, s1, 1))
+
+
 if __name__ == "__main__":
     unittest.main()
