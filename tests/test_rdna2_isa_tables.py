@@ -164,7 +164,7 @@ class Rdna2IsaTablesTests(unittest.TestCase):
                     seen_mnemonics[mnem] = hex(opc)
 
                     self.assertIsInstance(operands, tuple, f"{tname}[{opc:#x}] operands is not a tuple")
-                    seen_op_names = set()
+                    op_counts = {}
                     for idx, spec in enumerate(operands):
                         self.assertIsInstance(spec, tuple, f"{tname}[{opc:#x}] operand {idx} is not a tuple")
                         self.assertEqual(len(spec), 3, f"{tname}[{opc:#x}] operand {idx} expected 3-tuple")
@@ -175,14 +175,14 @@ class Rdna2IsaTablesTests(unittest.TestCase):
                             f"{tname}[{opc:#x}] operand {op_name} invalid width {width!r}",
                         )
                         self.assertIn(kind, VALID_OPERAND_KINDS, f"{tname}[{opc:#x}] unknown kind {kind!r}")
-                        # Only implicit VCC may appear twice (carry-out + carry-in on VOP2 *_co_ci_*).
-                        if op_name in seen_op_names:
-                            self.assertEqual(
-                                op_name,
-                                "VCC",
-                                f"{tname}[{opc:#x}] ({mnem}) repeats operand {op_name!r}",
+                        op_counts[op_name] = op_counts.get(op_name, 0) + 1
+                    # Only implicit VCC may appear twice (carry-out + carry-in on VOP2 *_co_ci_*).
+                    for op_name, count in op_counts.items():
+                        if count > 1:
+                            self.assertTrue(
+                                op_name == "VCC" and count == 2 and tname == "VOP2" and "_co_ci_" in mnem,
+                                f"{tname}[{opc:#x}] ({mnem}) repeats operand {op_name!r} {count} times",
                             )
-                        seen_op_names.add(op_name)
 
     def test_vop3_and_vop3b_disjoint_and_vop3b_has_sdst(self):
         overlap = set(T.VOP3) & set(T.VOP3B)
