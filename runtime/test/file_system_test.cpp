@@ -670,6 +670,36 @@ void run_checks(const std::filesystem::path& root) {
               "the host copy exists and the package source is hidden by a marker");
     }
 
+    // A package-to-host move needs REPLACE_EXISTING when the host file already exists.
+    {
+        constexpr auto source = L"GAME:\\replace-source.bin";
+        const auto package_source = package / "replace-source.bin";
+        const auto host = root / "replace-host.bin";
+        constexpr char package_bytes[] = "package bytes";
+        constexpr char old_host_bytes[] = "original host destination bytes";
+        write_path(package_source, package_bytes);
+        write_path(host, old_host_bytes);
+        check(read_path(host) == old_host_bytes, "the host destination starts with its original bytes");
+
+        check(!move_ex_w(source, host.c_str(), MOVEFILE_COPY_ALLOWED),
+              "COPY_ALLOWED alone refuses to replace the existing host file");
+        check(read_path(host) == old_host_bytes, "the refused replacement preserves the host bytes");
+        HANDLE h = create_w(source, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == package_bytes,
+              "the refused replacement leaves the GAME source readable with its original bytes");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+
+        check(move_ex_w(source, host.c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING) != FALSE,
+              "COPY_ALLOWED with REPLACE_EXISTING moves the GAME file onto the existing host file");
+        check(read_path(host) == package_bytes, "the replaced host file contains the package bytes");
+        SetLastError(ERROR_SUCCESS);
+        h = create_w(source, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_FILE_NOT_FOUND,
+              "the GAME source reports file not found after replacement");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(read_path(package_source) == package_bytes, "the replacement preserves the underlying package bytes");
+    }
+
     // CreateDirectory: the new folder is in the overlay; names the title can already see are refused.
     {
         check(mkdir_w(L"GAME:\\cache", nullptr) != FALSE, "CreateDirectoryW makes GAME:\\cache");
