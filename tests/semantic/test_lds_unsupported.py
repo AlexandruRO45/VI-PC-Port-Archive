@@ -11,7 +11,7 @@ These are RDNA2 Data Share instructions that tools/rdna2spirv.py has no rule for
 Until this file, one self-built model of each of these ran in tests/semantic, with an instruction decoder of its own,
 and so tested nothing the translator does. A model that is not the translator's behaviour cannot catch a regression;
 what the translator does is refuse them with `Unsupported`, and that is what is pinned here, in a compute shader (the
-only stage with LDS) and in a pixel shader. When a rule is added, move its entry out of this list and test its values.
+only stage with LDS). A separate test pins that LDS outside compute is refused, using a supported op. When a rule is added, move its entry out of this list and test its values.
 """
 import os
 import struct
@@ -51,10 +51,12 @@ class TestRefused(unittest.TestCase):
                     support.translate_lines("cs_lds_unsupported", [line, "s_endpgm"], fssm=FSSM)
                 self.assertIn(line.split()[0], str(cm.exception))
 
-    def test_pixel_shader_refuses_each(self):
-        for line in UNSUPPORTED:
-            with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
-                support.translate_lines("ps_lds_unsupported", [line, "s_endpgm"])
+    def test_lds_outside_compute_is_refused(self):
+        # The translator refuses any LDS op outside a compute shader, supported ones included, so this uses a
+        # supported op: it pins that rule, not the unsupported list above.
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_lds_outside_compute", ["ds_add_u32 v1, v2", "s_endpgm"])
+        self.assertIn("outside compute", str(cm.exception))
 
     def test_the_lowered_neighbours_still_translate(self):
         # Guard against a blanket refusal: the supported relatives of the refused forms translate.
