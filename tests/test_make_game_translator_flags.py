@@ -18,7 +18,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
 
-ALL_FLAGS = ("--no-float-controls", "--bary-fallback", "--texel-offset-fallback", "--mesh-compute")
+ALL_FLAGS = ("--no-float-controls", "--bary-fallback", "--texel-offset-fallback", "--mesh-compute",
+             "--min-lod-fallback")
 
 
 class FallbackFlagsTest(unittest.TestCase):
@@ -176,7 +177,7 @@ class RecordedFlagsTest(unittest.TestCase):
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
-    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None):
+    def run_main(self, *extra_argv, per_vertex=None, max_push_constants=None, min_lod=None):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
@@ -188,6 +189,7 @@ class MainWiringTest(unittest.TestCase):
                 mock.patch("make_game.check", return_value={"expected_exe": "game.exe"}), \
                 mock.patch("make_game.wave64_settings", return_value=(False, True)), \
                 mock.patch("make_game.runtime_gpu_per_vertex", return_value=per_vertex), \
+                mock.patch("make_game.runtime_gpu_min_lod", return_value=min_lod), \
                 mock.patch("make_game.runtime_gpu_max_push_constants", return_value=max_push_constants), \
                 mock.patch("make_game.preflight") as preflight, \
                 mock.patch("make_game.shaders") as shaders, \
@@ -211,6 +213,20 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(self.run_main(per_vertex=False), (("--f16-interp-fallback",),) * 2)
         self.assertEqual(self.run_main(per_vertex=True), ((), ()))
         self.assertEqual(self.run_main("--f16-interp-fallback", per_vertex=True), (("--f16-interp-fallback",),) * 2)
+
+    def test_min_lod_fallback_follows_the_device(self):
+        """On by itself where vk_subgroup_info says the GPU lacks shaderResourceMinLod (Intel), not where it has
+        it or can't tell; asked for explicitly, it is on everywhere."""
+        self.assertEqual(self.run_main(min_lod=False), (("--min-lod-fallback",),) * 2)
+        self.assertEqual(self.run_main(min_lod=True), ((), ()))
+        self.assertEqual(self.run_main(min_lod=None), ((), ()))
+        self.assertEqual(self.run_main("--min-lod-fallback", min_lod=True), (("--min-lod-fallback",),) * 2)
+
+    def test_runtime_gpu_min_lod_parses_probe(self):
+        for raw, want in (({"shader_resource_min_lod": False}, False), ({"shader_resource_min_lod": True}, True),
+                          ({}, None)):
+            with self.subTest(raw=raw), mock.patch("make_game.runtime_gpu_info", return_value=raw):
+                self.assertEqual(make_game.runtime_gpu_min_lod(), want)
 
     def test_pc_tail_ubo_follows_the_device(self):
         """On by itself where maxPushConstantsSize is below what the shaders need (144, or 152 with

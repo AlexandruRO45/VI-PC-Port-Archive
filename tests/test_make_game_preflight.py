@@ -592,6 +592,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             shader_outputs_reusable=mock.Mock(return_value=False),
             wave64_settings=mock.Mock(return_value=(False, False)),
             runtime_gpu_per_vertex=mock.Mock(return_value=True),
+            runtime_gpu_min_lod=mock.Mock(return_value=True),
             log=mock.DEFAULT,
             shaders=mock.DEFAULT,
             assets=mock.DEFAULT,
