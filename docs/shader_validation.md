@@ -422,6 +422,23 @@ The existing `runtime/test` tools already expose the hard parts (device selectio
 descriptor setup, readback). The differential runner should call them rather than grow a second
 Vulkan stack.
 
+### 32- and 16-bit integer VALU on the CPU (`tools/valu_int_diff.py`)
+
+`tools/valu_int_diff.py` is the CPU-side integer VALU fuzzer: no game files, no GPU and no LLVM. Seeded programs of
+32-bit integer, bitfield, SAD/lerp, 16-bit `op_sel` and packed 16-bit VALU instructions are compared bit-exact on all
+four exported VGPRs against an independent Python model written from the RDNA2 ISA pseudocode. The translated side is
+`tools/rdna2spirv.py` run by `tests/semantic/spirv_mini_interp.py`; `--spirv-val` additionally assembles and validates
+each module with `spirv-as`/`spirv-val`, which must be on PATH. Exit code 0 is every program matched, 1 the first
+mismatch (printed with its listing), 2 a harness error; `--self-test` checks the harness itself.
+
+```
+python -I tools/valu_int_diff.py --programs 200 --seed 1
+python -I tools/valu_int_diff.py --max-ops 32 --programs 200 --seed 7
+python -I tools/valu_int_diff.py --spirv-val --programs 50 --seed 1   # needs spirv-as/spirv-val on PATH
+python -I tools/valu_int_diff.py --self-test
+python -I tests/test_valu_int_diff.py
+```
+
 ### Integer VALU across the whole wave (`tools/wint_diff.py`)
 
 The one-lane fuzzers cannot see which lanes an instruction writes or the lane masks it reads and makes.
