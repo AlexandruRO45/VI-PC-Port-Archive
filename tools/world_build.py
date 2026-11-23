@@ -103,6 +103,20 @@ def _parse_archetype(value) -> int:
     raise TypeError("archetype must be an integer or a hex string")
 
 
+@contextmanager
+def _decoded_lines(path: str):
+    """``open(path)`` as UTF-8 text (a BOM allowed), but a decode error names the file.
+
+    The file is ``world_index.py --entities-out`` JSON lines, but one re-saved by an editor or by PowerShell's
+    ``Out-File`` (UTF-16LE by default) used to end in a bare UnicodeDecodeError traceback.
+    """
+    with open(path, encoding="utf-8-sig") as handle:
+        try:
+            yield handle
+        except UnicodeDecodeError as e:
+            raise ValueError(f"{path}: not UTF-8 text: {e}") from None
+
+
 def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tuple[list[dict], dict]:
     """Read ``world_index.py --entities-out`` rows. Returns (selected rows, counts).
 
@@ -114,7 +128,7 @@ def load_placements(path: str, lod_levels=DEFAULT_LOD_LEVELS, region=None) -> tu
     levels = set(lod_levels)
     counts = {"rows": 0, "malformed": 0, "other_lod_level": 0, "outside_region": 0, "selected": 0}
     rows: list[dict] = []
-    with open(path, encoding="utf-8-sig") as handle:
+    with _decoded_lines(path) as handle:
         for line in handle:
             line = line.strip()
             if not line:
