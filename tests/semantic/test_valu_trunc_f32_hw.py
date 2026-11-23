@@ -163,5 +163,44 @@ class TestValuTruncF32AST(unittest.TestCase):
         self.assertEqual(inst.disasm(), "v_trunc_f32 v2, s4")
 
 
+class ScalarMachineState:
+    def __init__(self, num_vgprs: int = 256, num_sgprs: int = 106) -> None:
+        self.vgprs: list[int] = [0] * num_vgprs
+        self.sgprs: list[int] = [0] * num_sgprs
+        self.scc: int = 0
+        self.vcc: int = 0
+
+    def read_operand(self, op: ASTOperand) -> int:
+        if op.kind == OperandKind.VGPR:
+            return self.vgprs[op.index] & MASK32
+        if op.kind == OperandKind.SGPR:
+            return self.sgprs[op.index] & MASK32
+        return op.value & MASK32
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def step(self, instr: ASTInstruction, state: ScalarMachineState) -> int:
+        s0 = state.read_operand(instr.src0)
+        res = ref_trunc_f32(s0)
+        if instr.dst.kind == OperandKind.VGPR:
+            state.write_vgpr(instr.dst.index, res)
+        return res
+
+
+class TestValuTruncF32ScalarInterpreter(unittest.TestCase):
+    """Stage 3: Deterministic scalar instruction interpreter."""
+
+    def test_scalar_interpreter_step(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(1, f32_to_u32(12.75))
+        instr = ASTInstruction(Opcode.V_TRUNC_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
+        res = ScalarInterpreter().step(instr, state)
+        self.assertEqual(res, f32_to_u32(12.0))
+        self.assertEqual(state.vgprs[0], f32_to_u32(12.0))
+
+
 if __name__ == "__main__":
     unittest.main()
