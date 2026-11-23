@@ -1,13 +1,15 @@
 // ExecuteCommandLists runs a list only on a queue of its own type (the debug layer's
 // D3D12_MESSAGE_ID_EXECUTECOMMANDLISTS_COMMANDLISTMISMATCH, 836 in d3d12sdklayers.h). Every list type on every queue
 // type, then a batch whose second list doesn't match: nothing of it may run, so the first list's copy must not land.
-// A list that closed with S_OK still runs when one more recording call reaches it afterwards, and that call is dropped.
+// A list that closed with S_OK still runs when one more recording call reaches it afterwards, and that call records
+// nothing.
 // No game files; exits 77 without a Vulkan device.
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 template<class T> struct Ref {
@@ -168,8 +170,11 @@ int main() {
 
     // 5. A list that closed with S_OK stays executable when one more recording call reaches it before
     // ExecuteCommandLists: the PC runtime ignores the call (measured on an RTX 5070 Ti, driver 610.74, and on WARP:
-    // every case below runs, a stray copy into bytes 4..8 never lands, the second Close is E_FAIL, the device is not
-    // removed). Bytes 4..8 hold a sentinel other than the marker and zero, so a failed Map can't pass for untouched.
+    // every case below runs, a stray copy into bytes 4..8 never lands, a second Close is E_FAIL, the device is not
+    // removed). Ignored means the list records no command after Close; bytes 4..8 hold a sentinel other than the
+    // marker and zero, so a failed Map can't pass for untouched. The second Close comes after the list ran, so it
+    // can't change what ran. DrawInstanced and Dispatch have no pipeline bound: they would make an open list invalid,
+    // so they show that a failing call on a closed list is ignored, not that a valid draw or dispatch is.
     const std::uint32_t sentinel = 0x53454e54;  // "SENT"
     using StrayCall = void (*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
     struct Stray {
@@ -213,7 +218,11 @@ int main() {
         readback->Unmap(0, nullptr);
         list->CopyBufferRegion(readback.p, 0, upload.p, 0, sizeof marker);
         const HRESULT closed = list->Close();
+        std::vector<leonida::Command> before, after;
+        const bool listed = rt::d3d12::recorded_commands(list.p, before);
         stray.call(list.p, readback.p, upload.p);
+        const bool recorded_none =
+            listed && rt::d3d12::recorded_commands(list.p, after) && after.size() == before.size();
         ID3D12CommandList* batch[] = {list.p};
         queues[0]->ExecuteCommandLists(1, batch);
         const bool ran = rt::d3d12::last_execute_result(queues[0].p) == leonida::ReplayResult::success;
@@ -222,10 +231,19 @@ int main() {
         const bool untouched = idle && read_word(4) == sentinel;  // only the stray CopyBufferRegion writes there
         char what[192];
         std::snprintf(what, sizeof what, "a list closed with S_OK still runs after %s on the closed list "
-                      "(Close 0x%08lx, batch %s, copy %s, bytes 4..8 %s)", stray.name,
-                      static_cast<unsigned long>(closed), ran ? "ran" : "refused", landed ? "landed" : "did not land",
+                      "(Close 0x%08lx, batch %s, copy %s)", stray.name, static_cast<unsigned long>(closed),
+                      ran ? "ran" : "refused", landed ? "landed" : "did not land");
+        check(closed == S_OK && ran && landed, what);
+        std::snprintf(what, sizeof what, "and the stray %s records nothing "
+                      "(%zu commands before, %zu after, bytes 4..8 %s)", stray.name, before.size(), after.size(),
                       untouched ? "untouched" : "written");
-        check(closed == S_OK && ran && landed && untouched, what);
+        check(recorded_none && untouched, what);
+        const HRESULT closed_again = list->Close();
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        std::snprintf(what, sizeof what, "and a second Close is E_FAIL with the device not removed "
+                      "(Close 0x%08lx, removed 0x%08lx)", static_cast<unsigned long>(closed_again),
+                      static_cast<unsigned long>(removed));
+        check(closed_again == E_FAIL && removed == S_OK, what);
     }
 
     std::printf("d3d12_queue_list_type_test: %s\n", failures ? "FAILED" : "OK");
