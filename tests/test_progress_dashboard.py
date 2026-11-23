@@ -582,6 +582,12 @@ class Outputs(unittest.TestCase):
             pd.collect_unit(col, out, args)
             self.assertEqual(col.sources[-1]["status"], "invalid")
 
+            with open(os.path.join(out, "unit_results.json"), "wb") as f:
+                f.write(b'{"ran_at": "2026-01-01T00:00:00Z", "results": [{"result": "pass"}]}')
+            col_missing = pd.Collector()
+            pd.collect_unit(col_missing, out, args)
+            self.assertEqual(col_missing.sources[-1]["status"], "invalid")
+
             work = os.path.join(tmp, "work")
             os.makedirs(os.path.join(work, "shaders", "dxbc"))
             os.makedirs(os.path.join(work, "shaders", "spirv"))

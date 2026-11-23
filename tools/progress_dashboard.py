@@ -325,8 +325,9 @@ def collect_unit(col, out_dir, args):
     elif os.path.isfile(path):
         try:
             data = json.loads(read_utf8(path))
-            if not (isinstance(data, dict) and isinstance(data.get("results"), list) and "ran_at" in data):
-                raise ValueError("expected a JSON object with 'results' list and 'ran_at'")
+            if not (isinstance(data, dict) and isinstance(data.get("results"), list) and "ran_at" in data
+                    and all(isinstance(r, dict) and "test" in r and "result" in r for r in data["results"])):
+                raise ValueError("expected a JSON object with 'results' entries ('test', 'result') and 'ran_at'")
         except (OSError, ValueError) as e:
             col.source("unit_results", path, "invalid", note=str(e))
             return
