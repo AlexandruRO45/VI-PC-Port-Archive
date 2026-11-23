@@ -1,11 +1,12 @@
-"""Tests for active-lane guarding of all image_atomic_* ops and support for image_atomic_{swap,inc,dec}.
+"""Tests for active-lane guarding of all image_atomic_* ops.
 
 Every 2D and 3D storage-image atomic must guard OpAccessChain / OpImageTexelPointer / OpAtomic* inside
 `if (active)` (matching image_atomic_cmpswap, buffer_atomic, global_atomic, and lds_op) so inactive lanes
 never execute spurious RMWs or dereference uninitialized descriptors/coordinates.
 
-Also covers image_atomic_swap (OpAtomicExchange) and image_atomic_{inc,dec} (wrapping CAS loop via
-atomic_inc_dec_cas) on 2D and 3D images, with/without glc and a16, plus invalid-form rejections.
+Also checks glc write-back inside the guarded block, the extra 32-bit ops lowered via
+`emit_image_atomic_extra` (`image_atomic_swap`, `image_atomic_inc`, `image_atomic_dec`) with `a16`/`glc`,
+preservation of two-VGPR `dmask:0x3` standard ops for corpus compatibility, and invalid-form rejections.
 
 Standard library only; validates emitted SPIR-V with spirv-as/spirv-val when on PATH. No GPU or game data.
 """
@@ -74,15 +75,16 @@ def parse_blocks(spv):
 
 def find_guarded_texel_block(spv):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch on %active, and return that block's instruction list."""
+    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
     blocks = parse_blocks(spv)
+    active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
             if ln.startswith("OpSelectionMerge ") and i + 1 < len(insns):
                 br = insns[i + 1]
                 m = re.match(r"OpBranchConditional (%\w+) (%\w+) (%\w+)", br)
-                if m:
+                if m and m.group(1) in active_loads:
                     guarded_targets.add(m.group(2))
     found = []
     for lbl, insns in blocks.items():
@@ -93,6 +95,15 @@ def find_guarded_texel_block(spv):
     if not found:
         raise AssertionError("No OpImageTexelPointer emitted")
     return found
+
+
+def vgpr_ptrs(spv, reg_idx):
+    """Return all SSA pointer IDs pointing to %vgpr[reg_idx]."""
+    consts = {k: int(v) for k, v in re.findall(r"^\s*(%\w+) = OpConstant %uint (\d+)\b", spv, re.M)}
+    return {
+        ptr for ptr, idx in re.findall(r"^\s*(%\w+) = OpAccessChain %_ptr_Function_uint %vgpr (%\w+)\b", spv, re.M)
+        if consts.get(idx) == reg_idx
+    }
 
 
 class ImageAtomicsGuardTests(unittest.TestCase):
@@ -131,6 +142,12 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                         self.assertTrue(any(f"OpAccessChain " in ln and arr_var in ln for ln in insns),
                                         "OpAccessChain must sit inside the active-guarded block")
                         self.assertTrue(any(f"= {spv_op} %uint " in ln for ln in insns))
+                        v0_ptrs = vgpr_ptrs(spv, 0)
+                        has_glc_store = any(
+                            ln.startswith("OpStore ") and ln.split()[1] in v0_ptrs for ln in insns
+                        )
+                        self.assertEqual(has_glc_store, bool(glc),
+                                         f"glc={bool(glc)} mismatch for v0 write-back in guarded block")
 
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [
@@ -170,7 +187,17 @@ class ImageAtomicsGuardTests(unittest.TestCase):
             validate_spirv(spv)
             find_guarded_texel_block(spv)
 
-        # 64-bit / wrong-width data operands must raise Unsupported loudly.
+        # Two-VGPR dmask:0x3 standard ops (64-bit corpus forms, e.g. image_atomic_umax) stay accepted
+        # and active-guarded so corpus translation coverage does not regress before Int64ImageEXT lands.
+        spv64 = translate([
+            "v_mov_b32_e32 v4, 1", "v_mov_b32_e32 v5, 0",
+            "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v2, 0",
+            "image_atomic_umax v[4:5], v[1:2], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",
+        ])
+        validate_spirv(spv64)
+        find_guarded_texel_block(spv64)
+
+        # Wrong-width data operands on extra 32-bit ops and cmpswap must still raise Unsupported.
         for bad in (
             "image_atomic_swap v[0:1], v[1:2], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",
             "image_atomic_inc v[0:1], v[1:2], s[4:11] dmask:0x3 dim:SQ_RSRC_IMG_2D unorm",

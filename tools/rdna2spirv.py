@@ -12166,12 +12166,12 @@ class Gen:
             for i, comp in enumerate(comps):
                 self.dst({"k": "vgpr", "r": vdata["r"] + i, "n": 1}, self.tou(comp))
 
-    # image atomic -> (SPIR-V op, value that leaves memory unchanged, used for inactive lanes)
-    IMG_ATOMICS = {"image_atomic_umin": ("OpAtomicUMin", 0xFFFFFFFF), "image_atomic_umax": ("OpAtomicUMax", 0),
-                   "image_atomic_smin": ("OpAtomicSMin", 0x7FFFFFFF), "image_atomic_smax": ("OpAtomicSMax", 0x80000000),
-                   "image_atomic_or": ("OpAtomicOr", 0), "image_atomic_xor": ("OpAtomicXor", 0),
-                   "image_atomic_and": ("OpAtomicAnd", 0xFFFFFFFF), "image_atomic_add": ("OpAtomicIAdd", 0),
-                   "image_atomic_sub": ("OpAtomicISub", 0)}
+    # image atomic -> SPIR-V op (guarded inside `if (active)` so inactive lanes skip the access)
+    IMG_ATOMICS = {"image_atomic_umin": "OpAtomicUMin", "image_atomic_umax": "OpAtomicUMax",
+                   "image_atomic_smin": "OpAtomicSMin", "image_atomic_smax": "OpAtomicSMax",
+                   "image_atomic_or": "OpAtomicOr", "image_atomic_xor": "OpAtomicXor",
+                   "image_atomic_and": "OpAtomicAnd", "image_atomic_add": "OpAtomicIAdd",
+                   "image_atomic_sub": "OpAtomicISub"}
     IMG_ATOMICS_EXTRA = ("image_atomic_swap", "image_atomic_inc", "image_atomic_dec",
                          "image_atomic_fmin", "image_atomic_fmax", "image_atomic_fcmpswap")
 
@@ -12715,9 +12715,14 @@ class Gen:
             if op in self.IMG_ATOMICS_EXTRA:
                 self.emit_image_atomic_extra(op, ptr_ty, arr_var, idx, iv, vdata, mods)
                 return
-            need_n = 2 if op == "image_atomic_cmpswap" else 1
-            if vdata["k"] != "vgpr" or vdata.get("n", 1) != need_n:
+            if op == "image_atomic_cmpswap":
+                if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2:
+                    raise Unsupported(op + " data")
+            elif vdata["k"] != "vgpr":
                 raise Unsupported(op + " data")
+            # Two-VGPR dmask:0x3 forms of the nine standard ops are 64-bit atomics; keep main's low-dword
+            # 32-bit behavior here so corpus translation count does not drop while Int64ImageEXT + fallback
+            # is handled separately.
             val = self.load_reg("vgpr", vdata["r"])
             cmpv = self.load_reg("vgpr", vdata["r"] + 1) if op == "image_atomic_cmpswap" else None
             act = self.active_b()
@@ -12731,7 +12736,7 @@ class Gen:
             if op == "image_atomic_cmpswap":
                 self.emit(f"{old} = OpAtomicCompareExchange %uint {tp} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmpv}")
             else:
-                spv, _ = self.IMG_ATOMICS[op]
+                spv = self.IMG_ATOMICS[op]
                 self.emit(f"{old} = {spv} %uint {tp} {self.cu(1)} {self.cu(0)} {val}")
             if "glc" in mods:
                 self.dst({"k": "vgpr", "r": vdata["r"], "n": 1}, old)
