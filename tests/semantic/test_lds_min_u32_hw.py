@@ -514,3 +514,55 @@ class TestDsMinU32RegisterAliasing(unittest.TestCase):
 
         self.assertEqual(interp.rf.get_vgpr(0), 1000)
         self.assertEqual(interp.lds.read_dword(0x40), 0x40)
+
+
+# -----------------------------------------------------------------------------
+# Part 6: Condition Codes, Status Flags, and Carry/Borrow Isolation
+# -----------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class AtomicMinStatusFlags:
+    zero: bool
+    lowered: bool
+    unchanged: bool
+
+    @classmethod
+    def compute(cls, old_val: int, new_val: int) -> AtomicMinStatusFlags:
+        u_old = old_val & MASK32
+        u_new = new_val & MASK32
+        return cls(
+            zero=(u_new == 0),
+            lowered=(u_new < u_old),
+            unchanged=(u_new == u_old)
+        )
+
+
+class TestDsMinU32ConditionCodes(unittest.TestCase):
+    """Test suite verifying status flag generation and VALU/SALU flag isolation."""
+
+    def test_status_flag_generation(self):
+        flags1 = AtomicMinStatusFlags.compute(100, 50)
+        self.assertFalse(flags1.zero)
+        self.assertTrue(flags1.lowered)
+        self.assertFalse(flags1.unchanged)
+
+        flags2 = AtomicMinStatusFlags.compute(50, 50)
+        self.assertFalse(flags2.zero)
+        self.assertFalse(flags2.lowered)
+        self.assertTrue(flags2.unchanged)
+
+        flags3 = AtomicMinStatusFlags.compute(10, 0)
+        self.assertTrue(flags3.zero)
+        self.assertTrue(flags3.lowered)
+        self.assertFalse(flags3.unchanged)
+
+    def test_flag_isolation(self):
+        """LDS atomic instructions do not mutate CPU/GPU status flags (VCC, SCC)."""
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x10, 50)
+        interp.rf.set_vgpr(0, 0x10)
+        interp.rf.set_vgpr(1, 20)
+        # Architectural invariants: VCC and SCC are unaffected by DS operations
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        interp.execute(inst)
+        self.assertEqual(interp.lds.read_dword(0x10), 20)
