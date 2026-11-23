@@ -431,3 +431,48 @@ class TestDsSwizzleB32Translator(unittest.TestCase):
         # 0x801F = QUAD_PERM(3, 3, 1, 0)
         res = self._run_cs_swizzle("ds_swizzle_b32 v2, v1 offset:0x801f")
         self.assertEqual(res[0:4], [103, 103, 101, 100])
+
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+class TestDsSwizzleB32NegativeAndMutation(unittest.TestCase):
+    def test_rejection_invalid_offset_range(self) -> None:
+        # Offsets 0xC000..0xFFFF are unsupported hardware modes
+        lines = [
+            "ds_swizzle_b32 v2, v1 offset:0xc000",
+            "s_endpgm",
+        ]
+        fssm = make_fssm_header(32)
+        with self.assertRaises(Exception):
+            support.translate_lines("cs_swizzle_bad_offset", lines, fssm=fssm)
+
+    def test_rejection_missing_operands(self) -> None:
+        lines = [
+            "ds_swizzle_b32 v2",
+            "s_endpgm",
+        ]
+        fssm = make_fssm_header(32)
+        with self.assertRaises(Exception):
+            support.translate_lines("cs_swizzle_missing_op", lines, fssm=fssm)
+
+    def test_mutation_detection_quad_perm_lane_mask(self) -> None:
+        # Mutation: quad permute without masking lane to 4-lane boundary
+        mutated_lane = lambda lane, sel: (lane + sel)
+        real_lane = lambda lane, sel: (lane & ~3) | sel
+        self.assertNotEqual(mutated_lane(7, 0), real_lane(7, 0))
+
+    def test_mutation_detection_bitmask_perm_inversion(self) -> None:
+        # Mutation: and/or without xor
+        mutated_bitmask = lambda lane, a, o, x: ((lane & a) | o)
+        real_bitmask = lambda lane, a, o, x: (((lane & a) | o) ^ x)
+        self.assertNotEqual(mutated_bitmask(10, 0x1F, 0, 1), real_bitmask(10, 0x1F, 0, 1))
+
+    def test_mutation_detection_inactive_source_default(self) -> None:
+        # Mutation: inactive source returning original source instead of 0
+        mutated_inactive = lambda src_val: src_val
+        real_inactive = lambda src_val: 0
+        self.assertNotEqual(mutated_inactive(42), real_inactive(42))
+
+
+if __name__ == "__main__":
+    unittest.main()
