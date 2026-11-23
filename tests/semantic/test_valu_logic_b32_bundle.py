@@ -894,3 +894,31 @@ class TestXnorB32SIMDAndProperties(unittest.TestCase):
             "v_xnor_b32 v0, v2, v1",
         ])
         self.assertEqual(val_ab, val_ba)
+
+
+# ------------------------------------------------------------------------------
+# v_xnor_b32 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestXnorB32NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            RegisterOperand(OperandType.VGPR, -1)
+
+    def test_boundary_extremes_hardware(self):
+        val_zero_zero, _ = run_shader("ps_xnor_zero_zero", [
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_xnor_b32 v0, v1, v2",
+        ])
+        self.assertEqual(val_zero_zero, 0xFFFFFFFF)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        val, spv = run_shader("ps_xnor_lowering", [
+            "v_mov_b32 v1, 0xFF00",
+            "v_mov_b32 v2, 0x0FF0",
+            "v_xnor_b32 v0, v1, v2",
+        ])
+        self.assertIn("OpBitwiseXor", spv)
+        self.assertIn("OpNot", spv)
+        self.assertEqual(val, 0xFFFF0F0F)
