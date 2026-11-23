@@ -89,21 +89,27 @@ struct Planes {
 };
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
-// `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
+// `c` and reads every plane of the destination back. The clears run in a list of their own, the resolve and the
+// readback copies in a second one. A second list whose Close fails is executed only when `run_invalid`: the layer
+// must refuse the whole batch (ExecuteCommandLists runs no list whose Close failed), and a third list then reads the
+// destination back, so a refused resolve is seen to keep it. The host runtime must not be given such a list.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
-    Ref<ID3D12CommandAllocator> allocator;
-    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12CommandAllocator> allocators[3];
+    Ref<ID3D12GraphicsCommandList> lists[3];
     Ref<ID3D12GraphicsCommandList1> list1;
     Ref<ID3D12Fence> fence;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
-    CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
-    CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
-                                             IID_PPV_ARGS(&list.p))));
-    CHECK(SUCCEEDED(list->QueryInterface(IID_PPV_ARGS(&list1.p))));
+    for (int i = 0; i < 3; ++i) {
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&allocators[i].p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[i].p, nullptr,
+                                                 IID_PPV_ARGS(&lists[i].p))));
+    }
+    ID3D12GraphicsCommandList* list = lists[0].p;
+    CHECK(SUCCEEDED(lists[1]->QueryInterface(IID_PPV_ARGS(&list1.p))));
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
 
     D3D12_HEAP_PROPERTIES heap_properties{};
@@ -198,28 +204,54 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.pResource = target.p;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     list->ResourceBarrier(2, barriers);
+    CHECK(SUCCEEDED(list->Close()));
+    ID3D12CommandList* clears[] = {list};
+    queue->ExecuteCommandLists(1, clears);
+
+    // The destination's readback: RESOLVE_DEST to COPY_SOURCE, then each plane into the readback buffer.
+    const auto read_target = [&](ID3D12GraphicsCommandList* l) {
+        D3D12_RESOURCE_BARRIER to_copy = barriers[1];
+        to_copy.Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        l->ResourceBarrier(1, &to_copy);
+        for (UINT i = 0; i < planes; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = i;
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = placed[i];
+            l->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    };
     D3D12_RECT rect = source_rect;
     const UINT x = c.dst_x >= 0 ? UINT(c.dst_x) : c.rect ? UINT(rect.left) : 0;
     const UINT y = c.dst_y >= 0 ? UINT(c.dst_y) : c.rect ? UINT(rect.top) : 0;
     list1->ResolveSubresourceRegion(target.p, c.plane, x, y, source.p, c.plane, c.rect ? &rect : nullptr, c.format,
                                     c.mode);
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &barriers[1]);
-    for (UINT i = 0; i < planes; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-        src.pResource = target.p;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = i;
-        dst.pResource = readback.p;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = placed[i];
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    read_target(lists[1].p);
+    out.close = lists[1]->Close();
+    if (FAILED(out.close)) {
+        if (!run_invalid) {
+            // Wait for the clears before the queue and the resources are released.
+            CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
+            Event event;
+            CHECK(event.handle);
+            CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
+            CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+            return true;
+        }
+        ID3D12CommandList* refused[] = {lists[1].p};
+        queue->ExecuteCommandLists(1, refused);
+        read_target(lists[2].p);
+        CHECK(SUCCEEDED(lists[2]->Close()));
+        ID3D12CommandList* reread[] = {lists[2].p};
+        queue->ExecuteCommandLists(1, reread);
+    } else {
+        ID3D12CommandList* resolve[] = {lists[1].p};
+        queue->ExecuteCommandLists(1, resolve);
     }
-    out.close = list->Close();
-    if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
     CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
     Event event;
     CHECK(event.handle);
