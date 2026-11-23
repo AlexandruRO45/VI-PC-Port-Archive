@@ -7,20 +7,51 @@ ROOT = Path(__file__).resolve().parents[1]
 DOCS = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
 
 
+def is_table_separator(line: str) -> bool:
+    """True when `line` is a Markdown table separator row (e.g. `|---|---|` or `| :---: | ---: |`)."""
+    stripped = line.strip()
+    if "|" not in stripped:
+        return False
+    cells = stripped.strip("|").split("|")
+    return bool(cells) and all(
+        (c := cell.strip()) and set(c) <= set("-:") and "-" in c
+        for cell in cells
+    )
+
+
+def find_orphan_table_rows(lines: list[str]) -> list[int]:
+    """Return 1-based line numbers of `|`-prefixed rows that have neither a preceding `|` row nor a separator."""
+    orphans = []
+    for i, line in enumerate(lines):
+        if not line.startswith("|"):
+            continue
+        prev = next((x for x in reversed(lines[:i]) if x.strip()), "")
+        if prev.startswith("|"):
+            continue
+        nxt = next((x for x in lines[i + 1:i + 3] if x.strip()), "")
+        if is_table_separator(nxt):
+            continue  # this is a table header followed by its separator
+        orphans.append(i + 1)
+    return orphans
+
+
 class DocsTableRowsTest(unittest.TestCase):
     def test_no_orphan_table_rows(self):
         for path in DOCS:
             lines = path.read_text(encoding="utf-8").splitlines()
-            for i, line in enumerate(lines):
-                if not line.startswith("|"):
-                    continue
-                prev = next((x for x in reversed(lines[:i]) if x.strip()), "")
-                if prev.startswith("|"):
-                    continue
-                nxt = next((x for x in lines[i + 1:i + 3] if x.strip()), "")
-                if set(nxt.replace("|", "").replace(" ", "")) <= set("-:"):
-                    continue  # this is a table header followed by its separator
-                self.fail(f"{path.relative_to(ROOT)}:{i + 1}: table row without a table header")
+            orphans = find_orphan_table_rows(lines)
+            if orphans:
+                self.fail(f"{path.relative_to(ROOT)}:{orphans[0]}: table row without a table header")
+
+    def test_orphan_row_detector_catches_eof_blank_lines_and_non_separators(self):
+        self.assertEqual(find_orphan_table_rows(["| A | B |", "|---|---|", "| 1 | 2 |"]), [])
+        self.assertEqual(find_orphan_table_rows(["| A | B |", "| :---: | ---: |", "| 1 | 2 |"]), [])
+        # Previously `set("") <= set("-:")` was True, missing orphan rows at EOF or before >=2 blank lines.
+        self.assertEqual(find_orphan_table_rows(["# Title", "", "| orphan | row |"]), [3])
+        self.assertEqual(find_orphan_table_rows(["# Title", "", "| orphan | row |", "", "", "Next"]), [3])
+        # A thematic break without pipes or an empty-cell row is not a table separator.
+        self.assertEqual(find_orphan_table_rows(["| orphan | row |", "---"]), [1])
+        self.assertEqual(find_orphan_table_rows(["| orphan | row |", "|  |  |"]), [1])
 
     def test_no_duplicate_rows_in_one_table(self):
         for path in DOCS:
