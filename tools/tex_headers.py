@@ -352,7 +352,8 @@ def decode_etpf_chunk_pages(meta, extra):
     zero. Returns a tuple of page counts, or ``None`` if any code or reserved
     bit is invalid.
     """
-    if not isinstance(meta, int) or not isinstance(extra, int):
+    if (isinstance(meta, bool) or isinstance(extra, bool)
+            or not isinstance(meta, int) or not isinstance(extra, int)):
         return None
     if meta < 0 or meta > 0x7FF or extra < 0 or extra > 0xFFFFFFFF:
         return None
@@ -397,16 +398,18 @@ def compact_surface_layout(width, height, mips, element_bytes, block=1,
     cannot describe the surface or a tile/element size outside the measured
     set.
     """
-    if width <= 0 or height <= 0:
+    if (isinstance(width, bool) or isinstance(height, bool)
+            or not isinstance(width, int) or not isinstance(height, int)
+            or width <= 0 or height <= 0):
         raise ValueError(f"invalid surface dimensions {width}x{height}")
-    if element_bytes not in _COMPACT_ELEMENT_LOG:
+    if isinstance(element_bytes, bool) or element_bytes not in _COMPACT_ELEMENT_LOG:
         raise ValueError(f"unsupported element size: {element_bytes}")
-    if block not in (1, 4):
+    if isinstance(block, bool) or block not in (1, 4):
         raise ValueError(f"unsupported block dimension: {block}")
-    if tile not in COMPACT_MAX_TAIL_MIPS:
+    if isinstance(tile, bool) or tile not in COMPACT_MAX_TAIL_MIPS:
         raise ValueError(f"unsupported compact tile size: {tile}")
     levels = max(width, height).bit_length()
-    if mips < 1 or mips > levels:
+    if isinstance(mips, bool) or not isinstance(mips, int) or mips < 1 or mips > levels:
         raise ValueError(f"invalid mip count {mips} for {width}x{height}")
 
     log = _COMPACT_ELEMENT_LOG[element_bytes]
