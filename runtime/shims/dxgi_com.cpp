@@ -808,19 +808,15 @@ constexpr DXGI_MODE_DESC from_mode_desc1(const DXGI_MODE_DESC1& m) noexcept {
     return {m.Width, m.Height, m.RefreshRate, m.Format, m.ScanlineOrdering, m.Scaling};
 }
 
-// EnumDisplaySettings exposes integer Hz. Query the WDDM source behind this monitor for
-// its original rational timings and scaling variants without loading the host DXGI factory.
-bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, std::vector<DXGI_MODE_DESC1>& modes) {
+template <class Action>
+bool with_display_source(const DisplayInfo& info, Action action) {
     if (!info.monitor) return false;
-    const auto surface = display_surface_format(fmt);
-    if (surface == D3DDDIFMT_UNKNOWN) return true;
     HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
     if (!gdi) return false;
     const auto open = reinterpret_cast<decltype(&D3DKMTOpenAdapterFromGdiDisplayName)>(
         GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName"));
-    const auto query = reinterpret_cast<decltype(&D3DKMTGetDisplayModeList)>(GetProcAddress(gdi, "D3DKMTGetDisplayModeList"));
     const auto close = reinterpret_cast<decltype(&D3DKMTCloseAdapter)>(GetProcAddress(gdi, "D3DKMTCloseAdapter"));
-    if (!open || !query || !close) return false;
+    if (!open || !close) return false;
     D3DKMT_OPENADAPTERFROMGDIDISPLAYNAME adapter{};
     wcscpy_s(adapter.DeviceName, info.device_name);
     if (open(&adapter) != 0) return false;
@@ -829,13 +825,26 @@ bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, st
         D3DKMT_CLOSEADAPTER args;
         ~AdapterGuard() { close(&args); }
     } guard{close, {adapter.hAdapter}};
+    return action(gdi, adapter);
+}
+
+// EnumDisplaySettings exposes integer Hz. Query the WDDM source behind this monitor for
+// its original rational timings and scaling variants without loading the host DXGI factory.
+bool physical_mode_list(const DisplayInfo& info, DXGI_FORMAT fmt, UINT flags, std::vector<DXGI_MODE_DESC1>& modes) {
+    const auto surface = display_surface_format(fmt);
+    if (surface == D3DDDIFMT_UNKNOWN) return true;
     D3DKMT_GETDISPLAYMODELIST request{};
-    request.hAdapter = adapter.hAdapter;
-    request.VidPnSourceId = adapter.VidPnSourceId;
-    if (query(&request) != 0 || !request.ModeCount) return false;
-    std::vector<D3DKMT_DISPLAYMODE> entries(request.ModeCount);
-    request.pModeList = entries.data();
-    if (query(&request) != 0 || request.ModeCount > entries.size()) return false;
+    std::vector<D3DKMT_DISPLAYMODE> entries;
+    if (!with_display_source(info, [&](HMODULE gdi, const auto& adapter) {
+        const auto query = reinterpret_cast<decltype(&D3DKMTGetDisplayModeList)>(
+            GetProcAddress(gdi, "D3DKMTGetDisplayModeList"));
+        request.hAdapter = adapter.hAdapter;
+        request.VidPnSourceId = adapter.VidPnSourceId;
+        if (!query || query(&request) != 0 || !request.ModeCount) return false;
+        entries.resize(request.ModeCount);
+        request.pModeList = entries.data();
+        return query(&request) == 0 && request.ModeCount <= entries.size();
+    })) return false;
     for (UINT i = 0; i < request.ModeCount; ++i) {
         const auto& entry = entries[i];
         if (entry.Format != surface || UINT(entry.DisplayOrientation) != UINT(info.rotation) ||
@@ -930,7 +939,16 @@ HRESULT find_closest_mode(const DisplayInfo& info, const DXGI_MODE_DESC& req, IU
     return S_OK;
 }
 
-void wait_for_vblank() {
+void wait_for_vblank(const DisplayInfo& info) {
+    // DwmFlush follows the compositor's cadence even when the caller selected another output.
+    if (with_display_source(info, [](HMODULE gdi, const auto& adapter) {
+        const auto wait = reinterpret_cast<decltype(&D3DKMTWaitForVerticalBlankEvent)>(
+            GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent"));
+        D3DKMT_WAITFORVERTICALBLANKEVENT event{};
+        event.hAdapter = adapter.hAdapter;
+        event.VidPnSourceId = adapter.VidPnSourceId;
+        return wait && wait(&event) == 0;
+    })) return;
     using DwmFlushFn = HRESULT(WINAPI*)();
     static const DwmFlushFn dwm_flush = []() -> DwmFlushFn {
         // Resolve dynamically so dxgi_com.cpp needs no extra dwmapi.lib link entry in CMakeLists.txt.
@@ -999,7 +1017,7 @@ public:
         return find_closest_mode(info_, *mode_to_match, concerned_device, *closest);
     }
     HRESULT STDMETHODCALLTYPE WaitForVBlank() override {
-        wait_for_vblank();
+        wait_for_vblank(info_);
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE TakeOwnership(IUnknown* device, BOOL) override {

@@ -12,6 +12,9 @@
 #include "window_station.h"
 #include "../src/vulkan_device_filter.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -61,6 +64,34 @@ bool same_monitor_modes(IDXGIOutput* shim, IDXGIOutput* host) {
     return true;
 }
 
+// Compare only stable native refresh intervals. A second host sample brackets the shim
+// measurement so a mode change or an overloaded desktop need not fail the test.
+bool same_vblank_cadence(IDXGIOutput* output, IDXGIOutput* host) {
+    using clock = std::chrono::steady_clock;
+    auto sample = [](IDXGIOutput* out, double& median, bool& stable) {
+        std::array<double, 17> intervals;
+        if (FAILED(out->WaitForVBlank())) return false;
+        auto start = clock::now();
+        for (auto& interval : intervals) {
+            if (FAILED(out->WaitForVBlank())) return false;
+            const auto end = clock::now();
+            interval = std::chrono::duration<double, std::milli>(end - start).count();
+            start = end;
+        }
+        std::sort(intervals.begin(), intervals.end());
+        median = intervals[8];
+        stable = intervals[12] - intervals[4] < median * 0.2;
+        return true;
+    };
+    double before = 0, actual = 0, after = 0;
+    bool stable;
+    if (!sample(host, before, stable) || !stable || before < 1) return true;
+    if (!sample(output, actual, stable)) return false;
+    if (!sample(host, after, stable) || !stable || std::abs(after - before) > before * 0.1) return true;
+    std::fprintf(stderr, "WaitForVBlank: native %.2f ms, shim %.2f ms\n", after, actual);
+    return std::abs(actual - after) < after * 0.3;
+}
+
 bool compare_attached_modes(IDXGIAdapter1* adapter, IDXGIAdapter1* host_adapter, UINT output_count) {
     for (UINT hi = 0; ; ++hi) {
         IDXGIOutput* host = nullptr;
@@ -75,7 +106,7 @@ bool compare_attached_modes(IDXGIAdapter1* adapter, IDXGIAdapter1* host_adapter,
                 if (FAILED(adapter->EnumOutputs(i, &output))) continue;
                 DXGI_OUTPUT_DESC desc{};
                 if (SUCCEEDED(output->GetDesc(&desc)) && desc.Monitor == target.Monitor)
-                    matched = same_monitor_modes(output, host);
+                    matched = same_monitor_modes(output, host) && same_vblank_cadence(output, host);
                 output->Release();
             }
         }
@@ -1388,7 +1419,7 @@ int main() {
                     IDXGIAdapter1* hadp = nullptr;
                     if (SUCCEEDED(hfac->EnumAdapterByLuid(desc1.AdapterLuid, IID_PPV_ARGS(&hadp))) && hadp) {
                         if (!compare_attached_modes(adapter1, hadp, our_output_count))
-                            return fail("Physical display modes did not match host DXGI");
+                            return fail("Physical display modes or vblank cadence did not match host DXGI");
                         if (hadp->EnumOutputs(0, nullptr) != adapter1->EnumOutputs(0, nullptr)) {
                             hadp->Release();
                             hfac->Release();
