@@ -77,13 +77,14 @@ environment variable `LEONIDA_UNIMPLEMENTED`, read once per process:
 
 | value | a call to the thunk |
 |---|---|
-| `log` (default) | prints `[rt] unimplemented: dll!name` once and returns 0 in rax and xmm0. This is what the runtime always did. |
-| `fail` | the same, but returns `E_NOTIMPL` (`0x80004001`) for imports known to return an `HRESULT`, and 0 for all others. |
+| `fail` (default) | prints the missing import and returns `E_NOTIMPL` (`0x80004001`) for imports known to return an `HRESULT`, and 0 for all others. |
+| `log` | compatibility mode: prints the missing import once and returns 0 in rax and xmm0, including `S_OK` for an unimplemented HRESULT function. |
 | `stop` | on the first call prints the import, the caller's return address as `module+RVA`, and rcx, rdx, r8 and r9 as the game passed them; then breaks if a debugger is attached (continuing returns the `fail` value), else ends the process with exit code 3. |
 
-No mode writes to an out parameter: a function that fills one in on success leaves it as the caller had it. Under
-`log` an `HRESULT` function therefore returns `S_OK` with its outputs unset, which is why `fail` exists; with `fail`
-the caller sees an error and can take its own failure path. Any other value is reported and treated as `log`.
+No mode writes to an out parameter: a function that fills one in on success leaves it as the caller had it. The default
+`fail` mode prevents a known HRESULT function from falsely returning `S_OK` with unset outputs. `log` remains available
+as an explicit compatibility override; use it only when deliberately accepting that behavior. Any invalid value warns
+and falls back to `fail`.
 
 Whether an import returns an `HRESULT` is decided by DLL and name alone (`classify_import` in
 `shims/registry.cpp`, where each entry names its source). The list is short on purpose and every entry was checked
