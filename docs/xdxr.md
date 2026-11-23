@@ -11,10 +11,13 @@ copies and validation branches of the functions below. Addresses are RVAs (image
 the DLL is reproduced here except type names that its own exported symbols carry; check a claim by opening the
 function at its RVA in your own copy.
 
-**Errors are thrown, not returned.** Every rejection below in the build and prebuild-info exports stores
-`E_INVALIDARG` and throws it as an MSVC C++ exception through the `_CxxThrowException` thunk at `0x2302e`, and those
+**Errors are thrown, not returned.** The three rejections below in the build and prebuild-info exports store
+`E_INVALIDARG` and throw it as an MSVC C++ exception through the `_CxxThrowException` thunk at `0x2302e`, and those
 exports return `void`: the `Dest` alignment check in `0x216a0` (branch at `0x217a3`, throw at `0x21876`), the
 `Inputs.Type` check in `0xcc00` (branch at `0xce0c`, throw at `0xd578`) and the postbuild-type check in `0xe6a0` (§4).
+Other checks on the same path throw other codes: the geometry-descriptor validator throws `E_NOTIMPL` for an unsupported
+index buffer format and `E_FAIL` when the upload buffer cannot be allocated
+([d3d12_command_objects.md §3.3b](d3d12_command_objects.md#33b-the-batched-build-validates-the-geometry-descriptors-on-the-cpu-first)).
 Only `ValidateRehydrateAccelerationStructureBuildDesc` (`0x21a00`) returns `E_INVALIDARG` as an `HRESULT`. Checked
 with `llvm-objdump` on the 1.0.2.1 file (RT-155).
 
@@ -98,7 +101,7 @@ Default for type 0's `0x08` value when it is negative (or when there is no type-
 
 **The offline statistics layout is not recoverable from this DLL**: it never writes them. It would have to come from
 the offline builder that produces dehydrated BVHs, which is not in the package. A runtime that implements the builder
-should reject `0x10` the same way.
+should reject `0x10` the same way: by throwing `E_INVALIDARG` before any work, since the export returns no `HRESULT`.
 
 RT-155 re-checked this on the same file (SHA-256 as in the manifest) with `llvm-objdump` on Linux. Every use of the
 type is one of two checks, and neither reads past the `InfoType` field:
