@@ -201,6 +201,15 @@ void test_serializer_shim_matches_host() {
     values.push_back(all_public_flags());
     values.push_back(0);
 
+    // Probed once, as the shim does: does the host serialize an empty 1.2 description?
+    bool host_serializes_1_2 = false;
+    {
+        const D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty12 = versioned(D3D_ROOT_SIGNATURE_VERSION_1_2, 0);
+        Blobs b;
+        host_serializes_1_2 = SUCCEEDED(D3D12SerializeVersionedRootSignature(&empty12, &b.blob, &b.error));
+        std::printf("host serializer %s root signature 1.2\n", host_serializes_1_2 ? "takes" : "refuses");
+    }
+
     const D3D_ROOT_SIGNATURE_VERSION versions[] = {D3D_ROOT_SIGNATURE_VERSION_1_0, D3D_ROOT_SIGNATURE_VERSION_1_1,
                                                    D3D_ROOT_SIGNATURE_VERSION_1_2};
     const char* names[] = {"1.0", "1.1", "1.2"};
@@ -218,9 +227,11 @@ void test_serializer_shim_matches_host() {
                 else ++same_bytes;
             } else {
                 ++host_refused;
-                // The host refuses 1.2 where it serializes only up to 1.1; the shim rewrites that as 1.1. For 1.0
-                // and 1.1 the shim must refuse what the host refuses.
-                if (versions[v] != D3D_ROOT_SIGNATURE_VERSION_1_2 && SUCCEEDED(hr_ours)) ++differ;
+                // A host that serializes only up to 1.1 refuses every 1.2 description, and the shim rewrites those
+                // as 1.1. Otherwise (1.0, 1.1, or 1.2 on a host that takes 1.2) the shim must refuse what the host
+                // refuses.
+                const bool rewritten_as_1_1 = versions[v] == D3D_ROOT_SIGNATURE_VERSION_1_2 && !host_serializes_1_2;
+                if (!rewritten_as_1_1 && SUCCEEDED(hr_ours)) ++differ;
             }
             if (SUCCEEDED(hr_ours) && ours.blob) {
                 ID3D12VersionedRootSignatureDeserializer* de = nullptr;
