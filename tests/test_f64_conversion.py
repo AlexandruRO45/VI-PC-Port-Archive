@@ -48,10 +48,14 @@ class F64ConversionTest(unittest.TestCase):
         if clamp:
             value = result(rf"OpExtInst %float %glsl FClamp {value} %f0 %f1")
         word = result(rf"OpBitcast %uint {value}")
-        dest = result(r"OpAccessChain %_ptr_Function_uint %vgpr %c3")
-        old_word = result(rf"OpLoad %uint {dest}")
-        masked_word = result(rf"OpSelect %uint %\w+ {word} {old_word}")
-        self.assertRegex(spv, rf"(?m)^ *OpStore {dest} {masked_word}$")
+        # A block with no inactive lanes stores the word directly (#4473); one whose EXEC can be partial
+        # predicates the write on a select of the old word. Both are correct, and neither may write another
+        # register or write this one from a different value.
+        predicated = re.search(rf"(?m)^ *(%\w+) = OpSelect %uint %\w+ {word} (%\w+)$", spv)
+        stored = word if predicated is None else predicated.group(1)
+        written = re.findall(r"(?m)^ *OpStore %reg_v3 (\S+)$", spv)
+        self.assertIn(stored, written, "nothing stores the converted word to v3")
+        self.assertEqual([w for w in written if w != stored], [], "v3 is also written from another value")
 
 
 if __name__ == "__main__":
