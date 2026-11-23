@@ -302,6 +302,21 @@ class TestPermLane16AST(unittest.TestCase):
         self.assertIn("OpBitFieldUExtract", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestPermLane16Routing(unittest.TestCase):
+    def test_reverse_routing(self):
+        lanes = [i for i in range(64)]
+        s1 = 0x01234567
+        s2 = 0x89ABCDEF
+        out = model_permlane16(lanes, s1, s2, xor16=False)
+        self.assertEqual(out[0], 7)
+        self.assertEqual(out[7], 0)
+
+    def test_translator_permlane16_routing(self):
+        prog = ["s_mov_b32 s1, 0x01234567", "s_mov_b32 s2, 0x89ABCDEF", "v_permlane16_b32 v0, v1, s1, s2", "s_endpgm"]
+        spv = support.translate_lines("cs_p16_rout", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
