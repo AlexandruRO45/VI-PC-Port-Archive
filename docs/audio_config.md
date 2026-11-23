@@ -39,7 +39,7 @@ the duration:
 | 0 | 2 | `0c 01` marker |
 | +2 | 2 | config id (u16) |
 | +4 | 4 | `02 00 0c 00` |
-| +8 | 4 | hash A (unresolved) |
+| +8 | 4 | hash A: also stored in one 24-byte entry elsewhere in the config ([radio_stations.md](radio_stations.md#hash-a-entries)); its meaning is still open |
 | +12 | 4 | hash B: `joaat(normalized name)` |
 | +16 | 4 | `00 00 02 23` |
 | +20 | 22 | fixed flags/parameters (constant on this package) |

@@ -246,6 +246,55 @@ the four is assigned to CircoLoco by record-id and AWC-bank adjacency rather tha
 The title hash identifies a bank, not a station, not a play order and not a start offset. Keep the
 station assignment and cue times as separate, evidence-labelled steps.
 
+## Hash A entries
+
+Every music record's hash A (record `+8`) is stored a second time, in a 24-byte entry of a table in
+two other config streams. `tools/audio_objects.py` finds these entries by their shape and by the join
+(the word at `+12` must be a record's hash A), not by a stream offset:
+
+```text
++0   flags     a multiple of 0x800
++4   u32       not decoded
++8   kind      small integer
++12  hash A    the record's hash A
++16  V         not decoded
++20  V         the same word again
+```
+
+On the measured package:
+
+- **1,589 of 1,589** records have exactly one entry; none has zero or two. The two `V` words are equal
+  in all 1,589.
+- The entries sit in two streams, 1,357 and 232, one after another with no gap. The table continues
+  across the stream boundary: the first stream's last entry ends at its last byte and the second
+  stream starts with the next entry's flags.
+- `flags` is `0x800` on 1,563 entries; the rest are other multiples of `0x800` up to `0x6000`.
+  `kind` is 2 on 1,561, 0 on 27 and 4 on 1. The `+4` word takes three values.
+- 1,515 of 1,587 neighbouring entries have ascending record ids, so the table broadly follows the
+  record order.
+- 1,350 distinct `V` values: 158 are shared, by up to 10 entries. No `V` equals a record's hash A or
+  hash B.
+
+The table names each record's hash A once more; it does not group them by station.
+
+### Where the station lists are not
+
+Three places a station's track list could be, checked over the whole 54 MiB config (13,535,867
+aligned words) and ruled out on this package:
+
+- **Hash A or V as list members.** Outside the entries, `V` values occur 412 times in 97 streams,
+  never more than 8 within 64 words, and those few mix records hundreds of ids apart with repeated
+  values. No stream lists the records by these keys.
+- **A content-id table.** No word in the content-id band `0x2822`-`0x29A6` lies within four words of
+  a record's hash A or hash B. The config does not store a content id next to the record it means, so
+  the per-range base above stays the only link from a content id to a record.
+- **The hash-A table as a playlist.** Its order follows the record ids (1,515 of 1,587 neighbours
+  ascending), and no entry field has anywhere near one value per station for the 19 descriptors:
+  `+4` takes 3 values, `kind` 3, `flags` 8 and `V` 1,350.
+
+So, from the config alone, the VCRR anchor is still the only measured station-to-record mapping; the
+other stations need the executable, or a content-id base rule this page has not found.
+
 ## What a runtime needs
 
 | Need | Source | Status |
@@ -267,8 +316,9 @@ descriptors and the 22-entry ident table are different sets.
 The graph after each station pair is not a substitute for the groups: it mixes local and shared ids and
 has no count or order guarantee. The groups are the only place where the VCRR range is complete.
 
-The u32 hash at `+8` (hash A) remains unresolved. It is not the normalized-name hash at `+12`, not
-the stream id, and it did not match any content id checked. The name hash at `+12` is only useful
+The u32 hash at `+8` (hash A) has no known meaning yet. It is not the normalized-name hash at `+12`,
+not the stream id, and it did not match any content id checked; it is the key of one 24-byte entry
+per record (*Hash A entries* above), which does not group the records by station. The name hash at `+12` is only useful
 with a name dictionary; no such dictionary is committed here.
 
 ## Measured vs inferred
@@ -288,6 +338,11 @@ Measured:
 - The six cluster ranges and their present/span counts.
 - The title-keyed stream-id check: 702/800 exact `joaat(normalized title)` matches and 746/800
   with the tested case/punctuation/feature variants; 54 remain unmatched.
+
+- Hash A entries: 1,589 of 1,589 records have exactly one 24-byte entry holding their hash A, with
+  equal `V` words in all 1,589; the table does not group records by station.
+- Over the whole config: `V` values outside the entries never cluster beyond 8 within 64 words, and
+  no content-id word lies within four words of a record's hash A or hash B.
 
 Inferred:
 
@@ -309,8 +364,10 @@ python -I tools/rpf9_carve.py audio.rpf <out> --until-adat
 same window there.)
 
 The carve writes `000000762160.bin` and `0000000daeb0.bin`, both 65,536 bytes. The record table is
-`python -I tools/audio_config.py <out> --join --json`. The station scan is a u32 read of the two
-streams; no station scanner is committed, because the station hash set needs a local dictionary.
+`python -I tools/audio_config.py <out> --join --json`. The hash A entries and their counts are
+`python -I tools/audio_objects.py <out>` (`--json` for one row per record). The station scan is a u32
+read of the two streams; no station scanner is committed, because the station hash set needs a local
+dictionary and the config gives no measured content-id-to-record link beyond the VCRR anchor.
 
 ## No-sharing rule
 
