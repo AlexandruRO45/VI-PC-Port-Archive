@@ -340,6 +340,22 @@ class CliTest(unittest.TestCase):
         self.assertIn("--out", self.cli_error([path, "--out", os.path.join(path, "sub", "r.json")]))
         self.assertIn("folder", self.cli_error([path, "--out", self.tmp.name]))
 
+    def test_without_out_writes_no_report_in_the_current_folder(self):
+        defs, m = scene()
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([defs, m]))
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            with redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(WA.main([path]), 0)
+            self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "reports")),
+                             "a run without --out must not write a report into the current folder")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(json.loads(out.getvalue())["summary"]["archetypes"], 2)
+
     def test_missing_path_is_an_error(self):
         with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
             sys.stderr, saved = io.StringIO(), sys.stderr
