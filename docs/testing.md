@@ -401,7 +401,9 @@ whose Metal device is "Apple Paravirtual device" (Metal family Mac2, not Apple7)
 subgroups, so the wave64 and "32 lanes on request" tests skip there (about 75 of 190 in November 2026), and Mesa's
 KosmicKrisp finds no device. `macos-15` can't build the runtime: Xcode 16's libc++ has no floating-point
 `std::from_chars`. A test known to fail on MoltenVK is listed in the step's `EXPECTED_FAILURES` with the pull
-request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step on any other failure.
+request or coordination-issue finding that tracks it; it still runs, and `scripts/ci_expected_failures.py` fails the step
+on any other failure. It takes `FAILED_LIST EXIT_STATUS [EXPECTED ...]`, answers `--help`, and reports a list it cannot
+read or a non-numeric status as one line with exit code 2.
 
 ## GPUs without fragment barycentrics (NVIDIA Volta, Pascal and older)
 
@@ -498,8 +500,20 @@ over integrated, the first on a tie, `vulkan_device_rank` in `runtime/src/vulkan
 `LEONIDA_VK_DEVICE=radeon`. The D3D12 tests (`vk_test_device.h`) and the layer's standalone device read it,
 and a value that matches no device fails the run instead of testing
 another GPU. For the host side of the comparison tests, `LEONIDA_HOST_ADAPTER` picks the D3D12 adapter the same way.
+Unset, the host side is the adapter behind the layer's Vulkan device (`runtime/test/host_adapter.h`; `d3d12_buffer_tiles`
+by the layer's `GetAdapterLuid()`), so on a PC with two GPUs the layer is compared with its own GPU's driver.
 The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) read it the same way through
 `vk_device_pick.h`, and fail with a message naming the filter when it matches no device.
+
+Two test settings make the layer's standalone device look like a GPU with fewer Vulkan queues, so D3D12 queues share
+them (`docs/d3d12_vulkan.md` section 4.4) on any GPU: `LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N` (1 to 16) creates at most
+N Vulkan queues per queue family, and `LEONIDA_VK_GRAPHICS_FAMILY_ONLY=1` puts COMPUTE and COPY queues in the
+graphics family, as on a GPU without async compute or transfer families. Both together give the shape of the Intel
+UHD 770 on Windows and of lavapipe, one family with one queue; the `d3d12_queue_share_one_queue` and
+`d3d12_queue_wait_one_queue` tests run that way, and any other test can be run so by hand. The device logs what it
+applied; a queue count outside 1 to 16 is ignored, with a message. Only tests apply them: the device that
+`gta6rt --run` creates for a game (`LEONIDA_D3D12=vulkan`) ignores both and prints `... is a test setting; the
+game's device ignores it`, so leaving them set cannot slow a game down (`run_tiny_frame_queue_test_settings`).
 
 ## Known problems
 
@@ -510,6 +524,7 @@ The GPU tools of `runtime/test/shaders` (`vk_compute_test`, `vk_harness`, ...) r
 | `tools/hw_oracle` works once, then stops with "hardware oracle unavailable: Windows Defender blocked the launcher ... (WinError 225)" (older runs: an `OSError: [WinError 225] ... contains a virus or potentially unwanted software` traceback) | Defender's machine-learning check flags the small unsigned `leonida_hw_oracle_<hash>.exe` that the runner builds in `%TEMP%` (seen as `Trojan:Win32/Bearfoos.A!ml`) and quarantines it; every later run rebuilds and loses it again | Add an exclusion for the build folder (`%TEMP%`) in Windows Security, Virus & threat protection, Manage settings, Exclusions, restore the file from Protection history if you want it back, and rerun. The program is built from `tools/hw_oracle/hw_oracle.c` and is a false positive |
 | Validation errors without a VUID, or messages from a layer you didn't ask for | An implicit Vulkan layer from other software (Rockstar Social Club, ReShade, MangoHud, an overlay) | Set `VK_LOADER_LAYERS_DISABLE=~implicit~`. Overlays that hook the swapchain (RivaTuner `VK_LAYER_RTSS`, OBS `VK_LAYER_OBS_HOOK`) can stay loaded: see the next row |
 | Validation errors that only your machine shows (e.g. `xbox_present`'s sRGB swapchain `STORAGE` message), with MSI Afterburner/RivaTuner or OBS installed | An overlay layer that hooks the swapchain: while RivaTuner Statistics Server is running, its `VK_LAYER_RTSS` adds `STORAGE` usage to it (OBS's `VK_LAYER_OBS_HOOK` injects `VK_IMAGE_USAGE_STORAGE_BIT` too). In an elevated (administrator) terminal the loader ignores `VK_LOADER_LAYERS_DISABLE` (`VK_LOADER_DEBUG=all` says so), so `~implicit~` leaves the layer in | Run the tests from a normal terminal, close the overlay application, or set the layer's own switch, which works elevated too: `DISABLE_RTSS_LAYER=1`, `DISABLE_VULKAN_OBS_CAPTURE=1` (OBS). Any other layer's switch is the `disable_environment` entry in its manifest (the JSON listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers` or `HKCU\...`). `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted |
+| GPU tests crash with an access violation (`0xC0000005`, exit `-1073741819`) right after device creation, with no layer message and validation off (e.g. `d3d12_method_variants` 9 of 10 runs, `xbox_present` 10 of 10, on `main` 561b65a83, RTX 4070 Ti, NVIDIA 616.56) | An implicit layer from an overlay or game tool you did not install for these tests. FPS Monitor's `fpsmonvk64.json` (listed under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers`) names itself `VK_LAYER_RENDERDOC_Capture`, so `DISABLE_VULKAN_OBS_CAPTURE=1` does not disable it | `VK_LOADER_DEBUG=layer` prints the layers that were actually inserted. That manifest's `disable_environment` is `DISABLE_LAYER=1`; `DISABLE_LAYER=1` or `VK_LOADER_LAYERS_DISABLE=~implicit~` gave 20 of 20 clean runs (a layer's own switch is its `disable_environment` entry, as the row above says) |
 | `vk_sync_validation` fails with `LEONIDA_VK_VALIDATION=1` ("the write-after-write hazard was not reported") | Synchronization validation is off although the tests ask for it: an older layer, or a layer setting such as `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=false` or a `vk_layer_settings.txt` that overrides it. Every other GPU test then reports "0 validation errors" without having been checked | Remove the override or update the Vulkan SDK, then rerun `ctest -R vk_sync_validation` until it passes |
 | On RADV with Mesa 25.2 (Ubuntu 24.04's default; 25.2.8 measured) or 25.3 (from the source, not run), `cs_w32_salu64` fails with word 2 = `0` (want `0xFFFFFFFF`) and `cs_signed_zero_nan` fails with word 5 = `0` (want `1`). The `cs_signed_zero_nan` failure alone is also measured on RADV 25.0.7 (RX 7800 XT, Debian 13; @mrbean56, #4421) and on ANV 25.2.8 (Intel UHD 630; @theswiss24, #4571); llvmpipe on Mesa 26.0.8 (Ubuntu 26.04) still gives word 5 = `0`, which `check.py` does not judge there (`UNJUDGED_WORDS`) | Two Mesa bugs, not translator bugs (#166). `cs_w32_salu64`: ACO's `combine_add_sub_b2i` reads a temporary without counting the use, so dead-code elimination removes it (`ACO ERROR: ... never defined` with `MESA_SHADER_CACHE_DISABLE=true`); `RADV_DEBUG=llvm` passes. `cs_signed_zero_nan`: NIR's range analysis (`fmul_is_a_number`) calls `0 * x` a number when `x` may be infinite, so the `x != x` check folds to false despite `SignedZeroInfNanPreserve`. The same NIR code is behind llvmpipe's word 5 (#664) and ANV's, since both drivers run NIR; `cs_w32_salu64` is ACO's, so only RADV has it | Expected with these Mesa versions. From the source, the ACO function is gone from Mesa 26.0 and the NIR code was replaced in 26.1 (neither run); RADV from Mesa 26.3.1 passes both on an 8060S (gfx1151) |
 | Every test crashes inside `libnvidia-eglcore.so` | NVIDIA's 535 server driver (Ubuntu 24.04's default) | Use driver 615 or newer |
