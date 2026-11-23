@@ -512,6 +512,67 @@ int main() {
         EXPECT(pacer.frames_in_flight() == 1);
     }
 
+    // Re-presenting a token clears stale display statistics and supersedes earlier in-flight entries for that token.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 2));
+        clock.advance_us(period);  // origin 1, due at 2 * period
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 1);
+
+        // First present tears immediately at 2.5 periods (50% scanned, displayed at once).
+        clock.advance_us(period + period / 2);
+        pacer.commit_present_token(token, 1, PresentSync::immediate);
+        FrameStatistic stats[2]{};
+        std::uint32_t count = 2;
+        EXPECT(pacer.get_frame_statistics(token, stat_present | stat_display, &count, stats) == pacer_hr::ok &&
+               count == 2 && stats[1].time_us == 2 * period + period / 2 && stats[1].percent_scanned == 50.0f);
+
+        // Re-present the same token paced at 2.75 periods (queued for vblank 3): display must be pending again,
+        // never reporting the stale earlier display timestamp (< present_us) or the old 50% scan value.
+        clock.advance_us(period / 4);  // 2.75 periods
+        pacer.commit_present_token(token, 1, PresentSync::vblank);
+        EXPECT(pacer.frames_in_flight() == 1);
+        count = 2;
+        EXPECT(pacer.get_frame_statistics(token, stat_present | stat_display, &count, stats) == pacer_hr::false_ &&
+               count == 1 && stats[0].type == stat_present && stats[0].time_us == 2 * period + 3 * period / 4);
+
+        // Re-present the same token again while the 2.75-period present is still in flight (queued for vblank 4).
+        clock.advance_us(period / 8);  // 2.875 periods
+        pacer.commit_present_token(token, 1, PresentSync::vblank);
+        EXPECT(pacer.frames_in_flight() == 2);
+
+        // At vblank 3, the superseded first queued frame retires, leaving one frame in flight and no display stat yet.
+        clock.advance_us(period / 8);  // 3 * period
+        EXPECT(pacer.frames_in_flight() == 1);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, stats) == pacer_hr::false_ && count == 0);
+
+        // At vblank 4, the latest present displays with the new timestamp and 0% scanned.
+        clock.advance_us(period);  // 4 * period
+        EXPECT(pacer.frames_in_flight() == 0);
+        count = 2;
+        EXPECT(pacer.get_frame_statistics(token, stat_present | stat_display, &count, stats) == pacer_hr::ok &&
+               count == 2 && stats[0].time_us == 2 * period + 7 * period / 8 &&
+               stats[1].time_us == 4 * period && stats[1].percent_scanned == 0.0f);
+
+        // Unpaced re-present after an immediate tear also clears the stale scan percent.
+        clock.advance_us(period);  // origin 5, token 2, due at 6 * period
+        std::uint64_t token2 = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token2) == pacer_hr::ok && token2 == 2);
+        clock.advance_us(period + period / 2);  // 6.5 periods
+        pacer.commit_present_token(token2, 1, PresentSync::immediate);
+        pacer.suspend();
+        pacer.resume();  // unpaced until interval and origin event are set up again
+        clock.advance_us(period / 4);  // 6.75 periods
+        pacer.commit_present_token(token2, 1, PresentSync::vblank);
+        count = 2;
+        EXPECT(pacer.get_frame_statistics(token2, stat_present | stat_display, &count, stats) == pacer_hr::ok &&
+               count == 2 && stats[0].time_us == 6 * period + 3 * period / 4 &&
+               stats[1].time_us == stats[0].time_us && stats[1].percent_scanned == 0.0f);
+    }
+
     // Real clock: five 10 ms vblanks take about 50 ms.
     {
         SteadyFrameClock clock;

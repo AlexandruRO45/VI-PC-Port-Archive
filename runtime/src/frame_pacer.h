@@ -299,7 +299,11 @@ public:
         last_presented_ = std::max(last_presented_, token);
         if (!interval_set_ || !armed_) {  // not paced (PresentX holds no vblank until the event is armed): shows at once
             for (Record& r : records_)
-                if (r.token == token) { r.presented = r.displayed = true; r.present_us = r.display_us = now; }
+                if (r.token == token) {
+                    r.presented = r.displayed = true;
+                    r.present_us = r.display_us = now;
+                    r.percent_scanned = 0.0f;
+                }
             return;
         }
         // The vblank after now, and not before the one after the previous queued frame.
@@ -315,9 +319,21 @@ public:
             percent = scan_percent(late_us, period_us_);
             ++immediate_presents_;
         }
+        // An earlier queued present of the same token keeps its vblank slot for pacing, but no longer updates this
+        // token's display statistics once a newer present has superseded it.
+        if (token) {
+            for (Pending& p : pending_)
+                if (p.token == token) p.token = 0;
+        }
         pending_.push_back(Pending{token, flip, percent});
         for (Record& r : records_)
-            if (r.token == token) { r.presented = true; r.present_us = now; }
+            if (r.token == token) {
+                r.presented = true;
+                r.present_us = now;
+                r.displayed = false;
+                r.display_us = 0;
+                r.percent_scanned = 0.0f;
+            }
         retire_locked(now);
         cv_.notify_all();
     }
