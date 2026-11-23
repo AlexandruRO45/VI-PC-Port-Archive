@@ -2,6 +2,7 @@
 the Linux backend that need no GPU (reading the assembled object, the launcher's tokens, the display check). The
 last tests run on the hardware when the oracle tools are present and are skipped otherwise.
 Standard library only."""
+import hashlib
 import os
 from pathlib import Path
 import struct
@@ -719,6 +720,97 @@ class LinuxBackend(unittest.TestCase):
                 drm.find_node({"LEONIDA_HW_DRM_NODE": str(busy)}, str(sysfs))
             allowed = {"LEONIDA_HW_DRM_NODE": str(busy), "LEONIDA_HW_DRM_ALLOW_DISPLAY": "1"}
             self.assertEqual(drm.find_node(allowed, str(sysfs)), str(busy))
+
+    def build_launcher(self, root):
+        """drm's _build_launcher with the temp folder and the cache under root, gcc faked: (exe, compile argvs)."""
+        compiles = []
+
+        def run(argv, **kwargs):
+            compiles.append(argv)
+            with open(argv[argv.index("-o") + 1], "wb") as f:
+                f.write(b"#!/bin/sh\necho '# device=x arch=gfx1030'\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(tempfile, "tempdir", os.path.join(root, "tmp")), \
+                mock.patch.dict(os.environ, {"XDG_CACHE_HOME": os.path.join(root, "cache")}), \
+                mock.patch.object(drm.shutil, "which", return_value=None), \
+                mock.patch.object(drm.runner, "find_cc", return_value=("gcc", "gcc")), \
+                mock.patch.object(drm.subprocess, "run", side_effect=run):
+            return drm.DrmOracle._build_launcher(object.__new__(drm.DrmOracle)), compiles
+
+    def test_the_launcher_is_cached_in_a_private_folder_not_the_shared_temp_folder(self):
+        with tempfile.TemporaryDirectory() as root:
+            shared = os.path.join(root, "tmp")
+            os.mkdir(shared)
+            with open(drm.SOURCE, "rb") as f:
+                tag = hashlib.sha1(f.read()).hexdigest()[:10]
+            with open(os.path.join(shared, f"leonida_hw_oracle_drm_{tag}"), "wb") as f:   # another user's file
+                f.write(b"planted")
+            exe, compiles = self.build_launcher(root)
+            cache = os.path.join(root, "cache", "leonida")
+            self.assertEqual(os.path.dirname(exe), cache)
+            self.assertEqual(len(compiles), 1)                                    # built, the planted file not used
+            out = compiles[0][compiles[0].index("-o") + 1]
+            self.assertEqual(os.path.dirname(out), cache)                         # built in the private folder
+            self.assertNotEqual(out, exe + f".{os.getpid()}")                    # under a name no one can predict
+            self.assertTrue(os.path.isfile(exe))
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(self.build_launcher(root), (exe, []))               # and reused the next time
+
+    @unittest.skipIf(os.name == "nt", "POSIX owners and modes")
+    def test_a_cached_launcher_someone_else_could_have_written_is_rebuilt(self):
+        with tempfile.TemporaryDirectory() as root:
+            exe, _ = self.build_launcher(root)
+            self.assertEqual(os.stat(os.path.dirname(exe)).st_mode & 0o777, 0o700)
+            self.assertEqual(os.stat(exe).st_mode & 0o777, 0o700)
+            for plant in ("group-writable", "other-writable", "symlink", "other owner"):
+                with self.subTest(plant=plant):
+                    os.remove(exe)
+                    elsewhere = os.path.join(root, "elsewhere")
+                    with open(elsewhere if plant == "symlink" else exe, "wb") as f:
+                        f.write(b"planted")
+                    if plant == "symlink":
+                        os.chmod(elsewhere, 0o700)
+                        os.symlink(elsewhere, exe)
+                    else:
+                        os.chmod(exe, {"group-writable": 0o720, "other-writable": 0o702}.get(plant, 0o700))
+                    real_lstat = os.lstat
+
+                    def lstat(path):   # the planted file as another user's: only root can chown it for real
+                        st = real_lstat(path)
+                        if plant != "other owner" or path != exe:
+                            return st
+                        return os.stat_result(st[:4] + (st.st_uid + 1,) + st[5:10])
+
+                    # drm.os is the os module, so this patches os.lstat for everything until the block ends;
+                    # the side effect changes only the result for exe, so tempfile and shutil are unaffected.
+                    with mock.patch.object(drm.os, "lstat", side_effect=lstat):
+                        again, compiles = self.build_launcher(root)
+                    self.assertEqual(again, exe)
+                    self.assertEqual(len(compiles), 1)
+                    self.assertFalse(os.path.islink(exe))
+                    with open(exe, "rb") as f:
+                        self.assertNotEqual(f.read(), b"planted")
+            os.chmod(os.path.dirname(exe), 0o770)                                # a cache folder others can write
+            with self.assertRaisesRegex(runner.Unavailable, "leonida"):
+                self.build_launcher(root)
+
+    def test_a_cache_folder_that_cannot_be_made_is_unavailable_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "cache"), "wb") as f:   # XDG_CACHE_HOME names a regular file
+                f.write(b"not a folder")
+            with self.assertRaisesRegex(runner.Unavailable, "cannot create the launcher cache"):
+                self.build_launcher(root)
+
+    def test_no_absolute_home_and_no_xdg_cache_home_is_unavailable(self):
+        # HOME unset and no passwd entry: expanduser leaves "~" as is, which would be a folder under the current one
+        with mock.patch.object(drm.os.path, "expanduser", return_value="~"):
+            with self.assertRaisesRegex(runner.Unavailable, "XDG_CACHE_HOME or HOME"):
+                drm.launcher_cache({})
+            with self.assertRaisesRegex(runner.Unavailable, "XDG_CACHE_HOME or HOME"):
+                drm.launcher_cache({"XDG_CACHE_HOME": "relative"})
+        cache = os.path.abspath("cache")
+        self.assertEqual(drm.launcher_cache({"XDG_CACHE_HOME": cache}), os.path.join(cache, "leonida"))
 
     def test_linux_gets_the_kernel_driver_backend(self):
         with unittest.mock.patch.object(sys, "platform", "linux"), \

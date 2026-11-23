@@ -220,7 +220,9 @@ through the kernel driver (`libdrm_amdgpu`), so nothing sits between the instruc
   kernel driver reset that GPU. A node with a display connected is refused unless
   `LEONIDA_HW_DRM_ALLOW_DISPLAY=1`. An integrated GPU next to a discrete card is the convenient case.
 - **Tools.** `clang` with the amdgcn target (the distribution's LLVM has it; `LEONIDA_AMD_CLANG` overrides), `gcc`
-  and the libdrm headers. The launcher is built once into the temp folder. By hand:
+  and the libdrm headers. The launcher is built once into `$XDG_CACHE_HOME/leonida` (else `~/.cache/leonida`), a
+  folder only you can write, and not into the shared `/tmp`: it runs with the render node open, so a cached file that
+  is a symlink, belongs to another user or is group- or other-writable is rebuilt, not run. By hand:
   `gcc -O1 tools/hw_oracle/hw_oracle_drm.c -o hw_oracle_drm $(pkg-config --cflags --libs libdrm_amdgpu)`.
 - **Access.** Your user must be able to open the render node (the `render` or `video` group on most
   distributions).

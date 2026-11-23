@@ -8,6 +8,7 @@ driver (libdrm_amdgpu) by hw_oracle_drm.c. Standard library only. No ROCm: an as
     LEONIDA_HW_DRM_ALLOW_DISPLAY  set to 1 to use a GPU that has a display connected. A kernel that hangs makes the
                                   kernel driver reset the GPU, and with it everything shown on that display.
     LEONIDA_AMD_CLANG, LEONIDA_HOST_CC, LEONIDA_HW_ARCH   as in runner.py
+    XDG_CACHE_HOME                the launcher is cached in $XDG_CACHE_HOME/leonida (else ~/.cache/leonida)
 
 The launcher supports compute engine version 10 only: GFX10, which is RDNA1 and RDNA2.
 """
@@ -15,6 +16,7 @@ import glob
 import hashlib
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -132,6 +134,29 @@ def kernel_registers(elf):
     return out
 
 
+def launcher_cache(environ=os.environ):
+    """The folder the launcher is cached in: $XDG_CACHE_HOME/leonida, else ~/.cache/leonida (a relative
+    XDG_CACHE_HOME is ignored, as the XDG base directory specification says). Raise Unavailable if neither gives an
+    absolute path: with HOME unset and no passwd entry, expanduser leaves "~" as is, a folder under the current one."""
+    base = environ.get("XDG_CACHE_HOME", "")
+    if not os.path.isabs(base):
+        home = os.path.expanduser("~")
+        if not os.path.isabs(home):
+            raise Unavailable("no folder to cache the launcher in: set XDG_CACHE_HOME or HOME to an absolute path")
+        base = os.path.join(home, ".cache")
+    return os.path.join(base, "leonida")
+
+
+def _private(st, kind):
+    """Whether an lstat result is a kind (stat.S_ISREG, stat.S_ISDIR) that only this user owns and can write: not a
+    symlink, owned by os.getuid(), no group or other write bit. Windows has no POSIX owner or mode bits to check."""
+    if not kind(st.st_mode):
+        return False
+    if not hasattr(os, "getuid"):
+        return True
+    return st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
 def launcher_tokens(tokens, offsets, registers):
     """name[:threads[:words]] -> name@offset/rsrc1/rsrc2/wave[:threads[:words]], the form hw_oracle_drm takes."""
     out = []
@@ -166,24 +191,51 @@ class DrmOracle(runner.Oracle):
             self._probe_waves()
 
     def _build_launcher(self):
+        # The launcher runs as the user with the render node open, so it is cached where no one else can write: the
+        # user's cache folder, not the shared temp folder, where anyone can compute the name from the public source
+        # and put a program there first. A cached file is reused only if it is still the user's own.
         with open(SOURCE, "rb") as f:
             tag = hashlib.sha1(f.read()).hexdigest()[:10]
-        exe = os.path.join(tempfile.gettempdir(), f"leonida_hw_oracle_drm_{tag}")
-        if not os.path.isfile(exe):
-            flags = ["-I/usr/include/libdrm", "-ldrm_amdgpu"]
-            pkg_config = shutil.which("pkg-config")
-            if pkg_config:
-                r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"], capture_output=True, text=True)
-                if r.returncode == 0 and r.stdout.strip():
-                    flags = r.stdout.split()
-            tmp = exe + f".{os.getpid()}"
-            kind, cc = runner.find_cc()
-            if kind != "gcc":   # only an override named cl gives anything else on Linux
-                raise Unavailable(f"hw_oracle_drm.c needs gcc or a compiler that takes its options, not {cc}")
+        cache = launcher_cache()
+        try:   # a read-only HOME or an XDG_CACHE_HOME that names a file is a missing oracle, not a traceback
+            os.makedirs(cache, mode=0o700, exist_ok=True)
+            cache_st = os.lstat(cache)
+        except OSError as e:
+            raise Unavailable(f"cannot create the launcher cache {cache}: {e.strerror or e}") from None
+        if not _private(cache_st, stat.S_ISDIR):
+            raise Unavailable(f"{cache} is not a folder only you can write (owned by you, no group or other write "
+                              "bit); remove it or chmod go-w it")
+        exe = os.path.join(cache, f"hw_oracle_drm_{tag}")
+        try:
+            if _private(os.lstat(exe), stat.S_ISREG):
+                return exe
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise Unavailable(f"cannot read the launcher cache {cache}: {e.strerror or e}") from None
+        flags = ["-I/usr/include/libdrm", "-ldrm_amdgpu"]
+        pkg_config = shutil.which("pkg-config")
+        if pkg_config:
+            r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"], capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                flags = r.stdout.split()
+        kind, cc = runner.find_cc()
+        if kind != "gcc":   # only an override named cl gives anything else on Linux
+            raise Unavailable(f"hw_oracle_drm.c needs gcc or a compiler that takes its options, not {cc}")
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=f"hw_oracle_drm_{tag}.", dir=cache)
+        except OSError as e:
+            raise Unavailable(f"cannot write to the launcher cache {cache}: {e.strerror or e}") from None
+        os.close(fd)
+        try:
             r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags], capture_output=True, text=True)
             if r.returncode:
                 raise Unavailable("hw_oracle_drm.c did not build (it needs the libdrm headers): " + r.stderr.strip()[:300])
-            os.replace(tmp, exe)
+            os.chmod(tmp, 0o700)
+            os.replace(tmp, exe)   # replaces a file or symlink that failed the check above, never writes through it
+        finally:
+            if os.path.lexists(tmp):
+                os.remove(tmp)
         return exe
 
     def _device_arch(self):
