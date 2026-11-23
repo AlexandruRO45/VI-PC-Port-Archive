@@ -388,6 +388,17 @@ class TestVAddNcI16Translator(unittest.TestCase):
         words = mrt0_words(spv)
         self.assertEqual(words, [300, 0x7FFF, 300, 0x7FFF])
 
+def ref_v_sub_nc_i16(s0: int, s1: int, clamp: bool = False) -> int:
+    return ref_v_sub_i16(s0, s1, clamp=clamp)
+
+
+class TestVSubNcI16Reference(unittest.TestCase):
+    def test_ref_sub_nc_i16_basic(self):
+        self.assertEqual(ref_v_sub_nc_i16(500, 200), 300)
+
+    def test_ref_sub_nc_i16_clamped(self):
+        self.assertEqual(ref_v_sub_nc_i16(0x8000, 10, clamp=True), 0x8000)
+
 
 if __name__ == "__main__":
     unittest.main()
