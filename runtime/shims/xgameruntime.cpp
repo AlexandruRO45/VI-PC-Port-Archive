@@ -77,8 +77,8 @@ std::string g_inline_config;
 
 HRESULT api_initialize(const char* which, ULONG gdk_ver, ULONG gs_ver, int mode, const ApiImplOptions* options) {
     std::lock_guard<std::mutex> lock(g_config_mutex);
-    g_inline_config = options && options->is_inline && options->game_config && *options->game_config
-                          ? options->game_config : "";
+    if (options && options->is_inline)
+        g_inline_config = options->game_config ? options->game_config : "";
     if (g_api_refs.fetch_add(1) == 0)
         std::fprintf(stderr, "[rt] xgameruntime: %s(gdk=%lu, gs=%lu, mode=%#x, options=%s) (offline)\n", which,
                      gdk_ver, gs_ver, mode & 0xFF,
@@ -1008,10 +1008,9 @@ HRESULT STDMETHODCALLTYPE pkg_identifier(void*, size_t size, char* buffer) {
 }
 bool STDMETHODCALLTYPE pkg_is_packaged(void*) { return XPackageIsPackagedProcess(); }
 // The locales the package declares: <Resources><Resource Language="xx-YY"/> in MicrosoftGame.Config, read from
-// the game folder (LEONIDA_GAME_DIR, else --game-dir). Empty when there is no config or it declares none.
-// The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir); empty when
-// there is no folder or no config. Wide on purpose: a game folder named outside the ANSI code page must reach the file
-// intact.
+// The package's MicrosoftGame.Config as text, from the game folder (LEONIDA_GAME_DIR, else --game-dir),
+// falling back to inline config when the file is missing or empty. The path is wide so names outside the ANSI
+// code page reach the file intact.
 std::string package_config() {
     wchar_t env[MAX_PATH] = {};
     const DWORD n = GetEnvironmentVariableW(L"LEONIDA_GAME_DIR", env, MAX_PATH);

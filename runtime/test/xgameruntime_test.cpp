@@ -926,17 +926,16 @@ void check_run_time_load() {
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
               "empty disk config falls back to inline config");
         DeleteFileA(config.c_str());
+        check(init_ex2(0x2410, 0, 2, nullptr) == S_OK, "nested initialize without options");
         id = 0;
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
-              "inline config remains available before uninitialize");
-        check(uninit_api() == S_OK && init_ex2(0x2410, 0, 2, nullptr) == S_OK,
-              "uninitialize and reinitialize without options");
+              "nested initialize preserves inline config");
+        check(uninit_api() == S_OK && uninit_api() == S_OK, "uninitialize both references");
         id = 0;
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == E_FAIL,
               "inline config is cleared after uninitialize");
         if (game) release(game);
         if (package) release(package);
-        check(uninit_api() == S_OK, "uninitialize after inline config test");
         SetEnvironmentVariableA("LEONIDA_GAME_DIR", nullptr);
         RemoveDirectoryA(dir.c_str());
     }
