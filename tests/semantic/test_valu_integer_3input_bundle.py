@@ -673,5 +673,31 @@ class TestOr3B32SIMDBoundaries(unittest.TestCase):
         self.assertEqual(oracle_or3_b32(MASK32, 0, 0), MASK32)
         self.assertEqual(oracle_or3_b32(0x5555_5555, 0xAAAA_AAAA, 0), MASK32)
 
+# ---------------------------------------------------------------------------
+# Opcode 6: v_or3_b32 - Translator Integration & Suite Compliance
+# ---------------------------------------------------------------------------
+
+class TestOr3B32TranslatorAndCompliance(unittest.TestCase):
+    def test_translated_execution(self) -> None:
+        triples = [
+            (0x1, 0x2, 0x4),
+            (0x10, 0x20, 0x40),
+            (0x5555_5555, 0xAAAA_AAAA, 0),
+            (0, 0, 0),
+            (MASK32, 0, 0),
+        ]
+        for a, b, c in triples:
+            expected = oracle_or3_b32(a, b, c)
+            actual = run_translated_triop("v_or3_b32", a, b, c)
+            self.assertEqual(actual, expected)
+
+    def test_suite_compliance_guard(self) -> None:
+        test_path = os.path.join(HERE, "test_valu_integer_3input_bundle.py")
+        self.assertTrue(os.path.isfile(test_path))
+        with open(test_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("import support", content)
+        self.assertIn("support.translate_lines", content)
+
 if __name__ == "__main__":
     unittest.main()
