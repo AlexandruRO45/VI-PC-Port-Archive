@@ -413,6 +413,16 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("vs -> ps at location 8, component 0 [missing-output]", result.stdout)
 
+    def test_quiet_help_says_it_hides_pipelines_without_problems(self):
+        result = self.command("batch", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        help_text = " ".join(result.stdout.split())
+        # --quiet skips every pipeline without problems and prints only the summary (run_checks),
+        # so the usage text must not promise the diagnostics it removes.
+        self.assertIn("--quiet", help_text)
+        self.assertNotIn("display diagnostics", help_text)
+        self.assertIn("pipelines with problems", help_text)
+
     def test_wrong_stage_and_missing_module_return_two(self):
         result = self.command("check", "--vs", self.ps, "--ps", self.directory / "missing.spv")
         self.assertEqual(result.returncode, 2)
