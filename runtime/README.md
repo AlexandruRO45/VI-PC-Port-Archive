@@ -99,14 +99,18 @@ through it.
 ### Stepping over guest asserts: `LEONIDA_SKIP_ASSERTS`
 
 Off by default. `LEONIDA_SKIP_ASSERTS=N` with N > 0 installs a vectored exception handler (last in the chain) that
-steps over the first N `int3` breakpoints raised by guest code: an address in no host-loaded module (the mapped game
-images and the guest's own allocations), whose byte is `0xCC`. Each one is logged as
-`[rt] assert skipped: int3 in guest code at <module+RVA, or the address> (LEONIDA_SKIP_ASSERTS)` and execution
-resumes at the next byte. A breakpoint in a host module, a fault that is not an `int3`, and any `int3` after the N-th
-continue the exception search as before. A console devkit continues past a failed assert; the retail title has some
-that are tuning checks (see [retail_boot_chain.md](../docs/retail_boot_chain.md)), so this is a way to see what
-comes after, not a fix. `LEONIDA_SKIP_INT3` (with `--trace`) is the unbounded diagnostic variant. Test:
-`guest_asserts_test` (a real `int3` on `VirtualAlloc`'d executable memory).
+steps over the first N `int3` breakpoints raised by guest code: "guest code" here means outside every loaded module
+(the mapped images, guest allocations and the runtime's generated thunks), at a byte that is `0xCC`. Each one is
+logged as `[rt] assert skipped: int3 in guest code at <module+RVA, or the address> (LEONIDA_SKIP_ASSERTS)` and
+execution resumes at the next byte. A breakpoint in a loaded host module, a fault that is not an `int3`, and any
+`int3` after the N-th continue the exception search as before. Being a vectored handler it runs before a guest
+`__try` that would catch the `int3` itself.
+
+Hypothesis: a console devkit continues past a failed assert, and some of the retail title's asserts are tuning checks
+rather than faults (see [retail_boot_chain.md](../docs/retail_boot_chain.md)), so this is a way to see what comes
+after, not a fix. A debugging aid for the title's own asserts; it does not touch any protection or anti-debug check.
+`LEONIDA_SKIP_INT3` (with `--trace`) is the unbounded diagnostic variant. Test: `guest_asserts_test` (a real `int3`
+on `VirtualAlloc`'d executable memory).
 
 ## PE loader
 

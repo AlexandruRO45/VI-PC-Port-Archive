@@ -1,10 +1,11 @@
 // LEONIDA_SKIP_ASSERTS=N: step over the first N `int3` asserts raised by guest code (opt-in, off by default).
 //
-// A console devkit lets a title continue past a failed assert; the retail title has some asserts that are tuning
-// checks, not faults (docs/retail_boot_chain.md). With the variable set to a positive number the runtime installs a
-// vectored exception handler that, for a breakpoint at an address outside every host-loaded module (the guest's
-// mapped images and its own allocations), whose byte is 0xCC, logs the site and resumes one byte later. Anything
-// else continues the exception search untouched.
+// Hypothesis: a console devkit lets a title continue past a failed assert, and some of the retail title's asserts
+// are tuning checks rather than faults (docs/retail_boot_chain.md). With the variable set to a positive number the
+// runtime installs a vectored exception handler that, for a breakpoint at an address outside every loaded module
+// (the mapped images, guest allocations and the runtime's generated thunks), whose byte is 0xCC, logs the site and
+// resumes one byte later. Anything else continues the exception search untouched. A debugging aid for the title's
+// own asserts; it does not touch any protection or anti-debug check.
 #pragma once
 
 #include <windows.h>
@@ -15,10 +16,11 @@
 
 namespace rt::guest_asserts {
 
-// True when a breakpoint whose byte is `byte` is to be stepped over. `remaining` is decremented once per guest int3
-// considered and the skip happens while the result is not negative, so N allows exactly N skips.
+// True when a breakpoint whose byte is `byte` is to be stepped over. `remaining` is decremented once per skipped
+// int3 and never below 0 once spent, so N allows exactly N skips.
 inline bool should_skip(std::atomic<long>& remaining, bool in_host_module, unsigned char byte) {
     if (in_host_module || byte != 0xCC) return false;
+    if (remaining.load(std::memory_order_relaxed) <= 0) return false;
     return remaining.fetch_sub(1) - 1 >= 0;
 }
 
