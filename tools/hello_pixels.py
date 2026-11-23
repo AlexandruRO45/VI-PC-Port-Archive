@@ -4,8 +4,8 @@
 first_light.py needs the game's own package; this tool needs only vk_harness (built from runtime/) and
 spirv-as (Vulkan SDK or spirv-tools). It assembles a tiny hand-written vertex+fragment pair, feeds an
 indexed fullscreen quad through VKH_DRAW_MESH/VKH_VERTEX_LAYOUT, reads back the RGBA32F image and writes
-image.ppm plus image.png. --check verifies the picture like first_light's oracle: coverage, the corner
-clear value and pixel probes against the pattern's own closed form.
+image.ppm plus image.png. --check verifies the picture like first_light's oracle: coverage and every
+pixel against the pattern's own closed form (the quad is fullscreen, so no clear value is visible).
 
   python -I tools/hello_pixels.py --work <dir> --run [--check] [--size 256]
 
@@ -206,34 +206,22 @@ def check_image(data: bytes, width: int, height: int):
     if len(data) != want:
         raise AssertionError(f"image.raw is {len(data)} bytes, expected {want}")
     pixels = struct.unpack(f"<{width * height * 4}f", data)
-    clear_tol = 1e-3
-    probes = [
-        (width // 2, height // 2),
-        (width // 4, height // 4),
-        (3 * width // 4, height // 4),
-        (width // 4, 3 * height // 4),
-        (3 * width // 4, 3 * height // 4),
-        (width // 8, height // 2),
-        (7 * width // 8, height // 2),
-    ]
     covered = 0
     for y in range(height):
         for x in range(width):
             i = (y * width + x) * 4
             if pixels[i + 3] != 0.0:
                 covered += 1
+            got = pixels[i : i + 4]
+            want_px = expected_pixel(x, y, width, height)
+            for c in range(4):
+                if abs(got[c] - want_px[c]) > 0.04:
+                    raise AssertionError(
+                        f"pixel ({x},{y}) is {[round(g, 4) for g in got]}, "
+                        f"expected {[round(w, 4) for w in want_px]} channel {c}"
+                    )
     if covered != width * height:
         raise AssertionError(f"coverage {covered}/{width * height}: the quad did not fill the image")
-    for x, y in probes:
-        i = (y * width + x) * 4
-        got = pixels[i : i + 4]
-        want_px = expected_pixel(x, y, width, height)
-        for c in range(4):
-            if abs(got[c] - want_px[c]) > 0.04:
-                raise AssertionError(
-                    f"pixel ({x},{y}) is {[round(g, 4) for g in got]}, "
-                    f"expected {[round(w, 4) for w in want_px]} channel {c}"
-                )
     return {"covered": covered, "pixels": pixels}
 
 
@@ -312,7 +300,7 @@ def main(argv=None) -> int:
     ap.add_argument("--size", type=int, default=256, help="image edge in pixels (default 256)")
     ap.add_argument("--harness", help="vk_harness binary (default LEONIDA_VK_HARNESS or runtime/build)")
     ap.add_argument("--run", action="store_true", help="run the draw and write image.raw/.ppm/.png")
-    ap.add_argument("--check", action="store_true", help="verify coverage and probe pixels after the draw")
+    ap.add_argument("--check", action="store_true", help="verify coverage and every pixel after the draw")
     ap.add_argument("--emit-only", action="store_true", help="write shaders and mesh.bin, then stop")
     args = ap.parse_args(argv)
 

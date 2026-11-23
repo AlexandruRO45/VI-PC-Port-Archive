@@ -52,6 +52,15 @@ class TestCheckImage(unittest.TestCase):
         with self.assertRaises(AssertionError):
             hp.check_image(bytes(px), W, H)
 
+    def test_rejects_wrong_colour_off_probe(self):
+        # A colour-only error anywhere must fail — the oracle compares every pixel, not just the
+        # probe points a weaker check watched (milas6669's report on #5732).
+        px = bytearray(make_image())
+        i = (3 * W + 3) * 16  # a pixel no probe used to look at
+        px[i : i + 4] = struct.pack("<f", 9.0)  # red channel far out of tolerance, alpha untouched
+        with self.assertRaises(AssertionError):
+            hp.check_image(bytes(px), W, H)
+
     def test_expected_pixel_corners(self):
         # u rises left->right, v rises bottom->top (row 0 is the top of the image).
         bottom_left = hp.expected_pixel(0, H - 1, W, H)

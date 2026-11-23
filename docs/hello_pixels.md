@@ -24,12 +24,12 @@ Same style as the first_light oracle, so the image has to be *right*, not just n
 
 - the buffer is exactly `w*h*16` bytes of RGBA32F;
 - coverage is 100% — a quad that misses the image fails, and so does an all-clear image;
-- seven probe pixels match `expected_pixel`, the closed form of the same pattern (u, v, (u+v)/2 with cell
-  parity) computed at pixel centres, within 0.04. A flipped axis, a swapped u/v or a mirrored checker moves
-  probe values out of tolerance.
+- every pixel matches `expected_pixel`, the closed form of the same pattern (u, v, (u+v)/2 with cell
+  parity) computed at pixel centres, within 0.04. A flipped axis, a swapped u/v, a mirrored checker or a
+  draw right at only a handful of points is out of tolerance.
 
 `tests/test_hello_pixels.py` runs the oracle on synthetic buffers without a GPU or vk_harness: the accepted
-image, a truncated buffer, a wrong probe pixel and a coverage loss away from every probe.
+image, a truncated buffer, a wrong pixel and a coverage loss.
 
 ## Why it matters
 
