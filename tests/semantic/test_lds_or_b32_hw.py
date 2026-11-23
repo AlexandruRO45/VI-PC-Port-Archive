@@ -246,5 +246,112 @@ class TestLdsOrB32AST(unittest.TestCase):
         self.assertEqual(lines[1], "ds_or_b32 v0, v2 offset:16")
 
 
+# ---------------------------------------------------------------------------
+# Condition Codes and Status Flags
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class LdsConditionCodes:
+    """Condition codes reflecting 32-bit bitwise operation result values."""
+    zero: bool
+    negative: bool
+    positive: bool
+
+
+def compute_lds_condition_codes(result: int) -> LdsConditionCodes:
+    """Computes condition codes from a 32-bit bitwise operation result."""
+    val32 = result & MASK32
+    return LdsConditionCodes(
+        zero=(val32 == 0),
+        negative=bool(val32 & SIGN_BIT32),
+        positive=(val32 > 0 and not bool(val32 & SIGN_BIT32)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Scalar Instruction Interpreter
+# ---------------------------------------------------------------------------
+
+class ScalarLdsInterpreter:
+    """Deterministic scalar interpreter for ds_or_b32."""
+
+    def __init__(self, size_dwords: int = DEFAULT_LDS_DWORDS) -> None:
+        self.vgprs: list[int] = [0] * 256
+        self.vcc: int = 0
+        self.scc: int = 0
+        self.lds: LDSMemory = LDSMemory(size_dwords)
+        self.trace: list[str] = []
+        self.last_condition_codes: LdsConditionCodes | None = None
+
+    def read_vgpr(self, idx: int) -> int:
+        if idx < 0 or idx >= 256:
+            raise IndexError(f"VGPR index out of bounds: v{idx}")
+        return self.vgprs[idx] & MASK32
+
+    def write_vgpr(self, idx: int, val: int) -> None:
+        if idx < 0 or idx >= 256:
+            raise IndexError(f"VGPR index out of bounds: v{idx}")
+        self.vgprs[idx] = val & MASK32
+
+    def step(self, inst: Instruction) -> int:
+        """Executes a single ds_or_b32 instruction; returns updated memory value."""
+        vaddr = self.read_vgpr(inst.vaddr.index)
+        vdata = self.read_vgpr(inst.vdata.index)
+        updated = self.lds.atomic_or_b32(vaddr, vdata, offset16=inst.mods.offset)
+
+        # ds_or_b32 is non-returning: VGPRs remain unchanged!
+        self.last_condition_codes = compute_lds_condition_codes(updated)
+        self.trace.append(f"{inst.to_assembly()} => lds={updated:#010x}")
+        return updated
+
+    def run_program(self, prog: Program) -> list[int]:
+        """Executes all instructions in a program sequentially."""
+        return [self.step(inst) for inst in prog.instructions]
+
+
+class TestLdsOrB32ScalarInterpreter(unittest.TestCase):
+    """Unit tests for the deterministic scalar instruction interpreter."""
+
+    def setUp(self) -> None:
+        self.interp = ScalarLdsInterpreter(size_dwords=1024)
+
+    def test_scalar_step_basic_or(self) -> None:
+        self.interp.lds.write_dword(0x10, 0x1100)
+        self.interp.write_vgpr(0, 0x10)    # vaddr
+        self.interp.write_vgpr(1, 0x0022)  # vdata
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        updated = self.interp.step(inst)
+        self.assertEqual(updated, 0x1122)
+        self.assertEqual(self.interp.lds.read_dword(0x10), 0x1122)
+
+    def test_scalar_step_with_immediate_offset(self) -> None:
+        self.interp.lds.write_dword(0x20, 0x0F)
+        self.interp.write_vgpr(2, 0x10)    # vaddr=0x10
+        self.interp.write_vgpr(3, 0xF0)    # vdata
+
+        # 0x10 + 0x10 offset = 0x20
+        inst = Instruction(
+            Opcode.DS_OR_B32,
+            Register(RegKind.VGPR, 2),
+            Register(RegKind.VGPR, 3),
+            LdsModifiers(offset=0x10),
+        )
+        updated = self.interp.step(inst)
+        self.assertEqual(updated, 0xFF)
+        self.assertEqual(self.interp.lds.read_dword(0x20), 0xFF)
+
+    def test_scalar_non_returning_preserves_vgprs(self) -> None:
+        self.interp.write_vgpr(0, 0x40)
+        self.interp.write_vgpr(1, 0xDEADBEEF)
+
+        inst = Instruction(Opcode.DS_OR_B32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        self.interp.step(inst)
+
+        # Neither vaddr nor vdata are modified
+        self.assertEqual(self.interp.read_vgpr(0), 0x40)
+        self.assertEqual(self.interp.read_vgpr(1), 0xDEADBEEF)
+
+
 if __name__ == "__main__":
     unittest.main()
