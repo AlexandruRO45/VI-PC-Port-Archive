@@ -204,6 +204,16 @@ def load_manifest(manifest: str) -> dict:
 
 def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
     want = load_manifest(manifest)
+    # The recorded executable (the manifest's "expected_exe") lives next to the package, outside the "files"
+    # table on purpose, so it must not be reported as NEW.
+    expected_exe = None
+    try:
+        with open(manifest, encoding="utf-8") as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get("expected_exe"), str) and doc["expected_exe"]:
+            expected_exe = doc["expected_exe"]
+    except (OSError, ValueError):
+        pass
     have = dict(walk(game_dir, exclude=manifest))
     if not want and have:
         # A create that was cut short, or a mistyped --manifest, would otherwise print OK without checking a file.
@@ -241,7 +251,10 @@ def verify(game_dir: str, manifest: str, jobs: int = 1) -> int:
         if kind:
             print(f"{kind:<10}{rel}")
             bad += 1
-    for rel in sorted(set(have) - set(want)):
+    extra = set(have) - set(want)
+    if expected_exe:
+        extra.discard(expected_exe)
+    for rel in sorted(extra):
         print(f"{'NEW':<10}{rel}")
     print("OK" if not bad else f"{bad} problem(s)")
     return 1 if bad else 0

@@ -280,6 +280,31 @@ class ManifestCreateVerifyTest(unittest.TestCase):
         self.assertIn("NEW       content/unexpected_new.dat", output)
         self.assertIn("OK", output)
 
+    def test_verify_expected_exe_is_not_reported_new(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            manifest.create(self.pkg, self.out_manifest, jobs=1)
+
+        with open(self.out_manifest, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc["expected_exe"] = "master.exe"
+        with open(self.out_manifest, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f)
+
+        with open(os.path.join(self.pkg, "master.exe"), "wb") as f:
+            f.write(b"recorded executable payload bytes")
+        with open(os.path.join(self.pkg, "still_untracked.dat"), "wb") as f:
+            f.write(b"another rogue asset")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = manifest.verify(self.pkg, self.out_manifest, jobs=1)
+
+        self.assertEqual(rc, 0)
+        output = out.getvalue()
+        self.assertNotIn("master.exe", output)
+        self.assertIn("NEW       still_untracked.dat", output)
+        self.assertIn("OK", output)
+
     def test_verify_accumulates_multiple_corruptions(self):
         with contextlib.redirect_stdout(io.StringIO()):
             manifest.create(self.pkg, self.out_manifest, jobs=1)
