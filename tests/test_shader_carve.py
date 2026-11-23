@@ -655,5 +655,80 @@ class ShaderCarveCliIntegrationTest(unittest.TestCase):
         self.assertEqual([(r["name"], r["offset"]) for r in index], [("real_shader", len(bogus))])
 
 
+class ShaderCarveOsErrorTest(unittest.TestCase):
+    """A failed read, write or replace is one ERROR line and exit 1, never a traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.archive = os.path.join(self.tmp.name, "shaders.rpf")
+        self.out = os.path.join(self.tmp.name, "out")
+        dxbc = make_dxbc([(b"DXIL", make_dxil_payload(0x65, 1, 40))])
+        with open(self.archive, "wb") as f:
+            f.write(make_rpf_entry("vs_main", 1, dxbc, entry_id=1))
+
+    def carve(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = shader_carve.main([self.archive, self.out])
+        return code, err.getvalue()
+
+    def test_archive_open_failure(self):
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == self.archive:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", fake_open):
+            code, err = self.carve()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: cannot read", err)
+        self.assertIn("Permission denied", err)
+
+    def test_archive_mmap_failure_closes_the_file(self):
+        with mock.patch.object(shader_carve.mmap, "mmap", side_effect=OSError(12, "Cannot allocate memory")):
+            code, err = self.carve()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: cannot read", err)
+        self.assertIn("Cannot allocate memory", err)
+
+    def test_dxbc_write_failure(self):
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).endswith(".dxbc"):
+                raise OSError(28, "No space left on device")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", fake_open):
+            code, err = self.carve()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertIn("No space left on device", err)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "index.json")))
+
+    def test_index_replace_failure_leaves_no_index(self):
+        with mock.patch.object(shader_carve.os, "replace", side_effect=OSError(13, "Access is denied")):
+            code, err = self.carve()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertIn("index.json", err)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "index.json")))
+
+    def test_index_staging_failure(self):
+        with mock.patch.object(shader_carve.tempfile, "TemporaryDirectory", side_effect=OSError(30, "Read-only file system")):
+            code, err = self.carve()
+        self.assertEqual(code, 1)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertIn("Read-only file system", err)
+
+    def test_success_still_works(self):
+        code, err = self.carve()
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(os.path.isfile(os.path.join(self.out, "index.json")))
+
+
 if __name__ == "__main__":
     unittest.main()
