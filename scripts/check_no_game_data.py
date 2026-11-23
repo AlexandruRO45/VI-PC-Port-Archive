@@ -2,6 +2,7 @@
 
     python3 -I scripts/check_no_game_data.py            # every file `git ls-files` lists
     python3 -I scripts/check_no_game_data.py PATH...    # only these files
+    python3 -I scripts/check_no_game_data.py -h         # this usage
 
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
@@ -267,6 +268,9 @@ def display(path):
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())  # the usage at its head; it checks nothing
+        return 0
     paths = argv or tracked_files(os.getcwd())
     found = check(paths)
     for path, name in found:

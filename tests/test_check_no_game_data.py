@@ -241,6 +241,15 @@ class CheckNoGameData(unittest.TestCase):
         result = run([os.path.join(self.dir, "sub"), os.path.join(self.dir, "missing.bin")])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_help_prints_the_docstring_and_checks_nothing(self):
+        # -h and --help used to be taken for file paths and skipped, so they printed nothing at all.
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                result = run([flag])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("python3 -I scripts/check_no_game_data.py", result.stdout)
+                self.assertEqual(result.stderr, "")
+
     @unittest.skipUnless(shutil.which("git"), "git not installed")
     def test_default_mode_reads_tracked_files_only(self):
         git = ["git", "-c", "init.defaultBranch=main"]
