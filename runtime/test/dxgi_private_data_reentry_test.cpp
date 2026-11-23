@@ -144,6 +144,9 @@ bool concurrent_remove(IDXGIObject& factory, Payload& payload) {
            factory.GetPrivateData(kInterface, &size, nullptr) == DXGI_ERROR_NOT_FOUND;
 }
 
+// `allocations` counts the operator new calls that succeed before the injected failure. The count follows the
+// standard library's allocation order (a debug iterator level adds its own), so a case's name describes the release
+// build; every case still requires E_OUTOFMEMORY.
 template<class Call>
 bool reports_oom(int allocations, Call call) {
     fail_after = allocations;

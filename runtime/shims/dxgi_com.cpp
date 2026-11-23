@@ -33,6 +33,10 @@ void stub(const char* method) {
 // SetPrivateDataInterface holds one reference until the entry is replaced, removed or the owner dies (Microsoft:
 // IDXGIObject::SetPrivateDataInterface). Zero bytes remove the entry. GetPrivateData gives an interface back with a
 // reference added, and a buffer too small for the entry gets DXGI_ERROR_MORE_DATA and the size to retry with.
+// The interface's AddRef runs outside the store lock with the stored reference pinned, so it may reenter or race a
+// removal. System32 DXGI (Windows 11 x64) also calls AddRef unlocked but without the pin: a SetPrivateData on the same
+// key from inside AddRef, or a removal on another thread, drops the stored reference to 0 while AddRef runs and the
+// caller gets data that is no longer the pointer. Out of memory is E_OUTOFMEMORY with the old entry kept.
 class PrivateDataStore {
 public:
     PrivateDataStore() = default;
