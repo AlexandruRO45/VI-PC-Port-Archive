@@ -259,5 +259,11 @@ class VCubeScAstTests(unittest.TestCase):
         self.assertEqual(ast.mnemonic, "v_cubesc_f32")
         self.assertEqual(ast.dst.index, 4)
 
+class VCubeScScalarInterpreterTests(unittest.TestCase):
+    def test_cubesc_scalar_execution(self):
+        # Z major ray: (1.5, 2.0, 4.0) -> sc = x = 1.5
+        res = oracle_cubesc_f32(1.5, 2.0, 4.0)
+        self.assertEqual(res, 1.5)
+
 if __name__ == "__main__":
     unittest.main()
