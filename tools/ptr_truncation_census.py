@@ -294,13 +294,16 @@ def listings(src):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
-    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1),
+                    help="worker processes (at least 1)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1 (a smaller value would silently scan fewer listings)")
+    if a.jobs < 1:                        # max(1, a.jobs) below used to turn 0 and -3 into a silent serial run
+        ap.error("--jobs must be at least 1")
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
