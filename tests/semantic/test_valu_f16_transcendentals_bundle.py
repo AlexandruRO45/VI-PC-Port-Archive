@@ -243,6 +243,18 @@ class TestVCosF16Translation(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0] & MASK16, 0x3c00)
 
+def ref_v_exp_f16(u: int) -> int:
+    f = u16_to_f16(u)
+    return f16_to_u16(math.pow(2.0, f))
+
+GLOBAL_ORACLE_MAP[Opcode.V_EXP_F16] = ref_v_exp_f16
+
+
+class TestVExpF16Oracle(unittest.TestCase):
+    def test_oracle_truth_table(self) -> None:
+        res = ref_v_exp_f16(0x3C00)
+        self.assertEqual(res, 0x4000)
+
 
 if __name__ == "__main__":
     unittest.main()
