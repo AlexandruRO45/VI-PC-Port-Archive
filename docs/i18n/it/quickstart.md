@@ -84,6 +84,18 @@ verifica che tutto il necessario sia installato e che ci sia abbastanza spazio l
 solo ciò che manca. Il risultato va in `Documents\Leonida`. Se la build viene interrotta, riprende da dove si era
 fermata.
 
+### Poco spazio su disco
+
+I circa 400 GB valgono per la build completa. Per *avviare* il port, `--stages check,shaders,runtime` richiede
+circa 30 GB; la fase `assets` (~370 GB) serve solo agli strumenti per gli asset, e `--wav` aggiunge più volte la
+dimensione dell'Ogg Opus (la preflight stampa questa scelta quando è proprio la fase `assets` a non entrare).
+`--work` e `--out` possono stare su un altro disco. Il runtime legge il pacchetto sul posto, quindi un disco del
+pacchetto in sola lettura richiede `gta6rt --overlay <cartella scrivibile>`; `--overlay` è un'opzione di
+`gta6rt`, non di `make_game.py`. Lascia i file `.s` in `work/shaders/dxbc/disasm`: la build successiva li confronta
+con l'elenco in `disasm.done` e disassembla di nuovo solo quelli che mancano (tutti, per una cartella il cui
+`disasm.done` precede quell'elenco), poi ritraduce ogni shader. Una cartella `disasm` che è un link simbolico viene
+rifiutata quando la fase deve svuotarla.
+
 ### Dal terminale (`make_game.py`)
 
 Stesso comportamento, con più controllo:
