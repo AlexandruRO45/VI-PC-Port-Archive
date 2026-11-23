@@ -1093,6 +1093,15 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
     def is_index(value: object) -> bool:
         return type(value) is int and value >= 0
 
+    def is_whole(value: object) -> bool:
+        """A count, offset or stride: the reader takes these through int(), so 3.0 reads as 3."""
+        return is_index(value) or (type(value) is float and value.is_integer() and value >= 0)
+
+    def check_name(value: object, what: str) -> None:
+        """The part name is the node's name, else the mesh's; a value that is not text cannot be classified."""
+        if value and not isinstance(value, str):
+            raise bad(f"{what} must be a string, got {value!r}")
+
     def number(value: object, what: str) -> None:
         try:
             float(value)
@@ -1131,14 +1140,15 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
             raise bad(f"accessors[{index}] has unsupported type {atype!r}")
         if atype not in allowed:
             raise bad(f"{what} is accessor {index} of type {atype}, expected {' or '.join(allowed)}")
-        if not is_index(count):
+        if not is_whole(count):
             raise bad(f"accessors[{index}] has invalid count {count!r}")
         offsets = (view.get("byteOffset", 0), acc.get("byteOffset", 0))
         stride = view.get("byteStride")
-        if not all(is_index(v) for v in offsets) or not (stride is None or is_index(stride)):
+        if not all(is_whole(v) for v in offsets) or not (stride is None or is_whole(stride)):
             raise bad(f"accessors[{index}] has an invalid byteOffset or byteStride")
         elem_bytes = COMPONENT_STRUCT[ctype][1] * TYPE_COMPONENTS[atype]
-        if count and sum(offsets) + (count - 1) * (stride or elem_bytes) + elem_bytes > len(bin_chunk):
+        count, base, step = int(count), int(offsets[0]) + int(offsets[1]), int(stride or elem_bytes)
+        if count and base + (count - 1) * step + elem_bytes > len(bin_chunk):
             raise bad(f"accessors[{index}] ({what}) runs past the BIN chunk ({len(bin_chunk)} bytes)")
 
     for i, mesh in enumerate(meshes):
@@ -1186,10 +1196,17 @@ def _check_glb_document(doc: object, bin_chunk: bytes, path: str) -> None:
     for i, node in enumerate(nodes):
         if not isinstance(node, dict):
             raise bad(f"nodes[{i}] must be an object")
+    if not any("mesh" in node for node in nodes):
+        for i, mesh in enumerate(meshes):                   # the reader then makes one part per mesh
+            check_name(mesh.get("name"), f"meshes[{i}].name")
+    for i, node in enumerate(nodes):
         if "mesh" not in node:
             continue
         if not is_index(node["mesh"]) or node["mesh"] >= len(meshes):
             raise bad(f"nodes[{i}] names mesh {node['mesh']!r} (GLB has {len(meshes)})")
+        check_name(node.get("name"), f"nodes[{i}].name")
+        if not node.get("name"):
+            check_name(meshes[node["mesh"]].get("name"), f"meshes[{node['mesh']}].name")
         translation = node.get("translation", (0.0, 0.0, 0.0))
         if not isinstance(translation, (list, tuple)) or len(translation) != 3:
             raise bad(f"nodes[{i}].translation must be a list of 3 numbers")

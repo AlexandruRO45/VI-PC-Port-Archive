@@ -122,6 +122,12 @@ MALFORMED = (
     ("node is a number", ("nodes", 0), 0, "nodes[0] must be an object"),
     ("node mesh out of range", ("nodes", 0, "mesh"), 4, "names mesh 4"),
     ("node mesh is a string", ("nodes", 0, "mesh"), "tri", "names mesh 'tri'"),
+    ("count is a fraction", ("accessors", 0, "count"), 2.5, "invalid count 2.5"),
+    ("count is a bool", ("accessors", 0, "count"), True, "invalid count True"),
+    ("node name is a number", ("nodes", 0, "name"), 5, "nodes[0].name must be a string, got 5"),
+    ("node name is a fraction", ("nodes", 0, "name"), 3.5, "nodes[0].name must be a string"),
+    ("node name is a bool", ("nodes", 0, "name"), True, "nodes[0].name must be a string"),
+    ("node name is a list", ("nodes", 0, "name"), ["tri"], "nodes[0].name must be a string"),
     ("translation has two values", ("nodes", 0, "translation"), [1, 2], "translation must be a list of 3"),
     ("translation holds a string", ("nodes", 0, "translation"), [1, "x", 3], "translation must be a number"),
 )
@@ -163,6 +169,41 @@ class MalformedGlb(unittest.TestCase):
         doc = edited(("materials", 0, "pbrMetallicRoughness", "metallicFactor"), "0.75")
         (part,) = pa.read_glb_parts(self.write_doc("string_number.glb", doc))
         self.assertEqual(part.material.metallic_factor, 0.75)
+
+    def test_whole_floats_read_as_the_reader_always_took_them(self) -> None:
+        """The reader takes count, byteOffset and byteStride through int(), so 3.0 was 3 before and still is."""
+        for label, path, value in (
+            ("count", ("accessors", 0, "count"), 3.0),
+            ("view byteOffset", ("bufferViews", 0, "byteOffset"), 0.0),
+            ("accessor byteOffset", ("accessors", 0, "byteOffset"), 0.0),
+            ("byteStride", ("bufferViews", 0, "byteStride"), 12.0),
+            ("byteStride zero", ("bufferViews", 0, "byteStride"), 0.0),
+        ):
+            with self.subTest(label):
+                (part,) = pa.read_glb_parts(self.write_doc("whole.glb", edited(path, value)))
+                self.assertEqual(part.positions, [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)])
+
+    def test_a_name_that_is_not_text_is_an_error_only_where_it_names_the_part(self) -> None:
+        """The part is named after the node, else the mesh: a non-text name is refused where the reader would use
+        it, and left alone where it would not."""
+        mesh_named_5 = edited(("nodes", 0, "name"), DELETE)
+        mesh_named_5["meshes"][0]["name"] = 5
+        no_nodes = edited(("nodes",), DELETE)
+        no_nodes["meshes"][0]["name"] = 5
+        for label, doc in (("node without a name", mesh_named_5), ("no nodes", no_nodes)):
+            with self.subTest(label):
+                with self.assertRaises(pa.PedAssembleError) as caught:
+                    pa.read_glb_parts(self.write_doc("name.glb", doc))
+                self.assertIn("meshes[0].name must be a string, got 5", str(caught.exception))
+
+        unused = document()
+        unused["meshes"][0]["name"] = 5                      # the node has a text name, so this one is never used
+        (part,) = pa.read_glb_parts(self.write_doc("unused_name.glb", unused))
+        self.assertEqual(part.name, "tri")
+        for label, value in (("empty list", []), ("zero", 0), ("empty text", "")):
+            with self.subTest(label):                        # falsy: the reader falls back to the mesh's name
+                (part,) = pa.read_glb_parts(self.write_doc("falsy_name.glb", edited(("nodes", 0, "name"), value)))
+                self.assertEqual(part.name, "tri")
 
     def test_each_malformed_document_is_one_error(self) -> None:
         for index, (label, path, value, expected) in enumerate(MALFORMED):
