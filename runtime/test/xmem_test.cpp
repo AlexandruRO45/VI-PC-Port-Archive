@@ -158,6 +158,57 @@ void test_virtual_query(XMemVirtualQueryFn query) {
     check(bad == 0, "XMemVirtualQuery on an invalid address returns 0 without crashing");
 }
 
+void test_cpu_64k_commit(XMemVirtualAllocFn alloc) {
+    constexpr DWORD pages64k = 0x20400000;
+    constexpr DWORD reserve_commit = MEM_RESERVE | MEM_COMMIT;
+    constexpr SIZE_T guest_page = 64 * 1024;
+    constexpr SIZE_T bytes = 20 * 1024 * 1024;
+    void* const base = alloc(nullptr, bytes, pages64k | reserve_commit, 0x181, PAGE_READWRITE);
+    check(base != nullptr, "0x181 commits a new 64 KiB CPU allocation");
+    if (base) {
+        MEMORY_BASIC_INFORMATION info{};
+        const bool writable = VirtualQuery(base, &info, sizeof(info)) == sizeof(info) &&
+                              info.AllocationBase == base && info.RegionSize == bytes &&
+                              info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE;
+        check(writable && reinterpret_cast<uintptr_t>(base) % guest_page == 0,
+              "the 20 MiB region is aligned, committed and CPU-writable");
+        if (writable) {
+            auto* data = static_cast<volatile uint8_t*>(base);
+            data[0] = 0x35;
+            data[bytes - 1] = 0xa7;
+            check(data[0] == 0x35 && data[bytes - 1] == 0xa7, "read and write both ends of the region");
+        }
+        check(VirtualFree(base, 0, MEM_RELEASE), "release the full CPU allocation");
+    }
+
+    struct Request { DWORD type; ULONGLONG attributes; DWORD protect; };
+    constexpr Request unsupported[] = {
+        {pages64k | MEM_RESERVE, 0x181, PAGE_READWRITE},
+        {pages64k | MEM_COMMIT, 0x181, PAGE_READWRITE},
+        {0x20000000 | reserve_commit, 0x181, PAGE_READWRITE},
+        {pages64k | reserve_commit, 0x183, PAGE_READWRITE},
+        {pages64k | reserve_commit, 0x101, PAGE_READWRITE},
+        {pages64k | reserve_commit, 0x181, PAGE_GRAPHICS_READWRITE | PAGE_READWRITE},
+    };
+    for (const auto& request : unsupported) {
+        SetLastError(ERROR_SUCCESS);
+        void* result = alloc(nullptr, guest_page, request.type, request.attributes, request.protect);
+        check(!result && GetLastError() == ERROR_NOT_SUPPORTED, "unmeasured CPU allocation forms stay unsupported");
+        if (result) VirtualFree(result, 0, MEM_RELEASE);
+    }
+    void* const reserved = alloc(nullptr, guest_page, pages64k | MEM_RESERVE, 0, PAGE_NOACCESS);
+    check(reserved != nullptr, "reserve an ordinary 64 KiB control region");
+    if (reserved) {
+        MEMORY_BASIC_INFORMATION info{};
+        check(VirtualQuery(reserved, &info, sizeof(info)) == sizeof(info) && info.State == MEM_RESERVE,
+              "reserve-only with zero attributes still leaves the region uncommitted");
+        SetLastError(ERROR_SUCCESS);
+        check(!alloc(reserved, guest_page, pages64k | reserve_commit, 0x181, PAGE_READWRITE) &&
+                  GetLastError() == ERROR_NOT_SUPPORTED, "0x181 with an explicit address remains unsupported");
+        check(VirtualFree(reserved, 0, MEM_RELEASE), "release the control reservation");
+    }
+}
+
 void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn get_write_watch,
                        XMemResetWriteWatchFn reset_write_watch) {
     SYSTEM_INFO system_info{};
@@ -429,6 +480,7 @@ int main() {
     test_virtual_query(query);
     if (virtual_alloc && get_write_watch && reset_write_watch) {
         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
+        test_cpu_64k_commit(virtual_alloc);
     }
     test_attribute_trace(alloc, free_mem);
     if (transfer) {

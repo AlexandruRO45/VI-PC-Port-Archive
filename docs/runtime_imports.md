@@ -89,6 +89,10 @@ bootstrap call it as `if (!XMemTransferMemory(XMemTransferTitleToSystem, size))`
 returns `TRUE` for every direction and size and allocates nothing; with `--trace` it records each distinct direction
 and size as an `xmem_transfer` event, because the enum values are not public. `xmem_test` covers it.
 
+The startup call to `xmem.dll!XMemVirtualAlloc` requests a new 20 MiB region with 64 KiB pages,
+`MEM_RESERVE | MEM_COMMIT`, attribute `0x181` and `PAGE_READWRITE`. The shim backs this request with
+committed, CPU-writable host pages. The meaning of the attribute's `0x100` bit is unknown.
+
 ## Console paths and the write overlay
 
 A title's file calls name the console's drives, so `GAME:\data\x.sps` is a file inside the installed game folder.

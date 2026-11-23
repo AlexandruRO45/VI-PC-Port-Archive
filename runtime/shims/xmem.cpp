@@ -144,12 +144,16 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
     // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
-    // region. Nonzero attribute flags also fail until their host mapping is known.
+    // region.
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
-    if (attributes != 0) {
+    // The observed CPU allocation has 0x181, ordinary read/write protection and 64 KiB pages.
+    // Keep the attribute word exact: the meaning of its 0x100 bit has not been established.
+    const bool cpu_commit = attributes == 0x181 && !address && protect == PAGE_READWRITE &&
+                            allocation_type == (MEM_RESERVE | MEM_COMMIT | kXmem64kPages);
+    if (attributes != 0 && !cpu_commit) {
         SetLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
