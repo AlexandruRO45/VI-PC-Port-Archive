@@ -1,8 +1,8 @@
 # Cross-compile the Windows runtime from Linux with clang-cl and lld-link against an MSVC CRT and Windows SDK laid
 # out by xwin (https://github.com/Jake-Shadle/xwin) in the /winsysroot style:
 #
-#   xwin --accept-license --sdk-version 10.0.26100 splat --use-winsysroot-style --preserve-ms-arch-notation \
-#        --output ~/.local/share/xwin-sdk
+#   xwin --accept-license --cache-dir ~/.cache/xwin --sdk-version 10.0.26100 splat --use-winsysroot-style \
+#        --preserve-ms-arch-notation --output ~/.local/share/xwin-sdk
 #   cmake -S runtime -B runtime/build/windows --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
 #         -DXWIN_DIR="$HOME/.local/share/xwin-sdk"
 #   cmake --build runtime/build/windows --parallel

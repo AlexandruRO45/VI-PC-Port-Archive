@@ -191,8 +191,8 @@ against an MSVC CRT and Windows SDK that [xwin](https://github.com/Jake-Shadle/x
 (running it means accepting Microsoft's licence), and `ctest` runs them through Wine:
 
 ```sh
-xwin --accept-license --sdk-version 10.0.26100 splat --use-winsysroot-style --preserve-ms-arch-notation \
-     --output ~/.local/share/xwin-sdk
+xwin --accept-license --cache-dir ~/.cache/xwin --sdk-version 10.0.26100 splat --use-winsysroot-style \
+     --preserve-ms-arch-notation --output ~/.local/share/xwin-sdk
 cmake -S runtime -B runtime/build/windows --toolchain "$PWD/runtime/cmake/clang-cl-xwin.cmake" \
       -DXWIN_DIR="$HOME/.local/share/xwin-sdk"
 cmake --build runtime/build/windows --parallel
@@ -200,7 +200,10 @@ WINEPREFIX="$HOME/.local/share/leonida-wine" ctest --test-dir runtime/build/wind
 ```
 
 Use a recent xwin: 0.10.0 lays out SDK 10.0.26100 with the command above, while 0.6.5 stops with "unable to find
-x86_64 headers for Win11SDK_10.0.26100".
+x86_64 headers for Win11SDK_10.0.26100". `--cache-dir` keeps xwin's download cache on the same filesystem as
+`--output`: without it the cache is `./.xwin-cache` in the current directory, and when that is on another disk than
+`~/.local/share` (a repository on a second drive) the splat stops with "Invalid cross-device link (os error 18)",
+because xwin moves the unpacked files instead of copying them.
 
 On a machine without a display (a server, a container, WSL without WSLg), Wine has no graphics driver to create a
 Vulkan instance with, so every Vulkan test fails with `vkCreateInstance failed (VkResult -3)` and, with
