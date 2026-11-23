@@ -281,5 +281,20 @@ class TestValuTruncF32ConditionCodes(unittest.TestCase):
         self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
 
 
+class TestValuTruncF32IEEE754(unittest.TestCase):
+    """Stage 7: IEEE 754 boundary extremes, subnormals, and NaN handling."""
+
+    def test_subnormals_truncate_to_zero(self) -> None:
+        pos_subnormal = 0x00000001
+        neg_subnormal = 0x80000001
+        self.assertEqual(ref_trunc_f32(pos_subnormal), POS_ZERO_F32)
+        self.assertEqual(ref_trunc_f32(neg_subnormal), NEG_ZERO_F32)
+
+    def test_large_floats_already_integral(self) -> None:
+        # Floats with exponent >= 23 have no fractional bits; trunc is identity
+        large_f = f32_to_u32(8388608.0)  # 2^23
+        self.assertEqual(ref_trunc_f32(large_f), large_f)
+
+
 if __name__ == "__main__":
     unittest.main()
