@@ -16,6 +16,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -356,18 +357,61 @@ class InstancedBuildTest(unittest.TestCase):
         assets = os.path.join(self.tmp, "tex_assets")
         twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
         ents = os.path.join(self.tmp, "tex.jsonl")
-        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0)), twp.entity("tri", (600, 10, 0))])
         out = os.path.join(self.tmp, "tex_world")
         dds = os.path.join(assets, "models", "tri_tex", "001_albedo.dds")
+        dds_module = world_build._get_dds_png()
+        decode = dds_module.dds_file_to_png_bytes
 
-        for color in (tuple(twb.ALBEDO_RGBA), (25, 90, 175, 255)):
-            with self.subTest(color=color):
-                with open(dds, "wb") as texture:
-                    texture.write(twb._uniform_bgra_dds(color))
-                doc = world_build.build_world(assets, out, placements=ents, jobs=1)
-                glb = os.path.join(out, "chunks", doc["chunks"][0]["id"] + ".glb")
-                _, rgba = twb._glb_first_base_color_pixel(glb)
-                self.assertEqual(rgba, color)
+        with mock.patch.object(world_build, "_PNG_CACHE", {}):
+            for color in (tuple(twb.ALBEDO_RGBA), (25, 90, 175, 255)):
+                with self.subTest(color=color):
+                    with open(dds, "wb") as texture:
+                        texture.write(twb._uniform_bgra_dds(color))
+                    with mock.patch.object(dds_module, "dds_file_to_png_bytes", wraps=decode) as decoder:
+                        doc = world_build.build_world(assets, out, placements=ents, jobs=1, chunk_size=256)
+                    self.assertEqual(decoder.call_count, 1)  # one decode reused across chunks in this build
+                    self.assertEqual(world_build._PNG_CACHE, {})  # neither PNGs nor build keys survive
+                self.assertEqual(len(doc["chunks"]), 2)
+                for chunk in doc["chunks"]:
+                    glb = os.path.join(out, "chunks", chunk["id"] + ".glb")
+                    _, rgba = twb._glb_first_base_color_pixel(glb)
+                    self.assertEqual(rgba, color)
+
+    def test_serial_png_cache_does_not_retain_decode_failures(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0)), twp.entity("tri", (600, 10, 0))])
+        out = os.path.join(self.tmp, "tex_world")
+        dds = os.path.join(assets, "models", "tri_tex", "001_albedo.dds")
+        with open(dds, "wb") as texture:
+            texture.write(b"synthetic invalid DDS")
+        dds_module = world_build._get_dds_png()
+        decode = dds_module.dds_file_to_png_bytes
+
+        with mock.patch.object(world_build, "_PNG_CACHE", {}):
+            for _ in range(3):
+                with mock.patch.object(dds_module, "dds_file_to_png_bytes", wraps=decode) as decoder:
+                    doc = world_build.build_world(assets, out, placements=ents, jobs=1, chunk_size=256)
+                self.assertEqual(len(doc["chunks"]), 2)
+                self.assertEqual(doc["stats"]["textures_skipped"], 2)
+                self.assertEqual(decoder.call_count, 1)  # None is reused only across this build's chunks
+                self.assertEqual(world_build._PNG_CACHE, {})  # negative entries must not accumulate between builds
+
+    def test_serial_png_cache_is_released_when_chunk_write_fails(self) -> None:
+        assets = os.path.join(self.tmp, "tex_assets")
+        twb._write_param_fixture(assets, twb.PARAM_CASES["albedo-first"])
+        ents = os.path.join(self.tmp, "tex.jsonl")
+        twp.write_entities(ents, [twp.entity("tri", (10, 10, 0))])
+        out = os.path.join(self.tmp, "tex_world")
+
+        with mock.patch.object(world_build, "_PNG_CACHE", {}):
+            with mock.patch.object(glb_writer, "write_instanced_glb", side_effect=OSError("synthetic write failure")):
+                with self.assertRaisesRegex(OSError, "synthetic write failure"):
+                    world_build.build_world(assets, out, placements=ents, jobs=1)
+            self.assertEqual(world_build._PNG_CACHE, {})
+        self.assertFalse(os.path.exists(out))  # staging and newly-created output dirs are removed on failure
 
     def test_cli_instancing_option(self):
         ents = os.path.join(self.tmp, "cli.jsonl")

@@ -464,23 +464,30 @@ _PNG_CACHE: dict[tuple[str, str, int], bytes | None] = {}
 _PNG_CACHE_BUDGET = 256 * 1024 * 1024
 
 
-def _png_for(staging_dir: str, dds_path: str, max_tex_size: int) -> bytes | None:
-    """Decode once per worker per build, keeping at most about 256 MB of PNGs (oldest dropped first)."""
+def _png_for(staging_dir: str, dds_path: str, max_tex_size: int,
+             cache: dict[tuple[str, str, int], bytes | None] | None = None) -> bytes | None:
+    """Decode once per cache lifetime, keeping at most about 256 MB of PNGs (oldest dropped first).
+
+    Process workers use the process-local cache across chunk jobs. The serial caller supplies a cache
+    owned by one build, so successful and failed decodes are released when that build returns.
+    """
     key = (staging_dir, os.path.normcase(os.path.abspath(dds_path)), max_tex_size)
-    if key in _PNG_CACHE:
-        return _PNG_CACHE[key]
+    entries = _PNG_CACHE if cache is None else cache
+    if key in entries:
+        return entries[key]
     dds_mod = _get_dds_png()
     try:
         png = dds_mod.dds_file_to_png_bytes(dds_path, max_size=max_tex_size)
     except (dds_mod.DdsError, OSError):
         png = None
-    _PNG_CACHE[key] = png
-    while sum(len(v or b"") for v in _PNG_CACHE.values()) > _PNG_CACHE_BUDGET and len(_PNG_CACHE) > 1:
-        del _PNG_CACHE[next(iter(_PNG_CACHE))]
+    entries[key] = png
+    while sum(len(v or b"") for v in entries.values()) > _PNG_CACHE_BUDGET and len(entries) > 1:
+        del entries[next(iter(entries))]
     return png
 
 
-def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
+def _build_chunk_job(job: tuple, png_cache: dict[tuple[str, str, int], bytes | None] | None = None
+                     ) -> tuple[dict, int, int, int]:
     """Write one chunk: every distinct (model, mirrored) once, drawn by its instances. Returns
     (chunk record, textures embedded, textures skipped, bytes), after checking the written file."""
     (chunk_id, staging_dir, mode, insts, packs, mat_to_dds, textures, max_tex_size) = job
@@ -504,7 +511,7 @@ def _build_chunk_job(job: tuple) -> tuple[dict, int, int, int]:
         keys = sorted({p["material"] for m in meshes for p in m["primitives"] if p["material"]})
         for key in keys:
             dds = mat_to_dds.get(key)
-            png = _png_for(staging_dir, dds, max_tex_size) if dds else None
+            png = _png_for(staging_dir, dds, max_tex_size, png_cache) if dds else None
             if png is None:
                 skipped += 1
                 continue
@@ -661,7 +668,8 @@ def _build_instanced_world(entries, ttpf_index, *, placements, lod_levels, regio
         total_triangles = stored_triangles = textures_embedded = textures_skipped = 0
         total_bytes = max_bytes = 0
         cell_keys = iter(sorted(cells))
-        for rec, embedded, skipped, size in _run_jobs(_build_chunk_job, chunk_jobs(), workers):
+        chunk_job_fn = functools.partial(_build_chunk_job, png_cache={}) if workers <= 1 else _build_chunk_job
+        for rec, embedded, skipped, size in _run_jobs(chunk_job_fn, chunk_jobs(), workers):
             tier, ix, iz = next(cell_keys)
             if lod_sets:
                 rec["lod"] = LOD_TIER_NAMES[tier]
