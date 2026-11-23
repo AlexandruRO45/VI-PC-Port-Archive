@@ -12,9 +12,11 @@ features. That path is tested without the game: `gameinput_host_test` (ctest `ga
 built against the SDK's `gameinput.lib` and checks that its `GameInput.dll` import binds to the host's copy, that
 `GameInputCreate` and `GetCurrentTimestamp` work from mapped code, and that `GetCurrentReading` answers; with a pad
 attached, `GetGamepadState` must succeed on the reading. It passes on Windows 11 build 26300 (GameInput 0.2309) without
-a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that binds to nothing fails it. The game executable is not available yet,
-so whether it imports GameInput this way, and under which
-module, is unverified (see [VERIFY](#verify)).
+a pad attached. The test skips only where Windows cannot load `GameInput.dll`; with the DLL present, an import that
+binds to nothing fails it. The retail 1.0.2.1 executable imports GameInput by **ordinal**, `GameInput.dll!#1`, not by
+name, so the table above registers that ordinal as an alias of `GameInputCreate` as well. Bound to the host's stub
+`GameInput.dll`, that import made the title's startup step that creates its GameInput singleton fail and abort; with
+the alias it reaches the shim.
 
 ## Building
 
@@ -490,9 +492,10 @@ as working; nothing measured them, and the `resistance` mode was not tried.
 
 These need the game executable or a test on hardware:
 
-- **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
-  and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
-  built against one of those, the vtables need a second set.
+- **Which API version.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll` (by name
+  and as ordinal `#1`, the form the retail executable imports) and `xgameruntime.dll` (by name only). GameInput v1 and
+  later (NuGet 1.x and up) changed the interfaces; if the executable was built against one of those, the vtables need
+  a second set.
 - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
 - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
   and [previous reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getpreviousreading) pages describe half a second of readings per device and failure when old readings leave the stream. The table above records the shim's HRESULT choices. Changes faster than the poll are not seen.
