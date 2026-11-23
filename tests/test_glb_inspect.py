@@ -551,44 +551,6 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(animation["samplers"][0]["interpolation"], "LINEAR")
             self.assertEqual(animation["issues"], [])
 
-    def test_animation_duration_uses_only_samplers_used_by_channels(self):
-        # Two time tracks share the same translation values.
-        payload = struct.pack("<10f", 0, 1, 0, 30, 0, 0, 0, 1, 1, 1)
-        short = {"sampler": 0, "target": {"node": 0, "path": "translation"}}
-        long = {"sampler": 1, "target": {"node": 0, "path": "scale"}}
-        ignored = {"sampler": 1, "target": {"path": "scale"}}
-        pointer = {"sampler": 1, "target": {"path": "pointer", "extensions": {
-            "KHR_animation_pointer": {"pointer": "/nodes/0/scale"}}}}
-        invalid = {"sampler": 99, "target": {"node": 0, "path": "scale"}}
-        samplers = [{"input": 0, "output": 2}, {"input": 1, "output": 2}]
-        doc = {
-            "asset": {"version": "2.0"},
-            "extensionsUsed": ["KHR_animation_pointer"],
-            "nodes": [{"scale": [1, 1, 1]}],
-            "buffers": [{"byteLength": len(payload)}],
-            "bufferViews": [{"buffer": 0, "byteOffset": offset, "byteLength": size}
-                            for offset, size in ((0, 8), (8, 8), (16, 24))],
-            "accessors": [
-                {"bufferView": 0, "componentType": 5126, "type": "SCALAR", "count": 2, "min": [0], "max": [1]},
-                {"bufferView": 1, "componentType": 5126, "type": "SCALAR", "count": 2, "min": [0], "max": [30]},
-                {"bufferView": 2, "componentType": 5126, "type": "VEC3", "count": 2},
-            ],
-            "animations": [{"samplers": samplers, "channels": channels}
-                           for channels in ([short], [long, short], [short, ignored], [pointer], [invalid])],
-        }
-        with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "timelines.glb")
-            out = os.path.join(folder, "report.json")
-            with open(path, "wb") as handle:
-                handle.write(glb(doc, payload))
-            result = self.run_tool(path, "--json", out)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            with open(out, encoding="utf-8") as handle:
-                animations = json.load(handle)["animations"]
-        self.assertEqual([a["duration"] for a in animations], [1.0, 30.0, 1.0, 30.0, None])
-        self.assertEqual([s["duration"] for s in animations[0]["samplers"]], [1.0, 30.0])
-        self.assertIn("channel[0] has no valid sampler", animations[-1]["issues"])
-
     def test_animation_reference_issues_are_reported(self):
         gltf = animated_gltf()
         gltf["animations"][0]["channels"] = [
@@ -731,6 +693,44 @@ class GlbInspectTests(unittest.TestCase):
                 animation = json.load(handle)["animations"][0]
             self.assertEqual(animation["channel_count"], 0)
             self.assertIn("animation channels is not an array", animation["issues"])
+
+    def test_animation_duration_uses_only_samplers_used_by_channels(self):
+        # Two time tracks share the same translation values.
+        payload = struct.pack("<10f", 0, 1, 0, 30, 0, 0, 0, 1, 1, 1)
+        short = {"sampler": 0, "target": {"node": 0, "path": "translation"}}
+        long = {"sampler": 1, "target": {"node": 0, "path": "scale"}}
+        ignored = {"sampler": 1, "target": {"path": "scale"}}
+        pointer = {"sampler": 1, "target": {"path": "pointer", "extensions": {
+            "KHR_animation_pointer": {"pointer": "/nodes/0/scale"}}}}
+        invalid = {"sampler": 99, "target": {"node": 0, "path": "scale"}}
+        samplers = [{"input": 0, "output": 2}, {"input": 1, "output": 2}]
+        doc = {
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_animation_pointer"],
+            "nodes": [{"scale": [1, 1, 1]}],
+            "buffers": [{"byteLength": len(payload)}],
+            "bufferViews": [{"buffer": 0, "byteOffset": offset, "byteLength": size}
+                            for offset, size in ((0, 8), (8, 8), (16, 24))],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "type": "SCALAR", "count": 2, "min": [0], "max": [1]},
+                {"bufferView": 1, "componentType": 5126, "type": "SCALAR", "count": 2, "min": [0], "max": [30]},
+                {"bufferView": 2, "componentType": 5126, "type": "VEC3", "count": 2},
+            ],
+            "animations": [{"samplers": samplers, "channels": channels}
+                           for channels in ([short], [long, short], [short, ignored], [pointer], [invalid])],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "timelines.glb")
+            out = os.path.join(folder, "report.json")
+            with open(path, "wb") as handle:
+                handle.write(glb(doc, payload))
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                animations = json.load(handle)["animations"]
+        self.assertEqual([a["duration"] for a in animations], [1.0, 30.0, 1.0, 30.0, None])
+        self.assertEqual([s["duration"] for s in animations[0]["samplers"]], [1.0, 30.0])
+        self.assertIn("channel[0] has no valid sampler", animations[-1]["issues"])
 
     def test_cubic_spline_output_count_is_validated(self):
         gltf = animated_gltf()
