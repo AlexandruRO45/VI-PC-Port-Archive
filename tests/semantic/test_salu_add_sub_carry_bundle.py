@@ -98,6 +98,17 @@ class TestSAddI32AST(unittest.TestCase):
         expr_ovf = SAddI32Expr(0x7FFFFFFF, 10)
         self.assertEqual(expr_ovf.eval(), ((0x7FFFFFFF + 10) & MASK32, 1))
 
+class TestSAddI32OverflowAndSCC(unittest.TestCase):
+    def test_no_overflow_opposite_signs(self) -> None:
+        # Opposite signs can never overflow
+        self.assertEqual(ref_s_add_i32(0x7FFFFFFF, 0x80000000), (0xFFFFFFFF, 0))
+
+    def test_boundary_values(self) -> None:
+        # Max positive int32 + 0 -> no overflow
+        self.assertEqual(ref_s_add_i32(0x7FFFFFFF, 0), (0x7FFFFFFF, 0))
+        # Min negative int32 + -1 -> overflow
+        self.assertEqual(ref_s_add_i32(0x80000000, 0xFFFFFFFF), (0x7FFFFFFF, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
