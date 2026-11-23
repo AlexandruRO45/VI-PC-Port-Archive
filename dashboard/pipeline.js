@@ -18,7 +18,7 @@ const PIPE_CI_MS_NO_TOKEN = 5 * 60 * 1000;
 const PIPE_CI_MS_TOKEN = 60 * 1000;
 const PIPE_FULL_MS = 30 * 60 * 1000;
 const PIPE_PAGE = 100;
-const PIPE_MAX_PAGES = 10;                // search answers at most 1,000 results; a token's sweep has no cap
+const PIPE_WINDOW_PAGES = 10;             // search answers at most 1,000 results: past that, a new search starts at the last PR's date
 const PIPE_KEY = 'pipe:v2';
 const PIPE_JOB_KEY = 'pipe:job';
 const JOB_KEEP_MS = 10 * 60 * 1000;      // a load interrupted by F5 goes on if it is younger than this
@@ -93,10 +93,10 @@ function pipelineNeeds() {
   if (graph.busy) return { done: graph.busy.done, total: graph.busy.total, full: true };
   const job = pipe.job;
   if (!job) return null;
-  const pages = job.full ? (job.total === null ? 5 : Math.min(PIPE_MAX_PAGES, Math.ceil(job.total / PIPE_PAGE))) : 0;
+  const pages = job.full ? (job.total === null ? 5 : Math.ceil(job.total / PIPE_PAGE)) : 0;
   const total = 2 + pages;
-  const done = (job.ok ? 1 : 0) + (job.bad ? 1 : 0) + (job.full ? job.page - 1 : 0);
-  return { done, total, full: job.full };
+  const done = (job.ok ? 1 : 0) + (job.bad ? 1 : 0) + (job.full ? Math.ceil(job.items.length / PIPE_PAGE) : 0);
+  return { done: Math.min(done, total), total, full: job.full };
 }
 
 /** One call of a load; null when the search budget ran out (the load goes on at the next sync). */
@@ -126,12 +126,8 @@ async function loadPipeline(now) {
     store.set(PIPE_JOB_KEY, job);
     if (!job.bad && !(job.bad = await pipeCall(set('status:failure'), 'pipe:bad'))) return 'waiting';
     store.set(PIPE_JOB_KEY, job);
-    while (job.full && (job.total === null || (job.page - 1) * PIPE_PAGE < Math.min(job.total, PIPE_MAX_PAGES * PIPE_PAGE))) {
-      const page = await pipeCall(searchQ('is:pr is:open') + `&sort=created&order=asc&per_page=${PIPE_PAGE}&page=${job.page}`, 'pipe:list');
-      if (!page) return 'waiting';
-      job.total = page.total;
-      job.items.push(...page.items);
-      job.page++;
+    while (job.full && !job.listed) {
+      if (!await pipeListPage(job)) return 'waiting';
       store.set(PIPE_JOB_KEY, job);
     }
   } catch (e) {
@@ -148,6 +144,29 @@ async function loadPipeline(now) {
   if (job.full) applySnapshot(job.items);
   else restagePipeline();
   return 'done';
+}
+
+/**
+ * One page of the open PR list, oldest first. Search stops at 1,000 results, so after PIPE_WINDOW_PAGES pages the next
+ * search starts at the last PR's creation date (`since`); the overlap is dropped. Sets `listed` when the list is
+ * complete. Returns false when the search budget ran out.
+ */
+async function pipeListPage(job) {
+  const range = job.since ? ` created:>=${job.since}` : '';
+  const page = await pipeCall(searchQ('is:pr is:open' + range) + `&sort=created&order=asc&per_page=${PIPE_PAGE}&page=${job.page}`, 'pipe:list');
+  if (!page) return false;
+  if (!job.since) job.total = page.total;
+  const have = new Set(job.items.map(p => p.n));
+  const fresh = page.items.filter(p => !have.has(p.n));
+  job.items.push(...fresh);
+  job.page++;
+  const last = page.items[page.items.length - 1];
+  if (page.items.length < PIPE_PAGE || job.items.length >= job.total) job.listed = true;
+  else if (job.page > PIPE_WINDOW_PAGES) {
+    if (!fresh.length) job.listed = true;   // a whole page on one date: a new window would repeat it forever
+    else { job.since = last.created; job.page = 1; }
+  }
+  return true;
 }
 
 function coordSets() {
