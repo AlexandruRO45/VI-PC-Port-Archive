@@ -260,6 +260,15 @@ class CharacterTextureTests(unittest.TestCase):
                         self.assertIn("ERROR:", err.getvalue())
                         self.assertIn("Permission denied", err.getvalue())
 
+    def test_deeply_nested_json_is_a_clean_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "model.json"
+            path.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+            result = run_tool(path)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("JSON too deeply nested", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
