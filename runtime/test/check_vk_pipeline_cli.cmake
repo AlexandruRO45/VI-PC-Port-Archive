@@ -119,3 +119,12 @@ if(NOT code STREQUAL "2" OR NOT log MATCHES "index.json: " OR log MATCHES "memor
 endif()
 check_invalid(--memory-cap-mb -1)
 check_invalid(--memory-cap-mb 16GiB)
+
+# A cap too small for a Vulkan driver to start is refused before the cap is set up (several drivers crash instead).
+foreach(mb 1 64 255)
+  execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --memory-cap-mb ${mb}
+                  RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+  if(NOT code STREQUAL "2" OR NOT log MATCHES "--memory-cap-mb ${mb} is below 256 MiB" OR log MATCHES "index.json: ")
+    message(FATAL_ERROR "--memory-cap-mb ${mb}: expected a too-small-cap error, got ${code}\n${log}")
+  endif()
+endforeach()

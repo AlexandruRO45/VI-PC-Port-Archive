@@ -298,9 +298,12 @@ Measured on Windows 11, RTX 3080 (NVIDIA 621.14), 32 GB RAM, the wave64-emulated
 - If the job object can't be set up, the default cap is a warning and the check goes on without it. A cap asked for
   with `--memory-cap-mb N` (N > 0) is an error instead (exit 2, before any Vulkan call), so a caller who asked for
   containment never runs without it. `VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE=1` makes the setup fail, for tests.
-- A cap far below what the driver itself needs fails differently by driver: in the review of #8371, 48 MiB made
-  `vkCreateDevice` fail cleanly on an RTX 4060 (621.14) but ended the process with `0xC0000409` on an Intel UHD 730
-  (101.7085). Keep the cap in gigabytes.
+- A cap below 256 MiB (other than 0) is refused as a usage error: below what the driver itself needs, several
+  drivers end the process with `0xC0000409` instead of failing `vkCreateDevice` (RTX 3080, 621.14: below 128 MiB;
+  Intel UHD 730, 101.7085: 48 MiB; RTX 5090, 621.24: below 96 MiB, from the review of #8371). A driver that does
+  return an error there gets a hint naming the cap. Keep the cap in gigabytes.
+- Under a cap smaller than the memory available, the large-module budget above is three quarters of the cap, so
+  the gate never admits large modules that together can't fit under it.
 - A driver that crashes instead of returning an error when its allocation fails is handled as any other crash:
   `--inflight-file` and `--isolate` name the module, and the `pipelines` stage of `make_game.py` retries it alone.
 - `--isolate` children run in the same job and get the same cap each.

@@ -895,6 +895,16 @@ int main(int argc, char** argv) {
     // Before any Vulkan call: the driver's allocations are what the cap is for. A child of --isolate inherits the
     // parent's job and sets its own, nested, with the same value.
     if (memory_cap_mb > UINT64_MAX / (1024 * 1024)) memory_cap_mb = UINT64_MAX / (1024 * 1024);
+    // Below this the Vulkan driver itself can't start, and several drivers crash (0xC0000409) instead of failing
+    // vkCreateDevice: RTX 3080 (621.14) below 128 MiB, Intel UHD 730 (101.7085) at 48 MiB, RTX 5090 (621.24) below
+    // 96 MiB (#8371). Refuse such a cap up front, with a message that names it.
+    constexpr uint64_t kMinMemoryCapMb = 256;
+    if (memory_cap_given && memory_cap_mb != 0 && memory_cap_mb < kMinMemoryCapMb) {
+        std::fprintf(stderr, "error: --memory-cap-mb %llu is below %llu MiB, too small for a Vulkan driver to start "
+                             "(0 = no cap)\n",
+                     static_cast<unsigned long long>(memory_cap_mb), static_cast<unsigned long long>(kMinMemoryCapMb));
+        return 2;
+    }
     std::string cap_error;
     const char* simulate_cap_failure = std::getenv("VK_PIPELINE_CHECK_SIMULATE_CAP_FAILURE");
     const bool cap_ok = simulate_cap_failure && *simulate_cap_failure && memory_cap_mb
@@ -1223,7 +1233,15 @@ int main(int argc, char** argv) {
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci; dci.pNext = &f2;
     dci.enabledExtensionCount = uint32_t(enable.size()); dci.ppEnabledExtensionNames = enable.data();
     VkDevice dev;
-    if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) { std::fprintf(stderr, "vkCreateDevice %d\n", r); return 1; }
+    if (VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev)) {
+        std::fprintf(stderr, "vkCreateDevice %d\n", r);
+        // A cap below what the driver itself needs shows up here as a bare out-of-memory or init failure.
+        if (cap_ok && memory_cap_mb)
+            std::fprintf(stderr, "hint: the process is capped at %llu MiB (--memory-cap-mb); a cap that small can "
+                                 "keep the driver from starting: try a larger one, or 0 for none\n",
+                         static_cast<unsigned long long>(memory_cap_mb));
+        return 1;
+    }
     leonida::SubgroupSizeCaps runtime_subgroups;
     leonida::query_subgroup_size_caps(vkGetPhysicalDeviceProperties2, pd, f13.subgroupSizeControl,
                                      f13.computeFullSubgroups, runtime_subgroups);
@@ -1458,7 +1476,12 @@ int main(int argc, char** argv) {
     std::shared_mutex compile_gate;  // --large-parallel 1: large modules exclude other shader and pipeline work
     size_t isolated_modules = 0;
     // Otherwise large modules share a memory budget and the small ones are never held back (large_module_gate.h).
-    const uint64_t available_memory = leonida::available_memory_bytes();
+    // Under a memory cap (process_memory_cap.h) the cap is the ceiling of this process, so the budget is taken from
+    // whichever is smaller, so the gate never admits modules that together can't fit under it.
+    uint64_t available_memory = leonida::available_memory_bytes();
+    const uint64_t cap_bytes = cap_ok ? memory_cap_mb * 1024 * 1024 : 0;
+    const bool budget_from_cap = cap_bytes && (available_memory == 0 || cap_bytes < available_memory);
+    if (budget_from_cap) available_memory = cap_bytes;
     const bool large_exclusive = large_parallel == 1 || (large_parallel == 0 && available_memory == 0);
     leonida::LargeModuleGate large_gate(
         large_parallel == 0 ? available_memory / 4 * 3 : UINT64_MAX,
@@ -1469,8 +1492,9 @@ int main(int argc, char** argv) {
                          large_module_bytes);
         else if (large_parallel == 0)
             std::fprintf(stderr, "large modules (over %zu bytes): up to %u at once within %.1f GB "
-                                 "(3/4 of the %.1f GB available)\n", large_module_bytes, large_gate.max_inflight(),
-                         large_gate.budget() / 1e9, available_memory / 1e9);
+                                 "(3/4 of the %.1f GB %s)\n", large_module_bytes, large_gate.max_inflight(),
+                         large_gate.budget() / 1e9, available_memory / 1e9,
+                         budget_from_cap ? "allowed by --memory-cap-mb" : "available");
         else
             std::fprintf(stderr, "large modules (over %zu bytes): up to %u at once\n", large_module_bytes,
                          large_gate.max_inflight());
