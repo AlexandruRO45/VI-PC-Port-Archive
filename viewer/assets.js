@@ -84,13 +84,16 @@ async function refreshCatalog() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const catalog = parseCatalog(await response.json());
     applyCatalog(catalog.entries);
-    const { complete, processed, total, message } = catalog.status;
-    catalogPolling = !complete;
+    const { complete, finished, processed, total, message } = catalog.status;
+    catalogPolling = !complete && finished === false;
     const progress = Number.isSafeInteger(processed) && Number.isSafeInteger(total) ? ` (${processed}/${total})` : "";
     const detail = typeof message === "string" && message.trim() ? ` ${message}` : "";
-    status.textContent = (complete ? (catalogAssets.length ? "Catalog ready." : "The catalog is empty.") :
-      `Building catalog${progress}. ${catalogAssets.length ? "Partial results are available." : "No models are ready yet."}`) +
-      detail;
+    if (complete) {
+      status.textContent = (catalogAssets.length ? "Catalog ready." : "The catalog is empty.") + detail;
+    } else {
+      const empty = catalogAssets.length ? "" : " No models are available.";
+      status.textContent = `Partial catalog${progress}.${empty}` + (detail ? ` Last update —${detail}` : "");
+    }
   } catch (error) {
     status.textContent = `Could not refresh the catalog. ${error.message}`;
   } finally {

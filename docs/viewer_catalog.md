@@ -82,6 +82,11 @@ complete vehicle assemblies and animated pedestrian assembly remain outside the 
 Status names archives whose manifests are unavailable and counts known decode, recovery and file
 failures. `complete` describes the selected run's scope. A pause or an error leaves it false and
 preserves the ready entries. A deliberate pause exits zero. A reported build failure exits one.
+In v1, `status.finished` is false on intermediate snapshots and true on the run's final snapshot,
+including a pause or reported failure. The viewer polls intermediate snapshots and shows partial results
+with the last update. Legacy incomplete catalogs without the field can be refreshed manually, as can
+finished catalogs. If a writer stops before publishing its final snapshot, the viewer may keep polling
+the last intermediate snapshot.
 
 ### Retained window parts index
 

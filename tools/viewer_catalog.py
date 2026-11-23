@@ -358,7 +358,7 @@ class Catalog:
         if failed:
             self.errors += count
 
-    def publish(self, activity: str, *, complete: bool = False) -> None:
+    def publish(self, activity: str, *, complete: bool = False, finished: bool = False) -> None:
         counts = Counter(entry["category"] for entry in self.entries.values())
         summary = ", ".join(f"{counts[name]} {name}" for name in sorted(CATEGORY_DIRS))
         notes = ", ".join(f"{count} {kind}" for kind, count in sorted(self.notes.items()) if count)
@@ -376,6 +376,7 @@ class Catalog:
             "assets": [self.entries[path] for path in sorted(self.entries, key=lambda p: p.as_posix())],
             "status": {
                 "complete": complete,
+                "finished": finished,
                 "processed": processed,
                 "total": total,
                 "message": message,
@@ -831,7 +832,7 @@ def build(args) -> int:
         if not catalog.entries and exhausted and not catalog.errors:
             catalog.issue("no ready models", "provide a local model export or valid GLBs")
         complete = exhausted and catalog.errors == 0
-        catalog.publish("Catalog ready." if complete else "Catalog incomplete.", complete=complete)
+        catalog.publish("Catalog ready." if complete else "Catalog incomplete.", complete=complete, finished=True)
     return int(bool(catalog.errors))
 
 

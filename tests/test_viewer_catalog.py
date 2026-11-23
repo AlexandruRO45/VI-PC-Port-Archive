@@ -78,6 +78,7 @@ class CatalogTests(unittest.TestCase):
         result = self.catalog()
         self.assertEqual(result["version"], 1)
         self.assertTrue(result["status"]["complete"])
+        self.assertTrue(result["status"]["finished"])
         self.assertEqual(result["status"]["processed"], 4)
         self.assertIn("1 fragment or empty rows skipped", result["status"]["message"])
         assets = {entry["name"]: entry for entry in result["assets"]}
@@ -97,6 +98,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.build("--batch-size", "1", "--max-new", "1"), 0)
         first = self.catalog()
         self.assertFalse(first["status"]["complete"])
+        self.assertTrue(first["status"]["finished"])
         self.assertEqual((first["status"]["processed"], first["status"]["total"]), (1, 2))
         model = self.out / unquote(first["assets"][0]["model"])
         before = model.stat().st_mtime_ns
@@ -113,6 +115,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.build(), 1)
         result = self.catalog()
         self.assertFalse(result["status"]["complete"])
+        self.assertTrue(result["status"]["finished"])
         self.assertIn("2 unrecovered candidates", result["status"]["message"])
         self.assertIn("1 models failed", result["status"]["message"])
         self.assertEqual([asset["name"] for asset in result["assets"]], ["ready"])
@@ -128,7 +131,10 @@ class CatalogTests(unittest.TestCase):
         called = []
 
         def export(command, source, exports, reserve):
-            ready = [entry["name"] for entry in self.catalog()["assets"]]
+            snapshot = self.catalog()
+            self.assertFalse(snapshot["status"]["complete"])
+            self.assertFalse(snapshot["status"]["finished"])
+            ready = [entry["name"] for entry in snapshot["assets"]]
             self.assertIn("prepared", ready)
             self.assertEqual(command, ["fake-rpf9dump"])
             called.append(source.relative_to(game).as_posix())
@@ -154,6 +160,7 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(self.build("--game", str(game), "--archive", "levels.rpf"), 1)
         result = self.catalog()
         self.assertFalse(result["status"]["complete"])
+        self.assertTrue(result["status"]["finished"])
         self.assertIn("levels", result["status"]["message"])
         self.assertEqual([asset["name"] for asset in result["assets"]], ["ready"])
 

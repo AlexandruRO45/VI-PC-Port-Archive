@@ -129,8 +129,11 @@ test("a catalog build polls until complete and reports waiting, partial, and emp
   let pending;
   const payloads = [
     { status: 503 },
-    { ok: true, json: async () => ({ version: 1, status: { complete: false, processed: 1, total: 3 },
-      assets: [{ name: "Cart", category: "vehicles", model: "cart.glb" }] }) },
+    { ok: true, json: async () => ({
+      version: 1,
+      status: { complete: false, finished: false, processed: 1, total: 3, message: "Exporting models." },
+      assets: [{ name: "Cart", category: "vehicles", model: "cart.glb" }],
+    }) },
     { ok: true, json: async () => ({ version: 1, status: { complete: true }, assets: [] }) },
   ];
   const context = assetContext({
@@ -143,10 +146,44 @@ test("a catalog build polls until complete and reports waiting, partial, and emp
   await vm.runInContext("refreshCatalog()", context);
   assert.match(status.textContent, /Waiting for the generated catalog/);
   await pending();
-  assert.match(status.textContent, /Building catalog \(1\/3\).*Partial results/);
+  assert.match(status.textContent, /^Partial catalog \(1\/3\).*Last update.*Exporting models/);
   await pending();
   assert.equal(status.textContent, "The catalog is empty.");
   assert.equal(pending, undefined);
+});
+
+test("a finished partial catalog stops polling and can be refreshed manually", async () => {
+  const button = { disabled: false };
+  const status = {};
+  const asset = { name: "Cart", category: "vehicles", model: "cart.glb" };
+  const payloads = [
+    { complete: false, finished: false },
+    { complete: false, finished: true, message: "Catalog incomplete." },
+    { complete: false }, // Legacy catalog without a run marker.
+    { complete: true },
+  ];
+  let pending;
+  const context = assetContext({
+    document: { getElementById: id => ({ refresh: button, "catalog-status": status })[id] || {} },
+    fetch: async () => ({ ok: true, json: async () => ({
+      version: 1, status: payloads.shift(), assets: [asset],
+    }) }),
+    setTimeout: callback => { pending = callback; },
+    clearTimeout: () => { pending = undefined; },
+  });
+  vm.runInContext(source + "\napplyCatalog = entries => { catalogAssets = entries; };", context);
+  await button.onclick();
+  assert.equal(typeof pending, "function");
+  await pending();
+  assert.equal(pending, undefined);
+  assert.match(status.textContent, /^Partial catalog.*Catalog incomplete/);
+  assert.equal(vm.runInContext("catalogAssets[0].name", context), "Cart");
+  assert.equal(button.disabled, false);
+  await button.onclick();
+  assert.equal(status.textContent, "Partial catalog.");
+  assert.equal(pending, undefined);
+  await button.onclick();
+  assert.equal(status.textContent, "Catalog ready.");
 });
 
 test("the binary glTF check accepts embedded buffers and images", () => {
