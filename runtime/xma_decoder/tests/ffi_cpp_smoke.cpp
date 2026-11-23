@@ -2,8 +2,18 @@
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+
+void check(bool condition, const char* expression, int line) {
+  if (!condition) {
+    std::fprintf(stderr, "ffi_cpp_smoke.cpp:%d: %s\n", line, expression);
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+#define CHECK(condition) check((condition), #condition, __LINE__)
 
 template <size_t Size>
 void put_bits(std::array<uint8_t, Size>& bytes, size_t& position, uint32_t width,
@@ -37,39 +47,39 @@ std::array<uint8_t, LEONIDA_XMA2_PACKET_BYTES> make_silent_stereo_packet() {
   put_bits(packet, position, 2, 0);  // No transmitted coefficients: silence.
   put_bits(packet, position, 1, 0);  // Frame alignment bit.
   put_bits(packet, position, 1, 0);  // No additional frame in this packet.
-  assert(position == 32 + frame_bits);
+  CHECK(position == 32 + frame_bits);
   return packet;
 }
 
 int main() {
   LeonidaXma2Decoder* decoder = nullptr;
-  assert(leonida_xma2_decoder_create(48000, 2, &decoder) == LEONIDA_XMA2_OK);
-  assert(decoder != nullptr);
+  CHECK(leonida_xma2_decoder_create(48000, 2, &decoder) == LEONIDA_XMA2_OK);
+  CHECK(decoder != nullptr);
 
   const auto packet = make_silent_stereo_packet();
   std::array<uint8_t, LEONIDA_XMA2_PACKET_BYTES * 3> input{};
   std::copy(packet.begin(), packet.end(), input.begin() + LEONIDA_XMA2_PACKET_BYTES);
   std::copy(packet.begin(), packet.end(), input.begin() + LEONIDA_XMA2_PACKET_BYTES * 2);
   LeonidaXma2PcmBlock* pcm = nullptr;
-  assert(leonida_xma2_decode_buffer(decoder, input.data(), input.size(), &pcm) ==
-         LEONIDA_XMA2_OK);
-  assert(pcm != nullptr);
+  CHECK(leonida_xma2_decode_buffer(decoder, input.data(), input.size(), &pcm) ==
+        LEONIDA_XMA2_OK);
+  CHECK(pcm != nullptr);
   const size_t samples = leonida_xma2_pcm_sample_count(pcm);
-  assert(samples > 0);
-  assert(samples % 2 == 0);
+  CHECK(samples > 0);
+  CHECK(samples % 2 == 0);
   const int16_t* data = leonida_xma2_pcm_data(pcm);
-  assert(data != nullptr);
+  CHECK(data != nullptr);
 
   LeonidaXma2PcmBlock* invalid = reinterpret_cast<LeonidaXma2PcmBlock*>(1);
-  assert(leonida_xma2_decode_buffer(decoder, input.data(), input.size() - 1, &invalid) ==
-         LEONIDA_XMA2_BAD_PACKET_SIZE);
-  assert(invalid == nullptr);
+  CHECK(leonida_xma2_decode_buffer(decoder, input.data(), input.size() - 1, &invalid) ==
+        LEONIDA_XMA2_BAD_PACKET_SIZE);
+  CHECK(invalid == nullptr);
 
   leonida_xma2_decoder_destroy(decoder);
-  assert(leonida_xma2_pcm_sample_count(pcm) == samples);
-  assert(samples == leonida_xma2_pcm_sample_count(pcm));
+  CHECK(leonida_xma2_pcm_sample_count(pcm) == samples);
+  CHECK(leonida_xma2_pcm_data(pcm) == data);
   for (size_t i = 0; i < samples; ++i) {
-    assert(data[i] == 0);
+    CHECK(data[i] == 0);
   }
   leonida_xma2_pcm_destroy(pcm);
   leonida_xma2_decoder_destroy(nullptr);

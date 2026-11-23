@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::alloc::Layout;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
@@ -25,7 +26,26 @@ pub struct LeonidaXma2Decoder {
 
 #[repr(C)]
 pub struct LeonidaXma2PcmBlock {
-    samples: Box<[i16]>,
+    samples: Vec<i16>,
+}
+
+#[cfg(not(test))]
+use std::alloc::alloc as allocate_handle;
+#[cfg(test)]
+use tests::allocate_handle;
+
+fn try_new_handle<T>(value: T) -> Result<Box<T>, i32> {
+    const { assert!(std::mem::size_of::<T>() > 0) };
+    // Both the allocation and Box's eventual deallocation use the global allocator
+    // with T's exact layout. Initialize the storage before handing it to Box.
+    let storage = unsafe { allocate_handle(Layout::new::<T>()) }.cast::<T>();
+    if storage.is_null() {
+        return Err(LEONIDA_XMA2_OUT_OF_MEMORY);
+    }
+    unsafe {
+        storage.write(value);
+        Ok(Box::from_raw(storage))
+    }
 }
 
 /// Creates a decoder for one mono or stereo XMA2 stream.
@@ -48,17 +68,18 @@ pub unsafe extern "C" fn leonida_xma2_decoder_create(
     }
 
     match catch_unwind(AssertUnwindSafe(|| {
-        Xma2Stream::new(sample_rate, channels as usize)
+        let stream = Xma2Stream::new(sample_rate, channels as usize)
+            .map_err(|_| LEONIDA_XMA2_INVALID_FORMAT)?;
+        try_new_handle(LeonidaXma2Decoder {
+            stream: Mutex::new(stream),
+            channels: channels as usize,
+        })
     })) {
-        Ok(Ok(stream)) => {
-            let decoder = Box::new(LeonidaXma2Decoder {
-                stream: Mutex::new(stream),
-                channels: channels as usize,
-            });
+        Ok(Ok(decoder)) => {
             unsafe { *out_decoder = Box::into_raw(decoder) };
             LEONIDA_XMA2_OK
         }
-        Ok(Err(_)) => LEONIDA_XMA2_INVALID_FORMAT,
+        Ok(Err(status)) => status,
         Err(_) => LEONIDA_XMA2_PANIC,
     }
 }
@@ -100,7 +121,10 @@ pub unsafe extern "C" fn leonida_xma2_decode_buffer(
             .checked_mul(XMA_FRAME_SAMPLES)
             .and_then(|samples| samples.checked_mul(handle.channels))
             .ok_or(LEONIDA_XMA2_INVALID_ARGUMENT)?;
-        let mut samples = Vec::<i16>::new();
+        let mut block = try_new_handle(LeonidaXma2PcmBlock {
+            samples: Vec::new(),
+        })?;
+        let samples = &mut block.samples;
 
         let (packets, _) = bytes.as_chunks::<XMA_PACKET_BYTES>();
         for packet in packets {
@@ -114,15 +138,13 @@ pub unsafe extern "C" fn leonida_xma2_decode_buffer(
             samples
                 .try_reserve(max_packet_samples)
                 .map_err(|_| LEONIDA_XMA2_OUT_OF_MEMORY)?;
-            stream.decode_packet(packet, &mut samples);
+            stream.decode_packet(packet, samples);
         }
 
         if !samples.len().is_multiple_of(handle.channels) {
             return Err(LEONIDA_XMA2_DECODER_FAILURE);
         }
-        Ok(Box::new(LeonidaXma2PcmBlock {
-            samples: samples.into_boxed_slice(),
-        }))
+        Ok(block)
     }));
 
     match decoded {
@@ -174,5 +196,68 @@ pub unsafe extern "C" fn leonida_xma2_pcm_sample_count(block: *const LeonidaXma2
 pub unsafe extern "C" fn leonida_xma2_pcm_destroy(block: *mut LeonidaXma2PcmBlock) {
     if !block.is_null() {
         unsafe { drop(Box::from_raw(block)) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT_HANDLE_ALLOCATION: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) unsafe fn allocate_handle(layout: Layout) -> *mut u8 {
+        if FAIL_NEXT_HANDLE_ALLOCATION.replace(false) {
+            ptr::null_mut()
+        } else {
+            unsafe { std::alloc::alloc(layout) }
+        }
+    }
+
+    #[test]
+    fn decoder_handle_allocation_failure_clears_output() {
+        let mut decoder = ptr::dangling_mut();
+        FAIL_NEXT_HANDLE_ALLOCATION.set(true);
+        let status = unsafe { leonida_xma2_decoder_create(48_000, 2, &mut decoder) };
+        assert_eq!(status, LEONIDA_XMA2_OUT_OF_MEMORY);
+        assert!(decoder.is_null());
+
+        assert_eq!(
+            unsafe { leonida_xma2_decoder_create(48_000, 2, &mut decoder) },
+            LEONIDA_XMA2_OK
+        );
+        assert!(!decoder.is_null());
+        unsafe { leonida_xma2_decoder_destroy(decoder) };
+    }
+
+    #[test]
+    fn pcm_handle_allocation_failure_clears_output_and_allows_retry() {
+        let mut decoder = ptr::null_mut();
+        assert_eq!(
+            unsafe { leonida_xma2_decoder_create(48_000, 2, &mut decoder) },
+            LEONIDA_XMA2_OK
+        );
+        let packet = [0u8; XMA_PACKET_BYTES];
+        let mut block = ptr::dangling_mut();
+        FAIL_NEXT_HANDLE_ALLOCATION.set(true);
+        let status = unsafe {
+            leonida_xma2_decode_buffer(decoder, packet.as_ptr(), packet.len(), &mut block)
+        };
+        assert_eq!(status, LEONIDA_XMA2_OUT_OF_MEMORY);
+        assert!(block.is_null());
+
+        assert_eq!(
+            unsafe {
+                leonida_xma2_decode_buffer(decoder, packet.as_ptr(), packet.len(), &mut block)
+            },
+            LEONIDA_XMA2_OK
+        );
+        assert!(!block.is_null());
+        unsafe {
+            leonida_xma2_pcm_destroy(block);
+            leonida_xma2_decoder_destroy(decoder);
+        }
     }
 }
