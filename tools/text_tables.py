@@ -48,6 +48,7 @@ import collections
 import csv
 import json
 import mmap
+import operator
 import os
 import re
 import struct
@@ -71,6 +72,8 @@ CONVERSATION_PAIR = re.compile(rb"([A-Z0-9_]{2,40}AU_[A-Z]{4})\x00([A-Za-z0-9_]{
 _PTR = rb"(.{3}[\x50-\x5f])\x00\x00\x00\x00"
 DESCRIPTOR = re.compile(_PTR + rb".{4}\x10\x00\x00\x00.{3}[\x50-\x5f]\x00\x00\x00\x00"
                         rb"\x01\x01\x00\x00(.{4})" + _PTR + rb"\x10\x00\x00\x00(.{4})" + _PTR, re.S)
+DESCRIPTOR_FLAGS = b"\x01\x01\x00\x00"    # inside a descriptor match, DESCRIPTOR_FLAGS_AT bytes from its start
+DESCRIPTOR_FLAGS_AT = 24
 SPEAKER = re.compile(r"_([A-Z]{1,3})_\d+$")
 LABEL_WORD = re.compile(r"[A-Za-z0-9_]{3,80}")
 
@@ -102,6 +105,10 @@ UNKNOWN = "xx"
 
 
 # ---- string tables ----
+_HASH_ENTRY = struct.Struct("<IIB2xBH2x")   # joaat, 0, 1, 2 unused bytes, u24 index as u8 + u16, 2 unused bytes
+_REF = struct.Struct("<Q")
+
+
 def _ptr(b4: bytes) -> int:
     return struct.unpack("<I", b4)[0] & 0x0FFFFFFF
 
@@ -127,9 +134,32 @@ def blob_chunks(buf: bytes, at: int) -> list:
     return chunks
 
 
+def descriptors(buf: bytes):
+    """The matches of ``DESCRIPTOR`` in ``buf``: what ``DESCRIPTOR.finditer(buf)`` yields, without scanning every byte.
+
+    Every match holds ``01 01 00 00`` DESCRIPTOR_FLAGS_AT bytes after its start, so the literal is searched with
+    ``bytes.find`` and the pattern is only tried where it can start. A candidate inside the previous match is
+    skipped, as ``finditer`` resumes after a match.
+    """
+    pos = buf.find(DESCRIPTOR_FLAGS)
+    end = 0
+    while pos != -1:
+        start = pos - DESCRIPTOR_FLAGS_AT
+        if start >= end:
+            m = DESCRIPTOR.match(buf, start)
+            if m:
+                end = m.end()
+                yield m
+        pos = buf.find(DESCRIPTOR_FLAGS, pos + 1)
+
+
 def string_tables(buf: bytes):
     """Yield {label hash: text} for every string table in one logical resource."""
-    for m in DESCRIPTOR.finditer(buf):
+    size = len(buf)
+    view = memoryview(buf)
+    find = buf.find
+    unpack_ref = _REF.unpack_from
+    for m in descriptors(buf):
         index = _ptr(m.group(1))
         hash_bytes = struct.unpack("<I", m.group(2))[0]
         hashes = _ptr(m.group(3))
@@ -137,20 +167,22 @@ def string_tables(buf: bytes):
         if not (0 < hash_bytes < len(buf) and hashes + hash_bytes <= len(buf) and chunks):
             continue
         out = {}
-        for o in range(hashes, hashes + hash_bytes - 15, 16):
-            h, zero = struct.unpack_from("<II", buf, o)
-            if not h or zero or buf[o + 8] != 1:
+        nchunks = len(chunks)
+        # One C-level pass over the hash entries; the view avoids copying a table that is most of the resource.
+        entries = _HASH_ENTRY.iter_unpack(view[hashes:hashes + 16 * (hash_bytes // 16)])
+        for h, zero, flag, low, high in entries:
+            if not h or zero or flag != 1:
                 continue
-            i = int.from_bytes(buf[o + 11:o + 14], "little")
-            at = index + 16 * i + 8
-            if at + 8 > len(buf):
+            at = index + 16 * (low | high << 8) + 8
+            if at + 8 > size:
                 continue
-            ref = struct.unpack_from("<Q", buf, at)[0]
-            if ref & CHUNK_MASK >= len(chunks):
+            ref = unpack_ref(buf, at)[0]
+            which = ref & CHUNK_MASK
+            if which >= nchunks:
                 continue
-            lo, hi = chunks[ref & CHUNK_MASK]
+            lo, hi = chunks[which]
             start = lo + (ref >> 20)
-            end = buf.find(b"\0", start, hi)
+            end = find(b"\0", start, hi)
             if lo <= start <= end:
                 out[h] = buf[start:end].decode("utf-8", "replace")
         if out:
@@ -411,11 +443,12 @@ def _clean(s: str) -> str:
 
 def _write_csv(path, fields, rows):
     with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=fields, lineterminator="\n")
-        w.writeheader()
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(fields)
         n = 0
+        pick = operator.itemgetter(*fields)         # a row dict as a list in field order, in C
         for row in rows:
-            w.writerow(row)
+            w.writerow(pick(row) if len(fields) > 1 else (pick(row),))
             n += 1
     return n
 
