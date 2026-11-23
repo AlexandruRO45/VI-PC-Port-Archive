@@ -1,11 +1,12 @@
 // The 1/2/3 method variants of the Vulkan-backed ID3D12Device (D3D-28), each compared with the method it wraps:
 // CreateCommittedResource1/2/3 with CreateCommittedResource, CreatePlacedResource2 with CreatePlacedResource,
-// CreateReservedResource1/2 with CreateReservedResource, CreateCommandQueue1 with CreateCommandQueue and
-// GetCopyableFootprints1 with GetCopyableFootprints. The device is called directly, not through the Xbox-ABI proxy,
-// because the proxy's slot 76 is the Xbox texture method, not CreateCommittedResource3 (docs/d3d12_vulkan.md
-// section 7). The newer arguments' edge cases are checked against the PC runtime's answers, live when the host has
-// a D3D12 device. A texture from CreateCommittedResource3 goes through an upload, a copy and a readback on a queue
-// from CreateCommandQueue1. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
+// CreateReservedResource1/2 with CreateReservedResource, CreateCommandQueue1 with CreateCommandQueue,
+// GetCopyableFootprints1 with GetCopyableFootprints and CreateHeap1 with CreateHeap. The device is called directly,
+// not through the Xbox-ABI proxy, because the proxy's slot 76 is the Xbox texture method, not
+// CreateCommittedResource3 (docs/d3d12_vulkan.md section 7). The newer arguments' edge cases are checked against the
+// PC runtime's answers, live when the host has a D3D12 device. A texture from CreateCommittedResource3 goes through
+// an upload, a copy and a readback on a queue from CreateCommandQueue1. No shaders or game data. Set
+// LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -483,6 +484,95 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     };
 }
 
+D3D12_HEAP_DESC heap_desc_of(UINT64 size, D3D12_HEAP_PROPERTIES properties, UINT64 alignment = 0,
+                             D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE) {
+    D3D12_HEAP_DESC desc{};
+    desc.SizeInBytes = size;
+    desc.Properties = properties;
+    desc.Alignment = alignment;
+    desc.Flags = flags;
+    return desc;
+}
+
+// CreateHeap1 against CreateHeap. Heaps live in the GPU address arena, which `arena` has and `no_arena` lacks (it
+// cannot create a heap). `host` is the PC runtime when the host has a D3D12 device: it answers CreateHeap1 as
+// CreateHeap for each of these without a session (measured on an RX 5700 and WARP, and with a null output on the
+// RX 5700). Returns 0 when all agree.
+int check_heap1(ID3D12Device4* no_arena, ID3D12Device4* arena, ID3D12Device4* host) {
+    const D3D12_HEAP_FLAGS deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                      D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+    const D3D12_HEAP_DESC heaps[] = {
+        heap_desc_of(65536, {D3D12_HEAP_TYPE_DEFAULT}),
+        heap_desc_of(1000, {D3D12_HEAP_TYPE_DEFAULT}),
+        heap_desc_of(4u << 20, {D3D12_HEAP_TYPE_DEFAULT}, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT),
+        heap_desc_of(65536, {D3D12_HEAP_TYPE_UPLOAD}, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+        heap_desc_of(65536, {D3D12_HEAP_TYPE_READBACK}, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
+        // Refused, with an output or without one (D3D-238).
+        heap_desc_of(0, {D3D12_HEAP_TYPE_DEFAULT}),
+        heap_desc_of(65536, {D3D12_HEAP_TYPE_DEFAULT}, 4096),
+        heap_desc_of(65536, {D3D12_HEAP_TYPE(0)}),
+        heap_desc_of(65536, {D3D12_HEAP_TYPE_DEFAULT}, 0, deny_all),
+    };
+    const IID& iid = __uuidof(ID3D12Heap);
+    if (!host) std::printf("no host D3D12 device: CreateHeap1 checked against CreateHeap only\n");
+    for (const D3D12_HEAP_DESC& desc : heaps) {
+        // With an output: CreateHeap's answer, and the description back from a created heap.
+        Ref<ID3D12Heap> base, variant;
+        const HRESULT want = arena->CreateHeap(&desc, IID_PPV_ARGS(&base.p));
+        const HRESULT got = arena->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&variant.p));
+        EXPECT(got == want && !variant.p == !base.p);
+        if (variant.p) {
+            const D3D12_HEAP_DESC back = variant->GetDesc();
+            EXPECT(back.SizeInBytes == desc.SizeInBytes && back.Properties.Type == desc.Properties.Type &&
+                   back.Flags == desc.Flags);
+        }
+        // Without one, a capability check: S_FALSE for a valid description whatever the interface, and the refusal
+        // for an invalid one. Nothing is created, so the device without the arena gives the same answers.
+        const HRESULT check = SUCCEEDED(want) ? S_FALSE : want;
+        for (ID3D12Device4* on : {no_arena, arena}) {
+            EXPECT(on->CreateHeap(&desc, iid, nullptr) == check);
+            EXPECT(on->CreateHeap1(&desc, nullptr, iid, nullptr) == check);
+            EXPECT(on->CreateHeap1(&desc, nullptr, __uuidof(ID3D12Resource), nullptr) == check);
+        }
+        if (!host) continue;
+        Ref<ID3D12Heap> theirs;
+        const HRESULT host_answer = host->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&theirs.p));
+        const HRESULT host_check = host->CreateHeap1(&desc, nullptr, iid, nullptr);
+        const HRESULT host_check_other = host->CreateHeap1(&desc, nullptr, __uuidof(ID3D12Resource), nullptr);
+        if (host_answer != got || host_check != check || host_check_other != check) {
+            std::fprintf(stderr,
+                         "CreateHeap1 of %llu bytes: ours %08lx, null output %08lx; host runtime %08lx, null output "
+                         "%08lx, %08lx for another interface\n",
+                         static_cast<unsigned long long>(desc.SizeInBytes), got, check, host_answer, host_check,
+                         host_check_other);
+            return 1;
+        }
+    }
+
+    // No room: the device without the arena cannot create a heap, and a heap larger than any arena (at most
+    // 4095 MiB) does not fit one. Both fail with nothing handed out, while the capability check is S_FALSE. Not
+    // compared with the host, which would make the 4 GiB heap.
+    const D3D12_HEAP_DESC too_big = heap_desc_of(UINT64(4) << 30, {D3D12_HEAP_TYPE_DEFAULT});
+    void* out = reinterpret_cast<void*>(1);
+    EXPECT(no_arena->CreateHeap1(&heaps[0], nullptr, iid, &out) == E_NOTIMPL && !out);
+    out = reinterpret_cast<void*>(1);
+    EXPECT(arena->CreateHeap1(&too_big, nullptr, iid, &out) == E_OUTOFMEMORY && !out);
+    EXPECT(arena->CreateHeap(&too_big, iid, nullptr) == S_FALSE);
+    EXPECT(arena->CreateHeap1(&too_big, nullptr, iid, nullptr) == S_FALSE);
+
+    // A protected session is refused before the capability check (the layer reports no session support), so it is
+    // E_INVALIDARG with a null output too, and so is a null description. Nothing is handed out. On the layer alone:
+    // the session is not a real one.
+    for (ID3D12Device4* on : {no_arena, arena}) {
+        out = reinterpret_cast<void*>(1);
+        EXPECT(on->CreateHeap1(&heaps[0], fake_session(), iid, &out) == E_INVALIDARG && !out);
+        EXPECT(on->CreateHeap1(&heaps[0], fake_session(), iid, nullptr) == E_INVALIDARG);
+        EXPECT(on->CreateHeap1(nullptr, nullptr, iid, nullptr) == E_INVALIDARG);
+        EXPECT(on->CreateHeap(nullptr, iid, nullptr) == E_INVALIDARG);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -775,71 +865,10 @@ int main() {
                 EXPECT(same_footprints(device.p, &f.desc, f.first, f.count, base));
         EXPECT(same_footprints(device.p, nullptr, 0, 1, 0));
 
-        // CreateHeap1 against CreateHeap, on a device of its own: heaps need the GPU address arena, which the device
-        // above is not made with (they answer E_NOTIMPL there). The same answer for each description, the same
-        // description back from a created heap, a protected session refused with nothing handed out, and the PC
-        // runtime's answers where the host has a D3D12 device: it answers CreateHeap1 as CreateHeap for each of
-        // these (measured on an RX 5700 and WARP).
-        {
-            Ref<ID3D12Device> standalone;
-            EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone.p))));
-            Ref<ID3D12Device4> heaps_device;
-            EXPECT(SUCCEEDED(standalone->QueryInterface(IID_PPV_ARGS(&heaps_device.p))));
-            const auto heap_desc = [](UINT64 size, D3D12_HEAP_TYPE type, UINT64 alignment, D3D12_HEAP_FLAGS flags) {
-                D3D12_HEAP_DESC desc{};
-                desc.SizeInBytes = size;
-                desc.Properties.Type = type;
-                desc.Alignment = alignment;
-                desc.Flags = flags;
-                return desc;
-            };
-            const D3D12_HEAP_DESC heaps[] = {
-                heap_desc(65536, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
-                heap_desc(1000, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
-                heap_desc(4u << 20, D3D12_HEAP_TYPE_DEFAULT, D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT,
-                          D3D12_HEAP_FLAG_NONE),
-                heap_desc(65536, D3D12_HEAP_TYPE_UPLOAD, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
-                heap_desc(65536, D3D12_HEAP_TYPE_READBACK, 0, D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS),
-                heap_desc(0, D3D12_HEAP_TYPE_DEFAULT, 0, D3D12_HEAP_FLAG_NONE),
-            };
-            const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                                 reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                           : nullptr;
-            Ref<ID3D12Device4> host;
-            if (!create_host || FAILED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p))))
-                std::printf("no host D3D12 device: CreateHeap1 checked against CreateHeap only\n");
-            for (const D3D12_HEAP_DESC& desc : heaps) {
-                Ref<ID3D12Heap> base, variant;
-                const HRESULT want = heaps_device->CreateHeap(&desc, IID_PPV_ARGS(&base.p));
-                const HRESULT got = heaps_device->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&variant.p));
-                EXPECT(got == want);
-                EXPECT(!variant.p == !base.p);
-                if (host.p) {
-                    Ref<ID3D12Heap> theirs;
-                    const HRESULT host_answer = host->CreateHeap1(&desc, nullptr, IID_PPV_ARGS(&theirs.p));
-                    if (host_answer != got) {
-                        std::fprintf(stderr, "CreateHeap1 of %llu bytes: ours %08lx, host runtime %08lx\n",
-                                     static_cast<unsigned long long>(desc.SizeInBytes), got, host_answer);
-                        return 1;
-                    }
-                }
-                if (!variant.p) continue;
-                const D3D12_HEAP_DESC back = variant->GetDesc();
-                EXPECT(back.SizeInBytes == desc.SizeInBytes && back.Properties.Type == desc.Properties.Type &&
-                       back.Flags == desc.Flags);
-            }
-            const auto null_output = [&](ID3D12Device4* on) {
-                return on->CreateHeap1(&heaps[0], nullptr, __uuidof(ID3D12Heap), nullptr);
-            };
-            EXPECT(null_output(heaps_device.p) == S_FALSE);
-            EXPECT(!host.p || null_output(host.p) == S_FALSE);
-            EXPECT(heaps_device->CreateHeap1(nullptr, nullptr, __uuidof(ID3D12Heap), nullptr) ==
-                   heaps_device->CreateHeap(nullptr, __uuidof(ID3D12Heap), nullptr));
-            void* out = reinterpret_cast<void*>(1);
-            EXPECT(heaps_device->CreateHeap1(&heaps[0], fake_session(), __uuidof(ID3D12Heap), &out) == E_INVALIDARG);
-            EXPECT(out == nullptr);
-        }
+        // CreateHeap1 against CreateHeap, with an output and without one (a capability check), on the device above,
+        // which has no GPU address arena to put a heap in, and on the standalone device, which has one; and against
+        // the PC runtime when there is one.
+        EXPECT(check_heap1(device.p, standalone_device.p, have_host ? host.p : nullptr) == 0);
     }
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());

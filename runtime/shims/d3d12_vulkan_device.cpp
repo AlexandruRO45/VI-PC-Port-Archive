@@ -6035,6 +6035,9 @@ public:
             log_once((std::string("CreateHeap refused (") + why + "), heap type").c_str(), int(desc->Properties.Type));
             return E_INVALIDARG;
         }
+        // A null output is a capability check, as on the host (RX 5700): a valid description is S_FALSE whatever the
+        // interface, and nothing is created, so neither a missing arena nor a full one changes the answer.
+        if (!out) return S_FALSE;
         if (!state_.arena.mapped) {
             log_once("heaps need the GPU address arena (bufferDeviceAddress); heap size in KiB:",
                      int(desc->SizeInBytes / 1024));
@@ -6047,15 +6050,12 @@ public:
             heap->Release();
             return E_OUTOFMEMORY;
         }
-        if (!out) {
-            heap->Release();
-            return S_FALSE;
-        }
         return hand_out(heap, riid, out);
     }
 
-    // Device4. CreateHeap with a protected session; the PC runtime answers both alike without one. A session is
-    // refused as CreateCommittedResource1-3 refuse it, since the layer reports no protected-session support.
+    // Device4. CreateHeap with a protected session; the PC runtime answers both alike without one, a null output
+    // included. A session is refused as CreateCommittedResource1-3 refuse it, since the layer reports no
+    // protected-session support, and before the capability check: with a null output it is E_INVALIDARG too.
     HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
                                           REFIID riid, void** out) override {
         if (out) *out = nullptr;

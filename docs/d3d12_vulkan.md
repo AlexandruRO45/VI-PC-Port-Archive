@@ -444,8 +444,8 @@ What is implemented (all of it testable without the game):
     | `CreateCommandQueue1`'s creator ID | ignored |
 
     `CreatePlacedResource1/2` wrap the placed path above; `2` carries the castable-format list. `CreateHeap1`
-    wraps `CreateHeap`: the PC runtime answers both alike without a session (measured on an RX 5700 and WARP), and a
-    session is refused as above.
+    wraps `CreateHeap`: the PC runtime answers both alike without a session (measured on an RX 5700 and WARP, and
+    with a null output on the RX 5700), and a session is refused as above, with or without an output.
   - `CreateSampler2` as a wrapper over `CreateSampler` (D3D-28, part 2). Without flags it writes the same S#.
     `D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR` reads the union as integers. `(0,0,0,0)`, `(0,0,0,1)` and `(1,1,1,1)`
     take the S#'s transparent-black, opaque-black and opaque-white types. The S# has no separate integer types,
@@ -792,7 +792,10 @@ The compute path, end to end:
     property and memory pool or a non-custom heap with either, and a heap with all three `DENY_*` flags. It also
     refuses `ALLOW_DISPLAY` (committed resources only), as an RTX 4070 SUPER and a UHD 770 host do. It accepts
     `HARDWARE_PROTECTED`, as those hosts do, though the `D3D12_HEAP_FLAGS` documentation calls it unsupported.
-    (D3D-191). Multisampled 2D placed textures (`UNKNOWN` and `4x` tiled) share that backing with host-matched heap
+    (D3D-191). A null output is a capability check, as on the host (RX 5700): a description these checks pass is
+    `S_FALSE` whatever the interface, and nothing is created or reserved, so a device without the arena and a full
+    arena give that answer too; a description they refuse is refused as with an output.
+    Multisampled 2D placed textures (`UNKNOWN` and `4x` tiled) share that backing with host-matched heap
     and offset alignment checks (`4 MiB` vs `64 KiB`, `D3D-222`). `CreatePlacedResource2`'s castable-format list
     reaches the placed texture's image as the committed path's does (D3D-90).
 
@@ -1066,8 +1069,11 @@ and any validation error fails them.
   checks. `GetCopyableFootprints1` must match `GetCopyableFootprints` field by field, including the failure
   answer. A texture from `CreateCommittedResource3`
   is uploaded, copied back and compared on a queue from `CreateCommandQueue1`. On a standalone device (heaps need
-  the GPU address arena), `CreateHeap1` must give `CreateHeap`'s answer and description for six heaps (one
-  refused), the host runtime's answers when there is one, `S_FALSE` for a null output, and refuse a session.
+  the GPU address arena), `CreateHeap1` must give `CreateHeap`'s answer and description for nine heaps (four
+  refused) and the host runtime's answers when there is one. Without an output, both methods must answer the
+  capability check on that device and on the test's device without the arena: `S_FALSE` for a valid description
+  whatever the interface, also where no heap can be made (no arena, or a 4 GiB heap the arena cannot hold), and the
+  refusal for an invalid one, as the host does. A session is refused with or without an output.
 - `d3d12_sampler2_test`: `CreateSampler2` against `CreateSampler`, on the slots' bytes. It checks:
   - 10 descriptions without flags, which must be byte for byte the same;
   - 6 UINT and float-bit border colours against their float equivalents (the three built-in UINT colours with
