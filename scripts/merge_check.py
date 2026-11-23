@@ -10,10 +10,11 @@ against `--main` (default `origin/main`), using one history scan for the whole b
   merges come from: a rebased copy merged again keeps both copies of what it added.
 - `commits`: the PR's commits (merge base..REF) and how many `git cherry` finds on main already (same patch).
 - `duplicates`: runs of three or more consecutive lines the merge would add (each at least `--min-length`
-  characters once stripped) that already stand in the same order in the same file on main. This is what a second
-  merge leaves behind as a doubled paragraph, table or function, whether or not the commits match by patch; a single
-  repeated line is not reported, since code and tables repeat lines legitimately. Only text files (.md, .txt,
-  .rst) make the verdict `duplicates`; a block in code is listed, since equal lines in two functions are ordinary.
+  characters once stripped) that already stand in the same order in the same file on main, using the original path
+  for a Git-detected rename. This is what a second merge leaves behind as a doubled paragraph, table or function,
+  whether or not the commits match by patch; a single repeated line is not reported, since code and tables repeat
+  lines legitimately. Only text files (.md, .txt, .rst) make the verdict `duplicates`; a block in code is listed,
+  since equal lines in two functions are ordinary.
 - `conflict`: whether `git merge-tree` reports a conflict (the duplicate check is then on the conflicted tree).
 
 Verdict per PR: `already-merged` (a prior merge exists and either every commit is on main or the conflict-free merged
@@ -89,13 +90,13 @@ def merged_tree(repo, main, ref):
     return r.stdout.split()[0], r.returncode == 1
 
 
-def patch_destination(header):
-    """Decode Git's +++ header. An unquoted path containing spaces can have a trailing tab."""
+def patch_path(header, prefix):
+    """Decode a Git --- or +++ header. An unquoted path containing spaces can have a trailing tab."""
     name = header[4:].removesuffix("\t")
     if name.startswith('"') and name.endswith('"'):
         # Git's octal escapes describe filesystem bytes, not Unicode code points.
         name = codecs.escape_decode(name[1:-1].encode("utf-8"))[0].decode("utf-8", "surrogateescape")
-    return name[2:] if name.startswith("b/") else None  # Deleted files say /dev/null.
+    return name[len(prefix):] if name.startswith(prefix) else None  # A missing side says /dev/null.
 
 
 def duplicates(repo, main, tree, min_length, block=3):
@@ -104,29 +105,34 @@ def duplicates(repo, main, tree, min_length, block=3):
     table or function body merged twice. A single repeated line is not reported: code and tables repeat lines
     legitimately."""
     found = {}
-    hunks, path, added = {}, None, None
-    patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--no-renames",
+    hunks = {}
+    source, path, added = None, None, None
+    patch = git(repo, "-c", "core.quotePath=true", "diff", "--unified=0", "--no-color", "--find-renames",
                 "--src-prefix=a/", "--dst-prefix=b/", "--no-relative", "--no-ext-diff", "--no-textconv",
                 main, tree).stdout
     for line in patch.split("\n"):
         if line.startswith("diff --git "):
-            path, added = None, None
+            source, path, added = None, None, None
+        elif added is None and line.startswith("--- "):
+            source = patch_path(line, "a/")
         elif added is None and line.startswith("+++ "):
-            path = patch_destination(line)
+            path = patch_path(line, "b/")
         elif line.startswith("@@ ") and path:
             added = []
-            hunks.setdefault(path, []).append(added)
+            # Git can also show a type change as a deletion and an addition at the same path.
+            hunks.setdefault((source or path, path), []).append(added)
         elif added is not None and line.startswith("+"):
             text = line[1:].strip()
             if text:
                 added.append(text)
+
     def windows(rev, path):
         r = git(repo, "show", f"{rev}:{path}", check=False)
         lines = [l.strip() for l in r.stdout.split("\n") if l.strip()] if r.returncode == 0 else []
         return r.returncode == 0, Counter(tuple(lines[i:i + block]) for i in range(len(lines) - block + 1))
 
-    for path, groups in hunks.items():
-        exists, before = windows(main, path)
+    for (source, path), groups in hunks.items():
+        exists, before = windows(main, source)
         if not exists:
             continue  # a new file: nothing to duplicate
         _, after = windows(tree, path)

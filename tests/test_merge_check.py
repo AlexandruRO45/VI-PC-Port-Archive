@@ -200,6 +200,51 @@ class MergeCheckTest(unittest.TestCase):
         code, [r] = self.run_check("17=move")
         self.assertEqual((code, r["verdict"], r["duplicates"]), (0, "clean", {}))
 
+    def test_renamed_files_compare_against_their_original_path(self):
+        source = "docs/old notes \u00e9.md"
+        renamed = "docs/new notes \u65e5\u672c\u8a9e.md"
+        lines = [f"# Line {i:02d}: this synthetic document explains a distinct heading in enough detail.\n"
+                 for i in range(18)]
+        original = "".join(lines)
+        passage = "".join(lines[:3])
+        self.write(source, original)
+        base = self.commit("Add the original notes")
+        self.git("config", "core.quotePath", "false")
+        self.git("config", "diff.noprefix", "true")
+        self.git("config", "diff.renames", "copies")
+
+        cases = (
+            ("duplicate", renamed, original + passage, "R085", 1, "duplicates", 3),
+            ("pure", renamed, original, "R100", 0, "clean", 0),
+            ("move", renamed, "".join(lines[3:]) + passage, "R100", 0, "clean", 0),
+            ("new-file", renamed, original + passage, "A", 0, "clean", 0),
+            ("code", "docs/new notes.py", original + passage, "R085", 0, "clean", 3),
+        )
+        for branch, path, content, status, exit_code, verdict, count in cases:
+            with self.subTest(branch=branch):
+                self.git("checkout", "-q", "-b", branch, base)
+                if status == "A":
+                    self.append(source, "A new note in the original file.\n")
+                else:
+                    self.git("mv", source, path)
+                self.write(path, content)
+                self.commit(branch)
+                records = self.git("diff", "--find-renames", "--name-status", "-z", base, branch).split("\0")
+                expected = ["A", path, "M", source, ""] if status == "A" else [status, source, path, ""]
+                self.assertEqual(records, expected)
+                if status == "A":
+                    copies = self.git("diff", "--name-status", "-z", base, branch).split("\0")
+                    self.assertEqual(copies[:3], ["C085", source, path])
+
+                result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "scripts", "merge_check.py"),
+                                         "--repo", self.repo, "--main", "main", "--json", f"20={branch}"],
+                                        capture_output=True, encoding="utf-8")
+                self.assertEqual(result.stderr, "")
+                [row] = json.loads(result.stdout)
+                self.assertEqual((result.returncode, row["verdict"], row["duplicates"]),
+                                 (exit_code, verdict, {path: count} if count else {}))
+                self.assertEqual(row["duplicate_samples"], {path: passage.splitlines()} if count else {})
+
     def test_a_new_commit_after_the_merge_is_not_already_merged(self):
         base = self.git("rev-parse", "main")
         self.pr_branch("first", base, "\n" + PARAGRAPH)
