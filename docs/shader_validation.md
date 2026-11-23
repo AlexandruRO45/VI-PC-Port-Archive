@@ -1407,7 +1407,10 @@ to select another `vk_harness`. It exits 77 if the executable, SDK tools, Vulkan
 feature is unavailable. `--oracle hw` runs the same programs natively on an AMD GPU through `tools/hw_oracle` (one lane
 of a wave32 compute kernel, as `tools/fmisc_diff.py` does) and compares the four words with the reference only, not with
 the translator; `--hw-arch` picks the architecture to assemble for (default: detected). The campaign is one launch, and a
-failing program is re-run alone while it is shrunk. The hardware runs every form, so the known-divergence exclusions
+failing program is re-run alone while it is shrunk. The kernel sets v8..v11 to zero first, which is how the reference
+reads a register the program never writes: an allocated but unset VGPR keeps an earlier wave's word, so without it a
+shortened program still mismatched and the minimizer could delete every instruction (#6784). The hardware runs every
+form, so the known-divergence exclusions
 (translator limits) do not apply: output modifiers, clamp, negated/absolute operands and directed rounding are compared
 too, and the kernels start in the game's inferred float MODE (IEEE off, DX10_CLAMP on). `v_rcp_f64`, `v_rsq_f64` and
 `v_sqrt_f64` are counted skips there, because the native results are approximations (PROC-216) and the reference is exact;
