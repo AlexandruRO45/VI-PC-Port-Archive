@@ -303,9 +303,13 @@ def main(argv=None):
     summary["nodes_read"] = read
     text = json.dumps(summary, indent=1, sort_keys=True)
     if a.out:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text + "\n")
+        try:  # an --out that cannot be written is one ERROR line and exit 2, as tools/navmesh_decode.py does
+            os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text + "\n")
+        except OSError as e:
+            print("ERROR: cannot write %s: %s" % (a.out, e.strerror or e), file=sys.stderr)
+            return 2
     else:
         sys.stdout.write(text + "\n")
     return 0

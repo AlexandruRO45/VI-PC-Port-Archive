@@ -250,6 +250,36 @@ class ArchiveTest(unittest.TestCase):
                 self.assertNotIn("Traceback", cp.stderr)
                 self.assertEqual(cp.stdout, "")
 
+    def test_cli_reports_an_unwritable_out_as_one_error_line(self):
+        # The --out write sits outside the try that prints "ERROR: %s", so a target that cannot be
+        # written ended the run in a PermissionError or FileExistsError traceback (exit 1). The tool
+        # must answer like its sibling navmesh_decode.py: one "ERROR: cannot write ..." line, exit 2.
+        out_ro = os.path.join(self.tmp.name, "ro.json")
+        with open(out_ro, "w", encoding="utf-8") as f:
+            f.write("{}")
+        out_in_file = os.path.join(self.levels, "summary.json")   # its parent is a plain file
+        for out in (out_ro, out_in_file):
+            with self.subTest(out=out):
+                os.chmod(out_ro, 0o444)
+                try:
+                    try:
+                        with open(out_ro, "a", encoding="utf-8"):
+                            pass
+                        if out is out_ro:
+                            self.skipTest("the file is still writable (running as root, or Windows)")
+                    except OSError:
+                        pass
+                    cp = subprocess.run([sys.executable, "-I", TOOL, self.navmeshes, self.levels,
+                                         "--out", out], capture_output=True, text=True)
+                finally:
+                    os.chmod(out_ro, 0o644)
+                self.assertEqual(cp.returncode, 2, cp.stderr)
+                self.assertNotIn("Traceback", cp.stderr)
+                lines = cp.stderr.strip().splitlines()
+                self.assertEqual(len(lines), 1, cp.stderr)
+                self.assertTrue(lines[0].startswith("ERROR: cannot write " + out + ":"), cp.stderr)
+                self.assertFalse(os.path.exists(out_in_file))
+
     def test_cli_reports_a_file_that_is_not_an_archive(self):
         junk = os.path.join(self.tmp.name, "junk.rpf")
         with open(junk, "wb") as f:
