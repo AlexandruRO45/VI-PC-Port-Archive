@@ -144,9 +144,18 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual(self.detail(r, "ps_part"), ["ps_part", "ps", "8", "12", "1.50", "6", "-", "-", "-", "-", "-"])
         r = self.run_stats(rows, details=False, listings=listings)
         self.assertEqual((r.returncode, r.stderr), (0, ""))
-        self.assertEqual(r.stdout, "ps: 2 shaders, code growth median 1.75x (p90 1.50x, max 2.00x); "
+        self.assertEqual(r.stdout, "ps: 2 shaders, code growth median 1.75x (p90 2.00x, max 2.00x); "
                                    "VGPRs median 8 vs original 6 (1 of 2); scratch in 1 (1 of 2), spills in 1 (1 of 2); "
                                    "waves/SIMD median 16 (1 of 2)\n")
+
+    def test_growth_p90_uses_nearest_rank(self):
+        for count, expected in ((10, 9), (11, 10)):
+            with self.subTest(count=count):
+                listings = {f"ps_{i}": PS_FLAT for i in range(1, count + 1)}
+                rows = [f"ps_{i},ps,Instructions,{8 * i}" for i in range(1, count + 1)]
+                result = self.run_stats(rows, details=False, listings=listings)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"(p90 {expected:.2f}x, max {count:.2f}x)", result.stdout)
 
     def test_measured_zero_differs_from_missing_and_one_spill_counter_is_a_lower_bound(self):
         cases = [(["Scratch size,0", "Spilled VGPRs,0", "Spilled SGPRs,0"], "0", "0", "scratch in 0, spills in 0;"),

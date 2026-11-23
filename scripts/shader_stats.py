@@ -9,6 +9,7 @@ code uses, and it flags scratch memory and spills: a register file that didn't f
 which is the expensive case (relative VGPR indexing, v_movrels/v_movreld, forces it). It prints a summary per stage and,
 with --details, one line per shader.
 Growth is unavailable when the original listing has no parsed instructions; its driver counters are still shown.
+The code-growth p90 is the smallest observed growth factor at or above at least 90% of the stage's measured values.
 
 Metrics are read only where the driver emits these exact RADV/ACO statistic names with a numeric value: Instructions,
 VGPRs, SGPRs, Scratch size, Spilled VGPRs, Spilled SGPRs, Subgroups per SIMD. No equivalence is claimed for other
@@ -191,8 +192,9 @@ def main():
         g = sorted(r["growth"] for r in reported(rs, "growth"))
         growth = "code growth n/a"
         if g:
+            p90 = g[math.ceil(0.9 * len(g)) - 1]
             growth = (f"code growth median {statistics.median(g):.2f}x "
-                      f"(p90 {g[int(0.9 * (len(g) - 1))]:.2f}x, max {g[-1]:.2f}x){coverage(len(g), len(rs))}")
+                      f"(p90 {p90:.2f}x, max {g[-1]:.2f}x){coverage(len(g), len(rs))}")
         v = reported(rs, "vgprs")
         vgprs = "VGPRs n/a"
         if v:
