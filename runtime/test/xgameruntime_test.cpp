@@ -365,6 +365,9 @@ void check_run_time_load() {
         check(reinterpret_cast<Create>(slot(t, 12))(t, XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual,
                                                     &queue) == S_OK && queue,
               "slot 12 is XTaskQueueCreate");
+        using IsEmpty = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort);
+        check(reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Work),
+              "slot 28 reports an idle work port empty");
         static std::atomic<int> s_ran{0};
         using Submit = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, void*,
                                                   XTaskQueueCallback*);
@@ -373,6 +376,8 @@ void check_run_time_load() {
         };
         check(reinterpret_cast<Submit>(slot(t, 18))(t, queue, XTaskQueuePort::Work, &s_ran, cb) == S_OK,
               "slot 18 is XTaskQueueSubmitCallback");
+        check(!reinterpret_cast<IsEmpty>(slot(t, 28))(t, queue, XTaskQueuePort::Work),
+              "slot 28 reports queued work nonempty");
         using Dispatch = bool(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, XTaskQueuePort, uint32_t);
         check(reinterpret_cast<Dispatch>(slot(t, 16))(t, queue, XTaskQueuePort::Work, 0) && s_ran.load() == 1,
               "slot 16 is XTaskQueueDispatch: the callback ran on the work port");
@@ -390,11 +395,12 @@ void check_run_time_load() {
                   reinterpret_cast<SetSensitive>(slot(t, 27))(t, false) == S_OK &&
                   !reinterpret_cast<IsSensitive>(slot(t, 30))(t),
               "slots 27 and 30 set and read this thread's time-sensitive flag");
-        // Slot 8 (XAsyncBeginAlloc, private, signature not measured) must not report a begun call whose provider
-        // never received XAsyncOp::Begin: either it refuses, or the provider saw Begin exactly once.
         static std::atomic<int> s_begins{0};
-        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData*) -> HRESULT {
-            if (op == XAsyncOp::Begin) s_begins.fetch_add(1);
+        XAsyncProvider* provider = [](XAsyncOp op, const XAsyncProviderData* data) -> HRESULT {
+            if (op == XAsyncOp::Begin) {
+                s_begins.fetch_add(1);
+                XAsyncComplete(data->async, S_OK, 0);
+            }
             return S_OK;
         };
         XAsyncBlock alloc_block{};
@@ -402,8 +408,13 @@ void check_run_time_load() {
                                                         size_t, size_t, void*);
         const HRESULT alloc_hr =
             reinterpret_cast<BeginAlloc>(slot(t, 8))(t, &alloc_block, nullptr, "test", provider, 16, 0, nullptr);
-        check(FAILED(alloc_hr) || s_begins.load() == 1,
-              "slot 8 (XAsyncBeginAlloc) never reports success for a call whose provider did not begin");
+        check(alloc_hr == S_OK && s_begins.load() == 1,
+              "slot 8 begins the allocated provider");
+        if (alloc_hr == S_OK) {
+            using Status = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, bool);
+            check(reinterpret_cast<Status>(slot(t, 3))(t, &alloc_block, true) == S_OK,
+                  "slot 8 provider completes successfully");
+        }
         void* unk = nullptr;
         const GUID iunknown = {0, 0, 0, {0xc0, 0, 0, 0, 0, 0, 0, 0x46}};
         using QI = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
