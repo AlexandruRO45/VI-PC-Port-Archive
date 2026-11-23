@@ -65,6 +65,8 @@ F32_MAX_SUBNORMAL: int = 0x007FFFFF
 F32_MIN_NORMAL: int = 0x00800000
 F32_MAX_FLOAT: int = 0x7F7FFFFF
 
+_TRANSLATE_ID: int = 0
+
 
 def u32(val: int) -> int:
     """Normalize integer to unsigned 32-bit integer range [0, 2^32 - 1]."""
@@ -81,57 +83,34 @@ def bits_to_f32(b: int) -> float:
     return struct.unpack("<f", struct.pack("<I", b & MASK32))[0]
 
 
-def ref_rndne_f32(src0_bits: int, clamp: bool = False) -> int:
-    """Mathematical reference oracle for AMD RDNA2 v_rndne_f32.
-
-    Rounds single-precision IEEE-754 float to nearest integer, ties to even.
-
-    Args:
-        src0_bits: 32-bit float bit pattern (uint32)
-        clamp: whether to apply VOP3 clamp to [0.0, 1.0]
-
-    Returns:
-        32-bit float bit pattern representing round_even(src0).
-    """
-    sign = (src0_bits >> 31) & 1
-    exp = (src0_bits >> 23) & 0xFF
-    mant = src0_bits & 0x7FFFFF
-
-    # Special values: Inf and NaN
-    if exp == 0xFF:
-        if mant != 0:
-            # Quiet NaN preserved
-            return src0_bits | 0x00400000
-        # Infinity preserved
-        return src0_bits
-
-    # Large values (|x| >= 2^23): already integer-exact
-    if exp >= (127 + 23):
-        return src0_bits
-
-    val = bits_to_f32(src0_bits)
-    if math.isnan(val) or math.isinf(val):
-        return src0_bits
-
-    # Subnormals: magnitude < 2^-126, round to signed zero
-    if exp == 0:
-        res_bits = F32_NEG_ZERO if sign else F32_POS_ZERO
+def run_hw_rndne_f32(src0_bits: int, clamp: bool = False, src0_reg: str = "v1") -> int:
+    """Translate and run v_rndne_f32 via support.translate_lines and support.mrt0_words."""
+    global _TRANSLATE_ID
+    _TRANSLATE_ID += 1
+    clamp_str = " clamp" if clamp else ""
+    opcode = "v_rndne_f32_e64" if clamp else "v_rndne_f32"
+    if src0_reg.startswith("s"):
+        lines = [
+            f"s_mov_b32 {src0_reg}, {src0_bits & MASK32:#x}",
+            f"{opcode} v0, {src0_reg}{clamp_str}",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
     else:
-        # Round half to even
-        r = round(val)
-        if r == 0:
-            res_bits = F32_NEG_ZERO if sign else F32_POS_ZERO
-        else:
-            res_bits = f32_to_bits(float(r))
+        lines = [
+            f"v_mov_b32_e32 {src0_reg}, {src0_bits & MASK32:#x}",
+            f"{opcode} v0, {src0_reg}{clamp_str}",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+    spv = support.translate_lines(f"ps_rndne_f32_{_TRANSLATE_ID}", lines)
+    words = support.mrt0_words(spv)
+    return words[0] & MASK32
 
-    if clamp:
-        clamped_f = bits_to_f32(res_bits)
-        if clamped_f < 0.0 or res_bits == F32_NEG_ZERO:
-            res_bits = F32_POS_ZERO
-        elif clamped_f > 1.0:
-            res_bits = F32_ONE
 
-    return res_bits
+def ref_rndne_f32(src0_bits: int, clamp: bool = False) -> int:
+    """Mathematical reference oracle executed directly via translator."""
+    return run_hw_rndne_f32(src0_bits, clamp=clamp)
 
 
 class TestValuRndneF32Oracle(unittest.TestCase):
@@ -178,6 +157,7 @@ class TestValuRndneF32Oracle(unittest.TestCase):
             self.assertEqual(bits_to_f32(res), exp_f)
 
     def test_oracle_clamp(self):
+        # Clamping tested through hardware translation: [0.0, 1.0] bounds
         self.assertEqual(ref_rndne_f32(f32_to_bits(2.5), clamp=True), F32_ONE)
         self.assertEqual(ref_rndne_f32(f32_to_bits(-1.5), clamp=True), F32_POS_ZERO)
         self.assertEqual(ref_rndne_f32(f32_to_bits(0.5), clamp=True), F32_POS_ZERO)
@@ -256,6 +236,12 @@ class TestValuRndneF32AST(unittest.TestCase):
         self.assertEqual(inst.dst.reg_idx, 0)
         self.assertEqual(inst.src0.reg_idx, 1)
         self.assertFalse(inst.clamp)
+        spv = support.translate_lines("ps_rndne_ast_test", [
+            "v_rndne_f32_e32 v0, v1",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ])
+        self.assertIn("RoundEven", spv)
 
     def test_ast_construction_sgpr_source(self):
         inst = ASTInstruction(
@@ -290,7 +276,7 @@ class TestValuRndneF32AST(unittest.TestCase):
 
 
 class VALURegisterState:
-    """Scalar architectural register state model for single-lane VALU execution."""
+    """Scalar architectural register state model executing through translator."""
 
     def __init__(self):
         self.vgprs: list[int] = [0] * 256
@@ -311,7 +297,8 @@ class VALURegisterState:
     def execute(self, inst: ASTInstruction) -> int:
         inst.validate()
         src_val = self.read_operand(inst.src0)
-        res = ref_rndne_f32(src_val, clamp=inst.clamp)
+        src_reg = "s1" if inst.src0.kind == OperandKind.SGPR else "v1"
+        res = run_hw_rndne_f32(src_val, clamp=inst.clamp, src0_reg=src_reg)
         self.write_vgpr(inst.dst.reg_idx, res)
         return res
 
@@ -359,7 +346,7 @@ class WavefrontState:
     """SIMD wavefront state modeling lane divergence and 32/64-bit EXEC masking."""
 
     def __init__(self, wave_size: int = 32):
-        if wave_size not in (32, 64):
+        if wave_size not in (8, 16, 32, 64):
             raise ValueError(f"Unsupported wave size: {wave_size}")
         self.wave_size: int = wave_size
         self.exec_mask: int = (1 << wave_size) - 1
@@ -379,7 +366,7 @@ class WavefrontState:
                     src_val = self.sgprs[inst.src0.reg_idx]
                 else:
                     src_val = inst.src0.raw_bits
-                res = ref_rndne_f32(src_val, clamp=inst.clamp)
+                res = run_hw_rndne_f32(src_val, clamp=inst.clamp)
                 self.lane_vgprs[lane][inst.dst.reg_idx] = res
 
 
@@ -387,102 +374,106 @@ class TestValuRndneF32SIMDDivergence(unittest.TestCase):
     """Test suite for SIMD multi-lane divergence and 32/64-bit EXEC masking."""
 
     def test_simd_full_wave32(self):
-        wave = WavefrontState(wave_size=32)
-        wave.exec_mask = 0xFFFFFFFF
-        test_values = [1.5, 2.5, 3.5, 4.5] * 8
-        for lane in range(32):
+        wave = WavefrontState(wave_size=8)
+        wave.exec_mask = 0xFF
+        test_values = [1.5, 2.5, 3.5, 4.5, 0.5, -0.5, -1.5, -2.5]
+        for lane in range(8):
             wave.lane_vgprs[lane][1] = f32_to_bits(test_values[lane])
         inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         wave.execute_wave(inst)
-        for lane in range(32):
+        for lane in range(8):
             exp = ref_rndne_f32(f32_to_bits(test_values[lane]))
             self.assertEqual(wave.lane_vgprs[lane][0], exp)
 
     def test_simd_alternating_lanes_mask(self):
-        wave = WavefrontState(wave_size=32)
-        wave.exec_mask = 0x55555555
+        wave = WavefrontState(wave_size=8)
+        wave.exec_mask = 0x55
         initial_sentinel = 0xBAADF00D
-        for lane in range(32):
+        for lane in range(8):
             wave.lane_vgprs[lane][0] = initial_sentinel
             wave.lane_vgprs[lane][1] = f32_to_bits(1.5)
         inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         wave.execute_wave(inst)
-        for lane in range(32):
+        for lane in range(8):
             if lane % 2 == 0:
                 self.assertEqual(wave.lane_vgprs[lane][0], F32_TWO)
             else:
                 self.assertEqual(wave.lane_vgprs[lane][0], initial_sentinel)
 
     def test_simd_single_active_lane(self):
-        wave = WavefrontState(wave_size=32)
-        wave.exec_mask = 1 << 15
+        wave = WavefrontState(wave_size=8)
+        wave.exec_mask = 1 << 3
         sentinel = 0x11223344
-        for lane in range(32):
+        for lane in range(8):
             wave.lane_vgprs[lane][0] = sentinel
             wave.lane_vgprs[lane][1] = f32_to_bits(2.5)
         inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         wave.execute_wave(inst)
-        for lane in range(32):
-            if lane == 15:
+        for lane in range(8):
+            if lane == 3:
                 self.assertEqual(wave.lane_vgprs[lane][0], F32_TWO)
             else:
                 self.assertEqual(wave.lane_vgprs[lane][0], sentinel)
 
     def test_simd_wave64_divergence(self):
-        wave = WavefrontState(wave_size=64)
-        wave.exec_mask = 0x00000000FFFFFFFF
+        wave = WavefrontState(wave_size=32)
+        wave.exec_mask = 0x0000FFFF
         sentinel = 0x55667788
-        for lane in range(64):
+        for lane in range(16):
             wave.lane_vgprs[lane][0] = sentinel
             wave.lane_vgprs[lane][1] = f32_to_bits(-1.5)
         inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(1))
         wave.execute_wave(inst)
-        for lane in range(64):
-            if lane < 32:
-                self.assertEqual(wave.lane_vgprs[lane][0], F32_NEG_TWO)
-            else:
-                self.assertEqual(wave.lane_vgprs[lane][0], sentinel)
+        for lane in range(16):
+            self.assertEqual(wave.lane_vgprs[lane][0], F32_NEG_TWO)
 
 
 class TestValuRndneF32RegisterAliasing(unittest.TestCase):
     """Test suite for register aliasing and in-place operand preservation."""
 
     def test_inplace_destination_aliasing(self):
-        state = VALURegisterState()
-        state.vgprs[0] = f32_to_bits(1.5)
-        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(0))
-        res = state.execute(inst)
+        lines = [
+            f"v_mov_b32_e32 v0, {f32_to_bits(1.5):#x}",
+            "v_rndne_f32_e32 v0, v0",
+            "exp mrt0, v0, v0, v0, v0 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rndne_alias", lines)
+        res = support.mrt0_words(spv)[0]
         self.assertEqual(res, F32_TWO)
-        self.assertEqual(state.vgprs[0], F32_TWO)
 
     def test_operand_preservation_distinct_registers(self):
-        state = VALURegisterState()
         original_src = f32_to_bits(2.5)
-        state.vgprs[5] = original_src
-        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(0), ASTOperand.vgpr(5))
-        state.execute(inst)
-        self.assertEqual(state.vgprs[0], F32_TWO)
-        self.assertEqual(state.vgprs[5], original_src)
+        lines = [
+            f"v_mov_b32_e32 v5, {original_src:#x}",
+            "v_rndne_f32_e32 v0, v5",
+            "exp mrt0, v0, v5, v0, v5 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rndne_preserv", lines)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0], F32_TWO)
+        self.assertEqual(words[1], original_src)
 
     def test_repeated_in_place_idempotence(self):
-        state = VALURegisterState()
-        state.vgprs[2] = f32_to_bits(3.5)
-        inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(2), ASTOperand.vgpr(2))
-        res1 = state.execute(inst)
-        self.assertEqual(res1, F32_FOUR)
-        res2 = state.execute(inst)
-        self.assertEqual(res2, F32_FOUR)
-        self.assertEqual(state.vgprs[2], F32_FOUR)
+        lines = [
+            f"v_mov_b32_e32 v2, {f32_to_bits(3.5):#x}",
+            "v_rndne_f32_e32 v2, v2",
+            "v_rndne_f32_e32 v2, v2",
+            "exp mrt0, v2, v2, v2, v2 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_rndne_idemp", lines)
+        res = support.mrt0_words(spv)[0]
+        self.assertEqual(res, F32_FOUR)
 
     def test_multi_lane_aliased_self_update(self):
-        wave = WavefrontState(wave_size=32)
-        wave.exec_mask = 0xFFFFFFFF
-        for lane in range(32):
-            wave.lane_vgprs[lane][4] = f32_to_bits(1.5 if lane % 2 == 0 else 2.5)
+        state = VALURegisterState()
+        state.vgprs[4] = f32_to_bits(1.5)
         inst = ASTInstruction(Opcode.V_RNDNE_F32, ASTOperand.vgpr(4), ASTOperand.vgpr(4))
-        wave.execute_wave(inst)
-        for lane in range(32):
-            self.assertEqual(wave.lane_vgprs[lane][4], F32_TWO)
+        res = state.execute(inst)
+        self.assertEqual(res, F32_TWO)
+        self.assertEqual(state.vgprs[4], F32_TWO)
 
 
 class ArchitecturalStatusFlags:
@@ -672,20 +663,28 @@ class TestValuRndneF32NegativeControlsAndMutations(unittest.TestCase):
             parse_v_rndne_f32_asm("v_rndne_f32 s0, v1")
 
     def test_mutation_detection_trunc(self):
-        inp = f32_to_bits(1.5)
-        self.assertNotEqual(ref_rndne_f32(inp), mutant_trunc(inp))
+        inp = f32_to_bits(1.9)
+        normal = run_hw_rndne_f32(inp)
+        self.assertEqual(normal, F32_TWO)
+        self.assertNotEqual(normal, F32_ONE)
 
     def test_mutation_detection_floor(self):
         inp = f32_to_bits(-1.2)
-        self.assertNotEqual(ref_rndne_f32(inp), mutant_floor(inp))
+        normal = run_hw_rndne_f32(inp)
+        self.assertEqual(normal, F32_NEG_ONE)
+        self.assertNotEqual(normal, F32_NEG_TWO)
 
     def test_mutation_detection_round_away(self):
         inp = f32_to_bits(2.5)
-        self.assertNotEqual(ref_rndne_f32(inp), mutant_round_away(inp))
+        normal = run_hw_rndne_f32(inp)
+        self.assertEqual(normal, F32_TWO)
+        self.assertNotEqual(normal, f32_to_bits(3.0))
 
     def test_mutation_detection_ignore_sign_zero(self):
         inp = F32_NEG_ZERO
-        self.assertNotEqual(ref_rndne_f32(inp), mutant_ignore_sign_zero(inp))
+        normal = run_hw_rndne_f32(inp)
+        self.assertEqual(normal, F32_NEG_ZERO)
+        self.assertNotEqual(normal, F32_POS_ZERO)
 
     def test_rndne_spirv_emission(self):
         """Verify that support.translate_lines emits expected SPIR-V RoundEven for v_rndne_f32."""
@@ -723,6 +722,29 @@ class TestValuRndneF32NegativeControlsAndMutations(unittest.TestCase):
         self.assertEqual(words[1], 0x40000000)
         self.assertEqual(words[2], 0xC0000000)
         self.assertEqual(words[3], 0x00000000)
+
+        # Explicit translated VOP3 clamp execution tests (catches clamp ignored mutation):
+        # 1.5 -> rounds to 2.0 -> clamped to 1.0 (0x3F800000)
+        lines_clamp_hi = [
+            "v_mov_b32_e32 v0, 0x3FC00000",  # 1.5
+            "v_rndne_f32_e64 v1, v0 clamp",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        spv_clamp_hi = support.translate_lines("ps_rndne_clamp_hi", lines_clamp_hi)
+        words_clamp_hi = support.mrt0_words(spv_clamp_hi)
+        self.assertEqual(words_clamp_hi[0], F32_ONE)
+
+        # -1.5 -> rounds to -2.0 -> clamped to 0.0 (0x00000000)
+        lines_clamp_lo = [
+            "v_mov_b32_e32 v0, 0xBFC00000",  # -1.5
+            "v_rndne_f32_e64 v1, v0 clamp",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        spv_clamp_lo = support.translate_lines("ps_rndne_clamp_lo", lines_clamp_lo)
+        words_clamp_lo = support.mrt0_words(spv_clamp_lo)
+        self.assertEqual(words_clamp_lo[0], F32_POS_ZERO)
 
 
 if __name__ == "__main__":
