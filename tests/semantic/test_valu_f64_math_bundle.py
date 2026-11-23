@@ -464,5 +464,17 @@ class VMaxF64OracleTests(unittest.TestCase):
         # max(NaN, x) == x
         self.assertEqual(oracle_max_f64(F64_QNAN, f64_to_u64(5.0)), f64_to_u64(5.0))
 
+class VMaxF64AstInterpreterTests(unittest.TestCase):
+    def test_max_ast_construction(self):
+        ast = Instruction64AST("v_max_f64", Operand64(RegKind.VGPR_PAIR, 4), Operand64(RegKind.VGPR_PAIR, 0), Operand64(RegKind.VGPR_PAIR, 2))
+        self.assertEqual(ast.mnemonic, "v_max_f64")
+
+    def test_max_scalar_execution(self):
+        wave = SimdWaveState64(lane_count=1)
+        wave.set_f64(0, 0, f64_to_u64(100.0))
+        wave.set_f64(0, 2, f64_to_u64(50.0))
+        wave.set_f64(0, 4, oracle_max_f64(wave.get_f64(0, 0), wave.get_f64(0, 2)))
+        self.assertEqual(wave.get_f64(0, 4), f64_to_u64(100.0))
+
 if __name__ == "__main__":
     unittest.main()
