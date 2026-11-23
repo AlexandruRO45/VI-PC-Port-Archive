@@ -194,7 +194,7 @@ def vulkan_matrix():
                 if idx not in seen_gpus:
                     seen_gpus.add(idx)
                     run(["vulkaninfo", f"-j={idx}"], cwd=d)
-        files = sorted(glob.glob(os.path.join(d, "VP_VULKANINFO_*.json")))
+        files = sorted(glob.glob(os.path.join(glob.escape(d), "VP_VULKANINFO_*.json")))
 
         for path in files:
             try:

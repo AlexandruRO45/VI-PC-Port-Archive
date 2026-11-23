@@ -30,7 +30,8 @@ def report():
 class VulkanMatrixTests(unittest.TestCase):
     def probe(self, document, returncode=0):
         def run(cmd, cwd):
-            Path(cwd, "VP_VULKANINFO_Example.json").write_text(json.dumps(document), encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_Example.json").write_text(
+                json.dumps(document), encoding="utf-8", newline="\n")
             return subprocess.CompletedProcess(cmd, returncode)
 
         with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"):
@@ -65,6 +66,13 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertIsNone(matrix["subgroup"]["size"])
         self.assertIsNone(matrix["subgroup_size_control"]["subgroupSizeControl"])
         self.assertIsNone(matrix["storageInputOutput16"])
+
+    def test_profile_discovery_under_a_temp_path_with_brackets(self):
+        with tempfile.TemporaryDirectory(prefix="atlas[profiles]-") as root:
+            with patch.object(tempfile, "tempdir", root):
+                matrix = self.probe(report())
+        self.assertEqual(matrix["vulkaninfo"], "ok")
+        self.assertEqual(matrix["device"], {"name": "Example GPU", "driver": 7, "api": 42})
 
     def test_failed_subprocess_discards_even_a_valid_report(self):
         self.assert_unknown(self.probe(report(), returncode=1))
