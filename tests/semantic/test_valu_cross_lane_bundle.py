@@ -229,6 +229,25 @@ class TestWriteLaneAST(unittest.TestCase):
         self.assertIn("OpSelect", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestWriteLaneExecIndependence(unittest.TestCase):
+    def test_modulo_and_exec_independence(self):
+        lanes = [0] * 64
+        out = model_writelane(lanes, 777, 68)
+        self.assertEqual(out[4], 777)
+
+    def test_translator_writelane_exec_independence(self):
+        prog = [
+            "s_mov_b32 exec_lo, 0x00000000",
+            "s_mov_b32 exec_hi, 0x00000000",
+            "s_mov_b32 s1, 777",
+            "s_mov_b32 s2, 4",
+            "v_writelane_b32 v0, s1, s2",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("cs_wl_exec_ind", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpSelect", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
