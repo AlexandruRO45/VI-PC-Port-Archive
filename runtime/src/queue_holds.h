@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -63,12 +64,11 @@ public:
             std::lock_guard lock(mutex_);
             fences_.erase(semaphore);
         }
-        if (held_.load(std::memory_order_acquire) == 0 || in_pump()) return;
+        if (held_.load(std::memory_order_acquire) == 0 || is_pump_owner()) return;
         {
             std::lock_guard pump(pump_mutex_);
-            in_pump() = true;  // what is dropped may release other fences: they must not wait for this lock
+            const PumpOwnerGuard owner(*this);  // what is dropped may release other fences: they must not wait for this lock
             for (Holder* holder : snapshot()) holder->discard_waiting_on(semaphore);
-            in_pump() = false;
         }
         pump_ready();
     }
@@ -161,20 +161,21 @@ public:
     void pump_ready() {
         if (!any_held() && barrier_count_.load(std::memory_order_acquire) == 0) return;
         dirty_.store(true, std::memory_order_release);
-        if (in_pump()) return;  // a release on this thread submitted a Signal: the running pass will go again
+        if (is_pump_owner()) return;  // a release on this thread submitted a Signal: the running pass will go again
         for (;;) {
             std::unique_lock pump(pump_mutex_, std::try_to_lock);
             if (!pump) return;  // another thread is releasing and will see dirty_
-            in_pump() = true;
-            while (dirty_.exchange(false, std::memory_order_acq_rel)) {
-                bool progress = true;
-                while (progress) {
-                    progress = false;
-                    for (Holder* holder : snapshot()) progress |= holder->release_ready();
+            {
+                const PumpOwnerGuard owner(*this);
+                while (dirty_.exchange(false, std::memory_order_acq_rel)) {
+                    bool progress = true;
+                    while (progress) {
+                        progress = false;
+                        for (Holder* holder : snapshot()) progress |= holder->release_ready();
+                    }
+                    run_barriers();
                 }
-                run_barriers();
             }
-            in_pump() = false;
             pump.unlock();
             if (!dirty_.load(std::memory_order_acquire)) return;
         }
@@ -187,10 +188,24 @@ private:
         std::function<void()> fn;
     };
 
-    static bool& in_pump() {
-        static thread_local bool pumping = false;
-        return pumping;
+    // Per-instance pump ownership instead of thread_local: a mapped guest executable can own static TLS slot 0
+    // (TEB->ThreadLocalStoragePointer[0]), so host thread_local would read/corrupt guest TLS on title threads, and
+    // per-instance state also keeps re-entrant pumping on two QueueHolds objects independent.
+    bool is_pump_owner() const noexcept {
+        return pump_owner_.load(std::memory_order_acquire) == std::this_thread::get_id();
     }
+
+    struct PumpOwnerGuard {
+        QueueHolds& self;
+        explicit PumpOwnerGuard(QueueHolds& q) noexcept : self(q) {
+            self.pump_owner_.store(std::this_thread::get_id(), std::memory_order_release);
+        }
+        ~PumpOwnerGuard() noexcept {
+            self.pump_owner_.store(std::thread::id{}, std::memory_order_release);
+        }
+        PumpOwnerGuard(const PumpOwnerGuard&) = delete;
+        PumpOwnerGuard& operator=(const PumpOwnerGuard&) = delete;
+    };
 
     std::vector<Holder*> snapshot() const {
         std::lock_guard lock(mutex_);
@@ -230,6 +245,7 @@ private:
     std::atomic<std::int64_t> barrier_count_{0};
     std::atomic<std::uint64_t> seq_{0};
     std::atomic<bool> dirty_{false};
+    std::atomic<std::thread::id> pump_owner_{};
 };
 
 }  // namespace leonida
