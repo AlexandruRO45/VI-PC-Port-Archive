@@ -54,6 +54,35 @@ Buffer make(vktest::Device& gpu, std::size_t bytes, bool device_local = false) {
     return b;
 }
 
+// One host-visible VkBuffer from which BLAS destinations are suballocated, matching the D3D12 layer's arena.
+// Separate VkBuffer allocations can land in driver VA pools more than 2^40 bytes apart (measured on Intel Arc A770,
+// driver 32.0.101.9150: <64 KiB buffers at 0xffffb802... vs >=64 KiB buffers at 0xffff8004..., 61.5 TiB apart),
+// which no single 40-bit TLAS bias window can span.
+struct BlasArena {
+    Buffer backing;
+    std::size_t capacity = 0;
+    std::size_t cursor = 0;
+
+    bool init(vktest::Device& gpu, std::size_t bytes) {
+        backing = make(gpu, bytes);
+        capacity = backing.buffer ? bytes : 0;
+        cursor = 0;
+        return backing.buffer != VK_NULL_HANDLE;
+    }
+
+    Buffer alloc(std::size_t bytes) {
+        const std::size_t size = bytes ? bytes : 4;
+        const std::size_t aligned = (cursor + 255) & ~std::size_t(255);
+        if (!backing.buffer || aligned > capacity || size > capacity - aligned) return {};
+        cursor = aligned + size;
+        Buffer b;
+        b.buffer = backing.buffer;
+        b.map = static_cast<char*>(backing.map) + aligned;
+        b.address = backing.address + aligned;
+        return b;
+    }
+};
+
 void barrier_to_host(vktest::Device& gpu, VkCommandBuffer cb) {
     VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -136,7 +165,7 @@ struct Built {
 // `into_other` into a second buffer, in which case the untouched source is written too, as <name>_source.
 // `box16`: BOX16 inner nodes. `pair`: TRI1 pairing; the case's JSON then asks check-build for at least one TRI1
 // node, or with `expect_no_pairs` for none.
-int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir, const std::string& name,
+int build_blas(vktest::Device& gpu, BlasArena& arena, XdxrBuilder& builder, const std::string& dir, const std::string& name,
                const std::vector<Geometry>& geometries, Built& built, unsigned rays = 0,
                const std::vector<Geometry>* moved = nullptr, bool into_other = false, bool box16 = false,
                bool pair = false, bool expect_no_pairs = false) {
@@ -182,7 +211,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     }
     XdxrLayout layout;
     EXPECT(layout.compute(total, false, box16));
-    Buffer dst = make(gpu, layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
+    Buffer dst = arena.alloc(layout.size + 256), scratch = make(gpu, std::size_t(layout.scratch));
     EXPECT(dst.buffer && scratch.buffer);
     const std::uint64_t base = (dst.address + 255) & ~std::uint64_t(255);   // 256-byte aligned, as D3D12 requires
     bool recorded = false;
@@ -220,7 +249,7 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         std::memcpy(vertex_buffers[g].map, (*moved)[g].vertex_data.data(), (*moved)[g].vertex_data.size() * 4);
         expand((*moved)[g], std::uint32_t(g), moved_tris);
     }
-    Buffer other = into_other ? make(gpu, layout.size + 256) : Buffer{};
+    Buffer other = into_other ? arena.alloc(layout.size + 256) : Buffer{};
     const std::uint64_t target = into_other ? (other.address + 255) & ~std::uint64_t(255) : base;
     EXPECT(!into_other || other.buffer);
     EXPECT(gpu.run([&](VkCommandBuffer cb) {
@@ -332,26 +361,28 @@ int main(int argc, char** argv) {
         return g;
     };
 
+    BlasArena blas_arena;
+    EXPECT(blas_arena.init(gpu, 16u * 1024u * 1024u));
     Built one, five, random, grid16, xy32, moved, multi, empty;
-    if (build_blas(gpu, builder, dir, "blas_one", {soup(1)}, one)) return 1;
-    if (build_blas(gpu, builder, dir, "blas_five", {soup(5)}, five)) return 1;
-    if (build_blas(gpu, builder, dir, "blas_random", {soup(1000)}, random)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_one", {soup(1)}, one)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_five", {soup(5)}, five)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_random", {soup(1000)}, random)) return 1;
     Geometry g16 = grid(12, 4, false);
     g16.u16 = true;
-    if (build_blas(gpu, builder, dir, "blas_grid_u16_stride16", {g16}, grid16)) return 1;
-    if (build_blas(gpu, builder, dir, "blas_grid_u32_xy", {grid(9, 2, true)}, xy32)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_grid_u16_stride16", {g16}, grid16)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_grid_u32_xy", {grid(9, 2, true)}, xy32)) return 1;
     Geometry gt = grid(6, 3, false);
     gt.transform = true;
     const float m[12] = {0, 2, 0, 1, 0, 0, 1, -2, 2, 0, 0, 3};   // exact in float: permute, scale by 2, translate
     std::memcpy(gt.m, m, sizeof m);
-    if (build_blas(gpu, builder, dir, "blas_transform", {gt}, moved)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_transform", {gt}, moved)) return 1;
     Geometry a = soup(40), b = soup(25);
     b.vertex_data[3 * 3 * 7] = std::nanf("");                    // triangle 7 of geometry 1: inactive
-    if (build_blas(gpu, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
-    if (build_blas(gpu, builder, dir, "blas_empty", {}, empty)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_two_geometries", {a, b}, multi)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_empty", {}, empty)) return 1;
     // many radix-sort tiles (RADIX_TILE elements each), the last one partial (fewer rays: the brute force is slow)
     Built tiles;
-    if (build_blas(gpu, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
+    if (build_blas(gpu, blas_arena, builder, dir, "blas_three_sort_tiles", {soup(5000)}, tiles, 200)) return 1;
 
     // Updates. Every triangle moves (its own offset, and a stretch), so each box changes; the tree is kept.
     auto move = [&](Geometry g, float amount) {
@@ -369,21 +400,21 @@ int main(int argc, char** argv) {
         Built refitted;
         const Geometry big = soup(3000);                    // the radix-sort path
         const std::vector<Geometry> after = {move(big, 1.5f)};
-        if (build_blas(gpu, builder, dir, "blas_refit_in_place", {big}, refitted, 300, &after)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_refit_in_place", {big}, refitted, 300, &after)) return 1;
         Built copied;
         const Geometry g = grid(12, 4, false);              // R32 indices, stride 16; the small-sort path
         const std::vector<Geometry> after_grid = {move(g, 0.3f)};
-        if (build_blas(gpu, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_refit_into_other", {g}, copied, 0, &after_grid, true)) return 1;
     }
 
     // BOX16 inner nodes: the same tree with half boxes rounded outward (64-byte nodes instead of 128).
     {
         Built h0, h1, h2, h3, h4;                          // build_blas appends to a Built's triangles
-        if (build_blas(gpu, builder, dir, "blas_box16_random", {soup(1000)}, h0, 0, nullptr, false, true)) return 1;
-        if (build_blas(gpu, builder, dir, "blas_box16_sort_tiles", {soup(5000)}, h1, 200, nullptr, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_box16_random", {soup(1000)}, h0, 0, nullptr, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_box16_sort_tiles", {soup(5000)}, h1, 200, nullptr, false, true)) return 1;
         Geometry a16 = soup(40), b16 = soup(25);
         b16.vertex_data[3 * 3 * 3] = std::nanf("");                // an inactive triangle: an empty box
-        if (build_blas(gpu, builder, dir, "blas_box16_two_geometries", {a16, b16}, h2, 0, nullptr, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_box16_two_geometries", {a16, b16}, h2, 0, nullptr, false, true)) return 1;
         // Coordinates the half format cannot hold: past 65504 (inf outward, HALF_MAX inward), between 2^-14 and
         // 2^-24 and below (no denormal halves: 0 or +-2^-14), exact halves, and ordinary triangles the rays hit.
         Geometry x = soup(24);
@@ -397,10 +428,10 @@ int main(int argc, char** argv) {
         };
         for (const auto& t : odd) x.vertex_data.insert(x.vertex_data.end(), t, t + 9);
         x.triangle_count += sizeof odd / sizeof odd[0];
-        if (build_blas(gpu, builder, dir, "blas_box16_extremes", {x}, h3, 0, nullptr, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_box16_extremes", {x}, h3, 0, nullptr, false, true)) return 1;
         const Geometry big = soup(3000);
         const std::vector<Geometry> after = {move(big, 1.5f)};
-        if (build_blas(gpu, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_box16_refit_in_place", {big}, h4, 300, &after, false, true)) return 1;
     }
 
     // TRI1 pairing: the same tree, with sibling triangles that share an edge in one leaf.
@@ -408,14 +439,14 @@ int main(int argc, char** argv) {
         Built p0, p1, p2, p3, p4;
         Geometry pg = grid(12, 4, false);
         pg.u16 = true;
-        if (build_blas(gpu, builder, dir, "blas_paired_grid", {pg}, p0, 0, nullptr, false, false, true)) return 1;
-        if (build_blas(gpu, builder, dir, "blas_paired_grid_box16", {grid(9, 2, true)}, p1, 0, nullptr, false, true,
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_grid", {pg}, p0, 0, nullptr, false, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_grid_box16", {grid(9, 2, true)}, p1, 0, nullptr, false, true,
                        true))
             return 1;
         Geometry ptf = grid(6, 3, false);
         ptf.transform = true;
         std::memcpy(ptf.m, m, sizeof m);
-        if (build_blas(gpu, builder, dir, "blas_paired_transform", {ptf}, p2, 0, nullptr, false, false, true)) return 1;
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_transform", {ptf}, p2, 0, nullptr, false, false, true)) return 1;
         // A grid with a NaN vertex (its triangles are inactive); quads split across two geometries (each edge shared
         // the right way, but a leaf holds one geometry, so a pair would report the wrong one); and triangle pairs that
         // share an edge in the same direction (mirrored winding: not a valid pair).
@@ -441,15 +472,15 @@ int main(int argc, char** argv) {
         }
         cross_a.triangle_count = cross_b.triangle_count = 16;
         same_dir.triangle_count = 32;
-        if (build_blas(gpu, builder, dir, "blas_paired_mixed", {holed, cross_a, cross_b, same_dir}, p3, 0, nullptr,
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_mixed", {holed, cross_a, cross_b, same_dir}, p3, 0, nullptr,
                        false, false, true))
             return 1;
         // on their own, so that the triangles that must not pair are siblings: no TRI1 at all
         Built q0, q1;
-        if (build_blas(gpu, builder, dir, "blas_unpaired_geometries", {cross_a, cross_b}, q0, 0, nullptr, false, false,
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_unpaired_geometries", {cross_a, cross_b}, q0, 0, nullptr, false, false,
                        true, true))
             return 1;
-        if (build_blas(gpu, builder, dir, "blas_unpaired_same_direction", {same_dir}, q1, 0, nullptr, false, false,
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_unpaired_same_direction", {same_dir}, q1, 0, nullptr, false, false,
                        true, true))
             return 1;
         // Every triangle of a grid starts at another of its vertices (the same winding), so pairs come in all nine
@@ -462,10 +493,10 @@ int main(int argc, char** argv) {
             for (std::uint32_t k = 0; k < 3; ++k) rotated.indices[t + k] = v[(k + r) % 3];
         }
         Built p5;
-        if (build_blas(gpu, builder, dir, "blas_paired_rotations", {rotated}, p5, 0, nullptr, false, false, true))
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_rotations", {rotated}, p5, 0, nullptr, false, false, true))
             return 1;
         // 7,200 triangles: the radix-sort path
-        if (build_blas(gpu, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,
+        if (build_blas(gpu, blas_arena, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,
                        false, true))
             return 1;
     }
