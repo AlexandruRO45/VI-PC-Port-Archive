@@ -211,23 +211,34 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(failed)
         self.assertEqual(len(self.calls), 1)
 
-    def test_the_retries_stop(self):
-        all_names = [f"m{i}" for i in range(20)]
+    def test_more_crashers_than_retries_in_one_range_are_all_skipped(self):
+        all_names = [f"m{i:02d}" for i in range(20)]
+        crashers = all_names[:12]
         with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump({name: {} for name in all_names}, f)
-        names = iter(all_names)
+
         def script(args, n):
             if self.is_probe(args):
-                self.inflight_is(sorted(all_names)[int(args[args.index("--start") + 1])])
-                return ABORT
-            self.inflight_is(next(names))
+                name = sorted(all_names)[int(args[args.index("--start") + 1])]
+                self.inflight_is(name)
+                return ABORT if name in crashers else 0
+            skipped = set()
+            if self.skipped(args):
+                with open(self.skipped(args), encoding="utf-8") as f:
+                    skipped = set(f.read().split())
+            left = [c for c in crashers if c not in skipped]
+            if not left:
+                return 1
+            self.inflight_is(left[0])
             return ABORT
-        err = io.StringIO()
-        with mock.patch("sys.stderr", err):
-            failed, _ = self.stage(script)
-        self.assertIsNotNone(failed)
-        self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), make_game.PIPELINE_CRASH_RETRIES + 1)
-        self.assertIn("still crashed after", err.getvalue())
+        with mock.patch("sys.stderr", io.StringIO()):
+            failed, logs = self.stage(script)
+        self.assertIsNotNone(failed)   # exit 1: the skipped modules count as failed
+        self.assertGreater(len(crashers), make_game.PIPELINE_CRASH_RETRIES)
+        with open(self.skip, encoding="utf-8") as f:
+            self.assertEqual(f.read().split(), crashers)
+        self.assertEqual(len([c for c in self.calls if not self.is_probe(c)]), len(crashers) + 1)
+        self.assertFalse(any("still crashed after" in m for m in logs))
 
     def test_a_clean_run_is_one_call_and_an_old_skip_list_is_dropped(self):
         os.makedirs(self.out)

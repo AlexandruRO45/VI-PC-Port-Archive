@@ -1958,7 +1958,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     def check_range(start: int = 0, count: "int | None" = None) -> int:
         selection = ["--start", str(start), "--count", str(count)] if count is not None else []
         allowed = set(names[start:start + count]) if count is not None else None
-        for _ in range(PIPELINE_CRASH_RETRIES + 1):
+        # Every restart below skips at least one more module that crashed alone, so a range needs at most one per
+        # module in it; one driver can hold dozens in a batch (AMD's RDNA1/RDNA2 Windows driver on the ped shaders).
+        retries = max(PIPELINE_CRASH_RETRIES, count or 0)
+        for _ in range(retries + 1):
             drop(inflight)   # a crash during setup must not inherit another process's in-flight module names
             code = run(base + selection + (["--skip-file", skip] if crashed else []), check=False)
             # Native setup failures also return 1. A finished pass writes/clears this report even when shaders
@@ -1993,7 +1996,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
-        fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
+        fail(f"vk_pipeline_check still crashed after {retries} retries; modules that took it down: "
              + ", ".join(crashed))
 
     code = 0
@@ -2017,8 +2020,9 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     log("pipelines: done")
 
 
-# How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
-# 10 minutes since the last cache checkpoint, plus loading the cache).
+# How many times the pipelines stage restarts vk_pipeline_check after a module takes it down, at least (a range may
+# restart once per module in it, since each restart skips one more; each costs at most the 10 minutes since the last
+# cache checkpoint, plus loading the cache).
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
 
