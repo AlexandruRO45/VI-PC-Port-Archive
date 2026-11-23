@@ -427,6 +427,7 @@ private:
             const char c = text_[pos_++];
             if (c == '"') return true;
             if (c != '\\') {
+                if (static_cast<unsigned char>(c) < 0x20) return false;  // JSON controls must be escaped.
                 out.push_back(c);
                 continue;
             }

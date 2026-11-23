@@ -19,6 +19,18 @@ void check(bool ok, const char* what) {
     }
 }
 
+void test_string_controls() {
+    leonida::mods::Mod mod;
+    std::string error;
+    for (char control : {'\n', '\0'}) {
+        const std::string text = std::string("{\"name\":\"a") + control + "b\"}";
+        check(!leonida::mods::parse_mod(text, "m", mod, error) && error == "mod.json is not a JSON object",
+              "an unescaped control character makes the manifest invalid");
+    }
+    check(leonida::mods::parse_mod(R"({"name":"a\nb"})", "m", mod, error) && mod.name == "a\nb",
+          "an escaped newline remains valid in a mod name");
+}
+
 void write(const std::filesystem::path& p, const std::string& text) {
     std::filesystem::create_directories(p.parent_path());
     std::ofstream(p, std::ios::binary) << text;
@@ -28,6 +40,7 @@ void write(const std::filesystem::path& p, const std::string& text) {
 
 int main() {
     using namespace leonida::mods;
+    test_string_controls();
 
     // The model ids docs/character_skeleton.md measured in the packs tables are the joaat of their names.
     static_assert(joaat("player_story000_00") == 0xE472B687u, "Lucia's player model id");

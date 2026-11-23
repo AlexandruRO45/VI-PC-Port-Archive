@@ -23,6 +23,34 @@ namespace {
 
 std::vector<std::uint8_t> bytes(const std::string& s) { return {s.begin(), s.end()}; }
 
+int test_json_string_controls() {
+    using namespace leonida;
+    // RFC 8259 section 7: U+0000..U+001F must be escaped in both keys and values.
+    for (unsigned c = 0; c < 0x20; ++c) {
+        const std::string decoded = std::string("a") + static_cast<char>(c) + "b";
+        const std::string raw = "\"" + decoded + "\"";
+        for (const auto& text : {raw, "[" + raw + "]", "{" + raw + ":0}", "{\"name\":" + raw + "}"}) {
+            Json result;
+            CHECK(!JsonReader(text).parse(result));
+        }
+        char escaped[16];
+        std::snprintf(escaped, sizeof(escaped), "\"a\\u%04xb\"", c);
+        Json value, key;
+        CHECK(JsonReader(escaped).parse(value) && value.string == decoded);
+        CHECK(JsonReader("{" + std::string(escaped) + ":0}").parse(key) && key.find(decoded));
+    }
+    Json escaped;
+    CHECK(JsonReader(R"("\b\f\n\r\t")").parse(escaped) && escaped.string == "\b\f\n\r\t");
+    // The byte check must be unsigned: valid UTF-8 bytes can be negative as plain char.
+    const std::string utf8 = "space \x7f \xc3\xa9 \xf0\x9f\x98\x80";
+    Json text;
+    CHECK(JsonReader("\"" + utf8 + "\"").parse(text) && text.string == utf8);
+    Json whitespace;
+    CHECK(JsonReader(" \t\r\n{\n\"name\"\t:\r\"ok\"\n}\t").parse(whitespace));
+    CHECK(whitespace.find("name") && whitespace.find("name")->string == "ok");
+    return 0;
+}
+
 // The dynamic-Huffman sample: an LCG over a skewed alphabet (the same generator produced `dynamic` below).
 std::vector<std::uint8_t> skewed(std::size_t n) {
     static constexpr char alphabet[] = "eeeeettaaoinshrdlu";
@@ -251,6 +279,7 @@ int fspx_checks() {
 }  // namespace
 
 int main() {
+    CHECK(test_json_string_controls() == 0);
     using namespace leonida;
 
     // Test the shared file reader without passing malformed bytes to a driver.
