@@ -89,5 +89,92 @@ class TestVSinF32Reference(unittest.TestCase):
         self.assertTrue(math.isnan(ref_sin_f32(float("-inf"))))
 
 
+class RegType(enum.Enum):
+    VGPR = "v"
+    SGPR = "s"
+    IMM = "imm"
+
+
+@dataclasses.dataclass(frozen=True)
+class Operand:
+    reg_type: RegType
+    index_or_val: int | float
+
+    @classmethod
+    def vgpr(cls, idx: int) -> Operand:
+        if not (0 <= idx < 256):
+            raise ValueError(f"VGPR index out of range: {idx}")
+        return cls(RegType.VGPR, idx)
+
+    @classmethod
+    def sgpr(cls, idx: int) -> Operand:
+        if not (0 <= idx < 106):
+            raise ValueError(f"SGPR index out of range: {idx}")
+        return cls(RegType.SGPR, idx)
+
+    @classmethod
+    def imm_f32(cls, val: float) -> Operand:
+        return cls(RegType.IMM, float(val))
+
+
+@dataclasses.dataclass
+class Instruction:
+    opcode: str
+    dst: Operand
+    src0: Operand
+
+
+class ScalarState:
+    def __init__(self) -> None:
+        self.vgprs: dict[int, int] = {i: 0 for i in range(256)}
+        self.sgprs: dict[int, int] = {i: 0 for i in range(106)}
+
+    def read_operand_f32(self, op: Operand) -> float:
+        if op.reg_type == RegType.IMM:
+            return float(op.index_or_val)
+        elif op.reg_type == RegType.VGPR:
+            return bits_to_f32(self.vgprs[int(op.index_or_val)])
+        elif op.reg_type == RegType.SGPR:
+            return bits_to_f32(self.sgprs[int(op.index_or_val)])
+        raise ValueError(f"Unknown operand type: {op.reg_type}")
+
+    def write_vgpr_f32(self, idx: int, val: float) -> None:
+        self.vgprs[idx] = f32_to_bits(val)
+
+def step_scalar_sin_f32(state: ScalarState, instr: Instruction) -> None:
+    if instr.opcode != "v_sin_f32":
+        raise ValueError(f"Unexpected opcode: {instr.opcode}")
+    val = state.read_operand_f32(instr.src0)
+    res = ref_sin_f32(val)
+    state.write_vgpr_f32(int(instr.dst.index_or_val), res)
+
+
+class TestVSinF32ASTInterpreter(unittest.TestCase):
+    """AST opcode definitions and scalar interpreter for v_sin_f32."""
+
+    def test_ast_construction_and_operand_bounds(self):
+        instr = Instruction("v_sin_f32", Operand.vgpr(5), Operand.vgpr(10))
+        self.assertEqual(instr.opcode, "v_sin_f32")
+        self.assertEqual(instr.dst.index_or_val, 5)
+        self.assertEqual(instr.src0.index_or_val, 10)
+        with self.assertRaises(ValueError):
+            Operand.vgpr(256)
+        with self.assertRaises(ValueError):
+            Operand.sgpr(106)
+
+    def test_scalar_interpreter_execution(self):
+        state = ScalarState()
+        state.write_vgpr_f32(1, 0.25)
+        instr = Instruction("v_sin_f32", Operand.vgpr(0), Operand.vgpr(1))
+        step_scalar_sin_f32(state, instr)
+        self.assertAlmostEqual(bits_to_f32(state.vgprs[0]), 1.0, places=6)
+
+    def test_scalar_interpreter_imm_source(self):
+        state = ScalarState()
+        instr = Instruction("v_sin_f32", Operand.vgpr(2), Operand.imm_f32(-0.25))
+        step_scalar_sin_f32(state, instr)
+        self.assertAlmostEqual(bits_to_f32(state.vgprs[2]), -1.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
