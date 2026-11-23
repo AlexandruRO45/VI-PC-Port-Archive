@@ -1813,11 +1813,11 @@ The trace will enumerate them.
   heap's estimated usage, budget and size at device start, at power-of-two successful `VkDeviceMemory` allocation
   counts, and after an allocation failure. These driver estimates can change with other GPU activity; the report
   is diagnostic only and does not evict or stream resources.
-- **Sampled texture placement under memory pressure.** For ordinary single-sample 2D sampled textures on committed
-  default heaps, the layer consults the budget when the driver offers both device-local and host-visible system
-  memory for the image. If the allocation would exceed every compatible device-local heap's budget, the layer
-  tries eligible system-memory types with enough headroom first. The budget is an estimate, so the allocation
-  can still fall back to other valid types if the driver rejects the preferred type.
+- **Sampled texture placement under memory pressure.** For ordinary single-sample 2D textures and 2D arrays
+  created for sampling on committed default heaps, the layer consults the budget when the driver offers both
+  device-local and host-visible system memory for the image. If the allocation would exceed every compatible
+  device-local heap's budget, the layer tries eligible system-memory types with enough headroom first. The budget
+  is an estimate, so the allocation can still fall back to other valid types if the driver rejects the preferred type.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the

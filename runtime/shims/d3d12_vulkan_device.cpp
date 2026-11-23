@@ -1173,7 +1173,7 @@ struct DeviceState {
                     report_memory_budget("allocation milestone", 0, allocations);
                 if ((preferred & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
                     !(memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-                    const std::string msg = "resource allocation spilled from DEVICE_LOCAL to host memory (heap " +
+                    const std::string msg = "resource allocated in host memory with DEVICE_LOCAL preferred (heap " +
                                             std::to_string(memory.memoryTypes[i].heapIndex) + "); size in KiB:";
                     log_once(msg.c_str(), static_cast<int>(requirements.size / 1024));
                 }
