@@ -13128,6 +13128,24 @@ class Gen:
             halves.extend((lo, hi))
         return halves
 
+    def pack_b5g5r5a1(self, rgba, dmask):
+        """Pack the B5G5R5A1 storage view in increasing Vulkan bit order."""
+        word = self.cu(0)
+        for c, shift, width in ((2, 0, 5), (1, 5, 5), (0, 10, 5), (3, 15, 1)):
+            if not (dmask >> c) & 1:
+                continue
+            clamped, scaled, rounded, bits, packed = (self.tmp() for _ in range(5))
+            self.emit(f"{clamped} = OpExtInst %float %glsl NClamp {rgba[c]} {self.fconst(0.0)} {self.fconst(1.0)}")
+            self.emit(f"{scaled} = OpFMul %float {clamped} {self.fconst(float((1 << width) - 1))}")
+            self.emit(f"{rounded} = OpExtInst %float %glsl RoundEven {scaled}")
+            self.emit(f"{bits} = OpConvertFToU %uint {rounded}")
+            self.emit(f"{packed} = OpBitFieldInsert %uint {word} {bits} {self.cu(shift)} {self.cu(width)}")
+            word = packed
+        result = self.tmp()
+        zero = self.cu(0)
+        self.emit(f"{result} = OpCompositeConstruct %v4uint_st {word} {zero} {zero} {zero}")
+        return result
+
     def image_store(self, a, mods, dim):
         """image_store vData, vAddr, T#: write the dmask components to a storage image. The view is picked at run
         time from T# word1 FORMAT [28:20]: *_UINT -> uint view, *_SINT -> sint view, anything else -> float view
@@ -13204,7 +13222,8 @@ class Gen:
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
-        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
+        L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3",
+                                               "packed", "float", "norm_end")}
 
         def write(cls, texel):
             ip, img = self.tmp(), self.tmp()
@@ -13227,7 +13246,18 @@ class Gen:
         write(1, v4u)
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['f']} = OpLabel")
+        fmt, packed = self.tmp(), self.tmp()
+        self.emit(f"{fmt} = OpBitFieldUExtract %uint {t1} {self.cu(20)} {self.cu(9)}")
+        self.emit(f"{packed} = OpIEqual %bool {fmt} {self.cu(134)}")  # 1_5_5_5_UNORM
+        self.emit(f"OpSelectionMerge {L['norm_end']} None")
+        self.emit(f"OpBranchConditional {packed} {L['packed']} {L['float']}")
+        self.emit(f"{L['packed']} = OpLabel")
+        write(1, self.pack_b5g5r5a1(fv, dmask))
+        self.emit(f"OpBranch {L['norm_end']}")
+        self.emit(f"{L['float']} = OpLabel")
         write(0, v4f)
+        self.emit(f"OpBranch {L['norm_end']}")
+        self.emit(f"{L['norm_end']} = OpLabel")
         self.emit(f"OpBranch {L['e3']}")
         self.emit(f"{L['e3']} = OpLabel")
         self.emit(f"OpBranch {L['e2']}")

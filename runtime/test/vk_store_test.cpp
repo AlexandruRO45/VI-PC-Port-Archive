@@ -60,7 +60,7 @@ static void table_insert(std::vector<uint32_t>& t, const uint32_t key[8], uint32
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: vk_store_test cs.spv [load|load-d16|words|signed-zero|pack-1555]\n"); return 2; }
     gipa = load_vulkan();
     if (!gipa) return 1;
 #define LOADI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
@@ -126,6 +126,16 @@ int main(int argc, char** argv) {
     // "words" mode: the two images filled as for "load"; the shader's results are whatever it leaves in them.
     const bool words_mode = argc > 2 && !std::strcmp(argv[2], "words");
     const bool signed_zero = argc > 2 && !std::strcmp(argv[2], "signed-zero");
+    const bool pack_1555 = argc > 2 && !std::strcmp(argv[2], "pack-1555");
+    if (pack_1555) {
+        LOADI(vkGetPhysicalDeviceFormatProperties);
+        VkFormatProperties storage{};
+        vkGetPhysicalDeviceFormatProperties(pd, VK_FORMAT_R16_UINT, &storage);
+        if (!(storage.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) {
+            std::puts("unsupported: R16_UINT optimal storage images");
+            return 77;
+        }
+    }
     if (signed_zero) {
         LOADI(vkGetPhysicalDeviceProperties2);
         VkPhysicalDeviceFloatControlsProperties controls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -213,8 +223,9 @@ int main(int argc, char** argv) {
 
     // T#s exactly as the shader builds them (cs_imgstore.asm): word0 = 0x1000 * (k + 1), word1 = FORMAT << 20,
     // words 2..7 = 0x11 * (k + 1).
-    const uint32_t fmts[3] = {56, 20, 21};
-    const VkFormat compact_formats[3] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
+    const uint32_t fmts[3] = {56, pack_1555 ? 134u : 20u, 21};
+    const VkFormat compact_formats[3] = {VK_FORMAT_R8G8B8A8_UNORM,
+                                         pack_1555 ? VK_FORMAT_R16_UINT : VK_FORMAT_R32_UINT, VK_FORMAT_R32_SINT};
     const VkFormat rgba32_formats[3] = {VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32G32B32A32_UINT,
                                         VK_FORMAT_R32G32B32A32_SINT};
     const VkFormat* vkf = signed_zero ? rgba32_formats : compact_formats;
@@ -513,6 +524,23 @@ int main(int argc, char** argv) {
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     CHECK(vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE));
     CHECK(vkQueueWaitIdle(q));
+
+    if (pack_1555) {
+        // R rounds from x/8 to five bits, G is 0.25, B clamps from 2 to 1, and A is x/8.
+        // At x=4 the even midpoint rounds R up to 16 and A down to zero.
+        constexpr uint16_t expected[] = {0x011f, 0x111f, 0x211f, 0x311f, 0x411f, 0xcd1f, 0xdd1f, 0xed1f};
+        const auto* actual = static_cast<const uint16_t*>(rbp[1]);
+        unsigned bad = 0;
+        for (uint32_t i = 0; i < W * W; ++i) {
+            const uint16_t want = (i / W) % 2 ? 0xc000 : expected[i % W];
+            if (actual[i] != want) {
+                std::printf("packed texel %u: expected %04x, observed %04x\n", i, want, actual[i]);
+                ++bad;
+            }
+        }
+        std::printf("1_5_5_5_UNORM: %u/%u packed texels exact\n", W * W - bad, W * W);
+        return bad ? 1 : 0;
+    }
 
     if (signed_zero) {
         constexpr uint32_t neg = 0x80000000;

@@ -210,7 +210,9 @@ def texels(line: str) -> dict[str, list[int | None]]:
         elif op == "OpBitcast" and args[0] in consts:
             consts[res] = consts[args[0]]
         elif op == "OpCompositeConstruct" and ty in ("%v4float", "%v4uint_st", "%v4int_st"):
-            out[ty] = [src[x][1] if x in src and src[x][0] == "v" else consts.get(x) for x in args]
+            # The later packed-UNORM branch also constructs a uint texel. This
+            # test checks the ordinary float, uint and sint channel routing.
+            out.setdefault(ty, [src[x][1] if x in src and src[x][0] == "v" else consts.get(x) for x in args])
     return out
 
 
