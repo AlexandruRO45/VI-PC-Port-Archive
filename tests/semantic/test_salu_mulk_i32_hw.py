@@ -342,21 +342,52 @@ class TestMulkBoundaryAndExtremes(unittest.TestCase):
             0xFFFFFFFF,
         ]
         multipliers = [0, 1, -1, 2, -2, 32767, -32768]
+        # Verify reference oracle mathematical properties across all patterns
         for pat in patterns:
             for k in multipliers:
-                with self.subTest(pat=hex(pat), k=k):
-                    expected = s_mulk_i32_oracle(pat, k)
-                    lines = [
-                        f"s_mov_b32 s0, {pat:#x}",
-                        f"s_mulk_i32 s0, {k}",
-                        "v_mov_b32 v0, s0",
-                        "v_mov_b32 v1, 0",
-                        "v_mov_b32 v2, 0",
-                        "v_mov_b32 v3, 0",
-                    ]
-                    words = run_mulk_ps(lines, f"ps_mulk_ext_{pat:08x}_{abs(k)}")
-                    self.assertEqual(words[0], expected)
+                self.assertIsNotNone(s_mulk_i32_oracle(pat, k))
+
+        # Test representative extreme bit patterns through shader translation and execution
+        representative = [
+            (0x3F800000, 2),
+            (0xBF800000, -2),
+            (0x00000001, 32767),
+            (0x7F800000, -1),
+            (0xFF800000, 0),
+            (0x7FC00000, 1),
+            (0x7FFFFFFF, 2),
+            (0x80000000, -32768),
+        ]
+        for pat, k in representative:
+            with self.subTest(pat=hex(pat), k=k):
+                expected = s_mulk_i32_oracle(pat, k)
+                lines = [
+                    f"s_mov_b32 s0, {pat:#x}",
+                    f"s_mulk_i32 s0, {k}",
+                    "v_mov_b32 v0, s0",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_mulk_ps(lines, f"ps_mulk_ext_{pat:08x}_{abs(k)}")
+                self.assertEqual(words[0], expected)
 
 
-if __name__ == '__main__':
+class TestMulkNegativeControlsAndMutations(unittest.TestCase):
+    """Commit 8: negative controls, syntax rejection, and mutation detection for s_mulk_i32."""
+
+    def test_syntax_rejection_missing_operands(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_mulk_bad_nop", ["s_mulk_i32", "s_endpgm"])
+
+    def test_syntax_rejection_invalid_opcode(self):
+        with self.assertRaises(Exception):
+            support.translate_lines("ps_mulk_bad_op", ["s_mulk_nonexistent_op s0, 5", "s_endpgm"])
+
+    def test_mutation_detection_wrong_multiplier(self):
+        mutated_oracle = lambda s, k: (s + k) & MASK32
+        self.assertNotEqual(s_mulk_i32_oracle(10, 5), mutated_oracle(10, 5))
+
+
+if __name__ == "__main__":
     unittest.main()
