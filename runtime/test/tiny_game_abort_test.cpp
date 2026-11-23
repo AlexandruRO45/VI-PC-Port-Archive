@@ -47,6 +47,9 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, "usage: tiny_game_abort_test <gta6rt.exe> <tiny_game.exe>\n");
         return 1;
     }
+    // The three native fail-fast cases would otherwise each be reported to Windows Error Reporting, which can keep the
+    // exited child alive and tiny_game.exe locked for the next build. Every child started below inherits this mode.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     struct Case {
         const char* mode;
         DWORD native_code;
