@@ -46,6 +46,12 @@ WORKFLOW = os.path.join(".github", "workflows", "ci.yml")
 # the suffix form (tests/thing_test.py) counts even though no job's glob matches it today.
 TEST_FILE = re.compile(r"^(?:test.*\.py|.*_test\.py|test.*\.cjs)$")
 
+# Stdlib files that skip without llvm-mc but cannot run in the llvm-mc job yet. They stay detected below, so the
+# set cannot silently shrink; add each to llvm_mc_stdlib_tests when the named dependency lands.
+LLVM_MC_BLOCKED = {
+    "tests/test_rdna2_decode.py": "#4697",   # parity: ps_w64_a_discard.asm's `exp` null operand
+}
+
 
 def read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8", errors="replace") as f:
@@ -412,14 +418,16 @@ class RepositoryRegistrationTest(unittest.TestCase):
         # The check job runs these with python -I but has no llvm-mc, so their parity check only skips there.
         # Translator tests installs llvm-mc and sets LLVM_MC; it must run the same files as stdlib scripts.
         gated = llvm_mc_gated_stdlib_files(ROOT, self.files, self.rules)
-        self.assertGreaterEqual(len(gated), 2, f"only found {gated}")
         self.assertIn("tests/test_rdna2_decode.py", gated)
+        runnable = [rel for rel in gated if rel not in LLVM_MC_BLOCKED]
+        self.assertGreaterEqual(len(runnable), 1, f"only found {gated}")
         script = step_script(ROOT, "Translator tests")
         match = re.search(r"llvm_mc_stdlib_tests=\(\s*\n(.*?)\n\s*\)", script, re.S)
         self.assertIsNotNone(match, "the Translator tests step has no llvm_mc_stdlib_tests array to keep in sync")
         listed = sorted(re.findall(r"tests/[A-Za-z0-9_./-]+\.py", match.group(1)))
-        self.assertEqual(listed, gated,
-                         "llvm_mc_stdlib_tests must list exactly the stdlib files that skip without llvm-mc; "
+        self.assertEqual(listed, runnable,
+                         "llvm_mc_stdlib_tests must list exactly the runnable stdlib files that skip without "
+                         "llvm-mc (LLVM_MC_BLOCKED holds the ones waiting on a dependency); "
                          "otherwise a new one silently goes untested")
         self.assertIn('for t in "${llvm_mc_stdlib_tests[@]}"', script)
         self.assertIn('python -I "$t"', script)
