@@ -3407,16 +3407,34 @@ bitcode blob and an `XDAT`/`XBCH` record; the PC experiment below compiled the b
 executes the `XBCH` record. Measured from that record: 52/52 unpack to `FSSM`, 51 translate and all 51 pass
 `spirv-val` with the same translator the game's 26,503 shaders use; the one left (`Box16Rehydration`) needs
 `buffer_store_short` (#1864) ([embedded_shaders.md](embedded_shaders.md)). The
-raw 64-bit addresses are the corpus's existing raw-address path, not a separate lowering. Open: whether the game
-uses the builder at all (RT-5) and whether the translated programs match a reference on a GPU.
+raw 64-bit addresses are the corpus's existing raw-address path, not a separate lowering. Whether the translated
+programs match a reference on a GPU remains open.
+
+**Retail builder calls.** [Issue #9107](https://github.com/ItsNotRexed/Leonida/issues/9107) reports 24 candidate
+call sites across all seven `XboxBvhBuilder.dll` imports in the retail executable. The scan matched direct calls
+and tail jumps to import thunks by byte pattern. Incidental matches can inflate the counts.
+
+| Imported method | Candidate sites |
+|---|---:|
+| `Set64BitMortonCodes` | 8 |
+| `BuildRaytracingAccelerationStructureBatched2X` | 6 |
+| `RehydrateRaytracingAccelerationStructureBatched2X` | 4 |
+| `GetRaytracingAccelerationStructurePrebuildInfo` | 3 |
+| `CopyRaytracingAccelerationStructure` | 2 |
+| Constructor | 1 |
+| Destructor | 1 |
+
+The scan found constant Morton-width arguments at all eight sites (six `true`, two `false`), a null stream
+descriptor at all three prebuild-info sites, and a `0x50`-byte `BATCHED_DESC2` stride consistent with the
+[builder layout](xdxr.md). A first-frame trace is still needed to identify which calls execute.
 
 The design choice follows from that: **build AMD-format BVH data, not a `VkAccelerationStructureKHR`, unless the
 shaders are changed to `OpTraceRayKHR`.** The game's 64 RT compute shaders traverse the nodes themselves; a
 Vulkan AS would be invisible to them. Two paths:
 
-1. If `XboxBvhBuilder` does the build with its own compute dispatches (the likely case, given it ships as a DLL
-   with a device and command lists), the layer must translate and run its compute shaders. The console programs
-   are `FSSM` and 51 of the 52 already pass `spirv-val`; only `Box16Rehydration` still needs `buffer_store_short` (#1864). Buffers,
+1. When `XboxBvhBuilder` builds with its own compute dispatches, the layer must translate and run its compute
+   shaders. The console programs are `FSSM` and 51 of the 52 already pass `spirv-val`; only
+   `Box16Rehydration` still needs `buffer_store_short` (#1864). Buffers,
    UAVs, descriptors, barriers and indirect dispatch are necessary but not sufficient. The standard
    `BuildRaytracingAccelerationStructure` calls may never reach our command list.
 2. If the game calls `ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure`, the layer must implement
@@ -3873,7 +3891,7 @@ nothing is copied from their trees.
 | 4 | Are Xbox descriptor bytes GFX10 T#/S#, and what are the heap increments? Does the game use `Create*View` or build descriptors itself? | Dump a shader-visible heap after the first `CreateShaderResourceView` and after the first draw; compare the bytes the shader loads with the T# parser. The start-handle return ABI is known (RAX); the increment values still need measuring. |
 | 5 | What is the buffer/descriptor/code VA range, and what arena capacity is needed? | Log every `GetGPUVirtualAddress` and every descriptor base; track the high-water mark. Choose a capacity; grow at a frame boundary if needed. |
 | 6 | Which swapchain/present path is used: DXGI, `PresentX`, or both? | **Partly answered from public samples (§4.5):** GDKX samples use `PresentX` + frame events and no DXGI swapchain (DXGI only for `IDXGIDevice1`→adapter→output). Hypothesis for the game, not observed: same. Still open: vtable slots, `D3D12XBOX_*` layouts, and whether the game also creates a swapchain. Check imports and the first present call. Implement the `PresentX` + frame-event presenter first; keep DXGI swapchain as fallback. |
-| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | Log `BuildRaytracingAccelerationStructure`, `CopyRaytracingAccelerationStructure`, `Emit...PostbuildInfo`, and the builder's command-list method calls on the first RT frame. The builder's container carries a DXIL bitcode blob and a console `XBCH` record; the record is `FSSM` and 51 of 52 programs pass `spirv-val` ([embedded_shaders.md](embedded_shaders.md)). If the builder path is used, translate the `XBCH` record rather than the bitcode. |
+| 7 | Does the game build acceleration structures through the standard D3D12 calls or through `XboxBvhBuilder`'s own compute path? | The retail scan found six candidate sites for batched builds and four for batched rehydration through the builder. Translate its console `XBCH` records (`FSSM`): 51 of 52 programs pass `spirv-val` after translation. To establish which paths run on the first RT frame, trace the builder methods alongside the standard D3D12 build, copy and postbuild-info calls. [Retail scan](https://github.com/ItsNotRexed/Leonida/issues/9107) · [Shader validation](embedded_shaders.md) |
 | 8 | What are the layouts of `D3D12XBOX_XDXR_STREAM_DESC`, the batched build desc, and the offline statistics desc? | **Measured** from `XboxBvhBuilder.dll`'s reads ([xdxr.md](xdxr.md)): `BATCHED_DESC2` (`0x50`) and `XDXR_STREAM_DESC` (`0x10`) with every field's offset, and the stream records' offsets, types and defaults. Still open: the record names, and the offline statistics layout, which the DLL never writes (it rejects that postbuild type). |
 | 9 | Xbox texture creation is device slot 76 with layout `0x101` (tiled) or `0x1` (row-major). What is the tiled data layout, and does the game upload console-tiled or DCC data? | Trace slot 76, `CopyTextureRegion` and the resource descs. If the game uploads console-tiled data, add a detile step or a matching layout. |
 | 10 | Does the game use binning, DCC, VRS, wave MMA, stream output, tessellation, or amplification shaders? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1): no hull, domain or amplification shader (DXIL program kinds: 2,236 VS, 12,101 PS, 195 GS, 2,689 CS, 9,282 MS); no `WAVE_MMA` or `SHADING_RATE` in any SFI0, and no `v_mfma`/`v_wmma`/`v_smfmac` in the disassembly; no output-signature element on a stream other than 0 (all 195 GS write stream 0 only) and no GDS / `ds_ordered_count` / GWS instruction, so no stream-output path. Also from SFI0: 10 PS need ROVs (pixel interlock), 30 shaders `TILED_RESOURCES` (see #18), 685 `ATOMIC_INT64_ON_TYPED_RESOURCE`. Binning and DCC are not shader-visible; they stay open for the PSO/stream subobjects. |

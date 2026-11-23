@@ -453,8 +453,9 @@ matches the 64-byte-unit count; the DLL that builds the runtime structures expos
 
 **Verified (§4a):** these are the offline-built, dehydrated inputs for `XboxBvhBuilder`'s rehydrate path. Fed with
 their source geometry, `RehydrateRaytracingAccelerationStructureX` returns `S_OK` on them, and an independent CPU
-model of the packing gives the same bytes. Whether the game's runtime calls that path or rebuilds from source
-geometry is still **Open**; `docs/d3d12_vulkan.md` §4.8/§7.2 lists that call-path question.
+model of the packing gives the same bytes. A static scan of the retail executable reported four candidate calls
+to `RehydrateRaytracingAccelerationStructureBatched2X` and six to `BuildRaytracingAccelerationStructureBatched2X`.
+Which calls execute and which packs supply their inputs remain open. [Retail scan (#9107)](https://github.com/ItsNotRexed/Leonida/issues/9107)
 
 **Not present as a whole:** source vertex/index meshes. The `u16` "table" at header `0x130` once read as a remap table is the
 `rootNodePtr`/`offsetToElements`/`offsetToParents` words, and `offsetToPrimRemap` is 0 on every stream (§3.1). No
@@ -725,8 +726,8 @@ can share both the BLAS and its transform: the key identifies something finer th
 **Open:** why the BVH keeps the bucket-1 and bucket-2 geometries of at least 22 BLAS (ASSET-349 above); what decides the LOD a BLAS is built from; what the rest of the band of streams 231,012
 to 261,585 holds, and how the pack is ordered; why 4 exported archetypes with a kept shader have no BLAS; what
 the descriptor key at `+0x40` hashes; how the game picks the entity of a BLAS when the BLAS does not name it (the
-drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; whether the runtime
-rehydrates these packs at all (above).
+drawable match does it here); whether the game composes TLAS instances as `I * E * M^-1`; which `*_bvh4.rpf`
+streams, if any, reach the batched rehydrate method at runtime.
 
 ## Where BLAS live
 
