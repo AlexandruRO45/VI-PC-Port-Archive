@@ -150,7 +150,8 @@ def main(argv=None):
         cam = [str(x - 40), str(y - 40), str(z + 25), "45", "-20"]
         if a.window:
             return subprocess.call([tool, scene, *pair, "--window", "--cam", *cam])
-        frame = scene + ".ppm"
+        fd, frame = tempfile.mkstemp(suffix=".ppm")
+        os.close(fd)
         r = subprocess.run([tool, scene, *pair, "--out", frame, "--size", "640", "360", "--cam", *cam],
                            capture_output=True, text=True)
         if r.returncode:
