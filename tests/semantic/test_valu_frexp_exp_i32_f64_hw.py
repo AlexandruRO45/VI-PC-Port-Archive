@@ -186,5 +186,41 @@ class TestFrexpExpF64MultiLaneDivergence(unittest.TestCase):
         self.assertEqual([s32(w) for w in words], [1, 3, -1, 7])
 
 
+class TestFrexpExpF64RegisterAliasing(unittest.TestCase):
+    def test_in_place_overwrite_low_word(self):
+        val_bits = f64_to_bits(16.0)  # exp 5
+        lines = [
+            f"v_mov_b32 v0, {val_bits & MASK32:#010x}",
+            f"v_mov_b32 v1, {(val_bits >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v0, v[0:1]",
+            "exp mrt0 v0, v0, v0, v0 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_alias_lo", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(s32(words[0]), 5)
+
+    def test_in_place_overwrite_high_word(self):
+        val_bits = f64_to_bits(64.0)  # exp 7
+        lines = [
+            f"v_mov_b32 v0, {val_bits & MASK32:#010x}",
+            f"v_mov_b32 v1, {(val_bits >> 32) & MASK32:#010x}",
+            "v_frexp_exp_i32_f64 v1, v[0:1]",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spv = translate_lines("ps_frexp_alias_hi", lines)
+        words = mrt0_words(spv)
+        self.assertEqual(s32(words[0]), 7)
+
+    def test_sgpr_pair_operand(self):
+        val_bits = f64_to_bits(0.125)  # exp -2
+        setup = [
+            f"s_mov_b32 s0, {val_bits & MASK32:#010x}",
+            f"s_mov_b32 s1, {(val_bits >> 32) & MASK32:#010x}",
+        ]
+        self.assertEqual(run_frexp_exp(0, operands="s[0:1]", setup=setup), -2)
+
+
 if __name__ == "__main__":
     unittest.main()
