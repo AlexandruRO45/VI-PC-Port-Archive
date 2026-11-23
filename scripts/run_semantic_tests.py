@@ -7,8 +7,9 @@ r"""Run the translator regression suite (tests/semantic) one process per test fi
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py`, and packages below it), each as
 `python -m unittest <module>` from that folder, so a file sees the same import path as under discover. The files can
 run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails or none is found. Standard library only.
+or on a single core, it runs that discover command itself. -j is at least 1: a lower value used to take that same
+sequential path, so a job count of 0 looked like a run of the whole suite. Prints the output of every failing file and
+one summary line, and exits 1 if a file fails or none is found. Standard library only.
 """
 import argparse
 import concurrent.futures
