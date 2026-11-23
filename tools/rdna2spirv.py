@@ -12274,7 +12274,7 @@ class Gen:
               f"{orr(andd(andd(nnan[0], nnan[1]), nnan[2]), andd(andd(fnan[0], fnan[1]), fnan[2]))}")
             tnear = fext("FMax", "%f0", tmin)
             h1 = bop("OpFOrdGreaterThanEqual", tmx, tnear)
-            h2 = bop("OpFOrdLessThan", tmin, tmax)
+            h2 = bop("OpFOrdLessThanEqual", tnear, tmax)   # measured: max(tnear, 0) <= extent; a NaN extent misses
             hb = andd(nonan, andd(h1, h2))
             dist.append(sel(hb, tnear, INF))
             idx.append(sel(hb, child, self.cu(0xFFFFFFFF), "%uint"))
