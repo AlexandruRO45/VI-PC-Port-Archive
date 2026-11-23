@@ -269,6 +269,18 @@ class TestSSubU32BorrowAndSCC(unittest.TestCase):
         self.assertEqual(ref_s_sub_u32(0xFFFFFFFF, 0xFFFFFFFF), (0, 0))
         self.assertEqual(ref_s_sub_u32(0xFFFFFFFE, 0xFFFFFFFF), (0xFFFFFFFF, 1))
 
+class TestSSubU32Translator(unittest.TestCase):
+    def test_translator_s_sub_u32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0",
+            "s_sub_u32 s5, s4, 1",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_sub_u32")
+        for l in range(32):
+            self.assertEqual(results[l], 0xFFFFFFFF)
+
 
 if __name__ == "__main__":
     unittest.main()
