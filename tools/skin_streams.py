@@ -45,6 +45,9 @@ import sys
 import time
 import zlib
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from report_paths import same_report_path  # noqa: E402
+
 PAGE = 4096
 MAX_SYS = 32 * 1024 * 1024
 MAX_GFX = 224 * 1024 * 1024
@@ -450,14 +453,7 @@ def scan_archive(path, sample, log):
     return stats
 
 
-def same_output_path(first, second):
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
+same_output_path = same_report_path
 
 
 def main(argv=None):

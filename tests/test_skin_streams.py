@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 import zlib
 from unittest import mock
@@ -21,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "skin_streams.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import report_paths  # noqa: E402
 import skin_streams as ss  # noqa: E402
 
 
@@ -529,6 +531,19 @@ class TestCli(unittest.TestCase):
             self.assertEqual(r.stdout, "")
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), data)
+
+    def test_json_guard_follows_the_folding_volume(self):
+        """--json asks report_paths, so a case-insensitive APFS volume refuses a --json that is one of the input
+        archives; the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                    mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(ss.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(ss.same_output_path(composed, decomposed))
 
     def test_json_that_is_a_directory_is_refused_before_the_scan(self):
         with tempfile.TemporaryDirectory() as tmp:

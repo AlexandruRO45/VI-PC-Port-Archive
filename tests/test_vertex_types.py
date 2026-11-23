@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
 import zlib
 from unittest import mock
@@ -23,6 +24,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "vertex_types.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import report_paths  # noqa: E402
 import vertex_types as vt  # noqa: E402
 
 GRID = 10  # GRID x GRID vertices, 2 * (GRID - 1)^2 triangles
@@ -397,6 +399,19 @@ class ArchiveTests(unittest.TestCase):
                 mock.call(os.path.join(root, "a", "one.rpf"), 0),
                 mock.call(os.path.join(root, "z", "one.rpf"), 0),
             ])
+
+    def test_json_guard_follows_the_folding_volume(self):
+        """--json asks report_paths, so a case-insensitive APFS volume refuses a --json that is one of the input
+        archives; the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with mock.patch.object(report_paths, "sys", mock.Mock(platform="darwin")), \
+                    mock.patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(vt.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(vt.same_output_path(composed, decomposed))
 
     def test_negative_limit_is_an_error(self):
         r = subprocess.run([sys.executable, "-I", TOOL, TOOL, "--limit", "-1"], capture_output=True, text=True, errors="replace")

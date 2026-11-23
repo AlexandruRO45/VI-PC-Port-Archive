@@ -11,7 +11,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import unittest
+from unittest.mock import Mock, patch
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,7 @@ TOOL = os.path.join(ROOT, "tools", "instance_lists.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import instance_lists as il  # noqa: E402
+import report_paths  # noqa: E402
 
 M = il.M
 
@@ -272,6 +275,19 @@ class ArchiveTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["prop"]["instances"], 2)
+
+    def test_json_guard_follows_the_folding_volume(self):
+        """--json asks report_paths, so a case-insensitive APFS volume refuses a --json that is one of the input
+        archives; the private realpath+normcase copy answered "two files" there and let the report replace it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            composed = os.path.join(tmp, "café.rpf")
+            decomposed = os.path.join(tmp, unicodedata.normalize("NFD", "café.rpf"))
+            folding = [True]
+            with patch.object(report_paths, "sys", Mock(platform="darwin")), \
+                    patch.object(report_paths, "case_insensitive_volume", lambda path: folding[0]):
+                self.assertTrue(il.same_output_path(composed, decomposed))
+                folding[0] = False
+                self.assertFalse(il.same_output_path(composed, decomposed))
 
     def test_json_that_cannot_be_written_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
