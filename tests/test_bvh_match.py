@@ -353,6 +353,37 @@ class TestMatching(unittest.TestCase):
         finally:
             os.chmod(ro, 0o644)
 
+    def test_manifest_with_utf8_bom_is_accepted(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        bvh_path = os.path.join(self.dir, "dehydrated.bin")
+        manifest_path = os.path.join(self.dir, "manifest_bom.json")
+        obj_path = os.path.join(self.dir, "a.obj")
+        with open(bvh_path, "wb") as f:
+            f.write(src)
+        write_obj(obj_path, [group(2)])
+        with open(manifest_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"Items": [item(0x1000, "a.obj", [2])]}, f)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = M.main([bvh_path, manifest_path])
+        self.assertEqual(status, 0, out.getvalue() + err.getvalue())
+        self.assertIn("1 of 1 scored candidates are consistent", out.getvalue())
+
+    def test_malformed_manifest_with_utf8_bom_is_an_error_not_a_traceback(self):
+        src, _, _ = build(LEAVES, bounds=BOUNDS)
+        bvh_path = os.path.join(self.dir, "dehydrated.bin")
+        manifest_path = os.path.join(self.dir, "manifest_bad_bom.json")
+        with open(bvh_path, "wb") as f:
+            f.write(src)
+        with open(manifest_path, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("{not valid json")
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            status = M.main([bvh_path, manifest_path])
+        self.assertEqual(status, 2)
+        self.assertIn("error:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
 
 class TestPieces(unittest.TestCase):
     def test_leaf_signature_counts_a_paired_leaf_twice(self):

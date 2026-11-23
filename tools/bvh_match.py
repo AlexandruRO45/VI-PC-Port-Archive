@@ -291,7 +291,7 @@ def main(argv=None):
     try:
         with open(a.dehydrated, "rb") as f:
             src = f.read()
-        with open(a.manifest, encoding="utf-8") as f:
+        with open(a.manifest, encoding="utf-8-sig") as f:
             manifest = json.load(f)
         if not isinstance(manifest, dict):
             raise ValueError("%s is not a JSON object (got %s)" % (a.manifest, type(manifest).__name__))
