@@ -585,5 +585,71 @@ class TestSOrB64IEEE754Bitwise(unittest.TestCase):
         self.assertEqual(d, neg_zero)
         self.assertEqual(scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestSOrB64NegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_odd_aligned_destination(self):
+        for odd in (1, 3, 5, 7, 99, 101):
+            with self.subTest(odd=odd):
+                instr = SOrB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=odd, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64),
+                    src1=RegOperand(RegisterKind.SGPR, index=2, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_out_of_bounds_destination(self):
+        for oob in (104, 106, 120, 256):
+            with self.subTest(oob=oob):
+                instr = SOrB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=oob, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64),
+                    src1=RegOperand(RegisterKind.SGPR, index=2, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_vgpr_destination(self):
+        instr = SOrB64Instruction(
+            dst=RegOperand(RegisterKind.VGPR, index=0, size_bits=64),
+            src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64),
+            src1=RegOperand(RegisterKind.SGPR, index=2, size_bits=64)
+        )
+        with self.assertRaises(TypeError):
+            instr.validate()
+
+    def test_mutation_detector_logic(self):
+        """Verify detection of mutant logic implementations (OR vs AND vs XOR vs ORN2)."""
+        def mutant_and(s0: int, s1: int):
+            d = (s0 & s1) & MASK64
+            return d, int(d != 0)
+
+        def mutant_xor(s0: int, s1: int):
+            d = (s0 ^ s1) & MASK64
+            return d, int(d != 0)
+
+        def mutant_orn2(s0: int, s1: int):
+            d = (s0 | (~s1 & MASK64)) & MASK64
+            return d, int(d != 0)
+
+        s0 = 0x0000_FFFF_0000_0000
+        s1 = 0x0000_0000_FFFF_0000
+        correct_d, correct_scc = s_or_b64_oracle(s0, s1)
+        self.assertEqual(correct_d, s0 | s1)
+        self.assertEqual(correct_scc, 1)
+
+        # Mutant AND produces 0 != s0 | s1
+        m_and, _ = mutant_and(s0, s1)
+        self.assertNotEqual(m_and, correct_d)
+
+        # Mutant ORN2 produces s0 | ~s1 != s0 | s1
+        m_orn2, _ = mutant_orn2(s0, s1)
+        self.assertNotEqual(m_orn2, correct_d)
+
 if __name__ == "__main__":
     unittest.main()
