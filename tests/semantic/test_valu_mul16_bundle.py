@@ -322,5 +322,18 @@ class VMadI32I16InterpreterTests(unittest.TestCase):
         # -500 * 40 + 1000 = -20000 + 1000 = -19000
         self.assertEqual(i32(regs["v3"]), -19000)
 
+class VMadI32I16SimdBoundaryTests(unittest.TestCase):
+    """SIMD lane divergence and boundary extremes for v_mad_i32_i16."""
+
+    def test_simd_divergent_lanes(self):
+        lanes = 64
+        src0 = [u16(i - 32) for i in range(lanes)]
+        src1 = [1000 for _ in range(lanes)]
+        src2 = [50000 for _ in range(lanes)]
+        out = [ref_mad_i32_i16(s0, s1, s2) for s0, s1, s2 in zip(src0, src1, src2)]
+        for i in range(lanes):
+            expected = (i - 32) * 1000 + 50000
+            self.assertEqual(i32(out[i]), expected)
+
 if __name__ == "__main__":
     unittest.main()
