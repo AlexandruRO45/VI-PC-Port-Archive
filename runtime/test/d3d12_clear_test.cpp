@@ -3,6 +3,7 @@
 // both sides. Covers UNORM/SNORM/FLOAT/UINT/SINT render targets and depth/stencil, full and rectangle clears, and RTVs
 // through castable-format lists in the other channel order.
 // No game data or shaders. Run explicitly (needs Vulkan hardware); LEONIDA_VK_VALIDATION=1 checks Vulkan usage.
+#include "host_wine.h"
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 #include <dxgi1_4.h>
@@ -418,6 +419,12 @@ int main(int argc, char** argv) {
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) ||
             FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp.p))) ||
             FAILED(D3D12CreateDevice(warp.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+            // Every check below compares with WARP. A host that answers like Wine and has no WARP has nothing to
+            // compare with: a skip there, a failure on Windows, where WARP is always present.
+            if (hostwine::host_is_wine()) {
+                std::puts("WARP reference unavailable on this host: differential test skipped");
+                return 77;
+            }
             std::fprintf(stderr, "WARP reference unavailable: differential test cannot run\n");
             return 1;
         }

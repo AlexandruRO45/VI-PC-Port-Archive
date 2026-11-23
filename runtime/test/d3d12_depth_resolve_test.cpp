@@ -476,8 +476,9 @@ int main() {
             ++refusals;
         }
 
+        // The host comparison below stops under Wine, so a host that answers like Wine needs no DXGI factory.
         Ref<IDXGIFactory4> factory;
-        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
+        if (!hostwine::host_is_wine() && FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             std::fprintf(stderr, "no DXGI factory\n");
             return 1;
         }
