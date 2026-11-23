@@ -616,5 +616,99 @@ class TestValuAndOrB32IEEE754EdgeCases(unittest.TestCase):
                 for c in extremes:
                     self.assertEqual(ref_and_or_b32(a, b, c), ((a & b) | c) & MASK32)
 
+class TestValuAndOrB32NegativeControls(unittest.TestCase):
+    """Unit tests for instruction syntax rejection and parameter boundaries."""
+
+    def test_dst_cannot_be_sgpr(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_AND_OR_B32,
+                dst=Register(RegKind.SGPR, 0),
+                src0=0,
+                src1=0,
+                src2=0,
+            )
+
+    def test_dst_register_range_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            Instruction(
+                opcode=Opcode.V_AND_OR_B32,
+                dst=Register(RegKind.VGPR, 256),
+                src0=0,
+                src1=0,
+                src2=0,
+            )
+
+    def test_wave_size_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            SIMDVALUWavefrontInterpreter(wave_size=16)
+
+
+class TestValuAndOrB32MutationDetection(unittest.TestCase):
+    """Mutation testing to verify test suite catches faulty operator implementations."""
+
+    def test_mutation_or_then_and_caught(self) -> None:
+        # Buggy implementation: (src0 | src1) & src2
+        def buggy_or_and(a: int, b: int, c: int) -> int:
+            return ((a | b) & c) & MASK32
+
+        # When a=1, b=0, c=0:
+        # Correct: (1 & 0) | 0 = 0
+        # Buggy:   (1 | 0) & 0 = 0
+        # But when a=1, b=1, c=0:
+        # Correct: (1 & 1) | 0 = 1
+        # Buggy:   (1 | 1) & 0 = 0 (Caught!)
+        self.assertNotEqual(ref_and_or_b32(1, 1, 0), buggy_or_and(1, 1, 0))
+
+    def test_mutation_precedence_bug_caught(self) -> None:
+        # Buggy implementation: src0 & (src1 | src2)
+        def buggy_precedence(a: int, b: int, c: int) -> int:
+            return (a & (b | c)) & MASK32
+
+        # When a=0, b=0, c=1:
+        # Correct: (0 & 0) | 1 = 1
+        # Buggy:   0 & (0 | 1) = 0
+        self.assertNotEqual(ref_and_or_b32(0, 0, 1), buggy_precedence(0, 0, 1))
+
+
+class TestValuAndOrB32TranslationAndExecution(unittest.TestCase):
+    """End-to-end SPIR-V translation and execution under support and spirv_mini_interp."""
+
+    def test_translator_v_and_or_b32_basic(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available under current Python environment")
+
+        asm = [
+            "v_mov_b32 v0, 0xF0",
+            "v_mov_b32 v1, 0x33",
+            "v_mov_b32 v2, 0x0C",
+            "v_and_or_b32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("ps_and_or_test", asm)
+        self.assertIn("OpBitwiseAnd", spvasm)
+        self.assertIn("OpBitwiseOr", spvasm)
+
+        words = support.mrt0_words(spvasm)
+        # (0xF0 & 0x33) | 0x0C = 0x30 | 0x0C = 0x3C
+        self.assertEqual(words, [0x3C, 0x3C, 0x3C, 0x3C])
+
+    def test_translator_v_and_or_b32_sgpr_and_imm(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available under current Python environment")
+
+        asm = [
+            "s_mov_b32 s0, 0x00FF0000",
+            "v_mov_b32 v0, 0x0F0F0000",
+            "v_and_or_b32 v1, s0, v0, 0x00000042",
+            "exp mrt0 v1, v1, v1, v1 done vm",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("ps_and_or_sgpr", asm)
+        words = support.mrt0_words(spvasm)
+        # (0x00FF0000 & 0x0F0F0000) | 0x42 = 0x000F0000 | 0x42 = 0x000F0042
+        self.assertEqual(words, [0x000F0042, 0x000F0042, 0x000F0042, 0x000F0042])
+
 if __name__ == "__main__":
     unittest.main()
