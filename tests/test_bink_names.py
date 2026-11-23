@@ -317,6 +317,26 @@ class TestLoadPins(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_escaped_mount_name_matches_pin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = os.path.join(tmp, "test.rpf")
+            with open(archive, "wb") as fh:
+                fh.write(make_stream(1280, 720, 5))
+            xml = os.path.join(tmp, "list.xml")
+            with open(xml, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(mount_xml(["tv/rock&amp;roll.bk2", "tv/rock&#38;roll.bk2"]))
+            pins = os.path.join(tmp, "pins.csv")
+            with open(pins, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("offset,path\n0,tv/rock&roll.bk2\n")
+            report = os.path.join(tmp, "names.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(names_mod.main([archive, "--mount", xml, "--pins", pins, "--out", report]), 0)
+            with open(report, encoding="utf-8") as fh:
+                result = json.load(fh)
+            self.assertEqual(result["summary"]["list_entries"], 1)
+            self.assertEqual([(row["path"], row["confidence"]) for row in result["streams"]],
+                             [("tv/rock&roll.bk2", "verified")])
+
     def test_unreadable_mount_directory_preserves_the_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "empty.bk2")

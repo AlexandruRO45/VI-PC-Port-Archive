@@ -42,6 +42,7 @@ import json
 import os
 import re
 import sys
+import xml.etree.ElementTree as ET
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -124,6 +125,12 @@ def read_mount_lists(paths):
             continue
         text = data.decode("utf-8", errors="replace")
         for name in LIST_ENTRY.findall(text):
+            if "&" in name:
+                # Parse just the filename text so this still works on carved XML fragments.
+                try:
+                    name = ET.fromstring(f"<filename>{name}</filename>").text
+                except ET.ParseError:
+                    pass  # Keep the original spelling in a malformed entry.
             name = name.strip().replace("\\", "/")
             if name.lower() not in seen:
                 seen.add(name.lower())
