@@ -3418,8 +3418,8 @@ public:
         // fragment shader even when the pipeline has no pixel shader of its own (depth-only passes).
         if (depth24_dynamic) graphics_.push_stages |= VK_SHADER_STAGE_FRAGMENT_BIT;
         const VkPushConstantRange push{graphics_.push_stages, 0,
-                                       sizeof(leonida::ShaderUserData) +
-                                           (depth24_dynamic ? sizeof(leonida::DepthBias) : 0u)};
+                                       static_cast<std::uint32_t>(sizeof(leonida::ShaderUserData) +
+                                                                   (depth24_dynamic ? sizeof(leonida::DepthBias) : 0u))};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
