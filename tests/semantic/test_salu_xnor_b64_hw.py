@@ -164,5 +164,34 @@ class SXnorB64ScalarInterpreterTests(unittest.TestCase):
         self.assertEqual(state.get_sgpr_pair(4), 0)
         self.assertEqual(state.scc, 0)
 
+class WavefrontState:
+    def __init__(self, lane_count: int = 32):
+        self.lane_count = lane_count
+        self.scalar_state = ScalarRegisterState()
+        self.vgprs = [[0] * 64 for _ in range(lane_count)]
+
+    def execute_scalar_instruction(self, ast: InstructionAST) -> None:
+        # SALU instructions execute on the scalar processor once per wavefront
+        execute_scalar_xnor_b64(self.scalar_state, ast)
+
+
+class SXnorB64SimdDivergenceTests(unittest.TestCase):
+    def test_salu_uniform_execution(self):
+        wave = WavefrontState(lane_count=32)
+        wave.scalar_state.set_sgpr_pair(0, 0xFF00FF00FF00FF00)
+        wave.scalar_state.set_sgpr_pair(2, 0xFF00FF00FF00FF00)
+        ast = InstructionAST(
+            "s_xnor_b64",
+            Operand64(RegKind.SGPR, 4),
+            Operand64(RegKind.SGPR, 0),
+            Operand64(RegKind.SGPR, 2),
+        )
+        wave.execute_scalar_instruction(ast)
+        self.assertEqual(wave.scalar_state.get_sgpr_pair(4), MASK64)
+        self.assertEqual(wave.scalar_state.scc, 1)
+        # Vector registers remain untouched
+        for lane in range(32):
+            self.assertEqual(wave.vgprs[lane][0], 0)
+
 if __name__ == "__main__":
     unittest.main()
