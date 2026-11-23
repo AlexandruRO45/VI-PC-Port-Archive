@@ -2753,15 +2753,16 @@ Not implemented yet:
   draw-indexed, dispatch and mesh-dispatch signatures map to `vkCmdDraw*Indirect`, `vkCmdDispatchIndirect` and
   `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
   `ExecuteIndirect` call supplies a count buffer.
-- Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
-  one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
-  `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
-  signatures the game creates. Until such signatures execute, `CreateCommandSignature` refuses every valid
-  signature with an argument before its draw or dispatch with `E_NOTIMPL` (logged once). Before that refusal the
-  layer accepted them, kept only the final argument and read it at the start of each record: `[CONSTANT, DISPATCH]`
+- For now `CreateCommandSignature` refuses every valid signature with an argument before its draw or dispatch
+  with `E_NOTIMPL` (logged once), until the next item (#2077) executes them. Before that refusal the layer
+  accepted them, kept only the final argument and read it at the start of each record: `[CONSTANT, DISPATCH]`
   with the record `{7, 1, 1, 1}` ran 7 groups with the constant left at its earlier value, and `[CONSTANT, DRAW]`
   passed the record's start to `vkCmdDrawIndirect`, so Vulkan reads the constant as the vertex count
   (`d3d12_indirect_signature_test`).
+- Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
+  one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
+  `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which
+  signatures the game creates.
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins
