@@ -40,6 +40,7 @@ from gui.core import (
     BuildConfig,
     build_make_game_args,
     format_free_space,
+    format_validation_check_details,
     load_config,
     locate_python,
     resolve_repo_root,
@@ -877,6 +878,9 @@ class LeonidaWindow(QMainWindow):
         for chk in report.get("checks", []):
             row_frame, rl = self._card()
             rl.setContentsMargins(14, 10, 14, 10)
+            rl.setSpacing(8)
+            row_frame.setCursor(Qt.PointingHandCursor)
+
             hrow = QHBoxLayout()
             st = chk.get("status", "skip")
             badge = QLabel(st.upper())
@@ -888,9 +892,28 @@ class LeonidaWindow(QMainWindow):
             )
             name = QLabel(f"<b>{chk.get('name', '')}</b> — {chk.get('detail', '')}")
             name.setWordWrap(True)
+            hint = QLabel(tr(self.lang, "val_click_hint"))
+            hint.setStyleSheet("color: #7e8aa8; font-size: 11px; font-weight: 500;")
             hrow.addWidget(badge)
             hrow.addWidget(name, 1)
+            hrow.addWidget(hint)
             rl.addLayout(hrow)
+
+            detail_box = QPlainTextEdit()
+            detail_box.setReadOnly(True)
+            detail_box.setPlainText(format_validation_check_details(report, chk, self.lang))
+            detail_box.setMinimumHeight(140)
+            detail_box.setMaximumHeight(280)
+            detail_box.setVisible(False)
+            rl.addWidget(detail_box)
+
+            def _toggle_details(_event, box=detail_box) -> None:
+                box.setVisible(not box.isVisible())
+
+            row_frame.mousePressEvent = _toggle_details
+            name.mousePressEvent = _toggle_details
+            badge.mousePressEvent = _toggle_details
+            hint.mousePressEvent = _toggle_details
             self.val_list.addWidget(row_frame)
         self.val_list.addStretch()
 

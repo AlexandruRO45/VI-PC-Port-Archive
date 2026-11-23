@@ -341,6 +341,65 @@ def load_config(path: str | None = None) -> BuildConfig:
         return BuildConfig()
 
 
+def format_bytes(num_bytes: int | None) -> str:
+    if num_bytes is None:
+        return "?"
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0 or unit == "TB":
+            return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024.0
+    return f"{num_bytes} B"
+
+
+def format_validation_check_details(report: dict, chk: dict, lang: str = "en") -> str:
+    """Build a detailed, human-readable breakdown for a clicked validation card."""
+    cid = chk.get("id", "")
+    details = report.get("details") or {}
+    lines: list[str] = [f"{chk.get('name', '')} [{chk.get('status', '').upper()}]", chk.get("detail", ""), ""]
+
+    if cid == "integrity" and isinstance(details.get("issues"), list):
+        issues = details["issues"]
+        missing = [i for i in issues if i.get("kind") == "MISSING"]
+        wrong_size = [i for i in issues if i.get("kind") == "SIZE"]
+        changed = [i for i in issues if i.get("kind") == "CHANGED"]
+
+        if not issues:
+            lines.append(tr(lang, "val_all_files_ok"))
+            return "\n".join(lines).strip()
+
+        if missing:
+            lines.append(f"=== {tr(lang, 'val_missing_hdr')} ({len(missing)}) ===")
+            for item in missing:
+                exp = format_bytes(item.get("expected_size"))
+                lines.append(f"  - {item.get('path', '')}  ({tr(lang, 'val_expected')}: {exp})")
+            lines.append("")
+
+        if wrong_size:
+            lines.append(f"=== {tr(lang, 'val_incomplete_hdr')} ({len(wrong_size)}) ===")
+            for item in wrong_size:
+                act = item.get("actual_size")
+                exp = item.get("expected_size")
+                pct = f" ({(act / exp) * 100:.1f}%)" if (act is not None and exp) else ""
+                lines.append(f"  - {item.get('path', '')}  ({format_bytes(act)} / {format_bytes(exp)}{pct})")
+            lines.append("")
+
+        if changed:
+            lines.append(f"=== {tr(lang, 'val_changed_hdr')} ({len(changed)}) ===")
+            for item in changed:
+                lines.append(f"  - {item.get('path', '')}  (SHA-256 mismatch)")
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    if cid == "probes" and isinstance(details.get("probe_notes"), list):
+        for note in details["probe_notes"]:
+            lines.append(f"  - {note}")
+        return "\n".join(lines).strip()
+
+    return "\n".join(lines).strip()
+
+
 def format_free_space(path: str, lang: str = "en") -> str:
     target = os.path.abspath(path or default_out_dir())
     while target and not os.path.exists(target):
@@ -385,6 +444,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "export_report": "Exportar Relatório JSON",
         "val_prompt": "Clique em um botão acima para validar ambiente, jogo ou código.",
         "val_running": "Validando...",
+        "val_click_hint": "Clique para ver detalhes ▾",
+        "val_missing_hdr": "Arquivos ausentes (MISSING)",
+        "val_incomplete_hdr": "Arquivos incompletos / tamanho diferente (SIZE)",
+        "val_changed_hdr": "Arquivos corrompidos / SHA-256 diferente (CHANGED)",
+        "val_expected": "esperado",
+        "val_all_files_ok": "Todos os arquivos do manifesto estão presentes e íntegros.",
         "clear_logs": "Limpar",
         "copy_logs": "Copiar",
         "save_logs": "Salvar Log...",
@@ -443,6 +508,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "export_report": "Export JSON Report",
         "val_prompt": "Click a button above to validate your environment, game copy, or codebase.",
         "val_running": "Validating...",
+        "val_click_hint": "Click for details ▾",
+        "val_missing_hdr": "Missing files (MISSING)",
+        "val_incomplete_hdr": "Incomplete / wrong size files (SIZE)",
+        "val_changed_hdr": "Corrupted / SHA-256 mismatch files (CHANGED)",
+        "val_expected": "expected",
+        "val_all_files_ok": "All manifest files are present and verified.",
         "clear_logs": "Clear",
         "copy_logs": "Copy",
         "save_logs": "Save Log...",
@@ -501,6 +572,12 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "export_report": "Exportar Informe JSON",
         "val_prompt": "Haz clic arriba para validar el entorno, tu copia del juego o el código.",
         "val_running": "Validando...",
+        "val_click_hint": "Haz clic para ver detalles ▾",
+        "val_missing_hdr": "Archivos ausentes (MISSING)",
+        "val_incomplete_hdr": "Archivos incompletos / tamaño distinto (SIZE)",
+        "val_changed_hdr": "Archivos corruptos / SHA-256 distinto (CHANGED)",
+        "val_expected": "esperado",
+        "val_all_files_ok": "Todos los archivos del manifiesto están presentes e íntegros.",
         "clear_logs": "Limpiar",
         "copy_logs": "Copiar",
         "save_logs": "Guardar Log...",

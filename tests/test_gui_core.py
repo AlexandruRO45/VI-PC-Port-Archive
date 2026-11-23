@@ -12,6 +12,7 @@ from gui.core import (  # noqa: E402
     BuildConfig,
     build_make_game_args,
     detect_system_language,
+    format_validation_check_details,
     load_config,
     pending_install_plan,
     save_config,
@@ -87,6 +88,25 @@ class GuiCoreTest(unittest.TestCase):
         self.assertIn("winget", by_key["python"].command)
         self.assertFalse(by_key["llvm_mc"].manual_only)
         self.assertTrue(any("install_llvm.ps1" in part for part in by_key["llvm_mc"].command))
+
+    def test_validation_check_details_lists_missing_and_incomplete(self):
+        report = {
+            "kind": "game_package",
+            "details": {
+                "issues": [
+                    {"path": "common.rpf", "kind": "MISSING", "expected_size": 1048576, "actual_size": None},
+                    {"path": "audio.rpf", "kind": "SIZE", "expected_size": 2000, "actual_size": 1000},
+                    {"path": "data.rpf", "kind": "CHANGED", "expected_size": 500, "actual_size": 500},
+                ]
+            },
+        }
+        chk = {"id": "integrity", "name": "File Integrity", "status": "error", "detail": "3 issue(s) found."}
+        text = format_validation_check_details(report, chk, "pt-BR")
+        self.assertIn("common.rpf", text)
+        self.assertIn("audio.rpf", text)
+        self.assertIn("50.0%", text)
+        self.assertIn("data.rpf", text)
+        self.assertIn("SHA-256 mismatch", text)
 
     def test_translations(self):
         self.assertEqual(tr("pt-BR", "nav_validate"), "Validação")
