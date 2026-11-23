@@ -190,8 +190,8 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   `Box32Rehydration` and `LeafRehydration` are exactly the programs that would turn the dehydrated BVH packs
   into runtime trees ([bvh.md](bvh.md) §3.1). `LeafRehydration` translates since #1871, `Box32Rehydration`
   translates since #1968 (`427c1376`), and only `Box16Rehydration` awaits #1864 (`buffer_store_short`).
-* **What is still open.** None of the 52 has been executed on a GPU; translation and `spirv-val` do not prove the
-  output. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
+* **What is still open.** Translation and `spirv-val` alone do not prove the output; the GPU runs below check part of
+  it. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` metadata-only shape is consistent with reflection,
   but whether the builder consumes it has not been measured.
 * **They run on a GPU (TEST-594).** `tools/bvh_gpu_smoke.py` translates them from the package and runs each through
@@ -216,9 +216,37 @@ python -I tools/rdna2spirv.py <work>/embedded/dxbc/disasm --out <work>/embedded/
   * with every table word 0 instead, the descriptors point at the table itself, and `RadixCount` then writes into the
     table that other waves are reading, so its output differs between runs. That is the test input, not the
     translator; the tool's default avoids it.
+* **The box rehydration programs match the CPU reference (TEST-376).** `tools/bvh_rehydrate_gpu.py` lays a dehydrated
+  BLAS, its geometry and each dispatch's root table out in one heap and runs the dispatches in the order the data
+  needs: `LeafRehydration` over every 2,048-leaf chunk, then each level from the bottom, its BOX32 run before its
+  BOX16 run (a box reads its children's rehydrated bounds). It compares the output with `tools/bvh_rehydrate.py`.
+  The root-table layout of the three programs is in the tool's docstring. On two real BLASes of `core_bvh4.rpf` (181
+  and 21,814 leaves, geometry identified with `tools/bvh_match.py`), with the leaves seeded from the CPU reference
+  (`--seed-leaves`), `Box16Rehydration` and `Box32Rehydration` write all 376 BOX16 and 8,069 BOX32 nodes and all
+  8,443 parent entries as the reference does, and change no heap byte outside the output (NVIDIA RTX 4080, modules
+  translated with `--wave64-emulate`, 34 dispatches). Found on the way:
+  * *Empty-slot fill.* A BOX32 slot without a child gets `+inf` in its minimum and `-inf` in its maximum from
+    `Box32Rehydration`: the program loads `0x7f800000` and `0xff800000` at its start and writes them into the slots
+    past the child count, and again for a child of no box or triangle type. The PC library
+    (`RehydrateRaytracingAccelerationStructureX`) and `tools/bvh_rehydrate.py` write `+-FLT_MAX` there. These were
+    the only differing bytes (3,292 slots in 2,235 nodes); the tool counts them as their own category. Empty BOX16
+    slots are half `+-inf` on both sides.
+  * *A box group's node count is its number of active lanes.* The root table has no count: the programs take it from
+    `s_bcnt1_i32_b64` of EXEC and place the child pointers and override values after that many node words, so the
+    console runs a run's last group with fewer lanes. `vk_compute_test` runs whole groups; the tool dispatches each
+    run's last group on its own from a copy padded to 64 node words (`--partial pad`).
+  * *Wave64.* All three programs are wave64 (EXEC as 64 bits, a cross-lane read of lane 32, `v_permlanex16_b32`).
+    Translated without `--wave64-emulate` and run on 32-lane subgroups, every box node comes out wrong.
+  * *`LeafRehydration` loses the device* (`VK_ERROR_DEVICE_LOST` at the queue wait) with a real table on the RTX 4080,
+    with and without `--wave64-emulate`. The cause is open. Ruled out without a GPU: every pointer the module forms
+    adds the heap base; every address an active lane computes on the 181-leaf input (geometry record, index,
+    vertex, transform) lies inside the heap; inactive lanes issue no loads; the module has no loops; both early-out
+    branches land before its one `s_barrier`, so every wave reaches it. It differs from the 49 programs that run in
+    its 1,024-thread groups, its size (about 301,000 SPIR-V words) and `v_mad_u64_u32` for the vertex addresses.
+    It also finds a chunk's five leaf arrays from the chunk's own leaf count, so a smaller count at its `+0x2c`
+    needs the arrays packed for it (`--leaf-count`).
 * **What is still open.** The other programs' outputs (the sorts, prefix sums, builders, refit and loaders) are not
-  checked against a reference yet; the rehydration trio has one in TEST-376 (`tools/bvh_rehydrate.py`); `LeafRehydration` does not finish within 60 s with either table described
-  above. Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
+  checked against a reference yet, and neither is `LeafRehydration` (above). Which of them the game actually creates is a call-site question (RT-5). The module-to-pipeline order
   above comes from `ILDN`, not from a runtime trace. The `STAT` bitcode and the `0x07 NOBC` record are not
   explained.
 
@@ -230,6 +258,20 @@ byte-exact cases. Its report holds module names, statuses
 and counts only. `tests/test_bvh_gpu_smoke.py` checks the heap image, the word count and the judging of runs with a
 fake `vk_compute_test`, and the checked cases' inputs and judging (a fake that does what each case describes passes,
 one wrong byte fails), without a GPU or game files.
+
+`tools/bvh_rehydrate_gpu.py` runs the three rehydration programs on a dehydrated BLAS and compares them with
+`tools/bvh_rehydrate.py` (TEST-376, above). It takes the inputs `bvh_rehydrate.py` takes plus the translated modules:
+
+```powershell
+python -I tools/bvh_rehydrate_gpu.py <dehydrated.bin> --header-offset 256 --geom VB,IB [--geom ...] --spirv <dir> --vkc <vk_compute_test> [--seed-leaves | --leaf-count N] [--json report.json]
+python -I tests/test_bvh_rehydrate_gpu.py
+```
+
+It refuses a `vk_compute_test` built before `VKC_HEAP_INIT` existed (an older build ignores the variable and runs every
+program on its fill), and it stops at a dispatch whose dump has lost the read-only table or input. The report holds
+counts, statuses and heap addresses only; `--work` keeps the heap images, which hold the BLAS and its geometry.
+`tests/test_bvh_rehydrate_gpu.py` builds synthetic BLASes and runs the chain against a fake `vk_compute_test` that
+sets up memory as the real one does and does what the root-table layout says each program does.
 
 `tools/pe_shader_containers.py` is standard library only and reads the file, never runs it. It accepts a
 container only when the chunk table is sorted, 4-byte aligned, entirely inside the declared total and its last

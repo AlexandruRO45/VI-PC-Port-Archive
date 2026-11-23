@@ -490,7 +490,9 @@ structure, 2 to 21,814 leaves). The other two were identified later (below) and 
   24-bit override mask`, then every child pointer, then the override values (`f32` in BOX32, half in BOX16), one per
   mask bit. Bit `6 * slot + c` covers component `c` of a slot (`min xyz`, then `max xyz`). Rehydration recomputes each
   slot's box from the rehydrated child and then writes the stored values over the masked components. BOX16 rounds
-  min down and max up; a bound past the half range becomes `+-inf` (`0x7c00`/`0xfc00`), not `+-65504`.
+  min down and max up; a bound past the half range becomes `+-inf` (`0x7c00`/`0xfc00`), not `+-65504`. A slot without
+  a child is `+FLT_MAX`/`-FLT_MAX` in a BOX32 node of the library's output and half `+-inf` in a BOX16 node; the
+  console's `Box32Rehydration` writes `+-inf` in the BOX32 case ([embedded_shaders.md](embedded_shaders.md), TEST-376).
 * *Leaf frame.* Leaf vertices are `(R * v - t) * s`, from `compressionParams`: bit 31 enables a per-axis scale
   `2^(e - 127)` with `e` the bytes 0, 1 and 2; bit 30 enables a translation per axis, the centre of `sceneBounds`
   where the bounds do not straddle zero; bits 24-29 select one of 64 rotations, `Rz * Ry * Rx` in steps of pi/8
@@ -816,6 +818,15 @@ in §4a. On the 8 samples whose geometry was identified first, its output is byt
 `XboxBvhBuilder.dll`'s `RehydrateRaytracingAccelerationStructureX` writes (384 to 2,512,512 bytes per structure). It
 is the reference for checking the builder's `Box16Rehydration`, `Box32Rehydration` and `LeafRehydration` programs on
 a GPU ([embedded_shaders.md](embedded_shaders.md)). Its tests are synthetic.
+
+**Measured against the console programs (TEST-376).** `tools/bvh_rehydrate_gpu.py` runs the three programs through
+`vk_compute_test` and compares their output with this tool. On the first two BLAS of `core_bvh4.rpf` (181 and 21,814
+leaves, geometry identified with `bvh_match.py`), with the leaves seeded from this tool's output, `Box16Rehydration`
+and `Box32Rehydration` write all 376 BOX16 and 8,069 BOX32 nodes and all 8,443 parent entries as this tool does
+(NVIDIA RTX 4080, modules translated with `--wave64-emulate`). The one systematic difference is the empty-slot fill
+above: `+-inf` from the console program, `+-FLT_MAX` from the library and this tool, in 3,292 slots of 2,235 BOX32
+nodes, which the GPU tool reports apart. `LeafRehydration` loses the device on that GPU; the cause is open
+([embedded_shaders.md](embedded_shaders.md) lists what was ruled out), so the leaves are not checked yet.
 
 The output keeps the console's size convention: `64 * (totalSizeIn64BNodes + 1)` bytes from the header, which is the
 `0x140 + 64 * n` end of §3.1 with the header at `0x100`. `tools/xdxr_bvh.py validate` and the GPU builder use
