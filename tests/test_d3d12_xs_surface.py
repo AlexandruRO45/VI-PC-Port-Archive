@@ -101,6 +101,46 @@ def test_scarab_cross_check():
     assert errors == []
 
 
+def _scarab_paths(root):
+    return (
+        os.path.join(root, "components", "runtime-bridge", "src", "iid_table.cpp"),
+        os.path.join(root, "components", "extension-wrapper", "src", "iid_console.inc"),
+        os.path.join(root, "components", "extension-wrapper", "docs", "console-extension-catalogue.tsv"),
+    )
+
+
+def test_check_scarab_reports_directory_paths_as_errors():
+    with tempfile.TemporaryDirectory() as tmp:
+        for path in _scarab_paths(tmp):
+            os.makedirs(path)
+        errors, _notes = S.check_scarab(tmp)
+        assert len(errors) == 3, errors
+        assert S.main(["--scarab", tmp]) == 1
+
+
+def test_check_scarab_reports_invalid_utf8_as_errors():
+    with tempfile.TemporaryDirectory() as tmp:
+        for path in _scarab_paths(tmp):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"\xff\xfe")
+        errors, _notes = S.check_scarab(tmp)
+        assert len(errors) == 3, errors
+        assert S.main(["--scarab", tmp]) == 1
+
+
+def test_check_scarab_reports_read_oserror_as_errors():
+    with tempfile.TemporaryDirectory() as tmp:
+        for path in _scarab_paths(tmp):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(b"")
+        with mock.patch("builtins.open", side_effect=OSError(13, "Permission denied")):
+            errors, _notes = S.check_scarab(tmp)
+        assert len(errors) == 3, errors
+        assert all("Permission denied" in e for e in errors), errors
+
+
 if __name__ == "__main__":
     test_slots_are_116()
     test_data_classes()
@@ -109,6 +149,9 @@ if __name__ == "__main__":
     test_unrecovered_console_iids_stay_outside_the_table()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
+    test_check_scarab_reports_directory_paths_as_errors()
+    test_check_scarab_reports_invalid_utf8_as_errors()
+    test_check_scarab_reports_read_oserror_as_errors()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
     for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):

@@ -511,6 +511,18 @@ def parse_scarab_catalogue(path):
     return rows
 
 
+def _read_scarab_file(path, parser, errors):
+    """Read and parse one SCARAB file, recording missing/non-file/decode/read errors."""
+    if not os.path.isfile(path):
+        errors.append(("not a file: %s" if os.path.exists(path) else "missing %s") % path)
+        return None
+    try:
+        return parser(path)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        errors.append("unreadable %s: %s" % (path, exc))
+        return None
+
+
 def check_scarab(root):
     """Cross-check the table against a SCARAB checkout. Returns (errors, notes)."""
     errors = []
@@ -519,8 +531,8 @@ def check_scarab(root):
     iid_console = os.path.join(root, "components", "extension-wrapper", "src", "iid_console.inc")
     catalogue = os.path.join(root, "components", "extension-wrapper", "docs",
                              "console-extension-catalogue.tsv")
-    if os.path.exists(iid_table):
-        theirs = parse_scarab_iid_table(iid_table)
+    theirs = _read_scarab_file(iid_table, parse_scarab_iid_table, errors)
+    if theirs is not None:
         mine = dict(STANDARD_GUIDS)
         mine.update(CONSOLE_IIDS)
         if set(theirs) != set(mine):
@@ -530,25 +542,21 @@ def check_scarab(root):
                 errors.append("%s: SCARAB %s != table %s"
                               % (name, guid_text(theirs[name]), guid_text(mine[name])))
         notes.append("iid_table.cpp: %d GUID values compared" % len(theirs))
-    else:
-        errors.append("missing %s" % iid_table)
-    if os.path.exists(iid_console):
-        theirs = parse_scarab_iid_console(iid_console)
+    theirs_console = _read_scarab_file(iid_console, parse_scarab_iid_console, errors)
+    if theirs_console is not None:
         known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
-        unexpected = set(theirs) - known
+        unexpected = set(theirs_console) - known
         if unexpected:
             errors.append("iid_console.inc has names not in the table: %s" % sorted(unexpected))
         mine = {name: n for n, name, _kind, _ev in DATA_EXPORTS
-                if name in theirs}
-        for name in sorted(set(theirs) & set(mine)):
-            if theirs[name] != mine[name]:
+                if name in theirs_console}
+        for name in sorted(set(theirs_console) & set(mine)):
+            if theirs_console[name] != mine[name]:
                 errors.append("%s: SCARAB ordinal %d != table %d"
-                              % (name, theirs[name], mine[name]))
-        notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs) & set(mine)))
-    else:
-        errors.append("missing %s" % iid_console)
-    if os.path.exists(catalogue):
-        rows = parse_scarab_catalogue(catalogue)
+                              % (name, theirs_console[name], mine[name]))
+        notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs_console) & set(mine)))
+    rows = _read_scarab_file(catalogue, parse_scarab_catalogue, errors)
+    if rows is not None:
         methods = [r for r in rows if r[0] == "method"]
         enums = [r for r in rows if r[0] == "enum"]
         notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
@@ -558,8 +566,6 @@ def check_scarab(root):
         missing = sorted(CATALOGUE_NON_METHODS - present)
         if missing:
             errors.append("catalogue non-method rows missing: %s" % missing)
-    else:
-        errors.append("missing %s" % catalogue)
     return errors, notes
 
 
