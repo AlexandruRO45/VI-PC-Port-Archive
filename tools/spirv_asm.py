@@ -74,8 +74,8 @@ class SpirvAsmError(ValueError):
     """Raised when SPIR-V assembly text cannot be encoded."""
 
 
-def _tokenize_line(line: str, lineno: int) -> list[str]:
-    """Split one assembly line into tokens, stripping ';' comments outside quoted strings."""
+def _tokenize_line(line: str, lineno: int, lines) -> list[str]:
+    """Tokenize an instruction, consuming more source lines only inside quoted strings."""
     if '"' not in line:
         semi = line.find(";")
         return (line[:semi] if semi >= 0 else line).split()
@@ -92,7 +92,14 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
         if ch == '"':
             j = i + 1
             out = ['"']
-            while j < n:
+            while True:
+                if j == n:
+                    continuation = next(lines, None)
+                    if continuation is None:
+                        raise SpirvAsmError(f"line {lineno}: unterminated string literal")
+                    _, line = continuation
+                    j, n = 0, len(line)
+                    continue
                 c = line[j]
                 if c == "\\" and j + 1 < n:
                     out.append(c)
@@ -105,8 +112,6 @@ def _tokenize_line(line: str, lineno: int) -> list[str]:
                 else:
                     out.append(c)
                     j += 1
-            else:
-                raise SpirvAsmError(f"line {lineno}: unterminated string literal")
             tokens.append("".join(out))
             i = j
             continue
@@ -415,8 +420,11 @@ def assemble(text: str, target_env: str = "vulkan1.2") -> bytes:
 
         raise SpirvAsmError(f"line {lineno}: unsupported operand kind {kind!r}")
 
-    for lineno, raw_line in enumerate(text.splitlines(), 1):
-        toks = _tokenize_line(raw_line, lineno)
+    # Keep delimiters as literal string data; a quoted string can span source lines.
+    # Sharing the iterator preserves the next instruction's physical line number.
+    lines = enumerate(text.splitlines(keepends=True), 1)
+    for lineno, raw_line in lines:
+        toks = _tokenize_line(raw_line, lineno, lines)
         if not toks:
             continue
         res_tok = None
