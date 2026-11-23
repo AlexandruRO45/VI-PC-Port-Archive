@@ -165,7 +165,8 @@ skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's 
 (read raw barycentrics from an interpolated input, for devices without `VK_KHR_fragment_shader_barycentric`),
 `--texel-offset-fallback` (fold `image_sample*_o` offsets into the coordinate, for devices without
 `VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`).
-Each is documented in [docs/design.md](docs/design.md).
+Each is documented in [docs/design.md](docs/design.md). `--bary-fallback` and `--mesh-compute` turn on by themselves
+when `tools/vk_subgroup_info.py` finds that the GPU the runtime would use lacks the feature (RDNA1, NVIDIA Pascal).
 
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
 folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.

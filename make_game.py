@@ -1282,6 +1282,21 @@ def runtime_gpu_per_vertex():
         return None
 
 
+def runtime_gpu_features() -> dict:
+    """fragment_shader_barycentric and mesh_shader as tools/vk_subgroup_info.py answers for the GPU the runtime
+    would use: True or False each, None when it can't tell (no answer, or a probe that doesn't report it)."""
+    info = runtime_gpu_info()
+    return {key: info[key] if isinstance(info.get(key), bool) else None
+            for key in ("fragment_shader_barycentric", "mesh_shader")}
+
+
+# The fallbacks make_game.py turns on by itself where the runtime's GPU lacks the feature they stand in for:
+# (flag, argparse attribute, runtime_gpu_features key, what the log names).
+FEATURE_FALLBACKS = (("--bary-fallback", "bary_fallback", "fragment_shader_barycentric",
+                      "fragmentShaderBarycentric (VK_KHR_fragment_shader_barycentric)"),
+                     ("--mesh-compute", "mesh_compute", "mesh_shader", "mesh shaders (VK_EXT_mesh_shader)"))
+
+
 def runtime_gpu_max_push_constants():
     """max_push_constants_size as tools/vk_subgroup_info.py answers for the GPU the runtime would use, or None."""
     v = runtime_gpu_info().get("max_push_constants_size")
@@ -1988,7 +2003,7 @@ def main() -> int:
     ap.add_argument("--bary-fallback", action="store_true",
                     help="translate raw barycentric reads from an interpolated vec3 input (with a pass-through "
                          "geometry shader the runtime draws), for devices without "
-                         "VK_KHR_fragment_shader_barycentric")
+                         "VK_KHR_fragment_shader_barycentric; on by itself when the runtime's GPU lacks it")
     ap.add_argument("--texel-offset-fallback", action="store_true",
                     help="fold the run-time texel offset of image_sample*_o into the coordinate, for devices "
                          "without VK_KHR_maintenance8")
@@ -1997,7 +2012,7 @@ def main() -> int:
                          "PerVertexKHR inputs; on by itself when the runtime's GPU can't use them (MoltenVK)")
     ap.add_argument("--mesh-compute", action="store_true",
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
-                         "without VK_EXT_mesh_shader")
+                         "without VK_EXT_mesh_shader; on by itself when the runtime's GPU lacks it")
     ap.add_argument("--pc-tail-ubo", action="store_true",
                     help="keep s0..s31 in 128 push-constant bytes and move heap/code base to a set-1 uniform "
                          "block; on by itself when the runtime's GPU reports maxPushConstantsSize below what "
@@ -2064,6 +2079,17 @@ def main() -> int:
             stages = [s for s in stages if s not in WINDOWS_ONLY]
             log(f"{', '.join(WINDOWS_ONLY)}: left out, the cross-build needs {'; '.join(lacking)} "
                 "(or pass --runtime-build)")
+    # Before wave64: --mesh-compute changes which subgroup sizes the mesh shaders need.
+    if "shaders" in stages and not all(getattr(a, attr) for _, attr, _, _ in FEATURE_FALLBACKS):
+        features = runtime_gpu_features()
+        for flag, attr, key, what in FEATURE_FALLBACKS:
+            if getattr(a, attr):
+                continue
+            if features[key] is False:
+                log(f"shaders: the GPU the runtime would use has no {what}: translating with {flag}")
+                setattr(a, attr, True)
+            elif features[key] is None:
+                setattr(a, attr, keep_recorded_fallback(flag, work))
     emulate, keep_emulated = (wave64_settings(a.wave64_emulate, mesh_compute=a.mesh_compute) if "shaders" in stages
                               else (False, a.wave64_emulate == "auto"))
     if "shaders" in stages and not a.f16_interp_fallback:

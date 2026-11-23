@@ -69,6 +69,7 @@ class FakeDevice:
         vk_info.VK_SHADER_STAGE_COMPUTE_BIT | vk_info.VK_SHADER_STAGE_MESH_BIT_EXT
     )
     fragment_shader_barycentric: bool = True
+    mesh_shader: bool = False   # the meshShader bit the driver writes, with or without VK_EXT_mesh_shader listed
     max_push_constants_size: int = 256
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
@@ -250,10 +251,13 @@ class FakeVulkan:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.synchronization2)
             elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR:
                 ctypes.c_uint32.from_address(node_addr + 16).value = int(dev.fragment_shader_barycentric)
+            elif stype == vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT:
+                ctypes.c_uint32.from_address(node_addr + vk_info.MESH_FEATURES_MESH_SHADER).value = int(dev.mesh_shader)
         expected = {
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR,
+            vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
         }
         if dev.api_version >= vk_info.VK_API_VERSION_1_3:
             expected.add(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
@@ -329,6 +333,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES, 1000225000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, 1000196000)
         self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR, 1000203000)
+        self.assertEqual(vk_info.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT, 1000328000)
 
     def test_shader_stage_bits(self):
         self.assertEqual(vk_info.VK_SHADER_STAGE_COMPUTE_BIT, 0x20)
@@ -356,6 +361,8 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F12_SIZE, 208)
         self.assertEqual(vk_info.F13_SIZE, 80)
         self.assertEqual(vk_info.BARY_FEATURES_SIZE, 24)
+        self.assertEqual(vk_info.MESH_FEATURES_SIZE, 40)
+        self.assertEqual(vk_info.MESH_FEATURES_MESH_SHADER, 20)
         self.assertEqual(vk_info.DRIVER_PROPS_SIZE, 536)
         self.assertEqual(vk_info.QUEUE_FAMILY_SIZE, 24)
 
@@ -797,6 +804,8 @@ class QueryTest(unittest.TestCase):
                     "native64_compute": want_native64 or label == "missing_mesh_stage_bit",
                     "native64": want_native64,
                     "per_vertex_inputs": True,
+                    "fragment_shader_barycentric": False,   # the feature is set, its extension isn't listed
+                    "mesh_shader": False,
                     "max_push_constants_size": 256,
                     "vendor_id": 0,
                     "device_id": 0,
@@ -819,6 +828,22 @@ class QueryTest(unittest.TestCase):
             with self.subTest(case=label):
                 res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, driver_id=driver))
                 self.assertIs(res["per_vertex_inputs"], want)
+
+    def test_feature_fields_need_their_extension(self):
+        """fragment_shader_barycentric and mesh_shader are the feature bits, each only where the device lists the
+        extension: AMD's Windows driver writes meshShader = 1 on an RX 5700 XT, which has no VK_EXT_mesh_shader."""
+        bary_ext, mesh_ext = b"VK_KHR_fragment_shader_barycentric", b"VK_EXT_mesh_shader"
+        for label, bary, mesh, names, want_bary, want_mesh in (
+                ("both", True, True, (bary_ext, mesh_ext), True, True),
+                ("neither_feature", False, False, (bary_ext, mesh_ext), False, False),
+                ("rdna1_amd_windows", False, True, (), False, False),
+                ("bits_without_extensions", True, True, (), False, False),
+                ("mesh_only", False, True, (mesh_ext,), False, True)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(fragment_shader_barycentric=bary, mesh_shader=mesh,
+                                                      extension_names=names))
+                self.assertIs(res["fragment_shader_barycentric"], want_bary)
+                self.assertIs(res["mesh_shader"], want_mesh)
 
     def test_stage_caps_preserve_graphics_stage_bits(self):
         supported = 0x01 | 0x08 | 0x10 | 0x20

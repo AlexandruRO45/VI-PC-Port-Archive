@@ -32,6 +32,12 @@ docs/design.md): the fragmentShaderBarycentric feature, and a driver other than 
 conversion rejects the decoration ("PerVertexKHR decoration is not supported in MSL", MoltenVK 1.4.2). Where it is
 false, the shaders are translated with --f16-interp-fallback.
 
+fragment_shader_barycentric and mesh_shader are the fragmentShaderBarycentric and meshShader features themselves, each
+only where the device also lists its extension (VK_KHR_fragment_shader_barycentric, VK_EXT_mesh_shader), as the
+runtime checks: AMD's Windows driver (26.11.2) fills VkPhysicalDeviceMeshShaderFeaturesEXT with ones on an RX 5700 XT,
+which has no VK_EXT_mesh_shader. Where either is false, make_game.py translates with the fallback that stands in for it: --bary-fallback (a pass-through
+geometry shader feeds the raw barycentrics) and --mesh-compute (mesh shaders as compute shaders and a draw).
+
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
 RDNA2 iGPUs and some Intel Arc drivers), make_game.py translates with --pc-tail-ubo.
@@ -54,6 +60,7 @@ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR = 1000314007
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES = 1000225000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES = 1000196000
 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR = 1000203000
+VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT = 1000328000
 VK_DRIVER_ID_MOLTENVK = 14
 VK_DRIVER_ID_AMD_PROPRIETARY = 1
 AMD_VENDOR_ID = 0x1002
@@ -67,6 +74,8 @@ RDNA2_DEVICE_IDS = ((0x73A0, 0x73FF), (0x7420, 0x743F), (0x163F, 0x163F), (0x143
                     (0x1506, 0x1506), (0x164E, 0x164E), (0x13C0, 0x13C0))
 DRIVER_PROPS_SIZE = 536     # sizeof(VkPhysicalDeviceDriverProperties): 16 + driverID + 2 x char[256] + version, padded
 BARY_FEATURES_SIZE = 24     # sizeof(VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR): 16 + one VkBool32
+MESH_FEATURES_SIZE = 40     # sizeof(VkPhysicalDeviceMeshShaderFeaturesEXT): 16 + five VkBool32, padded
+MESH_FEATURES_MESH_SHADER = 20  # meshShader, after taskShader
 VK_SHADER_STAGE_COMPUTE_BIT = 0x20
 VK_SHADER_STAGE_MESH_BIT_EXT = 0x80
 VK_QUEUE_GRAPHICS_BIT = 1
@@ -256,6 +265,8 @@ def query(*, stage_caps=False) -> dict:
             f13 = block(F13_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
             f12 = block(F12_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
             bary = block(BARY_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR)
+            mesh = block(MESH_FEATURES_SIZE, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT)
+            set_next(bary, mesh)
             if core13:
                 set_next(f12, f13)
                 set_next(f13, bary)
@@ -286,11 +297,16 @@ def query(*, stage_caps=False) -> dict:
             rank = device_rank(dtype, vendor_id)
             if rank > chosen_rank:
                 chosen_rank = rank
+                # A feature counts only with its extension listed: AMD's Windows driver fills
+                # VkPhysicalDeviceMeshShaderFeaturesEXT with ones on RDNA1, which has no VK_EXT_mesh_shader.
+                extensions = device_extensions(vk, d)
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          bool(u32(bary, 16)) and b"VK_KHR_fragment_shader_barycentric" in extensions,
+                          bool(u32(mesh, MESH_FEATURES_MESH_SHADER)) and b"VK_EXT_mesh_shader" in extensions,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),
                           int.from_bytes(raw[PROPS_DEVICE_ID:PROPS_DEVICE_ID + 4], "little"), u32(drv, 16))
@@ -302,7 +318,7 @@ def query(*, stage_caps=False) -> dict:
                 )
             raise RuntimeError("no Vulkan 1.3 GPU with the features and graphics queue the runtime needs")
         (name, subgroup_size, supported_stages, lo, hi, required_stages, max_workgroup_subgroups,
-         sgc, per_vertex, max_push_constants_size, vendor, device, driver) = chosen
+         sgc, per_vertex, barycentric, mesh_shader, max_push_constants_size, vendor, device, driver) = chosen
         compute_required = bool(required_stages & VK_SHADER_STAGE_COMPUTE_BIT)
         mesh_required = bool(required_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
         compute_supported = bool(supported_stages & VK_SHADER_STAGE_COMPUTE_BIT)
@@ -324,6 +340,8 @@ def query(*, stage_caps=False) -> dict:
             "native64_compute": compute64,
             "native64": compute64 and mesh64,
             "per_vertex_inputs": per_vertex,
+            "fragment_shader_barycentric": barycentric,
+            "mesh_shader": mesh_shader,
             "max_push_constants_size": max_push_constants_size,
             "vendor_id": vendor,
             "device_id": device,
