@@ -897,7 +897,7 @@ void check_run_time_load() {
         const GUID game_cls = {0x973a344e, 0x24bf, 0x4d0f, {0x84, 0x57, 0x56, 0xc5, 0x34, 0x89, 0x2b, 0x29}};
         char tmp[MAX_PATH] = {};
         GetTempPathA(sizeof(tmp), tmp);
-        const std::string dir = std::string(tmp) + "leonida_inline_config_test";
+        const std::string dir = std::string(tmp) + "leonida_inline_config_test_" + std::to_string(GetCurrentProcessId());
         CreateDirectoryA(dir.c_str(), nullptr);
         const std::string config = dir + "\\MicrosoftGame.Config";
         DeleteFileA(config.c_str());
@@ -935,6 +935,25 @@ void check_run_time_load() {
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
               "inline config remains after first uninitialize");
         check(first_uninit == S_OK && uninit_api() == S_OK, "uninitialize both references");
+        // Mirror the runtime's documented behavior: the latest inline config replaces the previous one
+        // and remains in effect until the last initialization reference exits.
+        const char first_config[] = "<Game><TitleId>11111111</TitleId></Game>";
+        const char second_config[] = "<Game><TitleId>22222222</TitleId></Game>";
+        Options first_options{1, TRUE, first_config};
+        Options second_options{1, TRUE, second_config};
+        check(init_ex2(0x2410, 0, 2, &first_options) == S_OK, "initialize first distinct inline config");
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0x11111111u,
+              "first distinct inline config is active");
+        check(init_ex2(0x2410, 0, 2, &second_options) == S_OK, "initialize second distinct inline config");
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0x22222222u,
+              "second inline config replaces first");
+        check(uninit_api() == S_OK, "uninitialize one distinct inline reference");
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0x22222222u,
+              "second inline config remains until last reference exits");
+        check(uninit_api() == S_OK, "uninitialize last distinct inline reference");
         id = 0;
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == E_FAIL,
               "inline config is cleared after uninitialize");
