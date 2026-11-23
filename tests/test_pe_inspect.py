@@ -282,6 +282,54 @@ class PeInspectTest(unittest.TestCase):
         for report in (self.report, self.report32):
             self.assertEqual(report["pdata_functions"], 3)
             self.assertEqual(report["tls_callbacks"], 2)
+            self.assertFalse(report["has_static_tls"])
+            self.assertEqual(report["tls_raw_size"], 0)
+            self.assertEqual(report["tls_zero_fill"], 0)
+            self.assertEqual(report["tls_total_size"], 0)
+            self.assertFalse(report["tls_has_index"])
+
+    def test_static_tls_directory_is_reported_for_pe64_and_pe32(self):
+        for is64 in (True, False):
+            with self.subTest(is64=is64):
+                base = IMAGE_BASE if is64 else BASE32
+                buf = bytearray(build_image(is64=is64))
+                tls = bytearray(40 if is64 else 24)
+                fmt = "<QQQQII" if is64 else "<IIIIII"
+                struct.pack_into(
+                    fmt,
+                    tls,
+                    0,
+                    base + 0x1980,   # StartAddressOfRawData
+                    base + 0x19A8,   # EndAddressOfRawData (40 bytes raw)
+                    base + 0x19C0,   # AddressOfIndex
+                    base + 0x1940,   # AddressOfCallBacks
+                    0x20,            # SizeOfZeroFill (32 bytes)
+                    0,               # Characteristics
+                )
+                place(buf, 0x1900, bytes(tls))
+                path = os.path.join(self.dir, f"static_tls_{'64' if is64 else '32'}.dll")
+                with open(path, "wb") as f:
+                    f.write(bytes(buf))
+                report = pe_inspect.inspect(path, self.dir)
+                self.assertEqual(report["tls_callbacks"], 2)
+                self.assertTrue(report["has_static_tls"])
+                self.assertEqual(report["tls_raw_size"], 40)
+                self.assertEqual(report["tls_zero_fill"], 32)
+                self.assertEqual(report["tls_total_size"], 72)
+                self.assertTrue(report["tls_has_index"])
+                md = pe_inspect.to_markdown(report)
+                self.assertIn("static TLS: 72 bytes (40 raw + 32 zero-fill)", md)
+
+    def test_invalid_tls_raw_range_raises_pe_format_error(self):
+        buf = bytearray(build_image(is64=True))
+        tls = bytearray(40)
+        struct.pack_into("<QQ", tls, 0, IMAGE_BASE + 0x19A0, IMAGE_BASE + 0x1980)
+        place(buf, 0x1900, bytes(tls))
+        path = os.path.join(self.dir, "bad_tls_range.dll")
+        with open(path, "wb") as f:
+            f.write(bytes(buf))
+        with self.assertRaises(pe_inspect.PeFormatError):
+            pe_inspect.inspect(path, self.dir)
 
     def test_pe32_headers_and_thunks(self):
         r = self.report32

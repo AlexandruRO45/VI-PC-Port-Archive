@@ -281,30 +281,53 @@ def _export_module_name(img: PeImage) -> str:
     return img.string_at(struct.unpack_from("<I", img.data, at + 12)[0]) or ""
 
 
-def _tls_callbacks(img: PeImage) -> int:
+def _tls_info(img: PeImage) -> dict:
     rva, size = img.directory(DIR_TLS)
     header_size = 40 if img.is64 else 24
     callbacks_end = 32 if img.is64 else 16
+    empty = {
+        "callbacks": 0,
+        "has_static_tls": False,
+        "raw_size": 0,
+        "zero_fill": 0,
+        "total_size": 0,
+        "has_index": False,
+    }
     if not rva or size < header_size:
-        return 0
+        return empty
     at = img.offset(rva, header_size)
     if at is None:
         start = img.offset(rva)
         if start is not None and start + callbacks_end > len(img.data):
             raise PeFormatError("truncated TLS directory")
-        return 0
-    callbacks_va = struct.unpack_from("<Q" if img.is64 else "<I", img.data, at + (24 if img.is64 else 12))[0]
-    if not callbacks_va or callbacks_va < img.image_base:
-        return 0
-    callbacks = callbacks_va - img.image_base
+        return empty
+    fmt = "<QQQQII" if img.is64 else "<IIIIII"
+    start_va, end_va, index_va, callbacks_va, zero_fill, _chars = struct.unpack_from(fmt, img.data, at)
+    if end_va < start_va:
+        raise PeFormatError("invalid TLS raw data range")
+    raw_size = end_va - start_va if start_va or end_va else 0
+    total_size = raw_size + zero_fill
     count = 0
-    width = 8 if img.is64 else 4
-    for i in range(MAX_ENTRIES):
-        entry = img.offset(callbacks + i * width, width)
-        if entry is None or not img.word(entry):
-            break
-        count += 1
-    return count
+    if callbacks_va and callbacks_va >= img.image_base:
+        callbacks = callbacks_va - img.image_base
+        width = 8 if img.is64 else 4
+        for i in range(MAX_ENTRIES):
+            entry = img.offset(callbacks + i * width, width)
+            if entry is None or not img.word(entry):
+                break
+            count += 1
+    return {
+        "callbacks": count,
+        "has_static_tls": total_size > 0,
+        "raw_size": raw_size,
+        "zero_fill": zero_fill,
+        "total_size": total_size,
+        "has_index": index_va != 0,
+    }
+
+
+def _tls_callbacks(img: PeImage) -> int:
+    return _tls_info(img)["callbacks"]
 
 
 _apiset_cache: dict[str, bool] = {}
@@ -414,6 +437,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         entry["where"] = classify_dll(entry["name"], game_dir)
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
+    tls = _tls_info(img)
 
     return {
         "file": os.path.basename(path),
@@ -432,18 +456,28 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "export_count": len(exports),
         "exports": exports,
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
-        "tls_callbacks": _tls_callbacks(img),
+        "tls_callbacks": tls["callbacks"],
+        "has_static_tls": tls["has_static_tls"],
+        "tls_raw_size": tls["raw_size"],
+        "tls_zero_fill": tls["zero_fill"],
+        "tls_total_size": tls["total_size"],
+        "tls_has_index": tls["has_index"],
         "runtime_load_candidates": loads,
     }
 
 
 def to_markdown(r: dict) -> str:
+    static_tls = (
+        f"{r['tls_total_size']:,} bytes ({r['tls_raw_size']:,} raw + {r['tls_zero_fill']:,} zero-fill)"
+        if r.get("has_static_tls") else "no"
+    )
     out = [f"# {r['file']}", "",
            f"- {r['machine']}, {'DLL' if r['is_dll'] else 'EXE'}, subsystem {r['subsystem']}, {r['size']:,} bytes",
            f"- image base {r['image_base']}, size {r['size_of_image']:,}, entry RVA {r['entry_rva']}",
            f"- relocations: {'yes' if r['has_relocs'] else 'NO (must load at preferred base)'}; "
            f"ASLR flag: {r['dynamic_base']}",
-           f"- .pdata functions: {r['pdata_functions']:,}; TLS callbacks: {r['tls_callbacks']}; exports: {r['export_count']}",
+           f"- .pdata functions: {r['pdata_functions']:,}; TLS callbacks: {r['tls_callbacks']}; "
+           f"static TLS: {static_tls}; exports: {r['export_count']}",
            "", "## Sections", "", "| name | rva | vsize | exec | write | entropy | |", "|---|---|---|---|---|---|---|"]
     for s in r["sections"]:
         flag = "**encrypted?**" if s["looks_encrypted"] else ""
