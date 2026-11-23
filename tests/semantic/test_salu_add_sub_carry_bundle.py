@@ -220,6 +220,18 @@ class TestSAddU32CarryAndSCC(unittest.TestCase):
         self.assertEqual(ref_s_add_u32(0, 0), (0, 0))
         self.assertEqual(ref_s_add_u32(0xFFFFFFFF, 0), (0xFFFFFFFF, 0))
 
+class TestSAddU32Translator(unittest.TestCase):
+    def test_translator_s_add_u32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0xffffffff",
+            "s_add_u32 s5, s4, 1",
+            "v_mov_b32_e32 v1, s5",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_add_u32")
+        for l in range(32):
+            self.assertEqual(results[l], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
