@@ -50,11 +50,6 @@ The 23 sites pass these constants (`allocation_type`, `attributes`, `protect`; t
 | `0x20406000` | `0x27` | `0x1004`, `0x1404`, `0x8404`, `0x2404`, `0x2004` | 5 (one each) |
 | `0x42000` | `0x7` | `0x1` | 1 |
 
-Every `attributes` value is nonzero, and `runtime/shims/xmem.cpp` returns `ERROR_NOT_SUPPORTED` for a nonzero value
-("until their host mapping is known"), so none of the 23 calls succeeds there. Past that check the shim would also
-refuse the calls with `allocation_type` `0x20003000` (5 sites: the 2 MiB page mode) and those with bits it does not
-know: `0x4000` in `0x20406000` (5 sites) and `0x40000` in `0x42000` (1 site).
-
 The `protect` values are not Win32 protections alone. The Windows SDK's `winnt.h` defines the graphics page protections
 the high bits match: `PAGE_GRAPHICS_NOACCESS` `0x800`, `_READONLY` `0x1000`, `_READWRITE` `0x2000`, `_EXECUTE_READ`
 `0x8000`, `_COHERENT` `0x20000`, `_NOCACHE` `0x40000`, beside `PAGE_WRITECOMBINE` `0x400`. Read that way, `0x2004` is
