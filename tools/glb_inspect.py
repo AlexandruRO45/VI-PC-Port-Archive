@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import struct
 import sys
@@ -221,9 +222,12 @@ def _accessor_max(accessor: dict | None) -> float | None:
     if (isinstance(upper, list) and upper
             and isinstance(upper[0], (int, float)) and not isinstance(upper[0], bool)):
         try:
-            return float(upper[0])
+            bound = float(upper[0])
         except (OverflowError, ValueError):
             return None  # an integer too large to be a float has no usable bound
+        # JSON numbers like 1e400 parse as infinity; they are not usable as
+        # animation durations and cannot be serialized with allow_nan=False.
+        return bound if math.isfinite(bound) else None
     return None
 
 
