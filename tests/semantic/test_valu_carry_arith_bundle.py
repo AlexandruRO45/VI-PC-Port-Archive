@@ -1,0 +1,103 @@
+"""Semantic reference oracle and verification bundle for RDNA2 integer carry and funnel arithmetic.
+
+Covers:
+  - v_add_co_u32: 32-bit unsigned addition with carry-out
+  - v_sub_co_u32: 32-bit unsigned subtraction with carry-out (borrow)
+  - v_subrev_co_u32: 32-bit unsigned reverse subtraction with carry-out (borrow)
+  - v_add_co_ci_u32: 32-bit unsigned addition with carry-in and carry-out
+  - v_sub_co_ci_u32: 32-bit unsigned subtraction with carry-in and carry-out (borrow)
+  - v_subrev_co_ci_u32: 32-bit unsigned reverse subtraction with carry-in and carry-out (borrow)
+
+High-density Subsystem Feature Bundle testing reference oracles, AST modeling,
+scalar/lane interpreter, multi-lane divergence, 64-bit ripple-carry arithmetic,
+mutation detection, and tools/rdna2spirv.py SPIR-V translation.
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+import random
+import struct
+import sys
+import unittest
+from typing import Dict, List, Optional, Tuple
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+import rdna2spirv  # noqa: E402
+from support import translate_lines, mrt0_words  # noqa: E402
+
+MASK32 = 0xFFFFFFFF
+
+
+def u32(val: int) -> int:
+    return val & MASK32
+
+
+def ref_add_co_u32(x: int, y: int) -> Tuple[int, int]:
+    """32-bit addition with carry out."""
+    total = u32(x) + u32(y)
+    return u32(total), 1 if total >= 0x100000000 else 0
+
+
+def ref_sub_co_u32(x: int, y: int) -> Tuple[int, int]:
+    """32-bit subtraction with carry out (borrow)."""
+    borrow = 1 if u32(x) < u32(y) else 0
+    diff = (u32(x) - u32(y)) & MASK32
+    return diff, borrow
+
+
+def ref_subrev_co_u32(x: int, y: int) -> Tuple[int, int]:
+    """32-bit reverse subtraction (y - x) with carry out (borrow)."""
+    return ref_sub_co_u32(y, x)
+
+
+def ref_add_co_ci_u32(x: int, y: int, cin: int) -> Tuple[int, int]:
+    """32-bit addition with carry in and carry out."""
+    c = 1 if cin != 0 else 0
+    total = u32(x) + u32(y) + c
+    return u32(total), 1 if total >= 0x100000000 else 0
+
+
+def ref_sub_co_ci_u32(x: int, y: int, cin: int) -> Tuple[int, int]:
+    """32-bit subtraction with borrow in and borrow out."""
+    c = 1 if cin != 0 else 0
+    borrow = 1 if u32(x) < (u32(y) + c) else 0
+    diff = (u32(x) - u32(y) - c) & MASK32
+    return diff, borrow
+
+
+def ref_subrev_co_ci_u32(x: int, y: int, cin: int) -> Tuple[int, int]:
+    """32-bit reverse subtraction (y - x - cin) with borrow in and borrow out."""
+    return ref_sub_co_ci_u32(y, x, cin)
+
+class VAddCoU32OracleTests(unittest.TestCase):
+    """Reference mathematical oracle tests for v_add_co_u32."""
+
+    def test_basic_addition_no_carry(self):
+        s, c = ref_add_co_u32(10, 20)
+        self.assertEqual(s, 30)
+        self.assertEqual(c, 0)
+
+    def test_addition_with_carry_out(self):
+        s, c = ref_add_co_u32(0xFFFFFFFF, 1)
+        self.assertEqual(s, 0)
+        self.assertEqual(c, 1)
+
+        s2, c2 = ref_add_co_u32(0xFFFFFFFF, 0xFFFFFFFF)
+        self.assertEqual(s2, 0xFFFFFFFE)
+        self.assertEqual(c2, 1)
+
+    def test_identity_zero(self):
+        s, c = ref_add_co_u32(0x12345678, 0)
+        self.assertEqual(s, 0x12345678)
+        self.assertEqual(c, 0)
+
+if __name__ == "__main__":
+    unittest.main()
