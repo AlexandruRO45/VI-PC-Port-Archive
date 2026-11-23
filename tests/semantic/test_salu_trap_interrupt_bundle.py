@@ -248,5 +248,31 @@ class TestSTtraceDataImmBoundaries(unittest.TestCase):
         self.assertEqual(words, [0x789, 0x789, 0x789, 0x789])
 
 
+class TestSTtraceDataImmPreservation(unittest.TestCase):
+    def test_scc_untouched_by_imm(self):
+        lines = [
+            "s_cmp_eq_u32 10, 10",             # SCC = 1
+            "s_ttracedata_imm 42",
+            "s_cselect_b32 s0, 0xABC, 0xDEF",  # reads SCC -> 0xABC
+            "s_cmp_lg_u32 10, 10",             # SCC = 0
+            "s_ttracedata_imm 84",
+            "s_cselect_b32 s1, 0xABC, 0xDEF",  # reads SCC -> 0xDEF
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0xABC, 0xDEF, 0xABC, 0xDEF])
+
+    def test_register_dataflow_preservation(self):
+        lines = [
+            "s_mov_b32 s0, 0x55005500",
+            "v_mov_b32 v0, 0x00AA00AA",
+            "s_ttracedata_imm 0x1234",
+            "v_add_nc_u32 v1, v0, s0",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0x00AA00AA, 0x55AA55AA, 0x00AA00AA, 0x55AA55AA])
+
+
 if __name__ == "__main__":
     unittest.main()
