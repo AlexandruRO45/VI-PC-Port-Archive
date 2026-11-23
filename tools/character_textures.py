@@ -383,12 +383,16 @@ def main() -> int:
 
     rows = report_rows(report)
     print_report(report)
-    if args.json:
-        write_json(args.json, report, rows)
-        print("wrote", args.json)
-    if args.csv:
-        write_csv(args.csv, rows)
-        print("wrote", args.csv)
+    try:
+        if args.json:
+            write_json(args.json, report, rows)
+            print("wrote", args.json)
+        if args.csv:
+            write_csv(args.csv, rows)
+            print("wrote", args.csv)
+    except OSError as exc:  # a parent that is a file, a read-only folder, an invalid name
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 
