@@ -370,3 +370,28 @@ def test_cli_console_model_uses_each_shaders_stage(tmp_path):
     plain = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
                            capture_output=True, text=True)
     assert plain.returncode == 1 and "CONTRADICTION" in plain.stdout
+
+
+def _write_utf8_bom(path: Path, text: str) -> None:
+    """What Notepad and PowerShell 5.1 write: a UTF-8 BOM in front of the text."""
+    path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+
+
+@pytest.mark.parametrize("bom_file", ["index", "rootsig"])
+def test_bom_from_a_hand_written_file_is_read(tmp_path: Path, bom_file: str) -> None:
+    # --rootsig is hand-written JSON (docs/d3d12_vulkan.md), so a Windows editor's BOM must not turn it into an
+    # "Unexpected UTF-8 BOM" read error. Same for an index.json an editor has re-saved.
+    index = {"shader": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]}}
+    index_path = tmp_path / "index.json"
+    sig_path = tmp_path / "sig.json"
+    if bom_file == "index":
+        _write_utf8_bom(index_path, json.dumps(index))
+        sig_path.write_text(json.dumps(ROOT_SIG), encoding="utf-8")
+    else:
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        _write_utf8_bom(sig_path, json.dumps(ROOT_SIG))
+    r = subprocess.run([sys.executable, "-I", TOOL, str(index_path), "--rootsig", str(sig_path)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "1 shaders: 1 compatible, 0 contradictory" in r.stdout
+    assert "BOM" not in r.stderr
