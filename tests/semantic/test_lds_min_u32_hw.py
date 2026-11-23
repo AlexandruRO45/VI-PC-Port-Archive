@@ -437,3 +437,80 @@ class TestDsMinU32SIMDMultiLane(unittest.TestCase):
 
         for lane in range(32):
             self.assertEqual(simd.lds.read_dword(lane * 4), 50 + lane)
+
+
+# -----------------------------------------------------------------------------
+# Part 5: Register Aliasing & In-Place Operand Preservation
+# -----------------------------------------------------------------------------
+
+class TestDsMinU32RegisterAliasing(unittest.TestCase):
+    """Test suite verifying register aliasing semantics and operand preservation."""
+
+    def test_in_place_operand_preservation_non_returning(self):
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x40, 100)
+        interp.rf.set_vgpr(0, 0x40)
+        interp.rf.set_vgpr(1, 25)
+
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1))
+        interp.execute(inst)
+
+        # Memory updated
+        self.assertEqual(interp.lds.read_dword(0x40), 25)
+        # Operands unchanged in non-returning form
+        self.assertEqual(interp.rf.get_vgpr(0), 0x40)
+        self.assertEqual(interp.rf.get_vgpr(1), 25)
+
+    def test_addr_data_aliasing(self):
+        interp = ScalarLDSInterpreter()
+        # vaddr == vdata0: v0 is both address and data
+        addr_val = 0x10
+        interp.lds.write_dword(addr_val, 100)
+        interp.rf.set_vgpr(0, addr_val)
+
+        inst = DsInstruction(DsOpcode.DS_MIN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 0))
+        interp.execute(inst)
+
+        self.assertEqual(interp.lds.read_dword(addr_val), min(100, addr_val))
+        self.assertEqual(interp.rf.get_vgpr(0), addr_val)
+
+    def test_dst_addr_aliasing_returning(self):
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x20, 500)
+        interp.rf.set_vgpr(0, 0x20)
+        interp.rf.set_vgpr(1, 100)
+
+        # vdst == vaddr: v0 gets old memory value
+        inst = DsInstruction(DsOpcode.DS_MIN_RTN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1),
+                              vdst=Register(RegKind.VGPR, 0))
+        interp.execute(inst)
+
+        self.assertEqual(interp.rf.get_vgpr(0), 500)  # Old memory value
+        self.assertEqual(interp.lds.read_dword(0x20), 100)
+
+    def test_dst_data_aliasing_returning(self):
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x30, 800)
+        interp.rf.set_vgpr(0, 0x30)
+        interp.rf.set_vgpr(1, 300)
+
+        # vdst == vdata0: v1 gets old memory value
+        inst = DsInstruction(DsOpcode.DS_MIN_RTN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 1),
+                              vdst=Register(RegKind.VGPR, 1))
+        interp.execute(inst)
+
+        self.assertEqual(interp.rf.get_vgpr(1), 800)
+        self.assertEqual(interp.lds.read_dword(0x30), 300)
+
+    def test_dst_addr_data_all_alias(self):
+        interp = ScalarLDSInterpreter()
+        interp.lds.write_dword(0x40, 1000)
+        interp.rf.set_vgpr(0, 0x40)
+
+        # vdst == vaddr == vdata0
+        inst = DsInstruction(DsOpcode.DS_MIN_RTN_U32, Register(RegKind.VGPR, 0), Register(RegKind.VGPR, 0),
+                              vdst=Register(RegKind.VGPR, 0))
+        interp.execute(inst)
+
+        self.assertEqual(interp.rf.get_vgpr(0), 1000)
+        self.assertEqual(interp.lds.read_dword(0x40), 0x40)
