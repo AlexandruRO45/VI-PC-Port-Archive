@@ -248,6 +248,75 @@ int fspx_checks() {
     return 0;
 }
 
+// Stored blocks at their 16-bit length boundary, including a fixed -> stored -> fixed transition.
+// The mixed stream starts with the fixed literal 'A' and ends with the existing fixed sample. Its first
+// stored header shares a byte with the preceding EOB, exercising align(). Checksums: Python zlib.adler32.
+int stored_block_checks() {
+    struct Case { std::size_t size; std::uint32_t checksum[2]; };
+    const Case cases[] = {
+        {0, {0x00000001u, 0x814a09bau}},
+        {1, {0x000c000cu, 0x82aa09c5u}},
+        {31, {0xe04f0e8bu, 0xd5101844u}},
+        {256, {0x9eb17f81u, 0xd53e893au}},
+        {65535, {0xee58868cu, 0x97959045u}},
+        {65536, {0x75d98772u, 0x35cd912bu}},
+        {131070, {0xbecb0d4bu, 0x93891704u}},
+    };
+    for (const auto& c : cases) {
+        std::vector<std::uint8_t> data(c.size);
+        for (std::size_t i = 0; i < data.size(); ++i) data[i] = std::uint8_t(i * 37 + 11);
+        for (int mixed = 0; mixed != 2; ++mixed) {
+            std::vector<std::uint8_t> stream = {0x78, 0x01}, expected;
+            if (mixed) {
+                stream.insert(stream.end(), {0x72, 0x04, 0x00});  // fixed 'A', EOB, stored header, padding
+                expected.push_back('A');
+            }
+            std::size_t at = 0;
+            do {
+                const auto n = std::min<std::size_t>(65535, data.size() - at);
+                if (!mixed || at) stream.push_back(!mixed && at + n == data.size() ? 1 : 0);
+                stream.push_back(std::uint8_t(n));
+                stream.push_back(std::uint8_t(n >> 8));
+                stream.push_back(std::uint8_t(~n));
+                stream.push_back(std::uint8_t(~n >> 8));
+                stream.insert(stream.end(), data.begin() + at, data.begin() + at + n);
+                at += n;
+            } while (at < data.size());
+            expected.insert(expected.end(), data.begin(), data.end());
+            if (mixed) {
+                stream.insert(stream.end(), fixed.begin() + 2, fixed.end() - 4);
+                const auto suffix = bytes("hello hello hello leonida");
+                expected.insert(expected.end(), suffix.begin(), suffix.end());
+            }
+            for (int shift = 24; shift >= 0; shift -= 8)
+                stream.push_back(std::uint8_t(c.checksum[mixed] >> shift));
+            std::vector<std::uint8_t> out = {0xcc};
+            CHECK(leonida::zlib_inflate(stream, out, expected.size()) && out == expected);
+            // Reuse allocated output as callers do, then reject every short prefix of the small streams.
+            CHECK(leonida::zlib_inflate(stream, out, expected.size()) && out == expected);
+            if (c.size <= 256)
+                for (std::size_t cut = 0; cut < stream.size(); ++cut) {
+                    const std::vector<std::uint8_t> truncated(stream.begin(), stream.begin() + cut);
+                    CHECK(!leonida::zlib_inflate(truncated, out, expected.size()));
+                }
+            // Large payload truncations and incomplete trailers must not read beyond the supplied span.
+            for (const std::size_t cut : {std::size_t(7), std::size_t(8), std::size_t(65541),
+                                          stream.size() - 5, stream.size() - 4, stream.size() - 1})
+                if (cut < stream.size()) {
+                    const std::vector<std::uint8_t> truncated(stream.begin(), stream.begin() + cut);
+                    CHECK(!leonida::zlib_inflate(truncated, out, expected.size()));
+                }
+            if (!expected.empty()) {
+                CHECK(!leonida::zlib_inflate(stream, out, expected.size() - 1));
+                CHECK(out.size() <= expected.size() - 1);
+            }
+            stream[mixed ? 7 : 5] ^= 1;  // NLEN no longer complements LEN
+            CHECK(!leonida::zlib_inflate(stream, out, expected.size()));
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -292,6 +361,8 @@ int main() {
     CHECK(!zlib_inflate(broken, out));
     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
     CHECK(!zlib_inflate(bytes("not zlib"), out));
+
+    CHECK(stored_block_checks() == 0);
 
     Json json;
     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.

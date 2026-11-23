@@ -63,6 +63,15 @@ public:
         return true;
     }
 
+    // Stored blocks are byte-aligned. Check the whole payload before appending it in one copy.
+    bool append_bytes(std::vector<std::uint8_t>& out, std::size_t count) {
+        if (count > in_.size() - pos_) return failed_ = true, false;
+        const auto payload = in_.subspan(pos_, count);
+        out.insert(out.end(), payload.begin(), payload.end());
+        pos_ += count;
+        return true;
+    }
+
     std::size_t position() const { return pos_; }
     bool failed() const { return failed_; }
 
@@ -166,11 +175,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
                 if (!reader.byte(x)) return false;
             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
             if (length != (~complement & 0xffff) || out.size() + length > limit) return false;
-            for (unsigned i = 0; i < length; ++i) {
-                std::uint8_t x;
-                if (!reader.byte(x)) return false;
-                out.push_back(x);
-            }
+            if (!reader.append_bytes(out, length)) return false;
         } else if (type == 1) {  // fixed Huffman
             static const auto tables = [] {
                 std::pair<detail::Huffman, detail::Huffman> t;
