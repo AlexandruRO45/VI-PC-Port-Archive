@@ -136,6 +136,28 @@ public:
         extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
     }
 
+    // VK_EXT_host_image_copy depends on VK_KHR_copy_commands2 and VK_KHR_format_feature_flags2, which are core only
+    // from 1.3: a 1.2 device that enables it without both breaks VUID-vkCreateDevice-ppEnabledExtensionNames-01387,
+    // and a strict driver refuses the device. Whether this device can enable it, from its extension list.
+    bool host_image_copy_available(const std::vector<VkExtensionProperties>& extensions) const {
+        bool host_copy = false, copy_commands2 = false, format_feature_flags2 = false;
+        for (const auto& e : extensions) {
+            host_copy |= std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
+            copy_commands2 |= std::strcmp(e.extensionName, VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME) == 0;
+            format_feature_flags2 |= std::strcmp(e.extensionName, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME) == 0;
+        }
+        return host_copy && (core || (copy_commands2 && format_feature_flags2));
+    }
+
+    // VK_EXT_host_image_copy, after the two extensions it needs on a 1.2 device (none on 1.3).
+    void add_host_image_copy_extensions(std::vector<const char*>& extensions) const {
+        if (!core) {
+            extensions.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
+            extensions.push_back(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
+        }
+        extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+    }
+
 private:
     VkPhysicalDeviceVulkan13Features enable13_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceDynamicRenderingFeaturesKHR rendering_{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};

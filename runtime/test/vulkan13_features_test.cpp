@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -419,6 +420,46 @@ int main() {
         lookup.ext_name = nullptr;
         EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, "vkCmdBeginRendering") == nullptr);
         EXPECT(lookup.queries.size() == 3);
+    }
+
+    // VK_EXT_host_image_copy: on 1.3 by itself; on 1.2 only with VK_KHR_copy_commands2 and
+    // VK_KHR_format_feature_flags2, which are then enabled ahead of it (VUID-vkCreateDevice-ppEnabledExtensionNames-01387).
+    {
+        const auto props = [](std::initializer_list<const char*> names) {
+            std::vector<VkExtensionProperties> out;
+            for (const char* name : names) {
+                VkExtensionProperties p{};
+                std::memcpy(p.extensionName, name, std::strlen(name));
+                out.push_back(p);
+            }
+            return out;
+        };
+        const auto all = props({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME,
+                                VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME});
+        const auto host_only = props({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME});
+        const auto no_flags2 = props({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME});
+        const auto no_copy2 = props({VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME});
+        const auto deps_only = props({VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME});
+
+        Vulkan13Features v13;
+        v13.core = true;
+        EXPECT(v13.host_image_copy_available(host_only) && v13.host_image_copy_available(all));
+        EXPECT(!v13.host_image_copy_available(deps_only));
+        std::vector<const char*> exts;
+        v13.add_host_image_copy_extensions(exts);
+        EXPECT(exts.size() == 1 && std::strcmp(exts[0], VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0);
+
+        v13.core = false;
+        EXPECT(v13.host_image_copy_available(all));
+        EXPECT(!v13.host_image_copy_available(host_only));
+        EXPECT(!v13.host_image_copy_available(no_flags2) && !v13.host_image_copy_available(no_copy2));
+        EXPECT(!v13.host_image_copy_available(deps_only));
+        exts.clear();
+        v13.add_host_image_copy_extensions(exts);
+        EXPECT(exts.size() == 3);
+        EXPECT(std::strcmp(exts[0], VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME) == 0);
+        EXPECT(std::strcmp(exts[1], VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME) == 0);
+        EXPECT(std::strcmp(exts[2], VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0);
     }
 
     std::printf("vulkan13_features: all checks passed\n");

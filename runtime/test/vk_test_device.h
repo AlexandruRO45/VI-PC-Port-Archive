@@ -486,13 +486,11 @@ public:
         }
         VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT};
-        for (const auto& extension : extensions) {
-            if (std::strcmp(extension.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) != 0) continue;
+        if (v13_.host_image_copy_available(extensions)) {  // on a 1.2 device only with the extensions it depends on
             VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
             instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
             host_image_copy = host_copy.hostImageCopy == VK_TRUE;
         }
-        const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
         if (host_image_copy) {
             host_copy.pNext = *v13_.next();  // after the conditional rendering features, if any
             *v13_.next() = &host_copy;
@@ -562,7 +560,7 @@ public:
         if (image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
         if (vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
         if (conditional_rendering) device_extensions.push_back(conditional_extension);
-        if (host_image_copy) device_extensions.push_back(host_image_copy_name);
+        if (host_image_copy) v13_.add_host_image_copy_extensions(device_extensions);
         const char* swapchain = "VK_KHR_swapchain";
         if (presentation) device_extensions.push_back(swapchain);
 #if defined(VK_KHR_swapchain_maintenance1)
