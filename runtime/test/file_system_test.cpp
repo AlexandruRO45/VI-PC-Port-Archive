@@ -1168,6 +1168,23 @@ void run_checks(const std::filesystem::path& root) {
         write_path(overlay / ".gta6rt-temp" / "runtime.tmp", "runtime");
         write_path(overlay / ".gta6rt-deleted" / "data" / "gone.txt", "");
         write_path(overlay / ".gta6rt-other" / "ok.txt", "ok");
+        write_path(overlay / ".gta6rt-deleted" / "x", "marker");
+        const std::wstring host_probe = (overlay / L".gta6rt-deleted.").wstring() + L"\\x";
+        HANDLE host_handle = ::CreateFileW(host_probe.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        std::printf("Host middle-segment trailing-dot normalization: %s\n", host_handle != INVALID_HANDLE_VALUE ? "yes" : "no");
+        if (host_handle != INVALID_HANDLE_VALUE) ::CloseHandle(host_handle);
+        for (const wchar_t* reserved : {L"GAME:\\.gta6rt-deleted.\\x", L"GAME:\\.gta6rt-copy \\x",
+                                        L"GAME:\\.gta6rt-temp.. \\x", L"GAME:\\data\\.. \\.gta6rt-deleted.\\x",
+                                        L"GAME:\\...\\x"}) {
+            SetLastError(0);
+            HANDLE h = create_w(reserved, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            check(h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_NAME,
+                  "normalized reserved or empty component is refused");
+            if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        }
+        HANDLE ordinary_dot = create_w(L"GAME:\\.gta6rt-other.\\ok.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(ordinary_dot != INVALID_HANDLE_VALUE && read_handle(ordinary_dot) == "ok", "ordinary trailing dot still resolves");
+        if (ordinary_dot != INVALID_HANDLE_VALUE) ::CloseHandle(ordinary_dot);
         for (const wchar_t* reserved : {L"GAME:\\.gta6rt-temp\\runtime.tmp", L"GAME:\\.GTA6RT-TEMP\\runtime.tmp",
                                         L"game:/.gta6rt-temp/runtime.tmp", L"GAME:\\.\\.gta6rt-temp\\runtime.tmp",
                                         L"GAME:\\data\\..\\.gta6rt-temp\\runtime.tmp", L"G:\\.gta6rt-temp\\runtime.tmp",

@@ -161,6 +161,11 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
             part.clear();
             return true;
         }
+        if (part != L"..") {
+            const size_t end = part.find_last_not_of(L". ");
+            if (end == std::wstring::npos) return false;
+            part.erase(end + 1);
+        }
         if (part == L"..") {
             if (parts.size() <= floor) return false;
             parts.pop_back();
