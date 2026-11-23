@@ -225,6 +225,7 @@ class BlockTests(unittest.TestCase):
         nrm = out["tags"]["slot2:21"]
         self.assertNotIn("facenormal_crease_corners", nrm)
         self.assertEqual(nrm["facenormal_flat_good"], nrm["facenormal_flat_corners"])
+        self.assertEqual(nrm["facenormal_flat_median"], 1.0)
 
     def test_positions_follow_the_surface(self):
         _, out = measure(block())

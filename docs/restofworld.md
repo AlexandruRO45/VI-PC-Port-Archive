@@ -692,8 +692,40 @@ levels: 200 streams, 187 blocks), each class matches the face normals only under
 
 Bit 31 is set on 48,046 of the 60,600 sampled core_restofworld vertices (79.3%). Model axis order is the one
 `+0x6C` gives for positions; the other five axis orders and sign flips of the decoded vector score 0.27 to
-0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do; this
-check does not say why.
+0.36 there. Some core_restofworld blocks score lower under the matching decode than levels blocks do.
+
+**Why core_restofworld scores lower: varying faces at a vertex, not the decode (ASSET-280).** Two unit face
+normals with `|cos| = d` leave a best common normal (their bisector) at `sqrt((1 + d) / 2)` from each, so one
+stored normal can pass the `|cos| > 0.8` test on both only when `d > 2 * 0.8^2 - 1 = 0.28`.
+`tools/vertex_types.py` marks a **crease vertex** where two of its faces (over all triangles of the block) meet at
+`|cos| <= 0.28` (`CREASE_COS`), and scores the shaders' decode separately on the sampled triangle corners at
+crease vertices and on the other corners (`facenormal_crease_*`, `facenormal_flat_*`; corners, so a vertex counts
+once per sampled triangle it is in). `facenormal_flat_median` is the block median with crease corners left out.
+The second half of the table runs the same tool with the looser face-variation predicate `|cos| < 0.8` (any two
+faces that one normal may not both match within 0.8):
+
+| Sample | Blocks | Vertex share, block median | Corners at such vertices | Agreement there | Agreement, other corners | Block median, all | Block median, other corners |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Crease, abs(cos) <= 0.28** | | | | | | | |
+| core_restofworld, first 120 streams | 143 | 0.202 | 29.8% | 0.429 | 0.833 | 0.633 | 0.810 |
+| core_restofworld, all 958 streams | 1,152 | 0.194 | 29.9% | 0.430 | 0.860 | 0.705 | 0.841 |
+| levels, first 200 streams | 187 | 0.000 | 6.2% | 0.235 | 0.925 | 1.000 | 1.000 |
+| levels, first 1,000 streams | 880 | 0.000 | 10.7% | 0.315 | 0.886 | 0.982 | 0.996 |
+| **Face variation, abs(cos) < 0.8** | | | | | | | |
+| core_restofworld, first 120 streams | 143 | 0.547 | 64.3% | 0.618 | 0.884 | 0.633 | 0.911 |
+| core_restofworld, all 958 streams | 1,152 | 0.528 | 58.8% | 0.597 | 0.922 | 0.705 | 0.958 |
+| levels, first 200 streams | 187 | 0.038 | 22.3% | 0.614 | 0.959 | 1.000 | 1.000 |
+| levels, first 1,000 streams | 880 | 0.075 | 29.1% | 0.567 | 0.931 | 0.982 | 1.000 |
+
+core_restofworld blocks are small and coarse (median 92 vertices on the first 120 streams against 416 in
+levels): a fifth of a block's vertices are creases no normal can serve, against none in the median levels block.
+Leaving the crease corners out closes about half of the block-median gap (whole archive 0.705 against 0.982,
+0.841 against 0.996); leaving out every corner with face variation closes most of it (0.958 against 1.000).
+Where the faces at a vertex agree, the two archives agree about equally often (0.92 and 0.93 pooled). The
+looser predicate is a measure of face variation, not of impossibility: at a 60 degree fold the bisector still
+scores 0.866 on both faces. On the first 120 streams, no per-block anisotropic rescale of the positions (factors
+2^-3 to 2^3 on two axes) and no other bit width (11+11, 12+12, 15+15) or bit position raises the low blocks to
+the levels scores, so nothing points to another normal encoding.
 
 **The rest of the `0x21` word is the tangent frame.** The same mesh shaders go on to build a tangent.
 With bit 31 set, bits 20-29 are an angle, `v * 2pi/1023 - pi` (`v_fma_f32` by 2pi/1023 and -pi, then
