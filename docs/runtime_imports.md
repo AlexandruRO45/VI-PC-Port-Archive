@@ -131,10 +131,18 @@ Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.d
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
 `xapu.dll`, `AcpHal.dll`) with no shim at all.
 
-What this does not show: nothing here runs the executable. `--dry-run` does not call TLS callbacks, `DllMain` or the
-entry point, and `--init` and `--run` have not been run on it. A bound import is not a working one (the binding
-only says a function with that name exists), and an unimplemented import stops the run only if the title calls it
-([When an unimplemented import is called](#when-an-unimplemented-import-is-called)).
+`--init` on the same files also exits 0 with nothing on stderr. Its `--trace` file has 15 lines: the four package DLLs'
+`DllMain(DLL_PROCESS_ATTACH)` each return 1, the executable's two TLS callbacks run at process attach (reason 1) and
+again at detach (reason 0), and there is no `exception`, `error` or `unimplemented_call` event. So none of the 30
+unimplemented imports is reached by the TLS callbacks or the `DllMain`s.
+
+What this does not show: `--run` has not been run, so the entry point has not been called and no import is known to be
+reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
+that name exists), and an unimplemented import stops the run only if the title calls it
+([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
+host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
+which opens none.
 
 ## Console paths and the write overlay
 
