@@ -727,5 +727,31 @@ class TestInterpP1lvF16HardwareTranslator(unittest.TestCase):
         self.assertEqual(len(words), 4)
 
 
+# ------------------------------------------------------------------------------
+# v_interp_p2_f16 Reference Oracle
+# ------------------------------------------------------------------------------
+
+def ref_interp_p2_f16(j_coord: float, p0: float, p2: float, p1_accum: float, clamp: bool = False) -> int:
+    """Computes D = p1_accum + j * (P2 - P0), narrowed to binary16."""
+    d2 = f32_round(p2 - p0)
+    m2 = f32_round(d2 * j_coord)
+    res_f32 = f32_round(p1_accum + m2)
+    if clamp:
+        res_f32 = max(0.0, min(1.0, res_f32))
+    return f16_to_bits(res_f32)
+
+
+class TestInterpP2F16Oracle(unittest.TestCase):
+    def test_narrowing_to_f16(self):
+        # 0.25 * (-2) + 0.25 * 2 + 0.5 * 4 = 2.0
+        acc = bits_to_f32(ref_interp_p1_f32(0.25, -2.0, 2.0))
+        res = ref_interp_p2_f16(0.5, -2.0, 4.0, acc)
+        self.assertEqual(res, f16_to_bits(2.0))
+
+    def test_clamp_f16(self):
+        res = ref_interp_p2_f16(0.5, 0.0, 4.0, 1.0, clamp=True)
+        self.assertEqual(res, f16_to_bits(1.0))
+
+
 if __name__ == '__main__':
     unittest.main()
