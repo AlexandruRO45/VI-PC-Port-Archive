@@ -578,5 +578,68 @@ class TestSOrSaveExecIEEE754Bitwise(unittest.TestCase):
         self.assertEqual(new_exec, self.FLOAT64_PATTERNS["neg_inf"])
         self.assertEqual(scc, 1)
 
+# -----------------------------------------------------------------------------
+# Commit 8: Negative Controls, Syntax Rejection, and Mutation Detection
+# -----------------------------------------------------------------------------
+
+class TestSOrSaveExecNegativeAndMutation(unittest.TestCase):
+    """Unit tests for negative syntax controls, bounds checking, and mutation detection."""
+
+    def test_reject_odd_aligned_sgpr_destination(self):
+        for odd_idx in (1, 3, 5, 7, 99, 101):
+            with self.subTest(odd_idx=odd_idx):
+                instr = SOrSaveExecB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=odd_idx, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_out_of_bounds_sgpr_destination(self):
+        for oob_idx in (104, 106, 120, 256):
+            with self.subTest(oob_idx=oob_idx):
+                instr = SOrSaveExecB64Instruction(
+                    dst=RegOperand(RegisterKind.SGPR, index=oob_idx, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(ValueError):
+                    instr.validate()
+
+    def test_reject_invalid_destination_register_kind(self):
+        for bad_kind in (RegisterKind.VGPR, RegisterKind.EXEC, RegisterKind.VCC, RegisterKind.SCC):
+            with self.subTest(bad_kind=bad_kind):
+                instr = SOrSaveExecB64Instruction(
+                    dst=RegOperand(bad_kind, index=0, size_bits=64),
+                    src0=RegOperand(RegisterKind.SGPR, index=0, size_bits=64)
+                )
+                with self.assertRaises(TypeError):
+                    instr.validate()
+
+    def test_mutation_detector_logic(self):
+        """Verify detection of mutant logic implementations."""
+        def mutant_and(s0: int, e: int):
+            return s0 & e, e, int((s0 & e) != 0)
+
+        def mutant_overwrite_d(s0: int, e: int):
+            new_e = s0 | e
+            return new_e, new_e, int(new_e != 0)
+
+        s0 = 0x00FF
+        e = 0xFF00
+        # Correct oracle
+        correct_new, correct_d, correct_scc = s_or_saveexec_b64_oracle(s0, e)
+        self.assertEqual(correct_new, 0xFFFF)
+        self.assertEqual(correct_d, 0xFF00)
+        self.assertEqual(correct_scc, 1)
+
+        # Mutant AND fails
+        m_new, m_d, m_scc = mutant_and(s0, e)
+        self.assertNotEqual(m_new, correct_new)
+
+        # Mutant overwrite D fails
+        m_new2, m_d2, m_scc2 = mutant_overwrite_d(s0, e)
+        self.assertNotEqual(m_d2, correct_d)
+
+
 if __name__ == "__main__":
     unittest.main()
