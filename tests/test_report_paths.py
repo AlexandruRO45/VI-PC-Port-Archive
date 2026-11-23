@@ -108,7 +108,8 @@ class MacVolumeTests(unittest.TestCase):
             self.assertTrue(report_paths.same_report_path("/tmp/leonida_x/R.json", "/tmp/leonida_x/r.json"))
 
     def test_macos_case_sensitive_volume_keeps_case(self):
-        with self.darwin(1):
+        # Windows' normcase lowercases every path; macOS does not, so model it.
+        with self.darwin(1), mock.patch("os.path.normcase", lambda p: p):
             self.assertFalse(report_paths.case_insensitive_volume(os.getcwd()))
             self.assertNotEqual(report_paths.path_key("/tmp/leonida_x/R.json"), report_paths.path_key("/tmp/leonida_x/r.json"))
 
