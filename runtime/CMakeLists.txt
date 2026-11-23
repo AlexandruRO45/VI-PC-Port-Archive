@@ -117,6 +117,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/xgameruntime_offline.cpp
     shims/library_loader.cpp
     shims/process.cpp
+    shims/xaudio2_xma2_adapter.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -256,6 +257,16 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(winhttp_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(winhttp_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(winhttp_offline_test PRIVATE /OPT:NOREF)
+
+  # Standalone XAudio2 XMA2 source-voice adapter: pure C++ mock IXAudio2/decoder tests, no audio hardware.
+  add_executable(xaudio2_xma2_adapter_test
+    test/xaudio2_xma2_adapter_test.cpp
+    shims/xaudio2_xma2_adapter.cpp
+  )
+  target_include_directories(xaudio2_xma2_adapter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xaudio2_xma2_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xaudio2_xma2_adapter_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_libraries(xaudio2_xma2_adapter_test PRIVATE ole32)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -1009,6 +1020,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET winhttp_offline_test)
     add_test(NAME winhttp_offline COMMAND winhttp_offline_test)
+  endif()
+  if(WIN32 AND TARGET xaudio2_xma2_adapter_test)
+    add_test(NAME xaudio2_xma2_adapter COMMAND xaudio2_xma2_adapter_test)
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
