@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from contextlib import suppress
 import json
+import math
 import os
 import struct
 import sys
@@ -363,14 +364,15 @@ def _animation_report(gltf: dict, index: int, animation: dict) -> dict:
 
 
 def _bbox(accessor: dict | None) -> dict | None:
-    """An accessor's declared POSITION min/max, or None when either is missing."""
+    """An accessor's declared finite POSITION min/max, or None when unavailable."""
     if accessor is None:
         return None
     lower = accessor.get("min")
     upper = accessor.get("max")
     if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) >= 3 and len(upper) >= 3):
         return None
-    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in lower[:3] + upper[:3]):
+    if not all(_is_int(value) or (isinstance(value, float) and math.isfinite(value))
+               for value in lower[:3] + upper[:3]):
         return None
     return {"min": lower[:3], "max": upper[:3]}
 

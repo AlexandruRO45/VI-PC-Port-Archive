@@ -479,6 +479,34 @@ class GlbInspectTests(unittest.TestCase):
                                                 "images": 0, "skins": 0, "animations": 0})
             self.assertIsNone(report["position_bbox"])
 
+    def test_nonfinite_position_bounds_leave_the_rest_of_the_report_available(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "bounds.glb")
+            out = os.path.join(folder, "report.json")
+            gltf = bbox_gltf(with_bounds=True)
+            valid = gltf["accessors"][0]
+            gltf["accessors"].extend([
+                {**valid, "min": [-9e100, -2, -3]},
+                {**valid, "max": [4, 5, 9e100]},
+            ])
+            gltf["meshes"][0]["primitives"].extend([
+                {"attributes": {"POSITION": 1}},
+                {"attributes": {"POSITION": 2}},
+            ])
+            payload = json_bytes(gltf)
+            self.assertEqual(payload.count(b"9e+100"), 2)
+            with open(path, "wb") as handle:
+                handle.write(container(payload.replace(b"9e+100", b"9e+999"), bytes(36)))
+
+            result = self.run_tool(path, "--json", out)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out, encoding="utf-8") as handle:
+                report = json.load(handle)
+            expected = {"min": valid["min"], "max": valid["max"]}
+            self.assertEqual(report["position_bbox"], expected)
+            self.assertFalse(report["position_bbox_complete"])
+            self.assertEqual([p["bbox"] for p in report["meshes"][0]["primitives"]], [expected, None, None])
+
     def test_position_bbox_from_accessor_bounds(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "bounds.glb")
