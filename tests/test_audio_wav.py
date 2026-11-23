@@ -476,6 +476,19 @@ def write_fake_opus_inputs(directory, names=("x.ogg", "x.opus", "y.ogg")):
 class SameStemTest(unittest.TestCase):
     """x.ogg and x.opus both decoded to x.wav: two jobs raced on one file and one result was lost."""
 
+    def test_counter_fits_beside_an_occupied_limit_length_wav(self):
+        with tempfile.TemporaryDirectory() as out:
+            stem = "a" * 246
+            items = [(stem + ext, stem) for ext in (".ogg", ".opus")]
+            occupied = stem + ".opus.wav"  # fits exactly; adding ~2 would exceed 255
+            Path(out, occupied).touch()
+            with mock.patch.object(audio_wav, "audio_digest", return_value=None):
+                named, _, _ = audio_wav.plan_outputs(items, ".", out, "ffmpeg")
+            first, second = [name + ".wav" for _, name in named]
+            self.assertEqual(first, stem + ".ogg.wav")
+            self.assertTrue(second.endswith(".opus~2.wav"))
+            self.assertLessEqual(len(second), 255)
+
     def test_inputs_that_share_a_stem_keep_their_extension(self):
         items = [("d/x.ogg", "x"), ("d/x.opus", "x"), ("d/y.ogg", "y")]
         self.assertEqual(audio_wav.output_names(items),
@@ -614,6 +627,22 @@ class SameStemTest(unittest.TestCase):
 
 
 class FakeFfmpegDecodeTest(unittest.TestCase):
+    def test_long_same_stem_inputs_export_and_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "in")
+            out = Path(tmp, "out")
+            names = ["a" * 250 + ext for ext in (".ogg", ".opus")]
+            write_fake_opus_inputs(src, names)
+            run = [sys.executable, "-I", TOOL, src, "--out", str(out), "--jobs", "2",
+                   "--ffmpeg", write_fake_ffmpeg(tmp)]
+            for summary in ("2 WAV written", "0 WAV written, 2 already present"):
+                result = subprocess.run(run, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(summary, result.stdout)
+                files = list(out.glob("*.wav"))
+                self.assertEqual(len(files), 2)
+                self.assertEqual({p.read_bytes() for p in files}, {b"FAKE:" + name.encode() for name in names})
+
     def test_every_input_gets_its_own_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "in")

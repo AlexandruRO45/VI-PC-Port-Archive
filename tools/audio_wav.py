@@ -290,6 +290,15 @@ def repair_base(stem):
     return stem if stem.lower().endswith(EXTS) else None
 
 
+def short_repair_base(path):
+    directory, leaf = os.path.split(path)
+    base, ext = os.path.splitext(leaf)
+    # Leave room for the source extension, a counter and ".wav" on a 255-byte filesystem.
+    while len(os.fsencode(base)) > 230:
+        base = base[:-1]
+    return os.path.join(directory, base + ext)
+
+
 def plan_outputs(items, src, out, ffmpeg):
     """Apply the existing naming rules first. Reserve their results before moving any residual native aliases."""
     @cache
@@ -299,6 +308,29 @@ def plan_outputs(items, src, out, ffmpeg):
     def target(stem):
         directory, name = os.path.split(stem)
         return os.path.join(parent(directory), name)
+
+    def overlong(stem):
+        leaf = os.path.basename(stem) + ".wav"
+        if len(os.fsencode(leaf)) <= 255:
+            return False
+        if leaf.isascii():
+            return True
+        if os.name == "nt":
+            return len(leaf.encode("utf-16-le", "surrogatepass")) > 510
+        # Some volumes accept more than 255 encoded bytes for Unicode names.
+        # Check in an existing destination directory even on the first run.
+        directory = os.path.dirname(target(stem))
+        while not os.path.isdir(directory) and os.path.dirname(directory) != directory:
+            directory = os.path.dirname(directory)
+        try:
+            os.lstat(os.path.join(directory, leaf))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if exc.errno == errno.ENAMETOOLONG:
+                return True
+            raise
+        return False
 
     folded_parent = cache(lambda directory: fold_name(parent(directory)))
 
@@ -327,8 +359,11 @@ def plan_outputs(items, src, out, ffmpeg):
         if renamed:
             # Legacy assignments, including their counters, take precedence over all new names.
             reserved, groups, guarded = buckets(named)
+            repaired.update(i for i, _ in guarded if overlong(named[i][1]))
         for group in groups.values():
-            repaired.update(native_collisions(group, named, target, unprobed))
+            remaining = [i for i in group if i not in repaired]
+            if len(remaining) > 1:
+                repaired.update(native_collisions(remaining, named, target, unprobed))
         repaired.update(unprobed)
     counters, digests, dest_digests = {}, {}, {}
 
@@ -359,6 +394,8 @@ def plan_outputs(items, src, out, ffmpeg):
         stem, n = (base, 2) if first == 2 else (f"{base}~{first}", first + 1)
         skipped_unreserved = False
         while True:
+            if overlong(stem):
+                stem = short_repair_base(base) + stem[len(base):]
             candidate = key(stem)
             if candidate not in reserved:
                 if i in unprobed and not os.path.lexists(os.path.join(out, stem + ".wav")):
@@ -373,12 +410,7 @@ def plan_outputs(items, src, out, ffmpeg):
         named[i] = (named[i][0], stem)
 
     for i in sorted(repaired):
-        directory, leaf = os.path.split(os.path.relpath(named[i][0], src))
-        base, ext = os.path.splitext(leaf)
-        # Keep room for the source extension, a counter and ".wav" on a 255-byte filesystem.
-        while len(os.fsencode(base)) > 230:
-            base = base[:-1]
-        allocate(i, os.path.join(directory, base + ext))
+        allocate(i, short_repair_base(os.path.relpath(named[i][0], src)))
     # An earlier run may have left a repair under this shape for different audio. Plain names stay name-only.
     moved = 0
     for i, base in guarded:
