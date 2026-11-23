@@ -138,6 +138,10 @@ class Cli(unittest.TestCase):
             (["--waves", "3_2"], "--waves"),
             (["--waves", "+32"], "--waves"),
             (["--waves", "\u0663\u0662"], "--waves"),
+            # int() also accepts leading zeros and very long decimals; neither names a wave size.
+            (["--waves", "032"], "032"),
+            (["--waves", "32,064"], "064"),
+            (["--waves", "9" * 5000], "unknown:"),
         ]
         for argv, message in cases:
             with self.subTest(argv=argv), mock.patch.object(runner, "open_oracle") as open_oracle:
