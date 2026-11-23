@@ -1411,6 +1411,23 @@ class MarkerRegionsTest(unittest.TestCase):
                                          ("end_without_start", 3, "end", None)])
         self.check_sums(p)
 
+    def test_endpoint_contacts_match_unordered_pair_oracle(self):
+        from itertools import combinations
+
+        # All non-reversed intervals on four ticks: simultaneous starts and
+        # ends, gaps, identical bounds, empty intervals and repeated names.
+        regions = [dict(name=name, start=start, end=end)
+                   for start in range(4) for end in range(start, 4)
+                   for name in (1, 2, 3)]
+        def touches(a, b):
+            return (a["name"] != b["name"] and a["start"] < a["end"] and b["start"] < b["end"]
+                    and (a["end"] == b["start"] or b["end"] == a["start"]))
+
+        for a, b in combinations(regions, 2):
+            self.assertEqual(rsc8_audio.marker_region_contacts([b, a]), int(touches(a, b)))
+        expected = sum(touches(a, b) for a, b in combinations(regions, 2))
+        self.assertEqual(rsc8_audio.marker_region_contacts(regions[::-1]), expected)
+
     def test_two_names_interleaved(self):
         p = self.pair([
             (self.VERSE, self.S, 100, 0),
@@ -1463,7 +1480,7 @@ class MarkerRegionsTest(unittest.TestCase):
     def test_bank_tally_and_scan_summary(self):
         clean = self.region_bank(0x00112233, [
             (self.VERSE, self.S, 100, 0), (self.FILL, self.S, 150, 0), (self.VERSE, self.E, 200, 0),
-            (self.FILL, self.E, 450, 0), (self.VERSE, self.S, 1000, 0), (self.VERSE, self.E, 1700, 1),
+            (self.FILL, self.E, 450, 0), (self.VERSE, self.S, 450, 0), (self.VERSE, self.E, 1150, 1),
         ])
         ragged = self.region_bank(0x00445566, [
             (self.BEAT, 0, 0, 0), (self.FILL, self.E, 10, 0), (self.FILL, self.S, 20, 0), (self.FILL, self.E, 60, 0),
@@ -1508,6 +1525,7 @@ class MarkerRegionsTest(unittest.TestCase):
             rep = summary["marker_regions"]
             self.assertEqual((rep["tags"], rep["tags_all_paired"], rep["tags_with_sample_count"]), (3, 2, 2))
             self.assertEqual((rep["starts"], rep["ends"], rep["pairs"]), (8, 8, 7))
+            self.assertEqual(rep["endpoint_contacts_between_names"], {"total": 2, "per_tag": [1, 0, 1]})
             self.assertEqual(rep["pairs_per_tag"], {"min": 1, "median": 3, "max": 3})
             self.assertEqual(rep["overlaps_between_names"], {
                 "nested": 0, "crossing": 2, "by_names": {both: {"nested": 0, "crossing": 2}},
@@ -1573,6 +1591,7 @@ class MarkerRegionsTest(unittest.TestCase):
             _records, summary = rsc8_audio.scan_single_file(rsc_path)
         self.assertEqual(summary["marker_regions"], {
             "tags": 0, "tags_all_paired": 0, "tags_with_sample_count": 0, "starts": 0, "ends": 0, "pairs": 0,
+            "endpoint_contacts_between_names": {"total": 0, "per_tag": []},
             "pairs_per_tag": None, "pairs_extra_differs": 0,
             "overlaps_between_names": {"nested": 0, "crossing": 0, "by_names": {}},
             "names": {}, "exceptions_total": 0, "exceptions": [],

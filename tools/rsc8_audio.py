@@ -30,6 +30,7 @@ Every scan also reads the `0xbd` cue records of each stream; the summary's `mark
 matches the records whose value is joaat("start") or joaat("end") into region pairs, name by name
 (pair_marker_regions(), docs/rsc8_audio.md).
 """
+from collections import Counter
 import argparse
 import csv
 import json
@@ -1147,12 +1148,28 @@ def marker_region_overlaps(regions):
     return out
 
 
+def marker_region_contacts(regions):
+    """Count different-name, nonempty intervals meeting end-to-start within one tag."""
+    ends = Counter()
+    named_ends = Counter()
+    for region in regions:
+        if region["start"] < region["end"]:
+            ends[region["end"]] += 1
+            named_ends[region["end"], region["name"]] += 1
+
+    # Only the later interval counts the pair. Collecting all ends first makes
+    # the result independent of record order at a shared timestamp.
+    return sum(ends[r["start"]] - named_ends[r["start"], r["name"]]
+               for r in regions if r["start"] < r["end"])
+
+
 def _new_region_tally():
     """Running totals of pair_marker_regions() over the tags of a scan; marker_region_report() finishes them."""
     return {
         "tags": 0,  # tags with at least one start/end record
         "tags_all_paired": 0,  # ... and no exception
         "tags_with_sample_count": 0,  # ... on a stream that has a 0x76 sample count
+        "contacts_per_tag": [],
         "pairs_per_tag": [],
         "pairs_extra_differs": 0,
         "overlaps": {},  # marker_region_overlaps(), added up
@@ -1170,6 +1187,7 @@ def _tally_marker_regions(tally, records, *, bank_offset=0, stream_id=None, samp
     tally["tags"] += 1
     tally["tags_all_paired"] += not paired["exceptions"]
     tally["tags_with_sample_count"] += sample_count is not None
+    tally["contacts_per_tag"].append(marker_region_contacts(paired["regions"]))
     tally["pairs_per_tag"].append(len(paired["regions"]))
     for name, counts in paired["names"].items():
         into = tally["names"].setdefault(name, {"tags": 0, "lengths": []})
@@ -1241,6 +1259,8 @@ def marker_region_report(tally):
 
     ``names`` maps each region name (hex) to its ``starts``, ``ends``, ``pairs``, the four exception
     counts of pair_marker_regions() and the ``length_samples`` (min/median/max) of its pairs.
+    ``endpoint_contacts_between_names`` counts end-to-start contacts of nonempty regions, with one
+    count per region-bearing tag in scan order (including zero).
     ``overlaps_between_names`` counts pairs of paired regions of different names in one tag that share a
     sample (marker_region_overlaps()), in all and per pair of names. ``exceptions`` lists the first
     `MAX_REGION_EXCEPTIONS_LISTED` in scan order with where each one sits: its record index among the
@@ -1262,6 +1282,10 @@ def marker_region_report(tally):
         "pairs": sum(c["pairs"] for c in tally["names"].values()),
         "pairs_per_tag": _min_median_max(tally["pairs_per_tag"]),
         "pairs_extra_differs": tally["pairs_extra_differs"],
+        "endpoint_contacts_between_names": {
+            "total": sum(tally["contacts_per_tag"]),
+            "per_tag": tally["contacts_per_tag"],
+        },
         "overlaps_between_names": {
             "nested": sum(n for n, _c in tally["overlaps"].values()),
             "crossing": sum(c for _n, c in tally["overlaps"].values()),
