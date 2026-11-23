@@ -12,14 +12,15 @@ These tests verify:
 """
 import os
 import re
-import shlex
 import shutil
 import struct
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import support
+import mc_command
 import rdna2spirv
 
 PS_EPILOGUE = ["exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"]
@@ -52,7 +53,9 @@ def vdata_reg(dmask, d16=False):
 def llvm_mc_cmd():
     env = os.environ.get("LLVM_MC")
     if env:
-        return shlex.split(env)
+        # Not shlex.split: POSIX rules drop the backslashes of a Windows path such as the one
+        # scripts/build_llvm_mc.ps1 sets, and the test then dies with FileNotFoundError.
+        return mc_command.split_command(env)
     exe = shutil.which("llvm-mc")
     return [exe] if exe else None
 
@@ -307,6 +310,19 @@ class LlvmMcRoundTrip(unittest.TestCase):
                     self.assertEqual(m.coherent, set(CUBE_BINDINGS))
                 if shutil.which("spirv-as") and shutil.which("spirv-val"):
                     validate_spirv(spvasm)
+
+
+class LlvmMcPath(unittest.TestCase):
+    def test_a_windows_llvm_mc_path_keeps_its_backslashes(self):
+        # scripts/build_llvm_mc.ps1 sets LLVM_MC to a path like C:\Users\x\.leonida\llvm-mc\llvm-mc.exe. POSIX
+        # shlex.split turns that into C:Usersx.leonidallvm-mcllvm-mc.exe, so the round trip above died with
+        # FileNotFoundError on a Windows machine that had llvm-mc.
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "llvm-mc.exe")
+            with open(exe, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("")
+            with mock.patch.dict(os.environ, {"LLVM_MC": exe}):
+                self.assertEqual(llvm_mc_cmd(), [exe])
 
 
 if __name__ == "__main__":
