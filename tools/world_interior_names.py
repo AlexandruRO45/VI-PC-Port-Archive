@@ -42,6 +42,7 @@ if _TOOLS_DIR not in sys.path:
 
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
 
 J = WA.joaat_cs
@@ -157,7 +158,9 @@ def scan(path, start=None, limit=None, jobs=1):
     if n == 1:
         results = [scan_window(w) for w in windows]
     else:
-        with ProcessPoolExecutor(max_workers=n) as ex:
+        # Windows refuses more than 61 worker processes (pool_workers.py); --jobs is lowered there. The windows are
+        # still all scanned, so the result does not depend on the cap.
+        with ProcessPoolExecutor(max_workers=process_workers(n)) as ex:
             results = list(ex.map(scan_window, windows))
     for rows in results:
         for off, parsed in rows:

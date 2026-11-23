@@ -12,6 +12,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -19,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Imported by its real name: --jobs sends scan_window to worker processes, which import it by module name.
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import world_interior_names as T  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 WA, WI = T.WA, T.WI
 J = WA.joaat_cs
 SYS = 0x50000000
@@ -211,6 +213,32 @@ class CliTest(unittest.TestCase):
         for jobs in ("1", "3"):
             s = self.run_cli(path, "--jobs", jobs)
             self.assertEqual((s["interior_names"], s["placements"], s["keys_naming_an_interior"]), (2, 3, 2), jobs)
+
+    def test_jobs_above_the_process_pool_limit_are_lowered(self):
+        # Windows ProcessPoolExecutor raises "max_workers must be <= 61" (pool_workers.py). --jobs is lowered to the
+        # limit instead of being handed to the pool, and every window is still scanned.
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([interiors(), placements()]))
+        seen = []
+
+        class Pool:
+            def __init__(self, max_workers=None):
+                seen.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def map(self, fn, items):
+                return [fn(item) for item in items]
+
+        with mock.patch.object(T, "ProcessPoolExecutor", Pool):
+            s = self.run_cli(path, "--jobs", "62")
+        self.assertEqual(seen, [process_workers(62)])
+        self.assertEqual((s["interior_names"], s["placements"], s["keys_naming_an_interior"]), (2, 3, 2))
 
     def test_folder_of_carved_files(self):
         folder = os.path.join(self.tmp.name, "carved")
