@@ -15,7 +15,7 @@ A language is added when a contributor volunteers to maintain it and keeps the s
 | Français (`fr`) | [`fr/quickstart.md`](fr/quickstart.md) | `aa2988cc` | `@Urban225` |
 | Português (Brasil) (`pt-BR`) | [`pt-BR/quickstart.md`](pt-BR/quickstart.md) | `f847748c` | `@Andretuta` |
 | 简体中文 (`zh-CN`) | [`zh-CN/quickstart.md`](zh-CN/quickstart.md) | `aa2988cc` | `@liang-kai-shui` |
-| Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `f847748c` | `@Dom-in, @t91a60` |
+| Polski (Polish) (`pl-PL`) | [`pl-PL/quickstart.md`](pl-PL/quickstart.md) | `9f0ebbb3c` | `@Dom-in, @t91a60` |
 | Türkçe (`tr`) | [`tr/quickstart.md`](tr/quickstart.md) | `561b65a` | `@emirhan-karaca` |
 | Русский (`ru`) | [`ru/quickstart.md`](ru/quickstart.md) | `aa2988cc` | `@DmitryBykov-ISPO` |
 | 日本語 (`ja`) | [`ja/quickstart.md`](ja/quickstart.md) | `003e781` | `@bingll123` |
