@@ -620,3 +620,27 @@ class TestCmpClassF64SIMDAndProperties(unittest.TestCase):
         val_real, _ = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_SNAN | CLASS_QNAN, is_cmpx=False, test_id="real_part")
         self.assertEqual(val_nan, 1)
         self.assertEqual(val_real, 0)
+
+
+# ------------------------------------------------------------------------------
+# v_cmp_class_f64 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestCmpClassF64NegativeAndTranslator(unittest.TestCase):
+    def test_syntax_rejection(self):
+        with self.assertRaises(ValueError):
+            LiteralOperand(0x1_0000_0000_0000_0000)
+
+    def test_boundary_extremes_hardware(self):
+        # Min subnormal f64: 1
+        val_min_denorm, _ = run_cmp_shader("f64", 1, CLASS_POS_DENORM, is_cmpx=False, test_id="min_denorm")
+        self.assertEqual(val_min_denorm, 1)
+
+        # Max subnormal f64: 0x000FFFFFFFFFFFFF
+        val_max_denorm, _ = run_cmp_shader("f64", 0x000FFFFFFFFFFFFF, CLASS_POS_DENORM, is_cmpx=False, test_id="max_denorm")
+        self.assertEqual(val_max_denorm, 1)
+
+    def test_spirv_opcode_lowering_hardware(self):
+        _, spv = run_cmp_shader("f64", 0x3FF0000000000000, CLASS_POS_NORMAL, is_cmpx=False, test_id="lowering")
+        self.assertIn("OpBitwiseAnd", spv)
+        self.assertIn("OpShiftRightLogical", spv)
