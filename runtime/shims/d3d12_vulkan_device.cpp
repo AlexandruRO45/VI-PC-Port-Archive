@@ -15,6 +15,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "dxgi_memory_budget.h"
 #include "../src/arena_size.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -5187,6 +5188,7 @@ public:
     }
 
     ~Device() override {
+        if (dxgi_budget_) dxgi_budget_->shutdown();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -5226,6 +5228,14 @@ public:
     }
     bool upload_in_vram() const { return state_.upload_in_vram; }
     leonida::VulkanContext& context() { return *state_.context; }
+    const std::shared_ptr<rt::dxgi::VideoMemoryBudgetMonitor>& dxgi_memory_budget() {
+        std::call_once(dxgi_budget_once_, [this] {
+            const auto& info = state_.info;
+            dxgi_budget_ = rt::dxgi::make_video_memory_budget_monitor(info.get_instance_proc, info.instance,
+                                                                     info.physical);
+        });
+        return dxgi_budget_;
+    }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
     IUnknown* holder() { return identity(); }
@@ -8252,6 +8262,8 @@ private:
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
+    std::once_flag dxgi_budget_once_;
+    std::shared_ptr<rt::dxgi::VideoMemoryBudgetMonitor> dxgi_budget_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
@@ -8705,8 +8717,12 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     const auto& i = d->info();
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
     if (!gdpa) return E_FAIL;
-    return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
-                                    i.queue_family, riid, out);
+    try {
+        return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
+                                        i.queue_family, d->dxgi_memory_budget(), riid, out);
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    }
 }
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and

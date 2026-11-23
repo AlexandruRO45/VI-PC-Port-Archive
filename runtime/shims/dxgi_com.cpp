@@ -1,4 +1,5 @@
 #include "dxgi_com.h"
+#include "dxgi_memory_budget.h"
 #include "d3d12_stubs.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
@@ -1084,8 +1085,9 @@ LARGE_INTEGER umd_driver_version(LUID luid) {
 
 class Adapter final : public IDXGIAdapter3 {
 public:
-    Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical)
-        : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical) {
+    Adapter(IDXGIFactory4* parent, PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
+            const std::shared_ptr<VideoMemoryBudgetMonitor>& budget)
+        : parent_(parent), gipa_(gipa), instance_(instance), physical_(physical), budget_(budget) {
         if (parent_) parent_->AddRef();
         populate_desc();
         umd_version_ = umd_driver_version(desc_.AdapterLuid);
@@ -1093,6 +1095,7 @@ public:
     }
 
     ~Adapter() {
+        budget_->unsubscribe_all(this);
         if (parent_) parent_->Release();
     }
 
@@ -1200,33 +1203,11 @@ public:
             return E_INVALIDARG;
         std::memset(info, 0, sizeof(*info));
         const bool want_local = (group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
-        if (has_memory_budget_ && gipa_ && instance_ && physical_) {
-            if (const auto get_mem2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
-                    gipa_(instance_, "vkGetPhysicalDeviceMemoryProperties2"))) {
-                VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
-                VkPhysicalDeviceMemoryProperties2 mem2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
-                get_mem2(physical_, &mem2);
-                const auto& mem = mem2.memoryProperties;
-                if (want_local) {
-                    const std::uint32_t local_heap = primary_device_local_heap(mem);
-                    if (local_heap != UINT32_MAX) {
-                        info->Budget = budget.heapBudget[local_heap];
-                        info->CurrentUsage = budget.heapUsage[local_heap];
-                    }
-                } else {
-                    for (std::uint32_t i = 0; i < mem.memoryHeapCount; ++i) {
-                        if ((mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
-                            info->Budget += budget.heapBudget[i];
-                            info->CurrentUsage += budget.heapUsage[i];
-                        }
-                    }
-                }
-            }
-        }
-        if (info->Budget == 0) {
-            info->Budget = want_local ? desc_.DedicatedVideoMemory : desc_.SharedSystemMemory;
-        }
+        const auto current = budget_->query();
+        const auto segment = want_local ? current.local : current.non_local;
+        info->Budget = segment.budget ? segment.budget
+                                      : (want_local ? desc_.DedicatedVideoMemory : desc_.SharedSystemMemory);
+        info->CurrentUsage = segment.usage;
         info->AvailableForReservation = info->Budget / 2;
         info->CurrentReservation = want_local ? reservations_->local.load(std::memory_order_relaxed)
                                               : reservations_->non_local.load(std::memory_order_relaxed);
@@ -1245,15 +1226,12 @@ public:
         }
         return E_INVALIDARG;
     }
-    // Microsoft documents only "an HRESULT success or error code" and a cookie for
-    // UnregisterVideoMemoryBudgetChangeNotification. The budget here is recomputed on every QueryVideoMemoryInfo and
-    // never changes by itself, so the event is registered and never signalled.
     HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(HANDLE event, DWORD* cookie) override {
-        if (!event || !cookie) return E_INVALIDARG;
-        *cookie = next_budget_cookie_.fetch_add(1, std::memory_order_relaxed);
-        return S_OK;
+        return budget_->subscribe(this, event, cookie);
     }
-    void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD) override {}
+    void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) override {
+        budget_->unsubscribe(this, cookie);
+    }
 
 private:
     void populate_desc() {
@@ -1302,25 +1280,8 @@ private:
             desc_.DedicatedVideoMemory = static_cast<SIZE_T>(dedicated);
             desc_.SharedSystemMemory = static_cast<SIZE_T>(shared);
         }
-
-        if (const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
-                gipa_(instance_, "vkEnumerateDeviceExtensionProperties"))) {
-            std::uint32_t count = 0;
-            if (enum_exts(physical_, nullptr, &count, nullptr) == VK_SUCCESS && count > 0) {
-                std::vector<VkExtensionProperties> exts(count);
-                if (enum_exts(physical_, nullptr, &count, exts.data()) == VK_SUCCESS) {
-                    for (const auto& e : exts) {
-                        if (std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
-                            has_memory_budget_ = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
     }
 
-    std::atomic<DWORD> next_budget_cookie_{1};
     std::atomic<ULONG> refs_{1};
     PrivateDataStore private_data_;
     IDXGIFactory4* parent_ = nullptr;
@@ -1329,16 +1290,17 @@ private:
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     DXGI_ADAPTER_DESC2 desc_{};
     LARGE_INTEGER umd_version_{};  // CheckInterfaceSupport(IDXGIDevice): the adapter's user-mode driver version
-    bool has_memory_budget_ = false;
     std::shared_ptr<ReservationState> reservations_;
+    std::shared_ptr<VideoMemoryBudgetMonitor> budget_;
 };
 
 class Factory final : public IDXGIFactory7 {
 public:
     Factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
-            VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
+            VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family,
+            const std::shared_ptr<VideoMemoryBudgetMonitor>& budget)
         : context_(context), gipa_(gipa), instance_(instance), physical_(physical), gdpa_(gdpa),
-          queue_(queue), queue_family_(queue_family) {}
+          queue_(queue), queue_family_(queue_family), budget_(budget) {}
 
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
@@ -1382,7 +1344,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (index != 0) return DXGI_ERROR_NOT_FOUND;
-        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_, budget_);
         *out = static_cast<IDXGIAdapter*>(adapter);
         return S_OK;
     }
@@ -1435,7 +1397,7 @@ public:
         if (!out) return E_POINTER;
         *out = nullptr;
         if (index != 0) return DXGI_ERROR_NOT_FOUND;
-        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_, budget_);
         *out = static_cast<IDXGIAdapter1*>(adapter);
         return S_OK;
     }
@@ -1569,7 +1531,7 @@ public:
     HRESULT STDMETHODCALLTYPE EnumAdapterByLuid(LUID luid, REFIID riid, void** out) override {
         if (!out) return E_POINTER;
         *out = nullptr;
-        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_, budget_);
         const LUID actual = adapter->luid();
         if (actual.LowPart != luid.LowPart || actual.HighPart != luid.HighPart) {
             adapter->Release();
@@ -1601,7 +1563,7 @@ public:
         if (!out) return DXGI_ERROR_INVALID_CALL;
         *out = nullptr;
         if (index != 0) return DXGI_ERROR_NOT_FOUND;
-        auto* adapter = new Adapter(this, gipa_, instance_, physical_);
+        auto* adapter = new Adapter(this, gipa_, instance_, physical_, budget_);
         const HRESULT hr = adapter->QueryInterface(riid, out);
         adapter->Release();
         return hr;
@@ -1672,6 +1634,7 @@ private:
     PFN_vkGetDeviceProcAddr gdpa_;
     VkQueue queue_;
     std::uint32_t queue_family_;
+    std::shared_ptr<VideoMemoryBudgetMonitor> budget_;
     HWND assoc_hwnd_ = nullptr;
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
@@ -1684,12 +1647,48 @@ private:
 
 }  // namespace
 
+std::shared_ptr<VideoMemoryBudgetMonitor> make_video_memory_budget_monitor(
+    PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical) {
+    const auto enum_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+        gipa(instance, "vkEnumerateDeviceExtensionProperties"));
+    const auto get_mem2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        gipa(instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    VideoMemoryBudgetMonitor::ReadBudget reader;
+    std::uint32_t count = 0;
+    if (enum_exts && get_mem2 && enum_exts(physical, nullptr, &count, nullptr) == VK_SUCCESS && count) {
+        std::vector<VkExtensionProperties> extensions(count);
+        if (enum_exts(physical, nullptr, &count, extensions.data()) == VK_SUCCESS &&
+            std::any_of(extensions.begin(), extensions.end(), [](const VkExtensionProperties& extension) {
+                return std::strcmp(extension.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0;
+            })) {
+            reader = [get_mem2, physical] {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 result{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget};
+                get_mem2(physical, &result);
+                const auto& memory = result.memoryProperties;
+                VideoMemoryBudget snapshot;
+                const std::uint32_t local = primary_device_local_heap(memory);
+                if (local != UINT32_MAX) snapshot.local = {budget.heapBudget[local], budget.heapUsage[local]};
+                for (std::uint32_t i = 0; i < memory.memoryHeapCount; ++i) {
+                    if (memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) continue;
+                    snapshot.non_local.budget += budget.heapBudget[i];
+                    snapshot.non_local.usage += budget.heapUsage[i];
+                }
+                return snapshot;
+            };
+        }
+    }
+    return std::make_shared<VideoMemoryBudgetMonitor>(std::move(reader));
+}
+
 HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
                        VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-                       std::uint32_t queue_family, REFIID riid, void** out) {
+                       std::uint32_t queue_family, const std::shared_ptr<VideoMemoryBudgetMonitor>& budget,
+                       REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family);
+    auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family, budget);
     const HRESULT hr = factory->QueryInterface(riid, out);
     factory->Release();
     return hr;

@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "%s line %d: %s\n", label, __LINE__, #condition); return 1; } \
@@ -340,7 +341,27 @@ int main() {
         const int result = check_backend(label, device, inner, true);
         device->Release();
         if (result) return 1;
+
+        // A D3D12-backed adapter can outlive its device. Its budget subscription must stop before device teardown.
+        Ref<IDXGIFactory4> budget_factory;
+        Ref<IDXGIAdapter> adapter;
+        Ref<IDXGIAdapter3> budget_adapter;
+        EXPECT(SUCCEEDED(rt::d3d12::create_dxgi_factory(inner, IID_PPV_ARGS(&budget_factory.p))));
+        EXPECT(SUCCEEDED(budget_factory->EnumAdapters(0, &adapter.p)));
+        EXPECT(SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&budget_adapter.p))));
+        std::unique_ptr<void, decltype(&CloseHandle)> event(CreateEventW(nullptr, FALSE, FALSE, nullptr), &CloseHandle);
+        EXPECT(event);
+        DWORD cookie = 0;
+        EXPECT(budget_adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(event.get(), &cookie) == S_OK && cookie);
         EXPECT(inner->Release() == 0);  // nothing the adapter or the factory made kept the layer's device alive
+        budget_adapter->UnregisterVideoMemoryBudgetChangeNotification(cookie);
+        EXPECT(budget_adapter->RegisterVideoMemoryBudgetChangeNotificationEvent(event.get(), &cookie) ==
+               DXGI_ERROR_DEVICE_REMOVED && cookie == 0);
+        budget_adapter.reset();
+        adapter.reset();
+        budget_factory.reset();
+        std::printf("Vulkan: IDXGIAdapter3 budget subscription stops when its device is released\n");
+
         // A second device on the same Vulkan device, created as IDXGIDevice1.
         ID3D12Device* direct = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&direct))));
