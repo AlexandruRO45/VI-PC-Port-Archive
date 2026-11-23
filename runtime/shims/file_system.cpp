@@ -610,6 +610,7 @@ DWORD WINAPI get_full_path_name_w(LPCWSTR name, DWORD length, LPWSTR buffer, LPW
     bool has_file_part = false;
     const FullPath kind = name ? full_game_path(name, full, has_file_part) : FullPath::NotGame;
     if (kind == FullPath::NotGame) return ::GetFullPathNameW(name, length, buffer, file_part);
+    if (file_part) *file_part = nullptr;  // as when the host fails or the buffer is too small: no file part
     if (kind == FullPath::Refused) {
         SetLastError(ERROR_INVALID_NAME);
         return 0;
@@ -625,6 +626,7 @@ DWORD WINAPI get_full_path_name_a(LPCSTR name, DWORD length, LPSTR buffer, LPSTR
     bool has_file_part = false;
     const FullPath kind = name ? full_game_path(widen_ansi(name).c_str(), full, has_file_part) : FullPath::NotGame;
     if (kind == FullPath::NotGame) return ::GetFullPathNameA(name, length, buffer, file_part);
+    if (file_part) *file_part = nullptr;
     if (kind == FullPath::Refused) {
         SetLastError(ERROR_INVALID_NAME);
         return 0;

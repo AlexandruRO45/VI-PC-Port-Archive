@@ -758,6 +758,21 @@ int main() {
         check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &narrow_part) == 26,
               "GetFullPathNameA with a small buffer answers the size with the NUL");
 
+        // lpFilePart is NULL when the buffer is too small and when the name is refused, not left as the caller had it
+        // (Wine's GetFullPathNameW, which the Windows function follows here).
+        wchar_t* sentinel_w = reinterpret_cast<wchar_t*>(1);
+        char* sentinel_a = reinterpret_cast<char*>(1);
+        check(full_w(L"GAME:\\nested\\deeper\\c.bin", 5, full, &sentinel_w) == 26 && sentinel_w == nullptr,
+              "a buffer that is too small clears the file part (W)");
+        check(full_a("GAME:\\nested\\deeper\\c.bin", 5, narrow, &sentinel_a) == 26 && sentinel_a == nullptr,
+              "a buffer that is too small clears the file part (A)");
+        sentinel_w = reinterpret_cast<wchar_t*>(1);
+        sentinel_a = reinterpret_cast<char*>(1);
+        check(full_w(L"GAME:\\..\\x", MAX_PATH, full, &sentinel_w) == 0 && sentinel_w == nullptr,
+              "a refused name clears the file part (W)");
+        check(full_a("GAME:\\..\\x", MAX_PATH, narrow, &sentinel_a) == 0 && sentinel_a == nullptr,
+              "a refused name clears the file part (A)");
+
         // A path that climbs above GAME:\ is refused the way CreateFileW refuses the same name (ERROR_INVALID_NAME), and
         // never reaches the host: Windows would clamp "C:\..\x" at the drive root, but the open of "GAME:\..\x" fails, and
         // an answer that opens something else than the open would is worse than none.
