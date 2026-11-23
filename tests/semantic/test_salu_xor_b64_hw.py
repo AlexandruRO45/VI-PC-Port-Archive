@@ -262,5 +262,34 @@ class TestSaluXorB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(state.sgprs[1], 0x00000000)
 
 
+class SIMDMachineState:
+    def __init__(self, num_lanes: int = 64, exec_mask: int = ALL_LANES_ACTIVE) -> None:
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.scalar_state = ScalarMachineState()
+
+    def step(self, instr: ASTInstruction) -> tuple[int, int]:
+        return ScalarInterpreter().step(instr, self.scalar_state)
+
+
+class TestSaluXorB64SIMDDivergence(unittest.TestCase):
+    """Stage 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_exec_mask_interaction(self) -> None:
+        state = SIMDMachineState()
+        state.scalar_state.exec_mask = 0x5555555555555555
+        instr = ASTInstruction(
+            Opcode.S_XOR_B64,
+            ASTOperand.exec_mask(),
+            ASTOperand.exec_mask(),
+            ASTOperand.literal64(0x3333333333333333),
+        )
+        # 0x5555555555555555 ^ 0x3333333333333333 = 0x6666666666666666
+        res, scc = state.step(instr)
+        self.assertEqual(res, 0x6666666666666666)
+        self.assertEqual(state.scalar_state.exec_mask, 0x6666666666666666)
+        self.assertEqual(scc, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
