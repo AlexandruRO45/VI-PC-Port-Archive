@@ -302,3 +302,35 @@ Sanity checks from #3990 (GPU experiments, not repeated here): zeroing the Rayle
 white, zeroing the ozone absorption mostly bumps green, and raising Mie g brightens the sky toward the sun. With
 Earth-like values `CS_Transmittance` lands within about 0.01 of a reference transmittance table, which makes it the
 cheapest pass to sanity-check a translation.
+
+## Shadow record and `PS_DeferredTextured` material fields (#4759)
+
+Reported by @Silliana in [#4759](https://github.com/ItsNotRexed/Leonida/issues/4759), from changing one field at a time and
+observing the picture. **Not re-measured here**: there is no shader disassembly for these fields in this repository, so
+the offsets and behaviours below are the report's, not confirmed against `work/shaders/dxbc/disasm`. Treat them as the
+first check for a symptom, and confirm an offset in the disassembly before relying on it.
+
+The point of the list is that every failure mode below is silent. A wrong value gives no error, no device-lost and no
+validation message: the shadow map is skipped, or the results are flat, black or dim.
+
+### Shadow record
+
+- **First dword, bits 0-1 must read `3`.** Any other value and the shadow map is ignored outright: no shadows, and
+  nothing reports why.
+- **Bit 5 picks the single 2D map lookup.** With the bit clear the shader takes a different path that expects a
+  different shadow texture, so an ordinary 2D map read that way barely contributes.
+
+### `PS_DeferredTextured` material cbuffer
+
+The `props` of these passes carry no float parameters, so the material cbuffer is all effect defaults. A field left at its
+default looks like a broken input rather than a missing one.
+
+| Offset | Field | When it is wrong |
+|---|---|---|
+| `+0x0C` | Normal map strength | `0` gives flat mesh normals, which reads as broken normal maps. A negative value flips them. |
+| `+0x10` | Albedo / sqrt-target fade | `1` fades the albedo and the square-root target to black, so garbage here means black props. |
+| `+0x8C` | Albedo tint | Blends the albedo toward a fixed blueish colour. |
+| `+0x2C` | `mrt1` red only | Changes `mrt1`'s red byte and not the normals. |
+
+`mrt1` red is **not** smoothness: `0` to `128` changes nothing, and above that it only dims the whole light.
+
