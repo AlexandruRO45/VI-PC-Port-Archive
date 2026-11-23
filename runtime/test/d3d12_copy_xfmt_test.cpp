@@ -115,10 +115,13 @@ bool run(ID3D12Device* dev, const Case& c, std::vector<unsigned char>& out, HRES
     if (c.check_edge_bytes) {
         // The edge fixtures copy whole R32G32_UINT source rows, one eight-byte texel per BC1 block.
         // Count the data bytes, excluding padding, so each row contains a different pattern.
-        const UINT64 bytes_per_row = c.src.Width * 8;
-        for (UINT y = 0; y < c.src.Height; ++y) {
-            auto* row = p + sf[0].Offset + UINT64(y) * sf[0].Footprint.RowPitch;
-            for (UINT64 x = 0; x < bytes_per_row; ++x) row[x] = upload_byte(y * bytes_per_row + x);
+        UINT64 byte = 0;
+        for (UINT mip = 0; mip < ns; ++mip) {
+            const auto& s = sf[mip];
+            for (UINT y = 0; y < s.Footprint.Height; ++y) {
+                auto* row = p + s.Offset + UINT64(y) * s.Footprint.RowPitch;
+                for (UINT64 x = 0; x < UINT64(s.Footprint.Width) * 8; ++x) row[x] = upload_byte(byte++);
+            }
         }
     }
     upload->Unmap(0, nullptr);
@@ -239,6 +242,10 @@ int main() {
         {"CopyResource BC7 16x16 -> R32G32B32A32_UINT 4x4, 3 mips", mips(tex(DXGI_FORMAT_BC7_UNORM, 16, 16), 3), mips(tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), 3), true, false},
         {"negative control: CopyResource BC1 12x8 -> R32G32_UINT 3x2, 2 mips", mips(tex(DXGI_FORMAT_BC1_UNORM, 12, 8), 2), mips(tex(DXGI_FORMAT_R32G32_UINT, 3, 2), 2), true, false},
         {"CopyResource R32G32_UINT 3x2 -> BC1 12x8, 2 mips", mips(tex(DXGI_FORMAT_R32G32_UINT, 3, 2), 2), mips(tex(DXGI_FORMAT_BC1_UNORM, 12, 8), 2), true, false},
+        // Mip 0 consists of two full blocks, mip 1 (2x4) of one partial block.
+        {.name = "CopyResource R32G32_UINT 1x2 -> BC1 4x8, 2 mips",
+         .src = mips(tex(DXGI_FORMAT_R32G32_UINT, 1, 2), 2), .dst = mips(tex(DXGI_FORMAT_BC1_UNORM, 4, 8), 2),
+         .whole = true, .depth_values = false, .check_edge_bytes = true},
         {"CopyResource R32G32B32A32_UINT 4x4 -> BC7 16x16", tex(DXGI_FORMAT_R32G32B32A32_UINT, 4, 4), tex(DXGI_FORMAT_BC7_UNORM, 16, 16), true, false},
     };
 
@@ -254,7 +261,10 @@ int main() {
             std::vector<unsigned char> h, o;
             HRESULT hh = S_OK, oh = S_OK;
             if (c.check_edge_bytes) {
-                std::vector<unsigned char> expected(size_t(c.src.Width) * c.src.Height * 8);
+                size_t size = 0;
+                for (UINT mip = 0; mip < c.src.MipLevels; ++mip)
+                    size += size_t(std::max(UINT64{1}, c.src.Width >> mip)) * std::max(1u, c.src.Height >> mip) * 8;
+                std::vector<unsigned char> expected(size);
                 for (size_t i = 0; i < expected.size(); ++i) expected[i] = upload_byte(i);
                 const bool ours_ok = run(ours.p, c, o, oh);
                 if (!ours_ok || o != expected) {

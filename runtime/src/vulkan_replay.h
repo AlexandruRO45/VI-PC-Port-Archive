@@ -1877,7 +1877,7 @@ inline bool stage_unaligned_tile(const ReplayFunctions& vk, Prepared& p, bool up
 }
 
 // CopyResource: the whole buffer, or every subresource of two textures of the same shape.
-inline ReplayResult prepare_resource_copy(Prepared& p) {
+inline ReplayResult prepare_resource_copy(const ReplayFunctions& vk, Prepared& p) {
     if (p.binding.buffer && p.source.buffer) {
         if (p.binding.size != p.source.size || !p.source.size) return ReplayResult::invalid_copy;
         if (p.source.size > UINT64_MAX - p.source.buffer_offset ||
@@ -1893,7 +1893,8 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
     const ResourceBinding &dst = p.binding, &src = p.source;
     // A BC texture and one of its uncompressed equivalent match block for texel ("Format Conversion using
     // Direct3D 10.1"); the Vulkan extent is in source texels.
-    const std::uint32_t sb = block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
+    const BlockFormat src_format = block_format(src.format, VK_IMAGE_ASPECT_COLOR_BIT);
+    const std::uint32_t sb = src_format.block;
     const std::uint32_t db = block_format(dst.format, VK_IMAGE_ASPECT_COLOR_BIT).block;
     const auto blocks = [](std::uint32_t size, std::uint32_t b) { return (size + b - 1) / b; };
     const bool same_shape = sb == db ? dst.width == src.width && dst.height == src.height
@@ -1907,20 +1908,37 @@ inline ReplayResult prepare_resource_copy(Prepared& p) {
         return ReplayResult::invalid_copy;
     // A depth <-> colour pair has one aspect on each side; the copies name each side's own (staged by the caller).
     const bool cross = dst.aspects != src.aspects;
+    VkDeviceSize scratch_bytes = 0;
     for (const VkImageAspectFlags aspect : {VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT}) {
         if (!(dst.aspects & aspect)) continue;
         const VkImageAspectFlags src_aspect = cross ? src.aspects : aspect;
         for (std::uint32_t mip = 0; mip < dst.mip_levels; ++mip) {
             const VkExtent2D extent = mip_extent(src, mip), to = mip_extent(dst, mip);
-            // Lower mips can differ in blocks (BC 12x8 mip 1 is 2x1 blocks, R32G32 3x2 mip 1 is 1x1): more source
-            // blocks than the destination holds is refused, as by WARP. shortcut: a BC destination mip with a partial
-            // edge block cannot take a whole uncompressed texel per block in one vkCmdCopyImage; refused until such
-            // a copy is staged through a buffer.
-            if (sb != db && (blocks(extent.width, sb) * db > to.width || blocks(extent.height, sb) * db > to.height))
-                return ReplayResult::invalid_copy;
-            p.image_copies.push_back({{src_aspect, mip, 0, dst.array_layers}, {0, 0, 0}, {aspect, mip, 0, dst.array_layers},
-                                      {0, 0, 0}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}});
+            const VkImageCopy region{{src_aspect, mip, 0, src.array_layers}, {}, {aspect, mip, 0, dst.array_layers},
+                                     {}, {extent.width, extent.height, std::max(1u, src.depth >> mip)}};
+            if (sb != db) {
+                const std::uint32_t w = blocks(extent.width, sb), h = blocks(extent.height, sb);
+                // Lower mips can differ in block counts. WARP refuses source mips that need more blocks than fit.
+                if (w > blocks(to.width, db) || h > blocks(to.height, db)) return ReplayResult::invalid_copy;
+                if (w * db > to.width || h * db > to.height) {
+                    // Scratch holds one uncompressed texel per BC block. Tight packing gives both views the same
+                    // row and slice strides even when the destination extent ends inside the last block.
+                    p.staged_reads.push_back({scratch_bytes, 0, 0, region.srcSubresource, {}, region.extent});
+                    p.staged_writes.push_back({scratch_bytes, 0, 0, region.dstSubresource, {},
+                                              {std::min(w * db, to.width), std::min(h * db, to.height),
+                                               region.extent.depth}});
+                    scratch_bytes += VkDeviceSize(w) * h * region.extent.depth * src.array_layers * src_format.bytes;
+                    continue;
+                }
+            }
+            p.image_copies.push_back(region);
         }
+    }
+    if (scratch_bytes) {
+        VkDeviceSize base = 0;
+        if (!vk.copy_scratch || !vk.copy_scratch(scratch_bytes, p.staged, base)) return ReplayResult::unsupported;
+        for (auto& region : p.staged_reads) region.bufferOffset += base;
+        for (auto& region : p.staged_writes) region.bufferOffset += base;
     }
     p.range = {dst.aspects, 0, dst.mip_levels, 0, dst.array_layers};
     p.source_range = {src.aspects, 0, src.mip_levels, 0, src.array_layers};
@@ -2810,7 +2828,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     p.has_depth24 = true;
                 }
             } else {
-                result = detail::prepare_resource_copy(p);
+                result = detail::prepare_resource_copy(vk, p);
             }
             if (result == ReplayResult::success && !p.image_copies.empty() &&
                 p.image_copies[0].srcSubresource.aspectMask != p.image_copies[0].dstSubresource.aspectMask) {
@@ -3660,6 +3678,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
                 vk.copy_buffer_to_image(command_buffer, p.staged, p.binding.image, dst_layout,
                                         std::uint32_t(p.staged_writes.size()), p.staged_writes.data());
+                // A cross-format CopyResource can mix staged edge mips with direct copies of aligned mips.
+                if (!p.image_copies.empty())
+                    vk.copy_image(command_buffer, p.source.image, src_layout, p.binding.image, dst_layout,
+                                  std::uint32_t(p.image_copies.size()), p.image_copies.data());
             } else if (!p.image_copies.empty()) {
                 // A subresource can be both the source and destination only in a shared layout.
                 const bool self = p.same_copy_subresource;
