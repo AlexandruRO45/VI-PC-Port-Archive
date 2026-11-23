@@ -54,6 +54,18 @@ class VcmpF16(unittest.TestCase):
         self.assertEqual([f"{w:#010x}" for w in self.run_fixture("ps_vcmp_f16_e64")],
                          [f"{w:#010x}" for w in EXPECTED_E64])
 
+    def test_lg_is_two_ordered_compares(self):
+        """`lg` must not be OpFOrdNotEqual: MoltenVK lowers that op to Metal's unordered `!=`, which is true for a
+        NaN operand where the ISA's ordered "less or greater" is false (issue #3796: ps_vcmp_f16{,e64},
+        ps_vcmpx_f16{,e64} and ps_vcmp_f32_nan each had one predicate bit wrong in every pixel on an Apple M3 Max
+        with MoltenVK 1.4.2). `lt || gt` is exact for every input on every driver."""
+        for name in ("ps_vcmp_f16", "ps_vcmp_f16_e64"):
+            with self.subTest(fixture=name):
+                text = support.translate_fixture(name)
+                self.assertNotIn("OpFOrdNotEqual", text)
+                self.assertIn("OpFOrdLessThan %bool", text)
+                self.assertIn("OpFOrdGreaterThan %bool", text)
+
 
 if __name__ == "__main__":
     unittest.main()

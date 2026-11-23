@@ -1733,6 +1733,14 @@ class Gen:
                 self.emit(f"{b} = OpCopyObject %bool {'%false' if cond == 'f' else '%true'}")
         elif cond not in ops:
             raise Unsupported(op)
+        elif ty in ("f32", "f16") and cond == "lg":
+            # `lg` is the ordered "less or greater" (the ISA's S0 <> S1). OpFOrdNotEqual is that predicate, but
+            # MoltenVK lowers it to Metal's `!=`, which is unordered: true for a NaN operand where an ordered
+            # compare is false. Two ordered compares ORed are exact for every input and quiet on NaN.
+            lt, gt = self.tmp(), self.tmp()
+            self.emit(f"{lt} = OpFOrdLessThan %bool {x} {y}")
+            self.emit(f"{gt} = OpFOrdGreaterThan %bool {x} {y}")
+            self.emit(f"{b} = OpLogicalOr %bool {lt} {gt}")
         else:
             self.emit(f"{b} = {ops[cond]} %bool {x} {y}")
         if scalar and ty in ("u32", "i32") and use_wave_equal:
@@ -7611,6 +7619,10 @@ class Gen:
                     self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal %c3 %true")
                     self.emit(f"{present} = OpGroupNonUniformBallotBitExtract %bool %c3 {ballot} {src}")
                     self.emit(f"{safe_src} = OpSelect %uint {present} {src} {lane}")
+                    # SHADER-529: SPIRV-Cross inlines a single-use OpSelect into the shuffle's argument, so the
+                    # lanes it inlines away never compute their flag and the shuffle reads a stale value. A store
+                    # is a statement every lane runs (cs_w32_permlane_fi on MoltenVK 1.4.2, Apple M3 Max).
+                    sa = self.eager("%uint", sa)
                     self.emit(f"{act} = OpGroupNonUniformShuffle %uint %c3 {sa} {safe_src}")
                     self.emit(f"{got} = OpINotEqual %bool {act} {self.cu(0)}")
                     self.emit(f"{ok} = OpLogicalAnd %bool {present} {got}")

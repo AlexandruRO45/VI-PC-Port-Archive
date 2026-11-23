@@ -6,6 +6,7 @@ case. Expected words are the RDNA2 measurement from issue #374 (op_sel:[FI, BOUN
 FI=1 returns the off lane's value; FI=0 leaves the destination alone (BOUND_CTRL=0) or writes 0 (BOUND_CTRL=1);
 a source lane that is on gives its value whatever FI / BOUND_CTRL are.
 """
+import re
 import struct
 import unittest
 
@@ -34,6 +35,17 @@ def run(spv):
 
 
 class PermlaneSourceOff(unittest.TestCase):
+    def test_the_active_flag_is_stored_before_the_shuffle(self):
+        """SPIRV-Cross inlines a single-use OpSelect into the shuffle's argument (SHADER-529), and the lanes it
+        inlines away never compute it: every off source lane read as on in MoltenVK 1.4.2 on an Apple M3 Max, so
+        `cs_w32_permlane_fi` returned 4 4 4 1 52 52 52 49 instead of the words below. The flag comes from a
+        Function variable of its own, one eager store and load per FI=0 case."""
+        text = support.translate_fixture("cs_w32_permlane_fi", fssm=FSSM)
+        stores = re.findall(r"OpStore (%eager\d+) %t\d+", text)
+        loads = re.findall(r"OpLoad %uint (%eager\d+)", text)
+        self.assertEqual(len(stores), 6)          # permlane16 and permlanex16, FI=0 with BC=0 and BC=1
+        self.assertEqual(sorted(stores), sorted(loads))
+
     def test_all_cases(self):
         got = run(support.translate_fixture("cs_w32_permlane_fi", fssm=FSSM))
         for i, name in enumerate(NAMES):
