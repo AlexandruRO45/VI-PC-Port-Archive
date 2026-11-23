@@ -129,6 +129,13 @@ class TestRoundModeRejection(unittest.TestCase):
         spv = support.translate_lines("cs_rm_valid", prog, fssm=saveexec_run.fssm())
         self.assertIn("OpCapability Shader", spv)
 
+class TestRoundModeTranslator(unittest.TestCase):
+    def test_translator_mutation_guard(self):
+        prog = ["s_round_mode 0", "s_endpgm"]
+        spv = support.translate_lines("cs_rm_trans", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
