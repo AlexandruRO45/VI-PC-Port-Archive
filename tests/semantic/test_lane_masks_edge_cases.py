@@ -13,6 +13,9 @@ import support
 FSSM = bytearray(0x148)
 struct.pack_into("<4I", FSSM, 0x138, 0x88, 4, 1, 1)  # 4 user SGPRs, workgroup id in s4, 4x1x1
 FSSM = bytes(FSSM)
+FSSM64 = bytearray(0x148)
+struct.pack_into("<4I", FSSM64, 0x138, 0x88, 64, 1, 1)   # the same, 64x1x1 threads
+FSSM64 = bytes(FSSM64)
 
 OUT_BASE = 0x1000
 SCRATCH_BASE = 0x2000
@@ -32,7 +35,43 @@ def run_cs(name, asm, nlanes=4):
     return spv, [mem.get(OUT_BASE + 4 * i, 0) for i in range(nlanes)]
 
 
+def run_cs64(name, asm):
+    """Like run_cs for a wave64 program: one 64-wide subgroup, 64 lanes, two output words per lane."""
+    spv = support.translate_lines(name, asm, fssm=FSSM64)
+    mem = {}
+    si.run_workgroup(
+        spv,
+        64,
+        64,
+        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
+        push_constants=[OUT_BASE, 0, SCRATCH_BASE, 0] + [0] * 32,
+        memory=mem,
+    )
+    return spv, [(mem.get(OUT_BASE + 8 * i, 0), mem.get(OUT_BASE + 8 * i + 4, 0)) for i in range(64)]
+
+
 class LaneMasksEndToEndTests(unittest.TestCase):
+    def test_a_mask_parked_in_lane_8_survives_a_word_written_to_lane_40(self):
+        """lane_slot keys on lane & 63: a plain word in lane 40 must not end the mask parked in lane 8."""
+        _, got = run_cs64("cs_parked_lane8_lane40", [
+            "v_and_b32_e32 v8, 63, v0",
+            "v_cmp_gt_u32_e64 s[6:7], 2, v8",
+            "s_mov_b32 s10, 0x1234",
+            "v_writelane_b32 v5, s6, 8",
+            "v_writelane_b32 v5, s10, 40",
+            "v_readlane_b32 s11, v5, 8",
+            "v_readlane_b32 s12, v5, 40",
+            "s_bcnt1_i32_b32 s13, s11",
+            "v_mov_b32_e32 v1, s13",
+            "v_mov_b32_e32 v2, s12",
+            "v_lshlrev_b32_e32 v9, 3, v0",
+            "global_store_dword v9, v1, s[0:1]",
+            "global_store_dword v9, v2, s[0:1] offset:4",
+            "s_endpgm",
+        ])
+        # The mask parked in lane 8 is lanes 0 and 1 (popcount 2); lane 40 holds the word.
+        self.assertEqual(got, [(2, 0x1234)] * 64)
+
     def test_dpp_bitwise_respects_row_mask_on_mask_operands(self):
         """v_or_b32_dpp must not enter mask_writes and bypass dpp_guard (row_mask:0x0 keeps old v2)."""
         _, got = run_cs("cs_dpp_mask", [
