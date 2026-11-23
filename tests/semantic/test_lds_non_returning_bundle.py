@@ -283,6 +283,24 @@ class TestLdsIncU32Reference(unittest.TestCase):
         self.assertEqual(rtns, [0xDEAD])
         self.assertEqual(fin[0x40], 4)
 
+class TestLdsIncU32Offset(unittest.TestCase):
+    def test_byte_offset_increment(self):
+        init = {0x40: 1, 0x44: 2, 0x48: 3}
+        rtns, fin = L.run_chain([("ds_inc_u32", 0x20, 0x24, (5,))], init)
+        self.assertEqual(fin[0x44], 3)
+
+    def test_multiple_offsets_same_base(self):
+        init = {0x40: 4, 0x44: 5, 0x48: 6}
+        ops = [
+            ("ds_inc_u32", 0x40, 0, (5,)),
+            ("ds_inc_u32", 0x40, 4, (5,)),
+            ("ds_inc_u32", 0x40, 8, (5,)),
+        ]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(fin[0x40], 5)
+        self.assertEqual(fin[0x44], 0)
+        self.assertEqual(fin[0x48], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
