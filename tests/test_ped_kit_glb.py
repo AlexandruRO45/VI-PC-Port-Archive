@@ -225,6 +225,30 @@ class PedKitGlbTests(unittest.TestCase):
         self.assertIn("replace", result.stderr.lower())
         self.assertEqual(source.read_bytes(), before)
 
+    def test_output_cannot_replace_an_indexed_model_outside_the_kit(self):
+        trousers = catalogue_fixture._pack_state(state_id=0, drawable_hash=ped_catalogues.murmur64(PART_NAMES[0]))
+        blocks = catalogue_fixture.build_kit_blocks(kits=[(101, [(10, 0)])], presets=[(10, 0, [trousers])])
+        self.fixture["catalogue"].write_bytes(catalogue_fixture.build_synthetic_0drp(blocks))
+        source = self.fixture["parts"][1] / "model.glb"  # Indexed jacket outside this trousers-only kit.
+        original = source.read_bytes()
+        for kind in ("direct", "symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                output = source
+                if kind != "direct":
+                    output = self.root / f"{kind}.glb"
+                    try:
+                        if kind == "symlink":
+                            output.symlink_to(source)
+                        else:
+                            output.hardlink_to(source)
+                    except (NotImplementedError, OSError) as exc:
+                        self.skipTest(f"cannot create {kind}: {exc}")
+                result = self.export(101, output)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("indexed GLB", result.stderr)
+                self.assertEqual(source.read_bytes(), original)
+                self.assertTrue(output.samefile(source))
+
     def test_textured_primitive_requires_source_uv(self):
         source = self.fixture["parts"][1] / "model.glb"
         gltf, binary = skinned_glb.read_glb(str(source))
