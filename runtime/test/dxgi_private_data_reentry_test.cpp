@@ -12,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 static thread_local int fail_after = -1;
 
@@ -29,6 +30,7 @@ namespace {
 using namespace std::chrono_literals;
 constexpr GUID kValue{0x5eed0101, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b, 0x6c, 0, 1}};
 constexpr GUID kInterface{0x5eed0102, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b, 0x6c, 0, 2}};
+constexpr GUID kOther{0x5eed0103, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b, 0x6c, 0, 3}};
 constexpr UINT kValueData = 81;
 
 template<class T = IDXGIFactory4>
@@ -147,6 +149,57 @@ bool concurrent_remove(IDXGIObject& factory, Payload& payload) {
 // `allocations` counts the operator new calls that succeed before the injected failure. The count follows the
 // standard library's allocation order (a debug iterator level adds its own), so a case's name describes the release
 // build; every case still requires E_OUTOFMEMORY.
+// An interface whose Release reads and writes the store that is dropping it. The store must release a replaced or
+// removed reference after unlocking, or this call relocks its std::mutex on the same thread (a hang or an abort).
+struct ReleaseProbe final : IUnknown {
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *out = this;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG left = --refs;
+        if (owner && left == 1) {  // the store's reference going away; the test still holds its own
+            IDXGIObject* store = std::exchange(owner, nullptr);
+            UINT size = sizeof(UINT), value = 0;
+            const HRESULT read = store->GetPrivateData(kValue, &size, &value);
+            const UINT other = kValueData + 2;
+            const HRESULT write = store->SetPrivateData(kOther, sizeof(other), &other);
+            callback_ok = read == S_OK && size == sizeof(value) && value == kValueData && write == S_OK;
+            callback_ran = true;
+        }
+        return left;
+    }
+
+    std::atomic<ULONG> refs{1};
+    IDXGIObject* owner = nullptr;
+    bool callback_ran = false;
+    bool callback_ok = false;
+};
+
+// The entry holding `probe` is replaced by bytes for the same key (or removed); the probe's Release then reenters.
+bool release_reentry(IDXGIObject& factory, bool remove) {
+    ReleaseProbe probe;
+    if (factory.SetPrivateData(kValue, sizeof(kValueData), &kValueData) != S_OK ||
+        factory.SetPrivateDataInterface(kInterface, &probe) != S_OK || probe.refs != 2) return false;
+    probe.owner = &factory;
+    const UINT replacement = kValueData + 1;
+    const HRESULT hr = remove ? factory.SetPrivateDataInterface(kInterface, nullptr)
+                              : factory.SetPrivateData(kInterface, sizeof(replacement), &replacement);
+    UINT size = sizeof(UINT), value = 0;
+    const HRESULT after = factory.GetPrivateData(kInterface, &size, &value);
+    const bool entry_ok = remove ? after == DXGI_ERROR_NOT_FOUND && size == 0
+                                 : after == S_OK && size == sizeof(value) && value == replacement;
+    size = sizeof(UINT);
+    value = 0;
+    const bool other_ok = factory.GetPrivateData(kOther, &size, &value) == S_OK && value == kValueData + 2;
+    return hr == S_OK && probe.callback_ran && probe.callback_ok && probe.refs == 1 && entry_ok && other_ok;
+}
+
 template<class Call>
 bool reports_oom(int allocations, Call call) {
     fail_after = allocations;
@@ -298,7 +351,8 @@ int wmain(int argc, wchar_t** argv) {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     if (argc == 3) {
         const std::wstring_view scenario = argv[1], implementation = argv[2];
-        if ((scenario != L"reentrant" && scenario != L"concurrent") ||
+        const bool release_case = scenario == L"release-replace" || scenario == L"release-remove";
+        if ((scenario != L"reentrant" && scenario != L"concurrent" && !release_case) ||
             (implementation != L"native" && implementation != L"layer")) return 2;
         leonida::VulkanContext context(no_device_proc, VK_NULL_HANDLE, false);
         Payload payload;
@@ -310,8 +364,9 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, "factory creation failed: 0x%08lx\n", static_cast<unsigned long>(hr));
             return 1;
         }
-        const bool ok = scenario == L"reentrant" ? reentrant_replace(*factory.ptr, payload)
-                                                 : concurrent_remove(*factory.ptr, payload);
+        const bool ok = release_case             ? release_reentry(*factory.ptr, scenario == L"release-remove")
+                        : scenario == L"reentrant" ? reentrant_replace(*factory.ptr, payload)
+                                                   : concurrent_remove(*factory.ptr, payload);
         return ok ? 0 : 1;
     }
     const bool native = argc == 2 && std::wstring_view(argv[1]) == L"--native";
@@ -325,6 +380,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     const bool reentrant = report("AddRef reentry and replacement", run_child(L"reentrant", false));
     const bool concurrent = report("Concurrent removal during AddRef", run_child(L"concurrent", false));
+    // In a child too: with the reference released under the lock, these relock the store's mutex and hang or abort.
+    const bool release_replace = report("Release of a replaced interface reenters the store",
+                                        run_child(L"release-replace", false));
+    const bool release_remove = report("Release of a removed interface reenters the store",
+                                       run_child(L"release-remove", false));
 
     leonida::VulkanContext context(no_device_proc, VK_NULL_HANDLE, false);
     const bool owner = report("New interface key OOM while acquiring the owner", failed_insert(context, 0, true));
@@ -340,6 +400,6 @@ int wmain(int argc, wchar_t** argv) {
     const bool updates = report("Concurrent updates keep reference counts balanced", concurrent_updates(context));
     const bool registration = report("Adapter event registration recovers from OOM",
                                      failed_adapter_event_registration(context));
-    return reentrant && concurrent && owner && growth && copy && copy_growth && interface_to_interface &&
+    return reentrant && concurrent && release_replace && release_remove && owner && growth && copy && copy_growth && interface_to_interface &&
            interface_to_bytes && bytes_to_interface && bytes_to_bytes && updates && registration ? 0 : 1;
 }
