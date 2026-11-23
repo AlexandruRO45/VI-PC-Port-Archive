@@ -31,6 +31,10 @@ methods are still open.
   encoding="utf-8", newline="\n")` (the same for `Path.open`, `Path.write_text` and a text-mode
   `tempfile.NamedTemporaryFile`), so the output is LF on Windows too and the same input gives the same bytes on every
   platform. `tests/test_text_write_line_endings.py` fails for a writer that forgets it.
+- A report published through a private staging file takes the destination's permission bits from
+  `tools/file_mode.py` (`published_mode`, then the usual `os.replace`) instead of `os.umask`: a
+  `tempfile.NamedTemporaryFile` is created 0600, and reading the umask with `os.umask(0)`/`os.umask(mask)` sets
+  process-wide state that a thread creating a file between the two calls sees.
 - `tools/rpf9dump` needs the submodule: `git submodule update --init`.
 - A new shader-translator rule goes into the contract table in `docs/design.md`, with how it was confirmed: a GPU
   test, a Mesa/LLVM reference, or a count over the corpus.
