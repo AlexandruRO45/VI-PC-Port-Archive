@@ -360,6 +360,54 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
                 checked += 1
         self.assertGreater(checked, 5000)
 
+    def test_legacy_mac_mad_mnemonics_follow_the_target(self):
+        # One encoding, two llvm-mc names: GFX10.1 (the console, gfx1013) spells the legacy multiply-add ops
+        # without the fused prefix. The decoder printed the GFX10.3 name for every target.
+        cases = (
+            # VOP2 0x06: `v_mac_legacy_f32_e32 v0, v1, v2` on gfx1013, `v_fmac_legacy_f32_e32` on gfx1030.
+            ("vop2-0x06", "0105000c", "v_mac_legacy_f32_e32", "v_fmac_legacy_f32_e32"),
+            # VOP3 0x106 with clamp: same split, three operands.
+            ("vop3-0x106", "008006d501050200", "v_mac_legacy_f32", "v_fmac_legacy_f32"),
+            # VOP3 0x140: unfused v_mad_legacy_f32 on gfx1013, fused v_fma_legacy_f32 on gfx1030.
+            ("vop3-0x140", "000040d501050e04", "v_mad_legacy_f32", "v_fma_legacy_f32"),
+        )
+        for label, hexcode, gfx1013_name, gfx1030_name in cases:
+            raw = bytes.fromhex(hexcode)
+            for mcpu, want, other in (("gfx1013", gfx1013_name, gfx1030_name),
+                                      ("gfx1010", gfx1013_name, gfx1030_name),
+                                      ("gfx1030", gfx1030_name, gfx1013_name)):
+                text, bad = rdna2_decode.disasm_bytes(raw, mcpu=mcpu, wave32=True)
+                self.assertEqual(bad, 0, f"{label} {mcpu}")
+                self.assertIn(want, text, f"{label} {mcpu}: {text}")
+                self.assertNotIn(other, text, f"{label} {mcpu}: {text}")
+            # gfx1013 is the default, since the console is the project's target.
+            text, _ = rdna2_decode.disasm_bytes(raw, wave32=True)
+            self.assertIn(gfx1013_name, text, label)
+        # ... and shader_disasm's Python backend has to pass its --mcpu through.
+        text, _, _ = shader_disasm.disasm(bytes.fromhex("000040d501050e04"), "gfx1030", backend="python")
+        self.assertIn("v_fma_legacy_f32", text)
+
+    def test_python_backend_rejects_a_target_its_tables_do_not_cover(self):
+        # The tables are RDNA2. Any other target used to decode silently with the GFX10.3 names, and a bare
+        # `gfx101`/`gfx103` prefix must not let a near-miss such as gfx1014 or gfx1037 through either.
+        raw = bytes.fromhex("000040d501050e04")
+        for mcpu in ("gfx1100", "gfx9999", "rdna2", "", "gfx101", "gfx103", "gfx1014", "gfx1037",
+                     "gfx1030x", "GFX1013", " gfx1013"):
+            with self.assertRaises(ValueError, msg=mcpu):
+                rdna2_decode.disasm_bytes(raw, mcpu=mcpu, wave32=True)
+            with self.assertRaises(ValueError, msg=mcpu):
+                shader_disasm.disasm(raw, mcpu, backend="python")
+        self.assertIn("v_mad_legacy_f32", shader_disasm.disasm(raw, "gfx1013", backend="python")[0])
+        # A family prefix alone is not enough for the naming helper either: gfx1014 is not gfx1013.
+        self.assertEqual(rdna2_decode.target_name("vop2", 0x06, "v_fmac_legacy_f32", "gfx1014"),
+                         "v_fmac_legacy_f32")
+        self.assertEqual(rdna2_decode.target_name("vop2", 0x06, "v_fmac_legacy_f32", "gfx1013"),
+                         "v_mac_legacy_f32")
+        # Every listed target is accepted and uses the right GFX10.1/GFX10.3 name.
+        for mcpu in sorted(rdna2_decode.RDNA2_TARGETS):
+            want = "v_mad_legacy_f32" if mcpu.startswith("gfx101") else "v_fma_legacy_f32"
+            self.assertIn(want, shader_disasm.disasm(raw, mcpu, backend="python")[0], mcpu)
+
     def test_sdwa_inline_constants_and_sgpr(self):
         # Exact encodings from runtime/test/shaders/ps_sdwa_f16_const.asm:
         # 1) v_add_f16_sdwa v2, 1.0, v1 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE src0_sel:WORD_1 src1_sel:WORD_0

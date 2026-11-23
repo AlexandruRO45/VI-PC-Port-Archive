@@ -43,10 +43,41 @@ class DisasmFailureTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def run_tool(self, llvm_mc: str, out: str) -> subprocess.CompletedProcess:
+    def run_tool(self, llvm_mc: str, out: str, *extra: str) -> subprocess.CompletedProcess:
         env = dict(os.environ, LLVM_MC=llvm_mc)
-        return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1"],
+        return subprocess.run([sys.executable, "-I", TOOL, self.fssm, "--out", out, "--jobs", "1", *extra],
                               capture_output=True, text=True, errors="replace", env=env)
+
+    def test_skip_existing_only_reuses_listings_for_the_same_target(self):
+        # `--skip-existing` used to reuse any listing, so `--mcpu gfx1030` kept a gfx1013 listing (where VOP3 0x140
+        # is a different mnemonic) and reported it as reused.
+        out = os.path.join(self.dir, "out")
+        p = self.run_tool("unused", out, "--backend", "python", "--mcpu", "gfx1013")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            self.assertIn(", gfx1013,", f.read())
+        p = self.run_tool("unused", out, "--backend", "python", "--mcpu", "gfx1030", "--skip-existing")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("'reused': 1", p.stdout)
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            self.assertIn(", gfx1030,", f.read())
+        # Same target again: now it is a matching run and can be reused.
+        p = self.run_tool("unused", out, "--backend", "python", "--mcpu", "gfx1030", "--skip-existing")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'reused': 1", p.stdout)
+
+    def test_python_backend_rejects_a_target_its_tables_do_not_cover(self):
+        # --backend python used to accept any --mcpu and decode with the GFX10.3 opcode names.
+        out = os.path.join(self.dir, "out")
+        for mcpu in ("gfx1100", "gfx9999", "rdna2", "gfx101", "gfx1014", "gfx1037"):
+            p = self.run_tool("unused", out, "--backend", "python", "--mcpu", mcpu)
+            self.assertEqual(p.returncode, 2, (mcpu, p.stdout, p.stderr))
+            self.assertIn("gfx1013", p.stderr)
+            self.assertIn("not --mcpu " + mcpu, p.stderr)
+        p = self.run_tool("unused", out, "--backend", "python", "--mcpu", "gfx1013")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(os.path.join(out, "one.s"), encoding="utf-8") as f:
+            self.assertIn(", gfx1013, 0 invalid words", f.read())
 
     def fake(self, body: str) -> str:
         path = os.path.join(self.dir, "fake_mc.py")
@@ -186,8 +217,11 @@ class DisasmInputTest(unittest.TestCase):
         out = os.path.join(self.dir, "out")
         os.mkdir(out)
         kept = os.path.join(out, "kept.s")
+        # A published listing starts with the header that names the target it was written for; --skip-existing
+        # matches on that target.
+        header = "; kept  code 0x128..0x130 (header), gfx1013, 0 invalid words\n"
         with open(kept, "w", encoding="utf-8", newline="\n") as f:
-            f.write("completed listing\n")
+            f.write(header + "completed listing\n")
         open(os.path.join(out, "empty.s"), "w").close()
         open(os.path.join(out, ".disasm-abandoned.tmp"), "w").close()
 
@@ -196,7 +230,7 @@ class DisasmInputTest(unittest.TestCase):
         self.assertIn("'reused': 1", result.stdout)
         self.assertIn("'clean': 2", result.stdout)
         with open(kept, encoding="utf-8") as f:
-            self.assertEqual(f.read(), "completed listing\n")
+            self.assertEqual(f.read(), header + "completed listing\n")
         for name in ("empty", "unfinished"):
             with open(os.path.join(out, name + ".s"), encoding="utf-8") as f:
                 self.assertIn("s_endpgm", f.read())

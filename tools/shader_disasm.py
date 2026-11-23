@@ -13,6 +13,7 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -148,6 +149,17 @@ def code_range(b: bytes):
     return None, end + 4 if end >= 0 else None, "scan"
 
 
+def listing_target(path: str) -> str | None:
+    """The target a published listing was written for, from its header (`... , gfx1013, 0 invalid words`)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            head = f.readline()
+    except OSError:
+        return None
+    m = re.search(r", (gfx[0-9a-z]+), \d+ invalid words", head)
+    return m.group(1) if m else None
+
+
 def one(path, out, mcpu, backend="llvm-mc"):
     with open(path, "rb") as f:
         b = f.read()
@@ -198,6 +210,9 @@ def main():
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
+    if a.backend == "python" and not rdna2_decode.supports_target(a.mcpu):
+        targets = "/".join(sorted(rdna2_decode.RDNA2_TARGETS))
+        ap.error(f"--backend python decodes RDNA2 only ({targets}), not --mcpu {a.mcpu}")
     if os.path.isfile(a.src):
         if a.unpack_index:
             ap.error("--unpack-index requires an FSSM directory")
@@ -238,7 +253,10 @@ def main():
         pending = []
         for path in files:
             listing = output_path(path, out)
-            if not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0:
+            # A listing is only reusable for the target it was written for: `--mcpu gfx1030` must not keep a
+            # listing disassembled as gfx1013, where opcode 0x140 has a different name.
+            if (not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0
+                    and listing_target(listing) == a.mcpu):
                 res["reused"] += 1
             else:
                 pending.append(path)

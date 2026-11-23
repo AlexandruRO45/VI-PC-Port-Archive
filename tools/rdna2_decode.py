@@ -411,6 +411,44 @@ def _mimg_data_count(name: str, dmask: int, d16: bool, tfe: bool) -> int:
     return n + (1 if tfe else 0)
 
 
+# One encoding, two names: GFX10.1 (the console, gfx1013) spells the legacy multiply-add ops without the fused
+# "fma/fmac" prefix. `llvm-mc` prints both names from the same bytes, e.g. `v_mac_legacy_f32` for gfx1013 and
+# `v_fmac_legacy_f32` for gfx1030; the ISA tables carry the GFX10.3 spellings.
+TARGET_DEPENDENT_NAMES: dict[tuple[str, int], dict[str, str]] = {
+    ("vop2", 0x06): {"gfx101": "v_mac_legacy_f32"},
+    ("vop3", 0x106): {"gfx101": "v_mac_legacy_f32"},
+    ("vop3", 0x140): {"gfx101": "v_mad_legacy_f32"},
+}
+
+
+# The parts the tables describe: GFX10.1 (the console is gfx1013) and GFX10.3. Anything else would silently get
+# these opcode names for code the tables were not built from, so decode_bytes() refuses it. An explicit list, not a
+# `gfx101`/`gfx103` prefix: llvm-mc takes an unknown name like `gfx1037` without complaint, so a prefix would let the
+# same near-misses through here.
+RDNA2_TARGETS = frozenset((
+    "gfx1010", "gfx1011", "gfx1012", "gfx1013",                            # GFX10.1: Navi 10/12/14, the console
+    "gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036",  # GFX10.3: Navi 21/22/23/24 iGPUs
+))
+
+
+def supports_target(mcpu: str) -> bool:
+    """True when the ISA tables describe `mcpu` (a GFX10.1 or GFX10.3 part)."""
+    return mcpu in RDNA2_TARGETS
+
+
+def target_name(kind: str, opc: int, name: str, mcpu: str) -> str:
+    """Return the mnemonic this target uses for `kind`/`opc`, where it depends on the target.
+
+    `supports_target()` gates the family prefix, so a near-miss such as `gfx1014` keeps the table's
+    GFX10.3 spelling here too, not just at the `decode_bytes()` entry point.
+    """
+    if supports_target(mcpu):
+        for mcpu_prefix, replacement in TARGET_DEPENDENT_NAMES.get((kind, opc), {}).items():
+            if mcpu.startswith(mcpu_prefix):
+                return replacement
+    return name
+
+
 def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | None, int]:
     """Decode one RDNA2 instruction at byte offset `pc`. Returns (ins_dict_or_None, byte_length)."""
     if pc + 4 > len(code):
@@ -588,6 +626,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if entry is None:
             return None, 4
         name, spec = entry
+        name = target_name("vop2", opc, name, mcpu)
         mods = []
         if is_dpp16 or is_dpp8 or is_sdwa:
             if not need(8):
@@ -928,8 +967,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
         if entry is None:
             return None, 4
         name, spec = entry
-        if opc == 0x140 and mcpu.startswith("gfx101"):
-            name = "v_mad_legacy_f32"
+        name = target_name("vop3", opc, name, mcpu)
         sdst = (w0 >> 8) & 0x7F
         abs_bits = 0 if is_vop3b else ((w0 >> 8) & 7)
         op_sel = 0 if is_vop3b else ((w0 >> 11) & 0xF)
@@ -1414,8 +1452,19 @@ def _iter_insns(code: bytes, wave32: bool, code_start: int, mcpu: str) -> Iterat
         yield ins
 
 
+def require_supported_target(mcpu: str) -> None:
+    """Raise ValueError unless the ISA tables describe `mcpu`.
+
+    The tables are GFX10.1 and GFX10.3. Any other target used to decode silently with the GFX10.3 names.
+    """
+    if not supports_target(mcpu):
+        raise ValueError(f"unsupported target {mcpu!r}: the RDNA2 tables cover "
+                         f"{'/'.join(sorted(RDNA2_TARGETS))}")
+
+
 def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
     """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
+    require_supported_target(mcpu)
     insns = []
     invalid = 0
     for ins in _iter_insns(code, wave32, code_start, mcpu):
@@ -1431,6 +1480,7 @@ def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, cod
 
     The listing contains only instructions. `name` is accepted for caller compatibility.
     """
+    require_supported_target(mcpu)
     invalid = 0
     with StringIO() as listing:
         for ins in _iter_insns(code, wave32, code_start, mcpu):
