@@ -297,20 +297,29 @@ class JobsHandlingTest(unittest.TestCase):
     """Test --jobs default computation, command-line overrides, and forwarding."""
 
     def test_jobs_default_calculation_scenarios(self):
+        parse_args = argparse.ArgumentParser.parse_args
         scenarios = [
             (None, 1),
             (1, 1),
             (2, 1),
+            (3, 1),
             (4, 2),
+            (7, 3),
             (8, 4),
             (16, 8),
             (64, 32),
         ]
         for cpus, expected in scenarios:
             with self.subTest(cpus=cpus, expected=expected):
-                with patch("os.cpu_count", return_value=cpus):
-                    calc = max(1, (os.cpu_count() or 2) // 2)
-                    self.assertEqual(calc, expected)
+                def check_jobs(parser):
+                    self.assertEqual(parse_args(parser, []).jobs, expected)
+                    raise SystemExit(0)  # Stop before main discovers game files or starts a build.
+
+                with patch("os.cpu_count", return_value=cpus), \
+                        patch.object(argparse.ArgumentParser, "parse_args", check_jobs):
+                    with self.assertRaises(SystemExit) as stopped:
+                        make_game.main()
+                self.assertEqual(stopped.exception.code, 0)
 
     def test_custom_jobs_forwarded_to_shaders(self):
         with tempfile.TemporaryDirectory() as tmp:
