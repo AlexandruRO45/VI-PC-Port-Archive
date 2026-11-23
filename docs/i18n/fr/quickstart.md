@@ -133,7 +133,7 @@ encore ce cache.
 - **Ce qui est refait automatiquement** : la compilation enregistre la commande et la version de `llvm-mc`, les
   sources du traducteur et le décodeur des ressources (`third_party/rpf9-explorer` et `tools/rpf9dump`). Si l'un
   d'eux change, seule l'étape concernée est refaite (désassemblage, traduction ou export des modèles et textures).
-- **`--work`** : choisissez un disque avec au moins 350 Go libres. La traduction des shaders est l'étape la plus
+- **`--work`** : choisissez un disque avec au moins 400 Go libres. La traduction des shaders est l'étape la plus
   longue ; elle utilise par défaut la moitié des threads du processeur (réglable avec `--jobs`).
 - **`--wav`** : désactivé par défaut, car le WAV PCM 16 bits est plusieurs fois plus volumineux que l'Ogg Opus.
 - **Linux et Wine/Proton** : `make_game.py` fonctionne aussi sous Linux. L'étape `pipelines` utilise
