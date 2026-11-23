@@ -70,8 +70,8 @@ class Descriptors(unittest.TestCase):
         s = mp.sgpr_words(SPEC, layout)
         self.assertEqual(len(s), 32)
         self.assertEqual((s[17], s[19], s[20], s[23]), (0x100, 0x300, 0, 0x900))
-        self.assertEqual(s[21], 1 << 28)
-        self.assertEqual(sum(1 for w in s if w), 4)
+        self.assertEqual(s[21], 0)     # bit 28 clear: meshlet = workgroup index, no indirection list
+        self.assertEqual(sum(1 for w in s if w), 3)   # table, vertex block, heap base; the draw word is 0
 
 
 class Camera(unittest.TestCase):
@@ -252,12 +252,15 @@ class Candidates(unittest.TestCase):
 class NativeConfirmation(unittest.TestCase):
     """A native draw counts only when vk_harness says the mesh stage got the required size."""
 
-    def run_draw(self, stderr, emulate=False):
+    def run_draw(self, stderr, emulate=False, groups=1, env_out=None):
         from unittest import mock
         with tempfile.TemporaryDirectory() as out, mock.patch.object(mp.subprocess, "run") as run, \
                 mock.patch.object(mp, "heap_env", return_value=""):
             run.return_value = mock.Mock(returncode=0, stderr=stderr)
-            return mp.draw("vk_harness", "ms.spv", out, {"subgroup_size": 64}, b"", [0], 16, 16, emulate)
+            path = mp.draw("vk_harness", "ms.spv", out, {"subgroup_size": 64}, b"", [0], 16, 16, emulate, groups)
+            if env_out is not None:
+                env_out.update(run.call_args.kwargs["env"])
+            return path
 
     def test_native_needs_the_harness_to_confirm_the_mesh_size(self):
         self.assertTrue(self.run_draw("mesh subgroup size: 64\n").endswith("image.raw"))
@@ -267,8 +270,46 @@ class NativeConfirmation(unittest.TestCase):
             with self.subTest(stderr=stderr), self.assertRaises(SystemExit):
                 self.run_draw(stderr)
 
+    def test_several_meshlets_draw_one_workgroup_each_and_need_the_grid_confirmed(self):
+        env = {}
+        self.assertTrue(self.run_draw("mesh workgroups: 3 x 1 x 1\n", emulate=True, groups=3, env_out=env)
+                        .endswith("image.raw"))
+        self.assertEqual(env.get("VKH_MESH_GROUPS"), "3")
+        # No grid line (a harness without VKH_MESH_GROUPS drew one workgroup) or another grid: refused.
+        for stderr in ("", "mesh workgroups: 2 x 1 x 1\n"):
+            with self.subTest(stderr=stderr), self.assertRaises(SystemExit):
+                self.run_draw(stderr, emulate=True, groups=3)
+        # One meshlet sets no VKH_MESH_GROUPS, so the single-workgroup draw is unchanged.
+        env = {}
+        self.run_draw("", emulate=True, groups=1, env_out=env)
+        self.assertNotIn("VKH_MESH_GROUPS", env)
+
     def test_an_emulated_draw_requests_no_size(self):
         self.assertTrue(self.run_draw("", emulate=True).endswith("image.raw"))
+
+    def test_a_heap_too_dense_for_the_environment_goes_through_a_file(self):
+        from unittest import mock
+        heap = bytearray(mp.HEAP_BYTES)
+        for i in range(0, len(heap), 4):
+            struct.pack_into("<I", heap, i, 0xDEADBEEF)        # far past the environment limit as addr=word pairs
+        heap = bytes(heap)
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(mp.subprocess, "run") as run, \
+                mock.patch.dict(os.environ, {"VKH_HEAP": "0x0=0x1"}):
+            run.return_value = mock.Mock(returncode=0, stderr="")
+            mp.draw("vk_harness", "ms.spv", out, {"subgroup_size": 64}, heap, [0], 16, 16, True, 1)
+            env = run.call_args.kwargs["env"]
+            self.assertNotIn("VKH_HEAP", env)                  # not even one inherited from the caller
+            with open(env["VKH_HEAP_FILE"], "rb") as f:
+                self.assertEqual(f.read(), heap)
+        # A heap that fits goes as words, and no file is named.
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(mp.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stderr="")
+            small = bytearray(mp.HEAP_BYTES)
+            struct.pack_into("<I", small, 0x100, 7)
+            mp.draw("vk_harness", "ms.spv", out, {"subgroup_size": 64}, bytes(small), [0], 16, 16, True, 1)
+            env = run.call_args.kwargs["env"]
+            self.assertEqual(env["VKH_HEAP"], "0x100=0x7")
+            self.assertNotIn("VKH_HEAP_FILE", env)
 
 
 class Wave64Mode(unittest.TestCase):

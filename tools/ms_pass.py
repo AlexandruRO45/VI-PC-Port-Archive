@@ -48,7 +48,8 @@ SHADERS = {
         "table_sgpr": 17,              # 32-bit pointer to a table of 16-byte V#s
         "position_sgprs": (19, 20),    # low/high VA of the 42 40 vertex block; the shader builds its V# itself
         "draw_word_sgpr": 21,          # packed draw word
-        "group_from_index": 1 << 28,   # draw-word bit: meshlet = workgroup index (no indirection list)
+        "draw_word": 0,                # bit 28 clear: meshlet = workgroup index while below the group's meshlet
+                                       # count (else 0); bit 28 set reads the meshlet from an indirection list
         "heap_sgpr": 23,               # resource heap base, unused on that path but read
         "slots": {"meshlet_group": 0x40, "object": 0x80, "view": 0xA0},
         "object_bytes": 0x40,          # 4 x float4 object (world) matrix at +0
@@ -199,7 +200,7 @@ def sgpr_words(spec: dict, layout: dict) -> list[int]:
     s[spec["table_sgpr"]] = layout["table"]
     lo, hi = spec["position_sgprs"]
     s[lo], s[hi] = layout["vertex_block"], 0
-    s[spec["draw_word_sgpr"]] = spec["group_from_index"]
+    s[spec["draw_word_sgpr"]] = spec["draw_word"]
     s[spec["heap_sgpr"]] = layout["heap_base"]
     return s
 
@@ -410,16 +411,30 @@ def translate_ms(work: str, sha: str, emulate: bool = False) -> str:
 
 
 def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[int], width: int, height: int,
-         emulate: bool = False):
-    """Draw once. A native wave64 module needs the GPU to require 64-wide mesh subgroups; an emulated one runs at
+         emulate: bool = False, groups: int = 1):
+    """Draw once, `groups` mesh workgroups (one per meshlet: with s21 bit 28 clear the shader takes its meshlet from
+    the workgroup index). A native wave64 module needs the GPU to require 64-wide mesh subgroups; an emulated one runs at
     whatever size the GPU picks, so no size is requested."""
     fs_asm, fs_spv = os.path.join(out, "fs.spvasm"), os.path.join(out, "fs.spv")
     with open(fs_asm, "w", encoding="utf-8", newline="\n") as f:
         f.write(FS_ASM)
     subprocess.run(["spirv-as", "--target-env", "vulkan1.2", fs_asm, "-o", fs_spv], check=True)
-    env = dict(os.environ, VKH_MESH="1", VKH_SGPRS=",".join(hex(x) for x in sgprs), VKH_HEAP=heap_env(heap),
+    env = dict(os.environ, VKH_MESH="1", VKH_SGPRS=",".join(hex(x) for x in sgprs),
                VKH_COVERAGE_MASK=os.path.join(out, "coverage.bin"))
+    env.pop("VKH_HEAP", None)
+    env.pop("VKH_HEAP_FILE", None)
+    try:
+        env["VKH_HEAP"] = heap_env(heap)
+    except ValueError:
+        # Too many non-zero words for the environment: vk_harness reads the same image from a file instead.
+        heap_file = os.path.join(out, "heap.bin")
+        with open(heap_file, "wb") as f:
+            f.write(heap)
+        env["VKH_HEAP_FILE"] = heap_file
     env.pop("VKH_SUBGROUP_SIZE", None)
+    env.pop("VKH_MESH_GROUPS", None)
+    if groups > 1:
+        env["VKH_MESH_GROUPS"] = str(groups)
     if not emulate:
         env["VKH_SUBGROUP_SIZE"] = str(spec["subgroup_size"])
     raw = os.path.join(out, "image.raw")
@@ -427,6 +442,11 @@ def draw(harness: str, ms: str, out: str, spec: dict, heap: bytes, sgprs: list[i
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(f"vk_harness exited {r.returncode}: {r.stderr.strip()[-500:]}")
+    if groups > 1 and f"mesh workgroups: {groups} x 1 x 1\n" not in r.stderr + "\n":
+        # The harness prints the grid it drew; without that line it drew one workgroup (an older vk_harness without
+        # VKH_MESH_GROUPS), so the meshlets past the first are missing from the frame.
+        raise SystemExit(f"vk_harness did not confirm {groups} mesh workgroups (no 'mesh workgroups' line); it may "
+                         "predate VKH_MESH_GROUPS")
     if not emulate and f"mesh subgroup size: {spec['subgroup_size']}\n" not in r.stderr + "\n":
         # vk_harness prints "mesh subgroup size: N" only when the mesh stage got the required size, and
         # "... not available" otherwise; anything else is no confirmation, so the run is not recorded as native.
@@ -485,8 +505,6 @@ def main(argv=None) -> int:
         ap.error(f"{a.drawable} is not in {a.models}")
     sha, spec = next(iter(SHADERS.items()))
     d = load_drawable(os.path.join(a.game, "data.rpf"), item)
-    if d["meshlets"] != 1:
-        raise SystemExit(f"{d['meshlets']} meshlets: vk_harness draws one workgroup (docs/ms_pass.md, limits)")
     lo = [min(p[i] for p in d["positions"]) for i in range(3)]
     hi = [max(p[i] for p in d["positions"]) for i in range(3)]
     m = camera(lo, hi, a.yaw, a.pitch, aspect=a.width / a.height)
@@ -497,7 +515,8 @@ def main(argv=None) -> int:
     emulate = wave64_mode(a.wave64_emulate)
     a.emulate = emulate
     ms = translate_ms(a.work, sha, emulate)
-    draw(fl.find_harness(a.harness), ms, out, spec, heap, sgpr_words(spec, layout), a.width, a.height, emulate)
+    draw(fl.find_harness(a.harness), ms, out, spec, heap, sgpr_words(spec, layout), a.width, a.height, emulate,
+         groups=d["meshlets"])
     mode = "wave64 emulated" if emulate else f"native wave64 (required subgroup {spec['subgroup_size']})"
     man = {"fssm_sha256": sha, "subgroup_mode": mode, "subpixel_bits": a.subpixel_bits, "width": a.width, "height": a.height, "yaw": a.yaw,
            "pitch": a.pitch,
@@ -506,7 +525,8 @@ def main(argv=None) -> int:
     with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(man, f)
     result = check_folder(out, man)
-    print(f"{d['vertices']} vertices, {len(d['triangles'])} triangles, {d['meshlets']} meshlet, axis word "
+    print(f"{d['vertices']} vertices, {len(d['triangles'])} triangles, {d['meshlets']} "
+          f"meshlet{'s' if d['meshlets'] != 1 else ''}, axis word "
           f"{d['axis']}, {mode}: {summary(result)}")
     ok = passed(result)
     if a.controls:
@@ -527,7 +547,8 @@ def run_controls(a, d, m, lo, hi, spec, ms, out) -> bool:
     heap[slot + 16:slot + 32], heap[slot:slot + 16] = heap[slot:slot + 16], bytes(16)   # V# one slot too far
     wrong = os.path.join(out, "control_wrong_slot")
     os.makedirs(wrong, exist_ok=True)
-    draw(fl.find_harness(a.harness), ms, wrong, spec, heap, sgpr_words(spec, layout), a.width, a.height, a.emulate)
+    draw(fl.find_harness(a.harness), ms, wrong, spec, heap, sgpr_words(spec, layout), a.width, a.height, a.emulate,
+         groups=d["meshlets"])
     controls.append(("meshlet V# in the next table slot", m, d["positions"],
                      (read_mask(os.path.join(wrong, "coverage.bin"), a.width, a.height),
                       read_raw(os.path.join(wrong, "image.raw"), a.width, a.height))))

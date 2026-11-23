@@ -9,8 +9,14 @@
 //   VKH_SGPRS=w0,w1,...          sets s0, s1, ... (decimal or 0x hex)
 //   VKH_HEAP=addr=word,...       allocates a zeroed 64 KiB heap (Xbox VA 0 = its device address), writes each word at
 //                                its address and passes the heap base, so a V# in VKH_SGPRS can point into it.
+//   VKH_HEAP_FILE=<file>         as VKH_HEAP, from a raw heap image of at most 64 KiB (its non-zero words are written),
+//                                for heaps whose addr=word list would be too long for the environment. Not with VKH_HEAP.
 //   VKH_HEAP_DUMP=<file>         after the draw, writes the 64 KiB heap (needs VKH_HEAP, which may be empty-valued as
 //                                "0=0"), so a test can read what the pixel shader stored or atomically added.
+//   VKH_MESH_GROUPS=X[,Y,Z]      with VKH_MESH: draws that many mesh workgroups instead of one (a drawable with
+//                                several meshlets, its shader taking the meshlet from the workgroup index). Checked
+//                                against maxMeshWorkGroupCount/TotalCount (exit 77 past them); stderr says "mesh
+//                                workgroups: X x Y x Z". Not with --mesh-group-readback or VKH_MESH_COMPUTE (exit 2).
 //   VKH_COVERAGE_MASK=<file>     writes W*H stencil bytes after the draw (1 = a fragment was rasterized at the pixel,
 //                                0 = untouched). Independent of the fragment colour, so a shader writing
 //                                (-1,-1,-1,-1) still counts as covered. Not with --mesh-group-readback.
@@ -194,6 +200,31 @@ int main(int argc, char** argv) {
     const char* heap_env = std::getenv("VKH_HEAP");
     if (heap_env && !*heap_env) heap_env = nullptr;
     std::vector<std::pair<uint32_t, uint32_t>> heap_words;
+    const char* heap_file = std::getenv("VKH_HEAP_FILE");
+    if (heap_file && !*heap_file) heap_file = nullptr;
+    if (heap_file && heap_env) {
+        std::fprintf(stderr, "VKH_HEAP_FILE and VKH_HEAP cannot be combined\n");
+        return 2;
+    }
+    if (heap_file) {
+        std::ifstream hf(heap_file, std::ios::binary);
+        if (!hf) {
+            std::fprintf(stderr, "VKH_HEAP_FILE: cannot open %s\n", heap_file);
+            return 2;
+        }
+        std::vector<unsigned char> image(heap_bytes + 1);
+        hf.read(reinterpret_cast<char*>(image.data()), std::streamsize(image.size()));
+        const size_t got = size_t(hf.gcount());
+        if (got > heap_bytes) {
+            std::fprintf(stderr, "VKH_HEAP_FILE: %s is larger than the %u-byte heap\n", heap_file, heap_bytes);
+            return 2;
+        }
+        for (uint32_t addr = 0; addr + 4 <= got; addr += 4) {
+            uint32_t word;
+            std::memcpy(&word, image.data() + addr, 4);
+            if (word) heap_words.emplace_back(addr, word);
+        }
+    }
     if (heap_env && !parse_heap(heap_env, heap_words, heap_bytes)) {
         std::fprintf(stderr, "VKH_HEAP: expected addr=word pairs, 4-byte aligned below 0x%x, got \"%s\"\n",
                      heap_bytes, heap_env);
@@ -247,7 +278,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    const bool need_heap = heap_env != nullptr || tex_rgba_path != nullptr;
+    const bool need_heap = heap_env != nullptr || heap_file != nullptr || tex_rgba_path != nullptr;
     gipa = load_vulkan();
     if (!gipa) return 1;
     VkInstance inst = VK_NULL_HANDLE;
@@ -381,8 +412,16 @@ int main(int argc, char** argv) {
                      props.limits.maxPushConstantsSize);
         return 77;
     }
-    // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1).
+    // VKH_MESH=1: the first shader is a mesh shader (VK_EXT_mesh_shader), drawn with vkCmdDrawMeshTasksEXT(1,1,1), or
+    // with VKH_MESH_GROUPS' counts.
     const bool mesh = !mesh_compute && (group_readback || std::getenv("VKH_MESH") != nullptr);
+    const char* mesh_groups_env = std::getenv("VKH_MESH_GROUPS");
+    if (mesh_groups_env && !*mesh_groups_env) mesh_groups_env = nullptr;
+    if (mesh_groups_env && (group_readback || mesh_compute || !mesh)) {
+        std::fprintf(stderr, "VKH_MESH_GROUPS needs VKH_MESH and cannot be combined with --mesh-group-readback or "
+                             "VKH_MESH_COMPUTE\n");
+        return 2;
+    }
     VkPhysicalDeviceMeshShaderFeaturesEXT meshf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     if (mesh) {
         // Query the feature, not just the extension. 77: the device cannot run this test (as vk_compute_test and
@@ -397,6 +436,43 @@ int main(int argc, char** argv) {
         enable.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         meshf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
         meshf.meshShader = VK_TRUE; meshf.pNext = chain; chain = &meshf;
+        if (mesh_groups_env) {
+            // X[,Y,Z], each a decimal count of at least 1; the missing ones are 1.
+            uint32_t want[3] = {1, 1, 1};
+            const char* at = mesh_groups_env;
+            for (unsigned i = 0; i < 3; ++i) {
+                char* end = nullptr;
+                const unsigned long n = (*at >= '0' && *at <= '9') ? std::strtoul(at, &end, 10) : 0;
+                if (!n || n > 0xffffffffu || (*end && *end != ',') || (*end == ',' && i == 2)) {
+                    std::fprintf(stderr, "VKH_MESH_GROUPS: expected X[,Y,Z] with every count at least 1\n");
+                    return 2;
+                }
+                want[i] = uint32_t(n);
+                if (!*end) break;
+                at = end + 1;
+            }
+            // The device's limits, queried now that VK_EXT_mesh_shader is known to be there.
+            VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 mesh_props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            mesh_props2.pNext = &mesh_props;
+            vkGetPhysicalDeviceProperties2(pd, &mesh_props2);
+            const uint64_t total = uint64_t(want[0]) * want[1] * want[2];
+            for (unsigned i = 0; i < 3; ++i) {
+                if (want[i] > mesh_props.maxMeshWorkGroupCount[i]) {
+                    std::fprintf(stderr, "unsupported: VKH_MESH_GROUPS %u in dimension %u is past maxMeshWorkGroupCount %u\n",
+                                 want[i], i, mesh_props.maxMeshWorkGroupCount[i]);
+                    return 77;
+                }
+            }
+            if (total > mesh_props.maxMeshWorkGroupTotalCount) {
+                std::fprintf(stderr, "unsupported: VKH_MESH_GROUPS total %llu is past maxMeshWorkGroupTotalCount %u\n",
+                             static_cast<unsigned long long>(total), mesh_props.maxMeshWorkGroupTotalCount);
+                return 77;
+            }
+            for (unsigned i = 0; i < 3; ++i) groups[i] = want[i];
+            std::fprintf(stderr, "mesh workgroups: %u x %u x %u\n", groups[0], groups[1], groups[2]);
+        }
     }
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     VkPhysicalDeviceMaintenance8FeaturesKHR m8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
@@ -432,7 +508,8 @@ int main(int argc, char** argv) {
         // 77 is the "this device cannot run the test" code that check.py and run_gpu_tests.py report as SKIP.
         if (!f12q.bufferDeviceAddress) {
             std::fprintf(stderr, "unsupported: %s needs bufferDeviceAddress\n",
-                         tex_rgba_path ? "VKH_TEX_RGBA" : heap_env ? "VKH_HEAP" : "VKH_MESH_COMPUTE");
+                         tex_rgba_path ? "VKH_TEX_RGBA" : heap_env ? "VKH_HEAP" : heap_file ? "VKH_HEAP_FILE"
+                                                                                            : "VKH_MESH_COMPUTE");
             return 77;
         }
         f12.bufferDeviceAddress = VK_TRUE;

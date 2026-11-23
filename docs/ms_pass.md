@@ -32,7 +32,7 @@ Everything the shader reads sits in the one heap at heap base + Xbox VA (`docs/d
 | table +0x80 | V# | object constants: the object (world) matrix as the first four float4 rows; identity here |
 | table +0xA0 | V# | view constants: the view-projection is the 4 x float4 at +0x160 |
 | s19 / s20 | low / high VA | the drawable's `42 40` vertex block, unchanged; the shader builds the position V# itself |
-| s21 | draw word | bit 28 set: meshlet = workgroup index, so no indirection list is read |
+| s21 | draw word | 0. With bit 28 clear the meshlet is the workgroup index while it is below the group's meshlet count (the low 17 bits of the group's first word), else 0; with bit 28 set it is read from an indirection list instead (section 4) |
 | s23 | VA | resource heap base; read but unused on that path (a zeroed region) |
 
 The view-projection is stored so that the shader's row-vector multiply gives clip = M · p for the column-vector
@@ -78,6 +78,44 @@ fail, as they must:
 | CPU x and y axes swapped | IoU 0.2665 | IoU 0.3574 |
 | meshlet V# one table slot too far | nothing drawn | nothing drawn |
 
+### Every candidate (census)
+
+Every static single-geometry candidate in `data.rpf` (274; 5 have no static meshlet geometry the tool reads, so
+269 are drawn), one draw each at 35°, 25° on a 128 x 128 target, native wave64 on the 760M. The translator is
+`main` at `5d74c2723`, alone and with #3910 merged; the TEST-362 tools are this branch's.
+
+| | `main` | `main` + #3910 |
+|---|---:|---:|
+| all | 85 / 269 | **254 / 269** |
+| one meshlet | 80 / 141 | 135 / 141 |
+| several meshlets (2 to 18) | 5 / 128 | 119 / 128 |
+| axis word 0 / 1 / 2 | 17 / 43, 0 / 46, 68 / 180 | 34 / 43, 46 / 46, 174 / 180 |
+
+**What #3910 fixes here.** The shader marks a primitive culled when one of its vertex indices is out of range,
+with a compare whose wave64 lane mask lands in an SGPR pair. `shader_disasm.py` prints that pair as one SGPR
+(wave32 syntax), so without #3910 lanes 32-63 read the other SGPR's stale value, and the primitive of every lane
+32-63 in a wave is culled. On `main`, 55 of the 61 failing one-meshlet draws drew exactly the primitives of lanes
+0-31 of each wave, nothing more or less; the GPU drew more pixels than the CPU in only 5 of the 184 failing draws.
+The largest drawable that now passes has 1,836 triangles in 15 meshlets.
+
+**Still open (15 with #3910).** 10 draws have only extra pixels (2 to 37), 3 only missing ones (1, 2 and 163) and
+2 both; 9 of the 15 use axis word 0, and most are small on screen (136 to 1,586 pixels). The one with 163
+missing pixels (8 triangles, one meshlet) is not dropping primitives: no subset of its triangles reproduces the GPU
+coverage (the closest is all eight, 163 pixels off). It covers less than the CPU at three poses (163, 121 and 140
+pixels at 35°/25°, -60°/40° and 120°/-20°) and never more. Why, and on which side, is not measured yet: the CPU's
+`42 40` position decode and the translation are both candidates.
+
+**Emulated.** With `--wave64-emulate` the census gives the same 254, and all 269 coverage masks are byte-identical
+to the native ones.
+
+**The draw word.** With s21 bit 28 set, the shader reads each workgroup's meshlet from an indirection list. In this
+heap that list is zeroed memory, so every workgroup drew meshlet 0. A one-meshlet drawable hid this. The census
+draws with bit 28 clear, which section 2 now records; one 2-meshlet drawable gives IoU 0.9746 with the bit set
+and 1.0000 with it clear. With `--controls` (main + #3910) that drawable (175 vertices, 62 triangles, axis word 2)
+gives IoU 1.0000 at both poses, and its three controls fail (IoU 0.9717 / 0.9534 with the camera 3 degrees off,
+0.9906 / 0.9911 with the axes swapped but mismatching off the edge band, nothing drawn with the V# a slot off).
+The section 4 tables were re-measured with bit 28 clear and are unchanged.
+
 ## 5. Reproduce
 
 ```sh
@@ -100,10 +138,15 @@ zlib reader on synthetic inputs without the package or a GPU; with `LEONIDA_MS_P
   the 282 static candidates in `data.rpf` have one geometry.
 - **Rectangular targets.** `--width` and `--height` may differ; the camera divides its x scale by the aspect, so a
   square stays square (the GPU and the CPU share the projection, so a stretch would not show in the comparison).
-- **One meshlet.** `vk_harness` draws one mesh workgroup (`vkCmdDrawMeshTasksEXT(1, 1, 1)`), so the tool refuses a
-  drawable with more. A `VKH_MESH_GROUPS` knob would take the next drawables (several meshlets, axis word 1).
+- **Several meshlets.** The shader takes its meshlet from the workgroup index (s21 bit 28 clear), so a drawable with
+  k meshlets is drawn as k mesh workgroups: `vk_harness`'s `VKH_MESH_GROUPS=k`, checked against the device's
+  `maxMeshWorkGroupCount` / `maxMeshWorkGroupTotalCount` (exit 77 past them). The tool counts a draw only when
+  `vk_harness` prints `mesh workgroups: k x 1 x 1`; that line confirms the dispatch, not that every workgroup drew.
 - **One mesh shader.** The table offsets are per shader (`SHADERS` in `tools/ms_pass.py`, keyed by FSSM SHA-256);
   other variants read other offsets.
 - **A fixture pixel shader.** The deferred pass pairs a mesh shader that reads s16 and s17 as pointers with a pixel
   shader that reads s16 as a pointer and s17 as a constant, and `vk_harness` pushes one SGPR block to both stages.
-- **64 KiB heap.** The heap is passed as `VKH_HEAP` words; larger drawables need a heap loaded from a file.
+- **64 KiB heap.** Everything the shader reads must fit the 64 KiB heap. The heap goes to `vk_harness` as
+  `VKH_HEAP` words while the list fits the environment (32,000 characters); a larger image goes through
+  `VKH_HEAP_FILE` (`<out>/heap.bin`, the same image, non-zero words written), which most multi-meshlet drawables
+  need.
