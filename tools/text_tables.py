@@ -334,9 +334,8 @@ def nested_archives(path: str) -> list:
     return starts
 
 
-def archive_starts(source: str) -> list:
-    """Nested-archive offsets for a source whose blob offsets are archive offsets; [] when there is no archive."""
-    path = None
+def archive_path(source: str) -> "str | None":
+    """The archive a source's blob offsets refer to: the one its carve manifest names, or the .rpf itself."""
     if os.path.isdir(source):
         index = os.path.join(source, "index.json")
         if os.path.isfile(index):
@@ -348,10 +347,14 @@ def archive_starts(source: str) -> list:
             if isinstance(named, str):
                 for candidate in (named, os.path.join(source, named)):
                     if os.path.isfile(candidate):
-                        path = candidate
-                        break
+                        return candidate
     elif os.path.isfile(source) and source.lower().endswith(".rpf"):
-        path = source
+        return source
+    return None
+
+
+def archive_starts(path: "str | None") -> list:
+    """Offsets of the archives nested in `path`; [] when there is no archive."""
     if path is None:
         return []
     try:
@@ -509,7 +512,10 @@ def main(argv=None) -> int:
     scan = Scan()
     try:
         for source in a.sources:
-            starts = archive_starts(source)
+            archive = archive_path(source)
+            if archive is not None and any(_same_output_path(archive, o) for o in outs):
+                raise ValueError(f"report would overwrite the carve's archive: {archive}")
+            starts = archive_starts(archive)
             for label, offset, data in blobs(source, outs):
                 nested = archive_of(starts, offset) if starts else None
                 scan.add(label, offset, data, None if nested is None else (source, nested))

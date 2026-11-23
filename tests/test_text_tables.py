@@ -236,6 +236,72 @@ class TestChains(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), original)
                 self.assertEqual(report.read_bytes(), b"previous report")
 
+    def assert_carve_archive_preserved(self, full, named, spell=lambda archive: archive):
+        """A report path that names the manifest's archive is refused; `spell` gives the path used for the report."""
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = Path(tmp, "carve")
+            carve.mkdir()
+            archive = Path(tmp, "data.rpf")
+            archive.write_bytes(b"synthetic archive")
+            files = []
+            if full:
+                self.carve(carve, [make_resource(EN)])
+                files = json.loads((carve / "index.json").read_text(encoding="utf-8"))["files"]
+            (carve / "index.json").write_text(json.dumps({"files": files, "summary": {"archive": named(archive)}}),
+                                              encoding="utf-8", newline="\n")
+            report = Path(tmp, "dialogue.csv")
+            report.write_bytes(b"previous report")
+            target = spell(archive)
+            for flag in ("--tables", "--strings"):
+                with self.subTest(flag=flag):
+                    result = subprocess.run(
+                        [sys.executable, "-I", T.__file__, str(carve), "--dialogue", str(report), flag, str(target)],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("overwrite the carve's archive", result.stderr)
+                    self.assertEqual(archive.read_bytes(), b"synthetic archive")
+                    self.assertEqual(report.read_bytes(), b"previous report")
+
+    def test_reports_preserve_the_archive_a_full_carve_names(self):
+        self.assert_carve_archive_preserved(True, str)
+
+    def test_reports_preserve_the_archive_an_index_only_carve_names(self):
+        self.assert_carve_archive_preserved(False, str)
+
+    def test_reports_preserve_an_archive_named_relative_to_the_carve(self):
+        self.assert_carve_archive_preserved(True, lambda archive: "../" + archive.name)
+
+    def test_reports_preserve_an_archive_spelled_through_another_folder(self):
+        self.assert_carve_archive_preserved(True, str, lambda a: os.path.join(a.parent, "carve", "..", a.name))
+
+    def test_reports_preserve_a_hard_linked_archive(self):
+        def link(archive):
+            alias = archive.with_name("report.csv")
+            try:
+                os.link(archive, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            return alias
+        self.assert_carve_archive_preserved(True, str, link)
+
+    def test_a_report_beside_the_archive_is_still_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp, "data.rpf")
+            archive.write_bytes(b"synthetic archive")
+            carve = Path(tmp, "carve")
+            carve.mkdir()
+            self.carve(carve, [make_resource(EN)])
+            manifest = carve / "index.json"
+            index = json.loads(manifest.read_text(encoding="utf-8"))
+            index["summary"]["archive"] = str(archive)
+            manifest.write_text(json.dumps(index), encoding="utf-8", newline="\n")
+            report = Path(tmp, "strings.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([str(carve), "--strings", str(report)]), 0)
+            self.assertTrue(report.read_text(encoding="utf-8").startswith("source,offset,"))
+            self.assertEqual(archive.read_bytes(), b"synthetic archive")
+
     def test_index_only_carve_reserves_only_listed_payloads(self):
         with tempfile.TemporaryDirectory() as tmp:
             manifest = Path(tmp, "index.json")
