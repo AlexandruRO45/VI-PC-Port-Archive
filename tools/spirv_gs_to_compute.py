@@ -374,6 +374,9 @@ def main(argv):
     except (OSError, RuntimeError, ValueError) as e:
         print(f"cannot check input/output paths: {e}", file=sys.stderr)
         return 2
+    if not os.path.isfile(args[0]):
+        print(f"ERROR: input not found: {args[0]}", file=sys.stderr)
+        return 2
     dis = os.environ.get("SPIRV_DIS", "spirv-dis")
     asm = os.environ.get("SPIRV_AS", "spirv-as")
     text = subprocess.run([dis, "--raw-id", args[0]], check=True, capture_output=True, text=True).stdout

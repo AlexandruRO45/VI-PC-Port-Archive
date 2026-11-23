@@ -380,3 +380,21 @@ def test_entry_debug_lines_keep_locals_before_capture_setup(tmp_path: Path, befo
 
     assert lowered.index("%first = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
     assert lowered.index("%second = OpVariable") < lowered.index("%gsc_gidv = OpLoad")
+
+
+def test_cli_names_a_missing_input_in_one_line(tmp_path: Path) -> None:
+    """BUILD-1046: a missing input is a usage error (exit 2, one ERROR line), not a traceback.
+
+    The input check runs before spirv-dis, so this needs no SPIRV-Tools on PATH.
+    """
+    missing = tmp_path / "no-such-module.spv"
+    output = tmp_path / "cs.spv"
+    result = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "spirv_gs_to_compute.py"),
+                             str(missing), str(output)], capture_output=True, text=True)
+    assert result.returncode == 2, result.stderr
+    assert result.stderr.startswith("ERROR: "), result.stderr
+    assert len(result.stderr.strip().splitlines()) == 1, result.stderr
+    assert str(missing) in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not output.exists()
+
