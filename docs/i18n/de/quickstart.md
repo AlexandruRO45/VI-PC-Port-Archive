@@ -3,7 +3,7 @@
 > [!NOTE]
 > Die englische Dokumentation ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) und
 > [`docs/README.md`](../../README.md)) ist **maßgeblich**. Diese Anleitung enthält nur die stabilen Schritte zum
-> Einrichten und Bauen (abgeglichen mit Commit `aa2988cc`). Den aktuellen Projektstand findest du in der
+> Einrichten und Bauen (abgeglichen mit Commit `561b65a8`). Den aktuellen Projektstand findest du in der
 > [`README.md`](../../../README.md).
 
 ## Was ist Leonida?
@@ -46,8 +46,10 @@ gesammelt.
 
 - **Deine eigene Kopie** des Xbox-Series-Pakets in Version `1.0.2.1` (der Ordner mit `MicrosoftGame.Config` und den
   `.rpf`-Archiven, als normale, lesbare Dateien auf der Festplatte).
-- **Windows 10/11 x64** mit etwa **400 GB freiem Speicher** für die Arbeitsdateien (mit `--work` auch auf einem
-  anderen Laufwerk).
+- **Windows 10/11 x64** mit etwa **400 GB freiem Speicher** für die Arbeitsdateien (ein Export der Assets allein
+  belegte gemessen etwa 337 GB vor seinem Audio-Schritt und dauerte etwa 2 h 35 min). Die Größen hier sind so
+  angegeben, wie der Windows Explorer sie anzeigt, also in GiB: 400 GiB sind etwa 430 GB in Dezimaleinheiten. Mit
+  `--work` können die Arbeitsdateien auch auf einem anderen Laufwerk liegen.
 - [Python 3.12+](https://www.python.org/downloads/) (bei der Installation *„Add python.exe to PATH“* anhaken).
 - [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
 - [Vulkan SDK](https://vulkan.lunarg.com/) (`spirv-as`, `spirv-val` und `vulkaninfo`).
@@ -59,7 +61,8 @@ gesammelt.
     dauert etwa 20-40 Minuten.
   - Schneller, wenn du [conda](https://docs.conda.io/) nutzt: `conda install -c conda-forge llvm-tools` (der
     Windows-Build enthält das AMDGPU-Target), dann `LLVM_MC` auf den vollen Pfad des installierten `llvm-mc.exe`
-    setzen (`where llvm-mc` zeigt ihn bei aktivierter Umgebung).
+    setzen (`where.exe llvm-mc` zeigt ihn bei aktivierter Umgebung; in PowerShell ist ein bloßes `where` das Cmdlet
+    `Where-Object`).
   - Mit WSL: `llvm-21` in Ubuntu installieren und die Variable in derselben PowerShell-Sitzung setzen, in der du
     `make_game.py` startest:
 
@@ -101,8 +104,10 @@ Der Platzbedarf oben gilt für den vollständigen Build. Um den Port nur zu *sta
 Asset-Tools da, und `--wav` kommt mit einem Mehrfachen der Ogg-Opus-Größe hinzu. `--work` und `--out` können auf
 einem anderen Laufwerk liegen. Die Runtime liest das Paket an Ort und Stelle; liegt es auf einem schreibgeschützten
 Laufwerk, brauchst du `gta6rt --overlay <beschreibbarer Ordner>` (eine Option von `gta6rt`, nicht von
-`make_game.py`). Lösche die `.s`-Dateien in `work/shaders/dxbc/disasm` nicht: Ohne sie und ohne
-`work/shaders/spirv/index.json` kann die Stufe `shaders` mit null Shadern fertig aussehen.
+`make_game.py`). Lass die `.s`-Dateien in `work/shaders/dxbc/disasm` liegen: Der nächste Lauf prüft sie gegen die
+Liste in `disasm.done`, disassembliert die fehlenden neu (alle, wenn das `disasm.done` des Ordners älter als diese
+Liste ist) und übersetzt danach jeden Shader neu. Einen Ordner `disasm`, der ein symbolischer Link ist, lehnt die
+Stufe ab, wenn sie ihn leeren muss.
 
 ### Aus dem Terminal (`make_game.py`)
 
@@ -133,7 +138,8 @@ Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → 
   (ohne `VK_EXT_mesh_shader`). Siehe [`docs/design.md`](../../design.md).
 - **Was automatisch neu gemacht wird**: Der Build merkt sich Befehl und Version von `llvm-mc`, die Quellen des
   Übersetzers und den Asset-Decoder (`third_party/rpf9-explorer` und `tools/rpf9dump`). Ändert sich etwas davon,
-  wird nur der betroffene Schritt wiederholt (Disassemblierung, Übersetzung oder Export der Modelle und Texturen).
+  wird nur der betroffene Schritt wiederholt (Disassemblierung, Übersetzung oder Export der Modelle, Texturen und
+  Texturpools).
 - **Linux und Wine/Proton**: `make_game.py` läuft auch unter Linux. Die Stufe `pipelines` nutzt
   `vk_pipeline_check` (mit CMake in `runtime/build/linux` gebaut; fehlt es, baut das Skript es selbst). Der Loader ist
   ein Windows-Programm und läuft unter Wine oder Proton: Die Stufe `runtime` cross-kompiliert ihn mit clang-cl und
@@ -141,7 +147,9 @@ Die Stufen laufen in dieser Reihenfolge: `check` → `shaders` → `assets` → 
   [xwin](https://github.com/Jake-Shadle/xwin) bereitlegt; siehe [`docs/testing.md`](../../testing.md). Alternativ
   gibst du mit `--runtime-build <ordner>` einen anderswo gemachten Windows-Build an (`gta6rt.exe` und
   `gta6rt_tls_host.dll`). In beiden Fällen legt das Skript `gta6rt.sh` an, das das Programm mit `wine` startet (oder
-  mit dem Wine aus der Variable `WINE`, etwa von Proton).
+  mit dem Wine aus der Variable `WINE`, etwa von Proton). Ist mit `LEONIDA_D3D12=vulkan` das Vulkan-Backend gewählt,
+  findet die gepackte Runtime die übersetzten Shader in `<work>/shaders/spirv` über die Datei `shader_path.txt` neben
+  `gta6rt.exe`; mit `LEONIDA_SHADERS` gibst du ein anderes Verzeichnis an.
 
 Zu `--wave64-emulate`: `auto` schaltet die Emulation ein, wenn eine GPU keine 64 breiten Subgroups hat oder ihre
 Größe unbekannt ist. Mit dem Windows-Treiber von AMD bleibt `auto` auf RDNA1 und RDNA2 bei nativem Wave64, wenn die
