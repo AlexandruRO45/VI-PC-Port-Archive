@@ -360,6 +360,124 @@ class TestDSSubU32ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.state.get_vgpr(VGPR(0)), 200)
         self.assertEqual(self.lds.read_dword(0x34), 150)
 
+class SIMDWaveState:
+    """Architectural state for a SIMD wavefront (Wave32 or Wave64)."""
+
+    def __init__(self, lds: LDSMemory, wave_size: int = 32) -> None:
+        if wave_size not in (32, 64):
+            raise ValueError(f"Wave size must be 32 or 64, got {wave_size}")
+        self.wave_size = wave_size
+        self.lds = lds
+        self.exec_mask = (1 << wave_size) - 1
+        self.lanes = [ScalarThreadState(lds) for _ in range(wave_size)]
+
+    def is_lane_active(self, lane_id: int) -> bool:
+        return bool((self.exec_mask >> lane_id) & 1)
+
+
+class SIMDDSInterpreter:
+    """Multi-lane SIMD interpreter modeling divergence and atomic address clashes."""
+
+    def __init__(self, lds: LDSMemory) -> None:
+        self.lds = lds
+
+    def execute_wave(
+        self,
+        wave: SIMDWaveState,
+        inst: DSSubU32Instruction,
+        arbitration_order: Optional[List[int]] = None,
+    ) -> List[Optional[int]]:
+        results: List[Optional[int]] = [None] * wave.wave_size
+        active_lanes = [i for i in range(wave.wave_size) if wave.is_lane_active(i)]
+
+        order = [i for i in arbitration_order if i in active_lanes] if arbitration_order is not None else active_lanes
+
+        for lane_id in order:
+            lane_state = wave.lanes[lane_id]
+            addr = lane_state.get_vgpr(inst.vaddr)
+            data = lane_state.get_vgpr(inst.vdata0)
+
+            old_val, new_val = self.lds.atomic_sub_u32(addr, data, offset=inst.offset, rtn=inst.is_return)
+
+            if inst.is_return and inst.vdst is not None:
+                assert old_val is not None
+                lane_state.set_vgpr(inst.vdst, old_val)
+                results[lane_id] = old_val
+
+        return results
+
+
+class TestDSSubU32SIMDDivergenceAndExecMask(unittest.TestCase):
+    """Part 4: SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = SIMDDSInterpreter(self.lds)
+
+    def test_divergent_addresses_wave32(self) -> None:
+        wave = SIMDWaveState(self.lds, wave_size=32)
+        inst = DSSubU32Instruction.parse("ds_sub_rtn_u32 v5, v1, v2")
+
+        for i in range(32):
+            self.lds.write_dword(i * 4, 1000 + i * 10)
+            wave.lanes[i].set_vgpr(VGPR(1), i * 4)
+            wave.lanes[i].set_vgpr(VGPR(2), 100 + i)
+
+        results = self.interp.execute_wave(wave, inst)
+
+        for i in range(32):
+            expected_old = 1000 + i * 10
+            expected_new = (1000 + i * 10) - (100 + i)
+            self.assertEqual(results[i], expected_old)
+            self.assertEqual(wave.lanes[i].get_vgpr(VGPR(5)), expected_old)
+            self.assertEqual(self.lds.read_dword(i * 4), expected_new)
+
+    def test_exec_masking_wave64(self) -> None:
+        lds = LDSMemory(size_bytes=8192)
+        interp = SIMDDSInterpreter(lds)
+        wave = SIMDWaveState(lds, wave_size=64)
+        mask = 0
+        for i in range(0, 64, 2):
+            mask |= (1 << i)
+        wave.exec_mask = mask
+
+        inst = DSSubU32Instruction.parse("ds_sub_rtn_u32 v3, v1, v2")
+        for i in range(64):
+            lds.write_dword(i * 4, 500)
+            wave.lanes[i].set_vgpr(VGPR(1), i * 4)
+            wave.lanes[i].set_vgpr(VGPR(2), 50)
+            wave.lanes[i].set_vgpr(VGPR(3), 0xCAFE)
+
+        results = interp.execute_wave(wave, inst)
+
+        for i in range(64):
+            if i % 2 == 0:
+                self.assertEqual(results[i], 500)
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(3)), 500)
+                self.assertEqual(lds.read_dword(i * 4), 450)
+            else:
+                self.assertIsNone(results[i])
+                self.assertEqual(wave.lanes[i].get_vgpr(VGPR(3)), 0xCAFE)
+                self.assertEqual(lds.read_dword(i * 4), 500)
+
+    def test_address_clash_convergence(self) -> None:
+        # All 32 lanes subtract 10 from dword at 0x40.
+        # Initial = 1000. Total subtracted = 32 * 10 = 320. Final = 680.
+        inst = DSSubU32Instruction.parse("ds_sub_u32 v1, v2")
+
+        for order in [list(range(32)), list(reversed(range(32)))]:
+            lds = LDSMemory(size_bytes=1024)
+            interp = SIMDDSInterpreter(lds)
+            wave = SIMDWaveState(lds, wave_size=32)
+
+            lds.write_dword(0x40, 1000)
+            for i in range(32):
+                wave.lanes[i].set_vgpr(VGPR(1), 0x40)
+                wave.lanes[i].set_vgpr(VGPR(2), 10)
+
+            interp.execute_wave(wave, inst, arbitration_order=order)
+            self.assertEqual(lds.read_dword(0x40), 680)
+
 
 if __name__ == '__main__':
     unittest.main()
