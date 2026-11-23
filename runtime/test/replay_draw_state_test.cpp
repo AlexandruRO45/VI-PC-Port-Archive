@@ -23,7 +23,7 @@ struct Calls {
     unsigned graphics_push = 0, compute_push = 0;
     unsigned viewport = 0, scissor = 0, topology = 0, restart = 0, stencil_front = 0, stencil_back = 0, blend = 0;
     unsigned vertex = 0, index = 0;
-    unsigned draws = 0, dispatches = 0, scopes = 0, helpers = 0;
+    unsigned draws = 0, mesh_draws = 0, dispatches = 0, scopes = 0, helpers = 0;
 };
 Calls g;
 
@@ -293,6 +293,7 @@ void check(const char* name, Rig& rig, CommandList& list, const Calls& want, int
     field("vertex-buffer binds", g.vertex, want.vertex);
     field("index-buffer binds", g.index, want.index);
     field("draws", g.draws, want.draws);
+    field("mesh draws", g.mesh_draws, want.mesh_draws);
     field("dispatches", g.dispatches, want.dispatches);
     field("rendering scopes", g.scopes, want.scopes);
     field("helpers", g.helpers, want.helpers);
@@ -320,6 +321,41 @@ int main() {
         CommandList l;
         for (int i = 0; i < 3; ++i) l.draw(make(base));
         check("unchanged", rig, l, once(3));
+    }
+    // Mesh pipelines have no input assembly. Returning to the same indexed draw must restore
+    // topology and restart once; the following identical draw can reuse both.
+    {
+        constexpr std::uintptr_t mesh_id = 0x7010;
+        auto mesh_pipeline = rig.pipelines.at(p3);
+        mesh_pipeline.pipeline = handle<VkPipeline>(mesh_id);
+        mesh_pipeline.push_stages = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        mesh_pipeline.mesh = true;
+        rig.pipelines.emplace(mesh_id, mesh_pipeline);
+        rig.vk.draw_mesh_tasks = [](VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t) {
+            if (g.topology != 1 || g.restart != 1) {
+                std::fprintf(stderr, "FAIL mesh draw changed input assembly state\n");
+                ++failures;
+            }
+            ++g.mesh_draws;
+        };
+        CommandList l;
+        l.draw(make(base));
+        auto mesh = make(base);
+        mesh.pipeline = mesh_id;
+        mesh.mesh = true;
+        mesh.indexed = false;
+        mesh.count = mesh.instances = mesh.first = 1;
+        l.draw(mesh);
+        l.draw(make(base));
+        l.draw(make(base));
+        Calls want = once(4);
+        want.graphics_pipeline = want.graphics_push = 3;
+        want.draws = 3;
+        want.mesh_draws = 1;
+        want.vertex = 4;
+        want.viewport = want.scissor = want.topology = want.restart = 2;
+        want.stencil_front = want.stencil_back = want.blend = 2;
+        check("classic after mesh", rig, l, want);
     }
     // Each draw changes one more piece than the one before: only that piece is set again.
     {
