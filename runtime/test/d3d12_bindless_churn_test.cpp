@@ -18,6 +18,7 @@
 // must be above 0). The times are printed, not asserted.
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation with synchronization validation (0 errors
 // required).
+#include "test_temp_dir.h"
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -401,10 +402,12 @@ int main(int argc, char** argv) {
 
     // The shader's program and a translator index that maps its hash to the test module (as d3d12_set0_compute_test).
     const auto program = fssm_program({0x43530003, 0xbf810000});
-    const auto library = std::filesystem::temp_directory_path() / "leonida_bindless_churn_test";
-    std::filesystem::create_directories(library);
-    std::filesystem::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv",
-                               std::filesystem::copy_options::overwrite_existing);
+    // A folder of this process's own: ctest runs this program twice at once (d3d12_bindless_churn and
+    // d3d12_bindless_churn_validated), and with one shared name the first to finish removed the other's shader before
+    // its PSO was created (CreateComputePipelineState failed under ctest -j).
+    const testfiles::ScratchDir scratch("leonida_bindless_churn_test");
+    const auto& library = scratch.path();
+    if (!testfiles::copy_file(LEONIDA_TEST_CS_SET0_SAMPLE_SPV, library / "cs_set0_sample.spv")) return 1;
     {
         std::ofstream index(library / "index.json", std::ios::binary);
         index << "{\"cs_set0_sample\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << leonida::sha256_hex(program)
@@ -421,7 +424,6 @@ int main(int argc, char** argv) {
     if (ok) ok = run(d, library, false, true, async);
     if (ok) ok = run(d, library, true, false, legacy);
     if (ok) ok = run(d, library, true, true, async_legacy);  // the old wait, and no wait between the queues
-    std::filesystem::remove_all(library);
     if (!ok) return 1;
 
     const auto report = [](const char* name, const Result& r) {
