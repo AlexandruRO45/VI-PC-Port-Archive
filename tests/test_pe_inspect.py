@@ -478,11 +478,11 @@ class PeInspectTest(unittest.TestCase):
             self.assertEqual(pe_inspect.main([bad, "--out", os.path.join(self.dir, "reports2")]), 1)
         self.assertIn("not a PE image", err.getvalue())
 
-    def test_same_output_path_identity(self):
+    def test_same_report_path_identity(self):
         a = os.path.join(self.dir, "test.exe")
-        self.assertTrue(pe_inspect.same_output_path(a, a))
+        self.assertTrue(pe_inspect.same_report_path(a, a))
         b = os.path.join(self.dir, "other.exe")
-        self.assertFalse(pe_inspect.same_output_path(a, b))
+        self.assertFalse(pe_inspect.same_report_path(a, b))
 
     def test_cli_refuses_to_overwrite_input_file_with_report(self):
         out = os.path.join(self.dir, "reports_collision")
@@ -498,6 +498,29 @@ class PeInspectTest(unittest.TestCase):
         self.assertIn("would overwrite input file", err.getvalue())
         with open(colliding_file, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "original preserved text")
+
+    def test_cli_refuses_to_overwrite_input_file_case_insensitive(self):
+        out = os.path.join(self.dir, "reports_case_collision")
+        os.makedirs(out, exist_ok=True)
+        probe = os.path.join(out, "probe.tmp")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("x")
+        insensitive = os.path.exists(os.path.join(out, "PROBE.TMP"))
+        os.remove(probe)
+        if not insensitive:
+            self.skipTest("filesystem is case-sensitive")
+
+        colliding_file = os.path.join(out, "SAMPLE.DLL.MD")
+        with open(colliding_file, "w", encoding="utf-8") as f:
+            f.write("original preserved markdown")
+
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = pe_inspect.main([self.image, colliding_file, "--out", out])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", err.getvalue())
+        with open(colliding_file, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "original preserved markdown")
 
     def test_cli_refuses_existing_file_as_out_dir(self):
         file_out = os.path.join(self.dir, "some_file.txt")

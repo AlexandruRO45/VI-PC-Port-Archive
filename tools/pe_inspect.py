@@ -26,6 +26,12 @@ import struct
 import sys
 from collections import Counter
 
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+
+from report_paths import same_report_path  # noqa: E402
+
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
 
 MACHINES = {0x8664: "x86-64", 0x14C: "x86", 0xAA64: "ARM64"}
@@ -474,16 +480,6 @@ def to_markdown(r: dict) -> str:
     return "\n".join(out) + "\n"
 
 
-def same_output_path(first: str, second: str) -> bool:
-    """True when writing ``second`` would truncate ``first`` (same file, path or hard link)."""
-    if os.path.normcase(os.path.realpath(first)) == os.path.normcase(os.path.realpath(second)):
-        return True
-    try:
-        return os.path.samefile(first, second)
-    except OSError:
-        return False
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="+")
@@ -535,10 +531,10 @@ def main(argv: list[str] | None = None) -> int:
         md_path = stem + ".md"
         collision = None
         for other in a.image:
-            if same_output_path(other, json_path):
+            if same_report_path(other, json_path):
                 collision = json_path
                 break
-            if same_output_path(other, md_path):
+            if same_report_path(other, md_path):
                 collision = md_path
                 break
         if collision:
