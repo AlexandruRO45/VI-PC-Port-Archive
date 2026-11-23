@@ -132,6 +132,10 @@ void pump() {
     }
 }
 
+// Not resizable, so Wine gives the window min = max size hints and a tiling compositor (niri, sway, Hyprland, i3)
+// floats it at its size instead of tiling it; a tiled window's client size, not ours, reaches the readback.
+constexpr DWORD window_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
 // True when the window manager reports this window as the top-level window at a screen point. Being the foreground
 // window does not make it so: an always-on-top window, or one another process showed without taking the foreground,
 // can lie over it, and a GDI read of the screen then returns that window's pixel. WindowFromPoint passes over hidden
@@ -145,7 +149,7 @@ bool is_top_window_at(HWND window, POINT screen_point) {
 
 void set_client_size(HWND window, int width, int height) {
     RECT rect{0, 0, width, height};
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&rect, window_style, FALSE);
     SetWindowPos(window, HWND_TOP, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_SHOWWINDOW);
 }
@@ -326,9 +330,9 @@ int main() {
     }
     constexpr int width = 320, height = 240;
     RECT frame_rect{0, 0, width, height};
-    AdjustWindowRect(&frame_rect, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&frame_rect, window_style, FALSE);
     HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida M0: D3D12 clear on Vulkan",
-                                  WS_OVERLAPPEDWINDOW, 100, 100, frame_rect.right - frame_rect.left,
+                                  window_style, 100, 100, frame_rect.right - frame_rect.left,
                                   frame_rect.bottom - frame_rect.top, nullptr, nullptr, window_class.hInstance,
                                   nullptr);
     if (!window) {
