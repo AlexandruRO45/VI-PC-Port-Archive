@@ -210,6 +210,22 @@ class TestSAshrI32Oracle(unittest.TestCase):
         # -1 (0xFFFFFFFF) >> any = -1 (0xFFFFFFFF)
         self.assertEqual(ref_s_ashr_i32(0xFFFFFFFF, 10), (0xFFFFFFFF, 1))
 
+class SAshrI32Expr(ASTNode):
+    def __init__(self, src: int, shift: int) -> None:
+        self.src = src
+        self.shift = shift
+
+    def eval(self) -> tuple[int, int]:
+        return ref_s_ashr_i32(self.src, self.shift)
+
+
+class TestSAshrI32AST(unittest.TestCase):
+    def test_ast_evaluation(self) -> None:
+        expr = SAshrI32Expr(0x80000000, 1)
+        self.assertEqual(expr.eval(), (0xC0000000, 1))
+        expr_pos = SAshrI32Expr(4, 2)
+        self.assertEqual(expr_pos.eval(), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
