@@ -3,8 +3,8 @@
 Usage:
     python -I scripts/run_semantic_tests.py [--start DIR] [--pattern GLOB] [--jobs N] [--timeout SECONDS] [--verbose]
 
-Each test file (at the top of DIR and in its sub-packages) runs as `python -m unittest discover -s DIR -p FILE`, the same discovery and imports as
-`python -m unittest discover -s tests/semantic`, so a file that passes one way passes the other. The serial run takes
+Each test file (at the top of DIR and in its sub-packages) runs as `python -m unittest <dotted.module>` with DIR first on sys.path, the same
+imports as `python -m unittest discover -s tests/semantic`, so a file that passes one way passes the other; only that module is loaded. The serial run takes
 about 7 minutes on Linux (Python 3.13); with one file per process on 4 workers, about 1.5 minutes.
 
 A failing file's whole output is printed. The exit code is 1 when a file fails, errors, runs no test, or runs past
@@ -25,6 +25,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 KILL_WAIT = 10.0   # seconds to collect a killed file's output before giving up on it
+
+
+# Loads one module by its dotted name with `start` first on sys.path (what discovery does with its top-level directory).
+# `discover -p <basename>` is not used: it matches the basename in every package, so tests/semantic/test_x.py would also
+# run pkg/test_x.py. Exit code and "Ran N tests" line are unittest's own, as in `python -m unittest`.
+LOAD_ONE = "import sys, unittest; sys.path.insert(0, sys.argv[1]); unittest.main(module=None, argv=['unittest', sys.argv[2]])"
 
 
 def test_files(start, pattern):
@@ -55,12 +61,11 @@ def kill_tree(proc):
 def run_file(start, name, timeout):
     """(name, verdict, tests run, seconds, output) for one test file; verdict is "ok", "failed" or "timed out".
 
-    `name` is the file's path relative to `start`; a file in a sub-package is discovered from its own folder
-    with `start` as the top-level directory, so its imports resolve as in a full discovery.
+    `name` is the file's path relative to `start`; it is loaded by its dotted name with `start` as the import root,
+    so its imports resolve as in a full discovery and a same-named file in another package is not run with it.
     """
-    folder, _, base = name.rpartition("/")
-    sub = os.path.join(start, folder) if folder else str(start)
-    cmd = [sys.executable, "-m", "unittest", "discover", "-s", sub, "-t", str(start), "-p", base]
+    module = name[:-len(".py")].replace("/", ".")
+    cmd = [sys.executable, "-c", LOAD_ONE, str(start), module]
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
              else {"start_new_session": True})

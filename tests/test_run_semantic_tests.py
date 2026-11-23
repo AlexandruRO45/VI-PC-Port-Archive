@@ -126,6 +126,19 @@ class RunSemanticTests(unittest.TestCase):
         self.assertIn("===== pkg/test_inner.py: failed", r.stdout)
         self.assertIn("2 files, 3 tests", r.stdout)
 
+    def test_a_file_name_shared_with_a_sub_package_file_runs_once_each(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        os.mkdir(os.path.join(d, "pkg"))
+        for rel, body in (("test_shared.py", PASS), ("pkg/__init__.py", ""), ("pkg/test_shared.py", PASS)):
+            with open(os.path.join(d, *rel.split("/")), "w", encoding="utf-8") as f:
+                f.write(textwrap.dedent(body))
+        r = run(d, "--verbose")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("===== test_shared.py: ok (2 tests", r.stdout)
+        self.assertIn("===== pkg/test_shared.py: ok (2 tests", r.stdout)
+        self.assertIn("2 files, 4 tests", r.stdout)
+
     def test_a_failure_report_survives_a_stdout_that_cannot_encode_it(self):
         # cp1251 on Windows, here ASCII: the runner must still print the assertion (escaped) and the summary
         env = dict(os.environ, PYTHONIOENCODING="ascii")
