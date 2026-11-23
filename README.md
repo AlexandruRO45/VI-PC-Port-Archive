@@ -232,7 +232,7 @@ starts `gta6rt.exe` with `wine`, or with the Wine named by `WINE` (for Proton, i
 skips the build on Windows.
 
 On Linux, run `<out>/gta6rt.sh --dry-run` to inspect the packaged title's imports, then
-`<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup.
+`<out>/gta6rt.sh --init` to check TLS callbacks and DLL initialization. Use `<out>/gta6rt.sh --run` for startup. When gta6rt.exe is started through Proton's own launch (a Steam shortcut, `proton run`, umu), Proton gives it no console, so add `--log FILE` to its arguments: everything the loader and the game print is appended to that file.
 These commands use the package in `game_path.txt`, the port's `overlay` for writes, and Vulkan by default.
 
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders

@@ -10,6 +10,9 @@
 //       The same mapping, then each loaded DLL's TLS callbacks and DllMain(DLL_PROCESS_ATTACH) are run.
 //
 //   gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--trace-d3d12] [--trace FILE] [-- game arguments...]
+// Every mode takes --log FILE: everything the loader and the title print to stdout and stderr is appended to FILE
+// instead. Proton's default launch (Steam, `proton run`, umu) starts the program through its steam.exe, which gives
+// it no console, so without --log nothing the loader says reaches the player.
 //       The same, then the EXE's own TLS callbacks and its entry point, on a game thread. The game's argv and
 //       command line are <exe name> plus the arguments after "--"; exit/ExitProcess from the game end the run
 //       (shims/process.cpp). gta6rt prints the binding report first and returns the game's exit code.
@@ -20,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <io.h>
 #include <exception>
 #include <filesystem>
 #include <map>
@@ -50,13 +54,29 @@ const char* binding_name(rt::Binding b) {
 
 int usage() {
     std::fprintf(stderr,
-                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
-                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE] [--log FILE]\n"
+                 "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [--log FILE]\n"
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [--log FILE] [-- game arguments...]\n");
     return 2;
 }
 
 }  // namespace
+
+// --log FILE: stdout and stderr, the CRT's streams and the process's standard handles (host code, and the process
+// base_reservation starts again, inherit those), append to FILE. Appending, so the relaunched process, which reads
+// --log again, adds to what this one wrote, and so a second run keeps the first one's lines. Unbuffered: a title that
+// crashes or calls ExitProcess loses nothing.
+bool append_output_to(const std::wstring& path) {
+    FILE* file = nullptr;
+    if (_wfreopen_s(&file, path.c_str(), L"a", stdout) != 0 || !file) return false;
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::fflush(stderr);
+    if (_dup2(_fileno(stdout), _fileno(stderr)) != 0) return false;
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stdout))));
+    SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(stderr))));
+    return true;
+}
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
@@ -65,7 +85,7 @@ int wmain(int argc, wchar_t** argv) {
     uint32_t view_mode_getter_rva = 0;  // --view-mode-getter RVA: the game's view mode of a camera context
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
-    std::wstring trace_file;
+    std::wstring trace_file, log_file;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {
@@ -77,6 +97,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--run") run = true;
         else if (a == L"--trace-d3d12") trace_d3d12 = true;
         else if (a == L"--trace" && i + 1 < argc) trace_file = argv[++i];
+        else if (a == L"--log" && i + 1 < argc) log_file = argv[++i];
         else if (a == L"--game-dir" && i + 1 < argc) game_dir = argv[++i];
         else if (a == L"--overlay" && i + 1 < argc) overlay_dir = argv[++i];
         else if (a == L"--mods" && i + 1 < argc) mods_dir = argv[++i];
@@ -99,6 +120,10 @@ int wmain(int argc, wchar_t** argv) {
         else return usage();
     }
     if (image.empty()) return usage();
+    if (!log_file.empty() && !append_output_to(log_file)) {
+        std::fprintf(stderr, "error: cannot open the log file for appending\n");
+        return 1;
+    }
     // Exactly one mode: --dry-run --run would otherwise initialise the modules and call the entry point.
     if (dry_run + init + run != 1) return usage();
     // The console folders are fixed once, as absolute paths. A bare image name (`gta6rt --run game.exe` from the
