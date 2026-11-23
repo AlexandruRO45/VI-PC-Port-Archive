@@ -281,6 +281,29 @@ class SpirvAsmUnitTests(unittest.TestCase):
             with open(dst, "rb") as f:
                 _validate(f.read())
 
+    def test_out_of_range_decimal_f64_is_rejected(self):
+        threshold = (1 << 1024) - (1 << 970)
+        for opcode in ("OpConstant", "OpSpecConstant"):
+            for literal in ("1e309", "-1e309", str(threshold), str(-threshold), "inf", "-inf", "nan"):
+                with self.subTest(opcode=opcode, literal=literal):
+                    asm = f"%double = OpTypeFloat 64\n%value = {opcode} %double {literal}\n"
+                    with self.assertRaisesRegex(spirv_asm.SpirvAsmError, "line 2: .*decimal f64.*finite"):
+                        spirv_asm.assemble(asm)
+
+    def test_finite_f64_boundary_and_explicit_hex_specials(self):
+        just_below_overflow = (1 << 1024) - (1 << 970) - 1
+        for literal, expected in (
+            (str(just_below_overflow), 0x7FEFFFFFFFFFFFFF),
+            (str(-just_below_overflow), 0xFFEFFFFFFFFFFFFF),
+            ("-0.0", 0x8000000000000000),
+            ("0x1p1024", 0x7FF0000000000000),
+            ("-0x1p1024", 0xFFF0000000000000),
+            ("0x1.8p1024", 0x7FF8000000000000),
+        ):
+            with self.subTest(literal=literal):
+                asm = f"%double = OpTypeFloat 64\n%value = OpConstant %double {literal}\n"
+                self.assertEqual(struct.unpack_from("<Q", spirv_asm.assemble(asm), -8)[0], expected)
+
     def test_cli_source_that_is_not_utf8_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "bad.spvasm")

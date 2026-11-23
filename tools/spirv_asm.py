@@ -17,6 +17,7 @@ As a CLI:
 """
 import argparse
 import array
+import math
 import os
 import re
 import struct
@@ -199,6 +200,8 @@ def _parse_float_bits(tok: str, width: int, lineno: int) -> int:
         fv = float(tok)
     except ValueError as exc:
         raise SpirvAsmError(f"line {lineno}: invalid float literal {tok!r}") from exc
+    if width == 64 and not math.isfinite(fv):
+        raise SpirvAsmError(f"line {lineno}: decimal f64 literal {tok!r} must be finite")
     try:
         return struct.unpack(unpack_fmt, struct.pack(pack_fmt, fv))[0]
     except OverflowError:
