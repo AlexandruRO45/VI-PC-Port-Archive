@@ -242,7 +242,9 @@ class HardwareOracle(unittest.TestCase):
         why = asm.rdna23_skip_reason(oracle.arch)
         if why:
             oracle.close()
-            self.skipTest(why)
+            # Not asm.rdna23_skip_reason's text: it says the kernels do not assemble, but here the cause is the
+            # fixed MODE fields, which the MODE probe below cannot set on gfx1170+ (FUZZ-23).
+            self.skipTest(f"{oracle.arch} (GFX11.7 or GFX12): the MODE probe cannot set its fixed MODE fields (FUZZ-23)")
         try:
             ff.hw_probe_modes(oracle)
             cases = ff.gen_cases(300, 21, tuple(ff.ALL_OPS)) + ff.gen_probes(2, 21, tuple(ff.ALL_OPS))
