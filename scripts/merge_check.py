@@ -64,7 +64,8 @@ def _merged_pr_number(subject):
 def prior_merges(repo, main, numbers, depth):
     out = git(repo, "log", main, "--first-parent", f"-n{depth}", "--format=%H%x09%s").stdout
     hits = {number: [] for number in numbers}
-    for line in out.splitlines():
+    # Git terminates each record with LF. Other separators can occur inside the subject.
+    for line in out.split("\n"):
         sha, _, subject = line.partition("\t")
         number = _merged_pr_number(subject)
         if number in hits:

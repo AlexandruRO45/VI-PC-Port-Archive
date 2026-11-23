@@ -252,6 +252,16 @@ class MergeCheckTest(unittest.TestCase):
         self.assertEqual(len(r["merges"]), 1)
         self.assertEqual(r["commits"], {"total": 1, "on_main": 1})
 
+    def test_squash_merge_subject_can_contain_a_unicode_line_separator(self):
+        self.pr_branch("unicode-subject", "main", "\n" + PARAGRAPH)
+        self.squash_merge(42, "unicode-subject", "Add notes\u2028about the effect record")
+        merged_sha = self.git("rev-parse", "--short=12", "main")
+
+        code, [result] = self.run_check("42=unicode-subject")
+
+        self.assertEqual(result["merges"], [merged_sha])
+        self.assertEqual((code, result["verdict"]), (1, "already-merged"))
+
     def test_a_multi_commit_squash_merged_pr_is_already_merged_despite_cherry_miss(self):
         base = self.git("rev-parse", "main")
         self.git("checkout", "-q", "-b", "sq2", base)
