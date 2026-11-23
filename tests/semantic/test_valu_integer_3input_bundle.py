@@ -567,5 +567,24 @@ class TestAndOrB32ASTInterpreter(unittest.TestCase):
         self.assertEqual(res, 0x11)
         self.assertEqual(interp.vgprs[0], 0x11)
 
+# ---------------------------------------------------------------------------
+# Opcode 5: v_and_or_b32 - SIMD and Boundary Tests
+# ---------------------------------------------------------------------------
+
+class TestAndOrB32SIMDBoundaries(unittest.TestCase):
+    def test_simd_wave_masking(self) -> None:
+        wave = SIMDWavefront(wave_size=32)
+        s0 = [0xFFFF_FFFF] * 32
+        s1 = [lane for lane in range(32)]
+        s2 = [0x1000] * 32
+        res = wave.execute(oracle_and_or_b32, s0, s1, s2)
+        for lane in range(32):
+            self.assertEqual(res[lane], lane | 0x1000)
+
+    def test_boundary_bitwise_invariants(self) -> None:
+        self.assertEqual(oracle_and_or_b32(0, 0, 0), 0)
+        self.assertEqual(oracle_and_or_b32(MASK32, MASK32, MASK32), MASK32)
+        self.assertEqual(oracle_and_or_b32(MASK32, 0, 0), 0)
+
 if __name__ == "__main__":
     unittest.main()
