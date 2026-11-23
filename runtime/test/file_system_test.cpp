@@ -650,6 +650,26 @@ void run_checks(const std::filesystem::path& root) {
     write_path(package / "misc" / "inner" / "deep.txt", "deep");
     write_path(package / "misc" / "keep.txt", "keep");
 
+    // Host and GAME: are distinct volumes; only MoveFileEx's copy opt-in crosses them.
+    {
+        const auto host = root / "cross-volume.bin";
+        write_path(host, "cross-volume");
+        check(!move_ex_w(host.c_str(), L"GAME:\\cross-volume.bin", 0) && GetLastError() == ERROR_NOT_SAME_DEVICE,
+              "MoveFileExW without COPY_ALLOWED rejects a cross-volume move");
+        check(move_ex_w(host.c_str(), L"GAME:\\cross-volume.bin", MOVEFILE_COPY_ALLOWED) != FALSE,
+              "MoveFileExW with COPY_ALLOWED moves host to GAME");
+        check(std::filesystem::exists(overlay / "cross-volume.bin") &&
+                  read_path(overlay / "cross-volume.bin") == "cross-volume" && !std::filesystem::exists(host),
+              "the cross-volume move copies to the overlay and removes the source");
+        write_path(package / "cross-package.bin", "package-cross");
+        check(move_w(L"GAME:\\cross-package.bin", host.c_str()) != FALSE,
+              "MoveFileW moves a GAME package file to the host");
+        check(std::filesystem::exists(host) && read_path(host) == "package-cross" &&
+                  attributes_w(L"GAME:\\cross-package.bin") == INVALID_FILE_ATTRIBUTES &&
+                  std::filesystem::exists(package / "cross-package.bin"),
+              "the host copy exists and the package source is hidden by a marker");
+    }
+
     // CreateDirectory: the new folder is in the overlay; names the title can already see are refused.
     {
         check(mkdir_w(L"GAME:\\cache", nullptr) != FALSE, "CreateDirectoryW makes GAME:\\cache");
@@ -738,9 +758,9 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\misc", L"GAME:\\misc2") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a package folder is not moved");
         SetLastError(0);
-        check(move_w(L"GAME:\\misc\\keep.txt", (root / "host.txt").c_str()) == FALSE &&
+        check(move_ex_w(L"GAME:\\misc\\keep.txt", (root / "host.txt").c_str(), 0) == FALSE &&
                   GetLastError() == ERROR_NOT_SAME_DEVICE,
-              "a move between GAME: and a host path is refused as cross-volume");
+              "MoveFileExW without COPY_ALLOWED refuses GAME to host across volumes");
         SetLastError(0);
         check(move_ex_w(L"GAME:\\misc\\keep.txt", nullptr, MOVEFILE_DELAY_UNTIL_REBOOT) == FALSE &&
                   GetLastError() == ERROR_INVALID_PARAMETER,

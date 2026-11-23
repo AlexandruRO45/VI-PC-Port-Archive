@@ -1045,6 +1045,8 @@ BOOL WINAPI remove_directory_a(LPCSTR name) {
 
 // ---- Move, copy and attributes: the result lands in the overlay, a moved package name is deleted by a marker
 
+BOOL WINAPI copy_file_w(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists);
+
 BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (!from) return fail_bool(ERROR_INVALID_PARAMETER);
     std::vector<std::wstring> src, dst;
@@ -1054,8 +1056,19 @@ BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
     if (from_kind == Parsed::Refused || to_kind == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
     // A boot-time move or delete is a host feature a title cannot use on the console's drives.
     if (!to || (flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0) return fail_bool(ERROR_INVALID_PARAMETER);
-    // GAME: is its own volume: a move between it and a host path is refused the way a cross-volume move is.
-    if (from_kind != to_kind) return fail_bool(ERROR_NOT_SAME_DEVICE);
+    // GAME: is its own volume. Cross-volume file moves require a copy followed by deletion.
+    if (from_kind != to_kind) {
+        if ((flags & MOVEFILE_COPY_ALLOWED) == 0) return fail_bool(ERROR_NOT_SAME_DEVICE);
+        if (!copy_file_w(from, to, (flags & MOVEFILE_REPLACE_EXISTING) == 0)) return FALSE;
+        if ((flags & MOVEFILE_WRITE_THROUGH) != 0) {
+            const Target target = read_target(to);
+            DWORD error = target.error;
+            if (error || !flush_file(target.path, error)) return fail_bool(error);
+        }
+        // Windows reports a successful copy even if it cannot remove the original.
+        delete_file_w(from);
+        return TRUE;
+    }
 
     const Roots r = roots();
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
