@@ -263,6 +263,26 @@ class WideIntegers(unittest.TestCase):
                 with self.assertRaisesRegex(UnsupportedConstruct, "64-bit"):
                     self.lane0(f"%r = OpExtInst %ulong %glsl {name} %cl_2p32\n%res = OpUConvert %uint %r\n")
 
+    def test_64bit_integer_to_float_rounds_once(self):
+        # OpConvertUToF / OpConvertSToF of a 64-bit integer, rounded once to binary32 (to nearest, ties to even;
+        # the words an RTX 2060 gives). Through binary64 the value rounds twice: 2**62 + 2**38 + 1 becomes the
+        # midpoint 2**62 + 2**38 and ties down to 2**62 (0x5E800000), 2**62 + 3 * 2**38 - 1 becomes the midpoint
+        # 2**62 + 3 * 2**38 and ties up to 2**62 + 2**40 (0x5E800002).
+        consts = {"%u1": ("%ulong", 2**62 + 2**38 + 1), "%u2": ("%ulong", 2**62 + 3 * 2**38 - 1),
+                  "%u3": ("%ulong", 2**63 + 2**39 + 1), "%u4": ("%ulong", 2**64 - 1),
+                  "%s1": ("%long", -(2**62 + 2**38 + 1)), "%s2": ("%long", -(2**62 + 3 * 2**38 - 1)),
+                  "%s3": ("%long", -2**63), "%s4": ("%long", 2**53 + 1)}
+        head = self.HEAD64.replace("%c0 = OpConstant %uint 0", "%float = OpTypeFloat 32\n%long = OpTypeInt 64 1\n" +
+                                   "".join(f"{n} = OpConstant {t} {v}\n" for n, (t, v) in consts.items()) +
+                                   "%c0 = OpConstant %uint 0")
+        for srcs, want in ((("%u1", "%u2", "%u3", "%u4"), (0x5E800001, 0x5E800001, 0x5F000001, 0x5F800000)),
+                           (("%s1", "%s2", "%s3", "%s4"), (0xDE800001, 0xDE800001, 0xDF000000, 0x5A000000))):
+            with self.subTest(srcs=srcs):
+                op = "OpConvertUToF" if srcs[0].startswith("%u") else "OpConvertSToF"
+                body = "".join(f"%f{k} = {op} %float {s}\n%w{k} = OpBitcast %uint %f{k}\n" for k, s in enumerate(srcs))
+                body += "%v = OpCompositeConstruct %v4uint %w0 %w1 %w2 %w3\nOpStore %out %v\n"
+                self.assertEqual(run_wave(head + body + TAIL, wave=32)["outputs"][0]["%out"], want)
+
 
 class Strictness(unittest.TestCase):
     def test_float_arithmetic_is_rejected(self):
