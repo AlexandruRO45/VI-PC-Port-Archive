@@ -17,6 +17,7 @@
 //                 the memory available at start, at large_module_gate.h's estimate per module, up to --jobs, with the
 //                 small ones compiling alongside; 1 = each large module alone, the other threads waiting (the
 //                 behaviour before; also what 0 falls back to when the available memory can't be read)
+//   progress      every 5 minutes: "progress: modules done, GB of SPIR-V done, large modules done, rough ETA" (pipeline_progress.h)
 //   --start I --count N   check only index entries [I, I+N) (sorted by name)
 //   --slow SEC    print pipelines slower than SEC (default 30); compiles past 60 s are named while running
 //   --max-bytes N skip modules whose .spv is larger than N bytes (0 = no limit; names every skip)
