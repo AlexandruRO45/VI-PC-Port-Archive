@@ -88,6 +88,17 @@ class Main(unittest.TestCase):
         self.assertEqual(err.getvalue().count("\n"), 1)
         self.assertIn(str(missing), err.getvalue())
 
+    def test_malformed_utf8_is_one_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failed.txt"
+            path.write_bytes(b"expected\n\xff\n")
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertEqual(cef.main([str(path), "8", "expected"]), 2)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(err.getvalue().splitlines(),
+                             [f"ci_expected_failures: {path}: failure list is not valid UTF-8"])
+
     def test_a_non_integer_status_is_one_error_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "failed.txt"

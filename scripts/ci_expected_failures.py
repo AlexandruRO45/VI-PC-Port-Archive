@@ -2,7 +2,7 @@
 
     python -I scripts/ci_expected_failures.py FAILED_LIST EXIT_STATUS [EXPECTED ...]
 
-FAILED_LIST is a file with one failed test name per line, EXIT_STATUS the test runner's exit status, and each
+FAILED_LIST is a UTF-8 file with one failed test name per line, EXIT_STATUS the test runner's exit status, and each
 EXPECTED argument one or more whitespace-separated test names (so a workflow can pass one quoted list). Exits 1 when a
 test outside EXPECTED failed, the runner failed without naming a test, or the runner was terminated by a signal
 (its failure list can be incomplete); 2 on a usage error. `--help` prints this text. An expected failure absent
@@ -45,6 +45,9 @@ def main(argv: list[str]) -> int:
     try:
         with open(argv[0], encoding="utf-8") as f:
             failed = [line.strip() for line in f if line.strip()]
+    except UnicodeDecodeError:
+        print(f"ci_expected_failures: {argv[0]}: failure list is not valid UTF-8", file=sys.stderr)
+        return 2
     except OSError as e:
         print(f"ci_expected_failures: {argv[0]}: {e.strerror or e}", file=sys.stderr)
         return 2
