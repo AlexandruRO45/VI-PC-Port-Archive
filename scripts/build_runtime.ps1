@@ -60,7 +60,7 @@ $cfg = if ($Debug) { "Debug" } else { "RelWithDebInfo" }
 $sdl = if ($FetchSdl3) { "-DLEONIDA_SDL3_FETCH=ON" } else { "" }
 # With VULKAN_SDK set, a configure that still finds no Vulkan headers fails instead of dropping the Vulkan D3D12 device.
 $vk = if ($env:VULKAN_SDK) { "-DLEONIDA_REQUIRE_VULKAN=ON" } else { "" }
-$avx = if ($Avx2) { "-DLEONIDA_AVX2=ON" } else { "" }
+$avx = if ($Avx2) { "-DLEONIDA_AVX2=ON" } else { "-DLEONIDA_AVX2=OFF" }
 
 if ($cmake -and $ninja) {
     $configure = "`"$cmake`" -S `"$src`" -B `"$out`" -G Ninja `"-DCMAKE_MAKE_PROGRAM=$ninja`" -DCMAKE_BUILD_TYPE=$cfg $sdl $vk $avx"

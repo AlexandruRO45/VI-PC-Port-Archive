@@ -58,6 +58,12 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         self.assertTrue(wanted)
         self.assertEqual(wanted - listed, set(), "in CMake's gta6rt sources but not in the cl.exe fallback")
 
+    def test_avx2_switch_defined_and_forwards_options(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("[switch]$Avx2", text)
+        self.assertIn('$avx = if ($Avx2) { "-DLEONIDA_AVX2=ON" } else { "-DLEONIDA_AVX2=OFF" }', text)
+        self.assertIn('$arch = if ($Avx2) { "/arch:AVX2 /DLEONIDA_AVX2=1" } else { "" }', text)
+
     def test_every_test_source_it_compiles_exists(self):
         sources = re.findall(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', self.body)
         self.assertTrue(sources)
