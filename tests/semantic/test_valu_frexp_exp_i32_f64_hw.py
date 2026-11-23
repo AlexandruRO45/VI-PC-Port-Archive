@@ -246,5 +246,24 @@ class TestFrexpExpF64ModifiersAndSigns(unittest.TestCase):
                 self.assertEqual(got, run_frexp_exp(f64_to_bits(val)))
 
 
+class TestFrexpExpF64BoundaryExtremes(unittest.TestCase):
+    def test_signed_zeros(self):
+        self.assertEqual(run_frexp_exp(0x0000000000000000), 0)
+        self.assertEqual(run_frexp_exp(0x8000000000000000), 0)
+
+    def test_infinities_and_nans(self):
+        self.assertEqual(run_frexp_exp(POS_INF), 0)
+        self.assertEqual(run_frexp_exp(NEG_INF), 0)
+        self.assertEqual(run_frexp_exp(QNAN), 0)
+        self.assertEqual(run_frexp_exp(SNAN), 0)
+
+    def test_subnormals(self):
+        # Smallest positive subnormal: 2^-1074 -> exp = -1073
+        self.assertEqual(run_frexp_exp(1), -1073)
+        self.assertEqual(run_frexp_exp(2), -1072)
+        # Largest positive subnormal: 0x000F_FFFF_FFFF_FFFF -> exp = -1022
+        self.assertEqual(run_frexp_exp(0x000FFFFFFFFFFFFF), -1022)
+
+
 if __name__ == "__main__":
     unittest.main()
