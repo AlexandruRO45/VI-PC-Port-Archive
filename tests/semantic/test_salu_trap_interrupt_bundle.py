@@ -363,5 +363,31 @@ class TestSSendMsgOrderedPsDoneExecution(unittest.TestCase):
         self.assertEqual(words, [100, 100, 100, 100])
 
 
+class TestSSendMsgPreservation(unittest.TestCase):
+    def test_scc_preserved_across_sendmsg(self):
+        lines = [
+            "s_cmp_eq_u32 7, 7",               # SCC = 1
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "s_cselect_b32 s0, 0x777, 0x888",  # reads SCC -> 0x777
+            "s_cmp_lg_u32 7, 7",               # SCC = 0
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "s_cselect_b32 s1, 0x777, 0x888",  # reads SCC -> 0x888
+            "v_mov_b32 v0, s0",
+            "v_mov_b32 v1, s1",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0x777, 0x888, 0x777, 0x888])
+
+    def test_sgpr_vgpr_preserved_across_sendmsg(self):
+        lines = [
+            "s_mov_b32 s0, 0x11223344",
+            "v_mov_b32 v0, 0x55667788",
+            "s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)",
+            "v_mov_b32 v1, s0",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v0", "v1"))
+        self.assertEqual(words, [0x55667788, 0x11223344, 0x55667788, 0x11223344])
+
+
 if __name__ == "__main__":
     unittest.main()
