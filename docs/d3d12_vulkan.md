@@ -675,7 +675,7 @@ volume, plus minimum-LOD clamped views (inside the mip range via `VK_EXT_image_v
 Known gaps in the descriptor path: buffer shader-resource views and constant-buffer views (the V# a shader would
 load for them; the structure is in `gfx10_descriptors.h`, the views are not written; buffer UAVs of every kind are,
 section 3.4 "Buffer UAVs", `d3d12_m4_compute_test` and `d3d12_buffer_uav_test`);
-1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
+integer 1D-array SRVs, 1D and 3D storage views, other typeless volume formats, multisampled depth/stencil and typeless
 color SRVs, and shader-translator lowering for multisample loads. Single-sampled depth-plane views (`R24_UNORM_X8_TYPELESS`,
 `R32_FLOAT_X8X24_TYPELESS`) are a T# of the texture's depth format (8_24_UNORM, X24_8_32_FLOAT) through the
 depth aspect (the texture's backing format, so X24_8_32_FLOAT for a D24 texture where the layer stores it as

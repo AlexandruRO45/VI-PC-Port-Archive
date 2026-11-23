@@ -51,7 +51,7 @@
 #include "pipeline_cache_snapshot.h"
 #include "large_module_gate.h"
 #include "pipeline_summary.h"
-#include "../src/spirv_words.h"
+#include "../src/shader_library.h"
 #include "../src/subgroup_size.h"
 
 #include <algorithm>
@@ -353,12 +353,15 @@ struct JsonParser {
                 m.push_constant_bytes = parse_strict_u32("expected unsigned 32-bit push_constant_bytes");
             else if (k == "pc_tail") m.pc_tail_bytes = parse_pc_tail_bytes();
             else if (k == "bindings") {
-                ws();
-                if (i < s.size() && s[i] == '[') {
-                    const auto bindings = parse_u32_array();
-                    m.no_set0_bindings = bindings.empty();
-                    m.uses_1d_array = std::find(bindings.begin(), bindings.end(), 26u) != bindings.end();
-                } else skip_value();
+                const size_t start = i;
+                m.no_set0_bindings = consume('[') && consume(']');
+                if (!m.no_set0_bindings) {
+                    i = start;
+                    skip_value();
+                    leonida::Json bindings;
+                    if (!error && leonida::JsonReader(std::string_view(s).substr(start, i - start)).parse(bindings))
+                        m.uses_1d_array = (leonida::set0_binding_mask(bindings) & (std::uint32_t{1} << 26)) != 0;
+                }
             }
             else if (k == "wave64") {
                 ws();
@@ -1322,8 +1325,9 @@ int main(int argc, char** argv) {
     add(4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024); add(5, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
     add(6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256); add(7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
     for (uint32_t i = 8; i <= 19; i++) add(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256);
+    // The checker builds pipelines without allocating or binding a descriptor set.
     if (std::any_of(work.begin(), work.end(), [](const Item& item) { return item.second->uses_1d_array; }))
-        add(26, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 256);
+        add(26, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1);
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = uint32_t(b.size()); dli.pBindings = b.data();
     VkDescriptorSetLayout dsl;

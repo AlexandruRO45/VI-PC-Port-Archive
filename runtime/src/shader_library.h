@@ -325,6 +325,18 @@ inline const Json* Json::find(std::string_view key) const {
     return nullptr;
 }
 
+// Translated indices list binding numbers. Some index producers use objects with a "binding" field.
+inline std::uint32_t set0_binding_mask(const Json& bindings) {
+    std::uint32_t mask = 0;
+    for (const Json& entry : bindings.array) {
+        const Json* field = entry.kind == Json::Kind::object ? entry.find("binding") : &entry;
+        if (!field || field->kind != Json::Kind::number || !(field->number >= 0 && field->number < 32)) continue;
+        const auto binding = static_cast<std::uint32_t>(field->number);
+        if (field->number == binding) mask |= std::uint32_t{1} << binding;
+    }
+    return mask;
+}
+
 class JsonReader {
 public:
     explicit JsonReader(std::string_view text) : text_(text) {}
@@ -870,11 +882,7 @@ private:
                 e.fspx_state_sha256 = s->string;
             if (const Json* b = meta.find("bindings"); b && b->kind == Json::Kind::array) {
                 e.binding_count = b->array.size();
-                for (const Json& item : b->array) {
-                    if (item.kind != Json::Kind::number) continue;
-                    const auto binding = u32(&item);
-                    if (binding < 32) e.set0_binding_mask |= std::uint32_t{1} << binding;
-                }
+                e.set0_binding_mask = leonida::set0_binding_mask(*b);
             }
             e.push_constant_bytes = u32(meta.find("push_constant_bytes"));
             e.lds_bytes = u32(meta.find("lds_bytes"));

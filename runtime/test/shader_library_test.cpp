@@ -352,7 +352,8 @@ int main() {
     {
         std::ofstream index(dir / "index.json", std::ios::binary);
         index << "\xef\xbb\xbf" "{\"cs_test\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash
-              << "\", \"bindings\": [2], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+              << "\", \"bindings\": [2, {\"binding\": 26}, null, {\"binding\": 0}, {\"unrelated\": 7}, 8.5, 32], "
+                 "\"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
                  "\"uses_code_base\": true, \"wave64\": false},\n"
                  " \"vs_test\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << hash << "\", \"input_signature\": ["
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 0, \"mask\": 15, \"rw_mask\": 15, "
@@ -396,8 +397,8 @@ int main() {
     CHECK(ps->f16_halves.size() == 2 && ps->f16_halves.at(0)[0] == 28 && ps->f16_halves.at(0)[1] == 29 &&
           ps->f16_halves.at(7)[0] == 20 && ps->f16_halves.at(7)[1] == 21);
     const ShaderEntry* entry = library.find("cs", sha256_hex(fssm_program(shader)));
-    CHECK(entry && entry->name == "cs_test" && entry->binding_count == 1 && entry->push_constant_bytes == 144);
-    CHECK(entry->set0_binding_mask == (std::uint32_t{1} << 2));
+    CHECK(entry && entry->name == "cs_test" && entry->binding_count == 7 && entry->push_constant_bytes == 144);
+    CHECK(entry->set0_binding_mask == ((std::uint32_t{1} << 26) | (1u << 2) | 1u));
     CHECK(entry->local_size[0] == 64 && entry->uses_code_base && !entry->wave64);
     CHECK(!library.find("ms", hash));  // no mesh shader with this hash
     // The subgroup fields of the index (wave64 / subgroup_size / wave64_exchange): absent, native and emulated.

@@ -1075,7 +1075,8 @@ struct DeviceState {
         case VK_FORMAT_R32_UINT:
         case VK_FORMAT_R32G32_UINT:
         case VK_FORMAT_R32G32B32A32_UINT:
-        case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 1;
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+        case VK_FORMAT_A2R10G10B10_UINT_PACK32: return 1;
         case VK_FORMAT_R8_SINT:
         case VK_FORMAT_R8G8_SINT:
         case VK_FORMAT_R8G8B8A8_SINT:
@@ -1084,7 +1085,8 @@ struct DeviceState {
         case VK_FORMAT_R16G16B16A16_SINT:
         case VK_FORMAT_R32_SINT:
         case VK_FORMAT_R32G32_SINT:
-        case VK_FORMAT_R32G32B32A32_SINT: return 2;
+        case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_A2B10G10R10_SINT_PACK32: return 2;
         default: return 0;
         }
     }
@@ -1156,6 +1158,10 @@ struct DeviceState {
         if (view_format == VK_FORMAT_UNDEFINED ||
             (depth_or_stencil && !g::is_depth_stencil_format(view_format))) {
             log_once("no Vulkan view format for the GFX10 format of a view:", int(image.format));
+            return false;
+        }
+        if (dimension == leonida::ImageDimension::dim_1d_array && numeric_class(view_format)) {
+            log_once("1D array shader view requires a float-sampled Vulkan format:", int(view_format));
             return false;
         }
         const unsigned sampled_class = g::multisampled(image.type) ? numeric_class(view_format) : 0;
@@ -4555,8 +4561,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view format not supported for this texture:", int(view.format));
         return false;
     }
-    if (line_array && (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || DeviceState::numeric_class(view_format))) {
-        log_once("1D array shader view requires a float-sampled colour format:", int(view.format));
+    if (line_array && resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT) {
+        log_once("1D array shader view requires a colour format:", int(view.format));
         return false;
     }
     const UINT layers = volume ? 1 : desc.DepthOrArraySize;

@@ -87,3 +87,16 @@ foreach(bytes -1 1.5 4294967296)
     message(FATAL_ERROR "pc_tail.bytes=${bytes}: expected a malformed index, got ${code}\n${log}")
   endif()
 endforeach()
+
+# Legacy index producers describe bindings with objects. An empty isolated slice exercises the manifest
+# parser without loading Vulkan. Unknown array entries are still allowed, as they were before binding 26.
+file(WRITE "${TEST_DIR}/index.json" [=[
+{"array":{"stage":"ps","bindings":[0,{"binding":26},{"unrelated":2},null]},
+ "legacy":{"stage":"cs","bindings":[{"binding":0}]},
+ "empty":{"stage":"cs","bindings":[]}}
+]=])
+execute_process(COMMAND ${RUNNER} "${TOOL}" "${TEST_DIR}" --isolate --start 3
+                RESULT_VARIABLE code OUTPUT_VARIABLE log ERROR_VARIABLE log TIMEOUT 5)
+if(NOT code STREQUAL "0" OR NOT log MATCHES "wall time: .*\\(isolated\\)")
+  message(FATAL_ERROR "Expected mixed binding metadata to parse, got ${code}\n${log}")
+endif()
