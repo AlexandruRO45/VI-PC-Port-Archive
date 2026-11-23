@@ -146,6 +146,9 @@ def main(argv: list[str] | None = None) -> int:
                     ap.error(f"--out {a.out} would overwrite the docs input {os.path.join(dirpath, name)}")
     try:
         table = build(a.docs)
+    except UnicodeDecodeError as e:
+        print(f"ERROR: cannot read the docs {a.docs}: a file is not UTF-8 ({e})", file=sys.stderr)
+        return 2
     except OSError as e:
         print(f"ERROR: cannot read the docs {a.docs}: {e.strerror or e}", file=sys.stderr)
         return 2
