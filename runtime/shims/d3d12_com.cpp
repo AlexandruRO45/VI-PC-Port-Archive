@@ -17,6 +17,7 @@
 #include <optional>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <set>
 #include <string>
@@ -1192,6 +1193,27 @@ private:
     }
 };
 
+// The host runtime takes the event handle of SetEventOnCompletion and SetEventOnMultipleFenceCompletion before it
+// looks at the fence value: a handle that is not an event (closed, pseudo, another object type) is E_HANDLE, an event
+// without EVENT_MODIFY_STATE is E_ACCESSDENIED, the same on the RTX 4080 SUPER, the UHD 770 and WARP.
+HRESULT check_event_handle(HANDLE event) {
+    using NtQueryObjectFn = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
+    static const auto query = reinterpret_cast<NtQueryObjectFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryObject")));
+    if (!query) return S_OK;
+    constexpr int kObjectBasicInformation = 0, kObjectTypeInformation = 2;
+    struct Basic { ULONG attributes; ULONG granted_access; unsigned char rest[48]; } basic{};  // PUBLIC_OBJECT_BASIC_INFORMATION, 56 bytes: the call wants exactly that
+    ULONG length = 0;
+    if (query(event, kObjectBasicInformation, &basic, sizeof(basic), &length) < 0) return E_HANDLE;
+    alignas(8) unsigned char buffer[256]{};
+    if (query(event, kObjectTypeInformation, buffer, sizeof(buffer), &length) < 0) return E_HANDLE;
+    struct Name { USHORT length, maximum; PWSTR text; };  // the UNICODE_STRING that PUBLIC_OBJECT_TYPE_INFORMATION starts with
+    const auto* name = reinterpret_cast<const Name*>(buffer);
+    if (name->length != 5 * sizeof(wchar_t) || std::wmemcmp(name->text, L"Event", 5) != 0) return E_HANDLE;
+    // EVENT_MODIFY_STATE is the bit the signal needs; DuplicateHandle cannot be used to ask, it grants any access.
+    return (basic.granted_access & EVENT_MODIFY_STATE) ? S_OK : E_ACCESSDENIED;
+}
+
 class Fence final
     : public Child<Fence, ID3D12Fence1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Fence,
                     ID3D12Fence1> {
@@ -1256,6 +1278,9 @@ public:
 
     // A null event blocks until the value is reached, as D3D12 does.
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override {
+        if (event) {
+            if (const HRESULT hr = check_event_handle(event); FAILED(hr)) return hr;
+        }
         if (context_.is_device_lost() || fence_.completed() >= value) {
             if (event) SetEvent(event);
             return S_OK;
@@ -1751,6 +1776,9 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
     std::vector<Fence*> objects(count);
     for (UINT i = 0; i < count; ++i)
         if (!(objects[i] = Fence::from(fences[i]))) return E_INVALIDARG;
+    if (event) {
+        if (const HRESULT hr = check_event_handle(event); FAILED(hr)) return hr;
+    }
     const bool any = flags == D3D12_MULTIPLE_FENCE_WAIT_FLAG_ANY;
     if (!event) {
         // One vkWaitSemaphores call: VK_SEMAPHORE_WAIT_ANY_BIT is the ANY flag, no flag is ALL.

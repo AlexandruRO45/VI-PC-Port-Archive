@@ -5592,7 +5592,9 @@ public:
         return d3d12_trace::result(method, S_OK);
     }
 
-    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE) override {
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        // A type past SAMPLER..DSV is 0 on the host runtime (the RTX 4080 SUPER, the UHD 770 and WARP).
+        if (UINT(type) >= UINT(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES)) return 0;
         return kDescriptorSize;
     }
 
