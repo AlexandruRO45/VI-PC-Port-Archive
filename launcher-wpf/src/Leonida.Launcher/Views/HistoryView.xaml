@@ -18,12 +18,12 @@
                 <Grid Margin="4,0" ToolTip="{Binding Tip}">
                   <Grid.RowDefinitions><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
                   <Rectangle VerticalAlignment="Bottom" Height="{Binding Height}" Fill="{Binding Fill}"/>
-                  <TextBlock Grid.Row="1" Text="{Binding Label}" FontSize="10" Foreground="#777777" HorizontalAlignment="Center" Margin="0,3,0,0"/>
+                  <TextBlock Grid.Row="1" Text="{Binding Label}" FontSize="10" Foreground="{DynamicResource Faint}" HorizontalAlignment="Center" Margin="0,3,0,0"/>
                 </Grid>
               </DataTemplate>
             </ItemsControl.ItemTemplate>
           </ItemsControl>
-          <TextBlock x:Name="NoHistory" Text="No builds yet." Foreground="{StaticResource Faint}" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          <TextBlock x:Name="NoHistory" Text="No builds yet." Foreground="{DynamicResource Faint}" FontSize="15" HorizontalAlignment="Center" VerticalAlignment="Center"/>
         </Grid>
       </DockPanel>
     </Border>

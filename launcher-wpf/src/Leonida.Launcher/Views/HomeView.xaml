@@ -18,7 +18,7 @@
                 <Rectangle Height="5" Fill="{StaticResource Sunset}" Width="210" HorizontalAlignment="Left"/>
               </StackPanel>
             </StackPanel>
-            <TextBlock x:Name="Tagline" FontSize="19" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,18,0,10" Foreground="#111111"/>
+            <TextBlock x:Name="Tagline" FontSize="19" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,18,0,10" Foreground="{DynamicResource Heading}"/>
             <FlowDocumentScrollViewer x:Name="Intro" VerticalScrollBarVisibility="Disabled" HorizontalScrollBarVisibility="Disabled"
                                       IsToolBarVisible="False" Focusable="False" Margin="-2,0,0,0"/>
           </StackPanel>
@@ -50,7 +50,7 @@
               <Border Style="{StaticResource Card}" Margin="0,0,18,18" Cursor="Hand" Tag="{Binding Key}" MouseLeftButtonUp="OnTile">
                 <DockPanel>
                   <Border DockPanel.Dock="Bottom" Style="{StaticResource Caption}"><TextBlock Text="{Binding Title}" Style="{StaticResource CaptionText}"/></Border>
-                  <Grid Height="104" Background="#F7F7F7">
+                  <Grid Height="104" Background="{DynamicResource CardAlt}">
                     <TextBlock Text="{Binding Glyph}" FontFamily="{StaticResource Icons}" FontSize="44" Foreground="{Binding Brush}"
                                HorizontalAlignment="Center" VerticalAlignment="Center"/>
                   </Grid>
@@ -101,24 +101,25 @@
         <TextBlock Grid.Column="1" x:Name="PeopleNote" Style="{StaticResource Hint}" Margin="20,0,20,0" VerticalAlignment="Center"/>
         <Grid Grid.Column="2" Width="260" VerticalAlignment="Center">
           <TextBox x:Name="PeopleSearch" Padding="30,6,8,6" TextChanged="OnPeopleSearch" ToolTip="Find someone"/>
-          <TextBlock Text="&#xE721;" FontFamily="{StaticResource Icons}" FontSize="13" Foreground="#888888" Margin="10,0,0,0"
+          <TextBlock Text="&#xE721;" FontFamily="{StaticResource Icons}" FontSize="13" Foreground="{DynamicResource Faint}" Margin="10,0,0,0"
                      VerticalAlignment="Center" IsHitTestVisible="False"/>
         </Grid>
       </Grid>
-      <Border Grid.Row="2" Background="#FFFFFF" BorderBrush="#1A1A1A" BorderThickness="1" Effect="{StaticResource SoftShadow}">
+      <Border Grid.Row="2" Background="{DynamicResource CardBg}" BorderBrush="{DynamicResource CardBorder}" BorderThickness="1" Effect="{StaticResource SoftShadow}">
         <ListBox x:Name="People" BorderThickness="0" Background="Transparent" HorizontalContentAlignment="Stretch"
                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                  VirtualizingPanel.ScrollUnit="Pixel" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
           <ListBox.ItemContainerStyle>
             <Style TargetType="ListBoxItem">
+              <Setter Property="Foreground" Value="{DynamicResource Heading}"/>
               <Setter Property="Template">
                 <Setter.Value>
                   <ControlTemplate TargetType="ListBoxItem">
-                    <Border x:Name="b" Background="Transparent" BorderBrush="#EEEEEE" BorderThickness="0,0,0,1" Padding="18,9">
+                    <Border x:Name="b" Background="Transparent" BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="18,9">
                       <ContentPresenter/>
                     </Border>
                     <ControlTemplate.Triggers>
-                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#F6F6F6"/></Trigger>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource CardAlt}"/></Trigger>
                     </ControlTemplate.Triggers>
                   </ControlTemplate>
                 </Setter.Value>
@@ -147,14 +148,14 @@
                 </Grid>
                 <StackPanel Grid.Column="2" VerticalAlignment="Center">
                   <TextBlock Text="{Binding Name}" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-                  <TextBlock Text="{Binding Handle}" FontSize="11.5" Foreground="#888888" TextTrimming="CharacterEllipsis"/>
+                  <TextBlock Text="{Binding Handle}" FontSize="11.5" Foreground="{DynamicResource Faint}" TextTrimming="CharacterEllipsis"/>
                 </StackPanel>
-                <Grid Grid.Column="3" Height="6" VerticalAlignment="Center" Margin="0,0,18,0" Background="#EEEEEE">
+                <Grid Grid.Column="3" Height="6" VerticalAlignment="Center" Margin="0,0,18,0" Background="{DynamicResource CardAlt}">
                   <Rectangle HorizontalAlignment="Left" Width="{Binding BarWidth}" Fill="{StaticResource Sunset}"/>
                 </Grid>
                 <StackPanel Grid.Column="4" VerticalAlignment="Center" HorizontalAlignment="Right">
                   <TextBlock Text="{Binding Commits}" FontFamily="{StaticResource DisplayBold}" FontSize="20" HorizontalAlignment="Right"/>
-                  <TextBlock Text="COMMITS" FontSize="9.5" FontWeight="Bold" Foreground="#999999" HorizontalAlignment="Right"/>
+                  <TextBlock Text="COMMITS" FontSize="9.5" FontWeight="Bold" Foreground="{DynamicResource Faint}" HorizontalAlignment="Right"/>
                 </StackPanel>
               </Grid>
             </DataTemplate>

@@ -62,6 +62,8 @@ public sealed class LauncherSettings
     public HardwareOverride? Hardware { get; set; }
 
     // Launcher settings
+    /// <summary>"system" (Windows' app theme), "light" or "dark".</summary>
+    public string Theme { get; set; } = "system";
     /// <summary>"en" or "pl".</summary>
     public string Language { get; set; } = "en";
     /// <summary>"last" (where you left off), "home", "leonida" or "caniru".</summary>

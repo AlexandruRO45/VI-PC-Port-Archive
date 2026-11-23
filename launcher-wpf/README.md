@@ -34,10 +34,13 @@ tabs at the top right. The avatar next to the tabs opens **Settings**.
 | **Leonida › BUILD** | The running or last build: each stage, the measured numbers, the shader translation, and the console. |
 | **Leonida › HISTORY** | Every build the launcher ran, with its result, duration, stages, shaders, warnings, errors and peak memory. Each build has its log and a "build again with these options" button. |
 | **Can I Run Leonida** | Your CPU, GPU and memory, read from Windows, compared with every console on the [community checker](https://assttro.github.io/can-i-run-leonida/)'s list. It runs automatically, and **Detect again** reads the hardware again. |
-| **Settings** (avatar menu) | **Launcher settings**: language, start page, avatar, online features, how builds stop, end-of-build notice, console text size and log clean-up. **Leonida settings**: the setup check (`make_game.py`'s own preflight), Play's options, the Leonida folder, Python and environment variables. |
+| **Settings** (avatar menu) | **Launcher settings**: language, theme, start page, avatar, online features, how builds stop, end-of-build notice, console text size and log clean-up. **Leonida settings**: the setup check (`make_game.py`'s own preflight), Play's options, the Leonida folder, Python and environment variables. |
 
 The launcher is in **English** and **Polish**; choose the language in Launcher settings. The README pages and the
 build's own output stay in English.
+
+There is a **light** and a **dark** theme, or **Same as Windows** (the default), which follows Windows' app mode
+(Settings › Personalisation › Colours). The black sidebar, the console and the white BUILD/PLAY button look the same in both.
 
 ### The build popup
 
@@ -129,6 +132,14 @@ build's folders that `make_game.py` wouldn't write.
 | ![Home](docs/screenshots/home.png) | ![Credits](docs/screenshots/credits.png) |
 | ![The build popup](docs/screenshots/build-popup.png) | ![A build running](docs/screenshots/build.png) |
 | ![Can I Run Leonida](docs/screenshots/can-i-run.png) | ![Launcher settings](docs/screenshots/settings.png) |
+
+Dark theme:
+
+| | |
+|---|---|
+| ![The Leonida page, dark](docs/screenshots/dark-leonida.png) | ![Home, dark](docs/screenshots/dark-home.png) |
+| ![Credits, dark](docs/screenshots/dark-credits.png) | ![The build popup, dark](docs/screenshots/dark-build-popup.png) |
+| ![Can I Run Leonida, dark](docs/screenshots/dark-can-i-run.png) | |
 
 ## Layout
 

@@ -11,7 +11,7 @@
     </Style>
   </UserControl.Resources>
 
-  <Grid Background="{StaticResource Paper}">
+  <Grid Background="{DynamicResource Paper}">
     <Grid.ColumnDefinitions>
       <ColumnDefinition Width="270"/>
       <ColumnDefinition/>
@@ -51,6 +51,8 @@
                   <TextBlock Text="LANGUAGE" Style="{StaticResource Label}"/>
                   <ComboBox x:Name="LanguageBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnLanguage" AutomationProperties.Name="Language"/>
                   <TextBlock Style="{StaticResource Hint}" Text="The launcher's language. README pages and the build's output stay in English."/>
+                  <TextBlock Text="THEME" Style="{StaticResource Label}" Margin="0,14,0,4"/>
+                  <ComboBox x:Name="ThemeBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnTheme" AutomationProperties.Name="Theme"/>
                   <TextBlock Text="START PAGE" Style="{StaticResource Label}" Margin="0,14,0,4"/>
                   <ComboBox x:Name="StartPageBox" Width="220" HorizontalAlignment="Left" SelectionChanged="OnChanged"/>
                   <CheckBox x:Name="StartCollapsed" Content="Start with the sidebar collapsed" Margin="0,12,0,0" Checked="OnChanged" Unchecked="OnChanged"/>
@@ -142,13 +144,13 @@
                   <ItemsControl x:Name="ToolList">
                     <ItemsControl.ItemTemplate>
                       <DataTemplate>
-                        <Border BorderBrush="#E8E8E8" BorderThickness="0,0,0,1" Padding="0,8">
+                        <Border BorderBrush="{DynamicResource Line}" BorderThickness="0,0,0,1" Padding="0,8">
                           <DockPanel>
                             <TextBlock DockPanel.Dock="Left" FontFamily="{StaticResource Icons}" FontSize="16" Margin="0,1,12,0" VerticalAlignment="Top"
                                        Text="{Binding Glyph}" Foreground="{Binding Color}"/>
                             <StackPanel>
-                              <TextBlock><Run Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold"/><Run Text="{Binding For, Mode=OneWay}" Foreground="#777777" FontSize="11.5"/></TextBlock>
-                              <TextBlock Text="{Binding Detail}" FontSize="11.5" Foreground="#555555" TextWrapping="Wrap"/>
+                              <TextBlock><Run Text="{Binding Name, Mode=OneWay}" FontWeight="SemiBold"/><Run Text="{Binding For, Mode=OneWay}" Foreground="{DynamicResource Faint}" FontSize="11.5"/></TextBlock>
+                              <TextBlock Text="{Binding Detail}" FontSize="11.5" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
                               <TextBlock Text="{Binding Hint}" FontSize="11.5" Foreground="{StaticResource Bad}" TextWrapping="Wrap" Visibility="{Binding HintVisibility}"/>
                             </StackPanel>
                           </DockPanel>
@@ -193,7 +195,7 @@
                 <StackPanel Style="{StaticResource Body}">
                   <TextBlock Text="LEONIDA FOLDER (WITH BUILD.BAT)" Style="{StaticResource Label}"/>
                   <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-                    <TextBox x:Name="RepoBox" IsReadOnly="True" Background="#F6F6F6"/>
+                    <TextBox x:Name="RepoBox" IsReadOnly="True" Background="{DynamicResource CardAlt}"/>
                     <Button Grid.Column="1" Style="{StaticResource Small}" Content="Change" Click="OnChooseRepo"/></Grid>
                   <TextBlock Style="{StaticResource Hint}" Text="Found by itself when Leonida.exe is next to Build.bat."/>
                   <TextBlock Text="PYTHON" Style="{StaticResource Label}" Margin="0,12,0,4"/>

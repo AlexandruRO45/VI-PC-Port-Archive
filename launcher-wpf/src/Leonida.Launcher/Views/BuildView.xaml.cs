@@ -146,8 +146,8 @@ public partial class BuildView : UserControl
                 StageState.Running => ("", (Brush)FindResource("Sunset"), Brushes.White, Brushes.Transparent),
                 StageState.Done => ("", Brushes.Black, Brushes.White, Brushes.Black),
                 StageState.Failed => ("", (Brush)FindResource("Bad"), Brushes.White, Brushes.Transparent),
-                StageState.Skipped => ("", Brushes.White, (Brush)FindResource("Faint"), (Brush)FindResource("Line")),
-                _ => ("", Brushes.White, (Brush)FindResource("Muted"), (Brush)FindResource("Line")),
+                StageState.Skipped => ("", Theme.Brush("CardBg"), Theme.Brush("Faint"), Theme.Brush("Line")),
+                _ => ("", Theme.Brush("CardBg"), Theme.Brush("Muted"), Theme.Brush("Line")),
             };
             var detail = st.State switch
             {

@@ -14,15 +14,15 @@
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="RadioButton">
-            <Border x:Name="b" BorderBrush="#CFCFCF" BorderThickness="1.5" Background="#FFFFFF" Padding="14,11" CornerRadius="3">
+            <Border x:Name="b" BorderBrush="{DynamicResource Line}" BorderThickness="1.5" Background="{DynamicResource CardBg}" Padding="14,11" CornerRadius="3">
               <ContentPresenter/>
             </Border>
             <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#7A7A7A"/></Trigger>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{DynamicResource LineStrong}"/></Trigger>
               <Trigger Property="IsChecked" Value="True">
-                <Setter TargetName="b" Property="BorderBrush" Value="#000000"/>
+                <Setter TargetName="b" Property="BorderBrush" Value="{DynamicResource Heading}"/>
                 <Setter TargetName="b" Property="BorderThickness" Value="2.5"/>
-                <Setter TargetName="b" Property="Background" Value="#FAFAFA"/>
+                <Setter TargetName="b" Property="Background" Value="{DynamicResource CardAlt}"/>
               </Trigger>
             </ControlTemplate.Triggers>
           </ControlTemplate>
@@ -33,7 +33,7 @@
 
   <!-- Dimmed backdrop over the whole window; a click outside the panel closes it. -->
   <Grid x:Name="Backdrop" Background="#B3000000" MouseLeftButtonDown="OnBackdrop" SizeChanged="OnBackdropSize">
-    <Border x:Name="Panel" Background="#FFFFFF" Width="780"
+    <Border x:Name="Panel" Background="{DynamicResource CardBg}" Width="780"
             VerticalAlignment="Center" HorizontalAlignment="Center" BorderBrush="#000000" BorderThickness="1"
             Effect="{StaticResource SoftShadow}" MouseLeftButtonDown="OnPanelClick">
       <DockPanel>
@@ -51,7 +51,7 @@
         <Rectangle DockPanel.Dock="Top" Height="4" Fill="{StaticResource Sunset}"/>
 
         <!-- Footer -->
-        <Border DockPanel.Dock="Bottom" BorderBrush="#E2E2E2" BorderThickness="0,1,0,0" Padding="26,14" Background="#F7F7F7">
+        <Border DockPanel.Dock="Bottom" BorderBrush="{DynamicResource Line}" BorderThickness="0,1,0,0" Padding="26,14" Background="{DynamicResource CardAlt}">
           <DockPanel>
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
               <Button Style="{StaticResource Outline}" Content="Cancel" Click="OnClose" Margin="0,0,14,0" Padding="18,9" VerticalAlignment="Center"/>
@@ -98,25 +98,25 @@
               <RadioButton x:Name="ChoiceRun" AutomationProperties.Name="Ready to run" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
                 <StackPanel>
                   <TextBlock FontFamily="{StaticResource DisplayBold}" FontSize="18"><Run Text="READY TO RUN"/><Run Text="  recommended" FontFamily="{StaticResource Body}" FontSize="11" Foreground="{StaticResource Pink}" FontWeight="SemiBold"/></TextBlock>
-                  <TextBlock Text="Check, shaders and the runtime: what running the port needs. About 30 GB." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                  <TextBlock Text="Check, shaders and the runtime: what running the port needs. About 30 GB." FontSize="12" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
                 </StackPanel>
               </RadioButton>
               <RadioButton x:Name="ChoiceAll" AutomationProperties.Name="Everything" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
                 <StackPanel>
                   <TextBlock Text="EVERYTHING" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
-                  <TextBlock Text="Adds the asset export (models, textures, audio) and the pipeline check. About 330 GB." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                  <TextBlock Text="Adds the asset export (models, textures, audio) and the pipeline check. About 330 GB." FontSize="12" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
                 </StackPanel>
               </RadioButton>
               <RadioButton x:Name="ChoiceCheck" AutomationProperties.Name="Check my game files" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
                 <StackPanel>
                   <TextBlock Text="CHECK MY GAME FILES" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
-                  <TextBlock Text="Only check the copy against the file list; build nothing (--check)." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                  <TextBlock Text="Only check the copy against the file list; build nothing (--check)." FontSize="12" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
                 </StackPanel>
               </RadioButton>
               <RadioButton x:Name="ChoiceCustom" AutomationProperties.Name="Choose stages" Style="{StaticResource Choice}" GroupName="what" Checked="OnChoice">
                 <StackPanel>
                   <TextBlock Text="CHOOSE STAGES" FontFamily="{StaticResource DisplayBold}" FontSize="18"/>
-                  <TextBlock Text="Pick the stages yourself." FontSize="12" Foreground="#555555" TextWrapping="Wrap"/>
+                  <TextBlock Text="Pick the stages yourself." FontSize="12" Foreground="{DynamicResource SubText}" TextWrapping="Wrap"/>
                 </StackPanel>
               </RadioButton>
             </UniformGrid>
@@ -160,7 +160,7 @@
                     </ComboBox>
                   </StackPanel>
                   <StackPanel Grid.Column="2">
-                    <TextBlock Style="{StaticResource Label}"><Run Text="PARALLEL JOBS  "/><Run x:Name="JobsValue" Foreground="#000000"/></TextBlock>
+                    <TextBlock Style="{StaticResource Label}"><Run Text="PARALLEL JOBS  "/><Run x:Name="JobsValue" Foreground="{DynamicResource Heading}"/></TextBlock>
                     <DockPanel>
                       <CheckBox x:Name="JobsDefault" Content="Default" DockPanel.Dock="Left" Checked="OnChanged" Unchecked="OnChanged" ToolTip="Half your CPU threads, as make_game.py chooses."/>
                       <Slider x:Name="JobsSlider" Minimum="1" Maximum="32" IsSnapToTickEnabled="True" TickFrequency="1" VerticalAlignment="Center" ValueChanged="OnJobs"/>
@@ -195,7 +195,7 @@
                 <TextBox x:Name="ExtraBox" TextChanged="OnChanged" FontFamily="{StaticResource Mono}" ToolTip="Passed to make_game.py unchanged, for options this launcher does not know yet."/>
 
                 <TextBlock Text="THE COMMAND (THE SAME AS BUILD.BAT WITH THESE OPTIONS)" Style="{StaticResource Label}" Margin="0,14,0,4"/>
-                <TextBox x:Name="CommandPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="{StaticResource Mono}" FontSize="11.5" Background="#F5F5F5"/>
+                <TextBox x:Name="CommandPreview" IsReadOnly="True" TextWrapping="Wrap" FontFamily="{StaticResource Mono}" FontSize="11.5" Background="{DynamicResource CardAlt}"/>
                 <WrapPanel Margin="0,8,0,0">
                   <Button Style="{StaticResource Small}" Margin="0,0,8,6" Content="Copy command" Click="OnCopyCommand"/>
                   <ComboBox x:Name="PresetBox" Width="170" Margin="0,0,8,6" SelectionChanged="OnPreset" ToolTip="Load saved options"/>
