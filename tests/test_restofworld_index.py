@@ -21,6 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "restofworld_index.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import report_paths  # noqa: E402
 import restofworld_index  # noqa: E402
 
 
@@ -329,6 +330,9 @@ class ArchiveTest(unittest.TestCase):
                 self.assertEqual(len(stderr.getvalue().splitlines()), 1)
                 self.assertIn(out, stderr.getvalue())
                 self.assertIn("report write denied", stderr.getvalue())
+
+    def test_uses_shared_same_report_path(self):
+        self.assertIs(restofworld_index.same_report_path, report_paths.same_report_path)
 
     def test_cli_rejects_output_aliasing_source_archive(self):
         with open(self.rpf, "rb") as f:

@@ -20,7 +20,7 @@ SENTINEL = b"SYNTHETIC-SOURCE-DO-NOT-OVERWRITE\n" * 4
 
 
 def make_bink():
-    return SENTINEL
+    return struct.pack("<4s10I", b"KB2a", 40, 1, 0, 1, 16, 16, 30, 1, 0, 1) + bytes(4) + SENTINEL
 
 
 def make_rpf(payload, head_size=0x40):
@@ -90,6 +90,10 @@ class ReportSourceCollisionTest(unittest.TestCase):
     def test_rbf0_index_refuses_out_equal_to_source(self):
         self.assert_refused_without_touching(
             "rbf0_index.py", ["{src}", "{src}"], "x.rpf", make_rpf(b"RBF0" + bytes(128), 0x100))
+
+    def test_restofworld_index_refuses_out_equal_to_source(self):
+        self.assert_refused_without_touching(
+            "restofworld_index.py", ["{src}", "{src}"], "x.rpf", make_rpf(b"\0" * 64, 0x40))
 
     def test_rbf0_index_refuses_a_different_spelling_of_the_same_path(self):
         # realpath/normcase, not string equality: .\x.rpf and x.rpf are one file on Windows.
