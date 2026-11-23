@@ -3,7 +3,7 @@
 > [!NOTE]
 > La documentation en anglais ([`README.md`](../../../README.md), [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) et
 > [`docs/README.md`](../../README.md)) **fait foi**. Ce guide ne reprend que les instructions stables d'installation
-> et de compilation (synchronisé avec le commit `aa2988cc`). Pour l'état d'avancement du projet, qui change tous les
+> et de compilation (synchronisé avec le commit `561b65a8`). Pour l'état d'avancement du projet, qui change tous les
 > jours, consultez le [`README.md`](../../../README.md).
 
 ## Ce qu'est Leonida
