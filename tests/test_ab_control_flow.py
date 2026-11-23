@@ -25,6 +25,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -452,6 +453,38 @@ class CliBadInputTest(unittest.TestCase):
             self.check_one_line(self.run_cli(tmp, shaders, out, "--names", names,
                                              path=os.path.join(tmp, "empty-path")), "spirv-as")
             self.assertEqual(os.listdir(out), [])
+
+    def test_assembler_failure_preserves_concurrent_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "spirv").mkdir()
+            (root / "spirv/index.json").write_text("{}", encoding="utf-8")
+            disasm = root / "dxbc/disasm"
+            disasm.mkdir(parents=True)
+            (disasm / "one.s").write_text("s_endpgm\n", encoding="utf-8")
+            names = root / "names.txt"
+            names.write_text("one\n", encoding="utf-8")
+
+            for preexisting in (True, False):
+                with self.subTest(preexisting=preexisting):
+                    out = root / ("existing" if preexisting else "fresh")
+                    if preexisting:
+                        out.mkdir()
+                    sibling = out / "other-job.txt"
+
+                    def fail_assembler(command, **kwargs):
+                        self.assertEqual(command[0], "spirv-as")
+                        out.mkdir(exist_ok=True)
+                        sibling.write_bytes(b"other job")
+                        raise subprocess.CalledProcessError(1, command)
+
+                    with patch.object(AB.subprocess, "run", side_effect=fail_assembler), \
+                            contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        AB.main([tmp, tmp, str(out), "--names", str(names)])
+                    self.assertEqual(raised.exception.code, 2)
+                    self.assertTrue(sibling.is_file(), "cleanup deleted concurrent output")
+                    self.assertEqual(sibling.read_bytes(), b"other job")
 
     def test_bad_index_shape_and_stale_names_leave_no_output(self):
         with tempfile.TemporaryDirectory() as tmp:
