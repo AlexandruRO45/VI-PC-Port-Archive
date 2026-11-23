@@ -59,13 +59,22 @@ if ($missing.Count -gt 0 -or $stale) {
     }
 }
 Write-Host "`n== Loader dry run (map, relocate, bind imports; nothing executes)"
+# The exit status below is the dry run's, so clear the one the tools above left behind and require the loader to set
+# it. A loader that cannot start (an interrupted build's empty gta6rt.exe, or a call this script no longer makes as a
+# native command) leaves it null, and the report then says the dry run never ran instead of exiting with a tool's code.
+$global:LASTEXITCODE = $null
 & {
     # Keep native stderr in the report without letting Windows PowerShell stop the dry run on it.
     $ErrorActionPreference = "Continue"
     $PSNativeCommandUseErrorActionPreference = $false
     & $rt --dry-run $Exe --game-dir $GameDir 2>&1
 } | Tee-Object (Join-Path $out "dryrun.txt") | Select-Object -Last 40
-$dryRunExitCode = $LASTEXITCODE
+if ($null -eq $global:LASTEXITCODE) {
+    Write-Warning "the loader did not run, so the dry run has no exit status"
+    $dryRunExitCode = 1
+} else {
+    $dryRunExitCode = $global:LASTEXITCODE
+}
 
 # Shim to-do list, grouped by DLL, most functions first.
 $report = Get-Content (Join-Path $out "$([IO.Path]::GetFileName($Exe)).json") -Raw | ConvertFrom-Json
