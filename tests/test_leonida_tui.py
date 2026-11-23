@@ -97,6 +97,18 @@ class StageConsoleTest(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(f.read().splitlines(), ["a", "b", "c", "d"])
 
+    def test_log_file_writes_lf_line_endings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "shaders.log")
+            c = leonida_tui.StageConsole("shaders", path)
+            try:
+                c.write_line("first\r\n")
+                c.write_line("second")
+            finally:
+                c.close()
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"first\nsecond\n")
+
     def test_wrap_log_lines_breaks_and_keeps_newest(self):
         rows = leonida_tui.wrap_log_lines(["abcdefghij", "xyz"], width=4, max_rows=3)
         self.assertEqual(rows, ["efgh", "ij", "xyz"])
