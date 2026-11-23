@@ -563,8 +563,51 @@ class ProbeCoordinateTests(unittest.TestCase):
             "uv_probes": None,
         }
         self.assertEqual(check_image(self.image, manifest)["covered"], 2)
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(AssertionError, "uv_probes must be a list of objects, got False"):
             check_image(self.image, manifest | {"uv_probes": False})
+
+    def test_malformed_probe_lists_and_entries_are_one_assertion(self):
+        rgba_probe = {"pixel": [0, 1], "rgba": self.rgba}
+        uv_probe = {"pixel": [1, 1], "uv": self.rgba[:2]}
+        for probe, message in (
+            ({"rgba_probes": {"pixel": [0, 1]}}, "rgba_probes must be a list of objects"),
+            ({"rgba_probes": "probes"}, "rgba_probes must be a list of objects"),
+            ({"rgba_probes": [[0, 1]]}, r"rgba_probes entries must be objects, got \[0, 1\]"),
+            ({"rgba_probes": [None]}, "rgba_probes entries must be objects, got None"),
+            ({"rgba_probes": [{"pixel": [0, 1]}]}, r"rgba_probes\[\]\.rgba must contain exactly four RGBA values, got None"),
+            ({"rgba_probes": [rgba_probe | {"rgba": "rgba"}]}, r"rgba_probes\[\]\.rgba must contain exactly four"),
+            ({"rgba_probes": [rgba_probe | {"rgba": [0.25, "x", 0.0, 1.0]}]}, r"rgba_probes\[\]\.rgba must contain exactly four"),
+            ({"rgba_probes": [rgba_probe | {"rgba": [0.25, 0.75, None, True]}]}, r"rgba_probes\[\]\.rgba must contain exactly four"),
+            ({"centre_rgba": [0.25, 0.75, 0.0, "1"]}, "centre_rgba must contain exactly four"),
+            ({"uv_probes": {"pixel": [1, 1]}}, "uv_probes must be a list of objects"),
+            ({"uv_probes": [7]}, "uv_probes entries must be objects, got 7"),
+            ({"uv_probes": [{"pixel": [1, 1]}]}, r"uv_probes\[\]\.uv must contain exactly two UV values, got None"),
+            ({"uv_probes": [uv_probe | {"uv": [0.25]}]}, r"uv_probes\[\]\.uv must contain exactly two"),
+            ({"uv_probes": [uv_probe | {"uv": [0.25, 0.75, 0.0]}]}, r"uv_probes\[\]\.uv must contain exactly two"),
+            ({"uv_probes": [uv_probe | {"uv": ["u", "v"]}]}, r"uv_probes\[\]\.uv must contain exactly two"),
+            ({"centre_uv": 0.25}, "centre_uv must contain exactly two UV values, got 0.25"),
+            ({"centre_uv": [0.25, None]}, "centre_uv must contain exactly two"),
+        ):
+            with self.subTest(probe=probe):
+                with self.assertRaisesRegex(AssertionError, message):
+                    check_image(self.image, self.manifest | probe)
+
+    def test_check_reports_a_malformed_probe_as_one_line(self):
+        def draw(command, **kwargs):
+            Path(command[3]).write_bytes(self.image)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            manifest = self.manifest | {
+                "files": {"mesh": "mesh.bin"},
+                "uv_probes": [{"pixel": [1, 1]}],
+            }
+            (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8", newline="\n")
+            with (patch.object(fl, "find_harness", return_value="vk_harness"),
+                  patch.object(fl.subprocess, "run", side_effect=draw),
+                  self.assertRaisesRegex(SystemExit, r"uv_probes\[\]\.uv must contain exactly two UV values, got None")):
+                fl.main(["--check", "--out", tmp])
+            self.assertFalse((out / "image.ppm").exists())
 
     def test_check_reports_invalid_coordinates(self):
         def draw(command, **kwargs):

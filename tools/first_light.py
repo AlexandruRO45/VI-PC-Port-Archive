@@ -678,9 +678,34 @@ def check_image(data: bytes, manifest: dict) -> dict:
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
+    def is_number(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
     def check_rgba_shape(values: object, field: str) -> None:
-        if not isinstance(values, (list, tuple)) or len(values) != 4:
-            raise AssertionError(f"{field} must contain exactly four RGBA values")
+        if (
+            not isinstance(values, (list, tuple)) or len(values) != 4
+            or not all(is_number(value) for value in values)
+        ):
+            raise AssertionError(f"{field} must contain exactly four RGBA values, got {values!r}")
+
+    def check_uv_shape(values: object, field: str) -> None:
+        if (
+            not isinstance(values, (list, tuple)) or len(values) != 2
+            or not all(is_number(value) for value in values)
+        ):
+            raise AssertionError(f"{field} must contain exactly two UV values, got {values!r}")
+
+    def probe_list(field: str) -> list[dict]:
+        """A manifest probe list: absent or null is empty, anything else must be a list of objects."""
+        entries = manifest.get(field)
+        if entries is None:
+            return []
+        if not isinstance(entries, list):
+            raise AssertionError(f"{field} must be a list of objects, got {entries!r}")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise AssertionError(f"{field} entries must be objects, got {entry!r}")
+        return entries
 
     width, height = manifest["width"], manifest["height"]
 
@@ -735,8 +760,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
         tol = manifest.get("rgba_tolerance", 0.02)
         expected_rgbas = []
         if (rgba := manifest.get("centre_rgba")) is not None:
+            check_rgba_shape(rgba, "centre_rgba")
             expected_rgbas.append(rgba)
-        for probe in manifest.get("rgba_probes") or []:
+        for probe in probe_list("rgba_probes"):
+            check_rgba_shape(probe.get("rgba"), "rgba_probes[].rgba")
             expected_rgbas.append(probe["rgba"])
         if not expected_rgbas:
             raise AssertionError(
@@ -760,29 +787,29 @@ def check_image(data: bytes, manifest: dict) -> dict:
                 )
     elif (uv := manifest.get("centre_uv")) is not None:
         i = pixel_offset(centre, "centre_pixel")
+        check_uv_shape(uv, "centre_uv")
         for c, want in enumerate((uv[0], uv[1], 0.0, 1.0)):
             if not _close(pixels[i + c], want, 2e-3):
                 raise AssertionError(
                     f"centre {centre} is {pixels[i : i + 4]}, expected {want} at {c}"
                 )
-    if (rgba_probes := manifest.get("rgba_probes")) is not None:
+    rgba_probes = manifest.get("rgba_probes")
+    if rgba_probes is not None:
         tol = manifest.get("rgba_tolerance", 0.02)
-        for probe in rgba_probes:
+        for probe in probe_list("rgba_probes"):
             i = pixel_offset(probe.get("pixel"), "rgba_probes pixel")
-            want_rgba = probe["rgba"]
+            want_rgba = probe.get("rgba")
             check_rgba_shape(want_rgba, "rgba_probes[].rgba")
             for c, want in enumerate(want_rgba):
                 if not _close(pixels[i + c], want, tol):
                     raise AssertionError(
                         f"RGBA probe {probe['pixel']} is {pixels[i : i + 4]}, expected {want_rgba} (tol {tol})"
                     )
-    uv_probes = manifest.get("uv_probes")
-    if uv_probes is None:
-        uv_probes = []
-    for probe in uv_probes:
+    for probe in probe_list("uv_probes"):
         i = pixel_offset(probe.get("pixel"), "uv_probes pixel")
         if rgba_probes is not None:
             continue
+        check_uv_shape(probe.get("uv"), "uv_probes[].uv")
         u, v = probe["uv"]
         for c, want in enumerate((u, v, 0.0, 1.0)):
             if not _close(pixels[i + c], want, 2e-3):
