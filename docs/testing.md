@@ -36,8 +36,14 @@ This page collects the setup steps and the problems testers have run into so far
   PowerShell, set `$env:LLVM_MC` to the path of its executable and run:
 
   ```powershell
-  'v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]' | & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding
+  $line = 'v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]'
+  Set-Content -LiteralPath "$env:TEMP\inst.txt" -Value $line -Encoding ascii
+  & $env:LLVM_MC -triple=amdgcn--amdpal -mcpu=gfx1013 -show-encoding "$env:TEMP\inst.txt"
   ```
+
+  Writing the line to an ASCII file avoids the UTF-8 BOM that Windows PowerShell 5.1 puts before piped text
+  when `$OutputEncoding` is UTF-8 with a BOM (for example after a conda init); `llvm-mc` then answers
+  `<stdin>:1:1: error: invalid character in input`. PowerShell 7 (`pwsh`) accepts the pipe as it was written.
 
   If it reports `not a valid operand`, point `LLVM_MC` at a build that accepts this instruction. The Windows
   conda-forge `llvm-tools` 23.1.6 package assembled the same f16 programs.
