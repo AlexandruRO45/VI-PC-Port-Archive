@@ -695,11 +695,15 @@ def summarize(total, entities=None, lights_out=None):
         placed["entity_lights_in_maps"] = len(total["world_lights"]) if lights_out else lights.get("lights_entity_in_map_placed", 0)
         if entities:
             with open(entities, encoding="utf-8") as f:
-                for line in f:
+                for number, line in enumerate(f, 1):
                     if not line.strip():
                         continue
                     e = json.loads(line)
+                    if not isinstance(e, dict):
+                        raise ValueError(f"line {number} is not a JSON object")
                     a = e.get("archetype")
+                    if a is not None and not isinstance(a, (int, str)):
+                        raise ValueError(f"line {number}: archetype is not an integer or hex string")
                     a = int(a, 16) if isinstance(a, str) else a    # world_index writes the hash as hex
                     sets = arch.get(a)
                     placed["entities"] += 1

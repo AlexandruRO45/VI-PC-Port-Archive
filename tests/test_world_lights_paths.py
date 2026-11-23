@@ -515,6 +515,26 @@ class ScanTest(unittest.TestCase):
         self.assertIn("bad.jsonl", lines[0])
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_entities_row_that_is_not_an_object_is_one_error_line(self):
+        # A bare list or string on its own line used to end in an AttributeError traceback after the whole
+        # scan; an archetype that is a list ended in TypeError: unhashable type.
+        rows = os.path.join(self.tmp.name, "rows.jsonl")
+        for text, why in (("[1, 2]\n", "not a JSON object"),
+                          ('{"archetype": [1], "position": [0, 0, 0], "rotation": [0, 0, 0, 1]}\n',
+                           "not an integer or hex string")):
+            with self.subTest(row=text):
+                with open(rows, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = T.main([self.rpf, "--entities", rows])
+                self.assertEqual(rc, 2)
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn(rows, lines[0])
+                self.assertIn(why, lines[0])
+                self.assertNotIn("Traceback", err.getvalue())
+
     def test_lights_report_that_is_a_directory_leaves_no_partial(self):
         lights = os.path.join(self.tmp.name, "lights.jsonl")
         os.makedirs(lights)
