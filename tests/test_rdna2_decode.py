@@ -108,7 +108,9 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertIn("s_branch -20", text)
 
     def test_s_ttracedata_imm_keeps_simm16(self):
-        for word, value in ((0xBFA81234, 0x1234), (0xBFA8FFFF, 0xFFFF)):
+        for word, value in ((0xBFA80000, 0x0), (0xBFA80001, 0x1),
+                            (0xBFA80063, 0x63), (0xBFA80064, 0x64),
+                            (0xBFA81234, 0x1234), (0xBFA8FFFF, 0xFFFF)):
             with self.subTest(word=hex(word)):
                 code = words(word)
                 info = rdna2_decode.decode_bytes(code)
