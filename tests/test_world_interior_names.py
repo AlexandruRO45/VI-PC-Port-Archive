@@ -221,6 +221,32 @@ class CliTest(unittest.TestCase):
         s = self.run_cli(folder)
         self.assertEqual((s["interior_names"], s["placed_interior_names"]), (2, 2))
 
+    def test_report_cannot_replace_archive_or_names(self):
+        path = os.path.join(self.tmp.name, "levels.rpf")
+        with open(path, "wb") as f:
+            f.write(rpf([interiors(), placements()]))
+        for protected in (path, self.names):
+            with open(protected, "rb") as f:
+                original = f.read()
+            alias = os.path.join(self.tmp.name, "alias.json")
+            os.link(protected, alias)
+            try:
+                for output in (protected, alias):
+                    with self.subTest(protected=protected, output=output):
+                        with open(protected, "wb") as f:
+                            f.write(original)
+                        with redirect_stdout(io.StringIO()):
+                            try:
+                                T.main([path, "--names", self.names, "--out", output])
+                                code = 0
+                            except SystemExit as error:
+                                code = error.code
+                        with open(protected, "rb") as f:
+                            self.assertEqual(f.read(), original)
+                        self.assertEqual(code, 2)
+            finally:
+                os.unlink(alias)
+
     def test_bad_arguments(self):
         for argv in (["nope", "--names", self.names], [self.names, "--names", self.names, "--jobs", "0"]):
             with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):

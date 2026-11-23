@@ -40,6 +40,8 @@ _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+from report_paths import same_report_path
+
 import world_archetypes as WA  # noqa: E402
 import world_index as WI  # noqa: E402
 from world_names import hash64, joaat  # noqa: E402
@@ -263,6 +265,8 @@ def main(argv=None):
     for p in (a.path, a.names):
         if not os.path.exists(p):
             ap.error("no such file or folder: %s" % p)
+    if any(same_report_path(a.out, source) for source in (a.path, a.names)):
+        ap.error("--out must not overwrite an input file")
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
     summary, rows = resolve(load_names(a.names), scan(a.path, a.start, a.limit, a.jobs))
