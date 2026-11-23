@@ -394,5 +394,17 @@ class VCubeMaOracleTests(unittest.TestCase):
         # +Z major: 2 * z = 10.0
         self.assertEqual(oracle_cubema_f32(1.0, 1.0, 5.0), 10.0)
 
+class VCubeMaAstTests(unittest.TestCase):
+    def test_cubema_ast_construction(self):
+        ast = CubeInstructionAST(
+            "v_cubema_f32",
+            Operand(RegKind.VGPR, index=6),
+            Operand(RegKind.VGPR, index=0),
+            Operand(RegKind.VGPR, index=1),
+            Operand(RegKind.VGPR, index=2),
+        )
+        self.assertEqual(ast.mnemonic, "v_cubema_f32")
+        self.assertEqual(ast.dst.index, 6)
+
 if __name__ == "__main__":
     unittest.main()
