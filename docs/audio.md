@@ -268,8 +268,7 @@ fingerprinted. No game audio is stored in the repository; the searches ran on a 
 `radio-dump-v3` was not modified.
 Residual uncertainty: how the game sequences the stems (which layers play in which slot, and the
 order of the longer streams) is not decoded; the mission's audio config is the likely place (a
-hypothesis, not measured). No game audio is stored in the repository; the searches ran on a local
-copy and `radio-dump-v3` was not modified.
+hypothesis, not measured).
 
 This search first listed the `RSC8` resources of the story and minigame archives as the only
 mission-side container not decoded. They are decoded in [rsc8_audio.md](rsc8_audio.md), and none of
