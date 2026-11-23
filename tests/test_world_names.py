@@ -120,6 +120,36 @@ class DictionaryTest(unittest.TestCase):
         dictionary = WN.build_dictionary([os.path.join(self.dir, "assets")])
         self.assertIn("synthetic_dir_model", WN._unique_names(dictionary.names))
 
+    def test_unlistable_subfolder_is_a_clean_error_not_a_silent_skip(self):
+        # os.walk skips a directory it cannot list unless onerror raises; the build used to report the
+        # remaining manifests and exit 0, hiding the incomplete scan.
+        assets = os.path.join(self.dir, "assets")
+        models = os.path.join(assets, "models")
+        os.makedirs(models)
+        with open(os.path.join(models, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"Items": [{"Name": "synthetic_root.#dr"}]}, handle)
+        sub = os.path.join(assets, "sub")
+        submodels = os.path.join(sub, "models")
+        os.makedirs(submodels)
+        with open(os.path.join(submodels, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump({"Items": [{"Name": "synthetic_sub.#dr"}]}, handle)
+        os.chmod(sub, 0o000)
+        try:
+            try:
+                os.listdir(sub)
+                self.skipTest("the sub-folder is still listable (running as root, or Windows)")
+            except OSError:
+                pass
+            out = os.path.join(self.dir, "dict.json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = WN.main(["build", "--manifest", assets, "--out", out])
+            self.assertEqual(rc, 1)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+        finally:
+            os.chmod(sub, 0o755)
+
     def test_collision_is_ambiguous_without_key64_and_resolved_with_it(self):
         dictionary = WN.NameDictionary()
         dictionary.add("PLAYER")

@@ -401,12 +401,18 @@ class NameDictionary:
         return out
 
 
+def _walk_error(exc: OSError):
+    # os.walk skips a directory it cannot list unless onerror raises; a dictionary must not be built from
+    # an incomplete scan reported as complete. main() turns the OSError into one ERROR line.
+    raise exc
+
+
 def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
                      derive_lod: bool = False, rpf9_names=()) -> NameDictionary:
     dictionary = NameDictionary()
     for path in manifests:
         if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, onerror=_walk_error):
                 dirs.sort()
                 if "manifest.json" in files and os.path.basename(root).lower() == "models":
                     dictionary.add_manifest(os.path.join(root, "manifest.json"))
