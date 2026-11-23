@@ -166,6 +166,18 @@ class TestSLshrB32AST(unittest.TestCase):
         expr_zero = SLshrB32Expr(1, 1)
         self.assertEqual(expr_zero.eval(), (0, 0))
 
+class TestSLshrB32SCCAndMask(unittest.TestCase):
+    def test_scc_condition_code(self) -> None:
+        res, scc = ref_s_lshr_b32(0x80000000, 31)
+        self.assertEqual((res, scc), (1, 1))
+        res, scc = ref_s_lshr_b32(0x80000000, 32)  # shift 0
+        self.assertEqual((res, scc), (0x80000000, 1))
+
+    def test_logical_zero_fill(self) -> None:
+        # Highest bit cleared on right shift
+        res, _ = ref_s_lshr_b32(0x80000000, 1)
+        self.assertEqual(res, 0x40000000)
+
 
 if __name__ == "__main__":
     unittest.main()
