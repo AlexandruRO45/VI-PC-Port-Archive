@@ -3,6 +3,7 @@
 // arguments follow the public GDK reference. No game data; nothing online.
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -30,7 +31,7 @@ void check(bool condition, const char* what) {
 }
 
 using Handle = void*;
-struct GameLicense {   // XStoreGameLicense with the UNVERIFIED sizes of xgameruntime_store.cpp
+struct GameLicense {   // XStoreGameLicense with the measured sizes of xgameruntime_store.cpp
     char skuStoreId[18];
     bool isActive;
     bool isTrialOwnedByThisUser;
@@ -40,6 +41,10 @@ struct GameLicense {   // XStoreGameLicense with the UNVERIFIED sizes of xgameru
     char trialUniqueId[64];
     time_t expirationDate;
 };
+static_assert(sizeof(GameLicense) == 104, "XStoreGameLicense is 104 bytes");
+static_assert(offsetof(GameLicense, isTrialOwnedByThisUser) == 0x13, "measured flag offset");
+static_assert(offsetof(GameLicense, trialUniqueId) == 0x1C, "measured trial-id offset");
+static_assert(offsetof(GameLicense, expirationDate) == 0x60, "measured expiration offset");
 struct CanAcquire {
     char licensableSku[5];
     uint32_t status;
