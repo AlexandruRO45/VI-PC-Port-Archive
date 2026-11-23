@@ -33,13 +33,18 @@ import io
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
 VECTOR_KEYS = ("x", "y", "z", "w")
@@ -288,8 +293,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
                 filename = f"{stem}_{suffix}.json"
                 suffix += 1
             written_names.add(filename.casefold())
-            with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(value, f, indent=1, default=str)
+            write_json_report(os.path.join(out_dir, filename), value)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
             "elements_by_convention": dict(reader.stats), "type_classes": len(reader.types),
@@ -329,6 +333,39 @@ def main(argv=None):
         print(f"ERROR: no document could be read; {s['not_well_formed']} not well-formed", file=sys.stderr)
         return 1
     return 0
+
+
+def write_json_report(path, value):
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(value, f, indent=1, default=str)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".gamedata_reader-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(value, staged, indent=1, default=str)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
