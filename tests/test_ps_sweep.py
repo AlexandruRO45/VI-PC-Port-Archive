@@ -326,6 +326,18 @@ class CompareCommand(unittest.TestCase):
             self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "incompatible"})
             self.assertEqual(ps_sweep.depth_measurements(0, {"code": 0}, rec), {"depth_class": "missing"})
 
+    def test_unreadable_readbacks_are_classified_not_raised(self):
+        # A directory at a readback path makes open() raise OSError (IsADirectoryError, or PermissionError on
+        # Windows), which must come back as the reader's own class instead of a traceback out of compare.
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = os.path.join(tmp, "0.raw")
+            os.mkdir(raw)
+            rec = {"i": 0, "code": 0, "reason": "", "targets": 1, "dir": tmp, "depth": True, "samples_passed": 0}
+            self.assertEqual(ps_sweep.classify_pair(rec, rec, raw, raw), ("invalid readback", "a: missing output"))
+            self.assertEqual(ps_sweep.exact_pair(0, rec, rec), ("missing", []))
+            os.mkdir(raw + ".depth")
+            self.assertEqual(ps_sweep.depth_measurements(0, rec, rec), {"depth_class": "missing"})
+
     @unittest.skipUnless(os.environ.get("PS_SWEEP_TEST_EXE"), "requires a Vulkan worker")
     def test_integer_texture_fetch(self):
         from pathlib import Path
