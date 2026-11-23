@@ -579,6 +579,46 @@ class Gen:
             return list(mods)
         return [m for m in mods if m not in cls._DPP_MODS and not m.startswith(cls._DPP_PREFIXES)]
 
+    _SALU32_DST_SPECIAL = frozenset(("null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi"))
+    _SALU32_SRC_SPECIAL = frozenset(("null", "m0", "vcc_lo", "vcc_hi", "exec_lo", "exec_hi",
+                                     "scc", "src_scc", "src_pops_exiting_wave_id"))
+
+    def validate_salu32(self, ins, op, a, mods, nsrc):
+        """Validate encoding, modifiers, arity, and 32-bit scalar operands for SOP1/SOP2 ops."""
+        raw_op = ins["op"]
+        if raw_op != op:
+            raise Unsupported(f"{raw_op} invalid encoding")
+        if mods:
+            raise Unsupported(f"{op} modifier")
+        if len(a) != nsrc + 1:
+            raise Unsupported(f"{op} operands")
+        d = a[0]
+        if d.get("neg") or d.get("abs") or d.get("sext"):
+            raise Unsupported(f"{op} operand modifier")
+        dk = d.get("k")
+        if dk == "sgpr":
+            if d.get("n", 1) != 1:
+                raise Unsupported(f"{op} destination width")
+        elif dk == "special":
+            if d.get("t") not in self._SALU32_DST_SPECIAL:
+                raise Unsupported(f"{op} destination {d.get('t')}")
+        else:
+            raise Unsupported(f"{op} destination {dk}")
+        for s in a[1:]:
+            if s.get("neg") or s.get("abs") or s.get("sext"):
+                raise Unsupported(f"{op} operand modifier")
+            sk = s.get("k")
+            if sk == "sgpr":
+                if s.get("n", 1) != 1:
+                    raise Unsupported(f"{op} source width")
+            elif sk in ("imm", "fimm"):
+                pass
+            elif sk == "special":
+                if s.get("t") not in self._SALU32_SRC_SPECIAL:
+                    raise Unsupported(f"{op} source {s.get('t')}")
+            else:
+                raise Unsupported(f"{op} source {sk}")
+
     @staticmethod
     def opsel_bits(mods, nsrc):
         """Parse the VOP3 ``op_sel:[...]`` modifier of an op with ``nsrc`` sources -> (source selects, dst bit).
@@ -6820,6 +6860,7 @@ class Gen:
             self.store_reg("sgpr", d["r"], rlo)
             self.store_reg("sgpr", d["r"] + 1, rhi)
         elif op == "s_brev_b32":
+            self.validate_salu32(ins, op, a, mods, 1)
             x = self.src_u(a[1])
             r = self.tmp()
             self.emit(f"{r} = OpBitReverse %uint {x}")
@@ -8159,6 +8200,7 @@ class Gen:
             self.dst(a[0], yc)
             self.dst(a[1], xc)
         elif op == "s_abs_i32":
+            self.validate_salu32(ins, op, a, mods, 1)
             x_val = self.imm_val(a[1])
             if x_val is not None:
                 xi = x_val if x_val < 0x80000000 else x_val - 0x100000000
@@ -8180,6 +8222,7 @@ class Gen:
             self.emit(f"OpStore %scc {sc}")
         elif op in ("s_sext_i32_i8", "s_sext_i32_i16"):
             # D = S0's low byte / half, sign-extended to 32 bits; SCC is not written.
+            self.validate_salu32(ins, op, a, mods, 1)
             x_val = self.imm_val(a[1])
             if x_val is not None:
                 if op.endswith("i8"):
@@ -9441,6 +9484,7 @@ class Gen:
             self.emit(f"OpStore %scc {z}")
             self.uses_psb = True        # Int64 capability and %ulong come with the PSB declarations
         elif op == "s_ashr_i32":
+            self.validate_salu32(ins, op, a, mods, 2)
             x, sh = self.src_u(a[1]), self.src_u(a[2])
             m, xi, ri, r = (self.tmp() for _ in range(4))
             self.emit(f"{m} = OpBitwiseAnd %uint {sh} {self.cu(31)}")
@@ -9490,6 +9534,7 @@ class Gen:
         elif op in ("s_lshl1_add_u32", "s_lshl2_add_u32", "s_lshl3_add_u32", "s_lshl4_add_u32"):
             # D = (S0 << N) + S1. SCC = unsigned overflow of the sum taken in 64 bits (RDNA ISA pseudocode:
             # tmp = (64'U(S0) << N) + 64'U(S1); SCC = tmp >= 2^32), so bits shifted out of S0 count as a carry too.
+            self.validate_salu32(ins, op, a, mods, 2)
             n = int(op[6])
             val = None
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
@@ -10543,6 +10588,7 @@ class Gen:
         elif op == "s_absdiff_i32":
             # RDNA2 ISA: D = S0 - S1 as a 32-bit signed value, negated if negative; SCC = (D != 0). The difference
             # wraps before the absolute value (0x7FFFFFFF - 0x80000000 = -1 -> 1), and SAbs keeps 0x80000000 as is.
+            self.validate_salu32(ins, op, a, mods, 2)
             x_val, y_val = self.imm_val(a[1]), self.imm_val(a[2])
             if x_val is not None and y_val is not None:
                 diff = (x_val - y_val) & 0xFFFFFFFF
