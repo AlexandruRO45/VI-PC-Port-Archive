@@ -377,7 +377,7 @@ class UndefinedResult(Exception):
 
 
 def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_constants=None, memory=None,
-                  out_of_range="raise", return_outputs=False, lanes=None, resources=None):
+                  out_of_range="raise", return_outputs=False, lanes=None, resources=None, helpers=()):
     """Execute `invocations` invocations of `text` in lockstep and return the shared `memory`.
 
     Invocation i is subgroup i // subgroup_size, lane i % subgroup_size (a 1-D workgroup split into subgroups in
@@ -407,12 +407,17 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
     lanes[i] // subgroup_size (default: lanes[i] = i). A lane no invocation takes is not running, like a pixel
     lane with no covered sample, so a shuffle from it is undefined. The caller's `inputs_for` gives each
     invocation the %sg_lane that matches. `resources` binds descriptor-set variables (see _invocation).
+
+    `helpers` names invocations that run the shader but take no part in subgroup operations, as helper lanes a
+    driver leaves out: their ballot bit is never set, they count for no vote or reduction, and a shuffle from their
+    lane is undefined. They still receive each operation's result over the others.
     """
     if out_of_range not in ("raise", "wrap"):
         raise ValueError(f"out_of_range: {out_of_range!r}")
     memory = {} if memory is None else memory
     workgroup = {}                             # Workgroup variable id -> its box, one per workgroup
     slots = list(range(invocations)) if lanes is None else list(lanes)
+    helpers = frozenset(helpers)
     if len(slots) != invocations or len(set(slots)) != invocations or min(slots, default=0) < 0:
         raise ValueError("lanes: one distinct non-negative slot per invocation")
     gens = [_invocation(text, (inputs_for(i) if inputs_for else None), push_constants, memory, step=True,
@@ -448,7 +453,7 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
             kind, _, _value, ident = pending[i]
             sub = slots[i] // subgroup_size
             group = {slots[j] % subgroup_size: pending[j] for j in range(invocations)
-                     if slots[j] // subgroup_size == sub}
+                     if slots[j] // subgroup_size == sub and j not in helpers}
             if kind == "OpGroupNonUniformBallot":
                 # Bit l of the 128-bit mask = lane l of this subgroup is running with a true predicate.
                 bits = sum(1 << l for l, req in group.items() if req[2])
@@ -465,7 +470,7 @@ def run_workgroup(text, invocations, subgroup_size, inputs_for=None, push_consta
             elif kind == "OpControlBarrier":
                 results.append(None)           # everyone is here: the "same point" check above is the barrier
             elif kind == "OpGroupNonUniformBroadcastFirst":
-                results.append(group[min(group)][2])      # the lowest running lane's value
+                results.append(group[min(group)][2] if group else UNDEF)   # the lowest running lane's value
             elif kind == "OpGroupNonUniformShuffle":
                 if not 0 <= ident < subgroup_size:
                     if out_of_range == "raise":

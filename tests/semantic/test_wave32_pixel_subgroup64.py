@@ -95,9 +95,10 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
 
     def test_descriptor_index_comes_from_a_running_lane_of_each_half(self):
         # SHADER-1016: the image a wave32 pixel shader reads must not depend on which lanes of its half are
-        # running. Lanes 0-3 and 32-35 (the first quad of each half) are not running, as when that quad has no
-        # covered pixel or holds only helpers the driver leaves out. Each half reads its own T# (an SGPR offset
-        # from its first lane), so a broadcast across the whole 64-lane subgroup is wrong too.
+        # running. Lanes 0-3 and 32-35 (the first quad of each half) are either not running (a quad with no covered
+        # pixel) or helpers that run the shader but that the driver leaves out of subgroup operations; only the
+        # other lanes' pixels are judged. Each half reads its own T# (an SGPR offset from its first lane), so a
+        # broadcast across the whole 64-lane subgroup is wrong too.
         spv = support.translate_lines("ps_wave32_halves_descriptor", [
             "v_interp_mov_f32_e32 v1, p0, attr0.x",
             "v_cvt_u32_f32_e32 v1, v1",
@@ -122,14 +123,17 @@ class Wave32PixelSubgroupTests(unittest.TestCase):
         desc_map = [1, *tsharp[0], 1, 0, *tsharp[1], 2]
         texels = {1: (0.25, 0.5, 0.75, 1.0), 2: (1.0, 0.75, 0.5, 0.25)}
         images = [None] + [(lambda coord, lod, t=texels[k]: t) for k in (1, 2)]
-        lanes = [lane for lane in range(64) if lane % 32 >= 4]
-        inputs = [float(lane // 32) for lane in lanes]
-        expected = [tuple(fbits(c) for c in texels[1 + lane // 32]) for lane in lanes]
-        for subgroup_size in (32, 64):
-            with self.subTest(subgroup_size=subgroup_size):
-                self.assertEqual(run_ps(spv, subgroup_size, inputs, lanes, push_constants=[base, 0],
-                                        memory=memory,
-                                        resources={"%desc_map": desc_map, "%images": images}), expected)
+        for first_quad in ("absent", "helpers"):
+            lanes = [lane for lane in range(64) if first_quad == "helpers" or lane % 32 >= 4]
+            helpers = [i for i, lane in enumerate(lanes) if lane % 32 < 4] if first_quad == "helpers" else []
+            inputs = [float(lane // 32) for lane in lanes]
+            judged = [i for i in range(len(lanes)) if i not in helpers]
+            expected = [tuple(fbits(c) for c in texels[1 + lanes[i] // 32]) for i in judged]
+            for subgroup_size in (32, 64):
+                with self.subTest(first_quad=first_quad, subgroup_size=subgroup_size):
+                    got = run_ps(spv, subgroup_size, inputs, lanes, push_constants=[base, 0], memory=memory,
+                                 resources={"%desc_map": desc_map, "%images": images}, helpers=helpers)
+                    self.assertEqual([got[i] for i in judged], expected)
 
 
 if __name__ == "__main__":
