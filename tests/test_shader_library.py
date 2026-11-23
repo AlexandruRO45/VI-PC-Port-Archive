@@ -278,12 +278,8 @@ class Main(unittest.TestCase):
             s_path = os.path.join(out, "disasm", "lib_ps_00000.s")
             with open(s_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write("; lib_ps_00000  code 0x24..0x30 (fspx), gfx1013, 0 invalid words\n\ts_endpgm\n")
-            rdna2spirv._STAGES = None                    # stage_of caches the first index.json it reads
-            try:
-                with self.assertRaisesRegex(rdna2spirv.Unsupported, "no shader container"):
-                    rdna2spirv.translate(s_path)
-            finally:
-                rdna2spirv._STAGES = None
+            with self.assertRaisesRegex(rdna2spirv.Unsupported, "no shader container"):
+                rdna2spirv.translate(s_path)
 
 
 if __name__ == "__main__":

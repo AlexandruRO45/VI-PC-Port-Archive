@@ -131,18 +131,35 @@ class ScanTests(unittest.TestCase):
         b = report["per_stage"]["ps"]
         self.assertEqual((b["wave64"], b["with_selected_op"], b["occurrences"]), (1, 0, {}))
 
-    def test_stage_from_index_json_overrides_the_name(self):
-        # stage_of reads <disasm>/../index.json (the carve index), like the translator does
-        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as disasm:
-            with open(os.path.join(work, "index.json"), "w", encoding="utf-8") as f:
-                json.dump([{"file": "ps_0001.dxbc", "stage": "ps"}], f)
-            real = os.path.join(work, "dxbc", "disasm")
-            os.makedirs(real)
-            name, text = PS_W64_SENSITIVE
-            with open(os.path.join(real, "ps_0001.s"), "w", encoding="utf-8") as f:
-                f.write(text)  # name prefix says ps_ but the index is what counts
-            report = scan.scan_directory(real)
-            self.assertEqual(report["per_stage"]["ps"]["with_selected_op"], 1)
+    def test_stage_comes_from_each_carves_own_index(self):
+        name, listing = PS_W64_SENSITIVE
+        with tempfile.TemporaryDirectory() as work:
+            for folder, indexed_stage in (("first", "gs"), ("second", "vs"), ("unindexed", None)):
+                with self.subTest(folder=folder):
+                    root = Path(work, folder)
+                    disasm = root / "disasm"
+                    disasm.mkdir(parents=True)
+                    (disasm / name).write_text(listing, encoding="utf-8", newline="\n")
+                    if indexed_stage:
+                        index = [{"file": Path(name).with_suffix(".dxbc").name, "stage": indexed_stage}]
+                        (root / "index.json").write_text(json.dumps(index), encoding="utf-8", newline="\n")
+                    stages = scan.scan_directory(disasm)["per_stage"]
+                    self.assertEqual(stages[indexed_stage or "ps"]["with_selected_op"], 1)
+
+    def test_rescan_after_publishing_a_new_index(self):
+        name, listing = PS_W64_SENSITIVE
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            disasm = root / "disasm"
+            disasm.mkdir()
+            (disasm / name).write_text(listing, encoding="utf-8", newline="\n")
+            self.assertEqual(scan.scan_directory(disasm)["per_stage"]["ps"]["with_selected_op"], 1)
+            for stage in ("gs", "vs"):
+                index = [{"file": Path(name).with_suffix(".dxbc").name, "stage": stage}]
+                pending = root / "next.json"
+                pending.write_text(json.dumps(index), encoding="utf-8", newline="\n")
+                pending.replace(root / "index.json")
+                self.assertEqual(scan.scan_directory(disasm)["per_stage"][stage]["with_selected_op"], 1)
 
     def test_main_json_has_no_shader_names(self):
         # privacy rule: nothing from the game leaves the work folder, not even file names

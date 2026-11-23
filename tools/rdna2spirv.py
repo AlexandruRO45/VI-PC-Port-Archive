@@ -20,11 +20,13 @@ import bisect
 import hashlib
 import os
 import re
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -15008,21 +15010,25 @@ def no_contraction(text):
     return text[:at] + "".join(f"\n         OpDecorate {i} NoContraction" for i in ids) + text[at:]
 
 
-_STAGES = None
+@lru_cache(maxsize=1)
+def _indexed_stages(index_path, _version):
+    """Keep one carve's stage table in memory while its index is unchanged."""
+    with open(index_path, encoding="utf-8") as f:
+        return {e["file"][:-5]: e["stage"] for e in _json.load(f)}
 
 
 def stage_of(name, path):
     """Shader stage from the carve index (the DXIL program header in each container), not the name."""
-    global _STAGES
-    if _STAGES is None:
-        import json
-        idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
-        _STAGES = {}
-        if os.path.isfile(idx):
-            with open(idx, encoding="utf-8") as f:
-                for e in json.load(f):
-                    _STAGES[e["file"][:-5]] = e["stage"]
-    return _STAGES.get(name) or (name[:2].lower() if name[2:3] == "_" else "?")
+    fallback = name[:2].lower() if name[2:3] == "_" else "?"
+    idx = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(path))), "index.json")
+    try:
+        info = os.stat(idx)
+    except OSError:
+        return fallback
+    if not stat.S_ISREG(info.st_mode):
+        return fallback
+    version = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    return _indexed_stages(idx, version).get(name) or fallback
 
 
 # Wave64 markers in the instruction text. Besides EXEC/VCC forms, 64-bit lane-mask SOP1/SOP2 ops
