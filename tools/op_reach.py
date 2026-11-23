@@ -104,13 +104,15 @@ def census(disasm_dir, stages=None, fssm_dir=None):
             if key:
                 g[key] += 1
     shaders, instructions = Counter(), Counter()
+    names_by_base = defaultdict(list)
     for op, uses in by_name.items():
         base = base_name(op)
+        names_by_base[base].append(op)
         instructions[base] += sum(c for _, c in uses)
-    for base in instructions:
-        shaders[base] = len(_users(by_name, [op for op in by_name if base_name(op) == base]))
+    for base, names_for_base in names_by_base.items():
+        shaders[base] = len(_users(by_name, names_for_base))
     return {"listings": len(names), "after_last_endpgm": after, "has_stages": stages is not None,
-            "has_waves": waves is not None, "listing_groups": listings, "by_name": by_name,
+            "has_waves": waves is not None, "listing_groups": listings, "by_name": by_name, "names_by_base": names_by_base,
             "listings_by_stage": dict(sorted(groups[0].items())), "listings_by_wave": dict(sorted(groups[1].items())),
             "listings_by_stage_wave": dict(sorted(groups[2].items())),
             "shaders": shaders, "instructions": instructions}
@@ -127,6 +129,7 @@ def report(result, ops=None):
     """Rows for the selected OPs (base names or patterns), or every base name: shaders, instructions, and the
     shader count per stage / wave size / both when the census has them."""
     by_name = result["by_name"]
+    names_by_base = result["names_by_base"]
     if ops:
         chosen = [op if is_pattern(op) else base_name(op) for op in ops]
     else:
@@ -136,7 +139,7 @@ def report(result, ops=None):
         if is_pattern(op):
             names = [n for n in by_name if fnmatch.fnmatchcase(n, op)]
         else:
-            names = [n for n in by_name if base_name(n) == op]
+            names = names_by_base.get(op, ())
         users = _users(by_name, names)
         row = {"op": op, "shaders": len(users), "instructions": sum(c for n in names for _, c in by_name[n])}
         groups = [Counter(), Counter(), Counter()]
