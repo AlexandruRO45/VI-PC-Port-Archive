@@ -4424,12 +4424,11 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
-// The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
+// The Vulkan device create_vulkan_device_standalone made, destroyed with the D3D12 device. The instance belongs to
+// the process and is never destroyed (create_vulkan_device_standalone).
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
-    PFN_vkDestroyInstance destroy_instance = nullptr;
     VkDevice device = VK_NULL_HANDLE;
-    VkInstance instance = VK_NULL_HANDLE;
 };
 
 class Device final
@@ -4907,7 +4906,6 @@ public:
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
-        if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
@@ -8363,94 +8361,126 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
         std::fprintf(stderr, "[rt] d3d12: vulkan-1.dll not found\n");
         return E_FAIL;
     }
-    const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
-    const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
-    std::vector<const char*> inst_exts;
-    bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
-    bool swapchain_colorspace_enabled = false;  // VK_EXT_swapchain_colorspace on the instance
-    if (enum_inst_exts) {
-        std::uint32_t ext_cnt = 0;
-        enum_inst_exts(nullptr, &ext_cnt, nullptr);
-        std::vector<VkExtensionProperties> available(ext_cnt);
-        enum_inst_exts(nullptr, &ext_cnt, available.data());
-        bool has_surface = false, has_win32 = false, has_caps2 = false;
-        for (const auto& e : available) {
-            if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
-            if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
-            if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
-            if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
-            if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
-        }
-        if (has_surface && has_win32) {
-            inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-            inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
-            // Lists the HDR10 (ST.2084) surface formats, which a PresentX plane in HDR10 can use (xbox_present.h); without it
-            // the surface only offers sRGB-nonlinear ones.
-            for (const auto& e : available)
-                if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
-                    inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-                    swapchain_colorspace_enabled = true;
-                    break;
+    // One VkInstance for the process, made by the first call and kept until the process ends. Every device made here
+    // is created on it and destroyed with its D3D12 device (#5144, RT-398). Code outside the runtime caches the first
+    // instance's handles: RivaTuner Statistics Server's injected RTSSHooks64.dll calls
+    // vkGetPhysicalDeviceMemoryProperties on the first instance's VkPhysicalDevice from its vkQueuePresentKHR hook, and
+    // the loader ends the process when that instance was destroyed (a device released and another created). The
+    // instance settings, LEONIDA_VK_VALIDATION included, are those of the first call; the GPU is still picked per
+    // device (LEONIDA_VK_DEVICE).
+    struct ProcessInstance {
+        VkInstance instance = VK_NULL_HANDLE;
+        bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;
+        bool swapchain_colorspace_enabled = false, instance_has_surface = false, has_debug_utils = false;
+    };
+    static std::mutex process_instance_mutex;
+    static ProcessInstance process_instance;
+    ProcessInstance shared;
+    {
+        const std::lock_guard<std::mutex> lock(process_instance_mutex);
+        if (!process_instance.instance) {
+            const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+            const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::vector<const char*> inst_exts;
+            bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
+            bool swapchain_colorspace_enabled = false;  // VK_EXT_swapchain_colorspace on the instance
+            if (enum_inst_exts) {
+                std::uint32_t ext_cnt = 0;
+                enum_inst_exts(nullptr, &ext_cnt, nullptr);
+                std::vector<VkExtensionProperties> available(ext_cnt);
+                enum_inst_exts(nullptr, &ext_cnt, available.data());
+                bool has_surface = false, has_win32 = false, has_caps2 = false;
+                for (const auto& e : available) {
+                    if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
+                    if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+                    if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
+                    if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
+                    if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
                 }
-            // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
-            if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
-                inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-                if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
-                if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
-            } else {
-                surface_maintenance1_khr = surface_maintenance1_ext = false;
+                if (has_surface && has_win32) {
+                    inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+                    inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+                    // Lists the HDR10 (ST.2084) surface formats, which a PresentX plane in HDR10 can use (xbox_present.h); without it
+                    // the surface only offers sRGB-nonlinear ones.
+                    for (const auto& e : available)
+                        if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                            inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                            swapchain_colorspace_enabled = true;
+                            break;
+                        }
+                    // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
+                    if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
+                        inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                        if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
+                        if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
+                    } else {
+                        surface_maintenance1_khr = surface_maintenance1_ext = false;
+                    }
+                } else {
+                    surface_maintenance1_khr = surface_maintenance1_ext = false;
+                }
             }
-        } else {
-            surface_maintenance1_khr = surface_maintenance1_ext = false;
+            VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+            app.pApplicationName = "gta6rt";
+            app.apiVersion = VK_API_VERSION_1_3;
+            VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+            instance_info.pApplicationInfo = &app;
+            const char* layer = "VK_LAYER_KHRONOS_validation";
+            const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+            VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+            validation_features.enabledValidationFeatureCount = 1;
+            validation_features.pEnabledValidationFeatures = &sync_validation;
+            char validation[8] = {};
+            size_t length = 0;
+            if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
+                instance_info.pNext = &validation_features;
+                instance_info.enabledLayerCount = 1;
+                instance_info.ppEnabledLayerNames = &layer;
+            }
+            // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
+            const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+            bool has_debug_utils = false;
+            if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                    get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
+                std::uint32_t extension_count = 0;
+                enumerate(nullptr, &extension_count, nullptr);
+                std::vector<VkExtensionProperties> extensions(extension_count);
+                enumerate(nullptr, &extension_count, extensions.data());
+                for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
+            }
+            // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
+            const bool instance_has_surface = !inst_exts.empty();
+            if (has_debug_utils) inst_exts.push_back(debug_utils);
+            instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+            instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
+            ProcessInstance made;
+            if (create_instance(&instance_info, nullptr, &made.instance) != VK_SUCCESS) {
+                std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
+                return E_FAIL;  // nothing kept: a later call tries again
+            }
+            made.surface_maintenance1_khr = surface_maintenance1_khr;
+            made.surface_maintenance1_ext = surface_maintenance1_ext;
+            made.swapchain_colorspace_enabled = swapchain_colorspace_enabled;
+            made.instance_has_surface = instance_has_surface;
+            made.has_debug_utils = has_debug_utils;
+            process_instance = made;
         }
+        shared = process_instance;
     }
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "gta6rt";
-    app.apiVersion = VK_API_VERSION_1_3;
-    VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    instance_info.pApplicationInfo = &app;
-    const char* layer = "VK_LAYER_KHRONOS_validation";
-    const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
-    VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
-    validation_features.enabledValidationFeatureCount = 1;
-    validation_features.pEnabledValidationFeatures = &sync_validation;
-    char validation[8] = {};
-    size_t length = 0;
-    if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
-        instance_info.pNext = &validation_features;
-        instance_info.enabledLayerCount = 1;
-        instance_info.ppEnabledLayerNames = &layer;
-    }
-    // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
-    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    bool has_debug_utils = false;
-    if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-            get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
-        std::uint32_t extension_count = 0;
-        enumerate(nullptr, &extension_count, nullptr);
-        std::vector<VkExtensionProperties> extensions(extension_count);
-        enumerate(nullptr, &extension_count, extensions.data());
-        for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
-    }
-    // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
-    const bool instance_has_surface = !inst_exts.empty();
-    if (has_debug_utils) inst_exts.push_back(debug_utils);
-    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
-    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
+    const VkInstance instance = shared.instance;
+    const bool surface_maintenance1_khr = shared.surface_maintenance1_khr;
+    const bool surface_maintenance1_ext = shared.surface_maintenance1_ext;
+    const bool swapchain_colorspace_enabled = shared.swapchain_colorspace_enabled;
+    const bool instance_has_surface = shared.instance_has_surface;
+    const bool has_debug_utils = shared.has_debug_utils;
     OwnedRuntime owned{};
-    if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
-        std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
-        return E_FAIL;
-    }
-    owned.destroy_instance = reinterpret_cast<PFN_vkDestroyInstance>(get(owned.instance, "vkDestroyInstance"));
     const auto fail = [&](const char* why) {
         std::fprintf(stderr, "[rt] d3d12: %s\n", why);
-        owned.destroy_instance(owned.instance, nullptr);
         return E_FAIL;
     };
 
-#define LEONIDA_INSTANCE(name) const auto name = reinterpret_cast<PFN_##name>(get(owned.instance, #name))
+#define LEONIDA_INSTANCE(name) const auto name = reinterpret_cast<PFN_##name>(get(instance, #name))
     LEONIDA_INSTANCE(vkEnumeratePhysicalDevices);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
@@ -8461,12 +8491,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out) {
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
 #undef LEONIDA_INSTANCE
     std::uint32_t count = 0;
-    vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
     std::vector<VkPhysicalDevice> physicals(count);
-    vkEnumeratePhysicalDevices(owned.instance, &count, physicals.data());
+    vkEnumeratePhysicalDevices(instance, &count, physicals.data());
     VulkanDeviceInfo info{};
     info.get_instance_proc = get;
-    info.instance = owned.instance;
+    info.instance = instance;
     info.separate_depth_stencil_layouts = true;
     info.debug_utils = has_debug_utils;
     VkPhysicalDeviceProperties chosen{};
