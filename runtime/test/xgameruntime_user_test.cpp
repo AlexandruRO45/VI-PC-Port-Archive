@@ -145,13 +145,50 @@ int main(int argc, char** argv) {
               at<ResolveResult>(user, 22)(user, &resolve) == S_OK,
           "XUserResolvePrivilegeWithUiAsync completes with S_OK (nothing to resolve)");
 
-    // ---- tokens: not available offline (23) ----
+    // ---- offline asynchronous operations ----
     using TokenAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, const char*, const char*, size_t,
                                                    const void*, size_t, const void*, XAsyncBlock*);
-    XAsyncBlock token{};
-    check(at<TokenAsync>(user, 23)(user, h, 0, "GET", "https://example.invalid/", 0, nullptr, 0, nullptr, &token) ==
-              E_GAMEUSER_FAILED_TO_GET_TOKEN,
-          "XUserGetTokenAndSignatureAsync fails before starting: E_GAMEUSER_FAILED_TO_GET_TOKEN");
+    using WideTokenAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, const wchar_t*, const wchar_t*, size_t,
+                                                       const void*, size_t, const void*, XAsyncBlock*);
+    using PictureAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, XAsyncBlock*);
+    using MsaAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, uint32_t, const char*, XAsyncBlock*);
+    using SignOutAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XUserHandle, XAsyncBlock*);
+    using ResultSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t*);
+    using Result = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, void*, void*, size_t*);
+    using PictureResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, size_t, void*, size_t*);
+    XTaskQueueHandle queue{};
+    check(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue) == S_OK, "manual queue created");
+    for (int i = 0; i < 5; ++i) {
+        int callbacks = 0;
+        XAsyncBlock block{};
+        block.queue = queue;
+        block.context = &callbacks;
+        block.callback = [](XAsyncBlock* b) { ++*static_cast<int*>(b->context); };
+        HRESULT started = i == 0 ? at<PictureAsync>(user, 16)(user, h, 0, &block) :
+            i == 1 ? at<TokenAsync>(user, 23)(user, h, 0, "GET", "https://example.invalid/", 0, nullptr, 0, nullptr, &block) :
+            i == 2 ? at<WideTokenAsync>(user, 26)(user, h, 0, L"GET", L"https://example.invalid/", 0, nullptr, 0, nullptr, &block) :
+            i == 3 ? at<MsaAsync>(user, 39)(user, h, 0, "scope", &block) : at<SignOutAsync>(user, 48)(user, h, &block);
+        check(started == S_OK, "offline async starts with S_OK");
+        check(callbacks == 0, "completion is queued");
+        while (XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0) || XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0)) {}
+        check(callbacks == 1, "offline async invokes callback once");
+        if (started == S_OK) {
+            HRESULT expected = i == 0 ? E_FAIL : i == 4 ? S_OK : E_GAMEUSER_FAILED_TO_GET_TOKEN;
+            check(XAsyncGetStatus(&block, false) == expected, "offline async completion status");
+            if (i == 4) {
+                check(at<ResolveResult>(user, 49)(user, &block) == expected, "sign-out result");
+            } else {
+                size_t size = 0; char buffer[8]{}; void* data = nullptr;
+                const int size_slot = i == 0 ? 17 : i == 1 ? 24 : i == 2 ? 27 : 41;
+                const int result_slot = i == 0 ? 18 : i == 1 ? 25 : i == 2 ? 28 : 40;
+                check(at<ResultSize>(user, size_slot)(user, &block, &size) == expected, "offline result size status");
+                const HRESULT result = i == 0 ? at<PictureResult>(user, result_slot)(user, &block, sizeof(buffer), buffer, nullptr)
+                    : at<Result>(user, result_slot)(user, &block, sizeof(buffer), buffer, &data, nullptr);
+                check(result == expected, "offline result status");
+            }
+        }
+    }
+    XTaskQueueCloseHandle(queue);
 
     // ---- change events, sign-out deferral (33-36) ----
     using Register = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void(CALLBACK*)(void*, XUserLocalId, uint32_t),

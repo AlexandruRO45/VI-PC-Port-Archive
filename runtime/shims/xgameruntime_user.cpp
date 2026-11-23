@@ -146,6 +146,50 @@ HRESULT STDMETHODCALLTYPE user_get_max_users(void*, uint32_t* max_users) {
 const char kAddIdentity = 0;
 const char kAddByIdIdentity = 0;
 const char kResolveIdentity = 0;
+const char kOfflineIdentity = 0;
+
+template <HRESULT Status> HRESULT CALLBACK offline_provider(XAsyncOp op, const XAsyncProviderData* data) {
+    if (op == XAsyncOp::Begin) return XAsyncSchedule(data->async, 0);
+    if (op == XAsyncOp::DoWork) XAsyncComplete(data->async, Status, 0);
+    return S_OK;
+}
+
+template <HRESULT Status> HRESULT begin_offline(XUserHandle user, XAsyncBlock* async) {
+    if (!valid(user) || !async) return E_INVALIDARG;
+    return XAsyncBegin(async, nullptr, &kOfflineIdentity, "XUserOffline", offline_provider<Status>);
+}
+
+HRESULT STDMETHODCALLTYPE picture_async(void*, XUserHandle user, uint32_t, XAsyncBlock* async) {
+    return begin_offline<E_FAIL>(user, async);
+}
+template <typename Char> HRESULT STDMETHODCALLTYPE token_async(void*, XUserHandle user, uint32_t, const Char* method,
+    const Char* url, size_t count, const void* headers, size_t size, const void* body, XAsyncBlock* async) {
+    if (!method || !url || (count && !headers) || (size && !body)) return E_INVALIDARG;
+    return begin_offline<E_GAMEUSER_FAILED_TO_GET_TOKEN>(user, async);
+}
+HRESULT STDMETHODCALLTYPE msa_async(void*, XUserHandle user, uint32_t, const char* scope, XAsyncBlock* async) {
+    if (!scope) return E_INVALIDARG;
+    return begin_offline<E_GAMEUSER_FAILED_TO_GET_TOKEN>(user, async);
+}
+HRESULT STDMETHODCALLTYPE signout_async(void*, XUserHandle user, XAsyncBlock* async) {
+    return begin_offline<S_OK>(user, async);
+}
+HRESULT STDMETHODCALLTYPE offline_result_size(void*, XAsyncBlock* async, size_t* size) {
+    if (!async || !size) return E_INVALIDARG;
+    return XAsyncGetResultSize(async, size);
+}
+HRESULT STDMETHODCALLTYPE offline_result(void*, XAsyncBlock* async, size_t, void*, void*, size_t*) {
+    if (!async) return E_INVALIDARG;
+    return XAsyncGetStatus(async, false);
+}
+HRESULT STDMETHODCALLTYPE picture_result(void*, XAsyncBlock* async, size_t, void*, size_t*) {
+    if (!async) return E_INVALIDARG;
+    return XAsyncGetStatus(async, false);
+}
+HRESULT STDMETHODCALLTYPE signout_result(void*, XAsyncBlock* async) {
+    if (!async) return E_INVALIDARG;
+    return XAsyncGetResult(async, &kOfflineIdentity, 0, nullptr, nullptr);
+}
 
 HRESULT CALLBACK add_provider(XAsyncOp op, const XAsyncProviderData* data) {
     switch (op) {
@@ -470,19 +514,19 @@ const void* const kUserVtable[] = {
     FN(user_get_is_guest),                                                      // 13 XUserGetIsGuest
     FN(user_get_state),                                                         // 14 XUserGetState
     FN(unknown_slot<15>),                                                       // 15 (unknown in the docs)
-    FN((offline_failure<16, E_FAIL>)),                                          // 16 XUserGetGamerPictureAsync
-    FN((offline_failure<17, E_FAIL>)),                                          // 17 XUserGetGamerPictureResultSize
-    FN((offline_failure<18, E_FAIL>)),                                          // 18 XUserGetGamerPictureResult
+    FN(picture_async),                                                          // 16 XUserGetGamerPictureAsync
+    FN(offline_result_size),                                                    // 17 XUserGetGamerPictureResultSize
+    FN(picture_result),                                                         // 18 XUserGetGamerPictureResult
     FN(user_get_age_group),                                                     // 19 XUserGetAgeGroup
     FN(user_check_privilege),                                                   // 20 XUserCheckPrivilege
     FN(user_resolve_privilege_async),                                           // 21 XUserResolvePrivilegeWithUiAsync
     FN(user_resolve_privilege_result),                                          // 22 XUserResolvePrivilegeWithUiResult
-    FN((offline_failure<23, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 23 XUserGetTokenAndSignatureAsync
-    FN((offline_failure<24, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 24 ...ResultSize
-    FN((offline_failure<25, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 25 ...Result
-    FN((offline_failure<26, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 26 XUserGetTokenAndSignatureUtf16Async
-    FN((offline_failure<27, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 27 ...Utf16ResultSize
-    FN((offline_failure<28, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 28 ...Utf16Result
+    FN(token_async<char>),                                                      // 23 XUserGetTokenAndSignatureAsync
+    FN(offline_result_size),                                                    // 24 ...ResultSize
+    FN(offline_result),                                                         // 25 ...Result
+    FN(token_async<wchar_t>),                                                   // 26 XUserGetTokenAndSignatureUtf16Async
+    FN(offline_result_size),                                                    // 27 ...Utf16ResultSize
+    FN(offline_result),                                                         // 28 ...Utf16Result
     FN((offline_failure<29, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 29 XUserResolveIssueWithUiAsync
     FN((offline_failure<30, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 30 XUserResolveIssueWithUiResult
     FN((offline_failure<31, E_GAMEUSER_FAILED_TO_RESOLVE>)),                    // 31 XUserResolveIssueWithUiUtf16Async
@@ -493,17 +537,17 @@ const void* const kUserVtable[] = {
     FN(user_close_signout_deferral),                                            // 36 XUserCloseSignOutDeferralHandle
     FN(user_add_by_id_async),                                                   // 37 XUserAddByIdWithUiAsync (2)
     FN(user_add_by_id_result),                                                  // 38 XUserAddByIdWithUiResult (2)
-    FN((offline_failure<39, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 39 XUserGetMsaTokenSilentlyAsync (3)
-    FN((offline_failure<40, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 40 ...Result (3)
-    FN((offline_failure<41, E_GAMEUSER_FAILED_TO_GET_TOKEN>)),                  // 41 ...ResultSize (3)
+    FN(msa_async),                                                              // 39 XUserGetMsaTokenSilentlyAsync (3)
+    FN(offline_result),                                                         // 40 ...Result (3)
+    FN(offline_result_size),                                                    // 41 ...ResultSize (3)
     FN(user_is_store_user),                                                     // 42 XUserIsStoreUser (4)
     FN((offline_failure<43, E_NOTIMPL>)),                                       // 43 XUserPlatformRemoteConnectSetEventHandlers (5, PC)
     FN((offline_failure<44, E_NOTIMPL>)),                                       // 44 XUserPlatformRemoteConnectCancelPrompt (5, PC)
     FN((offline_failure<45, E_NOTIMPL>)),                                       // 45 XUserPlatformSpopPromptSetEventHandlers (5, PC)
     FN((offline_failure<46, E_NOTIMPL>)),                                       // 46 XUserPlatformSpopPromptComplete (5, PC)
     FN(private_slot<47>),                                                       // 47 XUserIsSignOutPresent (6): false
-    FN((offline_failure<48, E_NOTIMPL>)),                                       // 48 XUserSignOutAsync (6)
-    FN((offline_failure<49, E_NOTIMPL>)),                                       // 49 XUserSignOutResult (6)
+    FN(signout_async),                                                          // 48 XUserSignOutAsync (6)
+    FN(signout_result),                                                         // 49 XUserSignOutResult (6)
 };
 static_assert(std::size(kUserVtable) == 50, "IUnknown + IXUserImpl's 34 methods + 2 + 3 + 1 + 4 + 3");
 
