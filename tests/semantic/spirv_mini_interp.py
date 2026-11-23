@@ -135,6 +135,21 @@ class _F32(float):
         return self
 
 
+def fma_f64(x, y, z):
+    """x * y + z with one rounding to binary64 (round to nearest even)."""
+    if not all(math.isfinite(v) for v in (x, y, z)):
+        return x * y + z
+    exact = Fraction(x) * Fraction(y) + Fraction(z)
+    if exact == 0:
+        product_zero = x == 0.0 or y == 0.0
+        negative = product_zero and math.copysign(1.0, x) * math.copysign(1.0, y) < 0 and math.copysign(1.0, z) < 0
+        return -0.0 if negative else 0.0
+    try:
+        return float(exact)
+    except OverflowError:
+        return math.copysign(math.inf, exact)
+
+
 def fma_f32(x, y, z):
     """x * y + z with one rounding to binary32 (round to nearest even), as GLSL.std.450 Fma on IEEE hardware.
 
@@ -1029,9 +1044,11 @@ def _invocation(text, inputs, push_constants, memory, step=False):
             elif name == "PackHalf2x16":
                 values[res] = float_to_half(args[0][0]) | (float_to_half(args[0][1]) << 16)
             elif name == "Fma":
-                # Exact product and sum, one rounding to binary32 (fma_f32).
+                # Exact product and sum, one rounding to the result type (fma_f32, or fma_f64 for doubles).
                 x, y, z = args
-                if isinstance(x, tuple):
+                if not isinstance(x, tuple) and types.t[a[0]][:2] == ("float", 64):
+                    values[res] = fma_f64(x, y, z)
+                elif isinstance(x, tuple):
                     values[res] = tuple(fma_f32(p, q, s) for p, q, s in zip(x, y, z))
                 else:
                     values[res] = fma_f32(x, y, z)
