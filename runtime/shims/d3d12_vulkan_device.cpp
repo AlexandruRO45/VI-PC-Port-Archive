@@ -1663,7 +1663,9 @@ public:
             std::memset(cpu_, 0, std::size_t(bytes));
         } else {
             // A heap the process cannot allocate is E_OUTOFMEMORY, as on the host runtime, not a std::bad_alloc.
-            storage_.reset(new (std::nothrow) std::byte[std::size_t(bytes)]());
+            // calloc: fresh pages come zeroed from the OS, so a huge heap is not written page by page here
+            // (at least one byte, so an empty heap still has storage, as new std::byte[0] gave it).
+            storage_.reset(static_cast<std::byte*>(std::calloc(std::max<std::size_t>(std::size_t(bytes), 1), 1)));
             if (!storage_) {
                 log_once("descriptor heap too large for host memory; MiB:",
                          int(std::min<VkDeviceSize>(bytes >> 20, INT_MAX)));
@@ -1701,7 +1703,10 @@ public:
 private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
-    std::unique_ptr<std::byte[]> storage_;
+    struct FreeStorage {
+        void operator()(std::byte* p) const noexcept { std::free(p); }
+    };
+    std::unique_ptr<std::byte, FreeStorage> storage_;
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
     bool in_arena_ = false;
