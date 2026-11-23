@@ -1115,5 +1115,28 @@ class SkinnedJointRemappingTests(unittest.TestCase):
             pa.build_assembled_glb([oob_raw_part], skeleton=master_skel, apply_standing=False)
 
 
+class HandWrittenJsonInputTests(unittest.TestCase):
+    def test_parts_json_saved_with_a_bom_is_read(self):
+        """A Windows editor writes a BOM, which json.load refuses; the part set used to end in a traceback."""
+        script = os.path.join(TOOLS, "ped_assemble.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            part = {"name": "p", "positions": [[0, 0, 0], [1, 0, 0], [0, 1, 0]], "triangles": [[0, 1, 2]]}
+            parts_path = os.path.join(tmp, "bom_parts.json")
+            with open(parts_path, "w", encoding="utf-8-sig") as f:
+                json.dump(part, f)
+
+            loaded, skeleton = pa.load_parts_from_path(parts_path)
+            self.assertEqual([p.name for p in loaded], ["p"])
+            self.assertEqual(len(loaded[0].triangles), 1)
+            self.assertIsNone(skeleton)
+
+            r = subprocess.run(
+                [sys.executable, "-I", script, "inspect-seams", parts_path],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("1 part(s)", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
