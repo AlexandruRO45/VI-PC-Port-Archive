@@ -221,6 +221,7 @@ class WorkflowRules(ScanTest):
         self.assertIn((cps.BLOCK, "dangerous-trigger"), self.workflow("on:\n  " + PRT + ":\n"))
         self.assertIn((cps.BLOCK, "dangerous-trigger"), self.workflow("on: [push, workflow" + "_run]\n"))
         self.assertNotIn((cps.BLOCK, "dangerous-trigger"), self.workflow("on:\n  pull_request:\n"))
+        self.assertEqual(self.workflow("# never use " + PRT + " here\n"), set())  # a comment never runs
 
     def test_secrets_and_write_access_block(self):
         self.assertIn((cps.BLOCK, "workflow-secret"), self.workflow("    token: ${{ secrets." + "DEPLOY }}\n"))

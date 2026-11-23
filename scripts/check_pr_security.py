@@ -425,7 +425,7 @@ def check_line(path, number, text):
     rules = list(ALL_TEXT_RULES)
     if is_code(path):
         rules += CODE_RULES
-    if is_workflow(path):
+    if is_workflow(path) and not text.lstrip().startswith("#"):  # a YAML comment never runs
         rules += WORKFLOW_RULES
     for rule, level, pattern, message in rules:
         if pattern.search(text):
