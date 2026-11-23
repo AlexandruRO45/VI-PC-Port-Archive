@@ -473,6 +473,25 @@ int main() {
     std::printf("INFO trim freed %.0f MiB; %u chunk(s) left\n", double(freed) / (1 << 20), pool.chunk_count());
     EXPECT(pool.chunk_count() == 0);
 
+    // A released page that is still mapped is not handed out again until it is unmapped.
+    {
+        std::vector<PageId> held;
+        EXPECT(pool.allocate(1, held));
+        const auto held_pool = mapper.register_page_pool(held);
+        const PageMappingRange range{PageRangeType::incrementing, 1, 0};
+        const PageMappingBatch batch{kScratch * kPageSize, &range, 1};
+        EXPECT(mapper.copy_page_mappings_batch(held_pool, {&batch, 1}, submit));
+        pool.release(held);
+        std::vector<PageId> next;
+        EXPECT(pool.allocate(1, next));
+        EXPECT(next[0] != held[0]);
+        EXPECT(mapper.clear_page_mappings(kScratch * kPageSize, 1, submit));
+        EXPECT(mapper.unregister_page_pool(held_pool));
+        gpu.wait_queue(queue.submitted_ticket());
+        pool.release(next);
+        EXPECT(pool.trim(queue.completed_ticket()) == kChunkSize);
+    }
+
     // trim() keeps a chunk until the last bind that referenced it has completed.
     {
         std::vector<PageId> one;
