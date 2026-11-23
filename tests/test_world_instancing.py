@@ -137,6 +137,57 @@ class InstancedGlbTest(unittest.TestCase):
         with self.assertRaisesRegex(glb_writer.GlbError, "mode"):
             glb_writer.build_instanced_glb(bad, mode="other")
 
+    def test_rejects_instance_transform_component_counts(self):
+        valid = [[1, 2, 3], [0, 0, 1, 1], [1, 2, 3]]
+        for mode in ("gpu", "nodes"):
+            for index, (field, count) in enumerate((("translation", 3), ("rotation", 4), ("scale", 3))):
+                for values in ([], valid[index][:-1], valid[index] + [1]):
+                    transform = list(valid)
+                    transform[index] = values
+                    meshes = [{"primitives": [tri_prim()], "instances": [transform]}]
+                    with self.subTest(mode=mode, field=field, components=len(values)):
+                        with self.assertRaisesRegex(glb_writer.GlbError, f"instance {field}.*{count} components"):
+                            glb_writer.build_instanced_glb(meshes, mode=mode)
+
+    def test_invalid_instance_does_not_publish_or_replace_a_glb(self):
+        valid = ((1, 2, 3), (0, 0, 0, 1), (1, 1, 1))
+        good = [{"primitives": [tri_prim()], "instances": [valid]}]
+        previous, _ = glb_writer.build_instanced_glb(good)
+        bad = [{"primitives": [tri_prim()], "instances": [valid, ((1, 2, 3, 4), valid[1], valid[2])]}]
+        for mode in ("gpu", "nodes"):
+            for existing in (True, False):
+                with self.subTest(mode=mode, existing=existing), tempfile.TemporaryDirectory() as tmp:
+                    path = os.path.join(tmp, "output.glb")
+                    if existing:
+                        with open(path, "wb") as f:
+                            f.write(previous)
+                    with self.assertRaises(glb_writer.GlbError):
+                        glb_writer.write_instanced_glb(path, bad, mode=mode)
+                    if existing:
+                        with open(path, "rb") as f:
+                            self.assertEqual(f.read(), previous)
+                        os.unlink(path)
+                    self.assertEqual(os.listdir(tmp), [])
+
+    def test_instance_transforms_accept_iterators_and_normalize_rotation(self):
+        for mode in ("gpu", "nodes"):
+            with self.subTest(mode=mode):
+                transform = (iter([1, 2, 3]), iter([0, 0, 2, 2]), iter([2, 3, 4]))
+                meshes = [{"primitives": [tri_prim()], "instances": [transform]}]
+                data, _ = glb_writer.build_instanced_glb(meshes, mode=mode)
+                gltf, binary = twb.parse_and_validate_glb(data)
+                node = gltf["nodes"][0]
+                if mode == "gpu":
+                    attrs = node["extensions"][EXT]["attributes"]
+                    translation = twb.read_accessor_floats(gltf, binary, attrs["TRANSLATION"])[0]
+                    rotation = twb.read_accessor_floats(gltf, binary, attrs["ROTATION"])[0]
+                    scale = twb.read_accessor_floats(gltf, binary, attrs["SCALE"])[0]
+                else:
+                    translation, rotation, scale = node["translation"], node["rotation"], node["scale"]
+                self.assertEqual(tuple(translation), (1, 2, 3))
+                self.assertEqual(tuple(scale), (2, 3, 4))
+                self.assertTrue(twp.close(rotation, [0, 0, math.sqrt(0.5), math.sqrt(0.5)], 1e-6))
+
     def test_mirror_packed(self):
         p = glb_writer.pack_primitive({"positions": [(0, 1, 0), (1, 2, 0), (0, 3, 1)], "normals": [],
                                        "indices": [0, 1, 2], "uvs": []})

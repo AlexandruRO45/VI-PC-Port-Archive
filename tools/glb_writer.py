@@ -1084,7 +1084,8 @@ def build_instanced_glb(
     """One GLB in which each mesh is stored once and drawn by many instances.
 
     ``meshes`` is a list of ``{"name": str or None, "primitives": [pack_primitive(...)], "instances":
-    [(translation xyz, rotation xyzw, scale xyz), ...]}``. Every instance transform must have a positive
+    [(translation xyz, rotation xyzw, scale xyz), ...]}``. Transforms require exactly 3/4/3 components.
+    Every instance transform must have a positive
     determinant (no mirroring scale); give mirrored instances their own mirrored mesh instead, so the winding is
     right in every loader. ``mode`` "gpu" writes one node per mesh with ``EXT_mesh_gpu_instancing`` (listed in
     extensionsUsed and extensionsRequired); "nodes" writes one plain glTF node per instance, which every loader
@@ -1137,6 +1138,9 @@ def build_instanced_glb(
             t = [float(v) for v in t]
             sc = [float(v) for v in sc]
             q = [float(v) for v in q]
+            for field, values, count in (("translation", t, 3), ("rotation", q, 4), ("scale", sc, 3)):
+                if len(values) != count:
+                    raise GlbError(f"instance {field} must have exactly {count} components")
             n = math.sqrt(sum(v * v for v in q))
             if not n or not math.isfinite(n):
                 raise GlbError("instance rotation must be a finite non-zero quaternion")
