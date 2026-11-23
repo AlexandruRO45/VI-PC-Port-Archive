@@ -177,6 +177,17 @@ _FLOAT_FMT_MASKS = tuple(
 # User SGPRs s0..s(USER_SGPRS-1) are initialised from push constants (128 bytes = Vulkan's guaranteed minimum).
 USER_SGPRS = 32
 
+
+def code_base_dword(stage):
+    """First dword of the code base s_getpc_b64 reads, numbered as the push-constant block (SHADER-67,
+    docs/d3d12_vulkan.md section 5.2): 34 (block 144 bytes), or 38 for a pixel shader (block 160 bytes), so the VS or
+    MS and the PS of one pipeline can each have their own FSSM blob's address. Not 36: a --mesh-compute draw pushes its
+    output address there to the vertex shader that runs with the PS. The other stages are never two in a pipeline
+    that reads one (CS runs alone; 0 of the 195 GS keep s_getpc_b64 for data, open question 14), so they share 34.
+    --pc-tail-ubo keeps every stage at 34 (dwords 2..3 of the tail block): the runtime writes one 16-byte tail per
+    pipeline, so there a pipeline still has one code base."""
+    return USER_SGPRS + (6 if stage == "ps" and not PC_TAIL_UBO else 2)
+
 # v_pipeflush (GFX10 VOP1) only flushes the VALU pipeline: no register, memory or EXEC effect to translate.
 # s_icache_inv invalidates the instruction cache; s_ttracedata / s_ttracedata_imm send thread-trace data;
 # s_code_end pads the end of a code object; s_version records the ISA version. None of them has a register, memory,
@@ -8307,8 +8318,9 @@ class Gen:
             self.emit(f"{r} = OpShiftRightLogical %uint {self.local_index()} {self.cu(6 if self.wave64 else 5)}")
             self.dst(a[0], r)
         elif op == "s_getpc_b64":
-            # Address of the next instruction: code base (push constants 34-35: where the runtime put this shader's
-            # FSSM blob in the Xbox VA window) + offset of the next instruction within the blob.
+            # Address of the next instruction: code base (push constants 34-35, 38-39 in a PS, code_base_dword: where
+            # the runtime put this shader's FSSM blob in the Xbox VA window) + offset of the next instruction within
+            # the blob.
             if a[0]["k"] != "sgpr" or a[0].get("n") != 2:
                 raise Unsupported("s_getpc_b64 destination")
             if not ins.get("enc"):
@@ -8325,7 +8337,8 @@ class Gen:
             self.store_reg("sgpr", a[0]["r"], rlo)
             self.store_reg("sgpr", a[0]["r"] + 1, rhi)
             self.uses_codebase = True
-            self.cu(3), self.cu(4)
+            member = code_base_dword(self.stage) - USER_SGPRS + 1      # %UserData member: after s[] and the heap base
+            self.cu(member), self.cu(member + 1)
         elif op in ("s_add_i32", "s_sub_i32", "s_min_u32", "s_max_u32", "s_xor_b32", "s_andn2_b32",
                     "s_cselect_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32"):
             val = None
@@ -12586,6 +12599,15 @@ def dedupe_types(text):
     return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
+def tail_dwords(gen):
+    """Dwords of the tail after s0..s31: heap base and code base (4), --mesh-compute's output address after them (6), or
+    a PS's own code base (8, code_base_dword; never with --pc-tail-ubo). Without --pc-tail-ubo the push-constant
+    block is 128 + 4 * this bytes; with it, the %pc_tail block holds the same dwords at the same relative offsets."""
+    if getattr(gen, "msc_layout", None):
+        return 6
+    return code_base_dword(gen.stage) + 2 - USER_SGPRS if gen.uses_codebase else 4
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -13046,8 +13068,9 @@ def assemble(gen):
     gvars = [f"{n} = OpVariable %_ptr_Output_v4 Output" + (" %initial_mrt" if n in gen.partial_color_outputs else "")
              for n in gen.outputs]
     # Push constants: s0..s31 user data, then the tail: the 64-bit host address of the Xbox GPU VA window (heap
-    # base), the code base and, with --mesh-compute, the output address. --pc-tail-ubo moves the tail to %pc_tail.
-    tail = ["%uint"] * (6 if msc else 4)
+    # base), the code base, and up to the last dword this shader reads: --mesh-compute's output address, or a PS's own
+    # code base (tail_dwords). --pc-tail-ubo moves the tail to %pc_tail.
+    tail = ["%uint"] * tail_dwords(gen)
     types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
               " ".join(["%UserData = OpTypeStruct %arr_ud"] + ([] if PC_TAIL_UBO else tail)),
               "%_ptr_PC_UserData = OpTypePointer PushConstant %UserData",
@@ -13303,7 +13326,8 @@ def assemble(gen):
         gen.consts.setdefault(2, "%c2")
         fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)]
     if gen.uses_codebase:
-        fn += [pc_tail_chain("%ud_code_lo_p", 3, gen.cu), pc_tail_chain("%ud_code_hi_p", 4, gen.cu)]
+        member = code_base_dword(gen.stage) - USER_SGPRS + 1      # %UserData member: after s[] and the heap base
+        fn += [pc_tail_chain("%ud_code_lo_p", member, gen.cu), pc_tail_chain("%ud_code_hi_p", member + 1, gen.cu)]
     for i in range(USER_SGPRS):
         fn += [f"%ud{i}p = OpAccessChain %_ptr_PC_uint %user_data %c0 {gen.cu(i)}",
                f"%ud{i} = OpLoad %uint %ud{i}p",
@@ -15518,7 +15542,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
          "features": sorted({feats[c] for c in caps if c in feats and not feats[c].startswith(("core", "shaderImage1D"))} |
                             {{"subgroup": "shaderSubgroupClock", "device": "shaderDeviceClock"}[k]
                              for k in getattr(g, "uses_clock", ())}),
-         "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 16,
+         "bindings": binds, "push_constant_bytes": 4 * USER_SGPRS + 4 * tail_dwords(g),
          "subgroup_size": 64 if g.wave64 else 32,
          # Which stages can ask for a 64-wide subgroup is the driver's requiredSubgroupSizeStages, not a fixed rule:
          # the AMD Windows driver (FRAGMENT | COMPUTE | TASK | MESH) and Mesa RADV on GFX10+ (COMPUTE | FRAGMENT |
@@ -15549,6 +15573,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
             m["float_controls"].append("shaderDenormPreserveFloat16")
     if g.uses_codebase:
         m["uses_code_base"] = True
+        m["code_base_dword"] = code_base_dword(g.stage)
     if g.cs:
         m["local_size"] = list(g.cs["size"])
         m["user_sgprs"] = g.cs["user"]
@@ -15562,8 +15587,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         # --pc-tail-ubo: s0..s31 alone in push constants; the tail, if the shader reads it, in a uniform block.
         m["push_constant_bytes"] = 4 * USER_SGPRS
         if g.uses_pc_tail:
-            m["pc_tail"] = {"set": PC_TAIL_SET, "binding": PC_TAIL_BINDING,
-                            "bytes": 24 if getattr(g, "msc_layout", None) else 16}
+            m["pc_tail"] = {"set": PC_TAIL_SET, "binding": PC_TAIL_BINDING, "bytes": 4 * tail_dwords(g)}
     if g.ms:
         m["local_size"] = list(g.ms["size"])
         m["max_vertices"], m["max_primitives"] = g.ms["maxv"], g.ms["maxp"]

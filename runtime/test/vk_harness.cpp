@@ -25,6 +25,9 @@
 //                                set 0 image index 1 (with 1x1 magenta at index 0), writes a T# at VKH_TSHARP_VA
 //                                (default 0x100) in the 64 KiB heap, and registers VKH_SSHARP (4 comma-separated
 //                                dwords, default 0x92,0xc00000,0x14500000,0) at sampler index 1.
+//   VKH_CODE=vs,ps               code bases (Xbox VAs, as s_getpc_b64 sees them): vs in dwords 34..35, which every
+//                                stage but the pixel shader reads, ps in 38..39, the pixel shader's (SHADER-67).
+//                                With VKH_HEAP, data the shader reads from its own code goes at those addresses.
 //
 #define VK_NO_PROTOTYPES
 #include "vulkan_loader.h"
@@ -162,8 +165,10 @@ int main(int argc, char** argv) {
     } else if (argc > 5) {
         W = atoi(argv[4]); H = atoi(argv[5]);
     }
-    // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37).
-    uint32_t pc[38] = {};
+    // Push constants: s0..s31, heap base (32..33), code base (34..35), --mesh-compute output address (36..37), the
+    // pixel shader's code base (38..39).
+    uint32_t pc[40] = {};
+    bool ps_code_slot = false;  // VKH_CODE: the block runs to dword 39
     const char* draw_mesh_path = std::getenv("VKH_DRAW_MESH");
     if (draw_mesh_path && !*draw_mesh_path) draw_mesh_path = nullptr;
     VertexAttr vertex_attrs[8];
@@ -179,6 +184,17 @@ int main(int argc, char** argv) {
     if (sgprs_env && !parse_sgprs(sgprs_env, pc)) {
         std::fprintf(stderr, "VKH_SGPRS: expected up to 32 comma-separated words, got \"%s\"\n", sgprs_env);
         return 2;
+    }
+    if (const char* code_env = std::getenv("VKH_CODE"); code_env && *code_env) {
+        const char* s = code_env;
+        uint32_t vs_code = 0, ps_code = 0;
+        if (!parse_u32(s, vs_code) || *s++ != ',' || !parse_u32(s, ps_code) || *s) {
+            std::fprintf(stderr, "VKH_CODE: expected two words, vs,ps, got \"%s\"\n", code_env);
+            return 2;
+        }
+        pc[34] = vs_code;
+        pc[38] = ps_code;
+        ps_code_slot = true;
     }
     const uint32_t heap_bytes = 64 * 1024;
     const char* heap_env = std::getenv("VKH_HEAP");
@@ -365,7 +381,13 @@ int main(int argc, char** argv) {
                              "constants, not from the --pc-tail-ubo block\n");
         return 77;
     }
-    const uint32_t pc_bytes = pc_tail ? 128u : mesh_compute ? 152u : 144u;
+    // VKH_CODE's pixel-shader slot (SHADER-67) is push-constant dwords 38..39. --pc-tail-ubo has no such slot (every
+    // stage reads its code base from the tail block's dwords 2..3), so that combination isn't run either.
+    if (pc_tail && ps_code_slot) {
+        std::fprintf(stderr, "unsupported: VKH_CODE's pixel-shader code base with LEONIDA_PC_TAIL_UBO\n");
+        return 77;
+    }
+    const uint32_t pc_bytes = pc_tail ? 128u : ps_code_slot ? 160u : mesh_compute ? 152u : 144u;
     if (props.limits.maxPushConstantsSize < pc_bytes) {
         std::fprintf(stderr, "unsupported: need %u push constant bytes, device has %u\n", pc_bytes,
                      props.limits.maxPushConstantsSize);

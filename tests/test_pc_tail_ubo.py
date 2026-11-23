@@ -5,7 +5,8 @@ drivers) can't take the default 144-byte block (152 with --mesh-compute). With t
 s0..s31 alone, and the tail that follows them by default (heap base, code base, the --mesh-compute output address)
 is a uniform block at set 1, binding 0, in the same order. The inputs are the hand-written GPU tests in
 runtime/test/shaders with conftest's synthetic containers (no game data). Here:
-* without the flag the module and its metadata are what they were;
+* without the flag the module and its metadata are what they were (but for a pixel shader's own code-base slot,
+  SHADER-67);
 * with it the push-constant block is 128 bytes, every tail read goes through %pc_tail, the block is in the entry
   point's interface, the module passes spirv-val, and the metadata records "pc_tail" without counting its binding
   as a set-0 binding;
@@ -67,7 +68,8 @@ def test_default_is_unchanged(make_shader, name):
     assert "%pc_tail" not in spvasm and "PcTail" not in spvasm
     assert "OpMemberDecorate %UserData 1 Offset 128" in spvasm
     assert "OpMemberDecorate %UserData 4 Offset 140" in spvasm
-    assert meta["push_constant_bytes"] == 144 and "pc_tail" not in meta
+    # ps_m15 reads its code base: a pixel shader has its own slot, dwords 38-39 (SHADER-67), so its block is 160 bytes.
+    assert meta["push_constant_bytes"] == (160 if name == "ps_m15" else 144) and "pc_tail" not in meta
 
 
 @requires_tools

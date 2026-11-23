@@ -629,6 +629,7 @@ struct ShaderEntry {
     // pipeline needs it at or under the device's maxComputeSharedMemorySize (32768 on some drivers).
     std::uint32_t lds_bytes = 0;
     bool uses_code_base = false;
+    std::uint32_t code_base_dword = 34;  // where it reads its code base: 38 for a pixel shader (SHADER-67)
     bool wave64 = false;
     // The subgroup size the translator assumed (64 for a wave64 shader, 32 otherwise); 0 when the entry says null,
     // as one translated with --wave64-emulate does, or has none.
@@ -786,6 +787,7 @@ private:
             if (const Json* l = meta.find("local_size"); l && l->kind == Json::Kind::array)
                 for (std::size_t i = 0; i < l->array.size() && i < 3; ++i) e.local_size[i] = u32(&l->array[i]);
             if (const Json* c = meta.find("uses_code_base"); c && c->kind == Json::Kind::boolean) e.uses_code_base = c->boolean;
+            if (const Json* c = meta.find("code_base_dword")) e.code_base_dword = u32(c);
             if (const Json* w = meta.find("wave64"); w && w->kind == Json::Kind::boolean) e.wave64 = w->boolean;
             if (const Json* g = meta.find("subgroup_size"); g && g->kind == Json::Kind::number)
                 e.subgroup_size = u32(g);

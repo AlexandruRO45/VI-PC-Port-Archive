@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -742,12 +743,15 @@ struct ComputePipeline {
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
-// reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
+// reads. code_base: as for compute, for the VS (dwords 34-35); ps_code_base: the PS's, which it reads from dwords
+// 38-39 (SHADER-67, question 14). push_bytes is the layout's push-constant range: 160 when the PS has its own slot.
 struct GraphicsPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
+    std::uint32_t push_bytes = 144;
     std::uint64_t code_base = 0;
+    std::uint64_t ps_code_base = 0;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
@@ -763,13 +767,18 @@ struct GraphicsPipeline {
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
 };
 
-// The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
+// The push-constant block translated shaders declare: s0..s31, heap base, code base (dwords 34-35), 144 bytes. A
+// pixel shader that reads its code base has it at dwords 38-39 instead (a 160-byte block), so it and the VS or MS
+// before it can both have one; 36-37 are --mesh-compute's output address, which replay does not use.
 struct ShaderUserData {
     std::uint32_t s[32];
     std::uint64_t heap_base;
     std::uint64_t code_base;
+    std::uint64_t mesh_output;
+    std::uint64_t ps_code_base;
 };
-static_assert(sizeof(ShaderUserData) == 144);
+static_assert(sizeof(ShaderUserData) == 160 && offsetof(ShaderUserData, ps_code_base) == 38 * 4);
+constexpr std::uint32_t shader_user_data_bytes = 144;  // the block without the pixel shader's slot
 
 struct ReplayFunctions {
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
@@ -3647,8 +3656,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         if (p.pipeline.bindless_set)
                             vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
                                                     1, &p.pipeline.bindless_set, 0, nullptr);
-                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
-                                          &data);
+                        vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                          shader_user_data_bytes, &data);
                     }
                     for (std::uint32_t k = 0; k < ind->max_count; ++k) {
                         vk.dispatch_indirect(command_buffer,
@@ -3729,7 +3738,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (p.pipeline.bindless_set)
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
                                         &p.pipeline.bindless_set, 0, nullptr);
-            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
+            vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                              shader_user_data_bytes, &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
@@ -3776,11 +3786,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
+            data.ps_code_base = graphics.ps_code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
             if (graphics.bindless_set)
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &graphics.bindless_set, 0, nullptr);
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, graphics.push_bytes, &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
