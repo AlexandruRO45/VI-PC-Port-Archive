@@ -227,6 +227,16 @@ class TestVCvtF16U16AST(unittest.TestCase):
         self.assertEqual(expr.eval(2), 0x4000)
         self.assertEqual(expr.eval(100), float_to_f16_bits(100.0))
 
+class TestVCvtF16U16SIMD(unittest.TestCase):
+    def test_simd_lane_divergence(self) -> None:
+        for l in range(32):
+            got = ref_v_cvt_f16_u16(l * 100)
+            self.assertEqual(got, float_to_f16_bits(float(l * 100)))
+
+    def test_boundary_extremes(self) -> None:
+        # Max u16 is 65535 -> in f16 rounds to 65536 (0x7C00 = inf in half float without clamp)
+        self.assertEqual(ref_v_cvt_f16_u16(65535), 0x7C00)
+
 
 if __name__ == "__main__":
     unittest.main()
