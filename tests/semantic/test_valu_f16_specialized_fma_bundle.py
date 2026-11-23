@@ -346,5 +346,44 @@ class TestVFmamkF16ASTAndInterpreter(unittest.TestCase):
         self.assertEqual(res >> 16, 0xFEED)
         self.assertEqual(state.vgprs[2], res)
 
+class TestVFmamkF16SIMDAndIEEE(unittest.TestCase):
+    def test_condition_code_neutrality(self) -> None:
+        state = ScalarMachineState()
+        state.scc = 1
+        state.vcc = 0xAAAAAAAAAAAAAAAA
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0x3800)
+        state.write_vgpr(2, 0x22220000)
+        inst = ASTInstruction(
+            Opcode.V_FMAMK_F16,
+            ASTOperand.vgpr(2),
+            ASTOperand.vgpr(0),
+            ASTOperand.imm(0x4000),
+            ASTOperand.vgpr(1),
+        )
+        ScalarInterpreter().step(inst, state)
+        self.assertEqual(state.scc, 1)
+        self.assertEqual(state.vcc, 0xAAAAAAAAAAAAAAAA)
+
+    def test_register_aliasing(self) -> None:
+        state = ScalarMachineState()
+        state.write_vgpr(0, 0x3C00)
+        state.write_vgpr(1, 0x3800)
+        inst = ASTInstruction(
+            Opcode.V_FMAMK_F16,
+            ASTOperand.vgpr(0),
+            ASTOperand.vgpr(0),
+            ASTOperand.imm(0x4000),
+            ASTOperand.vgpr(1),
+        )
+        res = ScalarInterpreter().step(inst, state)
+        self.assertEqual(res & 0xFFFF, 0x4100)
+
+    def test_ieee754_nan_and_inf(self) -> None:
+        res_nan = ref_v_fmamk_f16(0x7E00, 0x4000, 0x3800)
+        self.assertEqual(res_nan & 0xFFFF, 0x7E00)
+        res_inf = ref_v_fmamk_f16(0x7C00, 0x4000, 0x3800)
+        self.assertEqual(res_inf & 0xFFFF, 0x7C00)
+
 if __name__ == "__main__":
     unittest.main()
