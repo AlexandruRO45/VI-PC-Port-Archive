@@ -43,8 +43,16 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
+
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]|KB2[a-z]")
 SYS_BASE = 0x50000000
@@ -1172,43 +1180,58 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
 
 
 def write_output(path, resources, summary):
-    """Write JSON or CSV based on the output path extension."""
+    """Write JSON or CSV based on the output path extension, staged via a sibling temp file."""
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".json":
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"summary": summary, "resources": resources}, fh, indent=1)
-            fh.write("\n")
-        return
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator="\n")
-        writer.writeheader()
-        for r in resources:
-            gfx_first = (
-                f"0x{r['graphics_streams'][0]['offset']:x}" if r["graphics_streams"] else ""
-            )
-            writer.writerow({
-                "offset": f"0x{r['offset']:x}",
-                "stream_index": r["stream_index"],
-                "kind": r["kind"],
-                "complete": int(r["complete"]),
-                "system_pages": r["system_pages"],
-                "graphics_pages": r["graphics_pages"],
-                "graphics_first_offset": gfx_first,
-                "system_stored": r["system_stored"],
-                "system_bytes": r["system_bytes"],
-                "graphics_stored": r["graphics_stored"],
-                "graphics_bytes": r["graphics_bytes"],
-                "required_system_bytes": r["required_system_bytes"],
-                "required_graphics_bytes": r["required_graphics_bytes"],
-                "drawables": r["drawables"],
-                "primary_geometries": r["primary_geometries"],
-                "primary_vertices": r["primary_vertices"],
-                "primary_triangles": r["primary_triangles"],
-                "all_lod_geometries": r["all_lod_geometries"],
-                "all_lod_vertices": r["all_lod_vertices"],
-                "all_lod_triangles": r["all_lod_triangles"],
-                "error": "" if r["error"] is None else r["error"],
-            })
+    parent = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".restofworld_model_join.", suffix=f"{ext}.tmp", dir=parent)
+    try:
+        if ext == ".json":
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"summary": summary, "resources": resources}, fh, indent=1)
+                fh.write("\n")
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=COLUMNS, lineterminator="\n")
+                writer.writeheader()
+                for r in resources:
+                    gfx_first = (
+                        f"0x{r['graphics_streams'][0]['offset']:x}" if r["graphics_streams"] else ""
+                    )
+                    writer.writerow({
+                        "offset": f"0x{r['offset']:x}",
+                        "stream_index": r["stream_index"],
+                        "kind": r["kind"],
+                        "complete": int(r["complete"]),
+                        "system_pages": r["system_pages"],
+                        "graphics_pages": r["graphics_pages"],
+                        "graphics_first_offset": gfx_first,
+                        "system_stored": r["system_stored"],
+                        "system_bytes": r["system_bytes"],
+                        "graphics_stored": r["graphics_stored"],
+                        "graphics_bytes": r["graphics_bytes"],
+                        "required_system_bytes": r["required_system_bytes"],
+                        "required_graphics_bytes": r["required_graphics_bytes"],
+                        "drawables": r["drawables"],
+                        "primary_geometries": r["primary_geometries"],
+                        "primary_vertices": r["primary_vertices"],
+                        "primary_triangles": r["primary_triangles"],
+                        "all_lod_geometries": r["all_lod_geometries"],
+                        "all_lod_vertices": r["all_lod_vertices"],
+                        "all_lod_triangles": r["all_lod_triangles"],
+                        "error": "" if r["error"] is None else r["error"],
+                    })
+        os.chmod(tmp, file_mode.published_mode(path))
+        replace_retry.replace(tmp, path)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def offset_arg(text):

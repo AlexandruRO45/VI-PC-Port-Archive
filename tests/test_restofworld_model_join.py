@@ -775,6 +775,61 @@ class ModelJoinTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertFalse(os.path.exists(out_ok))
 
+    def test_write_output_preserves_previous_json_on_write_failure(self):
+        out_dir = os.path.join(self.root, "stage_json")
+        os.makedirs(out_dir)
+        out_path = os.path.join(out_dir, "report.json")
+        previous = '{"previous": true}\n'
+        with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(previous)
+
+        with unittest.mock.patch.object(joiner.json, "dump", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                joiner.write_output(out_path, [], {"ok": True})
+
+        with open(out_path, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), previous)
+        self.assertEqual(os.listdir(out_dir), ["report.json"])
+
+    def test_write_output_preserves_previous_csv_on_write_failure(self):
+        out_dir = os.path.join(self.root, "stage_csv")
+        os.makedirs(out_dir)
+        out_path = os.path.join(out_dir, "report.csv")
+        previous = "offset,kind\n0x1010,drawable\n"
+        with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(previous)
+
+        class FailingWriter:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def writeheader(self):
+                raise OSError("disk full")
+
+        with unittest.mock.patch.object(joiner.csv, "DictWriter", FailingWriter):
+            with self.assertRaises(OSError):
+                joiner.write_output(out_path, [], {"ok": True})
+
+        with open(out_path, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), previous)
+        self.assertEqual(os.listdir(out_dir), ["report.csv"])
+
+    def test_write_output_preserves_previous_report_on_replace_failure(self):
+        out_dir = os.path.join(self.root, "stage_replace")
+        os.makedirs(out_dir)
+        out_path = os.path.join(out_dir, "report.json")
+        previous = '{"previous": true}\n'
+        with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(previous)
+
+        with unittest.mock.patch.object(joiner.replace_retry, "replace", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                joiner.write_output(out_path, [], {"ok": True})
+
+        with open(out_path, "r", encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), previous)
+        self.assertEqual(os.listdir(out_dir), ["report.json"])
+
 
 if __name__ == "__main__":
     unittest.main()
