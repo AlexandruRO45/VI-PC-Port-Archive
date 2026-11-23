@@ -350,6 +350,24 @@ class TestVCvtF32U32ASTAndInterpreter(unittest.TestCase):
         words = support.mrt0_words(spv)
         self.assertEqual(words[0], 0x42280000)
 
+class TestVCvtF32U32SIMDAndIEEE(unittest.TestCase):
+    """Stage 3 for v_cvt_f32_u32: SIMD multi-lane divergence and IEEE 754 edge cases."""
+
+    def test_v_cvt_f32_u32_edge_cases(self):
+        edge_cases = [0x00000000, 0x80000000, 0x7F800000, 0xFF800000, 0x7FC00000]
+        for val in edge_cases:
+            with self.subTest(val=hex(val)):
+                exp = oracle_v_cvt_f32_u32(val)
+                lines = [
+                    f"v_mov_b32 v1, {val:#x}",
+                    "v_cvt_f32_u32 v0, v1",
+                    "v_mov_b32 v1, 0",
+                    "v_mov_b32 v2, 0",
+                    "v_mov_b32 v3, 0",
+                ]
+                words = run_bundle_ps(lines, f"ps_ieee_v_cvt_f32_u32_{val:#x}")
+                self.assertEqual(words[0], exp)
+
 
 if __name__ == '__main__':
     unittest.main()
