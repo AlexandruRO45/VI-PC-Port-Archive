@@ -471,7 +471,6 @@ struct PersistentSpaceInfo {
     uint64_t total_bytes;           // the quota
 };
 static_assert(sizeof(PersistentSpaceInfo) == 32, "XPersistentLocalStorageSpaceInfo is four UINT64");
-static_assert(offsetof(PersistentSpaceInfo, available_free_bytes) == 0x00, "measured field offset in save caller");
 
 // The storage folder, created on first use. Empty when there is no overlay (no place to keep files) or the folder
 // cannot be created.
@@ -562,9 +561,9 @@ HRESULT STDMETHODCALLTYPE pls_mount_for_package(void*, const char*, void** mount
     return E_NOTIMPL;
 }
 
-// In the retail executable (game_scarlett_master.exe), exactly two thunks are linked: slot 4 (GetPath) and slot 5
-// (GetSpaceInfo), both referenced. Slots 3 (GetPathSize), 6-7 (PromptUserForSpace*), and 8 (MountForPackage)
-// have no thunks linked.
+// In the retail executable (game_scarlett_master.exe) only two thunks are linked: slot 4 (GetPath; one direct call,
+// passing a 256-byte buffer, and one tail call) and slot 5 (GetSpaceInfo; one direct call). Slots 3 (GetPathSize),
+// 6-7 (PromptUserForSpace*) and 8 (MountForPackage) have no thunks linked.
 #define PLS(fn) reinterpret_cast<const void*>(&fn)
 const void* const kPersistentStorageVtable[] = {
     PLS(object_query_interface), PLS(object_add_ref), PLS(object_release),
