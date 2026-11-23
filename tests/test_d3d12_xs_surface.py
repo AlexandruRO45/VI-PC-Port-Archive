@@ -138,6 +138,14 @@ def test_scarab_unreadable_input_reports_failure():
         assert any(e.startswith("cannot read ") for e in errors), errors
 
 
+def test_scarab_reports_every_unreadable_input():
+    bad = b"\xff\xfe\x00not utf-8"
+    with tempfile.TemporaryDirectory() as tmp:
+        errors, _notes = S.check_scarab(_scarab_tree(tmp, table=bad, console=bad, catalogue=bad))
+        reported = [e for e in errors if e.startswith("cannot read ")]
+        assert len(reported) == 3, errors
+
+
 def test_scarab_missing_input_is_reported_not_raised():
     with tempfile.TemporaryDirectory() as tmp:
         errors, _notes = S.check_scarab(tmp)
@@ -154,6 +162,7 @@ if __name__ == "__main__":
     test_sdk_discovery_sorts_versions_numerically()
     test_scarab_malformed_inputs_report_failure_not_traceback()
     test_scarab_unreadable_input_reports_failure()
+    test_scarab_reports_every_unreadable_input()
     test_scarab_missing_input_is_reported_not_raised()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
