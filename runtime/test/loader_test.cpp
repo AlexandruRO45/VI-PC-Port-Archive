@@ -1203,7 +1203,10 @@ void test_lookup_during_loads() {
         rt::Loader loader(g_dir);
         auto first = make_image();
         auto* first_nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(first.data() + 0x80);
-        first_nt->OptionalHeader.ImageBase = 0x200000000ull;
+        // Inside the span free_image_base() moves under Wine: at 0x200000000 CrossOver on Apple Silicon has its own
+        // loader mapped, and these images have no relocations.
+        constexpr uint64_t kLookupBase = 0x1a0000000ull;
+        first_nt->OptionalHeader.ImageBase = leonida_test::free_image_base(kLookupBase);
         rt::Module& anchor = loader.load(write_image(first));
         const uint64_t inside = reinterpret_cast<uint64_t>(anchor.base) + 0x1004;
 
@@ -1224,7 +1227,7 @@ void test_lookup_during_loads() {
         for (unsigned i = 1; i <= 300; ++i) {
             auto img = make_image();
             auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(img.data() + 0x80);
-            nt->OptionalHeader.ImageBase = 0x200000000ull + i * 0x10000ull;
+            nt->OptionalHeader.ImageBase = leonida_test::free_image_base(kLookupBase + i * 0x10000ull);
             rt::Module& m = loader.load(write_image(img));
             uint64_t base = 0;
             if (rt::shims::mapped_image_base(reinterpret_cast<uint64_t>(m.base) + 0x1000, base) &&
