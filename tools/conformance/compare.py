@@ -632,7 +632,9 @@ def load_manifest(path):
 
     try:
         document = json.loads(text, object_pairs_hook=unique_keys)
-    except json.JSONDecodeError as error:
+    except ValueError as error:
+        if not isinstance(error, json.JSONDecodeError):
+            raise ToolError(f"manifest '{manifest_path}' cannot decode a JSON value: {error}") from error
         raise ToolError(
             f"manifest '{manifest_path}' is not valid JSON: {error.msg} at line "
             f"{error.lineno} column {error.colno}. Check for a missing comma or "
