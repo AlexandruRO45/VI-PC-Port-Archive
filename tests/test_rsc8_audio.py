@@ -4,7 +4,9 @@
 
 Every byte is synthesized by the test. No game file, game audio, or game asset name is used.
 """
+import contextlib
 import csv
+import io
 import json
 import os
 import struct
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "rsc8_audio.py")
@@ -729,6 +732,27 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                 with open(out_json, encoding="utf-8") as f:
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
+
+    def test_an_unreadable_directory_is_an_error_not_a_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "locked")
+            os.mkdir(bad)
+            real = os.scandir
+
+            def scandir(path):
+                if os.fspath(path) == bad:
+                    raise PermissionError(13, "Permission denied", bad)
+                return real(path)
+
+            with mock.patch("os.scandir", side_effect=scandir):
+                with self.assertRaises(PermissionError):
+                    rsc8_audio.scan_dir(bad)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(rsc8_audio.main([bad]), 2)
+            lines = err.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, err.getvalue())
+            self.assertIn(bad, lines[0])
 
 # The packed blocks are anim_clips sequences, so the synthetic ones come from that tool's test encoder.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

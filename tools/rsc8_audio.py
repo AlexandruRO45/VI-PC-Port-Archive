@@ -1549,11 +1549,14 @@ def scan_rpf(path, *, start=0, limit=None, max_banks=None, deep=True, collect_re
 
 def scan_dir(path, *, max_banks=None, deep=True, collect_records=True, curves=False):
     """Scan a directory of `.awc` banks and/or standalone `.rsc8` files."""
+    def abort(error):
+        raise error
+
     t0 = time.time()
     summary = _new_summary("directory", path)
     records = []
     files = []
-    for root, _, names in os.walk(path):
+    for root, _, names in os.walk(path, onerror=abort):
         for name in sorted(names):
             low = name.lower()
             if low.endswith((".awc", ".rsc8")):
