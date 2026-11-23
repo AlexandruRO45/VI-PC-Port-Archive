@@ -721,7 +721,7 @@ def main() -> int:
                     help="SPIR-V assembler: auto (use spirv-as if on PATH, else tools/spirv_asm.py), "
                          "spirv-as, or python")
     ap.add_argument("--no-validate", action="store_true",
-                    help="skip spirv-val during translation (automatic when --assembler resolves to python "
+                    help="skip spirv-val checks (automatic when --assembler resolves to python "
                          "and spirv-val is not on PATH)")
     ap.add_argument("--disasm-dir", default=None,
                     help="folder of pre-disassembled <name>.s listings (e.g. tests/semantic/fixtures/disasm); "
@@ -901,14 +901,24 @@ def run_suite(a, work: str) -> int:
     print(out)
     if rc != 0:
         return 1
+
+    def assemble_fallback(source, spv):
+        spirv_as(Path(source).read_text(encoding="utf-8"), spv, assembler=assembler)
+        if not no_validate:
+            status, detail = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv], gpu=False)
+            if status:
+                raise RuntimeError(f"spirv-val failed for {source}:\n{detail}")
+
+    # Keep the helper tools' existing SPIRV-Tools path when using the default assembler and validator.
+    helper_assembler = assemble_fallback if assembler == "python" or no_validate else None
     if bary_fallback():
         import bary_fallback_gs
-        for gs in bary_fallback_gs.build_for_index(spirv_dir):
+        for gs in bary_fallback_gs.build_for_index(spirv_dir, assemble=helper_assembler):
             print("bary fallback GS:", os.path.basename(gs))
 
     if MESH_COMPUTE:
         import mesh_compute_vs
-        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir):
+        for vs_spv in mesh_compute_vs.build_for_index(spirv_dir, assemble=helper_assembler):
             print("mesh compute VS:", os.path.basename(vs_spv))
 
     # 3. Build helper SPIR-V shaders
@@ -1503,10 +1513,11 @@ def run_suite(a, work: str) -> int:
                 ok, detail = check_grad(raw, 0.0, 0.0)
                 results.append((name, ok, detail))
         elif name == "ms_v5_workgroup":
-            rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
-            if rc:
-                results.append((name, False, msg))
-                continue
+            if not no_validate:
+                rc, msg = run_cmd(["spirv-val", "--target-env", "vulkan1.2", spv])
+                if rc:
+                    results.append((name, False, msg))
+                    continue
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))

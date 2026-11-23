@@ -136,6 +136,53 @@ class PythonAssemblerTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), listing)
                 self.assertEqual(working.read_bytes(), listing)
 
+    def test_mesh_workgroup_respects_validation_mode(self) -> None:
+        cases = (
+            (True, "spirv-val", False),  # explicit --no-validate even with SPIRV-Tools installed
+            (False, None, False),        # Python assembler with no validator on PATH
+            (False, "spirv-val", True),  # validation errors are still reported by default
+        )
+        for no_validate, validator, should_validate in cases:
+            with self.subTest(no_validate=no_validate, validator=validator), tempfile.TemporaryDirectory() as work:
+                name = "ms_v5_workgroup"
+                args = SimpleNamespace(filter=name, build=work, llvm_mc="unused", assembler="python",
+                                       no_validate=no_validate, require_pass=True)
+                shader = Path(work, "spirv", name + ".spv")
+
+                def launch(cmd, **kwargs):
+                    if cmd[0] == "spirv-val":
+                        return 1, "mesh module rejected by validator"
+                    self.assertEqual(cmd[2], run_gpu_tests.TRANSLATOR)
+                    self.assertEqual("--no-validate" in cmd, not should_validate)
+                    shader.touch()
+                    if not should_validate:
+                        entry = {name: {"mesh_compute": rdna2spirv.mesh_compute_layout(64, 3, 0, 0, [])}}
+                        (shader.parent / "index.json").write_text(json.dumps(entry), encoding="utf-8", newline="\n")
+                    return 0, ""
+
+                output = io.StringIO()
+                with (patch.object(run_gpu_tests.shutil, "which", return_value=validator),
+                      patch.object(run_gpu_tests, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                      patch.object(run_gpu_tests, "bary_fallback", return_value=False),
+                      patch.object(run_gpu_tests, "f16_interp_fallback", return_value=False),
+                      patch.object(run_gpu_tests, "MESH_COMPUTE", not should_validate),
+                      patch.object(run_gpu_tests, "run_cmd", side_effect=launch) as run,
+                      patch.object(run_gpu_tests, "mesh_v5_test", return_value=None) as draw,
+                      patch("sys.stdout", output)):
+                    rc = run_gpu_tests.run_suite(args, work)
+                if should_validate:
+                    run.assert_called_with(["spirv-val", "--target-env", "vulkan1.2", str(shader)])
+                    draw.assert_not_called()
+                    self.assertEqual(rc, 1, output.getvalue())
+                    self.assertIn("mesh module rejected by validator", output.getvalue())
+                else:
+                    run.assert_called_once()
+                    draw.assert_called_once()
+                    helper = shader.with_suffix(".mesh_vs.spv")
+                    self.assertEqual(helper.read_bytes()[:4], b"\x03\x02\x23\x07")
+                    self.assertEqual(rc, 0, output.getvalue())
+                    self.assertIn("1/1 passed", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -167,8 +167,10 @@ def write_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
     return written
 
 
-def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
+def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None,
+                    *, assemble=None) -> list[str]:
     """Assemble and validate each helper with SPIRV-Tools for Vulkan 1.2 before publishing its text and binary.
+    If supplied, assemble(source_path, staged_binary_path) replaces the default SPIRV-Tools calls.
     Returns the .spv paths; raises RuntimeError with the tool output on failure."""
     built = []
     for asm, shader in _helpers_for_index(spirv_dir, pair):
@@ -177,11 +179,14 @@ def build_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | N
             staged_asm = os.path.join(staging, os.path.basename(asm))
             staged_spv = os.path.join(staging, os.path.basename(spv))
             Path(staged_asm).write_text(shader, encoding="utf-8", newline="\n")
-            for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
-                        ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
-                r = subprocess.run(cmd, capture_output=True, text=True)
-                if r.returncode:
-                    raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
+            if assemble is not None:
+                assemble(staged_asm, staged_spv)
+            else:
+                for cmd in (["spirv-as", "--target-env", "vulkan1.2", staged_asm, "-o", staged_spv],
+                            ["spirv-val", "--target-env", "vulkan1.2", staged_spv]):
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    if r.returncode:
+                        raise RuntimeError(f"{cmd[0]} failed for {asm}:\n{r.stdout}{r.stderr}")
             os.replace(staged_asm, asm)
             os.replace(staged_spv, spv)
         built.append(spv)

@@ -637,7 +637,8 @@ class F16InterpUnderBaryFallback(unittest.TestCase):
             env = {"LEONIDA_BARY_FALLBACK": "1" if bary else "0", "LEONIDA_F16_INTERP_FALLBACK": "1" if f16 else "0"}
             out = io.StringIO()
             with (patch.dict(rgt.os.environ, env),
-                  patch.dict(sys.modules, {"bary_fallback_gs": SimpleNamespace(build_for_index=lambda _d: [])}),
+                  patch.dict(sys.modules, {"bary_fallback_gs": SimpleNamespace(
+                      build_for_index=lambda _d, *, assemble=None: [])}),
                   patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
                   patch.object(rgt, "spirv_as"),
                   patch.object(rgt, "run_cmd", side_effect=run_cmd),

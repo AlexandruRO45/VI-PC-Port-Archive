@@ -260,15 +260,18 @@ def tool_path(name):
     return path
 
 
-def build_for_index(spirv_dir):
+def build_for_index(spirv_dir, *, assemble=None):
     """write_for_index, then assemble to <name>.mesh_vs.spv and validate (Vulkan 1.2, as for the translator).
+    If supplied, assemble(source_path, staged_binary_path) replaces the default SPIRV-Tools calls.
     Returns the .spv paths; raises RuntimeError with the tool output on failure."""
-    steps = [("spirv-as", tool_path("spirv-as")), ("spirv-val", tool_path("spirv-val"))]
+    steps = [] if assemble is not None else [("spirv-as", tool_path("spirv-as")), ("spirv-val", tool_path("spirv-val"))]
     built = []
     for asm in write_for_index(spirv_dir):
         spv = asm[: -len(".spvasm")] + ".spv"
         with tempfile.TemporaryDirectory(prefix=".mesh-vs-", dir=os.path.dirname(spv)) as staging:
             staged_spv = os.path.join(staging, os.path.basename(spv))
+            if assemble is not None:
+                assemble(asm, staged_spv)
             for name, tool in steps:
                 args = [asm, "-o", staged_spv] if name == "spirv-as" else [staged_spv]
                 cmd = [tool, "--target-env", "vulkan1.2"] + args
