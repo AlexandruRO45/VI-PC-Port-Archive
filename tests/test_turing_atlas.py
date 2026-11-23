@@ -269,5 +269,28 @@ class ValidationGateTests(unittest.TestCase):
         self.assertEqual(err, "")
 
 
+class OffsetCaseTests(unittest.TestCase):
+    """The maintenance8 case must sample with an Offset operand, not assemble an empty shader."""
+
+    def test_case_samples_a_texture_with_an_offset_operand(self):
+        asm = turing_atlas.CASES["maintenance8_offset"]
+        self.assertIn("%offset = OpConstantComposite %v2i", asm)
+        self.assertIn("OpImageSampleImplicitLod %v4f %sampled %uv Offset %offset", asm)
+
+    def test_only_the_offset_case_is_validated_with_the_maintenance8_flag(self):
+        cmds = {}
+
+        def run(cmd, **kw):
+            cmds[os.path.basename(cmd[-1])] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                patch.object(turing_atlas, "run", run):
+            turing_atlas.validate_cases()
+        flag = "--allow-offset-texture-operand"
+        self.assertIn(flag, cmds["maintenance8_offset.spv"])
+        self.assertNotIn(flag, cmds["compute32.spv"])
+
+
 if __name__ == "__main__":
     unittest.main()
