@@ -48,6 +48,12 @@ def segments(spv: str) -> tuple[int, int] | None:
     return len(cases), len(cases) - blocks
 
 
+def mismatch_counts(out: str) -> list[int]:
+    """Every "<n> mismatches" count vk_compute_test printed, as numbers. Looking for the text "0 mismatches"
+    instead accepted 10, 20, 100... mismatches as a clean run, because their last digit is a 0 too."""
+    return [int(n) for n in re.findall(r"(?<![\w.])(\d+) mismatches\b", out)]
+
+
 def run(tools, spv, groups, reps, driver, emulate):
     env = dict(os.environ, VK_LOADER_DRIVERS_SELECT=driver, VKC_BENCH=str(reps))
     args = [os.path.join(tools, "vk_compute_test" + (".exe" if os.name == "nt" else "")), spv, str(groups), "dump"]
@@ -61,8 +67,16 @@ def run(tools, spv, groups, reps, driver, emulate):
     m = re.search(r"bench ms: median=([\d.]+) min=([\d.]+) max=([\d.]+)", out)
     h = re.search(r"bench out fnv1a: (\w+)", out)
     dev = re.search(r"device: (.*) \(subgroup", out)
-    if r.returncode or not m or not h or "0 mismatches" not in out:
-        why = f"exit {r.returncode}" if r.returncode else "no 'bench ms' / 'bench out fnv1a' line (rebuild vk_compute_test)"
+    bad = mismatch_counts(out)
+    if r.returncode or not m or not h or not bad or any(bad):
+        if r.returncode:
+            why = f"exit {r.returncode}"
+        elif any(bad):
+            why = f"{max(bad)} mismatches"
+        elif not bad:
+            why = "no 'mismatches' line"
+        else:
+            why = "no 'bench ms' / 'bench out fnv1a' line (rebuild vk_compute_test)"
         return None, why + ": " + (out.strip().splitlines()[-1:] or ["no output"])[0], None
     return (float(m.group(1)), float(m.group(2))), h.group(1), dev.group(1) if dev else "?"
 

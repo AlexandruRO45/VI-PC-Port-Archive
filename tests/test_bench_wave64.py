@@ -68,6 +68,60 @@ class HarnessError(unittest.TestCase):
         self.assertIn("failed or unsupported", out.getvalue())
 
 
+class MismatchCount(unittest.TestCase):
+    """run() reads vk_compute_test's mismatch count as a number: a count that ends in 0 is not zero."""
+    BENCH = ("device: stub GPU (subgroup 32..64)\nbench ms: median=1.500 min=1.250 max=2.000\n"
+             "bench out fnv1a: 1a2b3c4d\n")
+
+    def run_with(self, tail, returncode=0):
+        done = bench_wave64.subprocess.CompletedProcess(["vk_compute_test"], returncode, self.BENCH + tail, "")
+        with patch.object(bench_wave64.subprocess, "run", return_value=done):
+            return bench_wave64.run("build", "x.spv", 65536, 30, "*nv*", True)
+
+    def test_zero_is_a_result(self):
+        self.assertEqual(self.run_with("65536 groups x 64: 0 mismatches\nout[0..7] = 1 2 3 4 5 6 7 8\n"),
+                         ((1.5, 1.25), "1a2b3c4d", "stub GPU"))
+
+    def test_counts_ending_in_zero_are_failures(self):
+        for count in (10, 20, 100, 4194300):
+            with self.subTest(count=count):
+                tail = (f"65536 groups x 64: {count} mismatches (first at 64: got 0x00000000)\n"
+                        "out[0..7] = 0 0 0 0 0 0 0 0\n")
+                timing, why, device = self.run_with(tail)
+                self.assertIsNone(timing)
+                self.assertIsNone(device)
+                self.assertTrue(why.startswith(f"{count} mismatches: "), why)
+
+    def test_other_counts_are_failures(self):
+        for count in (1, 7, 65):
+            with self.subTest(count=count):
+                timing, why, _ = self.run_with(f"65536 groups x 64: {count} mismatches (first at 0: got 0x00000001)\n")
+                self.assertIsNone(timing)
+                self.assertTrue(why.startswith(f"{count} mismatches: "), why)
+
+    def test_every_count_line_is_read(self):
+        # the 2x3x4 workgroup line comes before the per-group line; a clean second line must not hide the first
+        timing, why, _ = self.run_with("2x3x4 workgroup Y/Z: 30 mismatches\n65536 groups x 64: 0 mismatches\n")
+        self.assertIsNone(timing)
+        self.assertTrue(why.startswith("30 mismatches: "), why)
+        self.assertEqual(self.run_with("2x3x4 workgroup Y/Z: 0 mismatches\n65536 groups x 64: 0 mismatches\n")[0],
+                         (1.5, 1.25))
+
+    def test_no_count_line_is_a_failure(self):
+        timing, why, _ = self.run_with("out[0..7] = 1 2 3 4 5 6 7 8\n")
+        self.assertIsNone(timing)
+        self.assertTrue(why.startswith("no 'mismatches' line: "), why)
+
+    def test_exit_status_comes_first(self):
+        timing, why, _ = self.run_with("65536 groups x 64: 10 mismatches (first at 64: got 0x00000000)\n", 1)
+        self.assertIsNone(timing)
+        self.assertTrue(why.startswith("exit 1: "), why)
+
+    def test_counts(self):
+        self.assertEqual(bench_wave64.mismatch_counts("a: 0 mismatches\nb: 10 mismatches (first at 3)\n"), [0, 10])
+        self.assertEqual(bench_wave64.mismatch_counts("no count here, mismatches or not\n"), [])
+
+
 class ArgumentValidation(unittest.TestCase):
     def test_positive_only(self):
         for option in ("--groups", "--reps", "--procs"):
