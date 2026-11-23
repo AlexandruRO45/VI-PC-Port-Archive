@@ -36,6 +36,7 @@
 
 namespace rt::shims {
 void* xgameruntime_user_new_handle();   // xgameruntime_user.cpp
+bool xgameruntime_user_added();            // xgameruntime_user.cpp
 }
 
 namespace {
@@ -43,6 +44,7 @@ namespace {
 using XUserHandle = void*;
 
 // XGameErr.h values, from the GDK "Error codes" page.
+constexpr HRESULT E_GAMEUSER_USER_NOT_FOUND = static_cast<HRESULT>(0x89245104);
 constexpr HRESULT E_GAMESTREAMING_NOT_INITIALIZED = static_cast<HRESULT>(0x89245400);
 
 constexpr GUID kIUnknown = {0x00000000, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
@@ -439,9 +441,12 @@ struct APP_LOCAL_DEVICE_ID {
 const char kFindControllerIdentity = 0;
 
 // 3: HRESULT XUserFindForDevice(const APP_LOCAL_DEVICE_ID* deviceId, XUserHandle* handle): every device belongs to
-// the one offline user.
+// the one offline user, but only once the title has added it (XUserAddAsync): before that no user is associated with
+// the device and the reference answers E_GAMEUSER_USER_NOT_FOUND.
 HRESULT STDMETHODCALLTYPE device_find_user(void*, const APP_LOCAL_DEVICE_ID* device, XUserHandle* out) {
     if (!device || !out) return E_INVALIDARG;
+    *out = nullptr;
+    if (!rt::shims::xgameruntime_user_added()) return E_GAMEUSER_USER_NOT_FOUND;
     *out = rt::shims::xgameruntime_user_new_handle();
     return S_OK;
 }

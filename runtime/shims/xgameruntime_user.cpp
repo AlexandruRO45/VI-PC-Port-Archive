@@ -146,6 +146,9 @@ const char kAddIdentity = 0;
 const char kAddByIdIdentity = 0;
 const char kResolveIdentity = 0;
 
+// True once the title has collected an XUserAddAsync result: only then does a device belong to a user.
+std::atomic<bool> g_user_added{false};
+
 HRESULT CALLBACK add_provider(XAsyncOp op, const XAsyncProviderData* data) {
     switch (op) {
     case XAsyncOp::Begin:
@@ -156,6 +159,7 @@ HRESULT CALLBACK add_provider(XAsyncOp op, const XAsyncProviderData* data) {
     case XAsyncOp::GetResult:
         if (data->bufferSize < sizeof(XUserHandle) || !data->buffer) return E_INVALIDARG;
         *static_cast<XUserHandle*>(data->buffer) = new_handle();
+        g_user_added = true;
         return S_OK;
     default:
         return S_OK;
@@ -176,6 +180,7 @@ HRESULT CALLBACK add_by_id_provider(XAsyncOp op, const XAsyncProviderData* data)
     case XAsyncOp::GetResult:
         if (data->bufferSize < sizeof(XUserHandle) || !data->buffer) return E_INVALIDARG;
         *static_cast<XUserHandle*>(data->buffer) = new_handle();
+        g_user_added = true;
         return S_OK;
     default:
         return S_OK;
@@ -533,6 +538,9 @@ bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** o
 // A new handle to the offline user, for the classes that hand one out too (XUserFindForDevice, in
 // xgameruntime_offline.cpp). The title closes it with XUserCloseHandle like any other.
 void* xgameruntime_user_new_handle() { return new_handle(); }
+
+// True once the title has collected an XUserAddAsync result (XUserFindForDevice answers not-found before that).
+bool xgameruntime_user_added() { return g_user_added; }
 
 // For tests: the XUserHandles a title holds open.
 long xgameruntime_user_open_handles() {

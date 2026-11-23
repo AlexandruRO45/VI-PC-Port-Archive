@@ -158,6 +158,22 @@ int main() {
     if (!device) return 1;
     uint8_t device_id[32] = {7};
     void* user = nullptr;
+    // RT-382: before the title has added a user (XUserAddAsync) no user is associated with the device.
+    user = reinterpret_cast<void*>(1);
+    check(at<FindUser>(device, 3)(device, device_id, &user) == static_cast<HRESULT>(0x89245104) && !user &&
+              rt::shims::xgameruntime_user_open_handles() == 0,
+          "XUserFindForDevice before XUserAddAsync: E_GAMEUSER_USER_NOT_FOUND, no handle");
+    {
+        using AddAsync = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, XAsyncBlock*);
+        using AddResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, void**);
+        void* users = user_object(query);
+        XAsyncBlock add{};
+        void* added = nullptr;
+        check(at<AddAsync>(users, 7)(users, 0x01, &add) == S_OK && finished(&add) &&
+                  at<AddResult>(users, 8)(users, &add, &added) == S_OK && added,
+              "XUserAddAsync collected");
+        at<CloseUser>(users, 4)(users, added);
+    }
     check(at<FindUser>(device, 3)(device, device_id, &user) == S_OK && user, "XUserFindForDevice: the offline user");
     check(rt::shims::xgameruntime_user_open_handles() == 1, "the handle is an XUserHandle the title closes");
     at<CloseUser>(user_object(query), 4)(user_object(query), user);
