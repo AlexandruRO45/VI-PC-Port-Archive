@@ -1253,7 +1253,7 @@ void test_packaged_loader_directories() {
     auto load = reinterpret_cast<HMODULE (WINAPI*)(LPCWSTR)>(lookup("LoadLibraryW"));
     auto add = reinterpret_cast<DLL_DIRECTORY_COOKIE (WINAPI*)(PCWSTR)>(lookup("AddDllDirectory"));
     auto remove = reinterpret_cast<BOOL (WINAPI*)(DLL_DIRECTORY_COOKIE)>(lookup("RemoveDllDirectory"));
-    auto defaults = lookup("SetDefaultDllDirectories");
+    auto defaults = reinterpret_cast<BOOL (WINAPI*)(DWORD)>(lookup("SetDefaultDllDirectories"));
     if (!packaged || !load || !add || !remove || !defaults) {
         failed("packaged loader exports", "missing shim");
         return;
@@ -1295,6 +1295,8 @@ void test_packaged_loader_directories() {
     auto game = g_dir / L"dll_game";
     auto overlay = g_dir / L"dll_overlay";
     std::filesystem::create_directories(game / L"x");
+    std::filesystem::create_directories(overlay / L"x");
+    std::ofstream(overlay / L"x" / L"unrelated.txt") << "overlay";
     rt::fs::configure(game, overlay);
     // The host loader searches user directories only when explicitly requested. Give it a
     // hand-built DLL that exists only in the directory resolved from the console path.
@@ -1309,6 +1311,14 @@ void test_packaged_loader_directories() {
     fixture_out.write(reinterpret_cast<const char*>(fixture.data()), static_cast<std::streamsize>(fixture.size()));
     fixture_out.close();
     auto cookie = add(L"GAME:\\x");
+    HMODULE before = LoadLibraryExW(L"leonida_directory_fixture.dll", nullptr, 0);
+    if (!before) pass("default search excludes registered directories before configuration");
+    else { failed("default search excludes registered directories before configuration", "fixture loaded"); FreeLibrary(before); }
+    if (!defaults(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)) failed("set default DLL directories", "configuration failed");
+    HMODULE after = LoadLibraryExW(L"leonida_directory_fixture.dll", nullptr, 0);
+    if (cookie && after) pass("default search finds bundled fixture through registered directory");
+    else failed("default search finds bundled fixture through registered directory", "fixture not loaded");
+    if (after) FreeLibrary(after);
     HMODULE found = LoadLibraryExW(L"leonida_directory_fixture.dll", nullptr, LOAD_LIBRARY_SEARCH_USER_DIRS);
     if (cookie && found) pass("console DLL directory makes fixture searchable");
     else failed("console DLL directory makes fixture searchable", "registration or load failed");

@@ -367,6 +367,22 @@ Target read_target(const std::wstring& path) {
 
 }  // namespace
 
+bool resolve_dll_directory_paths(const std::wstring& path, std::vector<std::filesystem::path>& out, DWORD& error) {
+    std::filesystem::path resolved;
+    if (!resolve_read_path(path, resolved, error)) return false;
+    out.push_back(resolved);
+    std::vector<std::wstring> parts;
+    size_t prefix_length = 0;
+    if (console_drive(path, prefix_length) == Drive::Game && parse_console(path, parts) == Parsed::Console) {
+        const Roots r = roots();
+        const auto bundled = join(r.game, parts);
+        std::error_code ec;
+        if (resolved != bundled && !deleted(r.overlay, parts) && std::filesystem::is_directory(bundled, ec))
+            out.push_back(bundled);
+    }
+    return true;
+}
+
 bool resolve_read_path(const std::wstring& path, std::filesystem::path& out, DWORD& error) {
     const Target target = read_target(path);
     error = target.error;

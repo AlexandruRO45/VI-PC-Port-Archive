@@ -19,6 +19,7 @@
 #include <windows.h>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rt::fs {
 
@@ -30,6 +31,8 @@ void configure(const std::filesystem::path& game_dir, const std::filesystem::pat
 
 std::filesystem::path game_dir();
 std::filesystem::path overlay_dir();
+
+bool resolve_dll_directory_paths(const std::wstring& path, std::vector<std::filesystem::path>& out, DWORD& error);
 
 bool resolve_read_path(const std::wstring& path, std::filesystem::path& out, DWORD& error);
 

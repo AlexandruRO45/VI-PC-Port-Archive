@@ -236,22 +236,33 @@ HMODULE WINAPI load_packaged_library(LPCWSTR name, DWORD reserved) {
     return nullptr;
 }
 
-std::map<DLL_DIRECTORY_COOKIE, std::filesystem::path>& dll_directories() {
-    static auto* dirs = new std::map<DLL_DIRECTORY_COOKIE, std::filesystem::path>;
+std::map<DLL_DIRECTORY_COOKIE, std::vector<DLL_DIRECTORY_COOKIE>>& dll_directories() {
+    static auto* dirs = new std::map<DLL_DIRECTORY_COOKIE, std::vector<DLL_DIRECTORY_COOKIE>>;
     return *dirs;
 }
 
 DLL_DIRECTORY_COOKIE WINAPI add_dll_directory(PCWSTR dir) {
     if (!dir) return AddDllDirectory(dir);
-    std::filesystem::path resolved;
+    std::vector<std::filesystem::path> resolved;
     DWORD error = 0;
-    if (!rt::fs::resolve_read_path(dir, resolved, error)) {
+    if (!rt::fs::resolve_dll_directory_paths(dir, resolved, error)) {
         SetLastError(error);
         return nullptr;
     }
     std::lock_guard lock(loader_mutex());
-    auto cookie = AddDllDirectory(resolved.c_str());
-    if (cookie) dll_directories().emplace(cookie, resolved);
+    std::vector<DLL_DIRECTORY_COOKIE> cookies;
+    for (const auto& path : resolved) {
+        auto cookie = AddDllDirectory(path.c_str());
+        if (!cookie) {
+            const DWORD last_error = GetLastError();
+            for (auto registered : cookies) RemoveDllDirectory(registered);
+            SetLastError(last_error);
+            return nullptr;
+        }
+        cookies.push_back(cookie);
+    }
+    auto cookie = cookies.front();
+    dll_directories().emplace(cookie, std::move(cookies));
     return cookie;
 }
 
@@ -263,7 +274,10 @@ BOOL WINAPI remove_dll_directory(DLL_DIRECTORY_COOKIE cookie) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (!RemoveDllDirectory(cookie)) return FALSE;
+    while (!it->second.empty()) {
+        if (!RemoveDllDirectory(it->second.back())) return FALSE;
+        it->second.pop_back();
+    }
     dirs.erase(it);
     return TRUE;
 }
