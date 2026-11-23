@@ -432,12 +432,22 @@ OpFunctionEnd
                     self.assertNotIn("Traceback", r.stderr)
                     with open(src, "rb") as f:
                         self.assertEqual(f.read(), before)
-            alias = os.path.join(d, "alias.spvasm")
+            # Links to the source, where the host allows them: same_report_path ends with os.path.samefile, which
+            # is what a hard link needs, and a symlink is the alias a caller is most likely to type by accident.
+            aliases = []
+            hard = os.path.join(d, "hardlink.spvasm")
             try:
-                os.link(src, alias)
+                os.link(src, hard)
+                aliases.append(hard)
+            except (OSError, NotImplementedError, AttributeError):
+                pass
+            sym = os.path.join(d, "symlink.spvasm")
+            try:
+                os.symlink(os.path.basename(src), sym)
+                aliases.append(sym)
             except (OSError, NotImplementedError):
-                alias = None
-            if alias is not None:
+                pass
+            for alias in aliases:
                 with self.subTest(out=alias):
                     r = subprocess.run([sys.executable, "-I", os.path.join(TOOLS, "spirv_asm.py"),
                                         src, "-o", alias], capture_output=True, text=True, errors="replace")
