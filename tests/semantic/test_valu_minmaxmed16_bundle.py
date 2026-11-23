@@ -222,6 +222,13 @@ class TestVMed3U16TranslatorAndControls(unittest.TestCase):
         with self.assertRaises(Exception):
             support.translate_lines("ps_neg_v_med3_u16", ["v_med3_u16", "s_endpgm"])
 
+class TestVMin3I16ReferenceOracle(unittest.TestCase):
+    """Stage 1 for v_min3_i16: reference mathematical oracle validation."""
+
+    def test_v_min3_i16_oracle_identity(self):
+        res = oracle_v_min3_i16(0xfffe, 0x5, 0x14)
+        self.assertEqual(res, 0xfffe)
+
 
 if __name__ == '__main__':
     unittest.main()
