@@ -652,6 +652,41 @@ class BcDecodeTest(unittest.TestCase):
         self.assertGreater(px1e[0][0], 0.0)
         self.assertEqual(px1e[2][0], -px1e[0][0])
 
+    def test_bc6h_finish_scaling_matches_signed_integer_oracle(self):
+        # Microsoft BC6H: truncate the signed scale toward zero, then encode
+        # the sign of that integer, not the sign before scaling.
+        # https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc6h-format
+        lut = ttpf._f16_lut()
+        # The separate -32768 endpoint/clamping defect is covered by PR #6120.
+        for value in range(-32767, 32768):
+            scaled = int(value * 31 / 32)
+            expected = abs(scaled) + (0x8000 if scaled < 0 else 0)
+            actual = struct.unpack("<H", struct.pack("<e", ttpf._bc6h_finish(value, True, lut)))[0]
+            self.assertEqual(actual, expected, f"signed interpolant {value}")
+        for value in range(65536):
+            expected = value * 31 // 64
+            actual = struct.unpack("<H", struct.pack("<e", ttpf._bc6h_finish(value, False, lut)))[0]
+            self.assertEqual(actual, expected, f"unsigned interpolant {value}")
+
+    def test_bc6h_signed_mode14_zero_crossing_interpolants(self):
+        weights = (0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64)
+        for base in range(-8, 9):
+            for delta in range(-8, 8):
+                block = pack_bc6h_block(
+                    0x0F, fields=[[base & 0xFFFF, delta & 0xF, 0, 0],
+                                  [0, 0, 0, 0], [0, 0, 0, 0]],
+                    indices=range(16),
+                )
+                pixels = ttpf.decode_pixels(96, block, 1, 1)
+                expected = []
+                for weight in weights:
+                    interpolant = (base * 64 + delta * weight + 32) // 64
+                    scaled = int(interpolant * 31 / 32)
+                    expected.append(abs(scaled) + (0x8000 if scaled < 0 else 0))
+                words = [struct.unpack("<3H", struct.pack("<3e", *pixel)) for pixel in pixels]
+                self.assertEqual(words, [(word, 0, 0) for word in expected],
+                                 f"base {base}, delta {delta}")
+
     def test_hdr_tonemap_metric(self):
         same = [(0.0, 1.0, 500.0), (1000.0, 0.25, 65504.0)]
         self.assertEqual(ttpf.mean_abs_error(same, same, hdr=True), 0.0)

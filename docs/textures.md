@@ -304,6 +304,14 @@ each mip with a 2x2 box downsample of its parent (at 4x4 block resolution for BC
 resolution for uncompressed). A correct chain is 0–4 levels, as in the SixNG notes; the
 control is the first tail mip detiled at origin (0,0).
 
+Signed BC6H final scaling truncates toward zero before assigning the half-float sign:
+an interpolated integer of -1 therefore becomes positive zero (`0x0000`), not negative
+zero (`0x8000`). This follows [Microsoft's BC6H finalization algorithm](https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc6h-format#unquantization-of-color-endpoints).
+`tests/test_ttpf_mips.py` checks the signed finite range and the full unsigned range
+against an independent signed-integer scaling oracle, plus synthetic mode-14 blocks
+crossing zero at every interpolation weight. The separate signed minimum-endpoint
+behavior is tracked in [#6120](https://github.com/ItsNotRexed/Leonida/pull/6120).
+
 | Pool # | Descriptor | Mips | non_tail / first_tail | Max error | Tail control |
 |---|---|---:|---:|---:|---:|
 | `interiors_0_3` #19 | 512×256 BC1 | 7 | 1 / 3 | 0.38 | 126.06 |

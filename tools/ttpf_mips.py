@@ -370,7 +370,7 @@ def _bc6h_finish(val, signed, lut):
     h = (v * 31) >> 5
     if h > 0x7BFF:
         h = 0x7BFF
-    return lut[h | 0x8000] if neg else lut[h]
+    return lut[h | 0x8000] if neg and h else lut[h]
 
 
 def decode_bc6h_block(data, at, *, signed=False):
