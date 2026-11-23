@@ -81,7 +81,50 @@ struct DeviceProxy {
     std::atomic<std::uint32_t> frame_latency{1};
     std::atomic<bool> frame_event_scheduled{false};
     std::atomic<std::uint64_t> frame_next_token{1};
+    // The real presenter, once a factory has made one for the Xbox slots (d3d12_xs.cpp on the Vulkan backend).
+    // `presentation_mutex` guards creation and the explicit window; `presentation_failed_ms` throttles a retry after
+    // a factory returned null (no visible game window yet), and `presentation_window` is the optional caller window.
+    std::mutex presentation_mutex;
+    std::unique_ptr<XboxPresentationSink> presentation;
+    std::atomic<std::uint64_t> presentation_window{0};
+    std::atomic<std::uint64_t> presentation_failed_ms{0};
+    std::atomic<bool> presentation_logged{false};
 };
+
+std::atomic<XboxPresentationFactory> g_presentation_factory{nullptr};
+
+// The device's real presenter, made by the registered factory the first time an Xbox presentation slot is used. A
+// factory that returns null is retried at most once a second: at device creation the title's window may not exist
+// yet. The interval and origin event the stand-in recorded before a late success are replayed into the pacer so a
+// WaitFrameEventX that follows the first real Wait call has the state the title registered earlier.
+XboxPresentationSink* device_presentation(DeviceProxy* self) {
+    if (!self) return nullptr;
+    std::lock_guard lock(self->presentation_mutex);
+    if (self->presentation) return self->presentation.get();
+    XboxPresentationFactory factory = g_presentation_factory.load(std::memory_order_relaxed);
+    if (!factory) return nullptr;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG failed_at = self->presentation_failed_ms.load(std::memory_order_relaxed);
+    if (failed_at && now - failed_at < 1000) return nullptr;
+    XboxPresentationSink* sink =
+        factory(self->real, self->presentation_window.load(std::memory_order_relaxed));
+    if (!sink) {
+        self->presentation_failed_ms.store(now, std::memory_order_relaxed);
+        if (!self->presentation_logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: no window presenter for the Xbox slots yet; presents are dropped "
+                         "(retrying once a second)\n");
+        return nullptr;
+    }
+    self->presentation.reset(sink);
+    const std::uint32_t interval = self->frame_interval_us.load(std::memory_order_relaxed);
+    if (interval) {
+        sink->SetFrameIntervalX(0, interval, self->frame_latency.load(std::memory_order_relaxed), 0);
+        if (self->frame_event_scheduled.load(std::memory_order_relaxed)) sink->ScheduleFrameEventX(0, 0, 0);
+    }
+    std::fprintf(stderr, "[rt] d3d12_xs: Xbox presentation attached (real PresentX to the title's window)\n");
+    return sink;
+}
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
 
@@ -1199,10 +1242,39 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         }
         note_child_slot<K>(Slot);
         if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
-            // Opt-in: only the slots named by the environment (or, under LEONIDA_CAPTURE, the public HLE's 30/32) are
-            // routed; every other tail slot keeps the refusal below. The HLE's slot numbers are an observation, not
-            // documentation, so a trace can still move them without a code change.
+            // The retail executable presents through queue slot 32 (0x100): PresentX(plane_count, planes, params),
+            // measured at its frame loop (the plane layout is in d3d12_xs_device.h). When a real presenter exists,
+            // that call goes to it before the capture/refusal paths below. An environment-named slot is also a
+            // PresentX slot, so it gets the real presenter when there is one.
             const rt::d3d12::PresentXRouteConfig& route = rt::d3d12::presentx_route_config();
+            const bool present_slot = Slot == 32 || route.present_slot == Slot || route.present_slot_alt == Slot;
+            if (present_slot) {
+                if (XboxPresentationSink* presentation = device_presentation(self->device)) {
+                    static std::atomic<bool> logged{false};
+                    if (!logged.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: queue slot %u -> real PresentX (%u plane(s))\n", Slot,
+                                     static_cast<unsigned>(a1));
+                    d3d12_trace::record(child_trace_name<K>(Slot));
+                    return hr_to_u64(presentation->PresentX(
+                        static_cast<std::uint32_t>(a1),
+                        reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(a2),
+                        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(a3)));
+                }
+                // A registered factory means the Vulkan retail path: the window may not be visible yet (the factory
+                // retries once a second), and a present must not abort the title while it is missing. Drop it.
+                if constexpr (Slot == 32) {
+                    if (g_presentation_factory.load(std::memory_order_relaxed)) {
+                        static std::atomic<bool> dropped{false};
+                        if (!dropped.exchange(true, std::memory_order_relaxed))
+                            std::fprintf(stderr,
+                                         "[rt] d3d12_xs: queue slot 32 PresentX dropped: no window presenter yet "
+                                         "(the factory retries)\n");
+                        d3d12_trace::record(child_trace_name<K>(Slot));
+                        return hr_to_u64(S_OK);
+                    }
+                }
+            }
             if (route.present_slot == Slot || route.present_slot_alt == Slot) {
                 static std::atomic<bool> logged{false};
                 bool expected = false;
@@ -1454,20 +1526,28 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
-    (void)output;
-    (void)flags;
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
+    if (XboxPresentationSink* presentation = device_presentation(self))
+        return presentation->SetFrameIntervalX(output, static_cast<std::uint32_t>(interval_us),
+                                               static_cast<std::uint32_t>(latency ? latency : 1),
+                                               static_cast<std::uint32_t>(flags));
+    (void)output;
+    (void)flags;
     return S_OK;
 }
 
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
+    self->frame_event_scheduled.store(true, std::memory_order_relaxed);
+    if (XboxPresentationSink* presentation = device_presentation(self))
+        return presentation->ScheduleFrameEventX(static_cast<std::uint32_t>(event),
+                                                 static_cast<std::uint32_t>(offset_us),
+                                                 static_cast<std::uint32_t>(flags));
     (void)event;
     (void)offset_us;
     (void)flags;
-    self->frame_event_scheduled.store(true, std::memory_order_relaxed);
     return S_OK;
 }
 
@@ -1476,11 +1556,17 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
 // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
+    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+    if (!token) return E_POINTER;
+    // The real pacer hands out the token its PresentX checks; without a presenter the stand-in below keeps a fresh
+    // non-zero token so the boot can continue (there is no vblank source to wait on yet).
+    if (XboxPresentationSink* presentation = device_presentation(self))
+        return presentation->WaitFrameEventX(static_cast<std::uint32_t>(event),
+                                             static_cast<std::uint32_t>(timeout_ms),
+                                             static_cast<std::uint32_t>(flags), token);
     (void)event;
     (void)timeout_ms;
     (void)flags;
-    auto* token = reinterpret_cast<std::uint64_t*>(token_word);
-    if (!token) return E_POINTER;
     std::uint64_t value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);
     if (value == 0) value = self->frame_next_token.fetch_add(1, std::memory_order_relaxed);  // skip the null token
     *token = value;
@@ -1710,6 +1796,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     // No output: a capability check, answered by the device (S_FALSE, as on the PC).
     if (!out) return self->real->CreateDescriptorHeap(desc, *riid, nullptr);
 
+    // The title's requested description, before the PC-limit cap below: the XMem hook must allocate the size the
+    // title asked for, not the smaller PC heap we can create.
+    const D3D12_DESCRIPTOR_HEAP_DESC* const requested = desc;
+
     // The console takes larger shader-visible CBV/SRV/UAV heaps than a PC device: the retail executable asks for
     // 1,245,184 descriptors, and the PC runtime refuses a heap over the device's MaxViewDescriptorHeapSize
     // (D3D12_OPTIONS19; 1,000,000 below resource binding tier 3, and an RTX 5060 Ti reports no more) with
@@ -1756,10 +1846,10 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         alloc_fn = g_heap_alloc;
         free_fn = g_heap_free;
     }
-    if (alloc_fn && desc && desc->NumDescriptors > 0) {
-        const UINT inc = self->real->GetDescriptorHandleIncrementSize(desc->Type);
-        if (inc > 0 && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
-            const SIZE_T byte_size = static_cast<SIZE_T>(desc->NumDescriptors) * static_cast<SIZE_T>(inc);
+    if (alloc_fn && requested && requested->NumDescriptors > 0) {
+        const UINT inc = self->real->GetDescriptorHandleIncrementSize(requested->Type);
+        if (inc > 0 && requested->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
+            const SIZE_T byte_size = static_cast<SIZE_T>(requested->NumDescriptors) * static_cast<SIZE_T>(inc);
             void* backing = alloc_fn(byte_size, kXmemDescriptorHeapAttributes);
             if (backing) {
                 const auto addr = reinterpret_cast<SIZE_T>(backing);
@@ -1767,6 +1857,15 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
                     custom_cpu_start = addr;
                     custom_byte_size = byte_size;
                     real_cpu_start = raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
+                    static std::atomic<bool> logged_bases{false};
+                    if (!logged_bases.exchange(true, std::memory_order_relaxed))
+                        std::fprintf(stderr,
+                                     "[rt] d3d12_xs: slot 14 title-backed heap: console base=0x%llx bytes=%llu, "
+                                     "real PC base=0x%llx (%u descriptors)\n",
+                                     static_cast<unsigned long long>(custom_cpu_start),
+                                     static_cast<unsigned long long>(custom_byte_size),
+                                     static_cast<unsigned long long>(real_cpu_start),
+                                     desc ? desc->NumDescriptors : 0u);
                 } else if (free_fn) {
                     free_fn(backing, kXmemDescriptorHeapAttributes);
                 }
@@ -2427,6 +2526,15 @@ unsigned detect_slot_count(ID3D12Device* real) {
 }
 
 }  // namespace
+
+void set_xbox_presentation_factory(XboxPresentationFactory factory) {
+    g_presentation_factory.store(factory, std::memory_order_release);
+}
+
+void set_device_presentation_window(void* device, std::uint64_t window) {
+    if (!is_device_proxy(device)) return;
+    static_cast<DeviceProxy*>(device)->presentation_window.store(window, std::memory_order_relaxed);
+}
 
 HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     if (!real) return E_POINTER;

@@ -2198,6 +2198,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME xbox_present COMMAND xbox_present_test)
     set_tests_properties(xbox_present PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The retail executable's measured present path through the proxies: device 78/79/80 (frame events), queue 32
+    # (PresentX) and device 41 (CreateCommandSignature with the console IID), on a real window and swapchain with a
+    # PPM from the presented frame. Needs a Vulkan GPU with presentation; skips (77) without one.
+    add_executable(presentx_window_test test/presentx_window_test.cpp)
+    target_link_libraries(presentx_window_test PRIVATE gta6rt_d3d12_com user32)
+    target_compile_definitions(presentx_window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(presentx_window_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME presentx_window COMMAND presentx_window_test)
+    set_tests_properties(presentx_window PROPERTIES SKIP_RETURN_CODE 77)
+
     # Opt-in PresentX slot routing and windowless capture (docs section 4.5): a synthetic probe calls the configured
     # queue slot through the proxy's vtable. Three processes: capture (PPM pixels), malformed (E_INVALIDARG, no
     # file), inert (the old E_NOTIMPL when the variables are unset). Needs a Vulkan GPU; skips (77) without one.
