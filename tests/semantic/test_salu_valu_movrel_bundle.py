@@ -858,3 +858,39 @@ class TestVMovrelsd2B32Oracle(unittest.TestCase):
         spv = support.translate_lines("ps_vmovrelsd2_zero", lines)
         out = support.mrt0_words(spv)
         self.assertEqual(out[0], 0x99887766)
+
+
+class TestVMovrelsd2B32AST(unittest.TestCase):
+    def test_ast_structure_and_emission(self):
+        m0 = (2 << 16) | 4
+        lines = [
+            "v_mov_b32 v6, 0xCAFED00D",
+            f"s_mov_b32 m0, {m0}",
+            "v_movrelsd_2_b32 v5, v2",
+            "v_mov_b32 v0, v7",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd2_ast", lines)
+        self.assertIn("OpShiftRightLogical", spv)
+        self.assertIn("OpBitwiseAnd", spv)
+
+    def test_ast_execution_semantics(self):
+        m0 = (4 << 16) | 2
+        lines = [
+            "v_mov_b32 v3, 0x11223344",
+            f"s_mov_b32 m0, {m0}",
+            "v_movrelsd_2_b32 v6, v1",
+            "v_mov_b32 v0, v10",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_mov_b32 v3, 0",
+            "exp mrt0 v0, v1, v2, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_vmovrelsd2_exec", lines)
+        out = support.mrt0_words(spv)
+        self.assertEqual(out[0], 0x11223344)
