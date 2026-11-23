@@ -339,6 +339,16 @@ class TestSLshrB64AST(unittest.TestCase):
         expr = SLshrB64Expr(0x10000000000, 40)
         self.assertEqual(expr.eval(), (1, 1))
 
+class TestSLshrB64CrossDwordAndSCC(unittest.TestCase):
+    def test_scc_condition_code(self) -> None:
+        res, scc = ref_s_lshr_b64(1, 1)
+        self.assertEqual((res, scc), (0, 0))
+
+    def test_upper_dword_drain(self) -> None:
+        val = 0x8000000000000000
+        res, scc = ref_s_lshr_b64(val, 63)
+        self.assertEqual((res, scc), (1, 1))
+
 
 if __name__ == "__main__":
     unittest.main()
