@@ -98,6 +98,27 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(assess({"stage": "vs", "wave64": True, "subgroup_size": 32}, CAPS32).reason,
                          "conflicting-wave-width")
 
+    def test_zero_min_subgroup_with_nonzero_max_is_rejected_and_not_required(self):
+        # Both bounds zero is valid (e.g. Vulkan 1.2 without subgroup-size-control properties populated).
+        unpopulated = Device.read(dict(DEVICE_JSON, min_subgroup_size=0, max_subgroup_size=0))
+        self.assertEqual((unpopulated.minimum, unpopulated.maximum), (0, 0))
+        self.assertEqual(assess(shader("ps", width=32), unpopulated).outcome, "default-width")
+
+        # A zero minimum with a nonzero maximum leaves the range incomplete and skips the default <= max check.
+        for bad in (
+            dict(DEVICE_JSON, min_subgroup_size=0, max_subgroup_size=64),
+            dict(DEVICE_JSON, subgroup_size=128, min_subgroup_size=0, max_subgroup_size=64),
+            dict(DEVICE_JSON, subgroup_size=0, min_subgroup_size=0, max_subgroup_size=64),
+            dict(DEVICE_JSON, min_subgroup_size=32, max_subgroup_size=0),
+        ):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "inconsistent device subgroup size range"):
+                Device.read(bad)
+
+        # Even if constructed directly, minimum == 0 must never satisfy required-width.
+        half_zero = replace(HYBRID, minimum=0, maximum=64)
+        self.assertEqual(assess(shader("ps", width=64, tier="C"), half_zero).outcome, "approximate")
+        self.assertEqual(assess(shader("ps", width=32), replace(half_zero, default=64)).outcome, "unsupported")
+
     def test_capability_input_requires_actual_stage_masks(self):
         self.assertEqual(Device.read(DEVICE_JSON), CAPS32)
         for bad in ({}, dict(DEVICE_JSON, subgroup_size=48),
@@ -183,6 +204,15 @@ class CommandLineTest(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
                 self.assertIn("would overwrite", proc.stderr)
         self.assertEqual(spv.read_bytes(), b"unread")
+
+    def test_half_zero_device_range_fails_before_report_creation(self):
+        self.dump(self.caps, dict(DEVICE_JSON, min_subgroup_size=0, max_subgroup_size=64,
+                                  required_subgroup_size_stages=0x30))
+        self.dump(self.index, {"private.pixel": shader("ps", width=64, tier="C")})
+        proc = self.run_audit("--strict", "--report", self.report)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("inconsistent device subgroup size range", proc.stderr)
+        self.assertFalse(self.report.exists())
 
     def test_empty_selection_is_not_a_strict_pass(self):
         self.dump(self.index, {"only_compute": shader("cs")})

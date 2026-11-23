@@ -49,8 +49,8 @@ class Device:
                                               for i, v in enumerate(values) if i != 5):
             raise ValueError("invalid subgroup capability values")
         info = cls(*values)
-        if info.minimum > info.maximum or (info.minimum and info.default and
-                                           not info.minimum <= info.default <= info.maximum):
+        if ((info.minimum == 0) != (info.maximum == 0) or info.minimum > info.maximum
+                or (info.minimum and info.default and not info.minimum <= info.default <= info.maximum)):
             raise ValueError("inconsistent device subgroup size range")
         if any(v and v & (v - 1) for v in (info.default, info.minimum, info.maximum)):
             raise ValueError("device subgroup sizes must be powers of two")
@@ -87,7 +87,7 @@ def assess(entry, caps, *, in_chain=False):
         return Assessment("unsupported", "no-subgroup-operations-in-stage")
     if caps.minimum == caps.maximum == wanted:
         return Assessment("exact", "fixed-width")
-    if caps.control and caps.required & STAGE_BITS[stage] and caps.minimum <= wanted <= caps.maximum:
+    if caps.control and caps.required & STAGE_BITS[stage] and 0 < caps.minimum <= wanted <= caps.maximum:
         if stage in ("ms", "cs"):
             size = entry.get("local_size")
             if not isinstance(size, list) or len(size) != 3 or any(type(v) is not int or v <= 0 for v in size):
