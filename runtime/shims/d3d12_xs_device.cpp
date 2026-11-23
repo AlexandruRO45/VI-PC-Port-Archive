@@ -1739,11 +1739,40 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         static std::atomic<bool> logged127{false};
         if (first_call(logged127)) {
             std::fprintf(stderr,
-                         "[rt] d3d12_xs: slot 127 (unimplemented Xbox slot) args: a1=0x%llx a2=0x%llx a3=0x%llx "
-                         "a4=0x%llx a5=0x%llx a6=0x%llx\n",
+                         "[rt] d3d12_xs: slot 127 (Xbox CreateCommittedResource2) a1=0x%llx a2=0x%llx a3=0x%llx "
+                         "a4=0x%llx a5=0x%llx a6=0x%llx a7=0x%llx a8=0x%llx\n",
                          static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
                          static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
-                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6));
+                         static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6),
+                         static_cast<unsigned long long>(a7), static_cast<unsigned long long>(a8));
+        }
+        const auto* heap_props = reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(a1);
+        const auto heap_flags = static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(a2) & 0x3Fu);
+        const auto* xbox_desc = reinterpret_cast<const D3D12_RESOURCE_DESC*>(a3);
+        const auto* clear_val = reinterpret_cast<const D3D12_CLEAR_VALUE*>(a5);
+        const IID* riid = nullptr;
+        void** out = nullptr;
+        if (a9 && a10 && IsEqualIID(*reinterpret_cast<const IID*>(a9), __uuidof(ID3D12Resource))) {
+            riid = reinterpret_cast<const IID*>(a9);
+            out = reinterpret_cast<void**>(a10);
+        } else if (a7 && a8 && IsEqualIID(*reinterpret_cast<const IID*>(a7), __uuidof(ID3D12Resource))) {
+            riid = reinterpret_cast<const IID*>(a7);
+            out = reinterpret_cast<void**>(a8);
+        } else if (a8 && a9 && IsEqualIID(*reinterpret_cast<const IID*>(a8), __uuidof(ID3D12Resource))) {
+            riid = reinterpret_cast<const IID*>(a8);
+            out = reinterpret_cast<void**>(a9);
+        }
+        if (heap_props && xbox_desc && riid && out) {
+            D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+            pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                                  : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(pc_desc.Flags) & 0x3Fu);
+            const D3D12_CLEAR_VALUE* use_clear =
+                (pc_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+                    ? clear_val
+                    : nullptr;
+            return hr_to_u64(self->real->CreateCommittedResource(heap_props, heap_flags, &pc_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, use_clear, *riid, out));
         }
         return hr_to_u64(E_NOTIMPL);
     } else if constexpr (Slot == 133) {
