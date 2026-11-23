@@ -16036,17 +16036,39 @@ def translate(path):
     else:
         check_printed_encodings(path, info)
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
-    g.exec_static_true = not any(writes_exec(i) for i in insns)
-    if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
-        g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
-                           (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
-    g.round_mode = any(i["op"] == "s_round_mode" or
-                       (i["op"].startswith("s_setreg") and "HW_REG_MODE" in i["args"][0].get("t", ""))
-                       for i in insns)
-    strict_w64 = any(WAVE64_RE.search(" ".join([i["op"]] + [x.get("t", "") for x in i["args"]])) for i in insns)
-    code_w64 = strict_w64 or any(base_op(i["op"]).endswith("_b64") and any(x.get("t") in ("exec", "vcc")
-                                                                            for x in i["args"]) for i in insns)
-    code_w32 = any(WAVE32_RE.search(i["op"]) for i in insns)
+    # One pass answers five questions about the whole listing. Each used to be its own `any(... for i in insns)`
+    # walk, and the wave64 one built a joined string of the opcode and its operands per instruction only to run a
+    # regex on it. A build translates 26,503 shaders, so the walks are worth fusing; each flag stops its own work as
+    # soon as it is set.
+    exec_written = False
+    param_max = -1
+    round_mode = False
+    strict_w64 = code_w64 = code_w32 = False
+    wants_params = stage in ("vs", "ms")    # --f16-interp-fallback places the decoded halves clear of every param
+    for ins in insns:
+        op = ins["op"]
+        args = ins["args"]
+        if not exec_written and writes_exec(ins):
+            exec_written = True
+        if wants_params and op == "exp":
+            token = args[0].get("t", "")
+            if token.startswith("param") and token[5:].isdigit():
+                param_max = max(param_max, int(token[5:]))
+        if not round_mode and (op == "s_round_mode" or
+                               (op.startswith("s_setreg") and "HW_REG_MODE" in args[0].get("t", ""))):
+            round_mode = True
+        if not strict_w64 and (WAVE64_RE.search(op) or
+                               any(WAVE64_RE.search(x.get("t", "")) for x in args)):
+            strict_w64 = True
+        if not code_w64 and base_op(op).endswith("_b64") and any(x.get("t") in ("exec", "vcc") for x in args):
+            code_w64 = True
+        if not code_w32 and WAVE32_RE.search(op):
+            code_w32 = True
+    g.exec_static_true = not exec_written
+    if wants_params:
+        g.param_max = param_max
+    g.round_mode = round_mode
+    code_w64 = strict_w64 or code_w64
     # Authoritative wave size from the FSSM header flags at 0xD4 bit 5 (0x20 = wave32, 0 = wave64;
     # verified with 0 contradictions across all 26,503 corpus blobs). Falls back to the code-marker
     # heuristic (+ wave64 default for NGG mesh shaders) when no FSSM sidecar is present (FSPX or
