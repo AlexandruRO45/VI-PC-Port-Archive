@@ -383,6 +383,24 @@ class SoundnessRegressions(unittest.TestCase):
             "v_mov_b32_e32 v6, s5",
         ], "B", reasons=[], idioms=["readfirstlane-uniform"])
 
+    def test_vote_if_else_both_sides_narrow_exec(self):
+        for tag, op in (("saveexec", "s_andn2_saveexec_b64"), ("wrexec", "s_andn2_wrexec_b64")):
+            lines = vs([
+                "v_cmp_eq_u32_e32 vcc, 1, v0",
+                "s_cbranch_vccz 2",
+                "s_and_saveexec_b64 s[14:15], vcc",
+                "v_mov_b32_e32 v6, 3",
+                "s_mov_b64 exec, s[10:11]",
+                "s_branch 3",
+                f"{op} s[14:15], vcc",
+                "v_mov_b32_e32 v6, 9",
+                "s_mov_b64 exec, s[10:11]",
+                "v_add_nc_u32_e32 v6, 1, v6",
+            ])
+            (tier, reasons, _), asm = meta_of(f"vs_vote_ifelse_{tag}", lines)
+            self.assertNotIn("unsafe-vote-branch", reasons, f"vs_vote_ifelse_{tag}: reasons={reasons}")
+            self.assertEqual(out_param(run_cut(asm, 64)), out_param(run_cut(asm, 32)), f"vs_vote_ifelse_{tag}")
+
 
 if __name__ == "__main__":
     unittest.main()

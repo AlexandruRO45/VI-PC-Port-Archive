@@ -1144,6 +1144,14 @@ class Analysis:
         # that side must be no code of its own: the join, which the run side reaches again.
         ok = run is not None and self.narrows(run, reg) and skip is not None \
             and self.reaches(run, self.past_jumps(skip), n)
+        if not ok and run is not None and skip is not None and run != skip:
+            pos_then_neg = self.narrows(run, reg) and self.narrows_not(skip, reg)
+            neg_then_pos = self.narrows_not(run, reg) and self.narrows(skip, reg)
+            if pos_then_neg or neg_then_pos:
+                r_reach = {b for b in range(self.n) if self.reaches(run, b, n)}
+                s_reach = {b for b in range(self.n) if self.reaches(skip, b, n)}
+                if r_reach & s_reach:
+                    ok = True
         # The early exit of a pixel kill: the side a half takes when its mask is empty only empties EXEC (from that
         # mask or 0), may export with that EXEC and ends, so it writes nothing; the run side narrows EXEC into the
         # mask's whole quads and never widens it again, so in the wave the lanes of that half stay off to the end.
@@ -1340,6 +1348,19 @@ class Analysis:
                 return reg in [(_regs(x) or [None])[0] for x in a[1:] if _regs(x) != ["exec"]]
             if op == "s_mov_b64" and len(a) == 2 and _regs(a[0]) == ["exec"]:
                 return (_regs(a[1]) or [None])[0] == reg
+            return False
+        return False
+
+    def narrows_not(self, blk, reg):
+        for ins in self.blocks[blk]:
+            op = base_op(ins["op"])
+            if op in ("s_waitcnt", "s_nop"):
+                continue
+            a = ins["args"]
+            if op.startswith(("s_andn2_saveexec_b64", "s_andn2_wrexec_b64")) and len(a) == 2:
+                return (_regs(a[1]) or [None])[0] == reg
+            if op == "s_andn2_b64" and len(a) == 3 and _regs(a[0]) == ["exec"] and _regs(a[1]) == ["exec"]:
+                return (_regs(a[2]) or [None])[0] == reg
             return False
         return False
 
