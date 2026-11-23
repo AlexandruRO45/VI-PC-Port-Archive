@@ -290,7 +290,8 @@ int main() {
     XAsyncGetResultSize(&async, &folder_size);
     std::string folder(folder_size, '\0');
     check(folder_size > 0 && at<FolderResult>(save, 31)(save, &async, folder.size(), folder.data()) == S_OK &&
-              std::filesystem::is_directory(std::filesystem::u8path(folder.c_str())),
+              std::filesystem::is_directory(  // the folder is UTF-8: char8_t is C++20's spelling of u8path
+                  std::filesystem::path(reinterpret_cast<const char8_t*>(folder.c_str()))),
           "FilesGetFolderWithUiResult returns a folder that exists");
     int64_t fquota = 0;
     check(at<FilesQuota>(save, 32)(save, user, "SCID", &fquota) == S_OK && fquota == (int64_t{1} << 30),
