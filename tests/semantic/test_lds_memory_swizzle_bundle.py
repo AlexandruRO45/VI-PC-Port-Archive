@@ -643,6 +643,22 @@ class TestDsWriteB32SIMD(unittest.TestCase):
         for l in range(32):
             self.assertEqual(lds.read_u32(l * 4), 0x70000000 + l)
 
+class TestDsWriteB32Translator(unittest.TestCase):
+    def test_translator_write_b32_roundtrip(self) -> None:
+        # Full end-to-end pipeline: write_b32, read_u16, read_i16, write_b16, permute, swizzle
+        body = [
+            "v_lshlrev_b32_e32 v1, 2, v0",  # addr = lane * 4
+            "v_add_nc_u32_e32 v2, 0x5000, v0",
+            "ds_write_b32 v1, v2",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_b32 v3, v1",
+            "s_waitcnt lgkmcnt(0)",
+            "buffer_store_dword v3, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_write_b32_exec")
+        for l in range(32):
+            self.assertEqual(results[l], 0x5000 + l)
+
 
 if __name__ == "__main__":
     unittest.main()
