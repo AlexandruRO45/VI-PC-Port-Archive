@@ -160,6 +160,53 @@ class PsinPschTests(unittest.TestCase):
             self.assertEqual(p2.returncode, 2)
             self.assertIn("overwrite", p2.stderr)
 
+    def test_cli_reports_missing_inputs_unwritable_json_and_carve_dir_collisions_with_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.rpf")
+            p_missing = subprocess.run([sys.executable, "-I", TOOL, missing],
+                                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p_missing.returncode, 2)
+            self.assertIn("ERROR:", p_missing.stderr)
+            self.assertIn("no such file", p_missing.stderr)
+
+            psin_file = os.path.join(tmp, "sample.bin")
+            with open(psin_file, "wb") as f:
+                f.write(build_synthetic_psch_psin())
+
+            missing_carve = os.path.join(tmp, "no_such_carve")
+            p_carve = subprocess.run([sys.executable, "-I", TOOL, psin_file, "--carve-dir", missing_carve],
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p_carve.returncode, 2)
+            self.assertIn("ERROR:", p_carve.stderr)
+            self.assertIn("does not exist", p_carve.stderr)
+
+            # Unwritable --json (parent path is an existing regular file).
+            blocker = os.path.join(tmp, "not_a_dir")
+            with open(blocker, "wb") as f:
+                f.write(b"x")
+            p_unwritable = subprocess.run([sys.executable, "-I", TOOL, psin_file, "--json", os.path.join(blocker, "out.json")],
+                                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p_unwritable.returncode, 2)
+            self.assertIn("ERROR:", p_unwritable.stderr)
+
+            # --json targeting a carved .bin stream listed in --carve-dir/index.json must fail cleanly without modifying it.
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            stream_path = os.path.join(carve, "000000001000.bin")
+            original = b"keep-stream-intact"
+            with open(stream_path, "wb") as f:
+                f.write(original)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": [{"off": 0x1000, "stored": len(original), "size": len(original), "head": original.hex()}]}, f)
+
+            p_col = subprocess.run([sys.executable, "-I", TOOL, psin_file, "--carve-dir", carve, "--json", stream_path],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(p_col.returncode, 2)
+            self.assertIn("ERROR:", p_col.stderr)
+            self.assertIn("overwrite", p_col.stderr)
+            with open(stream_path, "rb") as f:
+                self.assertEqual(f.read(), original)
+
 
 if __name__ == "__main__":
     unittest.main()

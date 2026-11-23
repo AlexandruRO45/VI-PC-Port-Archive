@@ -442,7 +442,9 @@ def check_report_path(out_path: str, target: str, carve_dir: str | None = None,
         raise ValueError(f"--json is a directory: {out_path}")
     if carve_dir:
         idx = os.path.join(carve_dir, "index.json")
-        if same_report_path(out_path, carve_dir) or same_report_path(out_path, idx):
+        if os.path.isdir(carve_dir) and os.path.isfile(idx):
+            gm.check_report_path(out_path, carve_dir, rows=gm._read_index_rows(carve_dir))
+        elif same_report_path(out_path, carve_dir) or same_report_path(out_path, idx):
             raise ValueError(f"--json would overwrite the input {carve_dir}")
     if os.path.isdir(target):
         if os.path.isfile(os.path.join(target, "index.json")):
@@ -467,6 +469,9 @@ def main(argv=None) -> int:
     if not os.path.exists(a.target):
         print(f"ERROR: cannot read {a.target}: no such file or folder", file=sys.stderr)
         return 2
+    if a.carve_dir and not os.path.exists(a.carve_dir):
+        print(f"ERROR: {a.carve_dir}: does not exist", file=sys.stderr)
+        return 2
     try:
         if a.json:
             rows = (
@@ -477,8 +482,9 @@ def main(argv=None) -> int:
             check_report_path(a.json, a.target, a.carve_dir, rows=rows)
         summary = scan_target(a.target, carve_dir=a.carve_dir)
     except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
-        print("error:", e, file=sys.stderr)
-        return 2 if isinstance(e, ValueError) and "--json" in str(e) else 1
+        print(f"ERROR: {e}", file=sys.stderr)
+        is_cli_err = isinstance(e, OSError) or (isinstance(e, ValueError) and "--json" in str(e))
+        return 2 if is_cli_err else 1
 
     print(
         f'PSCH containers: {summary["valid_containers"]}/{summary["containers"]} valid '
@@ -509,8 +515,8 @@ def main(argv=None) -> int:
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:
                 json.dump(summary, f, indent=1)
         except OSError as e:
-            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
-            return 1
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
         print("wrote", a.json)
 
     return 0 if summary["valid"] else 1
