@@ -17,6 +17,7 @@ OpEntryPoint Fragment %main "main" %out
 %bool = OpTypeBool
 %v2float = OpTypeVector %float 2
 %v2uint = OpTypeVector %uint 2
+%v2bool = OpTypeVector %bool 2
 %_ptr_Output_uint = OpTypePointer Output %uint
 %out = OpVariable %_ptr_Output_uint Output
 %c0 = OpConstant %uint 0
@@ -143,6 +144,17 @@ class InterpreterTests(unittest.TestCase):
                 "%res = OpBitcast %uint %y\n")
         out = si.run_fragment(text + body + "OpStore %out %res\n" + FOOTER, push_constants=[0x3F800000])
         self.assertEqual(out["%out"], (0x40000000,))
+
+    def test_vector_bool_select_is_component_wise(self):
+        # SPIR-V OpSelect: Condition may be a vector of bool; each component picks from the matching operand.
+        # Object 1 = (1, 2), Object 2 = (0xFFFFFFF0, 0xFFFFFFFF): they differ in BOTH components, so taking the
+        # wrong operand in either one changes the result. Condition (true, false) must give (1, 0xFFFFFFFF).
+        body = ("%cond = OpCompositeConstruct %v2bool %t %f\n"
+                "%a = OpCompositeConstruct %v2uint %c1 %c2\n"
+                "%b = OpCompositeConstruct %v2uint %cF0 %cFF\n"
+                "%r = OpSelect %v2uint %cond %a %b\n")
+        self.assertEqual(tuple(run_word(f"{body}%res = OpCompositeExtract %uint %r {i}\n") for i in (0, 1)),
+                         (1, 0xFFFFFFFF))
 
     def test_integer_ops_wrap(self):
         self.assertEqual(run_word("%res = OpIAdd %uint %cFF %c2\n"), 1)

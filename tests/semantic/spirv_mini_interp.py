@@ -776,9 +776,17 @@ def _invocation(text, inputs, push_constants, memory, step=False):
                 p[0][p[1]] = new & MASK
             values[res] = old
         elif op == "OpSelect":
-            if not isinstance(val(a[1]), bool):
-                raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
-            values[res] = val(a[2]) if val(a[1]) else val(a[3])
+            cond, yes, no = val(a[1]), val(a[2]), val(a[3])
+            if isinstance(cond, tuple):
+                if not all(isinstance(v, bool) for v in cond) or not (isinstance(yes, tuple) and
+                                                                       isinstance(no, tuple)):
+                    raise UnsupportedConstruct("OpSelect with a non-bool-vector condition")
+                # SPIR-V OpSelect: a vector condition selects each component from the matching operand.
+                values[res] = tuple(t if c else f for c, t, f in zip(cond, yes, no))
+            else:
+                if not isinstance(cond, bool):
+                    raise UnsupportedConstruct("OpSelect with a non-scalar-bool condition")
+                values[res] = yes if cond else no
         elif op == "OpCopyObject":
             values[res] = val(a[1])
         elif op == "OpBitcast":
