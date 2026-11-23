@@ -499,6 +499,36 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
 
+    def test_rejects_non_positive_dimensions(self):
+        # A zero dimension used to raise ZeroDivisionError in the coverage ratio, and two
+        # negative ones multiplied to a positive area, so the oracle accepted any image.
+        for width, height in ((0, 4), (4, 0), (-4, 4), (4, -4), (-4, -4)):
+            with self.subTest(dimensions=f"{width}x{height}"):
+                with self.assertRaisesRegex(AssertionError, "positive ints"):
+                    check_image(self.image(), self.manifest | {"width": width, "height": height})
+
+    def test_rejects_zero_dimensions_on_an_empty_image(self):
+        # The old crash: empty data matched the 0-byte expectation and the ratio divided by zero.
+        with self.assertRaisesRegex(AssertionError, "positive ints"):
+            check_image(b"", self.manifest | {"width": 0, "height": 0})
+
+    def test_rejects_non_int_dimensions(self):
+        for width, height in (("4", 4), (4.0, 4), (True, 4)):
+            with self.subTest(dimensions=f"{width!r}x{height!r}"):
+                with self.assertRaisesRegex(AssertionError, "positive ints"):
+                    check_image(self.image(), self.manifest | {"width": width, "height": height})
+
+
+class DimensionArgumentTests(unittest.TestCase):
+    """--width and --height are refused before the tool touches a harness or a package."""
+
+    def test_cli_refuses_non_positive_dimensions(self):
+        for argv in (["--width", "0"], ["--height", "-4"], ["--width", "-2", "--height", "-2"]):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    fl.main(argv)
+            self.assertEqual(caught.exception.code, 2)
+
 
 class ProbeCoordinateTests(unittest.TestCase):
     rgba = (0.25, 0.75, 0.0, 1.0)

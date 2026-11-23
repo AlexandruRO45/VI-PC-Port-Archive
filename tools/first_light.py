@@ -680,6 +680,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
             raise AssertionError(f"{field} must contain exactly four RGBA values")
 
     width, height = manifest["width"], manifest["height"]
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise AssertionError(
+            f"manifest dimensions must be positive ints, got {width!r}x{height!r}"
+        )
 
     def pixel_offset(point, field: str) -> int:
         if (
@@ -957,6 +961,8 @@ def main(argv=None) -> int:
         help="list VS/PS names in the carve index and exit",
     )
     a = ap.parse_args(argv)
+    if a.width <= 0 or a.height <= 0:
+        ap.error("--width and --height must be positive")
     if a.camera:
         if a.vs not in (None, CAMERA_VS):
             ap.error(f"--camera writes the constant layout of {CAMERA_VS} only")
