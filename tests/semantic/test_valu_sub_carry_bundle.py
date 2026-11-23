@@ -518,5 +518,37 @@ class VSubCoCiU32AstInterpreterTests(unittest.TestCase):
         self.assertEqual(out[1], 0)
 
 
+class VSubCoCiU32SimdBoundaryTests(unittest.TestCase):
+    """64-bit ripple borrow chains and clamp saturation for v_sub_co_ci_u32."""
+
+    def test_64bit_ripple_borrow_chain_translator(self):
+        # 0x00000001_00000000 - 0x00000000_00000001 = 0x00000000_FFFFFFFF
+        out = run_prog([
+            "v_mov_b32 v2, 0",  # low minuend
+            "v_mov_b32 v3, 1",  # high minuend
+            "v_mov_b32 v4, 1",  # low subtrahend
+            "v_mov_b32 v5, 0",  # high subtrahend
+            "v_sub_co_u32 v0, vcc, v2, v4",
+            "v_sub_co_ci_u32 v1, vcc, v3, v5, vcc",
+            "v_cndmask_b32 v2, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 0xFFFFFFFF)  # low dword
+        self.assertEqual(out[1], 0x0)         # high dword
+        self.assertEqual(out[2], 0)           # final borrow out
+
+    def test_clamp_saturation_translator(self):
+        # 10 - 20 - 1 clamp -> 0 (borrow=1)
+        out = run_prog([
+            "v_mov_b32 v0, 10",
+            "v_mov_b32 v1, 20",
+            "v_sub_co_u32 v2, vcc, 0, 1",  # vcc = 1
+            "v_sub_co_ci_u32 v3, vcc, v0, v1, vcc clamp",
+            "v_mov_b32 v0, v3",
+            "v_cndmask_b32 v1, 0, 1, vcc",
+        ])
+        self.assertEqual(out[0], 0)
+        self.assertEqual(out[1], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
