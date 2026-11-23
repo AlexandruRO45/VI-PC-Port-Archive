@@ -198,5 +198,27 @@ class TestSTtraceDataRejection(unittest.TestCase):
         self.assertIn("s_ttrace_data", str(cm.exception))
 
 
+class TestSTtraceDataImmReference(unittest.TestCase):
+    def test_basic_ttracedata_imm_emission(self):
+        lines = [
+            "s_mov_b32 s0, 0x99887766",
+            "s_ttracedata_imm 100",
+            "v_mov_b32 v0, s0",
+        ]
+        words = run_ps(lines)
+        self.assertEqual(words, [0x99887766, 0x99887766, 0x99887766, 0x99887766])
+
+    def test_ttracedata_imm_mrt0_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0x11",
+            "v_mov_b32 v1, 0x22",
+            "v_mov_b32 v2, 0x33",
+            "v_mov_b32 v3, 0x44",
+            "s_ttracedata_imm 0",
+        ]
+        words = run_ps(lines, ("v0", "v1", "v2", "v3"))
+        self.assertEqual(words, [0x11, 0x22, 0x33, 0x44])
+
+
 if __name__ == "__main__":
     unittest.main()
