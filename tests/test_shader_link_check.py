@@ -487,6 +487,26 @@ class CommandLineTest(unittest.TestCase):
         self.assertIn("duplicate key 'vs'", result.stderr)
         self.assertFalse(self.report.exists())
 
+    def test_deeply_nested_manifest_returns_clean_error(self):
+        # CPython 3.14 can parse tens of thousands of levels before raising RecursionError.
+        # Leave the arrays unclosed to exercise the decoder with a malformed manifest.
+        self.manifest.write_bytes(b'{"pipelines":' + b"[" * 100_000)
+        for existing_report in (None, b"previous report\n"):
+            with self.subTest(existing_report=existing_report):
+                if existing_report is not None:
+                    self.report.write_bytes(existing_report)
+                result = self.run_batch("--report", self.report)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(
+                    result.stderr.splitlines(),
+                    [f"shader_link_check: error: {self.manifest}: JSON nesting is too deep"],
+                )
+                if existing_report is None:
+                    self.assertFalse(self.report.exists())
+                else:
+                    self.assertEqual(self.report.read_bytes(), existing_report)
+
     def test_bad_manifest_fields_return_clean_error(self):
         cases = [
             {"version": True, "pipelines": []},
