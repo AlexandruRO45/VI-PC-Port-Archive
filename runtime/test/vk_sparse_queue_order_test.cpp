@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <utility>
 
@@ -30,6 +31,8 @@ struct Trace {
     VkSemaphore producer = VK_NULL_HANDLE;
     std::uint64_t producer_completed = 0;
     unsigned host_waits = 0;
+    VkResult bind_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+    std::function<void()> on_idle;
 };
 
 Trace trace;
@@ -59,10 +62,13 @@ VulkanDeviceFunctions fake_driver() {
         return VK_SUCCESS;
     };
     vk.vkDestroyBuffer = +[](VkDevice, VkBuffer, const VkAllocationCallbacks*) {};
-    vk.vkQueueWaitIdle = +[](VkQueue) { return VK_SUCCESS; };
+    vk.vkQueueWaitIdle = +[](VkQueue) {
+        if (trace.on_idle) trace.on_idle();
+        return VK_SUCCESS;
+    };
     vk.vkQueueBindSparse = +[](VkQueue, std::uint32_t count, const VkBindSparseInfo*, VkFence) {
         trace.binds += count;
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
+        return trace.bind_result;
     };
     vk.vkQueueSubmit = +[](VkQueue, std::uint32_t count, const VkSubmitInfo* info, VkFence) {
         trace.submits += count;
@@ -212,6 +218,84 @@ bool signals_on_distinct_queues() {
            waiting_for_ten->point.queue->semaphore == predecessor;
 }
 
+bool run_lost_bind(VkResult result, bool logical) {
+    trace = {};
+    trace.bind_result = result;
+    const bool lost = result == VK_ERROR_DEVICE_LOST;
+    VulkanContext context(device_proc, handle<VkDevice>(1), true);
+    VulkanFence gate(context, 0);
+    auto queue = std::make_unique<VulkanQueue>(context, handle<VkQueue>(1), 0);
+    if (!queue->ok() || !gate.semaphore()) return false;
+
+    constexpr ResourceId id = 1;
+    auto buffer = std::make_shared<SparseResource>(context.device(), context.vk);
+    buffer->buffer = handle<VkBuffer>(1);
+    buffer->tile_count = 1;
+    buffer->memory_types = 1;
+    auto old_heap = std::make_shared<const TileHeapAllocation>(
+        TileHeapAllocation{handle<VkDeviceMemory>(1), 0, tile_size_in_bytes, 0});
+    auto new_heap = std::make_shared<const TileHeapAllocation>(
+        TileHeapAllocation{handle<VkDeviceMemory>(2), 0, tile_size_in_bytes, 0});
+    buffer->mapped.emplace(0, TileMapping{old_heap, 0});
+    ResourceBinding binding{};
+    binding.buffer = buffer->buffer;
+    binding.size = tile_size_in_bytes;
+    binding.sparse_buffer = true;
+    context.add_sparse_resource(id, binding, buffer);
+
+    auto wait_pin = std::make_shared<int>(0);
+    const std::weak_ptr<int> watched_wait = wait_pin;
+    const std::weak_ptr<SparseResource> watched_buffer = buffer;
+    const std::weak_ptr<const TileHeapAllocation> watched_old = old_heap, watched_new = new_heap;
+    std::weak_ptr<const QueueProgress> watched_progress;
+    auto logical_gate = logical ? std::make_shared<LogicalFence>(context, 0) : nullptr;
+    if (logical_gate) queue->wait_fence(logical_gate, 1);
+    else queue->wait(gate.semaphore(), 1, [&] { return wait_pin; });
+    const std::array regions{TileRegion{0, 1}};
+    const std::array ranges{TileRange{TileRangeMode::sequential, 0, 1}};
+    if (!queue->update_tiles(id, regions, ranges, [&](bool, std::uint32_t) { return new_heap; })) return false;
+
+    // The held operation must keep the resource and allocations even if the application releases all
+    // of them. Eject the mock's deferred-deletion reference too so only the queue owns the buffer.
+    context.remove_resource(id);
+    context.drain_deleted_resources(UINT64_MAX);
+    old_heap.reset();
+    new_heap.reset();
+    wait_pin.reset();
+    buffer.reset();
+    if (logical_gate) {
+        VulkanQueue producer(context, handle<VkQueue>(2), 0);
+        if (!producer.ok() || !producer.signal_fence(logical_gate, 1)) return false;
+        watched_progress = logical_gate->submitted_point(1).queue;
+        trace.producer = trace.signal_semaphore;
+        trace.producer_completed = trace.signal_value;
+        if (logical_gate->completed() != 1) return false;
+        logical_gate->close();
+        logical_gate.reset();
+    } else {
+        context.holds().signaled(gate.semaphore(), 1);
+        context.holds().pump_ready();
+    }
+
+    const auto wait_alive = [&] { return logical ? !watched_progress.expired() : !watched_wait.expired(); };
+    const auto backing_alive = [&] {
+        return !watched_buffer.expired() && !watched_old.expired() && !watched_new.expired();
+    };
+    const auto backing_gone = [&] {
+        return watched_buffer.expired() && watched_old.expired() && watched_new.expired();
+    };
+    const bool before_idle = wait_alive() && (lost ? backing_alive() : backing_gone());
+    bool at_idle = false;
+    trace.on_idle = [&] { at_idle = wait_alive() && (!lost || backing_alive()); };
+    queue.reset();
+    trace.on_idle = {};
+    const bool ok = trace.binds == 1 && trace.submits == static_cast<unsigned>(logical) &&
+                    context.is_device_lost() == lost && before_idle && at_idle && backing_gone() && !wait_alive();
+    if (!ok) std::fprintf(stderr, "%s deferred sparse bind lifetime: unexpected result for VkResult %d\n",
+                          logical ? "logical" : "raw", result);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -226,6 +310,10 @@ int main() {
     bool ok = true;
     for (const auto& test : cases) ok = run(test) && ok;
     ok = signals_on_distinct_queues() && ok;
-    if (ok) std::puts("Sparse queue order: deferred mappings preserve waits; GPU fence signals are ordered");
+    for (const auto result : {VK_ERROR_DEVICE_LOST, VK_ERROR_OUT_OF_HOST_MEMORY}) {
+        ok = run_lost_bind(result, false) && ok;
+        ok = run_lost_bind(result, true) && ok;
+    }
+    if (ok) std::puts("Sparse queue order: preserved raw and logical waits, bindings and cross-queue signals");
     return ok ? 0 : 1;
 }

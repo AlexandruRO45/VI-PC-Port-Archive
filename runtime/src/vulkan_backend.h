@@ -3077,13 +3077,13 @@ private:
         case Deferred::Kind::tile_mapping:
             if (!op.tile_mapping())
                 std::fprintf(stderr, "[rt] d3d12: a held tile mapping failed when it was released\n");
-            // A no-op or rejected mapping did not submit its GPU waits. Forward them to the next submission.
             break;
         }
         // A rejected submission or a no-op mapping leaves its waits for the next submission.
         if (!waits_.empty() || !logical_waits_.empty())
             preserve_deferred_waits(later_waits, later_values, later_pins, later_logical);
-        retire_pins(op.pins, submitted_);
+        const auto pin_ticket = context_.is_device_lost() ? UINT64_MAX : submitted_;
+        retire_pins(op.pins, pin_ticket);
         waits_ = std::move(later_waits);
         wait_values_ = std::move(later_values);
         wait_pins_ = std::move(later_pins);
@@ -3114,8 +3114,8 @@ private:
     // Holder: called by the thread whose Signal made a held operation ready (never with a queue lock held).
     bool release_ready() override {
         std::vector<std::shared_ptr<void>> retired;
+        std::vector<Deferred> abandoned;  // release COM pins outside state_mutex_
         bool released = false;
-        std::deque<Deferred> dropped;
         {
             std::lock_guard state(state_mutex_);
             while (!held_.empty() && (context_.is_device_lost() || ready(held_.front()))) {
@@ -3125,11 +3125,11 @@ private:
                 if (has_wait(op.logical_waits, LogicalFenceWait::Status::cancelled)) {
                     std::fprintf(stderr, "[rt] d3d12: a fence was released while a queue still held work waiting on it; "
                                          "that work is dropped\n");
-                    dropped.push_back(std::move(op));
+                    abandoned.push_back(std::move(op));
                 } else if (!context_.is_device_lost()) {
                     run(op);
                 } else {
-                    dropped.push_back(std::move(op));
+                    abandoned.push_back(std::move(op));
                 }
                 released = true;
             }
@@ -3257,6 +3257,7 @@ private:
         // Vulkan needs the resource until the bind completes and the previous allocation until it is unmapped.
         std::vector<std::shared_ptr<const TileHeapAllocation>> old_heaps;
         std::shared_ptr<SparseResource> resource;
+        std::map<std::uint64_t, TileMapping> lost_mappings{};  // new allocations a lost bind may still reference
     };
 
     struct SubmittedWaits {
@@ -3375,8 +3376,9 @@ private:
                               VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS || !submit(command_buffer, VK_NULL_HANDLE, 0)) {
-            slot->ticket = 0;
+        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS ||
+            !submit(command_buffer, VK_NULL_HANDLE, 0)) {
+            if (!context_.is_device_lost()) slot->ticket = 0;
             return false;
         }
         context_.tracker_.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
@@ -3427,7 +3429,14 @@ private:
             binds.push_back({resource_offset, tile_size_in_bytes, memory, page.offset, 0});
         }
         if (binds.empty() && image_binds.empty()) return true;
-        if (!image_binds.empty() && !initialize_sparse_image_layout(id, resource->image)) return false;
+        if (!image_binds.empty() && !initialize_sparse_image_layout(id, resource->image)) {
+            // The layout transition may already refer to this image if its submit returned device loss.
+            if (context_.is_device_lost()) {
+                pending.ticket = UINT64_MAX;
+                pending_bindings_.push_back(std::move(pending));
+            }
+            return false;
+        }
         const auto ticket = submitted_ + 1;
         pending.ticket = ticket;
         const auto done = completed();
@@ -3465,8 +3474,18 @@ private:
             std::lock_guard lock(context_.submit_mutex());
             const auto result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result != VK_SUCCESS) {
-                if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
-                pending_bindings_.pop_back();
+                if (result == VK_ERROR_DEVICE_LOST) {
+                    // Vulkan may have accepted this bind. Keep both sets of allocations and its wait
+                    // semaphores alive until this queue has waited for idle in its destructor.
+                    auto& lost = pending_bindings_.back();
+                    lost.ticket = UINT64_MAX;
+                    lost.lost_mappings = std::move(changes);
+                    clear_waits(UINT64_MAX);
+                    consume_logical_waits(UINT64_MAX);
+                    context_.mark_device_lost();
+                } else {
+                    pending_bindings_.pop_back();
+                }
                 return false;
             }
             context_.record_submit_locked(progress_, ticket);
@@ -3671,7 +3690,7 @@ private:
         }
         if (res == VK_ERROR_DEVICE_LOST) {
             context_.mark_device_lost();
-            clear_waits();
+            clear_waits(UINT64_MAX);
             // A device-lost submit may still refer to these timelines. Keep them through queue teardown,
             // independent of pending signals that the LogicalFence may already have discarded.
             consume_logical_waits(UINT64_MAX, std::move(predecessor_progress));
