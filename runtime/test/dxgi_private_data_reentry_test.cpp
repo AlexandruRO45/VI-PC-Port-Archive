@@ -1,4 +1,4 @@
-// Exercise the factory's IDXGIObject private data without a GPU or a swapchain.
+// Exercise the factory's private data and adapter event allocation without a GPU or a swapchain.
 #include "../shims/dxgi_com.h"
 
 #include <algorithm>
@@ -31,19 +31,21 @@ constexpr GUID kValue{0x5eed0101, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b,
 constexpr GUID kInterface{0x5eed0102, 0x1d3d, 0x4c12, {0x9a, 0x41, 0x77, 0x10, 0x2b, 0x6c, 0, 2}};
 constexpr UINT kValueData = 81;
 
+template<class T = IDXGIFactory4>
 struct FactoryRef {
-    IDXGIFactory4* ptr = nullptr;
+    T* ptr = nullptr;
     ~FactoryRef() { if (ptr) ptr->Release(); }
 };
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL no_device_proc(VkDevice, const char*) { return nullptr; }
 
-HRESULT create_layer_factory(leonida::VulkanContext& context, FactoryRef& factory) {
+template<class T>
+HRESULT create_layer_factory(leonida::VulkanContext& context, FactoryRef<T>& factory) {
     return rt::dxgi::create_factory(context, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, nullptr, VK_NULL_HANDLE, 0,
                                     IID_PPV_ARGS(&factory.ptr));
 }
 
-HRESULT create_native_factory(FactoryRef& factory) {
+HRESULT create_native_factory(FactoryRef<>& factory) {
     using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
     // The module stays loaded for the lifetime of the short-lived comparison process.
     const HMODULE module = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -65,14 +67,17 @@ struct Payload final : IUnknown {
     ULONG STDMETHODCALLTYPE AddRef() override {
         if (owner) {
             UINT size = sizeof(UINT), value = 0;
-            callback_ok = owner->GetPrivateData(kValue, &size, &value) == S_OK &&
-                          size == sizeof(value) && value == kValueData;
+            const HRESULT read = owner->GetPrivateData(kValue, &size, &value);
             // Replace the very entry the outer call is reading before it acquires its COM reference.
-            callback_ok &= owner->SetPrivateData(kInterface, sizeof(value), &value) == S_OK && refs == 1;
+            const HRESULT replace = owner->SetPrivateData(kInterface, sizeof(value), &value);
+            if (check_layer_guarantees)
+                callback_ok = read == S_OK && size == sizeof(value) && value == kValueData &&
+                              replace == S_OK && refs == 1;
         }
         if (entered) {
             entered->set_value();
-            callback_ok = removed.wait_for(3s) == std::future_status::ready && refs == 1;
+            const bool removed_in_time = removed.wait_for(3s) == std::future_status::ready;
+            if (check_layer_guarantees) callback_ok = removed_in_time && refs == 1;
         }
         return ++refs;
     }
@@ -84,16 +89,23 @@ struct Payload final : IUnknown {
     IDXGIObject* owner = nullptr;
     std::promise<void>* entered = nullptr;
     std::future<void> removed;
+    bool check_layer_guarantees = true;
     bool callback_ok = false;
 };
 
 bool reentrant_replace(IDXGIObject& factory, Payload& payload) {
     if (factory.SetPrivateData(kValue, sizeof(kValueData), &kValueData) != S_OK ||
-        factory.SetPrivateDataInterface(kInterface, &payload) != S_OK || payload.Release() != 1) return false;
+        factory.SetPrivateDataInterface(kInterface, &payload) != S_OK) return false;
+    const ULONG refs = payload.Release();
+    if (payload.check_layer_guarantees && refs != 1) return false;
     payload.owner = &factory;
     UINT size = sizeof(IUnknown*);
     IUnknown* result = nullptr;
     const HRESULT hr = factory.GetPrivateData(kInterface, &size, &result);
+    if (!payload.check_layer_guarantees) {
+        if (SUCCEEDED(hr) && result == &payload) result->Release();
+        return true;
+    }
     const bool read_ok = hr == S_OK && size == sizeof(result) && result == &payload && payload.callback_ok;
     const bool released = result == &payload && result->Release() == 0;
     UINT value = 0;
@@ -103,7 +115,9 @@ bool reentrant_replace(IDXGIObject& factory, Payload& payload) {
 }
 
 bool concurrent_remove(IDXGIObject& factory, Payload& payload) {
-    if (factory.SetPrivateDataInterface(kInterface, &payload) != S_OK || payload.Release() != 1) return false;
+    if (factory.SetPrivateDataInterface(kInterface, &payload) != S_OK) return false;
+    const ULONG refs = payload.Release();
+    if (payload.check_layer_guarantees && refs != 1) return false;
     std::promise<void> entered, removed;
     auto started = entered.get_future();
     payload.entered = &entered;
@@ -115,10 +129,14 @@ bool concurrent_remove(IDXGIObject& factory, Payload& payload) {
     std::thread reader([&] { hr = factory.GetPrivateData(kInterface, &size, &result); });
     const bool started_read = started.wait_for(3s) == std::future_status::ready;
     const bool erased = started_read && factory.SetPrivateDataInterface(kInterface, nullptr) == S_OK;
-    const bool retained = payload.refs == 1;
+    const bool retained = !payload.check_layer_guarantees || payload.refs == 1;
     removed.set_value();
     reader.join();
 
+    if (!payload.check_layer_guarantees) {
+        if (SUCCEEDED(hr) && result == &payload) result->Release();
+        return started_read;
+    }
     const bool read_ok = hr == S_OK && size == sizeof(result) && result == &payload && payload.callback_ok;
     const bool released = result == &payload && result->Release() == 0;
     size = sizeof(IUnknown*);
@@ -142,7 +160,7 @@ bool reports_oom(int allocations, Call call) {
 
 bool failed_insert(leonida::VulkanContext& context, int allocations, bool with_interface) {
     Payload payload;
-    FactoryRef factory;
+    FactoryRef<> factory;
     if (FAILED(create_layer_factory(context, factory))) return false;
     const bool oom = reports_oom(allocations, [&] {
         return with_interface ? factory.ptr->SetPrivateDataInterface(kInterface, &payload)
@@ -155,7 +173,7 @@ bool failed_insert(leonida::VulkanContext& context, int allocations, bool with_i
 
 bool failed_replace_interface(leonida::VulkanContext& context, bool with_interface) {
     Payload original, replacement;
-    FactoryRef factory;
+    FactoryRef<> factory;
     if (FAILED(create_layer_factory(context, factory)) ||
         factory.ptr->SetPrivateDataInterface(kInterface, &original) != S_OK) return false;
     const bool oom = reports_oom(0, [&] {
@@ -173,7 +191,7 @@ bool failed_replace_interface(leonida::VulkanContext& context, bool with_interfa
 
 bool failed_replace_bytes(leonida::VulkanContext& context, bool with_interface) {
     Payload replacement;
-    FactoryRef factory;
+    FactoryRef<> factory;
     if (FAILED(create_layer_factory(context, factory)) ||
         factory.ptr->SetPrivateData(kValue, sizeof(kValueData), &kValueData) != S_OK) return false;
     const UINT changed = kValueData + 1;
@@ -191,7 +209,7 @@ bool concurrent_updates(leonida::VulkanContext& context) {
     std::array<Payload, thread_count> values;
     std::atomic<bool> ok{true};
     {
-        FactoryRef factory;
+        FactoryRef<> factory;
         if (FAILED(create_layer_factory(context, factory))) return false;
         std::array<std::jthread, thread_count> threads;
         for (std::size_t t = 0; t < threads.size(); ++t) {
@@ -215,6 +233,21 @@ bool concurrent_updates(leonida::VulkanContext& context) {
         }
     }
     return ok && std::all_of(values.begin(), values.end(), [](const Payload& value) { return value.refs == 1; });
+}
+
+bool failed_adapter_event_registration(leonida::VulkanContext& context) {
+    FactoryRef<IDXGIFactory7> factory;
+    if (FAILED(create_layer_factory(context, factory))) return false;
+    const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    constexpr DWORD sentinel = 0xDEAD;
+    DWORD cookie = sentinel;
+    const bool oom = reports_oom(0, [&] { return factory.ptr->RegisterAdaptersChangedEvent(event, &cookie); });
+    const bool unchanged = cookie == sentinel;
+    const HRESULT retry = factory.ptr->RegisterAdaptersChangedEvent(event, &cookie);
+    const HRESULT unregister = retry == S_OK ? factory.ptr->UnregisterAdaptersChangedEvent(cookie) : E_FAIL;
+    CloseHandle(event);
+    return oom && unchanged && retry == S_OK && cookie == 1 && unregister == S_OK;
 }
 
 bool run_child(const wchar_t* scenario, bool native) {
@@ -266,7 +299,8 @@ int wmain(int argc, wchar_t** argv) {
             (implementation != L"native" && implementation != L"layer")) return 2;
         leonida::VulkanContext context(no_device_proc, VK_NULL_HANDLE, false);
         Payload payload;
-        FactoryRef factory;
+        payload.check_layer_guarantees = implementation == L"layer";
+        FactoryRef<> factory;
         const HRESULT hr = implementation == L"native" ? create_native_factory(factory)
                                                        : create_layer_factory(context, factory);
         if (FAILED(hr) || !factory.ptr) {
@@ -279,9 +313,15 @@ int wmain(int argc, wchar_t** argv) {
     }
     const bool native = argc == 2 && std::wstring_view(argv[1]) == L"--native";
     if (argc != 1 && !native) return 2;
-    const bool reentrant = report("AddRef reentry and replacement", run_child(L"reentrant", native));
-    const bool concurrent = report("Concurrent removal during AddRef", run_child(L"concurrent", native));
-    if (native) return reentrant && concurrent ? 0 : 1;
+    if (native) {
+        const bool reentrant = run_child(L"reentrant", true);
+        const bool concurrent = run_child(L"concurrent", true);
+        if (!reentrant || !concurrent) return 1;
+        std::puts("native: completes (layer-only guarantees not checked)");
+        return 0;
+    }
+    const bool reentrant = report("AddRef reentry and replacement", run_child(L"reentrant", false));
+    const bool concurrent = report("Concurrent removal during AddRef", run_child(L"concurrent", false));
 
     leonida::VulkanContext context(no_device_proc, VK_NULL_HANDLE, false);
     const bool owner = report("New interface key OOM while acquiring the owner", failed_insert(context, 0, true));
@@ -295,6 +335,8 @@ int wmain(int argc, wchar_t** argv) {
     const bool bytes_to_interface = report("Bytes to interface replacement OOM", failed_replace_bytes(context, true));
     const bool bytes_to_bytes = report("Bytes to bytes replacement OOM", failed_replace_bytes(context, false));
     const bool updates = report("Concurrent updates keep reference counts balanced", concurrent_updates(context));
+    const bool registration = report("Adapter event registration recovers from OOM",
+                                     failed_adapter_event_registration(context));
     return reentrant && concurrent && owner && growth && copy && copy_growth && interface_to_interface &&
-           interface_to_bytes && bytes_to_interface && bytes_to_bytes && updates ? 0 : 1;
+           interface_to_bytes && bytes_to_interface && bytes_to_bytes && updates && registration ? 0 : 1;
 }

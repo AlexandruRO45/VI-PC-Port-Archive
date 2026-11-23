@@ -1163,8 +1163,13 @@ public:
         std::lock_guard lock(adapters_changed_mutex_);
         for (const auto& [registered_cookie, registered_event] : adapters_changed_events_)
             if (registered_event == event) return DXGI_ERROR_INVALID_CALL;
-        const DWORD next = next_adapters_changed_cookie_++;
-        adapters_changed_events_.emplace(next, event);
+        const DWORD next = next_adapters_changed_cookie_;
+        try {
+            adapters_changed_events_.emplace(next, event);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        ++next_adapters_changed_cookie_;
         *cookie = next;
         return S_OK;
     }
