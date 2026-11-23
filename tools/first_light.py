@@ -648,7 +648,12 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         str(manifest["width"]),
         str(manifest["height"]),
     ]
-    subprocess.run(cmd, check=True, env=env)
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    except OSError as e:
+        raise SystemExit(
+            f"could not start First Light harness {harness}: {e.strerror or e}"
+        ) from e
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
     with open(raw, "rb") as f:

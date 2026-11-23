@@ -1,9 +1,11 @@
-"""CPU-only checks for the first-light harness lookup."""
+"""CPU-only checks for the First Light harness lookup and launch."""
 
+import errno
 import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -24,6 +26,20 @@ class FirstLightHarnessPathsTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
         return path
+
+    def test_draw_reports_harness_path_and_os_launch_error(self) -> None:
+        harness = self.put_harness("explicit")
+        for name in ("vs.spv", "ps.spv"):
+            (self.root / name).touch()
+        manifest = {"width": 1, "height": 1, "files": {"mesh": "mesh.bin"}}
+        error = OSError(errno.ENOEXEC, "synthetic exec format error")
+        with patch.object(first_light.subprocess, "run", side_effect=error):
+            with self.assertRaises(SystemExit) as raised:
+                first_light.run_draw(SimpleNamespace(harness=str(harness)), manifest, str(self.root))
+        self.assertEqual(
+            str(raised.exception),
+            f"could not start First Light harness {harness}: synthetic exec format error",
+        )
 
     def test_finds_windows_release_configuration(self) -> None:
         release = self.put_harness("runtime", "build", "windows", "Release")
