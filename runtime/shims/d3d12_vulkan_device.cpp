@@ -691,6 +691,11 @@ struct DeviceState {
 
     // What an arena range holds, for the high-water report (D3D-55).
     enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap };
+    // --vs-compute (issue #94): one arena region every prepass writes and every draw VS reads (one draw at a time,
+    // ordered by barriers). Allocated by the first pipeline that needs it, kept for the device's lifetime.
+    static constexpr VkDeviceSize vs_compute_region_bytes = 32ull << 20;
+    VkDeviceSize vs_compute_offset = 0;
+    VkDeviceSize vs_compute_bytes = 0;
     static constexpr const char* kArenaUseNames[4] = {"buffer", "descriptor heap", "shader", "heap"};
 
     // A zero-size range is refused: it would share its offset with the next range, and its release would collide
@@ -3074,6 +3079,9 @@ public:
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
+        if (graphics_.vsc_graphics) vk.vkDestroyPipeline(dev, graphics_.vsc_graphics, nullptr);
+        if (graphics_.vsc_pipeline) vk.vkDestroyPipeline(dev, graphics_.vsc_pipeline, nullptr);
+        if (graphics_.vsc_layout) vk.vkDestroyPipelineLayout(dev, graphics_.vsc_layout, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
@@ -3327,6 +3335,27 @@ public:
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
+        // --vs-compute (issue #94): a tier-C wave64 VS that this device does not guarantee to run with 64-wide
+        // subgroups gets an exact compute prepass, when the translation has one (<name>.vs_compute.spv and its draw
+        // VS). Not only when 64 is out of range: a default size of 64 is not a guarantee for the vertex stage either
+        // (AMD's Windows driver on an RDNA2 iGPU reports default 64, size control for compute only, and runs the VS
+        // 32-wide: d3d12_vs_compute_test reads 32 lanes there without the prepass). Without a geometry shader: the
+        // draw VS feeds the pixel shader directly.
+        std::vector<std::uint32_t> vsc_compute_words, vsc_draw_words;
+        const auto vsc_outcome = vs_stage.entry ? leonida::decide_subgroup_size(*vs_stage.entry, vs_compute_caps()).outcome
+                                                : leonida::SubgroupOutcome::unknown_stage;
+        if (vs_stage.entry && vs_stage.entry->vs_compute_stride && !gs_stage.entry &&
+            device_.info.max_push_constants_size >= leonida::vs_compute_push_bytes &&
+            (vsc_outcome == leonida::SubgroupOutcome::unavailable ||
+             vsc_outcome == leonida::SubgroupOutcome::device_default)) {
+            vsc_compute_words = library->spirv(*vs_stage.entry, ".vs_compute");
+            vsc_draw_words = library->spirv(*vs_stage.entry, ".vs_compute_draw");
+            if (vsc_compute_words.empty() || vsc_draw_words.empty()) {
+                log_once("a vs_compute VS has no .vs_compute.spv / .vs_compute_draw.spv (run tools/vs_compute_vs.py)", 0);
+                vsc_compute_words.clear();
+                vsc_draw_words.clear();
+            }
+        }
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
@@ -3662,7 +3691,9 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        const VkPushConstantRange push{graphics_.push_stages, 0,
+                                       vsc_draw_words.empty() ? std::uint32_t(sizeof(leonida::ShaderUserData))
+                                                              : leonida::vs_compute_push_bytes};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -3694,6 +3725,7 @@ public:
         graphics_.pipeline = build(0);
         if (!graphics_.pipeline) return E_FAIL;
         graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+        if (!vsc_draw_words.empty()) build_vs_compute(vsc_compute_words, vsc_draw_words, *vs_stage.entry);
 
         if (code_stage) {
             VkDeviceSize offset = 0;
@@ -3841,6 +3873,88 @@ private:
     };
 
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
+    // The device's subgroup sizes for the --vs-compute decision. A layer created on a device it did not create (the
+    // tests) may not have queried them; they are read here then, without size control, which is what such a device
+    // lets a pipeline ask for.
+    leonida::SubgroupSizeCaps vs_compute_caps() const {
+        leonida::SubgroupSizeCaps caps = device_.info.subgroup;
+        if (caps.default_size || caps.max_size) return caps;
+        const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            device_.info.get_instance_proc
+                ? device_.info.get_instance_proc(device_.info.instance, "vkGetPhysicalDeviceProperties2")
+                : nullptr);
+        if (properties2 && device_.info.physical)
+            leonida::query_subgroup_size_caps(properties2, device_.info.physical, false, false, caps);
+        return caps;
+    }
+
+    // --vs-compute (issue #94): the compute prepass, and the same graphics pipeline with the VS that reads its slots.
+    // Any failure leaves the plain pipeline alone (the VS then runs at the device's subgroup size, as before).
+    void build_vs_compute(const std::vector<std::uint32_t>& compute_words, const std::vector<std::uint32_t>& draw_words,
+                          const leonida::ShaderEntry& vs) {
+        auto& vk = device_.context->vk;
+        const VkDevice dev = device_.info.device;
+        const auto fail = [&](const char* why) {
+            std::fprintf(stderr, "[rt] d3d12: %s: --vs-compute prepass not built (%s); the VS runs at the device's "
+                                 "subgroup size\n", vs.name.c_str(), why);
+        };
+        if (!device_.vs_compute_bytes) {
+            VkDeviceSize offset = 0;
+            if (!device_.arena_allocate(DeviceState::vs_compute_region_bytes, 256, offset, DeviceState::arena_buffer))
+                return fail("no arena space for the output region");
+            device_.vs_compute_offset = offset;
+            device_.vs_compute_bytes = DeviceState::vs_compute_region_bytes;
+        }
+        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        module_info.codeSize = compute_words.size() * 4;
+        module_info.pCode = compute_words.data();
+        VkShaderModule compute_module = VK_NULL_HANDLE;
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &compute_module) != VK_SUCCESS)
+            return fail("compute module");
+        modules_.push_back(compute_module);
+        module_info.codeSize = draw_words.size() * 4;
+        module_info.pCode = draw_words.data();
+        VkShaderModule draw_module = VK_NULL_HANDLE;
+        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &draw_module) != VK_SUCCESS) return fail("draw module");
+        modules_.push_back(draw_module);
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, leonida::vs_compute_push_bytes};
+        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layout_info.pushConstantRangeCount = 1;
+        layout_info.pPushConstantRanges = &push;
+        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
+        if (graphics_.bindless_set) {
+            set0_layout = device_.bindless->layout();
+            layout_info.setLayoutCount = 1;
+            layout_info.pSetLayouts = &set0_layout;
+        }
+        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.vsc_layout) != VK_SUCCESS)
+            return fail("pipeline layout");
+        VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipeline_info.stage.module = compute_module;
+        pipeline_info.stage.pName = "main";
+        pipeline_info.layout = graphics_.vsc_layout;
+        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr,
+                                        &graphics_.vsc_pipeline) != VK_SUCCESS)
+            return fail("compute pipeline");
+        // The draw VS takes the vertex stage of the same recipe; it uses no subgroup operation, so no required size.
+        for (VkPipelineShaderStageCreateInfo& stage : recipe_.stages) {
+            if (stage.stage != VK_SHADER_STAGE_VERTEX_BIT) continue;
+            const VkShaderModule saved_module = stage.module;
+            const void* saved_next = stage.pNext;
+            stage.module = draw_module;
+            stage.pNext = nullptr;
+            graphics_.vsc_graphics = build(0);
+            stage.module = saved_module;
+            stage.pNext = saved_next;
+        }
+        if (!graphics_.vsc_graphics) return fail("draw pipeline");
+        graphics_.vsc_address = device_.arena.address + device_.vs_compute_offset;
+        graphics_.vsc_bytes = device_.vs_compute_bytes;
+        graphics_.vsc_stride = vs.vs_compute_stride;
+    }
+
     VkPipeline build(std::uint32_t unbound) const {
         // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it

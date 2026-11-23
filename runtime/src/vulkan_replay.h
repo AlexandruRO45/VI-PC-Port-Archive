@@ -772,6 +772,16 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    // --vs-compute (issue #94): a tier-C wave64 VS on a device that cannot give it 64-wide subgroups. A non-indexed
+    // draw with every attachment bound runs vsc_pipeline (the VS as an emulated compute prepass) over the draw's
+    // vertices and instances into vsc_address, then draws with vsc_graphics, whose VS reads the slots back. Other
+    // draws keep `pipeline`. Null: no prepass for this pipeline.
+    VkPipeline vsc_pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout vsc_layout = VK_NULL_HANDLE;
+    VkPipeline vsc_graphics = VK_NULL_HANDLE;
+    VkDeviceAddress vsc_address = 0;
+    VkDeviceSize vsc_bytes = 0;
+    std::uint32_t vsc_stride = 0;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -781,6 +791,9 @@ struct ShaderUserData {
     std::uint64_t code_base;
 };
 static_assert(sizeof(ShaderUserData) == 144);
+// --vs-compute: the block grows by the output address (dwords 36..37) and one count (dword 38: the vertex count for
+// the prepass, the slots per instance for the draw).
+inline constexpr std::uint32_t vs_compute_push_bytes = sizeof(ShaderUserData) + 12;
 
 // A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
 // capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
@@ -4063,19 +4076,57 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+
+            // --vs-compute (issue #94): outside the render pass, the prepass writes one slot per vertex and instance
+            // (workgroup x, y = 64 vertices of instance y). One region serves every draw, so its previous readers
+            // finish first; the draw's vertex shader then reads what this dispatch wrote.
+            const std::uint32_t vsc_groups = (draw->count + 63u) / 64u;
+            const VkDeviceSize vsc_need = VkDeviceSize(vsc_groups) * 64u * draw->instances * graphics.vsc_stride;
+            const bool vsc = graphics.vsc_pipeline && graphics.vsc_graphics && !draw->mesh && !draw->indexed &&
+                             d.pipeline == graphics.pipeline && draw->count && draw->instances &&
+                             vsc_need <= graphics.vsc_bytes;
+            std::uint32_t vsc_words[vs_compute_push_bytes / 4] = {};
+            if (vsc) {
+                ShaderUserData base{};
+                std::copy(draw->user_data.begin(), draw->user_data.end(), base.s);
+                base.heap_base = vk.heap_base;
+                base.code_base = graphics.code_base;
+                std::memcpy(vsc_words, &base, sizeof(base));
+                vsc_words[36] = std::uint32_t(graphics.vsc_address);
+                vsc_words[37] = std::uint32_t(graphics.vsc_address >> 32);
+                vsc_words[38] = draw->count;
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                                       VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, graphics.vsc_pipeline);
+                if (graphics.bindless_set) {
+                    const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
+                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, graphics.vsc_layout, 0, 1,
+                                            &set0, 0, nullptr);
+                }
+                vk.push_constants(command_buffer, graphics.vsc_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                  vs_compute_push_bytes, vsc_words);
+                vk.dispatch(command_buffer, vsc_groups, draw->instances, 1);
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
+                vsc_words[38] = vsc_groups * 64u;  // the draw VS's slots per instance
+            }
             vk.begin_rendering(command_buffer, &rendering);
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vsc ? graphics.vsc_graphics : d.pipeline);
             if (graphics.bindless_set) {
                 const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            if (vsc)
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, vs_compute_push_bytes,
+                                  vsc_words);
+            else
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;

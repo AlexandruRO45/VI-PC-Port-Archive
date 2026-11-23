@@ -189,6 +189,8 @@ def translate_tests(work, names):
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
     if os.environ.get("LEONIDA_W64_EMULATE") == "1":   # wave64 on 32-wide subgroups (compute shaders only)
         cmd.append("--wave64-emulate")
+    if os.environ.get("LEONIDA_VS_COMPUTE") == "1":   # tier-C wave64 VS also as a compute prepass (issue #94)
+        cmd.append("--vs-compute")
     if barycentric_fallback():   # raw barycentrics without VK_KHR_fragment_shader_barycentric
         cmd.append("--bary-fallback")
     if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma (default), OpFmaKHR, or emulated
@@ -253,8 +255,10 @@ def main():
         combined.update(validated)
         index.write_text(json.dumps(combined, indent=2) + "\n", encoding="utf-8", newline="\n")
         for n in validated:
-            for suffix in (".spv", ".spvasm"):
+            for suffix in (".spv", ".spvasm", ".vs_compute.spv", ".vs_compute.spvasm"):
                 artifact = built / (n + suffix)
+                if suffix.startswith(".vs_compute") and not artifact.is_file():
+                    continue   # only a --vs-compute VS has one
                 artifact.replace(spirv / artifact.name)
             sidecar = work / "fssm" / (n + ".fssm")
             published = not n.startswith("cs_") or cs_fssm_extra(os.path.join(HERE, n + ".asm"))
@@ -265,6 +269,12 @@ def main():
         sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "tools"))
         import spirv_stubs
         spirv_stubs.generate_for_index(str(spirv), combined)
+        if os.environ.get("LEONIDA_VS_COMPUTE") == "1":
+            # The vertex shader that draws each --vs-compute VS's slots (<name>.vs_compute_draw.spv).
+            import vs_compute_vs
+            _, failed = vs_compute_vs.build_for_index(str(spirv))
+            if failed:
+                sys.exit("vs_compute_vs did not build: " + ", ".join(failed))
         if barycentric_fallback():
             # The pass-through geometry shader each --bary-fallback PS is drawn with (<name>.bary_gs.spv).
             import bary_fallback_gs

@@ -2138,6 +2138,33 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_translated_draw COMMAND d3d12_translated_draw_test)
       set_tests_properties(d3d12_translated_draw PROPERTIES SKIP_RETURN_CODE 77)
 
+      # --vs-compute (issue #94): a tier-C wave64 VS through a graphics PSO; on a 32-wide device the layer runs it as
+      # the emulated compute prepass and draws with the VS that reads its slots (d3d12_vs_compute_test.cpp).
+      set(LEONIDA_VSC_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/vsc_shaders)
+      set(LEONIDA_VSC_FILES ${LEONIDA_VSC_DIR}/spirv/index.json ${LEONIDA_VSC_DIR}/fssm/vs_w64_c_wave_color.fssm
+                            ${LEONIDA_VSC_DIR}/fssm/ps_flat_color.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_VSC_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_VSC_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                "LEONIDA_VS_COMPUTE=1"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_VSC_DIR} vs_w64_c_wave_color ps_flat_color
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_w64_c_wave_color.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_flat_color.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/vs_compute_vs.py
+        COMMENT "Translating vs_w64_c_wave_color (--vs-compute) and ps_flat_color for the vs-compute test"
+        VERBATIM)
+      add_executable(d3d12_vs_compute_test test/d3d12_vs_compute_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_VSC_FILES})
+      target_link_libraries(d3d12_vs_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_vs_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VSC_DIR="${LEONIDA_VSC_DIR}")
+      add_test(NAME d3d12_vs_compute COMMAND d3d12_vs_compute_test)
+      set_tests_properties(d3d12_vs_compute PROPERTIES SKIP_RETURN_CODE 77)
+
       # vk_bindless_test (the bindless set and its table at the Vulkan level, no D3D12) takes the translated vs_ids,
       # ps_tex and ps_imgatomic; it was only run by scripts/run_gpu_tests.py and check.py until D3D-314 needed it.
       set(LEONIDA_BINDLESS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/bindless_shaders)

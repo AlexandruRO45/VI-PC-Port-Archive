@@ -718,6 +718,9 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // --vs-compute (issue #94): a tier-C wave64 VS also built as <name>.vs_compute.spv, drawn by
+    // <name>.vs_compute_draw.spv (tools/vs_compute_vs.py). The bytes of one vertex's slot; 0: no such variant.
+    std::uint32_t vs_compute_stride = 0;
 };
 
 class ShaderLibrary {
@@ -809,10 +812,11 @@ public:
         return all;
     }
 
-    // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
-    std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
+    // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V. With a suffix, the words of a
+    // variant written next to it (<dir>/<name><suffix>.spv, e.g. ".vs_compute").
+    std::vector<std::uint32_t> spirv(const ShaderEntry& entry, const char* suffix = "") const {
         auto path = dir_;
-        path += "/" + entry.name + ".spv";
+        path += "/" + entry.name + suffix + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         return read_spirv_words(file, file.tellg());
     }
@@ -923,6 +927,8 @@ private:
                 }
             }
             e.max_vertices = u32(meta.find("max_vertices"));
+            if (const Json* vc = meta.find("vs_compute"); vc && vc->kind == Json::Kind::object)
+                e.vs_compute_stride = u32(vc->find("vertex_stride"));
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
