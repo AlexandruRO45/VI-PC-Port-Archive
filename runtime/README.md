@@ -198,6 +198,11 @@ Current limits, by design:
   `UnregisterClassA/W` and `GetClassInfoExA/W` under the two `ext-ms-win-rtcore-ntuser-window-*` names the
   executable imports and `user32.dll`. A class or window created with the mapped image's `GetModuleHandle(nullptr)`
   result is registered against gta6rt's own instance, which user32 knows; the game's `WNDPROC` is left as is.
+- `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+  (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+  overlay; each queue reads file or memory ranges into memory in order on its own worker thread and reports through
+  status arrays, `ID3D12Fence` signals and events. zlib, BCPack, swizzle and physical-page requests are not done yet.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
   and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the
