@@ -26,16 +26,20 @@ import os
 import sys
 import unittest
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOOLS_DIR = os.path.join(ROOT, "tools")
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
-import rdna2spirv  # noqa: E402
+from support import mrt0_words, rdna2spirv, translate_lines  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 SIGN64 = 1 << 63
+PUSH_VSHARP = [0x1000, 0, 0x1000, 0x31016FAC] + [0] * 28
 
 
 def u64(v):
@@ -516,6 +520,351 @@ class TestSpirvTranslatorIntegration(unittest.TestCase):
 
                 self.assertEqual(spirv_res, ref_res)
                 self.assertEqual(spirv_scc, ref_scc)
+
+    def test_unsupported_64bit_shift_operands_rejected(self):
+        for op in ("s_lshl_b64", "s_lshr_b64", "s_ashr_i64"):
+            with self.subTest(op=op):
+                g_bad_dst = rdna2spirv.Gen("ps")
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    g_bad_dst.insn({
+                        "op": op,
+                        "args": [
+                            {"k": "sgpr", "r": 0},
+                            {"k": "sgpr", "r": 2, "n": 2},
+                            {"k": "imm", "v": 4},
+                        ],
+                        "mods": [],
+                    })
+
+                g_bad_src = rdna2spirv.Gen("ps")
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    g_bad_src.insn({
+                        "op": op,
+                        "args": [
+                            {"k": "sgpr", "r": 0, "n": 2},
+                            {"k": "sgpr", "r": 2},
+                            {"k": "imm", "v": 4},
+                        ],
+                        "mods": [],
+                    })
+
+
+def translate_ps_shifts(lines: list[str]) -> str:
+    """Translate a hand-written pixel shader listing exporting v0..v3 to mrt0."""
+    return translate_lines(
+        "ps_salu_shifts",
+        [*lines, "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"],
+    )
+
+
+class EndToEndScalarShiftTranslatorTests(unittest.TestCase):
+    """End-to-end rdna2spirv.translate + spirv_mini_interp execution for 64-bit and 32-bit scalar shifts."""
+
+    def test_runtime_s_lshl_b64_cross_dword_modulo64_and_scc_transitions(self):
+        # Load runtime 64-bit value s[4:5] and runtime 32-bit shift count s6 from buffer memory
+        # so neither operand is in sgpr_imm, exercising 0->1, 0->0, 1->0, and 1->1 SCC transitions.
+        spv = translate_ps_shifts([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_lshl_b64 s[8:9], s[4:5], s6",
+            "s_cselect_b32 s10, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when shifted result is 0)
+            "s_lshl_b64 s[12:13], s[4:5], s6",
+            "s_cselect_b32 s14, 1, 0",
+            "s_lshl_b32 s14, s14, 1",
+            "s_or_b32 s10, s10, s14",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s12",
+        ])
+
+        vectors = [
+            # Zero value across shifts: result = 0, SCC = 0 (clears seeded SCC = 1)
+            (0x00000000, 0x00000000, 0),
+            (0x00000000, 0x00000000, 1),
+            (0x00000000, 0x00000000, 32),
+            (0x00000000, 0x00000000, 63),
+            # Complete shift-out to zero: result = 0, SCC = 0
+            (0x00000000, 0x80000000, 1),
+            (0x80000000, 0x00000000, 33),
+            (0x00010000, 0x00000000, 48),
+            # Low-dword-only non-zero (rhi == 0, rlo != 0) -> SCC = 1
+            (0x00000001, 0x00000000, 0),
+            (0x00000001, 0x00000000, 15),
+            (0x00000001, 0x00000000, 31),
+            # High-dword-only non-zero (rlo == 0, rhi != 0) -> SCC = 1
+            (0x00000001, 0x00000000, 32),
+            (0x00000001, 0x00000000, 63),
+            (0x00000000, 0x00000001, 16),
+            # Cross-dword migration across 32-bit boundary
+            (0xCAFEBABE, 0xDEADBEEF, 0),
+            (0xCAFEBABE, 0xDEADBEEF, 1),
+            (0xCAFEBABE, 0xDEADBEEF, 4),
+            (0xCAFEBABE, 0xDEADBEEF, 16),
+            (0xCAFEBABE, 0xDEADBEEF, 31),
+            (0xCAFEBABE, 0xDEADBEEF, 32),
+            (0xCAFEBABE, 0xDEADBEEF, 33),
+            (0xCAFEBABE, 0xDEADBEEF, 48),
+            (0xCAFEBABE, 0xDEADBEEF, 63),
+            # Modulo-64 unmasked runtime shift counts (S1 & 63)
+            (0xCAFEBABE, 0xDEADBEEF, 64),          # 64 & 63 = 0
+            (0xCAFEBABE, 0xDEADBEEF, 68),          # 68 & 63 = 4
+            (0xCAFEBABE, 0xDEADBEEF, 96),          # 96 & 63 = 32
+            (0xCAFEBABE, 0xDEADBEEF, 127),         # 127 & 63 = 63
+            (0x00000001, 0x00000000, 0x80000020),  # & 63 = 32
+            (0x00000001, 0x00000000, 0xFFFFFFFF),  # & 63 = 63
+        ]
+
+        for lo, hi, sh in vectors:
+            with self.subTest(lo=hex(lo), hi=hex(hi), sh=hex(sh)):
+                want64, want_scc = ref_s_lshl_b64(join_dwords(lo, hi), sh)
+                want_lo, want_hi = split_dwords(want64)
+                want_scc_mask = (want_scc << 1) | want_scc
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: lo, 0x1004: hi, 0x1008: sh, 0x100C: 0},
+                )
+                self.assertEqual(words, [want_lo, want_hi, want_scc_mask, want_lo])
+
+    def test_runtime_s_lshr_b64_zero_extension_modulo64_and_scc_transitions(self):
+        spv = translate_ps_shifts([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_lshr_b64 s[8:9], s[4:5], s6",
+            "s_cselect_b32 s10, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when shifted result is 0)
+            "s_lshr_b64 s[12:13], s[4:5], s6",
+            "s_cselect_b32 s14, 1, 0",
+            "s_lshl_b32 s14, s14, 1",
+            "s_or_b32 s10, s10, s14",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s13",
+        ])
+
+        vectors = [
+            # Zero value across shifts: result = 0, SCC = 0
+            (0x00000000, 0x00000000, 0),
+            (0x00000000, 0x00000000, 1),
+            (0x00000000, 0x00000000, 32),
+            (0x00000000, 0x00000000, 63),
+            # Underflow shift-out to zero: result = 0, SCC = 0
+            (0x00000001, 0x00000000, 1),
+            (0xFFFFFFFF, 0x00000000, 32),
+            (0x00000000, 0x00007FFF, 47),
+            # MSB zero-extension (logical right shift never sign-extends bit 63)
+            (0x00000000, 0x80000000, 0),
+            (0x00000000, 0x80000000, 1),
+            (0x00000000, 0x80000000, 31),
+            (0x00000000, 0x80000000, 32),
+            (0x00000000, 0x80000000, 63),
+            (0xFFFFFFFF, 0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF, 32),
+            (0xFFFFFFFF, 0xFFFFFFFF, 63),
+            # Cross-dword migration
+            (0xCAFEBABE, 0xDEADBEEF, 0),
+            (0xCAFEBABE, 0xDEADBEEF, 1),
+            (0xCAFEBABE, 0xDEADBEEF, 8),
+            (0xCAFEBABE, 0xDEADBEEF, 16),
+            (0xCAFEBABE, 0xDEADBEEF, 31),
+            (0xCAFEBABE, 0xDEADBEEF, 32),
+            (0xCAFEBABE, 0xDEADBEEF, 33),
+            (0xCAFEBABE, 0xDEADBEEF, 48),
+            (0xCAFEBABE, 0xDEADBEEF, 63),
+            # Modulo-64 unmasked runtime shift counts (S1 & 63)
+            (0xCAFEBABE, 0xDEADBEEF, 64),          # 64 & 63 = 0
+            (0xCAFEBABE, 0xDEADBEEF, 72),          # 72 & 63 = 8
+            (0xCAFEBABE, 0xDEADBEEF, 96),          # 96 & 63 = 32
+            (0xCAFEBABE, 0xDEADBEEF, 127),         # 127 & 63 = 63
+            (0x00000000, 0x80000000, 0x80000010),  # & 63 = 16
+            (0x00000000, 0x80000000, 0xFFFFFFFF),  # & 63 = 63
+        ]
+
+        for lo, hi, sh in vectors:
+            with self.subTest(lo=hex(lo), hi=hex(hi), sh=hex(sh)):
+                want64, want_scc = ref_s_lshr_b64(join_dwords(lo, hi), sh)
+                want_lo, want_hi = split_dwords(want64)
+                want_scc_mask = (want_scc << 1) | want_scc
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: lo, 0x1004: hi, 0x1008: sh, 0x100C: 0},
+                )
+                self.assertEqual(words, [want_lo, want_hi, want_scc_mask, want_hi])
+
+    def test_runtime_s_ashr_i64_sign_extension_modulo64_and_scc_transitions(self):
+        spv = translate_ps_shifts([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_ashr_i64 s[8:9], s[4:5], s6",
+            "s_cselect_b32 s10, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1 (verifies active clear when positive value shifts to 0)
+            "s_ashr_i64 s[12:13], s[4:5], s6",
+            "s_cselect_b32 s14, 1, 0",
+            "s_lshl_b32 s14, s14, 1",
+            "s_or_b32 s10, s10, s14",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s13",
+        ])
+
+        vectors = [
+            # Zero value across shifts: result = 0, SCC = 0
+            (0x00000000, 0x00000000, 0),
+            (0x00000000, 0x00000000, 1),
+            (0x00000000, 0x00000000, 32),
+            (0x00000000, 0x00000000, 63),
+            # Positive values shifting out completely to 0 -> SCC = 0 (clears seeded SCC = 1)
+            (0x00000001, 0x00000000, 1),
+            (0xFFFFFFFF, 0x00000000, 32),
+            (0xFFFFFFFF, 0x7FFFFFFF, 63),
+            # Positive values (bit 63 == 0) zero-extend identically to s_lshr_b64
+            (0xFFFFFFFF, 0x7FFFFFFF, 0),
+            (0xFFFFFFFF, 0x7FFFFFFF, 1),
+            (0xFFFFFFFF, 0x7FFFFFFF, 16),
+            (0xFFFFFFFF, 0x7FFFFFFF, 31),
+            (0xFFFFFFFF, 0x7FFFFFFF, 32),
+            (0xFFFFFFFF, 0x7FFFFFFF, 48),
+            (0x9ABCDEF0, 0x12345678, 12),
+            (0x9ABCDEF0, 0x12345678, 36),
+            # Negative values (bit 63 == 1) sign-extend 1s across high and low dwords -> SCC = 1
+            (0x00000000, 0x80000000, 0),
+            (0x00000000, 0x80000000, 1),
+            (0x00000000, 0x80000000, 15),
+            (0x00000000, 0x80000000, 31),
+            (0x00000000, 0x80000000, 32),
+            (0x00000000, 0x80000000, 33),
+            (0x00000000, 0x80000000, 63),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0),
+            (0xFFFFFFFF, 0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF, 32),
+            (0xFFFFFFFF, 0xFFFFFFFF, 63),
+            (0xCAFEBABE, 0xDEADBEEF, 4),
+            (0xCAFEBABE, 0xDEADBEEF, 32),
+            (0xCAFEBABE, 0xDEADBEEF, 48),
+            # Modulo-64 unmasked runtime shift counts (S1 & 63)
+            (0x00000000, 0x80000000, 64),          # 64 & 63 = 0
+            (0x00000000, 0x80000000, 65),          # 65 & 63 = 1
+            (0x00000000, 0x80000000, 96),          # 96 & 63 = 32
+            (0x00000000, 0x80000000, 127),         # 127 & 63 = 63
+            (0xCAFEBABE, 0xDEADBEEF, 0x80000020),  # & 63 = 32
+            (0x00000000, 0x80000000, 0xFFFFFFFF),  # & 63 = 63
+        ]
+
+        for lo, hi, sh in vectors:
+            with self.subTest(lo=hex(lo), hi=hex(hi), sh=hex(sh)):
+                want64, want_scc = ref_s_ashr_i64(join_dwords(lo, hi), sh)
+                want_lo, want_hi = split_dwords(want64)
+                want_scc_mask = (want_scc << 1) | want_scc
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: lo, 0x1004: hi, 0x1008: sh, 0x100C: 0},
+                )
+                self.assertEqual(words, [want_lo, want_hi, want_scc_mask, want_hi])
+
+    def test_runtime_64bit_shifts_immediate_source_and_inplace_aliasing(self):
+        # 1. Immediate 64-bit source S0 shifted by runtime shift count s4, plus in-place dst == src0 aliasing.
+        spv = translate_ps_shifts([
+            "s_buffer_load_dwordx4 s[4:7], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            # Immediate source S0 = 1 shifted left by runtime s6
+            "s_lshl_b64 s[8:9], 1, s6",
+            # Immediate source S0 = -16 (sign-extended to 0xFFFFFFFFFFFFFFF0) shifted arithmetically right by s6
+            "s_ashr_i64 s[10:11], -16, s6",
+            # In-place destination aliasing: s[4:5] = s[4:5] >> s6
+            "s_lshr_b64 s[4:5], s[4:5], s6",
+            "v_mov_b32 v0, s8",
+            "v_mov_b32 v1, s9",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s4",
+        ])
+
+        for sh in (0, 1, 2, 4, 32, 35, 63, 66):
+            with self.subTest(sh=sh):
+                shl_lo, shl_hi = split_dwords(ref_s_lshl_b64(1, sh)[0])
+                ashr_lo, _ = split_dwords(ref_s_ashr_i64((-16) & MASK64, sh)[0])
+                inplace_lo, _ = split_dwords(ref_s_lshr_b64(0xDEADBEEFCAFEBABE, sh)[0])
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: 0xCAFEBABE, 0x1004: 0xDEADBEEF, 0x1008: sh, 0x100C: 0},
+                )
+                self.assertEqual(words, [shl_lo, shl_hi, ashr_lo, inplace_lo])
+
+    def test_runtime_s_lshl_b32_and_s_lshr_b32_modulo32_folding_and_scc(self):
+        # Exercises 32-bit scalar logical shifts across:
+        # 1) runtime value s4 + runtime shift count s5 (modulo-32 mask & 31, 0->1, 0->0, 1->0, 1->1 SCC)
+        # 2) constant-folded s_lshl_b32 / s_lshr_b32 followed by runtime overwrite invalidating sgpr_imm
+        spv = translate_ps_shifts([
+            "s_buffer_load_dwordx2 s[4:5], s[0:3], 0x0",
+            "s_waitcnt lgkmcnt(0)",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_lshl_b32 s6, s4, s5",
+            "s_cselect_b32 s7, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1
+            "s_lshl_b32 s8, s4, s5",
+            "s_cselect_b32 s9, 1, 0",
+            "s_lshl_b32 s9, s9, 1",
+            "s_or_b32 s7, s7, s9",
+            "s_cmp_eq_u32 0, 1",          # seed SCC = 0
+            "s_lshr_b32 s10, s4, s5",
+            "s_cselect_b32 s11, 1, 0",
+            "s_cmp_eq_u32 1, 1",          # seed SCC = 1
+            "s_lshr_b32 s12, s4, s5",
+            "s_cselect_b32 s13, 1, 0",
+            "s_lshl_b32 s13, s13, 1",
+            "s_or_b32 s11, s11, s13",
+            # Constant-folded s_lshl_b32 into s14, then overwritten by runtime s_lshr_b32 with immediate count 36 (& 31 = 4)
+            "s_mov_b32 s14, 0x11",
+            "s_lshl_b32 s14, s14, 4",
+            "s_lshr_b32 s14, s4, 36",
+            "s_xor_b32 s10, s10, s14",
+            "v_mov_b32 v0, s6",
+            "v_mov_b32 v1, s7",
+            "v_mov_b32 v2, s10",
+            "v_mov_b32 v3, s11",
+        ])
+
+        vectors = [
+            (0x00000000, 0),
+            (0x00000000, 5),
+            (0x00000001, 0),
+            (0x00000001, 1),
+            (0x00000001, 31),
+            (0x80000000, 1),          # shl -> 0 (SCC=0), shr -> 0x40000000 (SCC=1)
+            (0x80000000, 31),         # shl -> 0 (SCC=0), shr -> 1 (SCC=1)
+            (0x12345678, 4),
+            (0x12345678, 32),         # 32 & 31 = 0
+            (0x12345678, 36),         # 36 & 31 = 4
+            (0x12345678, 0x80000010), # & 31 = 16
+            (0x80000001, 0xFFFFFFFF), # & 31 = 31
+        ]
+
+        for val, sh in vectors:
+            with self.subTest(val=hex(val), sh=hex(sh)):
+                m = sh & 31
+                want_shl = ((val & MASK32) << m) & MASK32
+                want_shl_scc = 3 if want_shl != 0 else 0
+                want_shr = (val & MASK32) >> m
+                want_shr_scc = 3 if want_shr != 0 else 0
+                want_shr_imm36 = (val & MASK32) >> 4
+                words = mrt0_words(
+                    spv,
+                    push_constants=PUSH_VSHARP,
+                    memory={0x1000: val, 0x1004: sh},
+                )
+                self.assertEqual(
+                    words,
+                    [want_shl, want_shl_scc, want_shr ^ want_shr_imm36, want_shr_scc],
+                )
 
 
 if __name__ == "__main__":
