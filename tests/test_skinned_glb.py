@@ -244,6 +244,12 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaisesRegex(skinned_glb.SkinError, "bone has no fields"):
             skinned_glb._bone_name_map([{"name": "root", "bind_matrix": [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]}, [1, 2]])
 
+    def test_palette_resolver_rejects_a_non_object_drawable_bone(self):
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root, own_skeleton=[[1, 2]])
+        with self.assertRaisesRegex(skinned_glb.SkinError, "skeleton bone has no fields: list"):
+            skinned_glb.build_skinned_glb(skeleton, [component])
+
     def test_joint_count_and_palette_resolution(self):
         _gltf, _binary, stats = self._build()
         self.assertEqual(stats["ped_joints"], 3)

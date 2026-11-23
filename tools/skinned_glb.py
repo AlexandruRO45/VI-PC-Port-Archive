@@ -551,6 +551,8 @@ class PaletteResolver:
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                raise SkinError(f"skeleton bone has no fields: {type(bone).__name__}")
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
