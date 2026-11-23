@@ -19,6 +19,7 @@ RDNA2 listings via tools/rdna2spirv.py and executes the emitted SPIR-V across ev
 """
 import gc
 import os
+import re
 import struct
 import sys
 import tempfile
@@ -71,8 +72,10 @@ def _parse_spv(asm):
     blocks = {}      # %label -> [(res, op, args), ...]
     fn_entry = {}    # %fn -> entry %label
     fn_params = {}   # %fn -> [%param, ...]
+    fn_locals = {}   # %fn -> [(%var, elem, init)]: Function-storage variables, one set per call
     cur = None
     pending_fn = None   # the function whose header (OpFunction .. first OpLabel) is being read
+    cur_fn = None       # the function whose body is being read
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -88,7 +91,9 @@ def _parse_spv(asm):
             # Every function's body is read, not only %main: structured wave64 emulation outlines
             # lane-mask setup into helper functions and calls them with OpFunctionCall.
             pending_fn = res
+            cur_fn = res
             fn_params[res] = []
+            fn_locals[res] = []
             cur = None
             continue
         if op == "OpFunctionParameter":
@@ -97,6 +102,7 @@ def _parse_spv(asm):
             continue
         if op == "OpFunctionEnd":
             pending_fn = None
+            cur_fn = None
             cur = None
             continue
 
@@ -147,6 +153,8 @@ def _parse_spv(asm):
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
             fvars.append((res, elem, init))
+            if cur_fn is not None:
+                fn_locals[cur_fn].append((res, elem, init))
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
@@ -179,6 +187,7 @@ def _parse_spv(asm):
         "blocks": blocks,
         "fn_entry": fn_entry,
         "fn_params": fn_params,
+        "fn_locals": fn_locals,
         "make_zero": make_zero,
     }
 
@@ -217,6 +226,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     fn_entry = mod["fn_entry"]
     fn_params = mod["fn_params"]
     make_zero = mod["make_zero"]
+    fn_locals = mod["fn_locals"]
     mem = {} if memory is None else memory
     pc_words = list(push_constants or [0] * 32)
     if len(pc_words) < 32:
@@ -236,6 +246,14 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     # PushConstant struct layout matches rdna2spirv: member 0 = array[32] of uint, members 1..4 = heap/code ptrs
     pc_struct = [pc_words[:32], 0, 0, 0, 0]
 
+    def initial_function_value(elem, init):
+        """The value a Function-storage variable starts a call with."""
+        if init is None:
+            return make_zero(elem)
+        if isinstance(consts[init], tuple) and consts[init][0] == "null":
+            return make_zero(consts[init][1])
+        return consts[init]
+
     # Per-invocation state
     class Inv:
         __slots__ = ("gid", "sg_id", "sg_lane", "lid", "fn_mem", "ssa", "blk", "ip", "prev_blk",
@@ -251,12 +269,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             self.lid = [x, y, z]
             self.fn_mem = {}
             for vname, elem, init in mod["fvars"]:
-                if init is None:
-                    self.fn_mem[vname] = make_zero(elem)
-                elif isinstance(consts[init], tuple) and consts[init][0] == "null":
-                    self.fn_mem[vname] = make_zero(consts[init][1])
-                else:
-                    self.fn_mem[vname] = consts[init]
+                self.fn_mem[vname] = initial_function_value(elem, init)
             self.ssa = dict(consts)
             self.blk = "%entry"
             self.ip = 0
@@ -376,6 +389,8 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
                     raise NotImplementedError(f"OpFunctionCall {fid} in {inv.blk}")
                 for param_id, arg in zip(fn_params[fid], args[2:]):
                     inv.ssa[param_id] = val_of(inv, arg)
+                for var_name, var_elem, var_init in fn_locals[fid]:
+                    inv.fn_mem[var_name] = initial_function_value(var_elem, var_init)
                 inv.calls.append((inv.blk, inv.ip, res))
                 inv.prev_blk = None
                 inv.blk = fn_entry[fid]
@@ -1552,6 +1567,45 @@ class BarrierInLoopsTests(unittest.TestCase):
                                        threads=threads, lds_bytes=threads * 4, emulate=emulate)
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 self.assertEqual([mem[4 * t] for t in range(threads)], oracle(threads, 64 if wave64 else 32))
+
+
+class FunctionCallTests(unittest.TestCase):
+    """The interpreter's OpFunctionCall support (structured wave64 emulation outlines helpers)."""
+
+    def test_callee_function_variables_are_initialized_on_every_call(self):
+        """A Function-storage variable belongs to one call, not to the invocation: a helper that
+        starts from 0, increments its local and returns it must answer 1 on both calls, not 1 then 2.
+        """
+        spv, _ = _translate_cs(
+            "cs_call_locals",
+            ["v_mov_b32_e32 v1, 42", "buffer_store_dword v1, off, s[0:3], 0", "s_endpgm"],
+            threads=1,
+        )
+        # Splice a helper that returns an incrementing Function variable, called twice, into a
+        # module the translator produced (keeps the header, types, entry interfaces and V# valid).
+        spv = spv.replace("%main = OpFunction", "%test_fn = OpTypeFunction %uint\n%main = OpFunction", 1)
+        spv, replaced = re.subn(
+            r"OpStore (%\w+) %\w+ Aligned 4",
+            r"%first = OpFunctionCall %uint %helper\n"
+            r"%second = OpFunctionCall %uint %helper\n"
+            r"OpStore \1 %second Aligned 4",
+            spv,
+            count=1,
+        )
+        self.assertEqual(replaced, 1, "no translated store to call the helper from")
+        spv += (
+            "\n%helper = OpFunction %uint None %test_fn\n"
+            "%start = OpLabel\n"
+            "%slot = OpVariable %_ptr_Function_uint Function %c0\n"
+            "%old = OpLoad %uint %slot\n"
+            "%new = OpIAdd %uint %old %c1\n"
+            "OpStore %slot %new\n"
+            "OpReturnValue %new\n"
+            "OpFunctionEnd\n"
+        )
+        self.assertIn("OpFunctionCall %uint %helper", spv)
+        mem = run_compute_workgroup(spv, 1, 1, push_constants=VSHARP)
+        self.assertEqual(mem.get(0), 1)
 
 
 if __name__ == "__main__":
