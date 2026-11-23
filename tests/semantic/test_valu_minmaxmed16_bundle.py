@@ -178,6 +178,23 @@ class TestVMed3U16ReferenceOracle(unittest.TestCase):
         res = oracle_v_med3_u16(0xa, 0x5, 0x14)
         self.assertEqual(res, 0xa)
 
+class TestVMed3U16ASTAndInterpreter(unittest.TestCase):
+    """Stage 2 for v_med3_u16: AST and scalar interpreter execution."""
+
+    def test_v_med3_u16_ast_and_execution(self):
+        lines = [
+            "v_mov_b32 v0, 0x55AA0000",
+            "v_mov_b32 v1, 0xa",
+            "v_mov_b32 v2, 0x5",
+            "v_mov_b32 v3, 0x14",
+            "v_med3_u16 v0, v1, v2, v3",
+        ]
+        spv = support.translate_lines("ps_ast_v_med3_u16", lines + ["v_mov_b32 v1, 0", "v_mov_b32 v2, 0", "v_mov_b32 v3, 0", "exp mrt0 v0, v1, v2, v3 done vm", "s_endpgm"])
+        self.assertIn("UClamp", spv)
+        words = run_bundle_ps(lines, "ps_exec_v_med3_u16")
+        self.assertEqual(words[0] & 0xFFFF, 0xa)
+        self.assertEqual((words[0] >> 16) & 0xFFFF, 0x55AA)
+
 
 if __name__ == '__main__':
     unittest.main()
