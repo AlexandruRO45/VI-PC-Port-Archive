@@ -196,6 +196,10 @@ descomprimido. Así evita compilar el runtime; la misma opción funciona en Wind
   de Windows (`gta6rt.exe` y `gta6rt_tls_host.dll`): el script escribe entonces `gta6rt.sh`, que lanza
   `gta6rt.exe` con `wine`, o con el Wine indicado por la variable `WINE` (para Proton, su `files/bin/wine`).
 
+Con el backend Vulkan (`LEONIDA_D3D12=vulkan`), el runtime empaquetado encuentra los shaders traducidos en
+`<work>/shaders/spirv` mediante `shader_path.txt` junto a `gta6rt.exe`. `LEONIDA_SHADERS` permite indicar otro
+directorio.
+
 ## Problemas habituales
 
 - **Usó «Download ZIP» en GitHub**: el ZIP no contiene el submódulo `third_party/rpf9-explorer`. Use
