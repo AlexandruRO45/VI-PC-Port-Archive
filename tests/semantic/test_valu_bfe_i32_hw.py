@@ -173,5 +173,82 @@ class TestSymbolicAST(unittest.TestCase):
             Operand.vgpr(256)
 
 
+class ScalarRegisterState:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+        self.vcc = 0
+        self.scc = 0
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index]
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index]
+        else:
+            return op.literal_val
+
+    def write_vgpr(self, idx: int, val: int):
+        self.vgprs[idx] = val & MASK32
+
+
+class ScalarInterpreter:
+    def __init__(self, state: Optional[ScalarRegisterState] = None):
+        self.state = state if state is not None else ScalarRegisterState()
+
+    def step(self, insn: VBfeI32Instruction) -> int:
+        u0 = self.state.read_operand(insn.src0)
+        u1 = self.state.read_operand(insn.src1)
+        u2 = self.state.read_operand(insn.src2)
+        res = ref_bfe_i32(u0, u1, u2)
+        self.state.write_vgpr(insn.dst.index, res)
+        return res
+
+
+class TestScalarInterpreter(unittest.TestCase):
+    def test_scalar_interpreter_step_and_chaining(self):
+        interp = ScalarInterpreter()
+        interp.state.vgprs[0] = 0x12345678
+        interp.state.vgprs[1] = 4
+        interp.state.vgprs[2] = 8
+        interp.state.vgprs[4] = 0
+        interp.state.vgprs[5] = 4
+
+        # Step 1: v3 = v_bfe_i32 v0, v1, v2 -> (0x12345678 >> 4) & 0xFF = 0x67
+        insn1 = VBfeI32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        res1 = interp.step(insn1)
+        self.assertEqual(res1, 0x67)
+        self.assertEqual(interp.state.vgprs[3], 0x67)
+
+        # Step 2: v6 = v_bfe_i32 v3, v4, v5 -> (0x67 >> 0) & 0xF = 0x7
+        insn2 = VBfeI32Instruction(
+            dst=Operand.vgpr(6),
+            src0=Operand.vgpr(3),
+            src1=Operand.vgpr(4),
+            src2=Operand.vgpr(5),
+        )
+        res2 = interp.step(insn2)
+        self.assertEqual(res2, 0x7)
+        self.assertEqual(interp.state.vgprs[6], 0x7)
+
+    def test_scalar_interpreter_matches_translator_chain(self):
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 8",
+            "v_mov_b32 v4, 0",
+            "v_mov_b32 v5, 4",
+            "v_bfe_i32 v3, v0, v1, v2",
+            "v_bfe_i32 v3, v3, v4, v5",
+        ]
+        words = run_ps_bfe_i32(lines)
+        self.assertEqual(words[0], 0x7)
+
+
 if __name__ == "__main__":
     unittest.main()
