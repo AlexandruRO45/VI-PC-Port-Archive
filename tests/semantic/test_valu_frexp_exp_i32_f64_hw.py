@@ -26,8 +26,8 @@ for p in (HERE, TESTS_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import rdna2spirv  # noqa: E402
 from support import translate_lines, mrt0_words  # noqa: E402
+import rdna2spirv  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 POS_INF = 0x7FF0000000000000
@@ -263,6 +263,21 @@ class TestFrexpExpF64BoundaryExtremes(unittest.TestCase):
         self.assertEqual(run_frexp_exp(2), -1072)
         # Largest positive subnormal: 0x000F_FFFF_FFFF_FFFF -> exp = -1022
         self.assertEqual(run_frexp_exp(0x000FFFFFFFFFFFFF), -1022)
+
+
+class TestFrexpExpF64NegativeControls(unittest.TestCase):
+    def test_output_modifiers_rejected(self):
+        for mod in ("clamp", "mul:2", "mul:4", "div:2"):
+            with self.subTest(mod=mod):
+                lines = [
+                    "v_mov_b32 v0, 0",
+                    "v_mov_b32 v1, 0x3ff00000",
+                    f"v_frexp_exp_i32_f64 v2, v[0:1] {mod}",
+                    "exp mrt0 v2, v2, v2, v2 done vm",
+                    "s_endpgm",
+                ]
+                with self.assertRaises(rdna2spirv.Unsupported):
+                    translate_lines(f"ps_frexp_rej_{mod.replace(':', '_')}", lines)
 
 
 if __name__ == "__main__":
