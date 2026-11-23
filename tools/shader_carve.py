@@ -12,7 +12,6 @@ Usage:
 Writes <out_dir>/<name>.dxbc and <out_dir>/index.json (name, offset, stage, shader model, parts).
 """
 import argparse
-import json
 import mmap
 import os
 import re
@@ -20,6 +19,9 @@ import struct
 import sys
 import tempfile
 import zlib
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
+from json.encoder import encode_basestring_ascii as _quote
 
 # `python -I` leaves the script's directory off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -78,6 +80,62 @@ def file_name(name: str, seen: dict, used: set) -> str:
     return fname
 
 
+def index_entry(name, fname, offset, kind, stage, sm, size, p) -> str:
+    """One index.json row, as the text `json.dump(..., indent=1)` writes for the same dict one level in.
+    Formatting it here skips the pure-Python encoder `indent` forces and the dict kept per shader."""
+    q = _quote
+    rows = ",\n".join(f"   {q(k)}: {v[1]}" for k, v in p.items())
+    return (f' {{\n  "name": {q(name)},\n  "file": {q(fname)},\n  "offset": {offset},\n  "kind": {kind},\n'
+            f'  "stage": {"null" if stage is None else q(stage)},\n  "sm": {"null" if sm is None else q(sm)},\n'
+            f'  "size": {size},\n  "parts": ' + (f"{{\n{rows}\n  }}\n }}" if rows else "{}\n }"))
+
+
+def write_dxbc(path: str, data: bytes) -> None:
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+class WriteBehind:
+    """Creates the .dxbc files on worker threads (file creation is slow kernel work that drops the GIL) while the
+    caller inflates the next shader. The data still waiting for its write is bounded by `throttle`. The first
+    `inline` files are written by the caller: a small archive has nothing to gain from the threads' fixed memory."""
+
+    def __init__(self, workers: int = 4, inline: int = 64):
+        self.workers = workers
+        self.inline = inline
+        self.pool = None
+        self.queue = deque()  # (future, size) in submission order
+        self.held = 0         # bytes of the queued entries whose write has not been collected yet
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)  # also on an error: no worker is left writing into the folder being reported
+
+    def submit(self, path: str, data: bytes) -> None:
+        if self.inline > 0:
+            self.inline -= 1
+            write_dxbc(path, data)
+            return
+        if self.pool is None:
+            self.pool = ThreadPoolExecutor(max_workers=self.workers)
+        self.queue.append((self.pool.submit(write_dxbc, path, data), len(data)))
+        self.held += len(data)
+
+    def throttle(self, limit: int) -> None:
+        """Wait until at most `limit` bytes are still queued; raise the OSError of a write that failed."""
+        q = self.queue
+        while q and (q[0][0].done() or self.held > limit):
+            fut, n = q.popleft()
+            fut.result()
+            self.held -= n
+
+    def drain(self) -> None:
+        self.throttle(-1)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Carve DXBC shader containers out of an RPF9 archive.")
     ap.add_argument("src", help="the shaders.rpf archive")
@@ -94,9 +152,11 @@ def main(argv=None) -> int:
         os.makedirs(out, exist_ok=True)
     except OSError as e:  # a regular file where a parent folder is expected
         ap.error(f"cannot create {out}: {e.strerror or e}")
-    index, seen, used, bad = [], {}, set(), 0
-    with open(src, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        pos = 0
+    rows, seen, used, bad = [], {}, set(), 0
+    stages, models, part_names = Counter(), Counter(), Counter()
+    with WriteBehind() as writer, open(src, "rb") as fh, \
+            mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m, memoryview(m) as view:
+        pos = last = 0
         while (mt := ENTRY.search(m, pos)) is not None:
             # A rejected header is rescanned past its name (a real entry can start inside it); a carved
             # shader resumes after its stored bytes, so deflate output never becomes a name or a match.
@@ -107,12 +167,17 @@ def main(argv=None) -> int:
             if not (16 < stored < 64 << 20 and 32 < size < 256 << 20):
                 continue
             start = mt.end()
+            # The loop used to hold the last inflated shader plus a copy of the next stored bytes; the queue may hold
+            # as much, so the peak memory stays what it was. The shader just queued is no longer held by the loop.
+            data = None
+            writer.throttle(last + stored)
             decompressor = zlib.decompressobj(-15)
             try:
-                data = decompressor.decompress(m[start:start + stored], size + 1)
+                data = decompressor.decompress(view[start:start + stored], size + 1)
             except zlib.error:
                 bad += 1
                 continue
+            last = len(data)
             if not decompressor.eof or data[:4] != b"DXBC" or len(data) != size:
                 bad += 1
                 continue
@@ -124,26 +189,27 @@ def main(argv=None) -> int:
                 continue
             pos = start + stored
             fname = file_name(name, seen, used)
-            with open(os.path.join(out, fname), "wb") as f:
-                f.write(data)
-            index.append({"name": name, "file": fname, "offset": mt.start(), "kind": mt.group(2)[0],
-                          "stage": stage, "sm": sm, "size": size, "parts": {k: v[1] for k, v in p.items()}})
-    if not index:
+            writer.submit(os.path.join(out, fname), data)
+            rows.append(index_entry(name, fname, mt.start(), mt.group(2)[0], stage, sm, size, p))
+            stages[stage] += 1
+            models[sm] += 1
+            part_names.update(p.keys())
+        writer.drain()
+    if not rows:
         print(f"ERROR: no shaders carved from {src} (rejected candidates: {bad}).", file=sys.stderr)
         return 1
     # make_game.py takes index.json as proof the carve finished: write it last, under another name, then rename.
     with tempfile.TemporaryDirectory(dir=out, prefix=".shader-index-") as staging:
         tmp = os.path.join(staging, "index.json")
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(index, f, indent=1)
+            f.write("[\n" + ",\n".join(rows) + "\n]")
             f.flush()
             os.fsync(f.fileno())
         replace_retry(tmp, os.path.join(out, "index.json"))
-    from collections import Counter
-    print(f"{len(index)} shaders carved, {bad} candidates rejected")
-    print("stages:", dict(Counter(e["stage"] for e in index)))
-    print("shader models:", dict(Counter(e["sm"] for e in index)))
-    print("parts:", dict(Counter(k for e in index for k in e["parts"])))
+    print(f"{len(rows)} shaders carved, {bad} candidates rejected")
+    print("stages:", dict(stages))
+    print("shader models:", dict(models))
+    print("parts:", dict(part_names))
     return 0
 
 
