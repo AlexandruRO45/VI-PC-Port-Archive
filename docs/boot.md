@@ -34,7 +34,8 @@ On Windows, `--symbols <build dir>` resolves the stack frames of the modules tha
 (`host:gta6rt.exe+0x…`, `host:gta6rt_tls_host.dll+0x…`) against their PDB with `llvm-symbolizer`, printing the
 function and file:line under each frame. The title's own frames and the host's modules keep the `module+RVA`
 text. The symbolizer comes from `--symbolizer`, then `LLVM_SYMBOLIZER`, then PATH; the MSVC install ships one at
-`VC\Tools\MSVC\<version>\bin\Hostx64\x64\llvm-symbolizer.exe`.
+`VC\Tools\MSVC\<version>\bin\Hostx64\x64\llvm-symbolizer.exe`. If no symbolizer can be run, the report is still
+printed with the frames unchanged, the `symbols` block says why, and the exit code is 2.
 
 ## 2. Commands
 

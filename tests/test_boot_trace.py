@@ -549,7 +549,8 @@ class SymbolTests(unittest.TestCase):
         symbols = bt.symbolize(trace, self.dir, "fake-symbolizer", run=fake)
         self.assertEqual(symbols["frames"], 3)
         self.assertEqual(symbols["resolved"], 2)
-        self.assertEqual(symbols["unresolved"], 1)
+        self.assertEqual(symbols["unresolved"], 0)
+        self.assertEqual(symbols["skipped_frames"], 1)
         self.assertEqual(symbols["skipped"], ["kernel32.dll"])
         self.assertEqual(symbols["modules"], ["gta6rt.exe", "gta6rt_tls_host.dll"])
         self.assertEqual(
@@ -612,6 +613,24 @@ class SymbolTests(unittest.TestCase):
             },
         )
 
+    def test_parse_output_handles_a_function_without_a_location(self):
+        # The first address prints no location, so its second line is already the next address's function: the
+        # parser has to stay in the function state rather than consume it as a location.
+        text = "no_line_function\nframe_b\nC:\\src\\b.cpp:34:0\n"
+        self.assertEqual(
+            bt.parse_symbolizer_output(text, [1, 2]),
+            {
+                1: {"function": "no_line_function", "file": None, "line": None},
+                2: {"function": "frame_b", "file": "C:\\src\\b.cpp", "line": 34},
+            },
+        )
+
+    def test_parse_output_keeps_the_addresses_it_was_given_a_result_for(self):
+        self.assertEqual(
+            bt.parse_symbolizer_output("only\nC:\\src\\a.cpp:1:0\n", [1, 2]),
+            {1: {"function": "only", "file": "C:\\src\\a.cpp", "line": 1}},
+        )
+
     def test_report_prints_the_function_and_line_under_the_frame(self):
         self.module("gta6rt.exe", 0x140000000)
         self.write_trace(["game.exe+0x10", "host:gta6rt.exe+0x20"])
@@ -648,6 +667,37 @@ class SymbolTests(unittest.TestCase):
             {"function": "f", "file": "C:\\src\\f.cpp", "line": 7},
         )
 
+    def test_a_missing_symbolizer_keeps_the_exception_report(self):
+        """A missing tool must never suppress the parsed trace: the stack and the error both stay in the JSON."""
+        self.module("gta6rt.exe", 0x140000000)
+        self.write_trace(["host:gta6rt.exe+0x20"], at="host:gta6rt.exe+0x20")
+        output, error = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"PATH": "", "LLVM_SYMBOLIZER": ""}):
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                code = bt.main([self.startup, "--symbols", self.dir, "--json"])
+        self.assertEqual(code, 2)
+        startup = json.loads(output.getvalue())["startup"]
+        self.assertEqual(startup["exception_count"], 1)
+        self.assertEqual(startup["exceptions"][0]["stack"], ["host:gta6rt.exe+0x20"])
+        self.assertEqual(
+            startup["symbols"],
+            {
+                "dir": os.path.abspath(self.dir),
+                "symbolizer": None,
+                "frames": 1,
+                "resolved": 0,
+                "unresolved": 1,
+                "skipped_frames": 0,
+                "modules": ["gta6rt.exe"],
+                "skipped": [],
+                "errors": {
+                    "symbolizer": "--symbols needs llvm-symbolizer "
+                    "(--symbolizer PATH, LLVM_SYMBOLIZER, or PATH)"
+                },
+            },
+        )
+        self.assertIn("--symbols needs llvm-symbolizer", error.getvalue())
+
     def test_option_errors(self):
         self.write_trace(["host:gta6rt.exe+0x20"])
         cases = [
@@ -666,10 +716,15 @@ class SymbolTests(unittest.TestCase):
                 self.assertIn(message, error.getvalue())
 
         error = io.StringIO()
+        output = io.StringIO()
         with mock.patch.object(bt, "find_symbolizer", lambda explicit=None: None):
-            with contextlib.redirect_stderr(error):
-                self.assertEqual(bt.main([self.startup, "--symbols", self.dir]), 2)
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                self.assertEqual(bt.main([self.startup, "--symbols", self.dir, "--json"]), 2)
         self.assertIn("--symbols needs llvm-symbolizer", error.getvalue())
+        startup = json.loads(output.getvalue())["startup"]
+        self.assertEqual(startup["exceptions"][0]["stack"], ["host:gta6rt.exe+0x20"])
+        self.assertIsNone(startup["symbols"]["symbolizer"])
+        self.assertIn("symbolizer", startup["symbols"]["errors"])
 
         error = io.StringIO()
         with mock.patch.object(bt, "find_symbolizer", lambda explicit=None: "llvm-symbolizer"):
