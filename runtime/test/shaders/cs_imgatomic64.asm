@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; 64-bit image atomics (D3D-251) on an 8x8 and a 4x4x4 r64 uint image: image_atomic_add, sub, smin, smax, umin, umax,
 ; and, or, xor, swap and cmpswap with a VGPR pair of data. RDNA2 ISA (MIMG): an atomic's DMASK sets its data size,
 ; 0x1 for 32 bits and 0x3 for 64 (cmpswap, which also carries the comparand: 0x3 and 0xf); the opcodes are the same
