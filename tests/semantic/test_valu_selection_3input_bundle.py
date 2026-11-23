@@ -355,5 +355,18 @@ class VMin3I32OracleTests(unittest.TestCase):
         self.assertEqual(ref_min3_i32(int_min, 0, int_max), int_min)
         self.assertEqual(ref_min3_i32(int_max, -1, int_min), int_min)
 
+class VMin3I32AstInterpreterTests(unittest.TestCase):
+    """AST modeling and interpreter simulation for v_min3_i32."""
+
+    def test_ast_emission(self):
+        node = Valu3AstNode("v_min3_i32", "v0", "v1", "v2", "v3")
+        self.assertEqual(node.emit_asm(), "v_min3_i32 v0, v1, v2, v3")
+
+    def test_interpreter_scalar_simulation(self):
+        regs = {"v1": u32(-50), "v2": 25, "v3": u32(-10)}
+        res = ref_min3_i32(regs["v1"], regs["v2"], regs["v3"])
+        regs["v0"] = res
+        self.assertEqual(i32(regs["v0"]), -50)
+
 if __name__ == "__main__":
     unittest.main()
