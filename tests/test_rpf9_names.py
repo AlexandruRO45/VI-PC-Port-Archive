@@ -406,22 +406,40 @@ class NamesTest(unittest.TestCase):
             with open(sibling, "rb") as f:
                 self.assertEqual(f.read(), b"pre-existing sibling")
 
-    def test_main_uses_same_report_path_for_folding_alias(self):
+    def test_main_refuses_dotdot_and_hard_link_to_archive(self):
         import contextlib
         import io
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "sub")
+            os.makedirs(sub)
             arc = os.path.join(tmp, "tiny.rpf")
             make_archive(arc)
-            alias = os.path.join(tmp, "TINY.RPF")
+            with open(arc, "rb") as f:
+                original = f.read()
+            dotdot = os.path.join(sub, "..", "tiny.rpf")
             err = io.StringIO()
-            with mock.patch.object(rpf9_names, "same_report_path", return_value=True) as mocked, \
-                    mock.patch.object(sys, "argv", ["rpf9_names.py", arc, alias, "--quiet"]), \
+            with mock.patch.object(sys, "argv", ["rpf9_names.py", arc, dotdot, "--quiet"]), \
                     contextlib.redirect_stderr(err):
                 rc = rpf9_names.main()
             self.assertEqual(rc, 2)
             self.assertIn("input archive", err.getvalue())
-            mocked.assert_called_once_with(arc, alias)
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+            link = os.path.join(tmp, "link.rpf")
+            try:
+                os.link(arc, link)
+            except (OSError, NotImplementedError, AttributeError):
+                return
+            err = io.StringIO()
+            with mock.patch.object(sys, "argv", ["rpf9_names.py", arc, link, "--quiet"]), \
+                    contextlib.redirect_stderr(err):
+                rc = rpf9_names.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("input archive", err.getvalue())
+            with open(arc, "rb") as f:
+                self.assertEqual(f.read(), original)
 
 
 if __name__ == "__main__":
