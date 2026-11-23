@@ -11383,6 +11383,23 @@ class Gen:
         self.emit(f"{v4u} = OpCompositeConstruct %v4uint_st {' '.join(uv)}")
         self.emit(f"{v4s} = OpCompositeConstruct %v4int_st {' '.join(sv)}")
         act = self.active_b()
+        # RDNA2 drops a store whose coordinate is outside the image (gfx1036, tools/hw_oracle: x = width, -1, y = height,
+        # -1, the row pitch and 1000 left every word unchanged); an out-of-range OpImageWrite is undefined in Vulkan.
+        self.uses_query = True
+        qp, qi, qs = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{qp} = OpAccessChain %_ptr_UC_stv0_{di} %stv0_{di} {idx}")
+        self.emit(f"{qi} = OpLoad %stimg0_{di} {qp}")
+        self.emit(f"{qs} = OpImageQuerySize {'%int' if nc == 1 else '%v2int' if nc == 2 else '%v3int'} {qi}")
+        for ax in range(nc):
+            c, z, lt, both = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            if nc == 1:
+                c, z = coords[0], qs
+            else:
+                self.emit(f"{c} = OpCompositeExtract %int {iv} {ax}")
+                self.emit(f"{z} = OpCompositeExtract %int {qs} {ax}")
+            self.emit(f"{lt} = OpULessThan %bool {c} {z}")
+            self.emit(f"{both} = OpLogicalAnd %bool {act} {lt}")
+            act = both
         L = {k: self.tmp() + "_" + k for k in ("do", "end", "s", "rest", "e2", "u", "f", "e3")}
 
         def write(cls, texel):
