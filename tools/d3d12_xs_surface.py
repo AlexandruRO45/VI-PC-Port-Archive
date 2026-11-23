@@ -520,56 +520,44 @@ def check_scarab(root):
     catalogue = os.path.join(root, "components", "extension-wrapper", "docs",
                              "console-extension-catalogue.tsv")
     if os.path.exists(iid_table):
-        try:
-            theirs = parse_scarab_iid_table(iid_table)
-        except (OSError, UnicodeDecodeError, ValueError) as e:
-            errors.append("failed to parse %s: %s" % (iid_table, e))
-        else:
-            mine = dict(STANDARD_GUIDS)
-            mine.update(CONSOLE_IIDS)
-            if set(theirs) != set(mine):
-                errors.append("SCARAB iid_table names differ from this table")
-            for name in sorted(set(theirs) & set(mine)):
-                if theirs[name] != mine[name]:
-                    errors.append("%s: SCARAB %s != table %s"
-                                  % (name, guid_text(theirs[name]), guid_text(mine[name])))
-            notes.append("iid_table.cpp: %d GUID values compared" % len(theirs))
+        theirs = parse_scarab_iid_table(iid_table)
+        mine = dict(STANDARD_GUIDS)
+        mine.update(CONSOLE_IIDS)
+        if set(theirs) != set(mine):
+            errors.append("SCARAB iid_table names differ from this table")
+        for name in sorted(set(theirs) & set(mine)):
+            if theirs[name] != mine[name]:
+                errors.append("%s: SCARAB %s != table %s"
+                              % (name, guid_text(theirs[name]), guid_text(mine[name])))
+        notes.append("iid_table.cpp: %d GUID values compared" % len(theirs))
     else:
         errors.append("missing %s" % iid_table)
     if os.path.exists(iid_console):
-        try:
-            theirs = parse_scarab_iid_console(iid_console)
-        except (OSError, UnicodeDecodeError, ValueError) as e:
-            errors.append("failed to parse %s: %s" % (iid_console, e))
-        else:
-            known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
-            unexpected = set(theirs) - known
-            if unexpected:
-                errors.append("iid_console.inc has names not in the table: %s" % sorted(unexpected))
-            mine = {name: n for n, name, _kind, _ev in DATA_EXPORTS
-                    if name in theirs}
-            for name in sorted(set(theirs) & set(mine)):
-                if theirs[name] != mine[name]:
-                    errors.append("%s: SCARAB ordinal %d != table %d"
-                                  % (name, theirs[name], mine[name]))
-            notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs) & set(mine)))
+        theirs = parse_scarab_iid_console(iid_console)
+        known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
+        unexpected = set(theirs) - known
+        if unexpected:
+            errors.append("iid_console.inc has names not in the table: %s" % sorted(unexpected))
+        mine = {name: n for n, name, _kind, _ev in DATA_EXPORTS
+                if name in theirs}
+        for name in sorted(set(theirs) & set(mine)):
+            if theirs[name] != mine[name]:
+                errors.append("%s: SCARAB ordinal %d != table %d"
+                              % (name, theirs[name], mine[name]))
+        notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs) & set(mine)))
     else:
         errors.append("missing %s" % iid_console)
     if os.path.exists(catalogue):
-        try:
-            rows = parse_scarab_catalogue(catalogue)
-        except (OSError, UnicodeDecodeError, ValueError) as e:
-            errors.append("failed to parse %s: %s" % (catalogue, e))
-        else:
-            methods = [r for r in rows if r[0] == "method"]
-            enums = [r for r in rows if r[0] == "enum"]
-            notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
-            if (len(methods), len(enums)) != (105, 106):
-                notes.append("catalogue counts changed since the pin (expected 105/106)")
-            present = {r[1] for r in methods}
-            missing = sorted(CATALOGUE_NON_METHODS - present)
-            if missing:
-                errors.append("catalogue non-method rows missing: %s" % missing)
+        rows = parse_scarab_catalogue(catalogue)
+        methods = [r for r in rows if r[0] == "method"]
+        enums = [r for r in rows if r[0] == "enum"]
+        notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
+        if (len(methods), len(enums)) != (105, 106):
+            notes.append("catalogue counts changed since the pin (expected 105/106)")
+        present = {r[1] for r in methods}
+        missing = sorted(CATALOGUE_NON_METHODS - present)
+        if missing:
+            errors.append("catalogue non-method rows missing: %s" % missing)
     else:
         errors.append("missing %s" % catalogue)
     return errors, notes
