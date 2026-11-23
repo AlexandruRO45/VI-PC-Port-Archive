@@ -798,8 +798,6 @@ private:
         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
     }
 
-<<<<<<< HEAD
-=======
     // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
     // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
     // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
@@ -864,7 +862,6 @@ private:
         if (delta > 0) ++s.TotalDecompressionRequestCount;
     }
 
->>>>>>> 00551ba00 (DirectStorage: inflate zlib requests (file and memory sources))
     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {
         switch (e.type) {
             case Entry::Type::Request: {
