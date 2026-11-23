@@ -17,11 +17,11 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
 A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
 A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
 with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
-and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json).
+and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.state for compute, fspx/<name>.json, index.json).
 
 Usage:
     python -I shader_library.py <shaders.rpf | library.bin> --out DIR [--stages cs,ps,vs,ms] [--disasm]
-                                [--mcpu gfx1013] [--jobs N]
+                                [--mcpu gfx1013] [--backend llvm-mc|python] [--jobs N]
     python -I shader_library.py <shaders.rpf> --save library.bin       # the reassembled file, nothing else
 
 DIR/library.json gets the header, both pipeline tables (stage -> program name) and the per-program stage. Programs
@@ -254,6 +254,8 @@ def main(argv=None) -> int:
                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
+                    help="disassembler backend for --disasm (default llvm-mc; python uses tools/rdna2_decode.py)")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
                                     "digest its resource-layout blob ends with (the container's HASH part), and "
                                     "copy that container to <name>.dxbc for the translator's signature reads")
@@ -293,7 +295,22 @@ def main(argv=None) -> int:
         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
     sources = carve_digests(a.carve) if a.carve else None
-    cs_state = {c["program"]: c["state"] for c in lib["compute"]}
+    # Collect distinct kind-0 state blobs per compute program in record order. A compute program referenced with
+    # different kind-0 dispatch states needs one output per distinct state so the runtime can distinguish them by
+    # fspx_state_sha256 (docs/fspx.md, "Build and run-time lookup").
+    cs_states: dict[int, list[bytes]] = {}
+    cs_variant_names: dict[tuple[int, bytes], str] = {}
+    for c in lib["compute"]:
+        prog_i, state_i = c["program"], c["state"]
+        if prog_i is None or state_i is None:
+            continue
+        state_bytes = blob(b, lib, state_i)
+        seen = cs_states.setdefault(prog_i, [])
+        if state_bytes not in seen:
+            variant_idx = len(seen)
+            seen.append(state_bytes)
+            base = names[prog_i]
+            cs_variant_names[(prog_i, state_bytes)] = base if variant_idx == 0 else f"{base}_s{variant_idx}"
     index, written, work = [], 0, []
     for i in range(lib["header"]["programs"]):
         stages = lib["stage"].get(i, set())
@@ -302,59 +319,82 @@ def main(argv=None) -> int:
             continue
         code = program(b, lib, i)
         start, end = code_range(code)
-        meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
-                "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
-        if i in cs_state:
-            meta.update(fspx_unpack.decode_kind0(blob(b, lib, cs_state[i])))
-        name = names[i]
-        entry = {"file": name + ".dxbc", "stage": st, "program": i}
         digests = sorted(lib["digest"].get(i, ()))
-        meta["digest"] = [d.hex() for d in digests]
-        if sources is not None:
-            found = sorted({src for d in digests for src in sources.get(d, ())})
-            entry["source"] = meta["source"] = sorted({n for n, _ in found})
-            if found:
-                # The source container's signatures and PSV0 describe the stage's D3D12 interface, which the
-                # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
-                with open(found[0][1], "rb") as f:
-                    container = f.read()
-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
-                    f.write(container)
-        for k in ("threads", "wave32"):
-            if k in meta:
-                entry[k] = meta[k]
-        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
-            f.write(code)
-        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump(meta, f, indent=1)
-        if disasm and end:
-            work.append((entry, name, code[start:end], start, end))
-        index.append(entry)
-        written += 1
+        found = sorted({src for d in digests for src in sources.get(d, ())}) if sources is not None else None
+        container = None
+        if found:
+            # The source container's signatures and PSV0 describe the stage's D3D12 interface, which the
+            # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
+            with open(found[0][1], "rb") as f:
+                container = f.read()
+        variants = cs_states.get(i) or [None]
+        for variant_idx, state_bytes in enumerate(variants):
+            name = names[i] if variant_idx == 0 else f"{names[i]}_s{variant_idx}"
+            meta = {"program": i, "stage": st, "offset": lib["programs"][i][0], "size": len(code),
+                    "code": {"start": start, "end": end, "prologue": start == fspx_unpack.PROLOGUE_SIZE}}
+            if state_bytes is not None:
+                meta.update(fspx_unpack.decode_kind0(state_bytes))
+            entry = {"file": name + ".dxbc", "stage": st, "program": i}
+            meta["digest"] = [d.hex() for d in digests]
+            if sources is not None:
+                entry["source"] = meta["source"] = sorted({n for n, _ in found})
+                if container is not None:
+                    with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+                        f.write(container)
+            for k in ("threads", "wave32"):
+                if k in meta:
+                    entry[k] = meta[k]
+            with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+                f.write(code)
+            if state_bytes is not None:
+                with open(os.path.join(a.out, "fspx", name + ".state"), "wb") as f:
+                    f.write(state_bytes)
+            with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(meta, f, indent=1)
+            if disasm and end:
+                work.append((entry, name, code[start:end], start, end, bool(meta.get("wave32", True))))
+            index.append(entry)
+            written += 1
+
+    disasm_bad = 0
 
     def one(job):
-        entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu)
+        entry, name, code, start, end, wave32 = job
+        asm, invalid, err = disasm.disasm(code, a.mcpu, backend=a.backend, wave32=wave32)
+        if not asm.strip():
+            reason = (err.strip().splitlines() or ["no output"])[0]
+            return name, reason
         entry["invalid_words"] = invalid
         with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
             f.write(asm)
             if err.strip():
                 f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
+        return None
 
     if work:
         with ThreadPoolExecutor(a.jobs) as ex:   # each job waits on its own llvm-mc process
-            list(ex.map(one, work))
+            for failure in ex.map(one, work):
+                if failure is not None:
+                    name, reason = failure
+                    print(f"{name}: {reason}", file=sys.stderr)
+                    disasm_bad += 1
 
     def named(stages):
         return {k: names[v["program"]] for k, v in stages.items()}
+
+    def compute_name(c):
+        prog_i, state_i = c["program"], c["state"]
+        if prog_i is not None and state_i is not None:
+            return cs_variant_names.get((prog_i, blob(b, lib, state_i)), names.get(prog_i))
+        return names.get(prog_i)
 
     summary = {
         "header": lib["header"],
         "layout": lib["layout"],
         "graphics": [{"hash": g["hash"], "state": g["state"], "input_layout": g["input_layout"],
                       "stages": named(g["stages"])} for g in lib["graphics"]],
-        "compute": [{"hash": c["hash"], "state": c["state"], "program": names.get(c["program"])}
+        "compute": [{"hash": c["hash"], "state": c["state"], "program": compute_name(c)}
                     for c in lib["compute"]],
     }
     with open(os.path.join(a.out, "library.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -363,11 +403,12 @@ def main(argv=None) -> int:
         json.dump(index, f, indent=1)
     h = lib["header"]
     print(f"library {h['name']} {h['version']}: {h['graphics']} graphics + {h['compute']} compute pipelines, "
-          f"{h['programs']} programs; {written} written to {a.out}")
+          f"{h['programs']} programs; {written} written to {a.out}"
+          + (f", {disasm_bad} disassembly failure(s)" if disasm_bad else ""))
     if sources is not None:
         linked = sum(1 for e in index if e["source"])
         print(f"{linked} of {written} named by a carved shader's HASH digest, {written - linked} not in the carve")
-    return 0
+    return 1 if disasm_bad else 0
 
 
 if __name__ == "__main__":

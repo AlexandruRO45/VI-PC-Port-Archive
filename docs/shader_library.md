@@ -110,11 +110,19 @@ python -I tools/shader_library.py <package>/shaders.rpf --out <work>/library --d
 python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 ```
 
-* It writes `fspx/<name>.code` and `fspx/<name>.json`, the layout `fspx_unpack.py` writes and `rdna2spirv.py`
-  reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
-  `library.json` with the header and both pipeline tables, stage to program name. Programs are named
-  `lib_<stage>_<index>`.
-* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+* It writes `fspx/<name>.code`, `fspx/<name>.state` (for compute programs, the raw 28-byte kind-0 state blob so
+  `tools/shader_meta.py` records `fspx_state_sha256` alongside `fspx_code_sha256`) and `fspx/<name>.json`, the layout
+  `fspx_unpack.py` writes and `rdna2spirv.py` reads (`native_blob`, `cs_dispatch_state`). A compute program referenced
+  with multiple distinct kind-0 state blobs gets one entry per distinct state (`lib_cs_<index>`, `lib_cs_<index>_s1`,
+  ...); in 1.0.2.1 all 2,693 compute records map to 2,684 distinct `(code, state)` pairs (0 multi-state conflicts and
+  0 code-hash overlap with `amd_fidelityfx_upscaler_xbox.dll`'s 29 FSPX programs). It also writes `index.json` with
+  each program's stage, and `library.json` with the header and both pipeline tables, stage to program name. Programs
+  are named `lib_<stage>_<index>`.
+* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does (`--backend
+  python` uses `tools/rdna2_decode.py` without `llvm-mc`).
+* `make_game.py`'s `shaders` stage runs this step for `--stages cs` into `<work>/shaders/library` and translates the
+  compute programs into `<work>/shaders/spirv/library` (`library_build.json`), where `runtime/src/shader_library.h`
+  loads them alongside `fspx/index.json` for slot 67 (`DeserializeComputePipelineStateX`, D3D-703).
 * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
   interface.

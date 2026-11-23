@@ -225,17 +225,21 @@ int main() {
     }
     EXPECT(device_status == vktest::DeviceStatus::ready);
 
-    // Two programs, one translated entry each in <library>/fspx/index.json; the main index holds only an FSSM entry.
-    constexpr std::uint32_t marker_a = 5000, marker_b = 7000;
-    const auto code_a = kind6(marker_a), code_b = kind6(marker_b);
+    // Two programs in <library>/fspx/index.json and one pipeline-library compute program in <library>/library/index.json
+    // (D3D-703); the main index holds only an FSSM entry.
+    constexpr std::uint32_t marker_a = 5000, marker_b = 7000, marker_lib = 8500;
+    const auto code_a = kind6(marker_a), code_b = kind6(marker_b), code_lib = kind6(marker_lib);
     const auto container_a = container(payload(code_a));
     const testfiles::ScratchDir scratch("leonida_fspx_compute_test");
     const auto& library = scratch.path();
     std::filesystem::create_directories(library / "fspx");
+    std::filesystem::create_directories(library / "library");
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
                                 library / "fspx" / "cs_user_data.spv"));
     EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
                                 library / "fspx" / "cs_user_data_b.spv"));
+    EXPECT(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                library / "library" / "lib_cs_00001.spv"));
     // The review case on #1911: program C in two containers whose kind-0 entries differ, translated to two
     // different modules (the second has another generator word in its header, still a valid module).
     const auto code_c = kind6(9100);
@@ -262,11 +266,13 @@ int main() {
         sub << "{\"cs_user_data\": " << entry(code_a, 0x11) << ",\n \"cs_user_data_b\": " << entry(code_b, 0x11)
             << ",\n \"cs_c_state1\": " << entry(code_c, 0x31) << ",\n \"cs_c_state2\": " << entry(code_c, 0x32)
             << ",\n \"cs_c_state3\": " << entry(code_c, 0x33) << "}";  // no cs_c_state3.spv: see the slot-67 block
+        std::ofstream lib_sub(library / "library" / "index.json", std::ios::binary);
+        lib_sub << "{\"lib_cs_00001\": " << entry(code_lib, 0x41) << "}";
     }
 
     constexpr UINT elements = 64, bytes = elements * 4;
     const std::uint32_t table_values[4] = {1000, 2000, 3000, 4000};
-    std::vector<std::uint32_t> first(elements), second(elements);
+    std::vector<std::uint32_t> first(elements), second(elements), third(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -312,11 +318,26 @@ int main() {
         pso_desc.pRootSignature = root.p;
         pso_desc.CS = {container_a.data(), container_a.size()};
         const IID pso_iid = __uuidof(ID3D12PipelineState);
-        Ref<ID3D12PipelineState> pso_a, pso_b;
+        Ref<ID3D12PipelineState> pso_a, pso_b, pso_lib;
         EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
             device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso_a.p))));
         pso_desc.CS = {code_b.data(), code_b.size()};
         EXPECT(SUCCEEDED(device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso_b.p))));
+        // Pipeline-library compute program from <shaders>/library/index.json through slot 67 (D3D-703).
+        {
+            const std::vector<std::uint8_t> state_lib(28, 0x41), state_wrong(28, 0x42), kind1(20, 0x22), kind7(24, 0x77);
+            XboxNativeDesc lib_desc{root.p,
+                                    state_lib.data(), state_lib.size(),
+                                    kind1.data(), kind1.size(),
+                                    code_lib.data(), code_lib.size(),
+                                    kind7.data(), kind7.size()};
+            const auto slot67 = reinterpret_cast<XboxNativeComputePipelineFn>(slot(device.p, 67));
+            EXPECT(SUCCEEDED(slot67(device.p, &lib_desc, &pso_iid, reinterpret_cast<void**>(&pso_lib.p))) && pso_lib.p);
+            lib_desc.kind0 = state_wrong.data();
+            Ref<ID3D12PipelineState> wrong_state;
+            EXPECT(slot67(device.p, &lib_desc, &pso_iid, reinterpret_cast<void**>(&wrong_state.p)) == E_INVALIDARG &&
+                   !wrong_state.p);
+        }
         {
             // Program A bare and program B in a container resolve too: the key is the kind-6 bytes either way.
             const auto container_b = container(payload(code_b));
@@ -478,9 +499,9 @@ int main() {
         const D3D12_HEAP_PROPERTIES default_heap{D3D12_HEAP_TYPE_DEFAULT};
         const D3D12_HEAP_PROPERTIES upload_heap{D3D12_HEAP_TYPE_UPLOAD};
         const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
-        Ref<ID3D12Resource> out_a, out_b, constants, readback;
+        Ref<ID3D12Resource> out_a, out_b, out_lib, constants, readback;
         const auto uav = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        for (auto* out : {&out_a, &out_b})
+        for (auto* out : {&out_a, &out_b, &out_lib})
             EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &uav,
                                                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                                              IID_PPV_ARGS(&out->p))));
@@ -488,7 +509,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &constants_desc,
                                                          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
                                                          IID_PPV_ARGS(&constants.p))));
-        const auto readback_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
+        const auto readback_desc = buffer_desc(3 * bytes, D3D12_RESOURCE_FLAG_NONE);
         EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
                                                          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                          IID_PPV_ARGS(&readback.p))));
@@ -528,10 +549,14 @@ int main() {
         list->SetPipelineState(pso_b.p);
         list->SetComputeRootUnorderedAccessView(1, out_b->GetGPUVirtualAddress());
         list->Dispatch(1, 1, 1);
-        D3D12_RESOURCE_BARRIER barriers[2] = {transition(out_a.p), transition(out_b.p)};
-        list->ResourceBarrier(2, barriers);
+        list->SetPipelineState(pso_lib.p);
+        list->SetComputeRootUnorderedAccessView(1, out_lib->GetGPUVirtualAddress());
+        list->Dispatch(1, 1, 1);
+        D3D12_RESOURCE_BARRIER barriers[3] = {transition(out_a.p), transition(out_b.p), transition(out_lib.p)};
+        list->ResourceBarrier(3, barriers);
         list->CopyBufferRegion(readback.p, 0, out_a.p, 0, bytes);
         list->CopyBufferRegion(readback.p, bytes, out_b.p, 0, bytes);
+        list->CopyBufferRegion(readback.p, 2 * bytes, out_lib.p, 0, bytes);
         EXPECT(list->Close() == S_OK);
         ID3D12CommandList* lists[] = {list.p};
         queue->ExecuteCommandLists(1, lists);
@@ -542,10 +567,12 @@ int main() {
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &results)));
         std::memcpy(first.data(), results, bytes);
         std::memcpy(second.data(), static_cast<const std::uint8_t*>(results) + bytes, bytes);
+        std::memcpy(third.data(), static_cast<const std::uint8_t*>(results) + 2 * bytes, bytes);
 
-        for (auto* r : {&out_a, &out_b, &constants, &readback}) r->reset();
+        for (auto* r : {&out_a, &out_b, &out_lib, &constants, &readback}) r->reset();
         pso_a.reset();
         pso_b.reset();
+        pso_lib.reset();
         root.reset();
         heap.reset();
         list.reset();
@@ -559,8 +586,10 @@ int main() {
     for (std::uint32_t i = 0; i < elements; ++i) {
         const std::uint32_t a = 7 + 3 * i + table_values[i % 4] + marker_a;
         const std::uint32_t b = 7 + 3 * i + table_values[i % 4] + marker_b;
-        if ((first[i] != a || second[i] != b) && mismatches++ < 4)
-            std::fprintf(stderr, "element %u: got %u and %u, want %u and %u\n", i, first[i], second[i], a, b);
+        const std::uint32_t c = 7 + 3 * i + table_values[i % 4] + marker_lib;
+        if ((first[i] != a || second[i] != b || third[i] != c) && mismatches++ < 4)
+            std::fprintf(stderr, "element %u: got %u, %u, %u, want %u, %u, %u\n",
+                         i, first[i], second[i], third[i], a, b, c);
     }
     EXPECT(!mismatches);
     if (d.validation_errors()) {

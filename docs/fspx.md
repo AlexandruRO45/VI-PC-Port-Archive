@@ -183,9 +183,20 @@ The step is redone as a whole when the DLL, the unpacking or translating tools, 
 flags change (`fspx_build.json`, written last); it never makes the game's shaders translate again. A package without
 the DLL skips it.
 
-**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when it
-is there, `<dir>/fspx/index.json`, whose entries are named `fspx/<name>`. A missing or unreadable `fspx/index.json`
-leaves the main index loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+**Pipeline-library compute programs (D3D-703).** The retail executable also calls device slot 67
+(`DeserializeComputePipelineStateX`) with compute programs from the zlib pipeline library at the end of `shaders.rpf`
+([shader_library.md](shader_library.md)): 2,693 compute records covering 2,684 distinct programs in 1.0.2.1 (each with
+a 28-byte kind-0 state blob, 20-byte kind-1 blob, kind-6 RDNA2 program and kind-7 layout blob; 0 multi-state conflicts
+and 0 code-hash overlap with the 29 FidelityFX DLL programs). After `fspx_shaders`, `make_game.py`'s `shaders` stage
+runs `tools/shader_library.py --stages cs --disasm` into `<work>/shaders/library/` (writing `fspx/<name>.code`,
+`fspx/<name>.state` and `fspx/<name>.json`) and translates them into `<work>/shaders/spirv/library/`, cached by
+`library_build.json` and checked by `fspx_key_clash`.
+
+**Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
+are present, `<dir>/fspx/index.json` (entries named `fspx/<name>`) and `<dir>/library/index.json` (entries named
+`library/<name>`). A missing or unreadable side index leaves the remaining loaded indexes intact; both side folders
+are counted in `fspx_size()` so corpus orphan checks compare only the carved RPF entries. Entries are found by
+`fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
 `compute_program()` decides what a compute PSO's bytecode is looked up by:
 
 | Bytecode | Key | Who passes it |

@@ -722,13 +722,14 @@ struct ShaderEntry {
 
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
-    // when it is there:
+    // Reads <dir>/index.json, then the optional side-folder indexes make_game.py translates, each when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
     //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
-    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
+    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
+    //   - <dir>/library/index.json, shaders.rpf pipeline-library compute programs, entries named "library/<name>"
+    //     (docs/shader_library.md).
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Each side
+    // folder is optional: a missing or unreadable index there leaves the other loaded indexes intact.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -740,9 +741,9 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "bvh"}) {
+        const auto ignore = [](const std::string&) { return false; };
+        for (const char* folder : {"fspx", "bvh", "library"}) {
             try {
-                const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;
                 if (std::ifstream(sub / "index.json", std::ios::binary))
                     load_index(sub, std::string(folder) + "/", ignore);
@@ -754,8 +755,9 @@ public:
 
     bool loaded() const { return !dir_.empty(); }
     std::size_t size() const { return count_; }
-    // Entries loaded from <dir>/fspx/index.json. A corpus of RPF containers never reaches these: their programs
-    // come from FidelityFX DLLs, so callers comparing reached entries with size() must leave them out.
+    // Entries loaded from optional FSPX side folders (<dir>/fspx/index.json and <dir>/library/index.json). A corpus
+    // of carved RPF DXBC containers never reaches these, so callers comparing reached entries with size() leave them
+    // out.
     std::size_t fspx_size() const { return fspx_count_; }
     // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
     // their containers itself.
@@ -926,7 +928,7 @@ private:
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && prefix == "fspx/") ++fspx_count_;
+            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
             if (prefix == "bvh/") ++bvh_count_;
             ++count_;
         }

@@ -232,7 +232,10 @@ class Main(unittest.TestCase):
             rc, text = self.run_main(src, "--out", out, "--stages", "cs,vs")
             self.assertEqual(rc, 0)
             self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
-                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_vs_00001.code", "lib_vs_00001.json"])
+                             ["lib_cs_00003.code", "lib_cs_00003.json", "lib_cs_00003.state",
+                              "lib_vs_00001.code", "lib_vs_00001.json"])
+            with open(os.path.join(out, "fspx", "lib_cs_00003.state"), "rb") as f:
+                self.assertEqual(f.read(), kind0())
 
     def test_carve_names_sources_and_copies_containers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +268,9 @@ class Main(unittest.TestCase):
                 self.assertEqual(json.load(f)["digest"], [D_PS.hex()])
 
     def test_translator_reads_compute_sidecar(self):
+        import hashlib
         import rdna2spirv
+        import shader_meta
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "lib.bin")
             with open(src, "wb") as f:
@@ -274,7 +279,65 @@ class Main(unittest.TestCase):
             self.run_main(src, "--out", out, "--stages", "cs")
             s_path = os.path.join(out, "disasm", "lib_cs_00003.s")
             self.assertEqual(rdna2spirv.cs_dispatch_state(s_path, "lib_cs_00003"), (0xB8A, 8, 8, 1))
-            self.assertEqual(rdna2spirv.native_blob(s_path, "lib_cs_00003")[:36], prologue(0x77778888))
+            code = rdna2spirv.native_blob(s_path, "lib_cs_00003")
+            self.assertEqual(code[:36], prologue(0x77778888))
+            meta = shader_meta.collect(s_path, "lib_cs_00003", [[]], [[]])
+            self.assertEqual(meta["fspx_code_sha256"], hashlib.sha256(code).hexdigest())
+            self.assertEqual(meta["fspx_state_sha256"], hashlib.sha256(kind0()).hexdigest())
+
+    def test_compute_program_with_multiple_distinct_states(self):
+        import hashlib
+        import shader_meta
+        state_a = kind0(threads=(32, 1, 1), rsrc2=0xB8A)
+        state_b = kind0(threads=(64, 1, 1), rsrc2=0xB8C)
+        blobs = [state_a, state_b, b"\x01" * 20, layout_blob(3, D_CS, 1)]
+        programs = [prog(0x12345678, 2)]
+        # Three compute records share program 0: state_a, state_b, and a duplicate of state_a.
+        b = build([], [(0, 2, 0, 3), (1, 2, 0, 3), (0, 2, 0, 3)], blobs, programs)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(b)
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs")
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(os.path.join(out, "fspx"))),
+                             ["lib_cs_00000.code", "lib_cs_00000.json", "lib_cs_00000.state",
+                              "lib_cs_00000_s1.code", "lib_cs_00000_s1.json", "lib_cs_00000_s1.state"])
+            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
+                summary = json.load(f)
+            self.assertEqual([c["program"] for c in summary["compute"]],
+                             ["lib_cs_00000", "lib_cs_00000_s1", "lib_cs_00000"])
+            m0 = shader_meta.collect(os.path.join(out, "disasm", "lib_cs_00000.s"), "lib_cs_00000", [[]], [[]])
+            m1 = shader_meta.collect(os.path.join(out, "disasm", "lib_cs_00000_s1.s"), "lib_cs_00000_s1", [[]], [[]])
+            self.assertEqual(m0["fspx_code_sha256"], m1["fspx_code_sha256"])
+            self.assertEqual(m0["fspx_state_sha256"], hashlib.sha256(state_a).hexdigest())
+            self.assertEqual(m1["fspx_state_sha256"], hashlib.sha256(state_b).hexdigest())
+
+    def test_disasm_python_backend_and_failure_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(sample())
+            out = os.path.join(tmp, "out")
+            rc, _ = self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--backend", "python", "--jobs", "1")
+            self.assertEqual(rc, 0)
+            listing = os.path.join(out, "disasm", "lib_cs_00003.s")
+            self.assertTrue(os.path.isfile(listing))
+            with open(listing, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("s_endpgm", text)
+            # A failing disassembler must return non-zero and not write an empty listing.
+            import shader_disasm
+            from unittest import mock
+            out_fail = os.path.join(tmp, "out_fail")
+            err = io.StringIO()
+            with mock.patch.object(shader_disasm, "disasm", return_value=("", 0, "boom\n")), \
+                    contextlib.redirect_stderr(err):
+                rc_fail, _ = self.run_main(src, "--out", out_fail, "--stages", "cs", "--disasm", "--jobs", "1")
+            self.assertEqual(rc_fail, 1)
+            self.assertIn("boom", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(out_fail, "disasm", "lib_cs_00003.s")))
 
     def test_translator_rejects_pixel_program_without_container(self):
         """A pixel program whose source isn't in the carve has no <name>.dxbc for its input signature: Unsupported for

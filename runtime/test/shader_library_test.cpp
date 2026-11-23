@@ -532,6 +532,70 @@ int main() {
         std::filesystem::remove_all(dir);
     }
 
+    // Pipeline-library compute entries in <dir>/library/index.json (D3D-703): loaded alongside fspx/index.json,
+    // named "library/<name>", counted in fspx_size() so corpus orphan checks stay exact, and resolved through
+    // slot-67 FSPX payloads by (fspx_code_sha256, fspx_state_sha256).
+    {
+        const auto dll_code = fspx_code(0x6100);
+        const auto lib_code = fspx_code(0x6200);
+        const std::vector<std::uint8_t> state_dll(28, 0x11), state_lib(28, 0x33), state_lib2(28, 0x44);
+        const std::vector<std::uint8_t> kind1(20, 0x22), kind7(24, 0x77);
+        std::filesystem::create_directories(dir / "fspx");
+        std::filesystem::create_directories(dir / "library");
+        {
+            std::ofstream main_idx(dir / "index.json", std::ios::binary);
+            main_idx << "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" << hash << "\"}}";
+            std::ofstream fspx_idx(dir / "fspx" / "index.json", std::ios::binary);
+            fspx_idx << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(dll_code)
+                     << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_dll) << "\"}}";
+            std::ofstream lib_idx(dir / "library" / "index.json", std::ios::binary);
+            lib_idx << "{\"lib_cs_00001\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(lib_code)
+                    << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_lib)
+                    << "\", \"local_size\": [64, 1, 1], \"wave64\": false},\n"
+                       " \"lib_cs_00001_s1\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(lib_code)
+                    << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_lib2) << "\"}}";
+            const std::uint32_t words1[5] = {0x07230203, 0x00010500, 11, 1, 0};
+            const std::uint32_t words2[5] = {0x07230203, 0x00010500, 22, 1, 0};
+            std::ofstream spv1(dir / "library" / "lib_cs_00001.spv", std::ios::binary);
+            spv1.write(reinterpret_cast<const char*>(words1), sizeof(words1));
+            std::ofstream spv2(dir / "library" / "lib_cs_00001_s1.spv", std::ios::binary);
+            spv2.write(reinterpret_cast<const char*>(words2), sizeof(words2));
+        }
+        ShaderLibrary combined;
+        CHECK(combined.load(dir.string(), &error) && combined.size() == 4 && combined.fspx_size() == 3);
+        const FspxPart lib_parts[] = {{0, state_lib.data(), state_lib.size()}, {1, kind1.data(), kind1.size()},
+                                      {6, lib_code.data(), lib_code.size()}, {7, kind7.data(), kind7.size()}};
+        const auto lib_payload = fspx_payload_from_parts(lib_parts);
+        bool ambiguous = true;
+        const auto hit = combined.program_candidates("cs", compute_program(lib_payload), &ambiguous);
+        CHECK(hit.size() == 1 && !ambiguous && hit[0]->name == "library/lib_cs_00001" && hit[0]->local_size[0] == 64);
+        CHECK(combined.spirv(*hit[0]).size() == 5 && combined.spirv(*hit[0])[2] == 11);
+        const FspxPart lib_parts2[] = {{0, state_lib2.data(), state_lib2.size()}, {1, kind1.data(), kind1.size()},
+                                       {6, lib_code.data(), lib_code.size()}, {7, kind7.data(), kind7.size()}};
+        const auto hit2 = combined.program_candidates("cs", compute_program(fspx_payload_from_parts(lib_parts2)), &ambiguous);
+        CHECK(hit2.size() == 1 && !ambiguous && hit2[0]->name == "library/lib_cs_00001_s1");
+        CHECK(combined.spirv(*hit2[0]).size() == 5 && combined.spirv(*hit2[0])[2] == 22);
+        // A broken fspx/index.json does not prevent library/index.json from loading.
+        {
+            std::ofstream bad_fspx(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            bad_fspx << "{broken";
+        }
+        CHECK(combined.load(dir.string(), &error) && combined.size() == 3 && combined.fspx_size() == 2);
+        CHECK(combined.program_candidates("cs", compute_program(lib_payload)).size() == 1);
+        // A broken library/index.json leaves main and fspx loaded.
+        {
+            std::ofstream ok_fspx(dir / "fspx" / "index.json", std::ios::binary | std::ios::trunc);
+            ok_fspx << "{\"upscaler_00\": {\"stage\": \"cs\", \"fspx_code_sha256\": \"" << sha256_hex(dll_code)
+                    << "\", \"fspx_state_sha256\": \"" << sha256_hex(state_dll) << "\"}}";
+            std::ofstream bad_lib(dir / "library" / "index.json", std::ios::binary | std::ios::trunc);
+            bad_lib << "{broken";
+        }
+        CHECK(combined.load(dir.string(), &error) && combined.size() == 2 && combined.fspx_size() == 1);
+        CHECK(combined.fspx_candidates("cs", sha256_hex(dll_code)).size() == 1);
+        CHECK(combined.fspx_candidates("cs", sha256_hex(lib_code)).empty());
+        std::filesystem::remove_all(dir);
+    }
+
     // The review case on #1911: one kind-6 program in two containers whose kind-0 entries differ (32x1x1 and
     // 64x1x1), translated to two different modules. A container picks its own entry by fspx_state_sha256; a bare
     // kind-6 program cannot tell them apart and is refused as ambiguous; with one module for the key it is accepted.
