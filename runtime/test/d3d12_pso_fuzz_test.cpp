@@ -1,6 +1,7 @@
 // Differential graphics-state fuzzer: one seeded random program clears a colour target and an optional depth-stencil
 // target, then draws triangles through PSOs with random blend state (factors, ops, write masks, OMSetBlendFactor),
-// depth-stencil state (functions, stencil ops, masks, front and back faces, OMSetStencilRef) and rasterizer state
+// depth-stencil state (functions, stencil ops, masks, front and back faces, OMSetStencilRef), a second render target
+// with IndependentBlendEnable some of the time, and rasterizer state
 // (cull mode, winding, constant depth bias, depth clip), under a random viewport (offset, size, depth range) and
 // scissor, on the layer and on the host's D3D12 on the same GPU. Every byte of the colour target
 // and of every depth-stencil plane is read back and compared.
@@ -38,8 +39,8 @@
 #include <string>
 #include <vector>
 
-#if !defined(LEONIDA_PSO_VS_SPV) || !defined(LEONIDA_PSO_PS_SPV)
-#error "LEONIDA_PSO_VS_SPV and LEONIDA_PSO_PS_SPV must name the compiled test shaders"
+#if !defined(LEONIDA_PSO_VS_SPV) || !defined(LEONIDA_PSO_PS_SPV) || !defined(LEONIDA_PSO_PS_MRT_SPV)
+#error "LEONIDA_PSO_VS_SPV, LEONIDA_PSO_PS_SPV and LEONIDA_PSO_PS_MRT_SPV must name the compiled test shaders"
 #endif
 
 using d3d12test::Ref;
@@ -53,6 +54,9 @@ constexpr char kHostVs[] =
     "O main(float4 p : POSITION, float4 c : COLOR) { O o; o.pos = p; o.color = c; return o; }\n";
 constexpr char kHostPs[] =
     "float4 main(float4 pos : SV_Position, nointerpolation float4 c : COLOR) : SV_Target { return c; }\n";
+constexpr char kHostPsMrt[] =
+    "struct O { float4 t0 : SV_Target0; float4 t1 : SV_Target1; };\n"
+    "O main(float4 pos : SV_Position, nointerpolation float4 c : COLOR) { O o; o.t0 = c; o.t1 = c.zyxw; return o; }\n";
 
 bool compile_hlsl(pD3DCompile compile, const char* source, const char* target, std::vector<std::uint8_t>& out) {
     ID3DBlob* code = nullptr;
@@ -124,9 +128,10 @@ struct Draw {
 
 struct Program {
     const ColorFormat* color = nullptr;
+    const ColorFormat* color2 = nullptr;  // a second render target, or none
     const DepthFormat* depth = nullptr;
-    bool blendable = true;
-    float clear_color[4]{};
+    bool blendable = true, blendable2 = true;
+    float clear_color[4]{}, clear_color2[4]{};
     float clear_depth = 1.0f;
     UINT8 clear_stencil = 0;
     std::vector<Draw> draws;
@@ -178,6 +183,12 @@ Program generate(std::uint64_t seed, const Support& sup) {
     p.blendable = sup.blendable[c];
     p.depth = sup.depths[pick(UINT(sup.depths.size()))];
     for (float& v : p.clear_color) v = color_value(rng);
+    if (pick(3) == 0) {  // two render targets
+        const UINT c2 = pick(UINT(sup.colors.size()));
+        p.color2 = sup.colors[c2];
+        p.blendable2 = sup.blendable[c2];
+        for (float& v : p.clear_color2) v = color_value(rng);
+    }
     p.clear_depth = float(pick(65)) / 64.0f;
     p.clear_stencil = UINT8(rng());
     constexpr D3D12_BLEND factors[] = {
@@ -192,16 +203,24 @@ Program generate(std::uint64_t seed, const Support& sup) {
     const UINT draws = 1 + pick(5);
     for (UINT d = 0; d < draws; ++d) {
         Draw draw;
-        D3D12_RENDER_TARGET_BLEND_DESC& rt = draw.blend.RenderTarget[0];
-        rt.BlendEnable = p.blendable && pick(4) != 0;
-        rt.SrcBlend = factors[pick(UINT(std::size(factors)))];
-        rt.DestBlend = factors[pick(UINT(std::size(factors)))];
-        rt.BlendOp = D3D12_BLEND_OP(1 + pick(5));
-        rt.SrcBlendAlpha = alpha_factors[pick(UINT(std::size(alpha_factors)))];
-        rt.DestBlendAlpha = alpha_factors[pick(UINT(std::size(alpha_factors)))];
-        rt.BlendOpAlpha = D3D12_BLEND_OP(1 + pick(5));
-        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
-        rt.RenderTargetWriteMask = UINT8(pick(3) ? D3D12_COLOR_WRITE_ENABLE_ALL : pick(16));
+        const auto make_target = [&](D3D12_RENDER_TARGET_BLEND_DESC& rt, bool blendable) {
+            rt.BlendEnable = blendable && pick(4) != 0;
+            rt.SrcBlend = factors[pick(UINT(std::size(factors)))];
+            rt.DestBlend = factors[pick(UINT(std::size(factors)))];
+            rt.BlendOp = D3D12_BLEND_OP(1 + pick(5));
+            rt.SrcBlendAlpha = alpha_factors[pick(UINT(std::size(alpha_factors)))];
+            rt.DestBlendAlpha = alpha_factors[pick(UINT(std::size(alpha_factors)))];
+            rt.BlendOpAlpha = D3D12_BLEND_OP(1 + pick(5));
+            rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+            rt.RenderTargetWriteMask = UINT8(pick(3) ? D3D12_COLOR_WRITE_ENABLE_ALL : pick(16));
+        };
+        // With two targets, RenderTarget[0] serves both unless IndependentBlendEnable gives the second its own.
+        const bool independent = p.color2 && pick(2);
+        make_target(draw.blend.RenderTarget[0], p.blendable && (!p.color2 || independent || p.blendable2));
+        if (independent) {
+            draw.blend.IndependentBlendEnable = TRUE;
+            make_target(draw.blend.RenderTarget[1], p.blendable2);
+        }
         for (float& v : draw.blend_factor) v = color_value(rng);
         D3D12_DEPTH_STENCIL_DESC& ds = draw.depth;
         if (p.depth->format != DXGI_FORMAT_UNKNOWN) {
@@ -282,6 +301,9 @@ void print_program(const Program& p) {
     std::printf("  colour %s%s, depth %s; clear (%g %g %g %g), depth %g, stencil %u\n", p.color->name,
                 p.blendable ? "" : " (not blendable)", p.depth->name, p.clear_color[0], p.clear_color[1],
                 p.clear_color[2], p.clear_color[3], p.clear_depth, p.clear_stencil);
+    if (p.color2)
+        std::printf("  second target %s%s, clear (%g %g %g %g)\n", p.color2->name, p.blendable2 ? "" : " (not blendable)",
+                    p.clear_color2[0], p.clear_color2[1], p.clear_color2[2], p.clear_color2[3]);
     static const char* ops[] = {"?", "ADD", "SUB", "REV_SUB", "MIN", "MAX"};
     for (size_t i = 0; i < p.draws.size(); ++i) {
         const Draw& d = p.draws[i];
@@ -293,6 +315,15 @@ void print_program(const Program& p) {
                         blend_name(b.DestBlendAlpha));
         std::printf(" mask %x factor (%g %g %g %g)", b.RenderTargetWriteMask, d.blend_factor[0], d.blend_factor[1],
                     d.blend_factor[2], d.blend_factor[3]);
+        if (d.blend.IndependentBlendEnable) {
+            const D3D12_RENDER_TARGET_BLEND_DESC& b1 = d.blend.RenderTarget[1];
+            std::printf("; target 1 blend %s", b1.BlendEnable ? "on" : "off");
+            if (b1.BlendEnable)
+                std::printf(" (%s*src %s %s*dst; alpha %s %s %s)", blend_name(b1.SrcBlend), ops[b1.BlendOp],
+                            blend_name(b1.DestBlend), blend_name(b1.SrcBlendAlpha), ops[b1.BlendOpAlpha],
+                            blend_name(b1.DestBlendAlpha));
+            std::printf(" mask %x", b1.RenderTargetWriteMask);
+        }
         const D3D12_DEPTH_STENCIL_DESC& s = d.depth;
         std::printf("; depth %s func %d write %d", s.DepthEnable ? "on" : "off", int(s.DepthFunc),
                     int(s.DepthWriteMask));
@@ -317,6 +348,7 @@ struct Pass {
     const std::vector<std::uint8_t>* root;
     const std::vector<std::uint8_t>* vs;
     const std::vector<std::uint8_t>* ps;
+    const std::vector<std::uint8_t>* ps_mrt;  // two targets
 };
 
 // A plane of the readback, rows without padding.
@@ -329,7 +361,7 @@ struct Plane {
 };
 
 struct Result {
-    std::vector<std::uint8_t> color;
+    std::vector<std::uint8_t> color, color2;
     std::vector<std::uint8_t> depth;  // every plane, one after the other
     std::vector<Plane> depth_planes;
     std::string error;
@@ -366,27 +398,32 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
         desc.pRootSignature = root.p;
         desc.VS = {pass.vs->data(), pass.vs->size()};
-        desc.PS = {pass.ps->data(), pass.ps->size()};
+        const std::vector<std::uint8_t>& ps = p.color2 ? *pass.ps_mrt : *pass.ps;
+        desc.PS = {ps.data(), ps.size()};
         desc.BlendState = p.draws[i].blend;
         desc.SampleMask = 0xffffffff;
         desc.RasterizerState = p.draws[i].raster;
         desc.DepthStencilState = p.draws[i].depth;
         desc.InputLayout = {elements, 2};
         desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        desc.NumRenderTargets = 1;
+        desc.NumRenderTargets = p.color2 ? 2 : 1;
         desc.RTVFormats[0] = p.color->format;
+        if (p.color2) desc.RTVFormats[1] = p.color2->format;
         desc.DSVFormat = p.depth->format;
         desc.SampleDesc = {1, 0};
         if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&psos[i].p)))) return fail("PSO refused");
     }
     D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, up{D3D12_HEAP_TYPE_UPLOAD}, rb{D3D12_HEAP_TYPE_READBACK};
-    Ref<ID3D12Resource> color, depth, vertices, readback;
-    D3D12_CLEAR_VALUE color_clear{p.color->format};
-    std::memcpy(color_clear.Color, p.clear_color, sizeof color_clear.Color);
+    Ref<ID3D12Resource> color, color2, depth, vertices, readback;
     const auto cd = texture(p.color->format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
     if (FAILED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &cd, D3D12_RESOURCE_STATE_RENDER_TARGET,
                                                nullptr, IID_PPV_ARGS(&color.p))))
         return fail("colour target");
+    const auto cd2 = texture(p.color2 ? p.color2->format : p.color->format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    if (p.color2 && FAILED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &cd2,
+                                                           D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr,
+                                                           IID_PPV_ARGS(&color2.p))))
+        return fail("second colour target");
     if (has_depth) {
         const auto dd = texture(p.depth->format, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
         if (FAILED(device->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE,
@@ -412,14 +449,17 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
     if (FAILED(device->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &rbd, D3D12_RESOURCE_STATE_COPY_DEST,
                                                nullptr, IID_PPV_ARGS(&readback.p))))
         return fail("readback");
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1};
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2};
     Ref<ID3D12DescriptorHeap> rtv_heap, dsv_heap;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap.p)))) return fail("rtv heap");
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap.p)))) return fail("dsv heap");
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv2 = rtv;
+    rtv2.ptr += device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap->GetCPUDescriptorHandleForHeapStart();
     device->CreateRenderTargetView(color.p, nullptr, rtv);
+    if (p.color2) device->CreateRenderTargetView(color2.p, nullptr, rtv2);
     if (has_depth) device->CreateDepthStencilView(depth.p, nullptr, dsv);
 
     D3D12_COMMAND_QUEUE_DESC qd{};
@@ -433,12 +473,14 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))))
         return fail("queue");
     list->ClearRenderTargetView(rtv, p.clear_color, 0, nullptr);
+    if (p.color2) list->ClearRenderTargetView(rtv2, p.clear_color2, 0, nullptr);
     if (has_depth)
         list->ClearDepthStencilView(dsv, p.depth->stencil ? D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL
                                                           : D3D12_CLEAR_FLAG_DEPTH,
                                     p.clear_depth, p.clear_stencil, 0, nullptr);
     list->SetGraphicsRootSignature(root.p);
-    list->OMSetRenderTargets(1, &rtv, FALSE, has_depth ? &dsv : nullptr);
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {rtv, rtv2};
+    list->OMSetRenderTargets(p.color2 ? 2 : 1, rtvs, FALSE, has_depth ? &dsv : nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     const D3D12_VERTEX_BUFFER_VIEW vbv{vertices->GetGPUVirtualAddress(), UINT(vb_bytes), sizeof(Vertex)};
     list->IASetVertexBuffers(0, 1, &vbv);
@@ -455,9 +497,11 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         first += count;
     }
     // Read back the colour target and every depth-stencil plane.
-    D3D12_RESOURCE_BARRIER barriers[2] = {
+    D3D12_RESOURCE_BARRIER barriers[3] = {
         d3d12test::transition(color.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)};
     UINT nb = 1;
+    if (p.color2)
+        barriers[nb++] = d3d12test::transition(color2.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (has_depth)
         barriers[nb++] = d3d12test::transition(depth.p, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->ResourceBarrier(nb, barriers);
@@ -480,6 +524,7 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
         offset = (rg.fp.Offset + UINT64(rg.rows) * rg.fp.Footprint.RowPitch + 511) / 512 * 512;
     };
     copy_out(color.p, cd, 0);
+    if (p.color2) copy_out(color2.p, cd2, 0);
     const UINT planes = has_depth ? (p.depth->stencil ? 2u : 1u) : 0u;
     const auto dd = texture(p.depth->format, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
     for (UINT plane = 0; plane < planes; ++plane) copy_out(depth.p, dd, plane);
@@ -495,15 +540,17 @@ Result run(ID3D12Device* device, const Program& p, const Pass& pass) {
     std::uint8_t* back = nullptr;
     const D3D12_RANGE range{0, SIZE_T(1 << 20)};
     if (FAILED(readback->Map(0, &range, reinterpret_cast<void**>(&back)))) return fail("map readback");
+    const size_t colours = p.color2 ? 2 : 1;
     for (size_t i = 0; i < regions.size(); ++i) {
         const Region& rg = regions[i];
-        std::vector<std::uint8_t>& to = i == 0 ? out.color : out.depth;
+        std::vector<std::uint8_t>& to = i == 0 ? out.color : i < colours ? out.color2 : out.depth;
         const size_t start = to.size();
         for (UINT row = 0; row < rg.rows; ++row) {
             const std::uint8_t* from = back + rg.fp.Offset + UINT64(row) * rg.fp.Footprint.RowPitch;
             to.insert(to.end(), from, from + rg.row_bytes);
         }
-        if (i > 0) out.depth_planes.push_back({UINT(i - 1), rg.fp.Footprint.Format, start, rg.row_bytes, rg.rows});
+        if (i >= colours)
+            out.depth_planes.push_back({UINT(i - colours), rg.fp.Footprint.Format, start, rg.row_bytes, rg.rows});
     }
     readback->Unmap(0, nullptr);
     return out;
@@ -551,25 +598,28 @@ void note(Comparison& c, const char* what, UINT x, UINT y, std::uint64_t mine, s
 
 Comparison compare(const Program& p, const Result& layer, const Result& ref) {
     Comparison c;
-    if (layer.color.size() != ref.color.size() || layer.depth.size() != ref.depth.size()) {
+    if (layer.color.size() != ref.color.size() || layer.color2.size() != ref.color2.size() ||
+        layer.depth.size() != ref.depth.size()) {
         c.beyond_tolerance = 1;
         c.first = "readback sizes differ";
         return c;
     }
-    const UINT bytes = p.color->bytes;
+    const auto target = [&](const ColorFormat& format, const std::vector<std::uint8_t>& mine_bytes,
+                            const std::vector<std::uint8_t>& ref_bytes, const char* label) {
+    const UINT bytes = format.bytes;
     const size_t row_bytes = size_t(kSize) * bytes;
     for (UINT y = 0; y < kSize; ++y)
         for (UINT x = 0; x < kSize; ++x) {
             const size_t at = y * row_bytes + size_t(x) * bytes;
-            if (!std::memcmp(layer.color.data() + at, ref.color.data() + at, bytes)) continue;
+            if (!std::memcmp(mine_bytes.data() + at, ref_bytes.data() + at, bytes)) continue;
             ++c.exact_differences;
             bool within = true;
-            switch (p.color->kind) {
+            switch (format.kind) {
             case ColorFormat::unorm8:
-                for (UINT k = 0; k < 4; ++k) within = within && std::abs(int(layer.color[at + k]) - int(ref.color[at + k])) <= 1;
+                for (UINT k = 0; k < 4; ++k) within = within && std::abs(int(mine_bytes[at + k]) - int(ref_bytes[at + k])) <= 1;
                 break;
             case ColorFormat::unorm10_2: {
-                const std::uint32_t a = load(layer.color, at, 4), b = load(ref.color, at, 4);
+                const std::uint32_t a = load(mine_bytes, at, 4), b = load(ref_bytes, at, 4);
                 for (UINT k = 0; k < 3; ++k)
                     within = within && std::abs(int((a >> (10 * k)) & 0x3ff) - int((b >> (10 * k)) & 0x3ff)) <= 1;
                 within = within && (a >> 30) == (b >> 30);  // a 2-bit alpha has no rounding slack
@@ -577,14 +627,14 @@ Comparison compare(const Program& p, const Result& layer, const Result& ref) {
             }
             case ColorFormat::half:
                 for (UINT k = 0; k < 4; ++k)
-                    within = within && ulps16(load(layer.color, at + 2 * k, 2), load(ref.color, at + 2 * k, 2)) <= 1;
+                    within = within && ulps16(load(mine_bytes, at + 2 * k, 2), load(ref_bytes, at + 2 * k, 2)) <= 1;
                 break;
             case ColorFormat::single:
                 for (UINT k = 0; k < 4; ++k)
-                    within = within && ulps32(load(layer.color, at + 4 * k, 4), load(ref.color, at + 4 * k, 4)) <= 2;
+                    within = within && ulps32(load(mine_bytes, at + 4 * k, 4), load(ref_bytes, at + 4 * k, 4)) <= 2;
                 break;
             case ColorFormat::r11g11b10: {
-                const std::uint32_t a = load(layer.color, at, 4), b = load(ref.color, at, 4);
+                const std::uint32_t a = load(mine_bytes, at, 4), b = load(ref_bytes, at, 4);
                 constexpr UINT shift[3] = {0, 11, 22}, bits[3] = {11, 11, 10};
                 for (UINT k = 0; k < 3; ++k) {
                     const int da = int((a >> shift[k]) & ((1u << bits[k]) - 1)), db = int((b >> shift[k]) & ((1u << bits[k]) - 1));
@@ -595,11 +645,14 @@ Comparison compare(const Program& p, const Result& layer, const Result& ref) {
             }
             if (!within) {
                 std::uint64_t mine = 0, theirs = 0;
-                std::memcpy(&mine, layer.color.data() + at, std::min<UINT>(bytes, 8));
-                std::memcpy(&theirs, ref.color.data() + at, std::min<UINT>(bytes, 8));
-                note(c, "colour", x, y, mine, theirs);
+                std::memcpy(&mine, mine_bytes.data() + at, std::min<UINT>(bytes, 8));
+                std::memcpy(&theirs, ref_bytes.data() + at, std::min<UINT>(bytes, 8));
+                note(c, label, x, y, mine, theirs);
             }
         }
+    };
+    target(*p.color, layer.color, ref.color, "colour");
+    if (p.color2) target(*p.color2, layer.color2, ref.color2, "target 1");
     for (const Plane& pl : ref.depth_planes) {
         const UINT texel = UINT(pl.row_bytes / kSize);
         const bool stencil_plane = pl.plane == 1;
@@ -672,10 +725,13 @@ int main(int argc, char** argv) {
     const auto ps_program = d3d12test::fssm_program({0x50530501, 0xbf810000});
     const auto vs_container = d3d12test::shader_container(vs_program);
     const auto ps_container = d3d12test::shader_container(ps_program);
+    const auto ps_mrt_program = d3d12test::fssm_program({0x50530502, 0xbf810000});
+    const auto ps_mrt_container = d3d12test::shader_container(ps_mrt_program);
     const testfiles::ScratchDir scratch("leonida_pso_fuzz_test");
     const auto& library = scratch.path();
     if (!testfiles::copy_file(LEONIDA_PSO_VS_SPV, library / "vs.spv") ||
-        !testfiles::copy_file(LEONIDA_PSO_PS_SPV, library / "ps.spv"))
+        !testfiles::copy_file(LEONIDA_PSO_PS_SPV, library / "ps.spv") ||
+        !testfiles::copy_file(LEONIDA_PSO_PS_MRT_SPV, library / "ps_mrt.spv"))
         return 1;
     {
         std::ofstream index(library / "index.json", std::ios::binary);
@@ -686,7 +742,9 @@ int main(int argc, char** argv) {
                  "{\"semantic\": \"COLOR\", \"semantic_index\": 0, \"register\": 1, \"mask\": 15, \"rw_mask\": 15, "
                  "\"system_value\": 0, \"component_type\": \"float\"}]},\n"
                  " \"ps\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_program)
-              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]}}";
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0]},\n"
+                 " \"ps_mrt\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps_mrt_program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0, 1]}}";
     }
     // The device the runtime itself makes (its features, depthClamp among them), reading the shaders from
     // LEONIDA_SHADERS.
@@ -735,8 +793,9 @@ int main(int argc, char** argv) {
     const auto compile = compiler ? reinterpret_cast<pD3DCompile>(reinterpret_cast<void*>(
                                         GetProcAddress(compiler, "D3DCompile")))
                                   : nullptr;
-    std::vector<std::uint8_t> host_vs, host_ps;
-    if (!compile || !compile_hlsl(compile, kHostVs, "vs_5_0", host_vs) || !compile_hlsl(compile, kHostPs, "ps_5_0", host_ps)) {
+    std::vector<std::uint8_t> host_vs, host_ps, host_ps_mrt;
+    if (!compile || !compile_hlsl(compile, kHostVs, "vs_5_0", host_vs) || !compile_hlsl(compile, kHostPs, "ps_5_0", host_ps) ||
+        !compile_hlsl(compile, kHostPsMrt, "ps_5_0", host_ps_mrt)) {
         std::puts("SKIP: d3dcompiler_47 could not compile the reference's shaders");
         return 77;
     }
@@ -745,7 +804,8 @@ int main(int argc, char** argv) {
     root_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     const auto root_blob = d3d12test::serialize_root_signature(root_desc);
     if (root_blob.empty()) return 1;
-    const Pass layer_pass{&root_blob, &vs_container, &ps_container}, ref_pass{&root_blob, &host_vs, &host_ps};
+    const Pass layer_pass{&root_blob, &vs_container, &ps_container, &ps_mrt_container};
+    const Pass ref_pass{&root_blob, &host_vs, &host_ps, &host_ps_mrt};
     const Support sup = support(layer.p, ref.p);
     if (sup.colors.empty()) {
         std::puts("SKIP: no colour format both devices render");
@@ -825,9 +885,9 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(seed), c.beyond_tolerance, ref_name.c_str(), c.first.c_str());
             if (verbose) print_program(p);
         } else if (verbose) {
-            std::printf("seed %llu: same (%s, %s, %zu draws; %zu texels within the tolerance)\n",
-                        static_cast<unsigned long long>(seed), p.color->name, p.depth->name, p.draws.size(),
-                        c.exact_differences);
+            std::printf("seed %llu: same (%s%s%s, %s, %zu draws; %zu texels within the tolerance)\n",
+                        static_cast<unsigned long long>(seed), p.color->name, p.color2 ? " + " : "",
+                        p.color2 ? p.color2->name : "", p.depth->name, p.draws.size(), c.exact_differences);
         }
     }
     std::printf("pso fuzz (layer against %ls): %u seeds run, %u differ, %u refused by the layer; %zu texels within "
