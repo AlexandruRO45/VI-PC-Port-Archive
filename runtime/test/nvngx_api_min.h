@@ -56,6 +56,19 @@ enum PerfQualityValue {
     PERF_VALUE_DLAA = 5,             // 1.0x
 };
 
+// DLSS.Hint.Render.Preset values (guide 5.2.8.2, the 310.6 enum). Default keeps whatever the OTA brings; the
+// live presets are J/K/L/M (K is the transformer one recommended for DLAA/Balanced/Quality, L is Ultra Perf's,
+// M is Perf's); the rest are deprecated or reserved.
+enum PresetValue {
+    PRESET_DEFAULT = 0,
+    PRESET_E = 5,
+    PRESET_F = 6,
+    PRESET_J = 10,
+    PRESET_K = 11,
+    PRESET_L = 12,
+    PRESET_M = 13,
+};
+
 // The opaque object Allocate/Get(Capability)Parameters hands out: 17 virtual slots, single-inheritance vtable,
 // declared in this exact order (verified at runtime; changing the order changes the ABI).
 struct Parameter {
@@ -132,5 +145,13 @@ constexpr const char* SUPER_NEEDS_UPDATED_DRIVER = "SuperSampling.NeedsUpdatedDr
 constexpr const char* SUPER_MIN_DRIVER_VERSION_MAJOR = "SuperSampling.MinDriverVersionMajor";
 constexpr const char* SUPER_MIN_DRIVER_VERSION_MINOR = "SuperSampling.MinDriverVersionMinor";
 constexpr const char* SUPER_FEATURE_INIT_RESULT = "SuperSampling.FeatureInitResult";
+// Per-slot render preset hints (310.6): the int value is a member of PresetValue; setting the slot that
+// matches the feature's quality mode overrides which network preset runs.
+constexpr const char* PRESET_KEY_DLAA = "DLSS.Hint.Render.Preset.DLAA";
+constexpr const char* PRESET_KEY_ULTRA_QUALITY = "DLSS.Hint.Render.Preset.UltraQuality";
+constexpr const char* PRESET_KEY_QUALITY = "DLSS.Hint.Render.Preset.Quality";
+constexpr const char* PRESET_KEY_BALANCED = "DLSS.Hint.Render.Preset.Balanced";
+constexpr const char* PRESET_KEY_PERFORMANCE = "DLSS.Hint.Render.Preset.Performance";
+constexpr const char* PRESET_KEY_ULTRA_PERFORMANCE = "DLSS.Hint.Render.Preset.UltraPerformance";
 
 }  // namespace nvngx

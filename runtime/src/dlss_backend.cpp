@@ -118,32 +118,50 @@ void shutdown(ID3D12Device* device) {
     if (core().enabled) core().shutdown1(device);
 }
 
+nvngx::PerfQualityValue pick_quality(float upscale_ratio) {
+    // The FFX mode's ratio names the DLSS slot (the game's own ffxQuery feeds desc.upscale_ratio). The slot
+    // ratios anchored by the guide's Optimal Settings table are MaxQuality=1.5, UltraQuality=1.7,
+    // Balanced=1.7237, MaxPerf=3.0: distances fold 2.0-3.0 into UltraQuality and the 1.7237 collision keeps
+    // Balanced in the 1.71..2.0 band.
+    if (upscale_ratio >= 3.0f) return nvngx::PERF_VALUE_MAX_PERF;
+    if (upscale_ratio >= 2.0f) return nvngx::PERF_VALUE_ULTRA_QUALITY;
+    if (upscale_ratio > 1.71f) return nvngx::PERF_VALUE_BALANCED;    // 1.7237x
+    if (upscale_ratio > 1.6f) return nvngx::PERF_VALUE_ULTRA_QUALITY;  // 1.7x
+    if (upscale_ratio > 1.05f) return nvngx::PERF_VALUE_MAX_QUALITY;   // 1.5x
+    return nvngx::PERF_VALUE_DLAA;
+}
+
+int create_flags(const Description& desc) {
+    return (desc.hdr ? nvngx::DLSS_FLAG_IS_HDR : 0) | (desc.mv_low_res ? nvngx::DLSS_FLAG_MV_LOW_RES : 0) |
+           (desc.mv_jittered ? nvngx::DLSS_FLAG_MV_JITTERED : 0) |
+           (desc.depth_inverted ? nvngx::DLSS_FLAG_DEPTH_INVERTED : 0) |
+           (desc.auto_exposure ? nvngx::DLSS_FLAG_AUTO_EXPOSURE : 0);
+}
+
+float effective_mv_scale(float mv_scale) {
+    return mv_scale == 0.0f ? 1.0f : mv_scale;  // the shipped helper's 0-means-1.0 rule
+}
+
+const char* preset_key(nvngx::PerfQualityValue quality) {
+    switch (quality) {
+        case nvngx::PERF_VALUE_DLAA: return nvngx::PRESET_KEY_DLAA;
+        case nvngx::PERF_VALUE_ULTRA_QUALITY: return nvngx::PRESET_KEY_ULTRA_QUALITY;
+        case nvngx::PERF_VALUE_MAX_QUALITY: return nvngx::PRESET_KEY_QUALITY;
+        case nvngx::PERF_VALUE_BALANCED: return nvngx::PRESET_KEY_BALANCED;
+        case nvngx::PERF_VALUE_MAX_PERF: return nvngx::PRESET_KEY_PERFORMANCE;
+        case nvngx::PERF_VALUE_ULTRA_PERFORMANCE: return nvngx::PRESET_KEY_ULTRA_PERFORMANCE;
+    }
+    return nvngx::PRESET_KEY_QUALITY;
+}
+
 Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12Device* device,
                unsigned int creation_node_mask) {
     (void)device;
     if (!core().enabled) return Feature{};
     nvngx::Parameter* params = nullptr;
     if (core().allocate(&params) != nvngx::RESULT_SUCCESS || !params) return Feature{};
-    // Quality: the FFX mode's ratio names the DLSS slot (the game's own ffxQuery feeds desc.upscale_ratio).
-    // The two collisions in the shipped enum resolve conservatively: 3.0x keeps MaxPerf, 1.7237x keeps Balanced.
-    nvngx::PerfQualityValue quality = nvngx::PERF_VALUE_MAX_QUALITY;
-    if (desc.upscale_ratio >= 3.0f) {
-        quality = nvngx::PERF_VALUE_MAX_PERF;
-    } else if (desc.upscale_ratio > 1.71f) {
-        quality = nvngx::PERF_VALUE_BALANCED;   // 1.7237x
-    } else if (desc.upscale_ratio > 1.6f) {
-        quality = nvngx::PERF_VALUE_ULTRA_QUALITY;  // 1.7x
-    } else if (desc.upscale_ratio > 1.05f) {
-        quality = nvngx::PERF_VALUE_MAX_QUALITY;    // 1.5x
-    } else {
-        quality = nvngx::PERF_VALUE_DLAA;
-    }
-    int flags = 0;
-    if (desc.hdr) flags |= nvngx::DLSS_FLAG_IS_HDR;
-    if (desc.mv_low_res) flags |= nvngx::DLSS_FLAG_MV_LOW_RES;
-    if (desc.mv_jittered) flags |= nvngx::DLSS_FLAG_MV_JITTERED;
-    if (desc.depth_inverted) flags |= nvngx::DLSS_FLAG_DEPTH_INVERTED;
-    if (desc.auto_exposure) flags |= nvngx::DLSS_FLAG_AUTO_EXPOSURE;
+    const nvngx::PerfQualityValue quality = pick_quality(desc.upscale_ratio);
+    const int flags = create_flags(desc);
     params->Set(nvngx::CREATION_NODE_MASK, creation_node_mask);
     params->Set(nvngx::VISIBILITY_NODE_MASK, creation_node_mask);
     params->Set(nvngx::WIDTH, desc.render_width);
@@ -160,6 +178,7 @@ Feature create(ID3D12GraphicsCommandList* list, const Description& desc, ID3D12D
     f.ngx = handle;
     f.quality = quality;
     f.flags = flags;
+    f.preset = desc.preset;
     return f;
 }
 
@@ -171,10 +190,12 @@ bool eval_from_ffx(Feature& f, ID3D12GraphicsCommandList* list, const FfxDescrip
     if (fx.motion_vectors) f.params->Set(nvngx::MOTION_VECTORS, fx.motion_vectors);
     f.params->Set(nvngx::JITTER_OFFSET_X, fx.jitter_x);
     f.params->Set(nvngx::JITTER_OFFSET_Y, fx.jitter_y);
-    f.params->Set(nvngx::MV_SCALE_X, fx.mv_scale_x == 0.0f ? 1.0f : fx.mv_scale_x);
-    f.params->Set(nvngx::MV_SCALE_Y, fx.mv_scale_y == 0.0f ? 1.0f : fx.mv_scale_y);
+    f.params->Set(nvngx::MV_SCALE_X, effective_mv_scale(fx.mv_scale_x));
+    f.params->Set(nvngx::MV_SCALE_Y, effective_mv_scale(fx.mv_scale_y));
     f.params->Set(nvngx::SHARPNESS, fx.sharpness);
     f.params->Set(nvngx::RESET, fx.reset ? 1 : 0);
+    if (f.preset != nvngx::PRESET_DEFAULT)
+        f.params->Set(preset_key(f.quality), f.preset);  // per-slot hint; OTA default if unset
     if (fx.exposure) f.params->Set(nvngx::EXPOSURE_TEXTURE, fx.exposure);
     if (fx.transparency_mask) f.params->Set(nvngx::TRANSPARENCY_MASK, fx.transparency_mask);
     return core().evaluate(list, f.ngx, f.params, nullptr) == nvngx::RESULT_SUCCESS;

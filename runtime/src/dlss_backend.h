@@ -13,7 +13,8 @@
 namespace leonida::dlss {
 
 // What the game's FFX create asks for, in DLSS terms. The flags are the FFX upscale context flags the game
-// passes (measured on 1.0.2.1: HDR + inverted depth + auto exposure); the shim maps them 1:1.
+// passes (measured on 1.0.2.1: HDR + low-res MVs + inverted depth + auto exposure); the shim maps them 1:1. `preset` is a
+// DLSS.Hint.Render.Preset value (nvngx::PresetValue); the default 0 leaves the driver's OTA choice in place.
 struct Description {
     unsigned int render_width = 0;
     unsigned int render_height = 0;
@@ -25,6 +26,7 @@ struct Description {
     bool mv_jittered = false;
     bool depth_inverted = false;
     bool auto_exposure = false;
+    int preset = nvngx::PRESET_DEFAULT;
 };
 
 // One dispatch's inputs, as the game's FfxDispatchDescUpscale carries them.
@@ -49,7 +51,23 @@ struct Feature {
     nvngx::Result rc_create = 0;
     nvngx::PerfQualityValue quality = nvngx::PERF_VALUE_MAX_QUALITY;
     int flags = 0;
+    int preset = nvngx::PRESET_DEFAULT;  // per-slot hint set at eval; 0 stays the OTA default
 };
+
+// The translation pieces, exposed on their own because the tests drive them without NGX (they are the
+// game-measured mapping rules, not just implementation details):
+//   pick_quality — the FFX mode's ratio names the DLSS slot; the shipped-enum collisions resolve
+//                  conservatively (3.0x keeps MaxPerf, 1.7237x keeps Balanced; 2.0-3.0 folds into
+//                  UltraQuality, and the 1.71 cut is where the shipped values stop differing).
+//   create_flags — the bitmap the measured 1.0.2.1 FSR4 context translates to.
+//   effective_mv_scale — the shipped helper's 0-means-1.0 rule.
+nvngx::PerfQualityValue pick_quality(float upscale_ratio);
+int create_flags(const Description& desc);
+float effective_mv_scale(float mv_scale);
+
+// The per-slot preset key for a quality mode (DLSS.Hint.Render.Preset.*), and whether the feature's preset
+// hint should be set at all: the driver's OTA default stays untouched for PRESET_DEFAULT.
+const char* preset_key(nvngx::PerfQualityValue quality);
 
 // Process-level: loads the NGX Core by name (LEONIDA_NGX_DLL overrides), inits on device, checks capability.
 bool init(ID3D12Device* device, const wchar_t* data_path);
