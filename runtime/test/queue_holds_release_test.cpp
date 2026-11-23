@@ -41,6 +41,11 @@ struct FakeHolder : Holds::Holder {
         return true;
     }
 
+    std::uint64_t oldest_held_seq() override {
+        std::lock_guard own(held_mu);
+        return held.empty() ? 0 : held.front().second;
+    }
+
     void discard_waiting_on(int sem) override {
         if (hook_mu) {
             std::unique_lock lk(*hook_mu);
@@ -132,7 +137,7 @@ int test_post_zero_window() {
     holds.attach(&fake);
 
     bool first_seen = false, go = false, newcomer_entered = false, newcomer_pending = false;
-    bool early_failure = false;
+    bool newcomer_attempting = false, early_failure = false;
 
     std::thread first([&] {
         holds.begin_hold();
@@ -168,22 +173,37 @@ int test_post_zero_window() {
     }
 
     std::thread newcomer([&] {
+        {
+            std::lock_guard lock(mu);
+            newcomer_attempting = true;  // rendezvous: the reservation attempt is about to be made
+        }
+        cv.notify_all();
         holds.begin_hold();  // must block while the removal is in progress
         {
             std::lock_guard lock(mu);
             newcomer_entered = true;
         }
+        cv.notify_all();
         newcomer_pending = holds.pending(sem, 1);
         if (newcomer_pending) fake.add_hold(sem, 1);
         holds.end_hold();
         holds.pump_ready();
     });
 
-    // Give the newcomer time to try; it must still be waiting for the removal to finish.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Rendezvous at the reservation attempt: do not release the removal until the newcomer has actually reached it.
+    // Yielding (not a wall-clock sleep) lets a broken begin_hold() run far enough to be observed without depending on
+    // how fast this machine schedules the thread. A correct one cannot get past it until allow_discard is set below.
     {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [&] { return newcomer_attempting; });
+    }
+    for (int i = 0; i < 1000; ++i) {
+        std::this_thread::yield();
         std::lock_guard lock(mu);
-        if (newcomer_entered) early_failure = true;
+        if (newcomer_entered) {
+            early_failure = true;  // begin_hold() returned while a removal was still in progress
+            break;
+        }
     }
 
     {
