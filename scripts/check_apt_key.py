@@ -12,6 +12,7 @@ Reads the key with `gpg --show-keys --with-colons` (GnuPG 2.2.8+), which lists a
 keyring changes. Exits 0 when the key matches, 1 when it doesn't or gpg can't read it, 2 on a usage error. Standard
 library only.
 """
+import argparse
 import os
 import re
 import subprocess
@@ -66,10 +67,12 @@ def check(path, expected, gpg=("gpg",)):
 
 
 def main(argv):
-    if len(argv) != 2:
-        print("usage: check_apt_key.py KEYFILE FINGERPRINT", file=sys.stderr)
-        return 2
-    path, fingerprint = argv
+    ap = argparse.ArgumentParser(prog="check_apt_key.py", description=__doc__.splitlines()[0])
+    ap.add_argument("keyfile", metavar="KEYFILE", help="the downloaded key file; it is listed, not imported")
+    ap.add_argument("fingerprint", metavar="FINGERPRINT",
+                    help="the pinned fingerprint, 40 hex digits; spaces and case don't matter")
+    a = ap.parse_args(argv)
+    path, fingerprint = a.keyfile, a.fingerprint
     expected = normalize(fingerprint)
     if not expected:
         print(f"not a 40-digit key fingerprint: {fingerprint!r}", file=sys.stderr)
