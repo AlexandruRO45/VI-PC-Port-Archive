@@ -6,6 +6,7 @@ their normal window so the user sees and accepts each one's licence and the Wind
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -246,9 +247,14 @@ def verify_signature(path, signer=None):
         raise RuntimeError("Couldn't check the installer's signature")
     if status != "Valid":
         raise RuntimeError(f"The installer's signature isn't valid ({status}), so it wasn't run")
-    if signer and signer.lower() not in subject.lower():
-        org = next((p.strip()[2:] for p in subject.split(",") if p.strip().startswith("O=")), subject)
-        raise RuntimeError(f"The installer is signed by {org}, not {signer[2:]}, so it wasn't run")
+    if signer:
+        # compare the parsed O= value exactly: "Microsoft Corporation Fan Club LLC" or an OU holding the
+        # expected text must not pass
+        m = re.search(r'(?:^|,\s*)O=(?:"([^"]*)"|([^,]*))', subject)
+        org = ((m.group(1) if m.group(1) is not None else m.group(2)) if m else "").strip()
+        if org.lower() != signer[2:].lower():
+            raise RuntimeError(f"The installer is signed by {org or 'an unknown publisher'}, not {signer[2:]}, "
+                               "so it wasn't run")
 
 
 def run_installer(path, args=()):

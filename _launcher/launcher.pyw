@@ -40,6 +40,8 @@ STAGE_INFO = {
 NEED_GB = 350
 REPO_URL = "https://github.com/ItsNotRexed/Leonida"
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+# git stash (and pull --autostash) make a commit, which needs a name even where the user never set one
+IDENT = ("-c", "user.name=Leonida Launcher", "-c", "user.email=launcher@localhost")
 
 
 # ---------------------------------------------------------------- helpers
@@ -1156,15 +1158,18 @@ class App(tk.Tk):
         stash = False
         if connect:
             if silent or not messagebox.askyesno(
-                    "Leonida", f"Connect this folder to {REPO_URL}?\n\nThis runs git init here, fetches main and "
-                    "makes this folder a checkout of it. Files you changed show up as local edits.", parent=self):
+                    "Leonida", f"Connect this folder to {REPO_URL}?\n\nThis runs git init here and makes the folder "
+                    "a checkout of the newest main. Files that differ from main (older versions from the ZIP, or "
+                    "your own edits) are replaced; the old versions are kept in git stash, so nothing is lost.",
+                    parent=self):
                 return
         elif silent and not self.auto_ok(info):
             return
         elif info.get("dirty"):
             if not messagebox.askyesno(
                     "Leonida", "This folder has local edits.\n\nSet them aside, update, then put them back "
-                    "(git pull --autostash)? If they clash with the update, git keeps them in the stash.",
+                    "(git pull --autostash)? If they clash with the update, the launcher names the files to fix, "
+                    "and git keeps your edits in the stash.",
                     parent=self):
                 return
             stash = True
@@ -1182,7 +1187,26 @@ class App(tk.Tk):
                     if rc != 0:
                         self.q.put(("updated", rc, out, silent))
                         return
-            rc, out = self.git("pull", "--ff-only", *(["--autostash"] if stash else []), timeout=600)
+                # The mixed reset only moved the index: the ZIP's files are still on disk. Put them aside and
+                # check out main's, so the build runs the code the page says is installed.
+                _, st = self.git("status", "--porcelain")
+                if st.strip():
+                    rc, o = self.git(*IDENT, "stash", "push", "-q", "--include-untracked", "-m",
+                                     "Leonida launcher: files from the ZIP copy, before connecting", timeout=600)
+                    out += o
+                    if rc != 0:
+                        self.q.put(("updated", rc, out, silent))
+                        return
+                    out += "Files that differed from main were set aside: see git stash list.\n"
+                rc = 0
+            else:
+                rc, out = self.git(*IDENT, "pull", "--ff-only", *(["--autostash"] if stash else []), timeout=600)
+                _, unmerged = self.git("diff", "--name-only", "--diff-filter=U")
+                if unmerged.strip():
+                    files = ", ".join(unmerged.split()[:8])
+                    out += (f"\nYour local edits clash with the update in: {files}. Those files now hold conflict "
+                            "markers; fix them before building. Your edits are also still in git stash.\n")
+                    rc = rc or 1
             if rc == 0:
                 rc2, out2 = self.git("submodule", "update", "--init", "--recursive", timeout=600)
                 out += out2

@@ -385,7 +385,7 @@ def style_test():
     Check(f, "Also make WAV audio", v).pack(anchor="w", pady=px(SP["s"]))
     iv = tk.IntVar(value=6)
     Stepper(f, iv, 1, 12).pack(anchor="w", pady=px(SP["s"]))
-    sv = tk.StringVar(value="D:\\Games\\GTA VI Package")
+    sv = tk.StringVar(value="D:\\Games\\Package")
     entry(f, sv).pack(fill="x", ipady=px(8), pady=px(SP["s"]))
     root.geometry(f"{px(900)}x{px(860)}")
     return root
