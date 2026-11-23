@@ -76,23 +76,25 @@ def parse_container(data: bytes, offset: int):
     if table_end > total:
         raise ContainerError("chunk table past the container")
     chunks = []
+    previous_end = table_end
     for k in range(count):
         start = u32(data, offset + 32 + 4 * k)
         if not table_end <= start <= total - 8:
             raise ContainerError(f"chunk {k} offset {start} outside the container")
+        if start < previous_end:
+            raise ContainerError(f"chunk {k} overlaps an earlier chunk or is out of order")
         fourcc = data[offset + start : offset + start + 4]
         size = u32(data, offset + start + 4)
-        if start + 8 + size > total:
+        end = start + 8 + size
+        if end > total:
             raise ContainerError(f"chunk {k} payload past the container")
         if start % 4:
             raise ContainerError(f"chunk {k} offset {start} not 4-byte aligned")
         if not all(0x20 <= b < 0x7F for b in fourcc):
             raise ContainerError(f"chunk {k} fourcc is not printable")
         chunks.append((fourcc, start, size))
-    starts = [start for _, start, _ in chunks]
-    if starts != sorted(starts) or len(set(starts)) != len(starts):
-        raise ContainerError("chunk table is not sorted and unique")
-    if not chunks or max(start + 8 + size for _, start, size in chunks) != total:
+        previous_end = end
+    if previous_end != total:
         raise ContainerError("the last chunk does not end at the container size")
     return total, chunks
 

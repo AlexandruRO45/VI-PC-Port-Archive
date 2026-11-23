@@ -108,6 +108,20 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(len(rejected), 1)
 
+    def test_scan_rejects_overlapping_chunks_but_accepts_padding(self):
+        valid = container([(b"ONE1", b"x"), (b"TWO2", b"yz")])
+        first, second = struct.unpack_from("<2I", valid, 32)
+        self.assertGreater(second, first + 8 + 1)
+        found, rejected = psc.inspect(valid, "fake.dll")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(rejected, [])
+
+        overlapping = bytearray(valid)
+        struct.pack_into("<I", overlapping, first + 4, second - first - 8 + 1)
+        found, rejected = psc.inspect(bytes(overlapping), "fake.dll")
+        self.assertEqual(found, [])
+        self.assertEqual(rejected, [0])
+
     def test_fspx_is_reported_and_has_no_xbch(self):
         data = container([(b"SFI0", bytes(8)), (b"ACCC", b"FSPX" + bytes(12))])
         found, _ = psc.inspect(data, "fsr.dll")
