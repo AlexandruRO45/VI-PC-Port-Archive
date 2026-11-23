@@ -204,6 +204,27 @@ DWORD_PTR __stdcall game_set_thread_affinity_mask(HANDLE thread, DWORD_PTR mask)
     SetLastError(ERROR_SUCCESS);
     return actual;
 }
+// The retail title imports the group form (processtopology API sets), not SetThreadAffinityMask. The same rule holds: a
+// GROUP_AFFINITY naming cores or a processor group the PC lacks is answered, not failed. The thread stays where it is,
+// the call returns TRUE and the out parameter gets the affinity the thread had. An empty mask names no CPU on any
+// machine and a bad handle is the host's own error: both are passed to the host and fail as on Windows.
+BOOL __stdcall game_set_thread_group_affinity(HANDLE thread, const GROUP_AFFINITY* requested, PGROUP_AFFINITY previous) {
+    if (SetThreadGroupAffinity(thread, requested, previous)) return TRUE;
+    if (!requested || requested->Mask == 0 || GetLastError() != ERROR_INVALID_PARAMETER) return FALSE;
+    GROUP_AFFINITY actual = {};
+    if (!GetThreadGroupAffinity(thread, &actual)) return FALSE;  // the host's error stands
+    if (previous) *previous = actual;
+    static std::atomic<int> substituted{0};
+    const int n = ++substituted;
+    if (n <= 8)
+        std::fprintf(stderr, "[rt] process: SetThreadGroupAffinity(group %u, 0x%llx) names cores or a group the host lacks; "
+                             "the thread stays, answered group %u mask 0x%llx (call %d)\n",
+                     static_cast<unsigned>(requested->Group), static_cast<unsigned long long>(requested->Mask),
+                     static_cast<unsigned>(actual.Group), static_cast<unsigned long long>(actual.Mask), n);
+    // The log may have failed (a closed stderr pipe leaves ERROR_NO_DATA); the call itself succeeded.
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
 // A console-only kernel32 export that pins a thread pool to cores. The host has no such call, and a pool with the
 // host's own affinity runs the same work, so it succeeds and changes nothing.
 BOOL __stdcall game_set_threadpool_affinity_mask(PTP_POOL, DWORD_PTR) { return TRUE; }
@@ -392,6 +413,8 @@ using namespace rt::process;
     {dll, "_get_wide_winmain_command_line", reinterpret_cast<void*>(&game_get_wide_winmain_command_line)}
 #define EXIT_PROCESS(dll) {dll, "ExitProcess", reinterpret_cast<void*>(&game_exit_process)}
 #define THREAD_AFFINITY(dll) {dll, "SetThreadAffinityMask", reinterpret_cast<void*>(&game_set_thread_affinity_mask)}
+#define THREAD_GROUP_AFFINITY(dll) \
+    {dll, "SetThreadGroupAffinity", reinterpret_cast<void*>(&game_set_thread_group_affinity)}
 #define POOL_AFFINITY(dll) \
     {dll, "SetThreadpoolAffinityMask", reinterpret_cast<void*>(&game_set_threadpool_affinity_mask)}
 #define COMMAND_LINE(dll) \
@@ -421,6 +444,11 @@ SHIM_TABLE(process,
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-1.dll"),
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-2.dll"),
     THREAD_AFFINITY("api-ms-win-core-processthreads-l1-1-3.dll"),
+    THREAD_GROUP_AFFINITY("kernel32.dll"),
+    THREAD_GROUP_AFFINITY("kernelbase.dll"),
+    THREAD_GROUP_AFFINITY("api-ms-win-core-processtopology-l1-1-0.dll"),
+    THREAD_GROUP_AFFINITY("api-ms-win-core-processtopology-l1-1-1.dll"),
+    THREAD_GROUP_AFFINITY("api-ms-win-core-processtopology-l1-1-2.dll"),
     POOL_AFFINITY("kernel32.dll"),
     POOL_AFFINITY("kernelbase.dll"),
     COMMAND_LINE("kernel32.dll"),

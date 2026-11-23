@@ -309,6 +309,71 @@ int main() {
         }
     }
 
+    // The retail title pins threads with SetThreadGroupAffinity. A GROUP_AFFINITY of cores or a group the PC lacks must
+    // succeed, leave the thread where it is and hand back the affinity it had; an empty mask still fails.
+    {
+        using SetGroup = BOOL(WINAPI*)(HANDLE, const GROUP_AFFINITY*, PGROUP_AFFINITY);
+        const auto set_group = reinterpret_cast<SetGroup>(rt::shims::find("kernel32.dll", "SetThreadGroupAffinity"));
+        if (!set_group) {
+            std::fprintf(stderr, "FAIL SetThreadGroupAffinity is not served\n");
+            ++failures;
+        } else {
+            for (const char* dll : {"kernelbase.dll", "api-ms-win-core-processtopology-l1-1-0.dll",
+                                    "api-ms-win-core-processtopology-l1-1-1.dll", "api-ms-win-core-processtopology-l1-1-2.dll"})
+                if (rt::shims::find(dll, "SetThreadGroupAffinity") != reinterpret_cast<void*>(set_group)) {
+                    std::fprintf(stderr, "FAIL SetThreadGroupAffinity is not served under %s\n", dll);
+                    ++failures;
+                }
+            const HANDLE self = GetCurrentThread();
+            GROUP_AFFINITY own = {};
+            GetThreadGroupAffinity(self, &own);
+            // A processor group the PC does not have.
+            GROUP_AFFINITY absent_group = {~KAFFINITY{0}, static_cast<WORD>(GetActiveProcessorGroupCount()), {}};
+            GROUP_AFFINITY before = {1, 7, {}};
+            SetLastError(ERROR_GEN_FAILURE);
+            const BOOL ok = set_group(self, &absent_group, &before);
+            GROUP_AFFINITY after = {};
+            GetThreadGroupAffinity(self, &after);
+            if (!ok || GetLastError() != ERROR_SUCCESS || before.Group != own.Group || before.Mask != own.Mask ||
+                after.Group != own.Group || after.Mask != own.Mask) {
+                std::fprintf(stderr, "FAIL an absent group answered ok=%d error=%lu previous %u/0x%llx, want TRUE, 0, %u/0x%llx\n",
+                             ok, GetLastError(), before.Group, static_cast<unsigned long long>(before.Mask), own.Group,
+                             static_cast<unsigned long long>(own.Mask));
+                ++failures;
+            }
+            // Cores of the thread's own group that the process lacks (when it has every core of the group there is none).
+            DWORD_PTR process_mask = 0, system_mask = 0;
+            GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask);
+            const KAFFINITY missing = ~process_mask & (process_mask + 1);
+            if (missing) {
+                GROUP_AFFINITY absent_core = {missing, own.Group, {}};
+                GROUP_AFFINITY before_core = {};
+                if (!set_group(self, &absent_core, &before_core) || before_core.Mask != own.Mask) {
+                    std::fprintf(stderr, "FAIL absent cores answered previous 0x%llx, want 0x%llx\n",
+                                 static_cast<unsigned long long>(before_core.Mask), static_cast<unsigned long long>(own.Mask));
+                    ++failures;
+                }
+            }
+            // A mask the host accepts is applied; the answer is the affinity the thread had.
+            const KAFFINITY lowest = own.Mask & (~own.Mask + 1);
+            GROUP_AFFINITY one = {lowest, own.Group, {}}, prior = {};
+            GROUP_AFFINITY now = {};
+            if (!set_group(self, &one, &prior) || prior.Mask != own.Mask || !GetThreadGroupAffinity(self, &now) ||
+                now.Mask != lowest) {
+                std::fprintf(stderr, "FAIL a valid group mask was not applied with the old mask answered\n");
+                ++failures;
+            }
+            set_group(self, &own, nullptr);
+            // An empty mask names no CPU: it fails with ERROR_INVALID_PARAMETER, as on Windows.
+            GROUP_AFFINITY empty = {0, own.Group, {}};
+            SetLastError(ERROR_SUCCESS);
+            if (set_group(self, &empty, nullptr) || GetLastError() != ERROR_INVALID_PARAMETER) {
+                std::fprintf(stderr, "FAIL SetThreadGroupAffinity with an empty mask did not fail with ERROR_INVALID_PARAMETER\n");
+                ++failures;
+            }
+        }
+    }
+
     // The game thread that ends a run must park, not ExitProcess, even when run_entry has already returned and
     // cleared the run: main.cpp still prints "game exited with code N" and cleans up after it. On one CPU the
     // host preempts the game thread right after SetEvent(g_done), and Sleep lets the game thread run again before
