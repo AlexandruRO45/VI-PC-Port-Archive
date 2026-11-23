@@ -859,6 +859,35 @@ class SkinnedGlbTest(unittest.TestCase):
         self.assertTrue(os.path.exists(new_buf))
         self.assertEqual(hashlib.sha256(_read(new_buf)).hexdigest(), before_hash)
 
+    def test_palette_resolver_guards_non_dict_bones(self):
+        # BUILD-2683: malformed drawable-local skeleton entries must not crash with AttributeError
+        malformed_component = {
+            "drawable": {
+                "skeleton": [
+                    None,
+                    42,
+                    "stray_string",
+                    {"name": "VALID_LOCAL_BONE", "parent": 0},
+                ],
+                "strings": ["EXTRA_BONE"],
+            }
+        }
+        ped_by_name = {"SKEL_ROOT": {"name": "SKEL_ROOT"}}
+        resolver = skinned_glb.PaletteResolver(malformed_component, ped_by_name)
+        self.assertIn("VALID_LOCAL_BONE", resolver.own_by_name)
+        self.assertEqual(len(resolver.own_by_name), 1)
+
+        # own_parent_name must safely return None when parent entry in own_skeleton is not a dict
+        parent = skinned_glb.own_parent_name(resolver.own_by_name["VALID_LOCAL_BONE"], resolver.own_skeleton)
+        self.assertIsNone(parent)
+
+    def test_palette_resolver_guards_non_list_skeleton(self):
+        # Non-list skeleton in drawable must not raise TypeError or crash
+        component = {"drawable": {"skeleton": 12345}}
+        resolver = skinned_glb.PaletteResolver(component, {})
+        self.assertEqual(resolver.own_skeleton, [])
+        self.assertEqual(resolver.own_by_name, {})
+
 
 if __name__ == "__main__":
     unittest.main()

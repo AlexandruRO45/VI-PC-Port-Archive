@@ -544,11 +544,15 @@ class PaletteResolver:
     def __init__(self, component: dict, ped_by_name: dict[str, dict]):
         self.ped_by_name = ped_by_name
         drawable = component.get("drawable") or {}
-        own = drawable.get("skeleton") or []
+        own = drawable.get("skeleton")
+        if not isinstance(own, list):
+            own = []
         self.own_skeleton = own
         self.own_by_name = {}
         self.by_hash: dict[int, tuple[str, str]] = {}
         for bone in own:
+            if not isinstance(bone, dict):
+                continue
             name = bone.get("name")
             if isinstance(name, str) and name:
                 self.own_by_name.setdefault(name, bone)
@@ -586,7 +590,9 @@ def own_parent_name(record, own_skeleton) -> str | None:
     if parent_name is None:
         parent = record.get("parent")
         if isinstance(parent, int) and 0 <= parent < len(own_skeleton):
-            parent_name = own_skeleton[parent].get("name")
+            parent_entry = own_skeleton[parent]
+            if isinstance(parent_entry, dict):
+                parent_name = parent_entry.get("name")
     return parent_name if isinstance(parent_name, str) and parent_name else None
 
 
