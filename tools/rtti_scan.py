@@ -69,7 +69,7 @@ def load_pe64_image(data: bytes) -> tuple[int, bytes, list[dict]]:
             "<8sIIIIIIHHI", data, sec_off
         )
         span = vsize if vsize > 0 else rsize
-        end = vaddr + max(vsize, rsize)
+        end = vaddr + span
         if end > mapped_size:
             mapped_size = end
         sections.append({
@@ -93,9 +93,12 @@ def load_pe64_image(data: bytes) -> tuple[int, bytes, list[dict]]:
         rptr = sec["raw_ptr"]
         rsize = sec["raw_size"]
         vaddr = sec["virtual_address"]
-        if rsize <= 0 or rptr >= len(data) or vaddr >= mapped_size:
+        # Map at most VirtualSize bytes when VirtualSize > 0 (matching runtime/src/pe_loader.cpp and
+        # tools/pe_inspect.py): file-alignment padding past VirtualSize is not mapped into memory.
+        limit = min(rsize, sec["virtual_size"])
+        if limit <= 0 or rptr >= len(data) or vaddr >= mapped_size:
             continue
-        copy_len = min(rsize, len(data) - rptr, mapped_size - vaddr)
+        copy_len = min(limit, len(data) - rptr, mapped_size - vaddr)
         if copy_len > 0:
             img[vaddr : vaddr + copy_len] = data[rptr : rptr + copy_len]
 

@@ -523,6 +523,60 @@ class RttiScanCoreTest(unittest.TestCase):
         got = rtti_scan.scan_pe64_rtti(bytes(pe))
         self.assertEqual(got["vtables"], [])
 
+    def test_raw_bytes_past_virtual_size_are_not_mapped_or_scanned(self):
+        rdata = bytearray(0x1000)
+        # Real TypeDescriptor + COL inside .rdata's VirtualSize (0x000..0x0FF).
+        rdata[0x010:0x01D] = b".?AVMapped@@\x00"
+        struct.pack_into("<6I", rdata, 0x040, 1, 0, 0, 0x2000, 0, 0x2040)
+        # Phantom TypeDescriptor + COL sitting in raw file-alignment padding past VirtualSize (0x200..0x2FF).
+        rdata[0x210:0x21E] = b".?AVPhantom@@\x00"
+        struct.pack_into("<6I", rdata, 0x240, 1, 0, 0, 0x2200, 0, 0x2240)
+
+        pe = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
+        rdata_sec_off = 0x80 + 24 + 240 + 40
+        # VirtualSize = 0x100 while SizeOfRawData stays 0x1000.
+        struct.pack_into("<I", pe, rdata_sec_off + 8, 0x100)
+
+        _, img, _ = rtti_scan.load_pe64_image(bytes(pe))
+        self.assertEqual(img[0x2100:0x2300], b"\x00" * 0x200)
+
+        got = rtti_scan.scan_pe64_rtti(bytes(pe))
+        self.assertEqual(got["type_descriptors"], 1)
+        self.assertEqual([c["name"] for c in got["classes"]], ["Mapped"])
+
+    def test_raw_tail_past_virtual_size_does_not_clobber_adjacent_section_or_inflate_image(self):
+        rdata = bytearray(0x1000)
+        # Put a real TypeDescriptor in a section at RVA 0x2100 (offset 0x100 in rdata raw blob).
+        rdata[0x110:0x11D] = b".?AVKept@@\x00\x00\x00"
+        struct.pack_into("<6I", rdata, 0x140, 1, 0, 0, 0x2100, 0, 0x2140)
+        pe = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
+        sec_table = 0x80 + 24 + 240
+        sec2_off = sec_table + 40
+        sec3_off = sec_table + 80
+        struct.pack_into("<H", pe, 0x80 + 6, 3)  # num_sections = 3
+        # Section 2 (.rdata): RVA 0x2100, VirtualSize 0x100, raw bytes starting at rdata + 0x100.
+        pe[sec2_off:sec2_off + 40] = struct.pack(
+            "<8sIIIIIIHHI",
+            b".rdata\x00\x00", 0x100, 0x2100, 0x100, 0x400 + 0x1000 + 0x100,
+            0, 0, 0, 0, 0x40000040,
+        )
+        # Section 3 (.pad) placed after .rdata in the section table at RVA 0x2000 with VirtualSize 0x100
+        # and an oversized SizeOfRawData (0x90000000 > MAX_PE_IMAGE_SIZE) reading from .text's 0xC3 bytes.
+        # Unclamped mapping would both inflate mapped_size past MAX_PE_IMAGE_SIZE and clobber .rdata at 0x2100.
+        pe[sec3_off:sec3_off + 40] = struct.pack(
+            "<8sIIIIIIHHI",
+            b".pad\x00\x00\x00\x00", 0x100, 0x2000, 0x90000000, 0x400,
+            0, 0, 0, 0, 0x40000040,
+        )
+
+        got = rtti_scan.scan_pe64_rtti(bytes(pe))
+        self.assertEqual([c["name"] for c in got["classes"]], ["Kept"])
+
+        # VirtualSize == 0 still falls back to SizeOfRawData.
+        pe_zero_vs = bytearray(make_synthetic_pe(text_bytes=b"\xc3" * 0x10, rdata_bytes=bytes(rdata)))
+        struct.pack_into("<I", pe_zero_vs, sec2_off + 8, 0)
+        self.assertEqual(rtti_scan.scan_pe64_rtti(bytes(pe_zero_vs))["type_descriptors"], 1)
+
 
     def test_default_output_filename(self):
         rdata = bytearray(0x1000)
