@@ -408,6 +408,7 @@ class SetupDefaultsTest(unittest.TestCase):
 
 class PumpProcessTest(unittest.TestCase):
     def test_child_closing_stdout_early_completes_without_killing_siblings(self):
+        import io
         import subprocess
         import threading
 
@@ -428,24 +429,19 @@ class PumpProcessTest(unittest.TestCase):
                 stderr=subprocess.DEVNULL,
             )
             child_code = (
-                "import os, sys, time\n"
-                "print('hello', flush=True)\n"
-                "sys.stdout.flush()\n"
-                "sys.stderr.flush()\n"
-                "os.close(1)\n"
-                "os.close(2)\n"
+                "import sys, time\n"
                 "time.sleep(0.8)\n"
                 "with open(sys.argv[1], 'w', encoding='utf-8', newline='\\n') as f:\n"
                 "    f.write('done')\n"
-                "os._exit(0)\n"
             )
             child = subprocess.Popen(
                 [sys.executable, "-I", "-c", child_code, marker],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
+            # Supply a finite stream directly so EOF arrives immediately while the real child
+            # still has post-EOF work left, regardless of Windows launcher/CRT handle inheritance.
+            child.stdout = io.StringIO("hello\n")
             leonida_tui.register_live_process(sibling)
             try:
                 code = leonida_tui.pump_process(child, "shaders", FakeBoard())
@@ -454,6 +450,7 @@ class PumpProcessTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(marker), "child was killed before finishing post-EOF work")
                 self.assertIsNone(sibling.poll(), "unrelated sibling process was killed")
                 self.assertIn(sibling, leonida_tui._live_procs)
+                self.assertNotIn(child, leonida_tui._live_procs)
             finally:
                 leonida_tui.unregister_live_process(sibling)
                 if sibling.poll() is None:
@@ -464,6 +461,7 @@ class PumpProcessTest(unittest.TestCase):
                     child.wait(timeout=5)
 
     def test_board_stop_while_waiting_after_eof_terminates_child(self):
+        import io
         import subprocess
         import threading
         import time
@@ -476,30 +474,25 @@ class PumpProcessTest(unittest.TestCase):
                 pass
 
         board = FakeBoard()
-        child_code = (
-            "import os, sys, time\n"
-            "sys.stdout.flush()\n"
-            "sys.stderr.flush()\n"
-            "os.close(1)\n"
-            "os.close(2)\n"
-            "time.sleep(30)\n"
-        )
         child = subprocess.Popen(
-            [sys.executable, "-I", "-c", child_code],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
+            [sys.executable, "-I", "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        timer = threading.Timer(0.25, board._stop.set)
+        # Empty finite stream guarantees immediate EOF so pump_process enters the post-EOF wait loop.
+        child.stdout = io.StringIO("")
+        # Fire stop after the old 0.5s timeout so premature kills fail the board._stop assertion too.
+        timer = threading.Timer(0.7, board._stop.set)
         timer.start()
         t0 = time.monotonic()
         try:
             code = leonida_tui.pump_process(child, "shaders", board)
             elapsed = time.monotonic() - t0
+            self.assertTrue(board._stop.is_set(), "child was killed before stop was requested")
             self.assertLess(elapsed, 5.0)
             self.assertNotEqual(code, 0)
             self.assertIsNotNone(child.poll())
+            self.assertNotIn(child, leonida_tui._live_procs)
         finally:
             timer.cancel()
             if child.poll() is None:
