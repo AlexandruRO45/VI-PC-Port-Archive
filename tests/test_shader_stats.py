@@ -39,7 +39,8 @@ NOTHING = "ps: 1 shaders, code growth n/a; VGPRs n/a; scratch n/a, spills n/a; w
 
 
 class ShaderStats(unittest.TestCase):
-    def run_stats(self, rows, details=True, listings=None, header="name,stage,statistic,value", extra=()):
+    def run_stats(self, rows, details=True, listings=None, header="name,stage,statistic,value", extra=(),
+                  csv_encoding="utf-8"):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
             os.makedirs(disasm)
@@ -47,7 +48,7 @@ class ShaderStats(unittest.TestCase):
                 with open(os.path.join(disasm, name + ".s"), "w", encoding="utf-8") as f:
                     f.write(text)
             csv_path = os.path.join(tmp, "stats.csv")
-            with open(csv_path, "w", encoding="utf-8") as f:
+            with open(csv_path, "w", encoding=csv_encoding, newline="\n") as f:
                 f.write(header + "\n" + "".join(f"{r}\n" for r in rows))
             cmd = [sys.executable, "-I", SCRIPT, csv_path, disasm] + (["--details"] if details else []) + list(extra)
             return subprocess.run(cmd, capture_output=True, text=True)
@@ -117,6 +118,11 @@ class ShaderStats(unittest.TestCase):
         self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_DETAILS + COMPLETE_SUMMARY))
         r = self.run_stats(COMPLETE, details=False)
         self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", COMPLETE_SUMMARY))
+
+    def test_utf8_bom_is_accepted(self):
+        result = self.run_stats(COMPLETE, csv_encoding="utf-8-sig")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, COMPLETE_DETAILS + COMPLETE_SUMMARY)
 
     def test_other_driver_statistics_are_shown_raw_not_interpreted(self):
         rows = ["ps_flat,ps,Foo count (bytes),123", 'ps_flat,ps,"Bar, total",18446744073709551615',
