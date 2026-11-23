@@ -417,7 +417,8 @@ int main() {
                     ++tally.tolerated;
                 } else {
                     ++tally.differ;
-                    if (std::strcmp(c.group, "SRGB") != 0) report(c.group, c.name, i, "colour", actual, expected);
+                    if (std::strcmp(c.group, "SRGB") != 0 || actual.size() != expected.size())
+                        report(c.group, c.name, i, "colour", actual, expected);
                 }
             }
         }
