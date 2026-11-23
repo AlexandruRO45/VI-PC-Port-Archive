@@ -477,6 +477,50 @@ class TestDSIncU32SIMDDivergenceAndExecMask(unittest.TestCase):
         interp.execute_wave(wave, inst)
         self.assertEqual(lds.read_dword(0x40), 32)
 
+class TestDSIncU32RegisterAliasing(unittest.TestCase):
+    """Part 5: Register aliasing and in-place operand preservation."""
+
+    def setUp(self) -> None:
+        self.lds = LDSMemory(size_bytes=4096)
+        self.interp = ScalarDSInterpreter(self.lds)
+
+    def test_aliasing_vdst_equals_vaddr(self) -> None:
+        state = ScalarThreadState(self.lds)
+        self.lds.write_dword(0x50, 7)
+        state.set_vgpr(VGPR(1), 0x50)
+        state.set_vgpr(VGPR(2), 20)
+
+        inst = DSIncU32Instruction.parse("ds_inc_rtn_u32 v1, v1, v2")
+        res = self.interp.execute(state, inst)
+
+        self.assertEqual(res, 7)
+        self.assertEqual(state.get_vgpr(VGPR(1)), 7)
+        self.assertEqual(self.lds.read_dword(0x50), 8)
+
+    def test_aliasing_vdst_equals_vdata0(self) -> None:
+        state = ScalarThreadState(self.lds)
+        self.lds.write_dword(0x60, 10)
+        state.set_vgpr(VGPR(1), 0x60)
+        state.set_vgpr(VGPR(2), 10)
+
+        inst = DSIncU32Instruction.parse("ds_inc_rtn_u32 v2, v1, v2")
+        res = self.interp.execute(state, inst)
+
+        self.assertEqual(res, 10)
+        self.assertEqual(state.get_vgpr(VGPR(2)), 10)
+        self.assertEqual(self.lds.read_dword(0x60), 0)
+
+    def test_aliasing_vaddr_equals_vdata0(self) -> None:
+        state = ScalarThreadState(self.lds)
+        self.lds.write_dword(0x40, 0)
+        state.set_vgpr(VGPR(1), 0x40)
+
+        inst = DSIncU32Instruction.parse("ds_inc_u32 v1, v1")
+        self.interp.execute(state, inst)
+
+        self.assertEqual(state.get_vgpr(VGPR(1)), 0x40)
+        self.assertEqual(self.lds.read_dword(0x40), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
