@@ -403,6 +403,11 @@ What is implemented (all of it testable without the game):
     `ClearUnorderedAccessViewFloat` packs RGB9E5 with round-half-up (clamping negative/NaN to 0 and +Inf/overflow to
     65408, bumping on 512) and `ClearUnorderedAccessViewUint` writes 0, matching WARP (`d3d12_r9g9b9e5_uav_test`,
     `d3d12_uav_clear_test`);
+  - typed sRGB (`R8G8B8A8_UNORM_SRGB`, `B8G8R8A8_UNORM_SRGB`) and depth-only (`D32_FLOAT`, `D16_UNORM`) textures
+    with `ALLOW_UNORDERED_ACCESS` are created as the host creates them (D3D-466): no UAV view exists in these formats
+    without a castable-format list, so the image gets no storage usage, which these Vulkan formats lack. The host
+    refuses unordered access on `D24_UNORM_S8_UINT` and `D32_FLOAT_S8X24_UINT`, and any volume texture in a depth
+    format; the layer does the same in creation and `GetResourceAllocationInfo` (`d3d12_vulkan_device_test`);
   - the descriptor shader samples `B5G5R5A1_UNORM` through a 2D SRV. Opaque and transparent red check bit 15,
     and mixed-channel texels check the five-bit color fields;
   - `B8G8R8X8_UNORM`, `_UNORM_SRGB` and `_TYPELESS` (D3D-87) are `B8G8R8A8` images: clears, copies and footprints
