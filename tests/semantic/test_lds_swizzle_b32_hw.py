@@ -358,3 +358,22 @@ class TestDsSwizzleB32Aliasing(unittest.TestCase):
 
         self.assertEqual(state.vgprs[2][0:4], [1, 2, 3, 0])
         self.assertEqual(state.vgprs[2][4:8], [5, 6, 7, 4])
+
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+class TestDsSwizzleB32FlagsAndCondition(unittest.TestCase):
+    def test_status_flags_unmodified(self) -> None:
+        # RDNA2 architecture specification: ds_swizzle_b32 does not write to SCC, VCC, or EXEC
+        initial_scc = 1
+        initial_vcc = 0x12345678
+        initial_exec = 0xFFFFFFFF
+
+        state = SwizzleSimdState.create(32, initial_exec)
+        state.vgprs[1] = [i for i in range(32)]
+        ast = DsSwizzleB32AST(0, 1, SwizzleKind.SWAP, encode_swap(1), (1,))
+        step_swizzle_instruction(ast, state)
+
+        self.assertEqual(initial_scc, 1)
+        self.assertEqual(initial_vcc, 0x12345678)
+        self.assertEqual(state.exec_mask, initial_exec)
