@@ -186,7 +186,8 @@ upgrading.
 
 Stages run in order: `check`, `shaders`, `assets`, `runtime`, `pipelines` (creates every translated shader on your
 GPU driver and checks that it compiles, reports any it has to skip, and saves a pipeline cache to
-`pipeline_cache.bin` in `--out`; the runtime doesn't load that cache yet, so it doesn't speed up the first boot). The
+`pipeline_cache.bin` in `--out`; the runtime seeds its `VkPipelineCache` from that file beside `gta6rt.exe` when its
+Vulkan header matches the device, so the next boot does not compile them again). The
 shader translation is the longest step: it runs on `--jobs` processes (half the CPU threads by default).
 
 `--wav` is off by default because 16-bit PCM WAV is several times larger than Ogg Opus. It decodes the repackaged Ogg
