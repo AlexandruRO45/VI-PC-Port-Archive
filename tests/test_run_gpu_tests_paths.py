@@ -1,5 +1,6 @@
 """run_gpu_tests.py: a filtered run still builds the vertex shader a selected test draws with, and relative --build
 /--work paths keep working for test programs that run in another working directory (vk_texture_test)."""
+import errno
 import io
 import os
 from pathlib import Path
@@ -116,6 +117,7 @@ class RelativePaths(unittest.TestCase):
                     self.assertEqual(run_gpu_tests.main(), 0)
             finally:
                 os.chdir(old)
+            self.assertTrue((Path(tmp) / "work").is_dir())
             # Compare resolved paths: Windows can spell the temp directory with an 8.3 name (RUNNER~1).
             for got, want in ((seen["build"], build), (seen["work"], Path(tmp) / "work")):
                 self.assertTrue(os.path.isabs(got), got)
@@ -123,21 +125,61 @@ class RelativePaths(unittest.TestCase):
 
 
 class WorkDirectory(unittest.TestCase):
-    def test_file_blocking_work_directory_is_a_cli_error(self):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.build = self.root / "build"
+        self.build.mkdir()
         ext = ".exe" if os.name == "nt" else ""
+        for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
+            (self.build / (tool + ext)).touch()
+        self.argv = ["run_gpu_tests.py", "--build", str(self.build)]
+
+    def test_default_scratch_creation_failure_is_a_cli_error(self):
+        for path in (str(self.root / "blocked"), None):
+            with self.subTest(path=path):
+                err = io.StringIO()
+                failure = PermissionError(errno.EACCES, "scratch creation denied", path)
+                with (patch.object(sys, "argv", self.argv), patch.object(sys, "stderr", err),
+                      patch.object(tempfile, "mkdtemp", side_effect=failure),
+                      patch.object(run_gpu_tests, "run_suite") as suite,
+                      patch.object(run_gpu_tests.shutil, "rmtree") as cleanup):
+                    self.assertEqual(run_gpu_tests.main(), 2)
+                diagnostic = err.getvalue().splitlines()
+                self.assertEqual(len(diagnostic), 1, err.getvalue())
+                self.assertIn("error: cannot prepare GPU test directory", diagnostic[0])
+                self.assertIn(path or "system temporary directory", diagnostic[0])
+                self.assertIn("scratch creation denied", diagnostic[0])
+                suite.assert_not_called()
+                cleanup.assert_not_called()
+
+    def test_default_scratch_is_cleaned_after_suite_failure(self):
+        scratch = self.root / "scratch"
+        scratch.mkdir()
+
+        def suite(_args, work):
+            self.assertEqual(Path(work), scratch)
+            self.assertTrue(scratch.is_dir())
+            return 1
+
+        with (patch.object(sys, "argv", self.argv),
+              patch.object(tempfile, "mkdtemp", return_value=str(scratch)),
+              patch.object(run_gpu_tests, "native_folder", side_effect=lambda path: path),
+              patch.object(run_gpu_tests, "run_suite", side_effect=suite)):
+            self.assertEqual(run_gpu_tests.main(), 1)
+        self.assertFalse(scratch.exists())
+
+    def test_file_blocking_work_directory_is_a_cli_error(self):
         for blocked_child in ("", "spirv"):
-            with self.subTest(blocked_child=blocked_child), tempfile.TemporaryDirectory() as tmp:
-                build = Path(tmp) / "build"
-                build.mkdir()
-                for tool in run_gpu_tests.REQUIRED_TEST_PROGRAMS:
-                    (build / (tool + ext)).touch()
-                work = Path(tmp) / "work"
+            with self.subTest(blocked_child=blocked_child):
+                work = self.root / f"work-{blocked_child or 'root'}"
                 blocker = work / blocked_child
                 blocker.parent.mkdir(exist_ok=True)
                 blocker.write_text("keep me", encoding="utf-8")
 
                 result = subprocess.run(
-                    [sys.executable, "-I", run_gpu_tests.__file__, "--build", str(build),
+                    [sys.executable, "-I", run_gpu_tests.__file__, "--build", str(self.build),
                      "--work", str(work), "--filter", "cs_lds"],
                     capture_output=True, text=True, timeout=10,
                 )

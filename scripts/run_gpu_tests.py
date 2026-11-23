@@ -783,12 +783,16 @@ def main() -> int:
                  "Vulkan headers (vulkan-headers on Arch) and configure again.")
     a.build = resolved_build
 
-    work = a.work or tempfile.mkdtemp(prefix="leonida_gpu_tests_")
+    work = a.work
     try:
         try:
-            os.makedirs(work, exist_ok=True)
+            if work:
+                os.makedirs(work, exist_ok=True)
+            else:
+                work = tempfile.mkdtemp(prefix="leonida_gpu_tests_")
         except OSError as exc:      # the same report run_suite gives for its own folders (#4544)
-            print(f"error: cannot prepare GPU test directory {work}: {exc.strerror or exc}", file=sys.stderr)
+            directory = work or exc.filename or "in the system temporary directory"
+            print(f"error: cannot prepare GPU test directory {directory}: {exc.strerror or exc}", file=sys.stderr)
             return 2
         native = native_folder(work)
         if native is None:
@@ -798,7 +802,7 @@ def main() -> int:
             return 2
         return run_suite(a, native)
     finally:
-        if a.work is None:
+        if a.work is None and work is not None:
             shutil.rmtree(work, ignore_errors=True)
 
 
