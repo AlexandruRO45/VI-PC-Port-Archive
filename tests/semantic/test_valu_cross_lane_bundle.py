@@ -158,6 +158,17 @@ class TestReadLaneOracle(unittest.TestCase):
         self.assertIn("OpGroupNonUniformShuffle", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestReadLaneAST(unittest.TestCase):
+    def test_ast_evaluation(self):
+        lanes = [i * 3 for i in range(64)]
+        self.assertEqual(model_readlane(lanes, 15), 45)
+
+    def test_translator_readlane_ast(self):
+        prog = ["v_mov_b32_e32 v2, 333", "s_mov_b32 s3, 10", "v_readlane_b32 s2, v2, s3", "s_endpgm"]
+        spv = support.translate_lines("cs_rl_ast", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpGroupNonUniformShuffle", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
