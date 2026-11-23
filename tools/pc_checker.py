@@ -139,6 +139,7 @@ GEN_GROWTH = 1.25   # assumed uplift per generation beyond the tables
 _NV_SUFFIX = {"ti": 1.15, "super": 1.1, "ti super": 1.25}
 _RX_SUFFIX = {"xt": 1.12, "xtx": 1.3, "gre": 0.9}
 _VARIANT_WORDS = {"ti", "super", "xt", "xtx", "gre"}
+_UNSCORED_ARC_IGPU = re.compile(r"\barc b (?:370|390)\b")
 
 
 def _gen_score(table: dict, series: int, tier: int, step: int):
@@ -174,6 +175,8 @@ def gpu_lookup(name: str):
         return None, False
     raw = name.lower()
     n = _norm_gpu(name)
+    if _UNSCORED_ARC_IGPU.search(n):
+        return None, False  # Core Ultra integrated GPUs, not the discrete Arc B tiers
     if ("uhd" in raw or "iris" in raw or "hd graphics" in raw or n == ""
             or re.fullmatch(r"vega \d+", n)):
         return 15, True  # integrated graphics
@@ -563,9 +566,10 @@ def detect_all() -> dict:
     best = None
     for name, vram in detect_gpus():  # with several GPUs, use the strongest
         sc = gpu_score(name)
-        sc = -1 if sc is None else sc
-        if best is None or sc > best[0]:
-            best = (sc, name, vram)
+        # If nothing has a score, prefer the identified iGPU over an unrecognized adapter.
+        rank = (-1, bool(_UNSCORED_ARC_IGPU.search(_norm_gpu(name)))) if sc is None else (sc, False)
+        if best is None or rank > best[0]:
+            best = (rank, name, vram)
     gpu = ""
     if best:
         gpu = clean_name(best[1])

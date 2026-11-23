@@ -2,6 +2,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
 
@@ -27,6 +28,12 @@ class GpuScore(unittest.TestCase):
     def test_integrated(self):
         self.assertEqual(pc.gpu_score("Intel(R) UHD Graphics 770"), 15)
 
+    def test_arc_integrated_models_are_not_scored_as_discrete(self):
+        for name in ("Intel(R) Arc(TM) B390 GPU", "Intel Arc B370 Graphics", "Arc B390 (1 GB VRAM)"):
+            with self.subTest(name=name):
+                self.assertEqual(pc.gpu_lookup(name), (None, False))
+        self.assertEqual(pc.gpu_lookup("Intel Arc B580"), (100, True))
+
     def test_unknown(self):
         self.assertIsNone(pc.gpu_score("Some Future Card"))
         self.assertIsNone(pc.gpu_score(""))
@@ -46,6 +53,21 @@ class GpuScore(unittest.TestCase):
     def test_estimate_keeps_ordering(self):
         self.assertLess(pc.gpu_score("RTX 6060"), pc.gpu_score("RTX 6070"))
         self.assertLess(pc.gpu_score("RTX 6070"), pc.gpu_score("RTX 6080"))
+
+
+class DetectGpuRanking(unittest.TestCase):
+    def detect_gpu(self, adapters):
+        with patch.multiple(pc, detect_gpus=lambda: adapters, detect_cpu=lambda: "", detect_ram_gb=lambda: 32):
+            return pc.detect_all()["gpu"]
+
+    def test_named_arc_igpu_beats_unscored_virtual_adapter(self):
+        adapters = [("Parsec Virtual Display Adapter", None), ("Intel Arc B390", None)]
+        self.assertEqual(self.detect_gpu(adapters), "Intel Arc B390")
+        self.assertEqual(self.detect_gpu(adapters[::-1]), "Intel Arc B390")
+
+    def test_scored_adapter_still_beats_unscored_arc_igpu(self):
+        adapters = [("Intel Arc B390", None), ("NVIDIA GeForce RTX 3050", None)]
+        self.assertEqual(self.detect_gpu(adapters), "NVIDIA GeForce RTX 3050")
 
 
 class CpuScore(unittest.TestCase):
@@ -133,6 +155,15 @@ class Api(unittest.TestCase):
         import json
         d = pc.SpecChecker().check(*self.WEAK).as_dict()
         self.assertEqual(json.loads(json.dumps(d))["verdict"], pc.WEAK)
+
+    def test_unscored_arc_igpu_keeps_its_name_in_the_report(self):
+        name = "Intel(R) Arc(TM) B390 GPU"
+        report = pc.SpecChecker(XBOX).check(self.GOOD[0], name, self.GOOD[2]).as_dict()
+        gpu = next(check for check in report["checks"] if check["component"] == "GPU")
+        self.assertEqual(report["verdict"], pc.UNKNOWN)
+        self.assertEqual(gpu["status"], pc.UNKNOWN)
+        self.assertEqual(gpu["detected"], name)
+        self.assertFalse(gpu["estimated"])
 
     def test_unknown_profile(self):
         with self.assertRaises(ValueError):
