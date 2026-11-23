@@ -275,6 +275,22 @@ class TestSLshl4AddU32Translator(unittest.TestCase):
         for l in range(32):
             self.assertEqual(results[l], 50)
 
+def ref_s_pack_lh_b32_b16(src0: int, src1: int) -> int:
+    """Reference mathematical oracle for s_pack_lh_b32_b16 -> D = {S1[31:16], S0[15:0]}."""
+    lo = src0 & 0xFFFF
+    hi = src1 & 0xFFFF0000
+    return lo | hi
+
+
+class TestSPackLhB32B16Oracle(unittest.TestCase):
+    def test_basic_packing(self) -> None:
+        self.assertEqual(ref_s_pack_lh_b32_b16(0x1234, 0x56780000), 0x56781234)
+        self.assertEqual(ref_s_pack_lh_b32_b16(0xFFFF1234, 0xABCD0000), 0xABCD1234)
+
+    def test_unused_halves_ignored(self) -> None:
+        # High half of S0 and low half of S1 are ignored
+        self.assertEqual(ref_s_pack_lh_b32_b16(0xDEAD1111, 0x2222BEEF), 0x22221111)
+
 
 if __name__ == "__main__":
     unittest.main()
