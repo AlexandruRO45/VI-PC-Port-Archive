@@ -69,8 +69,9 @@ def _parse_spv(asm):
     gvars = {}       # %name -> (storage_class, elem_type)
     fvars = []       # [(%name, elem_type, init_id_or_None)]
     blocks = {}      # %label -> [(res, op, args), ...]
+    funcs = {}       # %fn -> {"params": [%id], "entry": %label, "locals": [(%name, elem, init)]}
     cur = None
-    in_main = False
+    cur_fn = None
 
     for raw in asm.splitlines():
         s = raw.strip()
@@ -83,14 +84,20 @@ def _parse_spv(asm):
             res, op, args = None, toks[0], toks[1:]
 
         if op == "OpFunction":
-            in_main = (res == "%main")
+            cur_fn = res
+            funcs[cur_fn] = {"params": [], "entry": None, "locals": []}
+            cur = None
+            continue
+        if op == "OpFunctionParameter":
+            if cur_fn is not None:
+                funcs[cur_fn]["params"].append(res)
             continue
         if op == "OpFunctionEnd":
-            in_main = False
+            cur_fn = None
             cur = None
             continue
 
-        if not in_main:
+        if cur_fn is None:
             if op == "OpTypeInt":
                 types[res] = ("int", int(args[0]), int(args[1]))
             elif op == "OpTypeBool":
@@ -129,11 +136,16 @@ def _parse_spv(asm):
         if op == "OpLabel":
             cur = res
             blocks[cur] = []
+            if funcs[cur_fn]["entry"] is None:
+                funcs[cur_fn]["entry"] = cur
             continue
         if op == "OpVariable":
             _, elem = ptr_elem[args[0]]
             init = args[2] if len(args) > 2 else None
-            fvars.append((res, elem, init))
+            if cur_fn == "%main":
+                fvars.append((res, elem, init))
+            else:
+                funcs[cur_fn]["locals"].append((res, elem, init))
             continue
         if cur is not None:
             blocks[cur].append((res, op, args))
@@ -164,6 +176,7 @@ def _parse_spv(asm):
         "gvars": gvars,
         "fvars": fvars,
         "blocks": blocks,
+        "funcs": funcs,
         "make_zero": make_zero,
     }
 
@@ -199,6 +212,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     types = mod["types"]
     gvars = mod["gvars"]
     blocks = mod["blocks"]
+    funcs = mod["funcs"]
     make_zero = mod["make_zero"]
     mem = {} if memory is None else memory
     pc_words = list(push_constants or [0] * 32)
@@ -222,7 +236,7 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
     # Per-invocation state
     class Inv:
         __slots__ = ("gid", "sg_id", "sg_lane", "lid", "fn_mem", "ssa", "blk", "ip", "prev_blk",
-                     "done", "waiting_barrier", "waiting_sg", "steps")
+                     "done", "waiting_barrier", "waiting_sg", "steps", "calls", "scope", "calls_made")
 
         def __init__(self, gid):
             self.gid = gid
@@ -248,6 +262,9 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             self.waiting_barrier = None   # (blk, ip) when paused at OpControlBarrier
             self.waiting_sg = None        # (blk, ip, res, op, args) when paused at subgroup op
             self.steps = 0
+            self.calls = []               # [(return blk, ip, destination, prev blk), ...]
+            self.scope = []               # helper-call locals: name -> fn_mem key
+            self.calls_made = 0
 
     invs = [Inv(i) for i in range(threads)]
     subgroups = []
@@ -319,6 +336,8 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
         raise KeyError(f"Cannot store to ptr {ptr}")
 
     def base_ptr(inv, tok):
+        if inv.scope and tok in inv.scope[-1]:
+            return ("fn", inv.scope[-1][tok])
         if tok in inv.fn_mem:
             return ("fn", tok)
         if tok in gvars:
@@ -350,7 +369,39 @@ def run_compute_workgroup(asm, threads, subgroup_size, push_constants=None, memo
             inv.ip += 1
             if op in ("OpSelectionMerge", "OpLoopMerge"):
                 continue
+            if op == "OpFunctionCall":
+                fn = funcs[args[1]]
+                inv.calls.append((inv.blk, inv.ip, res, inv.prev_blk))
+                for name, arg in zip(fn["params"], args[2:]):
+                    inv.ssa[name] = val_of(inv, arg)
+                scope = {}
+                for name, elem, init in fn["locals"]:
+                    key = (args[1], name, inv.calls_made)
+                    if init is None:
+                        inv.fn_mem[key] = make_zero(elem)
+                    elif isinstance(consts[init], tuple) and consts[init][0] == "null":
+                        inv.fn_mem[key] = make_zero(consts[init][1])
+                    else:
+                        inv.fn_mem[key] = consts[init]
+                    scope[name] = key
+                inv.calls_made += 1
+                inv.scope.append(scope)
+                inv.blk = fn["entry"]
+                inv.ip = 0
+                continue
+            if op == "OpReturnValue":
+                value = val_of(inv, args[0])
+                blk, ip, dest, prev = inv.calls.pop()
+                inv.scope.pop()
+                inv.ssa[dest] = value
+                inv.blk, inv.ip, inv.prev_blk = blk, ip, prev
+                continue
             if op == "OpReturn":
+                if inv.calls:
+                    blk, ip, _dest, prev = inv.calls.pop()
+                    inv.scope.pop()
+                    inv.blk, inv.ip, inv.prev_blk = blk, ip, prev
+                    continue
                 inv.done = True
                 return
             if op == "OpBranch":
@@ -1023,7 +1074,9 @@ class DivergentLoopBallotTests(unittest.TestCase):
             with self.subTest(mode=label):
                 spv, gen = _translate_cs("cs_div_loop_" + label, prog, threads=threads, emulate=emulate)
                 if emulate:
-                    self.assertEqual(gen.control_flow, "emulated wave64 rounds")
+                    # 4d9ef4eb routes a reducible compute CFG through structured inline emulation; the older
+                    # round scheduler remains for the cases it cannot structure. Both must agree lane for lane.
+                    self.assertIn(gen.control_flow, ("emulated wave64 rounds", "emulated wave64 structured"))
                 mem = run_compute_workgroup(spv, threads, sg_sz, push_constants=VSHARP)
                 want = expected_for(threads)
                 for t in range(threads):
