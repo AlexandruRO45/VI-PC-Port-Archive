@@ -430,5 +430,23 @@ class TestAddLshlU32Translator(unittest.TestCase):
             actual = run_translated_triop("v_add_lshl_u32", a, b, c)
             self.assertEqual(actual, expected)
 
+# ---------------------------------------------------------------------------
+# Opcode 4: v_lshl_or_b32 - Reference Oracle
+# ---------------------------------------------------------------------------
+
+def oracle_lshl_or_b32(a: int, b: int, c: int) -> int:
+    return (((a & MASK32) << (b & 31)) | (c & MASK32)) & MASK32
+
+
+class TestLshlOrB32Oracle(unittest.TestCase):
+    def test_basic_lshl_or(self) -> None:
+        # (1 << 4) | 5 = 16 | 5 = 21
+        self.assertEqual(oracle_lshl_or_b32(1, 4, 5), 21)
+        self.assertEqual(oracle_lshl_or_b32(0xFF, 8, 0xAA), 0xFFAA)
+
+    def test_bit_packing(self) -> None:
+        # Pack 16-bit halves: (hi << 16) | lo
+        self.assertEqual(oracle_lshl_or_b32(0x1234, 16, 0x5678), 0x12345678)
+
 if __name__ == "__main__":
     unittest.main()
