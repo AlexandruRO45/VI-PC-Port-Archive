@@ -51,11 +51,6 @@ def comment_text(line: str) -> str | None:
     return stripped[2:].strip() if stripped.startswith("//") else None
 
 
-def without_marker(text: str) -> str:
-    """The note without its leading marker word ("ASSUMPTION: x" -> "x"), which the list already shows."""
-    return re.sub(r"^\**\s*(ASSUMPTION|UNVERIFIED|VERIFY)S?\b[^:]*:\**\s*", "", text, count=1, flags=re.IGNORECASE)
-
-
 def code_notes(path: str, rel: str) -> list[dict]:
     """Each whole-line comment run holding a marker, as one note from the run's first line to its last. Trailing
     comments (`x = 18;  // UNVERIFIED, see the header`) point at such a run and are not notes of their own."""
@@ -73,13 +68,12 @@ def code_notes(path: str, rel: str) -> list[dict]:
             i += 1
         # A run can hold several notes, and a note starts at its marker (a file's header describes the file first):
         # each one runs from its marker to the next marker or the end of the run.
-        marks = [k for k, p in enumerate(parts) if CODE_MARK.search(p)]
-        for n, at in enumerate(marks):
-            stop = marks[n + 1] if n + 1 < len(marks) else len(parts)
-            first = parts[at][CODE_MARK.search(parts[at]).start():]
+        marks = [(k, m) for k, p in enumerate(parts) if (m := CODE_MARK.search(p))]
+        for n, (at, marker) in enumerate(marks):
+            stop = marks[n + 1][0] if n + 1 < len(marks) else len(parts)
+            first = parts[at][marker.end():].lstrip().removeprefix(":").lstrip()
             text = " ".join(p for p in [first] + parts[at + 1:stop] if p)
-            notes.append({"file": rel, "line": start + at + 1, "kind": CODE_MARK.search(first).group(1),
-                          "text": without_marker(text)})
+            notes.append({"file": rel, "line": start + at + 1, "kind": marker.group(1), "text": text})
     return notes
 
 
@@ -103,8 +97,12 @@ def doc_notes(path: str, rel: str) -> list[dict]:
         end = i + 1
         while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith(("- ", "* ", "#", "|")):
             end += 1
-        text = " ".join(re.sub(r"^[-*] ", "", l.strip()) for l in lines[i:end])
-        notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": without_marker(text)})
+        first = body[m.end():].lstrip()
+        if not m.group().endswith(":**"):
+            first = first.removeprefix(":").lstrip()
+        continuation = [re.sub(r"^[-*] ", "", l.strip()) for l in lines[i + 1:end]]
+        text = " ".join(part for part in [first, *continuation] if part)
+        notes.append({"file": rel, "line": i + 1, "kind": m.group(1).upper(), "text": text})
     return notes
 
 

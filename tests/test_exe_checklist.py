@@ -70,6 +70,17 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(demo[1]["text"], "nothing compares it.")
         self.assertEqual(demo[0]["classes"], [SAVE_CLASS])
 
+    def test_colon_in_note_body_preserves_the_subject(self):
+        body = "the file mode: read-only is expected."
+        for filename, marker, collect in (
+            ("demo.cpp", "// VERIFY ", ec.code_notes),
+            ("demo.md", "- **VERIFY** ", ec.doc_notes),
+        ):
+            with self.subTest(filename=filename):
+                path = Path(self.root, filename)
+                path.write_text(marker + body, encoding="utf-8", newline="\n")
+                self.assertEqual(collect(path, filename)[0]["text"], body)
+
     def test_one_class_scan_per_file_with_several_notes(self):
         many = "".join(f"// ASSUMPTION: note {i}\nint value;\n" for i in range(4))
         with open(os.path.join(self.root, "runtime/shims/many.cpp"), "w", encoding="utf-8", newline="\n") as f:
