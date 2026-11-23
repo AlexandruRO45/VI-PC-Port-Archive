@@ -20,8 +20,13 @@
 // The public HLE Freminet/ScarlettX reports five more Xbox device slots (a third-party observation, not a Microsoft
 // ABI); the generic thunk routes them before it forwards anything: 48 CreateCommandQueueX, 73 CreateCommandListX,
 // 78 SetFrameIntervalX, 79 ScheduleFrameEventX and 80 WaitFrameEventX. The slots can be moved with LEONIDA_XS_*_SLOT
+<<<<<<< HEAD
 // for a trace that disagrees; frame events are a per-device token state machine here because XboxPresentation needs a
 // WindowPresenter (xbox_present.cpp:34/57) and there is none before the first frame.
+=======
+// for a trace that disagrees. The frame-event calls answer from a per-device token counter: there is no vblank source
+// behind the device before a presenter exists, so WaitFrameEventX returns at once with a fresh non-zero token.
+>>>>>>> 2dbcb882c (d3d12_xs: route the public HLE's Xbox device slots 48/73/78/79/80 (#6935))
 #include "d3d12_xs_device.h"
 #include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
