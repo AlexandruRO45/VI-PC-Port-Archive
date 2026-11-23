@@ -530,5 +530,42 @@ class TestSOrn2B64ConditionCodes(unittest.TestCase):
         ScalarInterpreter.step(instr, state)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 7: IEEE 754 Boundary Extremes, Subnormals, and NaN Handling
+# -----------------------------------------------------------------------------
+
+class TestSOrn2B64IEEE754Bitwise(unittest.TestCase):
+    """Unit tests verifying that IEEE 754 float64 bit patterns are preserved bit-exact."""
+
+    FLOAT64_PATTERNS = {
+        "pos_zero": 0x0000_0000_0000_0000,
+        "neg_zero": 0x8000_0000_0000_0000,
+        "pos_inf": 0x7FF0_0000_0000_0000,
+        "neg_inf": 0xFFF0_0000_0000_0000,
+        "qnan": 0x7FF8_0000_0000_0000,
+        "snan": 0x7FF0_0000_0000_0001,
+        "min_subnormal": 0x0000_0000_0000_0001,
+        "max_subnormal": 0x000F_FFFF_FFFF_FFFF,
+        "min_normal": 0x0010_0000_0000_0000,
+        "max_normal": 0x7FEF_FFFF_FFFF_FFFF,
+        "one_point_zero": 0x3FF0_0000_0000_0000,
+    }
+
+    def test_float64_bitwise_orn2_identity(self):
+        """Verify x | ~x equals all-ones for every float64 extreme."""
+        for name, pattern in self.FLOAT64_PATTERNS.items():
+            with self.subTest(pattern_name=name):
+                d, scc = s_orn2_b64_oracle(pattern, pattern)
+                self.assertEqual(d, ALL64)
+                self.assertEqual(scc, 1)
+
+    def test_float64_nan_and_inf_combination(self):
+        qnan = self.FLOAT64_PATTERNS["qnan"]
+        pos_inf = self.FLOAT64_PATTERNS["pos_inf"]
+        d, scc = s_orn2_b64_oracle(qnan, pos_inf)
+        expected = (qnan | (~pos_inf & MASK64)) & MASK64
+        self.assertEqual(d, expected)
+        self.assertEqual(scc, 1)
+
 if __name__ == "__main__":
     unittest.main()
