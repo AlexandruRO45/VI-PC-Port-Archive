@@ -8,6 +8,7 @@ import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -94,6 +95,16 @@ class CommandLine(unittest.TestCase):
     def test_offsets_parse_as_hex_or_decimal(self):
         self.assertEqual(sm.parse_offset("0x101a32160"), 0x101A32160)
         self.assertEqual(sm.parse_offset("4096"), 4096)
+
+    def test_json_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}'
+            path = Path(tmp) / "report.json"
+            path.write_text(previous, encoding="utf-8", newline="\n")
+            with mock.patch.object(sm, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                with self.assertRaises(OSError):
+                    sm.write_json_report(str(path), {"streams": {}})
+            self.assertEqual(path.read_text(encoding="utf-8"), previous)
 
 
 if __name__ == "__main__":

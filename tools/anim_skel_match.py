@@ -20,6 +20,7 @@ Usage:
 
 The default streams are the four offsets in docs/animation.md (1.0.2.1 package). Exit 0 when the report was
 written, 2 on a read error. Nothing here decrypts anything.
+`--json` is published through a staged temp file so a mid-write failure leaves any previous complete report.
 Usage: `python -I tools/anim_skel_match.py --help` lists the options.
 """
 import argparse
@@ -27,7 +28,9 @@ import collections
 import json
 import mmap
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -35,6 +38,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import anim_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 DEFAULT_STREAMS = (0x101A32160, 0x101C379A0, 0x101C41D50, 0x101EA66C0)
@@ -161,9 +166,41 @@ def main(argv=None):
     report = match(names, skeletons)
     print_report(report)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        write_json_report(a.json, report)
     return 0
+
+
+def write_json_report(path: str, report: dict) -> None:
+    """Publish a complete regular file, or write directly to a non-regular destination."""
+    destination = os.path.realpath(path)
+    parent = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1)
+        return
+    if mode is not None:
+        # Retain the direct writer's permission check without truncating the report.
+        os.close(os.open(destination, os.O_WRONLY))
+
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=parent, prefix=".anim_skel_match-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":
