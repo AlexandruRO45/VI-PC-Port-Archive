@@ -5212,7 +5212,8 @@ public:
     // host refuses on their arguments are answered as the host does (d3d12_shared_handle_test) and a call that
     // would succeed on the host stays E_NOTIMPL. Docs:
     // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createsharedhandle
-    // Whether an object was created with its sharing flag: only fences, heaps and committed resources can be.
+    // Whether an object was created with its sharing flag: only fences, heaps and committed resources can be (not a
+    // placed resource, even in a shared heap).
     static bool created_shared(ID3D12DeviceChild* object) {
         ID3D12Fence1* fence = nullptr;
         if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&fence)))) {
@@ -5228,6 +5229,12 @@ public:
         }
         ID3D12Resource* resource = nullptr;
         if (SUCCEEDED(object->QueryInterface(IID_PPV_ARGS(&resource)))) {
+            // Only a committed resource can be shared: a placed one is refused on the host (WARP, NVIDIA, Intel)
+            // even when its heap was created shared, and a reserved one has no heap properties.
+            if (const Resource* r = Resource::from<Resource>(resource); r && !r->committed()) {
+                resource->Release();
+                return false;
+            }
             D3D12_HEAP_PROPERTIES props{};
             D3D12_HEAP_FLAGS flags = D3D12_HEAP_FLAG_NONE;
             const bool shared = SUCCEEDED(resource->GetHeapProperties(&props, &flags)) &&

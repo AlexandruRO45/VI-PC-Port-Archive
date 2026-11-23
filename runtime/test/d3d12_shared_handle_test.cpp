@@ -64,6 +64,22 @@ int check(ID3D12Device* device, const char* who, bool host) {
     EXPECT(SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                      nullptr, IID_PPV_ARGS(&buffer.p))));
     EXPECT_HR(device->CreateSharedHandle(buffer.p, nullptr, GENERIC_ALL, nullptr, &shared), E_INVALIDARG);
+    // A placed resource is refused too, even in a heap created shared (measured on NVIDIA, Intel and WARP:
+    // E_INVALIDARG for it, while the shared heap itself is accepted).
+    D3D12_HEAP_DESC shared_hd = hd;
+    shared_hd.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    Ref<ID3D12Heap> shared_heap;
+    const HRESULT made_shared_heap = device->CreateHeap(&shared_hd, IID_PPV_ARGS(&shared_heap.p));
+    EXPECT(SUCCEEDED(made_shared_heap) || (!host && made_shared_heap == E_NOTIMPL));
+    if (shared_heap.p) {
+        Ref<ID3D12Resource> placed;
+        EXPECT(SUCCEEDED(device->CreatePlacedResource(shared_heap.p, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&placed.p))));
+        EXPECT_HR(device->CreateSharedHandle(placed.p, nullptr, GENERIC_ALL, nullptr, &shared), E_INVALIDARG);
+        std::printf("%s: a placed resource in a shared heap is refused as a placed resource\n", who);
+    } else {
+        std::printf("%s: no shared heap here, the placed-resource row was not run\n", who);
+    }
     Ref<ID3D12CommandAllocator> allocator;
     EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
     EXPECT_HR(device->CreateSharedHandle(allocator.p, nullptr, GENERIC_ALL, nullptr, &shared), E_INVALIDARG);
@@ -97,6 +113,7 @@ int check(ID3D12Device* device, const char* who, bool host) {
 
 int main() {
     vktest::Device vk;
+    vk.request_buffer_device_address = true;  // the GPU address arena, so the Vulkan device can make heaps
     const auto status = vk.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;
     if (status != vktest::DeviceStatus::ready) return 1;
@@ -110,6 +127,7 @@ int main() {
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.buffer_device_address = vk.buffer_device_address;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         failures += check(ours.p, "vulkan", false);
         Ref<IDXGIFactory4> factory;
