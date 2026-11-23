@@ -20,12 +20,40 @@
 ; stage: cs
 ; wave: 32
 ; group: 64,1,1
-; rsrc2: 0x801a4
+; rsrc2: 0x801aa
 ;
-; RSRC2 0x801a4: 18 user SGPRs, TGID_X (s18), TGID_Y (s19), LDS_SIZE 16 x 512 bytes (64 lanes x 32 dwords).
+; RSRC2 0x801a4 before D3D-448 (now 0x801aa, see the moves below): 18 user SGPRs, TGID_X (s18), TGID_Y (s19), LDS_SIZE
+; 16 x 512 bytes (64 lanes x 32 dwords).
 ; s[0:1] table: 0 albedo T#, 1 normal T#, 2 view depth T#, 3 the TLAS as a raw V#, 4 output (raw), 5 step counts (raw)
 ; s2..s13: eye, d0, R, U as stage 9; s14 TLAS address >> 8; s15 unused (0); s16 ray mask; s17 step cap (2048)
 ; Light direction (to the light) 0.544949, 0.778499, 0.311400, its reciprocal as literals; tmax 64.
+; D3D-448: a D3D12 compute PSO gets its root arguments in the console layout (rt::rootsig::pack_stage,
+; docs/d3d12_vulkan.md section 3.5): from s4 in root-signature order, a descriptor table as ONE dword (the 32-bit
+; VA of its first descriptor; the heaps live below 4 GiB), a constant one dword per value; s0..s3 are the driver's.
+; RSRC2 0x801aa therefore counts 21 user SGPRs (4 + 17), and the thread-group ids follow at s21. These moves rebuild
+; the
+; layout the code below was written for: table s4 -> s[0:1] (high half 0); constants s5..s20 -> s2..s17; thread-group
+; ids s21..s22 -> s18..s19.
+s_mov_b32 s0, s4
+s_mov_b32 s1, 0
+s_mov_b32 s2, s5
+s_mov_b32 s3, s6
+s_mov_b32 s4, s7
+s_mov_b32 s5, s8
+s_mov_b32 s6, s9
+s_mov_b32 s7, s10
+s_mov_b32 s8, s11
+s_mov_b32 s9, s12
+s_mov_b32 s10, s13
+s_mov_b32 s11, s14
+s_mov_b32 s12, s15
+s_mov_b32 s13, s16
+s_mov_b32 s14, s17
+s_mov_b32 s15, s18
+s_mov_b32 s16, s19
+s_mov_b32 s17, s20
+s_mov_b32 s18, s21
+s_mov_b32 s19, s22
 s_load_dwordx8 s[20:27], s[0:1], 0x0
 s_load_dwordx8 s[28:35], s[0:1], 0x20
 s_load_dwordx8 s[36:43], s[0:1], 0x40
