@@ -10,6 +10,34 @@ This page collects the setup steps and the problems testers have run into so far
 
 [claims]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
+## Compare translator revisions on the CPU
+
+From the checkout that supplies the semantic tests, set `LEONIDA_TOOLS_DIR`
+to the absolute path of the other checkout's `tools` directory. Use that
+directory as a unit so that the translator and its helper modules come from
+the same revision. Without the override, consumers use the `tools` directory
+in the test checkout.
+
+```powershell
+$previousToolsDir = $env:LEONIDA_TOOLS_DIR
+try {
+    Remove-Item Env:LEONIDA_TOOLS_DIR -ErrorAction SilentlyContinue
+    python -I -B tests/semantic/test_alu_add3.py
+    $env:LEONIDA_TOOLS_DIR = 'C:\work\leonida-reference\tools'
+    python -I -B tests/semantic/test_alu_add3.py
+} finally {
+    $env:LEONIDA_TOOLS_DIR = $previousToolsDir
+}
+```
+
+Add Python's `-v` before the script path to see the filename from which
+`rdna2spirv` was imported. The example uses synthetic input and runs on the CPU.
+The test, its fixtures and its interpreter stay in the current checkout. The
+override applies where a test imports `tests/semantic/support.py` to set its
+tool path or reads the variable directly. Check the selected test when
+comparing a specific behavior. Some standalone probes also read the variable,
+including `tools/f32_fuzz.py`.
+
 ## What you need
 
 - **Python 3.11+.** `scripts/run_gpu_tests.py` needs at least 3.10.
