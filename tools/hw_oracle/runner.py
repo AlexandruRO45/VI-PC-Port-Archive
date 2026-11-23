@@ -32,6 +32,18 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 SENTINEL = 0xDEAD0000
 
 
+def device_arch(head):
+    """The architecture a launcher's device line ("# device=... arch=<gfxNNNN> ...") names, or None when the line has
+    no arch= field. Target features (gfx90a:xnack-) are dropped. hw_oracle_drm.c prints gfx10xx for a GFX10 chip it
+    cannot name (an unknown family, a revision outside its ranges); every GFX10 chip takes the same encodings, so
+    that and an empty field are gfx1030, the architecture drm.py assembles for when LEONIDA_HW_ARCH is unset."""
+    arch = next((field[5:] for field in head.split() if field.startswith("arch=")), None)
+    if arch is None:
+        return None
+    arch = arch.split(":", 1)[0]
+    return "gfx1030" if arch in ("", "gfx10xx") else arch
+
+
 class Unavailable(Exception):
     """A required tool or the GPU is not there."""
 
@@ -255,7 +267,8 @@ class Oracle:
         if rc:
             raise Unavailable(f"probe launch failed (exit {rc}): {err.strip()[:300]}")
         head = out.splitlines()[0] if out else ""
-        if "arch=" in head and self.arch not in head:
+        reported = device_arch(head)
+        if reported is not None and reported != self.arch.split(":", 1)[0]:
             raise Unavailable(f"device reports {head!r} but assembling for {self.arch} (set LEONIDA_HW_ARCH)")
         return head.lstrip("# ")
 

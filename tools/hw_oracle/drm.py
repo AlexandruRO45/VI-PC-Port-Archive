@@ -192,8 +192,7 @@ class DrmOracle(runner.Oracle):
         head = r.stdout.splitlines()[0] if r.stdout else ""
         if not head.startswith("#"):
             raise Unavailable((r.stderr.strip() or "the launcher printed no device line")[:300])
-        arch = next((field[5:] for field in head.split() if field.startswith("arch=")), "")
-        return "gfx1030" if arch in ("", "gfx10xx") else arch   # every GFX10 chip takes the same encodings
+        return runner.device_arch(head) or "gfx1030"   # no arch= field: every GFX10 chip takes the same encodings
 
     def _assemble(self, text, wave=32):
         s = os.path.join(self.workdir, "k.s")

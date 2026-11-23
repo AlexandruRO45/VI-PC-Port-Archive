@@ -116,6 +116,53 @@ class DetectArch(unittest.TestCase):
                 asm.family(arch)   # what Oracle() does next must accept it
 
 
+class DeviceLineArch(unittest.TestCase):
+    """The probe compares the device line's arch= with the architecture it assembles for, after the mapping drm.py
+    uses to pick that architecture: hw_oracle_drm.c labels a GFX10 chip it cannot name gfx10xx, which drm.py assembles
+    for as gfx1030, so the probe must accept that line for gfx1030 instead of reporting a mismatch."""
+
+    def probe(self, arch, head):
+        o = object.__new__(runner.Oracle)      # no tools, no GPU
+        o.arch, o.chunk, o.code_object = arch, 500, None
+        o._assemble = lambda text, wave=32: ("k.co", "")
+        o._launch = lambda co, names, words=4: (0, head + "\n", "")
+        return o._probe()
+
+    def test_an_unnamed_gfx10_chip_is_accepted_for_gfx1030(self):
+        head = "# device=AMD GPU (0x13fe) rev=0x90 arch=gfx10xx engine=10.0"
+        self.assertEqual(self.probe("gfx1030", head), head.lstrip("# "))
+
+    def test_another_architecture_is_refused(self):
+        head = "# device=AMD BC-250 (0x13fe) rev=0x84 arch=gfx1013 engine=10.0"
+        with self.assertRaisesRegex(runner.Unavailable, "assembling for gfx1030"):
+            self.probe("gfx1030", head)
+        with self.assertRaisesRegex(runner.Unavailable, "assembling for gfx1013"):
+            self.probe("gfx1013", "# device=AMD GPU (0x13fe) rev=0x90 arch=gfx10xx engine=10.0")
+
+    def test_the_named_architecture_is_accepted(self):
+        head = "# device=AMD BC-250 (0x13fe) rev=0x84 arch=gfx1013 engine=10.0"
+        self.assertEqual(self.probe("gfx1013", head), head.lstrip("# "))
+
+    def test_target_features_and_lines_without_arch(self):
+        self.assertEqual(self.probe("gfx1030", "# device=x arch=gfx1030:sramecc+:xnack-"), "device=x arch=gfx1030:sramecc+:xnack-")
+        self.assertEqual(self.probe("gfx1013", "# device=x"), "device=x")     # nothing to compare
+        self.assertIsNone(runner.device_arch("# device=x"))
+        self.assertEqual(runner.device_arch("# device=x arch= engine=10.0"), "gfx1030")
+
+    def test_drm_picks_the_architecture_the_probe_then_accepts(self):
+        for head, want in (("# device=x rev=0x90 arch=gfx10xx engine=10.0", "gfx1030"),
+                           ("# device=x rev=0x84 arch=gfx1013 engine=10.0", "gfx1013"),
+                           ("# device=x engine=10.0", "gfx1030")):
+            with self.subTest(head=head):
+                o = object.__new__(drm.DrmOracle)
+                o.exe, o.node = "hw_oracle_drm", "/dev/dri/renderD128"
+                done = subprocess.CompletedProcess([], 0, stdout=head + "\n", stderr="")
+                with mock.patch.object(drm.subprocess, "run", return_value=done):
+                    arch = o._device_arch()
+                self.assertEqual(arch, want)
+                self.assertEqual(self.probe(arch, head), head.lstrip("# "))
+
+
 class True16(unittest.TestCase):
     def test_the_low_half_is_named_only_on_the_f16_operand(self):
         for old, new in (
