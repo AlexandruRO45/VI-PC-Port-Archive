@@ -7,6 +7,8 @@ file", so the tests run anywhere without a real key or gpg: the one key, another
 with subkeys, a file gpg can't read. The workflows are read as text: every `.key`/`.gpg`/`.asc` URL they fetch must go
 to a temporary file that `scripts/check_apt_key.py` checks before anything installs it. Standard library only.
 """
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -80,6 +82,15 @@ class CheckWithStandInGpg(unittest.TestCase):
     def test_the_pinned_key_passes(self):
         self.assertIsNone(check_apt_key.check(self.key(listing((WINEHQ, ["9CDD4BB7ED8C37C95FFF34F1DDB25B3BE89767D6"]))),
                                               WINEHQ, self.gpg))
+
+    def test_help_flag_prints_the_docstring(self):
+        # Every script answers -h/--help with the docstring on stdout and exit 0; before this
+        # check_apt_key answered a usage error (exit 2).
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(check_apt_key.main(["--help"]), 0)
+        self.assertIn("python3 -I scripts/check_apt_key.py", out.getvalue())
+        self.assertEqual(check_apt_key.main(["-h"]), 0)
 
     def test_another_key_fails(self):
         problem = check_apt_key.check(self.key(listing((LLVM, []))), WINEHQ, self.gpg)

@@ -66,6 +66,9 @@ def check(path, expected, gpg=("gpg",)):
 
 
 def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
     if len(argv) != 2:
         print("usage: check_apt_key.py KEYFILE FINGERPRINT", file=sys.stderr)
         return 2

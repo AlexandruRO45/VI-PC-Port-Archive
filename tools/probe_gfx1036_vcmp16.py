@@ -333,7 +333,11 @@ def test_f16_nan_and_modifiers(wave_size=32):
     print(f"[{name}] ALL NaN & MODIFIER TESTS PASSED on gfx1036 silicon!")
 
 
-def main():
+def main(argv=None):
+    if (sys.argv[1:] if argv is None else argv)[:1] in (["-h"], ["--help"]):
+        # the probe would otherwise try to run the GPU fixture and fail on a missing spirv-as
+        print(__doc__.strip())
+        return 0
     print("=" * 70)
     print("PROBING GFX1036 SILICON FOR V_CMP(X) 16-BIT OP_SEL & CONSTANTS")
     print("=" * 70)
@@ -367,4 +371,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main(sys.argv[1:]))
