@@ -19,7 +19,7 @@ Usage:
     python -I tools/anim_skel_match.py <anim.rpf> <packs.rpf> [--stream OFFSET ...] [--json out.json]
 
 The default streams are the four offsets in docs/animation.md (1.0.2.1 package). Exit 0 when the report was
-written, 2 on a read error. Nothing here decrypts anything.
+written, 2 on a read or output error. Nothing here decrypts anything.
 """
 import argparse
 import collections
@@ -147,6 +147,13 @@ def main(argv=None):
     ap.add_argument("--json", help="write the report here")
     a = ap.parse_args(argv)
     if a.json:
+        folder = os.path.dirname(os.path.abspath(a.json))
+        if os.path.isdir(a.json):       # open() on a folder ends the run in an IsADirectoryError traceback
+            print("anim_skel_match: --json %s is a folder, not a JSON file" % a.json, file=sys.stderr)
+            return 2
+        if not os.path.isdir(folder):   # the packs.rpf walk runs for minutes before it reaches this write
+            print("anim_skel_match: --json folder does not exist: %s" % folder, file=sys.stderr)
+            return 2
         for source in (a.anim, a.packs):
             if same_report_path(a.json, source):
                 print(f"anim_skel_match: --json must not overwrite input {source}", file=sys.stderr)
