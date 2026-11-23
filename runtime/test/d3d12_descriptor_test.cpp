@@ -138,17 +138,18 @@ VkShaderModule load_shader(vktest::Device& d, const char* path) {
 
 // Seed a 2D image and three layers of an array. Each triangle writes one sample through gl_SampleMask,
 // so a device without sample-rate shading can still exercise reads of four independently known values.
-bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
+bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array, bool stencil = false) {
     const VkShaderModule vs = load_shader(d, LEONIDA_TEST_MSAA_VERT_SPV);
-    const VkShaderModule fs = load_shader(d, LEONIDA_TEST_MSAA_FRAG_SPV);
+    const VkShaderModule fs = load_shader(d, stencil ? LEONIDA_TEST_STENCIL_FRAG_SPV : LEONIDA_TEST_MSAA_FRAG_SPV);
     VkPipelineLayout layout{};
     VkPipeline pipeline{};
     VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     bool ok = vs && fs && d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(
                               d.device, &layout_info, nullptr, &layout) == VK_SUCCESS;
-    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    const VkFormat format = stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-    rendering.colorAttachmentCount = 1;
+    rendering.colorAttachmentCount = stencil ? 0 : 1;
+    if (stencil) rendering.stencilAttachmentFormat = format;
     rendering.pColorAttachmentFormats = &format;
     VkPipelineShaderStageCreateInfo stages[] = {
         {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"},
@@ -161,7 +162,8 @@ bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
     VkPipelineViewportStateCreateInfo viewports{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
     viewports.viewportCount = viewports.scissorCount = 1;
     viewports.pViewports = &viewport;
-    viewports.pScissors = &area;
+    const VkRect2D stencil_rect{{1, 1}, {2, 2}};
+    viewports.pScissors = stencil ? &stencil_rect : &area;
     VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.lineWidth = 1;
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -169,7 +171,17 @@ bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
     VkPipelineColorBlendAttachmentState color{};
     color.colorWriteMask = 0xf;
     VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    blend.attachmentCount = 1;
+    blend.attachmentCount = rendering.colorAttachmentCount;
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.stencilTestEnable = stencil;
+    ds.front.compareOp = VK_COMPARE_OP_ALWAYS;
+    ds.front.passOp = VK_STENCIL_OP_REPLACE;
+    ds.front.writeMask = 0xff;
+    ds.back = ds.front;
+    const VkDynamicState reference = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 1;
+    dynamic.pDynamicStates = &reference;
     blend.pAttachments = &color;
     VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
     pi.stageCount = 2;
@@ -180,39 +192,54 @@ bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
     pi.pRasterizationState = &raster;
     pi.pMultisampleState = &ms;
     pi.pColorBlendState = &blend;
+    pi.pDepthStencilState = &ds;
+    pi.pDynamicState = stencil ? &dynamic : nullptr;
     pi.layout = layout;
     ok = ok && d.fn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(
                    d.device, VK_NULL_HANDLE, 1, &pi, nullptr, &pipeline) == VK_SUCCESS;
     VkImageView views[4]{};
-    for (UINT k = 0; ok && k < std::size(views); ++k) {
+    const UINT first_view = single ? 0 : 1;
+    for (UINT k = first_view; ok && k < std::size(views); ++k) {
         VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
         info.image = k == 0 ? single : array;
         info.viewType = VK_IMAGE_VIEW_TYPE_2D;
         info.format = format;
-        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, k == 0 ? 0 : k - 1, 1};
+        info.subresourceRange = {VkImageAspectFlags(stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, k == 0 ? 0 : k - 1, 1};
         ok = d.fn<PFN_vkCreateImageView>("vkCreateImageView")(d.device, &info, nullptr, &views[k]) == VK_SUCCESS;
     }
     ok = ok && d.run([&](VkCommandBuffer cb) {
         d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        for (UINT k = 0; k < std::size(views); ++k) {
+        for (UINT k = first_view; k < std::size(views); ++k) {
             VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             attachment.imageView = views[k];
             attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.loadOp = stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.clearValue.depthStencil.stencil = 0x80 + k;
             attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo draw{VK_STRUCTURE_TYPE_RENDERING_INFO};
             draw.renderArea = area;
-            draw.layerCount = draw.colorAttachmentCount = 1;
+            draw.layerCount = 1;
+            draw.colorAttachmentCount = rendering.colorAttachmentCount;
+            if (stencil) draw.pStencilAttachment = &attachment;
             draw.pColorAttachments = &attachment;
             d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering")(cb, &draw);
-            d.fn<PFN_vkCmdDraw>("vkCmdDraw")(cb, 3, 4, 0, 4 * k);
+            if (stencil) {
+                for (UINT sample = 0; sample < 4; ++sample) {
+                    d.fn<PFN_vkCmdSetStencilReference>("vkCmdSetStencilReference")(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                                                   16 * k + sample);
+                    d.fn<PFN_vkCmdDraw>("vkCmdDraw")(cb, 3, 1, 0, sample);
+                }
+            } else {
+                d.fn<PFN_vkCmdDraw>("vkCmdDraw")(cb, 3, 4, 0, 4 * k);
+            }
             d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering")(cb);
         }
         VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        ready.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        ready.srcAccessMask = stencil ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(
-            cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            cb, stencil ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                        : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &ready, 0, nullptr, 0, nullptr);
         return true;
     });
@@ -648,7 +675,7 @@ int main() {
             ms_slot = volume_lod_slot + volume_lod_count, ms_array_slot, ms_slice_slot, ms_first_layer_slot,
             ms_uint_slot, ms_uint_array_slot, ms_sint_slot, ms_sint_array_slot,
             line_default, line_mip, line_clamped, bgrx_slot, bgra_slot, typed_bgrx_slot, cast_bgrx_slot,
-            cast_bgra_slot, cast_rgbx_slot, cast_rgba_slot, view_slot_count
+            cast_bgra_slot, cast_rgbx_slot, cast_rgba_slot, stencil_slice_slot, view_slot_count
         };
         D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, view_slot_count,
                                              D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
@@ -1536,6 +1563,33 @@ int main() {
             list->ResourceBarrier(UINT(std::size(ms_sampled)), ms_sampled);
         }
 #ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+        Ref<ID3D12Resource> stencil_array;
+        VkImageFormatProperties stencil_props{};
+        constexpr auto stencil_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (d.instance_fn<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties")(
+                d.physical, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+                stencil_usage, 0, &stencil_props) == VK_SUCCESS && (stencil_props.sampleCounts & VK_SAMPLE_COUNT_4_BIT)
+                && stencil_props.maxArrayLayers >= 3) {
+            auto desc = ms_desc;
+            desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+            desc.DepthOrArraySize = 3;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                        D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&stencil_array.p))));
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Texture2DMSArray = {1, 2};
+            device->CreateShaderResourceView(stencil_array.p, &srv, view_slot(stencil_slice_slot));
+            EXPECT(!null_at(stencil_slice_slot));
+            const auto ready = transition(stencil_array.p, D3D12_RESOURCE_STATE_COMMON,
+                                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            list->ResourceBarrier(1, &ready);
+        } else {
+            std::puts("MSAA stencil readback skipped: 4x sampled D32S8 array unavailable");
+        }
         struct IntegerMS {
             DXGI_FORMAT format;
             VkFormat vk_format;
@@ -1971,6 +2025,33 @@ int main() {
                 }
             std::printf("MSAA SRVs: %zu per-sample values matched through 2D, full-array and sliced-array views\n",
                         std::size(ms_keys) * texels);
+        }
+
+        if (stencil_array.p) {
+            EXPECT(seed_ms_images(d, VK_NULL_HANDLE, rt::d3d12::vulkan_image(stencil_array.p), true));
+            SampleKeys stencil_keys[2]{};
+            for (UINT layer = 0; layer < 2; ++layer) {
+                std::memcpy(stencil_keys[layer].tsharp, view_bytes(stencil_slice_slot), sizeof(stencil_keys[layer].tsharp));
+                stencil_keys[layer].mode = 5;
+                stencil_keys[layer].layer = layer;
+                stencil_keys[layer].first = layer * texels;
+            }
+            std::array<UINT, 2 * texels> values{};
+            EXPECT(sample_through_set(d, set0, set0_layout, stencil_keys, values.data(), LEONIDA_TEST_MS_UINT_SPV));
+            for (UINT layer = 0; layer < 2; ++layer)
+                for (UINT i = 0; i < texels; ++i) {
+                    const UINT x = i / 4 % 4, y = i / 16, sample = i % 4;
+                    const bool covered = x >= 1 && x <= 2 && y >= 1 && y <= 2;
+                    const UINT expected = covered ? 16 * (layer + 2) + sample : 0x82 + layer;
+                    const UINT got = values[layer * texels + i];
+                    if (got != expected) {
+                        std::fprintf(stderr, "stencil layer %u xy (%u,%u) sample %u: got %u expected %u\n",
+                                     layer, x, y, sample, got, expected);
+                        return 1;
+                    }
+                }
+            std::puts("MSAA stencil: 128 RGBA loads matched across two sliced layers");
+            stencil_array.reset();
         }
 
         for (auto& test : integer_ms) {

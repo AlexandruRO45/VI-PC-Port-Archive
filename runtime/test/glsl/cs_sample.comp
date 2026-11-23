@@ -73,6 +73,19 @@ void main() {
     }
     const uint image = lookup(image_key);
 #if defined(TEST_MS_UINT) || defined(TEST_MS_SINT)
+#ifdef TEST_MS_UINT
+    if (pc.mode == 5) {
+        // A miss selects the fallback descriptor. Keep the stencil coordinates away from it.
+        if (image == 0) {
+            result[pc.first + i] = 0xffffffffu;
+            return;
+        }
+        const ivec3 coord = ivec3((i / 4) % 4, i / 16, pc.layer);
+        const uvec4 t = texelFetch(ms_arrays[image], coord, int(i % 4));
+        result[pc.first + i] = all(equal(t.rba, uvec3(0, 0, 1))) ? t.g : 0xffffffffu;
+        return;
+    }
+#endif
     // The integer SRV tests clear R32 textures and check the exact bits, including the missing key's zero.
     // Texel (0,0), layer 0 and sample 0 exist in the fallback as well as in the resources.
     if (pc.mode == 2) result[pc.first + i] = uint(texelFetch(ms_images[image], ivec2(0), 0).r);
