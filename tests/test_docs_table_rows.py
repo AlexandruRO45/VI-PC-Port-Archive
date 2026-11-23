@@ -1,10 +1,37 @@
 """Docs tables must not carry rows detached from a header (append-only drift)."""
 
+import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = [ROOT / "README.md", *sorted((ROOT / "docs").rglob("*.md"))]
+STATUS_HEADER = re.compile(r"^\|\s*What\s*\|\s*Status\s*\|$")
+FIRST_CELL = re.compile(r"^\|([^|]+)\|")
+
+
+def status_subjects(lines):
+    """First cells of the README "What | Status" table, without its header and separator."""
+    subjects, inside = [], False
+    for line in lines:
+        if STATUS_HEADER.match(line):
+            inside = True
+        elif not inside:
+            continue
+        elif not line.startswith("|"):
+            break
+        elif set(line.replace("|", "").replace(" ", "")) <= set("-:"):
+            continue
+        else:
+            match = FIRST_CELL.match(line)
+            if match:
+                subjects.append(match.group(1).strip())
+    return subjects
+
+
+def repeated(items):
+    """The items that occur more than once, sorted."""
+    return sorted({item for item in items if items.count(item) > 1})
 
 
 class DocsTableRowsTest(unittest.TestCase):
@@ -44,6 +71,19 @@ class DocsTableRowsTest(unittest.TestCase):
                     check(block)
                     block = []
             check(block)
+
+    def test_status_table_names_each_subject_once(self):
+        # Merge leftovers can leave two rows for one subject with different figures (issue #4066).
+        lines = (ROOT / "README.md").read_text(encoding="utf-8").splitlines()
+        subjects = status_subjects(lines)
+        self.assertGreaterEqual(len(subjects), 10)
+        self.assertEqual(repeated(subjects), [],
+                         "the README project status table names a subject twice: " + ", ".join(repeated(subjects)))
+
+    def test_a_repeated_subject_is_reported(self):
+        table = ["| What | Status |", "|---|---|", "| A | yes |", "| B | no |", "| A | old |"]
+        self.assertEqual(status_subjects(table), ["A", "B", "A"])
+        self.assertEqual(repeated(status_subjects(table)), ["A"])
 
 
 if __name__ == "__main__":
