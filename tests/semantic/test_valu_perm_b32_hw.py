@@ -192,5 +192,71 @@ class TestVPermB32AST(unittest.TestCase):
             Operand(RegType.VGPR, -1)
 
 
+class ScalarRegisterFile:
+    def __init__(self):
+        self.vgprs = [0] * 256
+        self.sgprs = [0] * 106
+
+    def read_operand(self, op: Operand) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index] & MASK32
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK32
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+    def write_vgpr(self, idx: int, value: int) -> None:
+        if not (0 <= idx <= 255):
+            raise ValueError(f"VGPR index out of range: {idx}")
+        self.vgprs[idx] = value & MASK32
+
+
+class ScalarVALUInterpreter:
+    @staticmethod
+    def execute(rf: ScalarRegisterFile, inst: VPermB32Instruction) -> int:
+        s0 = rf.read_operand(inst.src0)
+        s1 = rf.read_operand(inst.src1)
+        s2 = rf.read_operand(inst.src2)
+        res = ref_perm_b32(s0, s1, s2)
+        rf.write_vgpr(inst.dst.index, res)
+        return res
+
+
+class TestVPermB32ScalarInterpreter(unittest.TestCase):
+    """Deterministic scalar instruction interpreter and execution model."""
+
+    def setUp(self):
+        self.rf = ScalarRegisterFile()
+
+    def test_scalar_execution_all_vgpr(self):
+        self.rf.write_vgpr(1, 0x07060504)
+        self.rf.write_vgpr(2, 0x03020100)
+        self.rf.write_vgpr(3, 0x00010203)
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 0),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.VGPR, 2),
+            src2=Operand(RegType.VGPR, 3),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        self.assertEqual(res, 0x00010203)
+        self.assertEqual(self.rf.vgprs[0], 0x00010203)
+
+    def test_scalar_execution_sgpr_and_imm(self):
+        self.rf.vgprs[1] = 0x8899AABB
+        self.rf.sgprs[5] = 0x11223344
+        inst = VPermB32Instruction(
+            dst=Operand(RegType.VGPR, 4),
+            src0=Operand(RegType.VGPR, 1),
+            src1=Operand(RegType.SGPR, 5),
+            src2=Operand(RegType.IMM, 0, value=0x07060100),
+        )
+        res = ScalarVALUInterpreter.execute(self.rf, inst)
+        expected = ref_perm_b32(0x8899AABB, 0x11223344, 0x07060100)
+        self.assertEqual(res, expected)
+        self.assertEqual(self.rf.vgprs[4], expected)
+
+
 if __name__ == "__main__":
     unittest.main()
