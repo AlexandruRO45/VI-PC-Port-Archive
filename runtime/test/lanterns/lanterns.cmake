@@ -39,9 +39,10 @@ elseif(LEONIDA_TEST_LANTERNS)
   if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND TARGET Python3::Interpreter)
     set(LEONIDA_LANTERNS_SHADERS ${CMAKE_CURRENT_BINARY_DIR}/generated/lanterns)
     set(_lanterns_tools ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
-    # Every tools/*.py, as make_game.py's translator_digest() hashes them: the translator imports many of them
-    # (fssm_header, shader_ir, shader_meta, mc_command, rdna2_decode, ...), and a stale index.json must not survive.
-    file(GLOB _lanterns_tool_py CONFIGURE_DEPENDS ${_lanterns_tools}/*.py)
+    # Every tools/*.py and tools/*.json: the translator imports many of the scripts (fssm_header, shader_ir,
+    # shader_meta, mc_command, rdna2_decode, ...) and reads data such as gfx10_formats.json (rdna2spirv.py,
+    # rdna2_decode.py), and a stale index.json must not survive a change to any of them.
+    file(GLOB _lanterns_tool_py CONFIGURE_DEPENDS ${_lanterns_tools}/*.py ${_lanterns_tools}/*.json)
     set(_lanterns_asm ${_lanterns_src}/shaders/vs_lanterns.asm ${_lanterns_src}/shaders/ps_lanterns_lit.asm
                       ${_lanterns_src}/shaders/ps_lanterns_floor.asm ${_lanterns_src}/shaders/vs_lanterns_w64.asm
                       ${_lanterns_src}/shaders/ps_lanterns_lit_w64.asm ${_lanterns_src}/shaders/vs_lanterns_edges.asm
