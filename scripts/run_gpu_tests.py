@@ -87,6 +87,14 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+def assembler_error(message: str) -> str:
+    """The first `error:` line of an llvm-mc failure, for a one-line FAIL; the whole text if it has none."""
+    for line in message.splitlines():
+        if "error:" in line:
+            return line.strip()
+    return " ".join(message.split())[:300]
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
@@ -697,6 +705,7 @@ def run_suite(a, work: str) -> int:
 
     # 1. Create synthetic DXBC / FSSM metadata + assemble .asm -> .s
     disasm_files = []
+    asm_failures: dict[str, str] = {}   # fixture -> llvm-mc's error, reported as that test's FAIL
     for fname in build_files:
         name = os.path.splitext(fname)[0]
         if name in CLIP_CASES and name != "vs_clip_undeclared":
@@ -725,10 +734,15 @@ def run_suite(a, work: str) -> int:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
         fname = shader_source(name) + ".asm"
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
-        assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
-        disasm_files.append(disasm_path)
         # A failed translation must not run an old binary left in a reused --work directory.
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
+        try:
+            assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
+        except RuntimeError as e:
+            # One fixture this llvm-mc can't assemble fails that test, not the whole suite (TEST-961).
+            asm_failures[name] = assembler_error(str(e))
+            continue
+        disasm_files.append(disasm_path)
 
     # 2. Translate this run's inputs only. The translator looks for metadata one level above the input directory.
     with tempfile.TemporaryDirectory(prefix="disasm-", dir=work) as selected_disasm:
@@ -793,6 +807,9 @@ def run_suite(a, work: str) -> int:
             # is no .spv (the f16 fallback is on by default where PerVertexKHR doesn't compile: MoltenVK).
             results.append((name, None, "SKIP (computed I/J pairs need PerVertexKHR inputs: "
                                         "no --bary-fallback / --f16-interp-fallback)"))
+            continue
+        if name in asm_failures:
+            results.append((name, False, f"llvm-mc: {asm_failures[name]}"))
             continue
         if not os.path.isfile(spv):
             results.append((name, False, "missing .spv (translation failed)"))

@@ -62,6 +62,45 @@ class PackedFormatFixture(unittest.TestCase):
             self.assertIn("0/1 passed", output.getvalue())
 
 
+class FixtureLlvmMcRejects(unittest.TestCase):
+    """TEST-961: one fixture llvm-mc can't assemble is that test's FAIL, not a RuntimeError ending the suite."""
+
+    def test_the_fixture_fails_and_the_suite_finishes(self):
+        name = "cs_fmt_1010102"
+        stderr = "<stdin>:3:1: error: instruction not supported on this GPU\nv_bogus v0\n^"
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+
+            def refuse(_mc, _src, _dst, n):
+                raise RuntimeError(f"llvm-mc failed on {n}:\n{stderr}")
+
+            translated = []
+
+            def translate(cmd, env=None, gpu=True):
+                translated.append(sorted(os.listdir(cmd[3])))   # the disasm folder rdna2spirv.py is given
+                return 0, ""
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=refuse),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt, "run_cmd", side_effect=translate),
+                  patch.object(rgt, "fmt_1010102_test") as check_fmt,
+                  contextlib.redirect_stdout(output)):
+                self.assertEqual(rgt.run_suite(args, tmp), 1)
+            check_fmt.assert_not_called()                 # nothing runs for a fixture that didn't assemble
+            self.assertEqual(translated, [[]])            # and it isn't handed to the translator
+            text = output.getvalue()
+            self.assertIn("FAIL", text)
+            self.assertIn(f"{name}", text)
+            self.assertIn("llvm-mc: <stdin>:3:1: error: instruction not supported on this GPU", text)
+            self.assertIn("0/1 passed", text)
+
+    def test_the_first_error_line_is_reported(self):
+        self.assertEqual(rgt.assembler_error("llvm-mc failed on x:\nwarning: a\n<stdin>:2:5: error: bad\n  v0\n"),
+                         "<stdin>:2:5: error: bad")
+        self.assertEqual(rgt.assembler_error("llvm-mc failed on x:\nsegfault"), "llvm-mc failed on x: segfault")
+
+
 class TextureTestOnASmallPushConstantDevice(unittest.TestCase):
     """vk_texture_test exits 77 on a device with 128 push constant bytes: a SKIP, not a FAIL."""
     UNSUPPORTED_MSG = "unsupported: need 144 push constant bytes, device has 128\n"
