@@ -207,9 +207,10 @@ corpus writes; other MODE writes are refused (see Known approximations).
 
 ### GPU tests (RTX 4060 Ti)
 
-`runtime\test\vk_harness.cpp` (build: `runtime\build\test\build_harness.cmd`, MSVC + the Vulkan 1.4 headers from
-Hookshot's CPM cache, loading `vulkan-1.dll` at runtime) draws one triangle with a given VS + FS into an RGBA32F
-target and dumps the floats. Test shaders are in `<work>\gputest`.
+`runtime\test\vk_harness.cpp` (a CMake target of `runtime`, `runtime/CMakeLists.txt`; built with
+`scripts\build_runtime.ps1` or `cmake -S runtime -B runtime/build` and `cmake --build`, per
+[testing.md](testing.md#build-the-test-programs); loading `vulkan-1.dll` at runtime) draws one triangle with a given
+VS + FS into an RGBA32F target and dumps the floats. Test shaders are in `<work>\gputest`.
 
 - **`VS_Passthrough` (translated) is bit-exact.** All 64×64 pixels are written, and `param0.xy` = (u, 1 − v) with max
   error **0**, with zw = (0, 1) as exported. This covers the VertexIndex input, integer/float ALU, inline constants,
