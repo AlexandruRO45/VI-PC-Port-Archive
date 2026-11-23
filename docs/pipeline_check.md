@@ -339,7 +339,9 @@ memory. A work folder with at most 500 entries keeps the single invocation. An o
 options keeps the older invocation; rebuild the runtime to get batching.
 
 If a batch crashes, its in-flight modules are checked alone in fresh processes. A module that reproducibly crashes
-is recorded as failed, and the rest is checked. If none crashes alone, the entire failed range is retried in
+is recorded as failed, and the rest is checked. A range restarts once more for each module it adds this way, so
+a batch can hold any number of them (AMD's RDNA1/RDNA2 Windows driver crashes on dozens of the game's ped pixel shaders in a
+single batch, #857). If none crashes alone, the entire failed range is retried in
 smaller processes, down to one entry; healthy modules are not added to the crash list. An unrecoverable crash,
 an interrupted check or a setup error stops the stage. A validation failure in one batch remains a failure even
 when subsequent batches succeed; it does not prevent those later batches from being checked.
@@ -351,8 +353,10 @@ starts with a cleared report path, so an earlier process's report cannot hide an
 
 An abnormal diagnostic-probe exit confirms a module crash only when that probe's fresh in-flight report names
 the selected module. A missing, empty or unrelated report makes the result inconclusive and stops the stage
-without blaming that module. The native report is periodic for small modules, so even a real fast crash can
-leave no evidence; this conservative fallback does not guess its cause or add an unconfirmed crash-list entry.
+without blaming that module; this conservative fallback does not guess its cause or add an unconfirmed crash-list
+entry. The checker rewrites the report as each module enters the driver, so a module that crashes it within
+milliseconds is still named (before this, small modules were only named by the 5 s watchdog, and the ped shaders
+above crashed before it ran).
 
 The batch size limits the index range, **not total memory usage**. Concurrent heavy modules, loading a large
 saved cache or compiling one large shader can still exceed a process's available memory; a range that
