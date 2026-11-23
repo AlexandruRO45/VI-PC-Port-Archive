@@ -1,0 +1,34 @@
+Leonida_Performance_Revolution - changed files
+
+Branch:  perf/translator-fast-paths
+Base:    1cc6e3c12 (upstream main, untouched)
+Files:   15 (12 modified, 3 new)
+
+Every path is relative to the repository root. Only modified and new files are in this archive:
+no unchanged files, no git metadata, no build output, no downloaded dependencies.
+
+STATUS    PATH                                  DESCRIPTION
+--------  --------------------------------------  ----------------------------------------
+MODIFIED  docs/README.md                          Index the new performance note in the documentation table.
+NEW       docs/translator_performance.md          Measured profile of the translator, what changed and the result (1.16x); the same for the tiling loops (1.02-2.46x); how to re-measure both.
+MODIFIED  runtime/CMakeLists.txt                  Build resource_detile_bench and register its --self-test with ctest.
+MODIFIED  runtime/src/resource_detile.h           Rewrite of the 64 KiB tile/detile inner loops: per-tile-row offset table, four-way unroll, width-typed moves, direction as a template parameter.
+NEW       runtime/test/resource_detile_bench.cpp  Throughput benchmark for the tiling loops plus a --self-test round trip that ctest runs.
+MODIFIED  runtime/test/resource_detile_test.cpp   Add a deterministic randomized sweep of 240 shapes to the round-trip test.
+MODIFIED  tests/test_shader_ir.py                 Tests for memoised/interned base_op, the shared implementation across passes, and that operand() hands out copies.
+NEW       tools/bench_translate.py                Translator benchmark over the repository's own fixtures (no game data, no GPU).
+MODIFIED  tools/lane_masks.py                     Delegate base_op to the shared implementation in shader_ir; sys.path set up before the sibling import.
+MODIFIED  tools/ptr_truncation_census.py          Forward the precomputed operand split to _step_state.
+MODIFIED  tools/rdna2spirv.py                     emit() maintains the construct stack for desc_cache_ok, module-level comparison tables, check_lane_local keeps the hoisted-pointer set, dedupe_types splits only the header.
+MODIFIED  tools/shader_ir.py                      Memoised and interned base_op, memoised operand parse with a copy on the way out, parse_file counts on the text as read.
+MODIFIED  tools/shader_meta.py                    One operand split per instruction, mnemonic classified once, shared base_op, sys.path set up before the sibling import.
+MODIFIED  tools/wave64_emulate_opt.py             Delegate base_op to the shared implementation in shader_ir.
+MODIFIED  tools/wave64_halves.py                  Delegate base_op to the shared implementation in shader_ir.
+
+Verification (this machine):
+  python -m compileall -q make_game.py tools tests                      OK
+  python -I scripts/run_semantic_tests.py tests/semantic -j 2            433 files, 5821 tests, only test_float_nan_fract fails (pre-existing on the base commit)
+  python3 -m pytest tests -q -p no:randomly --ignore=tests/semantic     7635 passed, 25 failed (all 25 fail identically on the base commit)
+  cmake --build runtime && ctest                                        22 tests, 21 passed, 1 skipped (shader_library_corpus needs the game package)
+  node --test tests/test_viewer_streaming.cjs                           56 passed, 1 failed (AbortController unavailable in this Node; same on the base commit)
+  git diff --check 1cc6e3c12..HEAD                                      clean

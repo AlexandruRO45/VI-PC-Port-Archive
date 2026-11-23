@@ -28,6 +28,15 @@ it moves an already-computed value, so it is an ordinary VALU write and inactive
 (SHADER-21 part 2).
 """
 
+import os
+import sys
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling (the pattern in
+# tools/anim_clips.py).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from shader_ir import base_op as _base_op  # noqa: E402
+
 MASK = "mask"           # full lane mask (64-bit pair, vcc, or wave32 single register)
 MASK_LO = "mask_lo"     # low 32-bit half of a 64-bit lane mask (lanes 0-31)
 MASK_HI = "mask_hi"     # high 32-bit half of a 64-bit lane mask (lanes 32-63)
@@ -54,10 +63,8 @@ VECTOR_BITWISE = ("v_mov_b32", "v_or3_b32", "v_or_b32", "v_and_b32", "v_and_or_b
 
 
 def base_op(op):
-    for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
-        if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+    # The one memoised implementation (shader_ir.base_op); this module keeps the name for its callers.
+    return _base_op(op)
 
 
 def kind(state, a):
@@ -136,10 +143,8 @@ def lane_slot(vgpr, lane):
     return ("lane", vgpr["r"], lane["v"] & 63)
 
 
-def step(state, ins, wave64=True):
-    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR.
-
-    `wave64` False: the program runs in 32-lane waves, where a 64-bit s_bfm_b64 result can't be a lane mask."""
+def step(state, ins):
+    """Update `state` (register -> MASK | MASK_LO | MASK_HI | EITHER) for one instruction. True if it writes a mask to a VGPR."""
     op, a = base_op(ins["op"]), ins["args"]
     if not a or op.startswith(NO_DESTINATION):
         return
@@ -212,9 +217,7 @@ def step(state, ins, wave64=True):
     if "_saveexec_b" in op or "_wrexec_b" in op:
         put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
     elif op == "s_bfm_b64":
-        # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
-        # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
-        put(state, a[0], MASK if wave64 else None)
+        put(state, a[0], MASK)
     elif op.startswith(COPIES) and len(a) > 1:
         k = kind(state, a[1])
         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
@@ -264,7 +267,7 @@ def parked(blocks, masks):
     return sorted(found)
 
 
-def analyse(blocks, succ, *, include_either=False, wave64=True):
+def analyse(blocks, succ, *, include_either=False):
     entry = [None] * len(blocks)                        # None: not reached yet
     if blocks:
         entry[0] = {}
@@ -273,7 +276,7 @@ def analyse(blocks, succ, *, include_either=False, wave64=True):
         n = work.pop()
         state = dict(entry[n])
         for ins in blocks[n]:
-            step(state, ins, wave64)
+            step(state, ins)
         for s in succ[n]:
             if entry[s] is None:
                 merged = dict(state)
@@ -299,6 +302,6 @@ def analyse(blocks, succ, *, include_either=False, wave64=True):
             out[id(ins)] = {r: k for r, k in state.items() if k in MASK_KINDS}
             if include_either:
                 either[id(ins)] = {r for r, k in state.items() if k == EITHER}
-            if step(state, ins, wave64):
+            if step(state, ins):
                 writes.add(id(ins))
     return (out, writes, either) if include_either else (out, writes)

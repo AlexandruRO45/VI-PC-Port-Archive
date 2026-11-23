@@ -6,13 +6,38 @@ label/offset (for branches), hw register, and raw text for anything else.
 
 As a module: parse_file(path) -> {"name", "code_start", "insns": [...], "invalid": [pc...]}
 As a tool:  python -I shader_ir.py <disasm dir> [--limit N]   (parses everything and reports coverage)
-Usage: `python -I tools/shader_ir.py --help` lists the options.
 """
 import argparse
 import os
 import re
 import sys
 from collections import Counter
+from functools import lru_cache
+
+
+_BASE_OP_CACHE = {}
+
+
+def base_op(op):
+    """The mnemonic without its encoding-size suffix (_e32, _e64, _sdwa, _dpp), interned.
+
+    Every pass over an instruction list asks this for every instruction: the translator's dispatch, the metadata
+    pass (shader_meta.py), the lane-mask pass (lane_masks.py) and the wave64 rewriters, each of which used to carry
+    its own copy and re-derive the same answer. The answer is memoised (the test is four endswith() calls and a
+    slice, and the corpus draws from a few thousand distinct names), and sys.intern makes the `op == "..."`
+    comparisons in the translator's dispatch chain pointer comparisons instead of character-by-character ones.
+    Interning changes identity, not equality, so a caller comparing against a literal behaves the same.
+    """
+    r = _BASE_OP_CACHE.get(op)
+    if r is None:
+        r = op
+        for suf in ("_e32", "_e64", "_sdwa", "_dpp"):
+            if op.endswith(suf):
+                r = op[: -len(suf)]
+                break
+        _BASE_OP_CACHE[op] = r = sys.intern(r)
+    return r
+
 
 ENC = re.compile(r";\s*encoding:\s*\[([^\]]*)\]")
 HDR = re.compile(r"^;\s*(\S+)\s+code 0x([0-9a-f]+)\.\.0x([0-9a-f]+)")
@@ -35,19 +60,22 @@ _ATTR = re.compile(r"attr(\d+)\.([xyzw])")
 _TARGET = re.compile(r"(pos|param|mrt|mrtz|null|prim)(\d*)")
 _INT = re.compile(r"-?(0x[0-9a-fA-F]+|\d+)")
 _FLOAT = re.compile(r"-?\d+\.\d+(e[+-]?\d+)?")
-# LLVM 23 prints a literal it could also show as an inline constant as lit(V), e.g. a v_fma_mix* f32 source
-# `lit(0x42200000)`, where LLVM 21 printed the inline constant of the low half (0) and dropped the literal.
-# Only a numeric constant is unwrapped: lit(v2) is no literal and stays raw (Unsupported), as before.
-_LIT = re.compile(r"lit\((-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+(?:e[+-]?\d+)?)?))\)")
 
 
 def operand(tok):
-    t = tok.strip()
-    if "lit(" in t:
-        # lit(V) is the constant V. A leading '-' on it is the VOP3 neg modifier, as neg(V) (not integer negation).
-        t = _LIT.sub(r"\1", t)
-        if t.startswith("-"):
-            t = "neg(" + t[1:] + ")"
+    """One operand of one instruction, as the dictionary the translator works with.
+
+    The same spellings recur constantly (register names, the inline constants, a shader's literals), and the ones
+    that are not a bare register cost several regex matches each. So the parse is memoised per spelling and the
+    caller gets a copy: the translator annotates operands it is looking at (an SDWA select, an f64 literal) and a
+    shared dictionary would leak that to every other instruction with the same spelling. The cache is bounded
+    because a full corpus has millions of distinct literals.
+    """
+    return dict(_operand_cached(tok.strip()))
+
+
+@lru_cache(maxsize=1 << 16)
+def _operand_cached(t):
     neg = t.startswith("-")
     core = t[1:] if neg else t
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")
@@ -217,11 +245,8 @@ def parse_line(line):
             return ""
         rest = MODWORDS.sub(_take_mod, rest)
     parts = [a for a in split_args(rest) if a.strip()]
-    if op in ("s_waitcnt", "s_waitcnt_depctr"):
-        # LLVM separates named wait counters with spaces.
-        parts = [token for part in parts for token in part.split()]
-    elif parts and len(parts[0].split()) == 2:
-        # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
+    # 'exp pos0 v3, ...' / 'exp null off, ...': the target is space-separated from the first operand.
+    if parts and len(parts[0].split()) == 2:
         parts = parts[0].split() + parts[1:]
     args = [operand(a) for a in parts]
     if op.startswith(("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64",
@@ -237,8 +262,11 @@ def parse_line(line):
 
 def parse_file(path):
     with open(path, encoding="utf-8", errors="replace") as f:
-        lines = f.read().splitlines()
-    info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [], "invalid": 0}
+        text = f.read()
+    lines = text.splitlines()
+    # Counted on the text as read: joining the lines back together for this copied the whole listing a second time.
+    info = {"name": os.path.splitext(os.path.basename(path))[0], "insns": [],
+            "invalid": text.count("invalid instruction encoding")}
     m = HDR.match(lines[0]) if lines else None
     pc = int(m.group(2), 16) if m else 0
     info["code_start"] = pc
@@ -258,8 +286,6 @@ def parse_file(path):
         if ins["enc"]:
             pc += len(ins["enc"]) // 2
         info["insns"].append(ins)
-    tail = "\n".join(lines)
-    info["invalid"] = tail.count("invalid instruction encoding")
     return info
 
 

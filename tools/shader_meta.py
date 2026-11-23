@@ -10,6 +10,13 @@ Standard library only; no game data.
 import hashlib
 import os
 import struct
+import sys
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing the sibling (the pattern in
+# tools/anim_clips.py).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from shader_ir import base_op as _base_op  # noqa: E402
 
 # DXBC SFI0 (Shader Feature Info) 64-bit bitmask flags (Microsoft DXC DxilConstants.h).
 SFI0_RESOURCE_DESCRIPTOR_HEAP_INDEXING = 1 << 25   # 0x02000000
@@ -58,10 +65,8 @@ KIND_PRIORITY = {
 
 
 def base_op(op):
-    for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
-        if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+    # The one memoised implementation (shader_ir.base_op); this module keeps the name for its callers.
+    return _base_op(op)
 
 
 def _imm_u32(a):
@@ -144,37 +149,54 @@ def _const_of(sym, a):
     return None
 
 
+# Which operand layout an instruction has. Decided once per mnemonic: the tests below are a run of startswith()
+# calls against a tuple of prefixes, and the same mnemonics come back for every instruction of every shader.
+_SPLIT_CLASS = {}
+_NO_DST, _CMPX, _CMP, _RMW, _DUAL_DST, _PLAIN = range(6)
+
+
+def _split_class(op):
+    k = _SPLIT_CLASS.get(op)
+    if k is None:
+        if op.startswith(NO_SGPR_DST):
+            k = _NO_DST
+        elif op.startswith("v_cmpx_"):
+            k = _CMPX
+        elif op.startswith("v_cmp_"):
+            k = _CMP
+        elif op in SGPR_RMW:
+            k = _RMW
+        elif (op.startswith("v_") and "_co_" in op) or op in (
+            "v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64",
+        ):
+            k = _DUAL_DST
+        else:
+            k = _PLAIN
+        _SPLIT_CLASS[op] = k
+    return k
+
+
 def _split_operands(ins):
     """Return (read_sgprs, write_sgprs) for one parsed instruction."""
-    op = base_op(ins["op"])
     a = ins["args"]
     if not a:
         return [], []
-    if op.startswith(NO_SGPR_DST):
-        reads = [r for x in a for r in _sgpr_regs(x)]
-        return reads, []
-    if op.startswith("v_cmpx_"):
+    op = base_op(ins["op"])
+    k = _split_class(op)
+    if k == _NO_DST:
+        return [r for x in a for r in _sgpr_regs(x)], []
+    if k == _PLAIN:
+        return [r for x in a[1:] for r in _sgpr_regs(x)], _sgpr_regs(a[0])
+    if k == _CMP or k == _CMPX:
         # e32 has 2 source operands; e64 has dst in a[0] and 2 sources in a[1:3].
         if len(a) <= 2:
             return [r for x in a for r in _sgpr_regs(x)], []
         return [r for x in a[1:] for r in _sgpr_regs(x)], _sgpr_regs(a[0])
-    if op.startswith("v_cmp_"):
-        if len(a) <= 2:
-            return [r for x in a for r in _sgpr_regs(x)], []
-        return [r for x in a[1:] for r in _sgpr_regs(x)], _sgpr_regs(a[0])
-    if op in SGPR_RMW:
-        reads = [r for x in a for r in _sgpr_regs(x)]
-        return reads, _sgpr_regs(a[0])
-    if (op.startswith("v_") and "_co_" in op) or op in (
-        "v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64",
-    ):
-        # vdst in a[0], scalar carry/scale-out dst in a[1], sources in a[2:].
-        writes = _sgpr_regs(a[0]) + (_sgpr_regs(a[1]) if len(a) > 1 else [])
-        reads = [r for x in a[2:] for r in _sgpr_regs(x)]
-        return reads, writes
-    reads = [r for x in a[1:] for r in _sgpr_regs(x)]
-    writes = _sgpr_regs(a[0])
-    return reads, writes
+    if k == _RMW:
+        return [r for x in a for r in _sgpr_regs(x)], _sgpr_regs(a[0])
+    # vdst in a[0], scalar carry/scale-out dst in a[1], sources in a[2:].
+    writes = _sgpr_regs(a[0]) + (_sgpr_regs(a[1]) if len(a) > 1 else [])
+    return [r for x in a[2:] for r in _sgpr_regs(x)], writes
 
 
 def _fold_scalar_alu(op, x, y):
@@ -226,8 +248,12 @@ def _valid_stride(n):
     return isinstance(n, int) and 4 <= n <= 4096 and n % 4 == 0
 
 
-def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
-    """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction."""
+def _step_state(sym, scale, ptr_stride, vscale, ins, events=None, writes=None):
+    """Advance symbolic SGPR origin/constants and descriptor-stride state by one instruction.
+
+    `writes` is the second half of _split_operands(ins) when the caller already has it: the operand split is a pure
+    function of the instruction, and analyse_instructions computes it once per instruction and hands it to both
+    passes rather than letting this derive it a second time."""
     op = base_op(ins["op"])
     a = ins["args"]
     if not a:
@@ -318,7 +344,8 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 vscale.pop(r, None)
 
     # Update SGPR symbolic state for writes.
-    _, writes = _split_operands(ins)
+    if writes is None:
+        _, writes = _split_operands(ins)
     if not writes:
         return
 
@@ -504,6 +531,18 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     entry_pstride = [None] * nblk
     entry_vscale = [None] * nblk
 
+    # The operand split is a pure function of the instruction, and the worklist revisits a block once per
+    # change of its entry state (so a loop body is split several times, and once more in the final pass below).
+    # Cache it per instruction for the length of this call: the instructions are alive in `blocks`, so ids are
+    # stable for that long.
+    split_cache = {}
+
+    def split_operands(ins):
+        r = split_cache.get(id(ins))
+        if r is None:
+            r = split_cache[id(ins)] = _split_operands(ins)
+        return r
+
     entry_written[0] = frozenset()
     entry_sym[0] = {r: ("user", r) for r in user_range}
     entry_scale[0] = {}
@@ -527,8 +566,8 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
         for ins in blocks[b]:
             if base_op(ins["op"]) == "s_endpgm":
                 break
-            _, writes = _split_operands(ins)
-            _step_state(sym, scale, pstride, vscale, ins, events=None)
+            writes = split_operands(ins)[1]
+            _step_state(sym, scale, pstride, vscale, ins, events=None, writes=writes)
             written.update(writes)
         out_w = frozenset(written)
         for s in succ[b]:
@@ -578,11 +617,11 @@ def analyse_instructions(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
         for ins in blocks[b]:
             if base_op(ins["op"]) == "s_endpgm":
                 break
-            reads, writes = _split_operands(ins)
+            reads, writes = split_operands(ins)
             for r in reads:
                 if r in user_range and r not in written:
                     rbw.add(r)
-            _step_state(sym, scale, pstride, vscale, ins, events=events)
+            _step_state(sym, scale, pstride, vscale, ins, events=events, writes=writes)
             written.update(writes)
 
     # Assign the strongest observed kind to each read-before-write user SGPR.

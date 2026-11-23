@@ -33,7 +33,6 @@ candidate cross-half opcodes and decides nothing. This module decides per shader
 the tiers the translator wrote into an index.json. They answer different questions.
 
 Standard library only.
-Usage: `python -I tools/wave64_halves.py --help` lists the options.
 """
 import argparse
 import json
@@ -44,6 +43,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import lane_masks  # noqa: E402
+from shader_ir import base_op as _base_op  # noqa: E402
 
 # taint bits
 CNT = 1         # number of lanes of a mask in the own half (s_bcnt1 of a lane mask)
@@ -131,10 +131,8 @@ def partial_write(ins, op):
 
 
 def base_op(op):
-    for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
-        if op.endswith(suffix):
-            return op[:-len(suffix)]
-    return op
+    # The one memoised implementation (shader_ir.base_op); this module keeps the name for its callers.
+    return _base_op(op)
 
 
 def _regs(a):
@@ -1719,7 +1717,7 @@ def main(argv=None):
     # JSON document that is not the index object used to end in a traceback (FileNotFoundError, PermissionError,
     # JSONDecodeError, AttributeError).
     try:
-        with open(args.census, encoding="utf-8-sig") as f:
+        with open(args.census, encoding="utf-8") as f:
             index = json.load(f)
     except OSError as exc:
         print(f"ERROR: cannot read {args.census}: {exc.strerror or exc}", file=sys.stderr)

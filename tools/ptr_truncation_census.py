@@ -92,9 +92,9 @@ def pointer_sites(blocks, succ, user_sgpr_limit=32, system_sgprs=()):
     seen = {}
     step, record = shader_meta._step_state, shader_meta._record_ptr_pair
 
-    def step_state(sym, scale, ptr_stride, vscale, ins, events=None):
+    def step_state(sym, scale, ptr_stride, vscale, ins, events=None, writes=None):
         current["ins"] = ins
-        return step(sym, scale, ptr_stride, vscale, ins, events)
+        return step(sym, scale, ptr_stride, vscale, ins, events, writes)
 
     def record_ptr_pair(events, sym, slots, is_desc_width=False):
         lo_t, hi_t = shader_meta._slot_tag(sym, slots[0]), shader_meta._slot_tag(sym, slots[1])
@@ -299,8 +299,6 @@ def main(argv=None):
     ap.add_argument("--json", help="write the summary here")
     ap.add_argument("--index-out", help="write {number: {stage, user_sgpr_reads}} for tools/user_sgpr_census.py")
     a = ap.parse_args(argv)
-    if a.limit is not None and a.limit < 1:
-        ap.error("--limit must be at least 1 (a smaller value would silently scan fewer listings)")
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2

@@ -173,6 +173,27 @@ int main() {
     CHECK(test_roundtrip(1001, 603, 8, 4));
     CHECK(test_roundtrip(1920, 1080, 16, 4));
 
+    // 6. A randomized sweep over the shapes the inner loops can get wrong: a width that ends inside a tile column
+    // (the tail run), a height that ends inside a tile row, and both at once. Deterministic, so a failure repeats.
+    {
+        std::uint32_t state = 0x9E3779B9u;
+        auto next = [&state](std::uint32_t bound) {
+            state = state * 1664525u + 1013904223u;
+            return state % bound;
+        };
+        const std::uint32_t bpes[] = {1, 2, 4, 8, 16};
+        for (int i = 0; i < 240; ++i) {
+            const std::uint32_t bpe = bpes[next(5)];
+            const std::uint32_t block = next(4) == 0 ? 4u : 1u;
+            const std::uint32_t w = 1 + next(block == 4 ? 520u : 660u);
+            const std::uint32_t h = 1 + next(block == 4 ? 300u : 400u);
+            if (!test_roundtrip(w, h, bpe, block)) {
+                std::fprintf(stderr, "randomized case %d: %ux%u eb=%u blk=%u\n", i, w, h, bpe, block);
+                return 1;
+            }
+        }
+    }
+
     std::printf("resource detile: all 64 KiB GFX10 swizzle round-trip and validation checks passed\n");
     return 0;
 }

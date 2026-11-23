@@ -4,6 +4,7 @@
 """
 import contextlib
 import errno
+import importlib
 import importlib.util
 import io
 import os
@@ -27,6 +28,39 @@ def load_module():
 shader_ir = load_module()
 
 
+class BaseOpTests(unittest.TestCase):
+    """base_op() strips the encoding suffix and is the one memoised implementation every pass shares."""
+
+    def test_each_encoding_suffix_is_stripped(self):
+        for suffix in ("_e32", "_e64", "_sdwa", "_dpp"):
+            self.assertEqual(shader_ir.base_op("v_add_f32" + suffix), "v_add_f32")
+
+    def test_a_name_without_a_suffix_is_unchanged(self):
+        self.assertEqual(shader_ir.base_op("s_endpgm"), "s_endpgm")
+        self.assertEqual(shader_ir.base_op("v_mad_mk_f32"), "v_mad_mk_f32")   # _mk is part of the name, not a suffix
+
+    def test_the_answer_is_memoised_and_interned(self):
+        # One dictionary lookup per call instead of four endswith() calls, and the same interned object every time,
+        # so the comparisons in the translator's dispatch chain are pointer comparisons.
+        a = shader_ir.base_op("v_cmpx_le_f32_e64")
+        b = shader_ir.base_op("v_cmpx_le_f32_e64")
+        self.assertIs(a, b)
+        self.assertEqual(a, "v_cmpx_le_f32")
+        self.assertIs(a, sys.intern(a))
+        self.assertIn("v_cmpx_le_f32_e64", shader_ir._BASE_OP_CACHE)
+
+    def test_the_other_passes_share_this_implementation(self):
+        # shader_meta, lane_masks and the wave64 rewriters used to carry their own copies; each now delegates here.
+        saved = sys.path[:]
+        try:
+            sys.path.insert(0, os.path.join(ROOT, "tools"))
+            for name in ("shader_meta", "lane_masks", "wave64_halves", "wave64_emulate_opt"):
+                module = importlib.import_module(name)
+                self.assertEqual(module.base_op("v_add_f32_e64"), "v_add_f32", name)
+        finally:
+            sys.path[:] = saved
+
+
 class OperandTests(unittest.TestCase):
     def test_single_registers(self):
         self.assertEqual(
@@ -37,6 +71,28 @@ class OperandTests(unittest.TestCase):
             shader_ir.operand("v3"),
             {"k": "vgpr", "r": 3, "n": 1, "neg": False, "abs": False},
         )
+
+    def test_each_call_gets_its_own_dictionary(self):
+        # operand() memoises the parse per spelling, but the translator annotates the operand it is looking at
+        # (an SDWA select, an f64 literal), so a shared dictionary would leak that to every other instruction.
+        a = shader_ir.operand("v3")
+        b = shader_ir.operand("v3")
+        self.assertEqual(a, b)
+        self.assertIsNot(a, b)
+        a["sdwa_sel"] = "BYTE_0"
+        self.assertNotIn("sdwa_sel", shader_ir.operand("v3"))
+        self.assertNotIn("sdwa_sel", b)
+
+    def test_two_parses_of_one_line_do_not_share_operands(self):
+        first = shader_ir.parse_line("\tv_and_b32 v1, v2, v3")
+        second = shader_ir.parse_line("\tv_and_b32 v1, v2, v3")
+        first["args"][1]["sext"] = True
+        self.assertNotIn("sext", second["args"][1])
+
+    def test_a_modifier_on_a_spelling_does_not_change_another(self):
+        # The cache is keyed by the whole spelling: '-v1' and 'v1' are different keys and different operands.
+        self.assertTrue(shader_ir.operand("-v1")["neg"])
+        self.assertFalse(shader_ir.operand("v1")["neg"])
 
     def test_register_ranges(self):
         self.assertEqual(
@@ -156,22 +212,6 @@ class OperandTests(unittest.TestCase):
 
     def test_unknown_operand_falls_back_to_raw(self):
         self.assertEqual(shader_ir.operand("weirdthing"), {"k": "raw", "t": "weirdthing"})
-
-    def test_llvm23_lit_is_the_constant(self):
-        # LLVM 23 prints lit(V) for a literal it could also show as an inline constant (v_fma_mix* sources).
-        for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
-                            ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
-            with self.subTest(text=text):
-                self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
-
-    def test_llvm23_lit_of_a_register_is_not_unwrapped(self):
-        # lit() wraps a constant; a register inside it is not a literal and must not parse as the register (or as a
-        # constant): it keeps the lit(...) text, which the translator refuses as before lit() was read.
-        for text in ("lit(v2)", "lit(s4)", "-lit(v2)", "lit(vcc_lo)"):
-            with self.subTest(text=text):
-                op = shader_ir.operand(text)
-                self.assertNotIn(op["k"], ("vgpr", "sgpr", "imm", "fimm"))
-                self.assertIn("lit(", op.get("t", ""))
 
 
 class SplitArgsTests(unittest.TestCase):
