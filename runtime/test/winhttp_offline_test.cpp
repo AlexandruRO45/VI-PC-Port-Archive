@@ -236,10 +236,23 @@ int main() {
               !config.lpszProxyBypass, "proxy configuration is empty");
         check(platform() != FALSE, "platform is supported");
         HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const DWORD timeout_options[] = {WINHTTP_OPTION_RESOLVE_TIMEOUT, WINHTTP_OPTION_CONNECT_TIMEOUT,
+                                         WINHTTP_OPTION_SEND_TIMEOUT, WINHTTP_OPTION_RECEIVE_TIMEOUT};
+        const DWORD defaults[] = {0, 60000, 30000, 30000};
+        for (int i = 0; i < 4; ++i) {
+            DWORD out = 0, size = sizeof(out);
+            check(query_option(session, timeout_options[i], &out, &size) != FALSE && out == defaults[i],
+                  "untouched handle reports default timeout");
+        }
         WINHTTP_AUTOPROXY_OPTIONS opts = {}; WINHTTP_PROXY_INFO info = {};
         SetLastError(0);
         check(proxy(session, L"https://example.invalid", &opts, &info) == FALSE &&
               GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED, "proxy discovery fails offline");
+        opts.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT;
+        opts.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A;
+        SetLastError(0);
+        check(proxy(session, L"https://example.invalid", &opts, &info) == FALSE &&
+              GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED, "auto-detect fails offline");
         close(session);
     }
     check(rt::shims::owns_dll("winhttp.dll"), "winhttp.dll is a module the shims own (LoadLibrary gets a pseudo-handle)");

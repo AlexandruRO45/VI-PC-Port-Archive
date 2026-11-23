@@ -53,7 +53,7 @@ struct Handle {
     WINHTTP_STATUS_CALLBACK callback = nullptr;
     DWORD notifications = 0;
     DWORD_PTR context = 0;
-    DWORD resolve_timeout = 0, connect_timeout = 0, send_timeout = 0, receive_timeout = 0;
+    DWORD resolve_timeout = 0, connect_timeout = 60000, send_timeout = 30000, receive_timeout = 30000;
     DWORD security_flags = 0, max_redirects = 0;
 
     std::wstring server;  // Connect: for the log
