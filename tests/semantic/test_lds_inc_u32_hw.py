@@ -579,6 +579,94 @@ class TestDSIncU32BoundaryExtremes(unittest.TestCase):
         idx2 = self.lds.resolve_dword_index(4096)
         self.assertEqual(idx2, 0)
 
+class TestDSIncU32NegativeAndTranslator(unittest.TestCase):
+    """Part 8: Negative controls, syntax rejection, mutation detection, and translator execution."""
 
-if __name__ == '__main__':
+    def test_syntax_rejection(self) -> None:
+        invalid_assemblies = [
+            "ds_inc_u32",
+            "ds_inc_u32 v1",
+            "ds_inc_u32 v1, v2, v3",
+            "ds_inc_rtn_u32 v1, v2",
+            "ds_inc_u32 s1, v2",
+            "ds_inc_rtn_u32 s0, v1, v2",
+            "ds_inc_u32 v1, v2 offset:-1",
+            "ds_inc_u32 v1, v2 offset:70000",
+            "ds_inc_u32 v1, v2 bad_mod",
+        ]
+        for asm in invalid_assemblies:
+            with self.subTest(asm=asm):
+                with self.assertRaises(ValueError):
+                    DSIncU32Instruction.parse(asm)
+
+    def test_mutation_detection_signed_comparison(self) -> None:
+        # Mutant: treats operands as signed integers instead of unsigned
+        def mutant_inc_signed(cur: int, data: int) -> int:
+            s_cur = cur - (1 << 32) if (cur & 0x80000000) else cur
+            s_data = data - (1 << 32) if (data & 0x80000000) else data
+            return 0 if s_cur >= s_data else (cur + 1) & MASK32
+
+        # cur = 0xFFFFFFFF (-1 signed), data = 10 (+10 signed)
+        # Unsigned: cur (4294967295) >= data (10) -> resets to 0.
+        # Signed mutant: s_cur (-1) < s_data (10) -> increments to 0!
+        # Let's test with cur = 0x80000000 (-2147483648 signed), data = 10:
+        # Unsigned: 2147483648 >= 10 -> resets to 0.
+        # Signed: -2147483648 < 10 -> increments to 0x80000001!
+        oracle_res = ref_ds_inc_u32(0x80000000, 10)
+        mutant_res = mutant_inc_signed(0x80000000, 10)
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 0x80000001)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_mutation_detection_strict_greater_instead_of_ge(self) -> None:
+        def mutant_strict_gt(cur: int, data: int) -> int:
+            return 0 if cur > data else (cur + 1) & MASK32
+
+        oracle_res = ref_ds_inc_u32(10, 10)
+        mutant_res = mutant_strict_gt(10, 10)
+        self.assertEqual(oracle_res, 0)
+        self.assertEqual(mutant_res, 11)
+        self.assertNotEqual(oracle_res, mutant_res)
+
+    def test_translator_emits_cas_loop_with_ugreater_than_equal(self) -> None:
+        """Verifies tools/rdna2spirv.py emits OpAtomicCompareExchange and OpUGreaterThanEqual."""
+        lines = [
+            "v_mov_b32_e32 v1, 0x40",
+            "v_mov_b32_e32 v2, 10",
+            "ds_inc_u32 v1, v2",
+            "ds_inc_rtn_u32 v5, v1, v2 offset:16",
+            "s_waitcnt lgkmcnt(0)",
+        ]
+        spv = L.translate(lines)
+        self.assertIn("OpAtomicCompareExchange", spv)
+        self.assertIn("OpUGreaterThanEqual", spv)
+
+    def test_translator_backed_execution_via_lds_run(self) -> None:
+        """Executes translated ds_inc_u32 and ds_inc_rtn_u32 in spirv_mini_interp."""
+        # Test 1: Increment when cur < data (cur=3, data=10 -> 4)
+        init = {0x40: 3}
+        ops = [("ds_inc_rtn_u32", 0x40, 0, (10,))]
+        rtns, fin = L.run_chain(ops, init)
+        self.assertEqual(rtns, [3])
+        self.assertEqual(fin, {0x40: 4})
+
+        # Test 2: Reset to 0 when cur >= data (cur=10, data=10 -> 0)
+        init2 = {0x44: 10}
+        ops2 = [("ds_inc_rtn_u32", 0x44, 0, (10,))]
+        rtns2, fin2 = L.run_chain(ops2, init2)
+        self.assertEqual(rtns2, [10])
+        self.assertEqual(fin2, {0x44: 0})
+
+        # Test 3: Non-returning ds_inc_u32 with offset
+        init3 = {0x48: 5, 0x4C: 20}
+        ops3 = [
+            ("ds_inc_u32", 0x48, 4, (20,)),       # 0x48 + 4 = 0x4C: cur=20, data=20 -> resets to 0
+            ("ds_inc_rtn_u32", 0x48, 0, (10,)),   # 0x48: cur=5, data=10 -> 6
+        ]
+        rtns3, fin3 = L.run_chain(ops3, init3)
+        self.assertEqual(rtns3, [0xDEAD, 5])
+        self.assertEqual(fin3, {0x48: 6, 0x4C: 0})
+
+
+if __name__ == "__main__":
     unittest.main()
