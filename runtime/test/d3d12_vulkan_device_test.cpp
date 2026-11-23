@@ -589,8 +589,6 @@ int compare_footprints(ID3D12Device* ours) {
 // whole number of alignments and at least the texels of its top mip; both sizes are printed. Also checks the
 // Device4/Device8 variants' per-resource layout. Returns the number of mismatches, or -1 without a host device.
 int compare_allocation_info(ID3D12Device* ours) {
-    // Device4 and Device8 use PC vtable slots here. Keep the base-device calls on the proxy.
-    ID3D12Device* const pc = xs_test::pc_device(ours);
     Ref<ID3D12Device> host;
     if (!create_host_device(host)) return -1;
     const auto with = [](D3D12_RESOURCE_DESC desc, UINT64 alignment, UINT samples = 1) {
@@ -931,9 +929,9 @@ int compare_allocation_info(ID3D12Device* ours) {
     {
         Ref<ID3D12Device4> ours4, host4;
         Ref<ID3D12Device8> ours8_mask, host8_mask;
-        pc->QueryInterface(IID_PPV_ARGS(&ours4.p));
+        ours->QueryInterface(IID_PPV_ARGS(&ours4.p));
         host->QueryInterface(IID_PPV_ARGS(&host4.p));
-        pc->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
+        ours->QueryInterface(IID_PPV_ARGS(&ours8_mask.p));
         host->QueryInterface(IID_PPV_ARGS(&host8_mask.p));
         const D3D12_RESOURCE_DESC buffer = buffer_desc(256);
         D3D12_RESOURCE_DESC1 buffer1{};
@@ -998,7 +996,7 @@ int compare_allocation_info(ID3D12Device* ours) {
         }
     }
 
-    if (FAILED(pc->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
+    if (FAILED(ours->QueryInterface(IID_PPV_ARGS(&ours8.p)))) return mismatches + 1;
     const D3D12_RESOURCE_DESC mixed[] = {with(texture_desc(16, 16, rgba8, none), k4), buffer_desc(300),
                                          with(texture_desc(64, 64, rgba8, rt), 0, 4)};
     D3D12_RESOURCE_DESC1 mixed1[3]{};
@@ -3027,16 +3025,27 @@ HRESULT command_list(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TY
     return released(hr, &out);
 }
 
-HRESULT command_list1(ID3D12Device* device, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, bool output = true,
-                      D3D12_COMMAND_LIST_FLAGS flags = D3D12_COMMAND_LIST_FLAG_NONE) {
-    Ref<ID3D12Device4> device4;
-    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
-    void* out = nullptr;
-    // CreateCommandList1 is PC slot 51; device_method maps it on the Xbox proxy.
-    return released(xs_test::device_method(device4.p, 51, node_mask, type, flags,
-                                           &__uuidof(ID3D12GraphicsCommandList), output ? &out : nullptr),
-                    &out);
-}
+struct CommandList1Case {
+    const char* name;
+    UINT node_mask;
+    int type;
+    bool output = true;
+    UINT flags = 0;
+
+    HRESULT create(ID3D12Device* device, bool console) const {
+        Ref<ID3D12Device4> device4;
+        if (FAILED(device->QueryInterface(IID_PPV_ARGS(&device4.p)))) return E_NOINTERFACE;
+        void* out = nullptr;
+        const auto list_type = D3D12_COMMAND_LIST_TYPE(type);
+        const auto list_flags = D3D12_COMMAND_LIST_FLAGS(flags);
+        const auto& iid = __uuidof(ID3D12GraphicsCommandList);
+        const HRESULT hr = console
+            ? xs_test::console_call(device4.p, xs_test::device_slot(51), node_mask, list_type, list_flags,
+                                    &iid, output ? &out : nullptr)
+            : device4->CreateCommandList1(node_mask, list_type, list_flags, iid, output ? &out : nullptr);
+        return released(hr, &out);
+    }
+};
 
 // A 64 KiB heap description for the CreateHeap cases (D3D-238).
 D3D12_HEAP_DESC heap_desc_of(UINT64 alignment, D3D12_HEAP_PROPERTIES properties = {D3D12_HEAP_TYPE_DEFAULT},
@@ -3115,7 +3124,8 @@ using InvalidCase = HRESULT (*)(ID3D12Device*);
 // A call that faults is reported as this, not a crash of the whole test (the host may not validate everything).
 constexpr HRESULT kFaulted = HRESULT(0xC0000005);
 
-HRESULT call_guarded(InvalidCase call, ID3D12Device* device) {
+template<class Call>
+HRESULT call_guarded(const Call& call, ID3D12Device* device) {
     __try {
         return call(device);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4105,44 +4115,6 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         {"command list: null output, no allocator", [](ID3D12Device* d) {
              return command_list(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, -2, false);
          }},
-        {"command list1: type direct", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(0)); }},
-        {"command list1: type bundle", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(1)); }},
-        {"command list1: type compute", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(2));
-         }},
-        {"command list1: type copy", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(3)); }},
-        {"command list1: type 7", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(7)); }},
-        {"command list1: type 99", [](ID3D12Device* d) { return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99)); }},
-        // NONE (-1): Windows 10's runtime (19045, no ID3D12Device10) creates the list and newer Windows 11 runtimes
-        // refuse it (measured on #2297); Windows 11 23H2 (22621.5415, ID3D12Device10 but no ID3D12Device11) still
-        // creates it, so it is compared only on a host with ID3D12Device11.
-        {"command list1: type -1", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(-1));
-         }, +device11},
-        {"command list1: node mask 1", [](ID3D12Device* d) {
-             return command_list1(d, 1, D3D12_COMMAND_LIST_TYPE_DIRECT);
-         }},
-        {"command list1: node mask 2", [](ID3D12Device* d) {
-             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT);
-         }},
-        {"command list1: null output", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
-         }},
-        {"command list1: null output, node mask 2", [](ID3D12Device* d) {
-             return command_list1(d, 2, D3D12_COMMAND_LIST_TYPE_DIRECT, false);
-         }},
-        {"command list1: null output, type 99", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE(99), false);
-         }},
-        {"command list1: flags 1", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, true, D3D12_COMMAND_LIST_FLAGS(1));
-         }},
-        {"command list1: flags 0xffffffff", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, true, D3D12_COMMAND_LIST_FLAGS(0xffffffffu));
-         }},
-        {"command list1: null output, flags 1", [](ID3D12Device* d) {
-             return command_list1(d, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, false, D3D12_COMMAND_LIST_FLAGS(1));
-         }},
         // CreateCommandSignature (no root signature). A null description faults in the host runtime, so it is not
         // compared.
         {"command signature: null output", [](ID3D12Device* d) {
@@ -4320,6 +4292,40 @@ int compare_invalid_arguments(ID3D12Device* ours) {
         }
         ++mismatches;
         std::fprintf(stderr, "invalid arguments %s: ours 0x%08lx, host 0x%08lx\n", c.name, a, b);
+    }
+
+    // A host QueryInterface on our proxy returns its PC view. Check both that view and the Xbox slot
+    // against the same native CreateCommandList1 result for each argument combination.
+    constexpr CommandList1Case list_cases[] = {
+        {"type direct", 0, 0}, {"type bundle", 0, 1}, {"type compute", 0, 2}, {"type copy", 0, 3},
+        {"type 7", 0, 7}, {"type 99", 0, 99}, {"type -1", 0, -1},
+        {"node mask 1", 1, 0}, {"node mask 2", 2, 0}, {"null output", 0, 0, false},
+        {"null output, node mask 2", 2, 0, false}, {"null output, type 99", 0, 99, false},
+        {"flags 1", 0, 0, true, 1}, {"flags 0xffffffff", 0, 0, true, 0xffffffffu},
+        {"null output, flags 1", 0, 0, false, 1},
+    };
+    for (const auto& c : list_cases) {
+        if (verbose) {
+            std::printf("invalid arguments command list1: %s\n", c.name);
+            std::fflush(stdout);
+        }
+        const auto pc_call = [&](ID3D12Device* d) { return c.create(d, false); };
+        const HRESULT native = call_guarded(pc_call, host.p);
+        for (bool console : {false, true}) {
+            const HRESULT result = call_guarded([&](ID3D12Device* d) { return c.create(d, console); }, ours);
+            const char* view = console ? "Xbox" : "PC";
+            // Windows 10 and Windows 11 23H2 accept type -1. Newer hosts refuse it (#2297).
+            if (result != native && c.type == -1 && !device11(host.p)) {
+                std::printf("invalid arguments command list1: %s (%s): not comparable on this host "
+                            "(ours 0x%08lx, host 0x%08lx)\n", c.name, view, result, native);
+                continue;
+            }
+            if (result != native || verbose)
+                std::fprintf(result == native ? stdout : stderr,
+                             "invalid arguments command list1: %s (%s): ours 0x%08lx, host 0x%08lx\n",
+                             c.name, view, result, native);
+            if (result != native) ++mismatches;
+        }
     }
 
     // A buffer on a GPU upload heap. The layer reports OPTIONS16.GPUUploadHeapSupported FALSE and refuses the heap
