@@ -1550,7 +1550,8 @@ def run_suite(a, work: str) -> int:
                 # The capture path (SHADER-1092): the scatter regroups vs_tri's outputs (its constants,
                 # VS_TRI_OUTPUTS) and the draw's indices into the capture pass's input buffer, the capture
                 # module runs the geometry shader over them, and the generated vertex shader draws the
-                # records. Non-indexed first, then a u16 index buffer, so the scatter's two paths both run.
+                # records. Non-indexed first, then u16 and u32 index buffers, so the scatter's three index
+                # paths all run.
                 env = gs_env(spirv_dir, name, gfx_env)
                 if env is None:
                     results.append((name, False, "gs_compute layout or generated stages missing"))
@@ -1566,6 +1567,11 @@ def run_suite(a, work: str) -> int:
                     f.write(struct.pack("<3H", 0, 1, 2))
                 raw2 = os.path.join(raw_dir, f"{name}.u16.raw")
                 runs.append(("u16 indices", raw2, dict(env, VKH_GS_INDICES=idx, VKH_GS_INDEX_TYPE="16")))
+                idx32 = os.path.join(work, "gs_tri_indices_u32.bin")
+                with open(idx32, "wb") as f:
+                    f.write(struct.pack("<3I", 0, 1, 2))
+                raw3 = os.path.join(raw_dir, f"{name}.u32.raw")
+                runs.append(("u32 indices", raw3, dict(env, VKH_GS_INDICES=idx32, VKH_GS_INDEX_TYPE="32")))
                 capture = os.path.join(spirv_dir, f"{name}.gs_compute.spv")
                 ok, parts = True, []
                 for label, out, run_env in runs:
