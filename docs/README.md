@@ -31,6 +31,7 @@ method, scope and caveats. No game data is included.
 | [navmesh.md](navmesh.md) | 90,295 `navmeshes.rpf` streams (0 unclassified): 9,603 `0DRP` cover-point `0x7a` pages, 27,644 `0x00010015` navmesh tiles (`136×180` grid), 27,482 Band-3 sparse grids, 22 `PSIN`. |
 | [bvh.md](bvh.md) | 565,596 `core_bvh4.rpf` streams; 271,627 BVH4 streams and 269,106 instances, prebuilt acceleration data. |
 | [rbf0.md](rbf0.md) | 1,263 RBF0 resources, 475,461 elements; UI/Scaleform definitions, not a sectioned container; strict JSON/CSV/XML tree decoder. |
+| [psin_root_descriptor.md](psin_root_descriptor.md) | Retail registration and in-memory field layout for both PSIN root IDs. |
 | [gamedata.md](gamedata.md) | `common.rpf`: 954 streams, 266 XML documents / 118 roots; 0 RBF0/PSIN; a streaming reader (`gamedata_reader.py`) converts 259 documents by root and `type`. |
 | [gamedata_graph.md](gamedata_graph.md) | `common.rpf` mount graph: 25 manifest documents, 30 content-set ids, 14 include refs (12 resolve), 3,386 target refs, 0 cycles. |
 | [weather.md](weather.md) | The weather document measured: 168 types (151 tagged / 17 untagged, a family split), exact-case `Mod*` vocabulary mismatches, axis-to-field Spearman (niceness tracks its field, `Rain` is a 7-of-25 data-set split), `TimeMult` and the inert `Honor*` values. |
