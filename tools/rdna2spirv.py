@@ -237,10 +237,13 @@ class Unsupported(Exception):
 
 
 class Gen:
-    def __init__(self, stage, hoist_reg_ptrs=False):
+    def __init__(self, stage, hoist_reg_ptrs=False, cache_active=False):
         self.stage = stage
         self.hoist_reg_ptrs = hoist_reg_ptrs
         self.reg_ptrs = {}
+        self.cache_active = cache_active
+        self.exec_static_true = False
+        self._active_ssa = None
         self.body = []
         self.consts = {}
         # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
@@ -388,6 +391,11 @@ class Gen:
 
     def emit(self, s):
         self.body.append("         " + s)
+        if s.startswith("OpStore %active "):
+            assert not self.exec_static_true, f"OpStore %active emitted with exec_static_true: {s}"
+            self._active_ssa = s.split()[2]
+        elif s.endswith("= OpLabel"):
+            self._active_ssa = None
         if self.emulate:
             if s.startswith(("OpStore %vcc ", "OpStore %active ")):
                 reg, val = s.split()[1:3]
@@ -1408,12 +1416,22 @@ class Gen:
 
     # ---- EXEC (this lane's active bit) ----
     def active_b(self):
+        if self.exec_static_true:
+            return "%true"
+        if self.cache_active:
+            if self._active_ssa is None:
+                b = self.tmp()
+                self.emit(f"{b} = OpLoad %bool %active")
+                self._active_ssa = b
+            return self._active_ssa
         b = self.tmp()
         self.emit(f"{b} = OpLoad %bool %active")
         return b
 
     def exec_value(self):
         """EXEC as a lane mask for this invocation: all-ones if active, else 0."""
+        if self.exec_static_true:
+            return self.cu(0xFFFFFFFF)
         r = self.tmp()
         self.emit(f"{r} = OpSelect %uint {self.active_b()} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
@@ -1452,9 +1470,9 @@ class Gen:
         if a["k"] == "vgpr" and a.get("n", 1) == 1:
             # VALU writes only land in active lanes. The exception is a lane mask on its way through a VGPR
             # (lane_masks.py): every lane works out its own bit of it, active or not. Inside an active run
-            # (insns) the enclosing `if (active)` already leaves inactive lanes out (DPP's row/bank mask never
-            # gets there: DPP instructions aren't lane-local).
-            if self.write_all_lanes or (self.active_run and self.dpp_guard is None):
+            # (insns) the enclosing `if (active)` already leaves inactive lanes out, and when the shader never
+            # modifies EXEC (`exec_static_true`) every lane is always active (DPP is guarded separately).
+            if self.write_all_lanes or ((self.active_run or self.exec_static_true) and self.dpp_guard is None):
                 self.store_reg("vgpr", a["r"], val)
                 return
             p = self.reg_ptr("vgpr", a["r"])
@@ -4817,6 +4835,7 @@ class Gen:
         self.x_marks.append((len(self.body), seg))
         self.desc_cache.clear()
         self.sgpr_imm.clear()
+        self._active_ssa = None
         self.block_label = f"%blk{seg}"
         self.x_dirty = set()
 
@@ -15733,7 +15752,8 @@ def translate(path):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
-    g = Gen(stage, hoist_reg_ptrs=True)
+    g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
+    g.exec_static_true = not any(writes_exec(i) for i in insns)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
         g.param_max = max((int(t[5:]) for i in insns if base_op(i["op"]) == "exp" for t in
                            (i["args"][0].get("t", ""),) if t.startswith("param") and t[5:].isdigit()), default=-1)
@@ -16105,6 +16125,7 @@ def translate(path):
                 or any((kind, "r") in g.x_dirty or (kind, "w") in g.x_dirty for kind in fd["mem_writes"])):
             g.x_order_barrier()
         g.desc_cache.clear()
+        g._active_ssa = None
         g.sgpr_imm.clear()
         g.x_tok.clear()
         g.x_mcache.clear()
@@ -16142,6 +16163,7 @@ def translate(path):
                         g.emit(f"OpBranch {blbl}")
                         g.emit(f"{blbl} = OpLabel")
                         g.desc_cache.clear()
+                        g._active_ssa = None
                         g.sgpr_imm.clear()
                         g.x_tok.clear()
                         g.x_mcache.clear()
@@ -16217,6 +16239,7 @@ def translate(path):
         for kind in fd["mem_writes"]:
             g.x_dirty.add((kind, "w"))
         g.desc_cache.clear()
+        g._active_ssa = None
         g.sgpr_imm.clear()
         g.x_tok.clear()
         g.x_mcache.clear()
@@ -16237,7 +16260,8 @@ def translate(path):
         g.x_dirty = set(plan["dirty_in"].get(n, ())) if g.emulate_inline else set()
         g.x_tok, g.x_mcache = {}, {}     # a register's value is only known from where this block wrote it
         g.x_gen += 1
-        g.desc_cache.clear()            # a cached lookup is only good inside the block that made it
+        g.desc_cache.clear()
+        g._active_ssa = None            # a cached lookup is only good inside the block that made it
         g.sgpr_imm.clear()
         cur = n
         while True:
@@ -16256,6 +16280,7 @@ def translate(path):
                 if cur in fold_chain:
                     cur = fold_chain[cur]
                     g.desc_cache.clear()
+                    g._active_ssa = None
                     g.sgpr_imm.clear()
                     g.x_tok.clear()
                     g.x_mcache.clear()
