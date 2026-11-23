@@ -139,13 +139,31 @@ std::filesystem::path pipeline_cache_path() {
 }
 
 // Where a session saves the pipelines it learned, and where the next one starts: LEONIDA_PIPELINE_CACHE, else a file
-// beside the seed. Empty without either; never the seed itself.
+// beside the seed; "off" turns the session file off (nothing loaded, nothing saved). Empty without a place; never the
+// seed itself.
+std::wstring environment_value(const wchar_t* name) {
+    std::wstring value(32768, L'\0');
+    const DWORD length = GetEnvironmentVariableW(name, value.data(), static_cast<DWORD>(value.size()));
+    if (!length || length >= value.size()) return {};
+    value.resize(length);
+    return value;
+}
+
+// The most a session cache file may hold, to load or to save: LEONIDA_PIPELINE_CACHE_MAX_MB, else 1 GiB. A session
+// that ended with a bigger cache (the full-corpus seed is 3.8 GB) keeps the file it started from.
+std::uint64_t session_cache_limit() {
+    const std::wstring text = environment_value(L"LEONIDA_PIPELINE_CACHE_MAX_MB");
+    wchar_t* end = nullptr;
+    const unsigned long long megabytes = std::wcstoull(text.c_str(), &end, 10);
+    if (text.empty() || *end || megabytes > (UINT64_MAX >> 20)) return leonida::pipeline_cache_store::kDefaultMaxSessionBytes;
+    return std::uint64_t{megabytes} << 20;
+}
+
 std::filesystem::path session_cache_path(const std::filesystem::path& seed) {
-    std::wstring named(32768, L'\0');
-    const DWORD length = GetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE", named.data(), static_cast<DWORD>(named.size()));
+    const std::wstring named = environment_value(L"LEONIDA_PIPELINE_CACHE");
+    if (leonida::pipeline_cache_store::is_off(named)) return {};
     std::filesystem::path path;
-    if (length && length < named.size()) {
-        named.resize(length);
+    if (!named.empty()) {
         path = named;
     } else if (!seed.empty()) {
         path = seed.parent_path() / leonida::pipeline_cache_store::kSessionFileName;
@@ -233,7 +251,7 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
     namespace store = leonida::pipeline_cache_store;
     if (!session.empty() && store::session_file_is_current(session, seed))
         if (const VkPipelineCache cache = create_cache_from_file(create_cache, device, identity, session,
-                                                                 store::kMaxSessionBytes, loaded_bytes))
+                                                                 session_cache_limit(), loaded_bytes))
             return cache;
     return create_cache_from_file(create_cache, device, identity, seed, UINT64_MAX, loaded_bytes);
 }
@@ -677,10 +695,15 @@ struct DeviceState {
         try {
             std::size_t size = 0;
             if (vk.vkGetPipelineCacheData(info.device, pipeline_cache_handle, &size, nullptr) != VK_SUCCESS) return;
-            if (size <= pipeline_cache_loaded_bytes) return;  // nothing learned since the file it started from
-            if (size > store::kMaxSessionBytes) {
-                std::fprintf(stderr, "[rt] d3d12: the pipeline cache (%zu bytes) is too big to save to %s\n", size,
-                             name.c_str());
+            // Nothing learned since the file it started from: every pipeline came from the cache. Without feedback
+            // the cache growing is the only sign.
+            const std::uint32_t made = pipeline_stats.pipelines, hits = pipeline_stats.cache_hits;
+            if (info.pipeline_creation_feedback ? made <= hits : size <= pipeline_cache_loaded_bytes) return;
+            if (const std::uint64_t limit = session_cache_limit(); size > limit) {
+                std::fprintf(stderr,
+                             "[rt] d3d12: not saving the pipeline cache: %zu bytes is over the %llu MB limit "
+                             "(LEONIDA_PIPELINE_CACHE_MAX_MB)\n",
+                             size, static_cast<unsigned long long>(limit >> 20));
                 return;
             }
             const auto begin = std::chrono::steady_clock::now();

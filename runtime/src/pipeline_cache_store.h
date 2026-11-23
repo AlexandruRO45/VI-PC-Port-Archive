@@ -16,15 +16,21 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <string>
 #include <system_error>
 #include <vector>
 
 namespace leonida::pipeline_cache_store {
 
-// A cache bigger than this is neither loaded from nor saved to the session file: saving reads the whole cache into
-// memory next to the driver's own copy, and a corrupt file should not map a whole disk. The full-corpus seed is 3.8 GB
-// (docs/design.md).
-inline constexpr std::uint64_t kMaxSessionBytes = std::uint64_t{8} << 30;
+// A session cache file bigger than this is neither loaded nor saved (LEONIDA_PIPELINE_CACHE_MAX_MB overrides): saving
+// reads the whole cache into memory next to the driver's copy and writes all of it, and the full-corpus seed is 3.8 GB
+// (docs/design.md); a session that made a few pipelines should not write that at exit.
+inline constexpr std::uint64_t kDefaultMaxSessionBytes = std::uint64_t{1} << 30;
+
+// LEONIDA_PIPELINE_CACHE=off: no session file.
+inline bool is_off(const std::wstring& value) {
+    return value.size() == 3 && (value[0] | 0x20) == L'o' && (value[1] | 0x20) == L'f' && (value[2] | 0x20) == L'f';
+}
 
 inline constexpr const wchar_t* kSessionFileName = L"pipeline_cache.user.bin";
 

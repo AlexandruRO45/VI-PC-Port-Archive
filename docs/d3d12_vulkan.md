@@ -2025,7 +2025,7 @@ Pipeline creation:
   `pipeline_cache.user.bin` beside the executable (`LEONIDA_PIPELINE_CACHE` names another file; the build's
   `pipeline_cache.bin` is never written, and the variable naming it is refused). It writes a staging file and renames it
   over the old one, so an interrupted or failed save (a read-only folder, a full disk) leaves the previous file and
-  never fails the run. A cache that did not grow, or is over 8 GiB, is not saved. The next session starts from that file
+  never fails the run. It saves only if the session created a pipeline that missed the cache (creation feedback), and not when the cache is over 1 GiB (`LEONIDA_PIPELINE_CACHE_MAX_MB` changes the limit; one log line says it was skipped); a bigger file is not loaded either. `LEONIDA_PIPELINE_CACHE=off` turns the file off. The next session starts from that file
   when its Vulkan header matches the device and it is at least as new as `pipeline_cache.bin` (a rebuilt seed wins), else
   from the seed. At teardown the log says how many pipelines were created, how long they took and how many the cache
   already had (VK_EXT_pipeline_creation_feedback); `d3d12_pipeline_cache_persist_test` checks the second session finds

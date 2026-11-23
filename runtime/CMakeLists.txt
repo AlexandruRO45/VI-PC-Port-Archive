@@ -2992,3 +2992,12 @@ if(WIN32 AND MSVC)
     target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
   endforeach()
 endif()
+
+# A test that creates a D3D12 device would otherwise save pipeline_cache.user.bin beside its executable (and the next run
+# would start from it). Only d3d12_pipeline_cache_persist chooses its own file, in a scratch folder it removes.
+get_directory_property(_leonida_tests TESTS)
+foreach(_test ${_leonida_tests})
+  if(NOT _test STREQUAL "d3d12_pipeline_cache_persist")
+    set_property(TEST ${_test} APPEND PROPERTY ENVIRONMENT "LEONIDA_PIPELINE_CACHE=off")
+  endif()
+endforeach()

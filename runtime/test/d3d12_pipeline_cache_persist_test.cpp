@@ -1,8 +1,10 @@
 // Pipelines one session creates are found in the pipeline cache of the next. A D3D12 device is made on a Vulkan device
-// three times in one process, each with LEONIDA_PIPELINE_CACHE naming the same scratch file, and creates the same
+// several times in one process, each with LEONIDA_PIPELINE_CACHE naming the same scratch file, and creates the same
 // compute PSOs; VK_EXT_pipeline_creation_feedback (rt::d3d12::pipeline_cache_stats) says how many came from the cache:
 //   1. no file: every pipeline is compiled, and the device saves its cache when it is destroyed;
 //   2. the saved file: every pipeline is found in the cache;
+//   2b. a session that made nothing new leaves the file alone; over LEONIDA_PIPELINE_CACHE_MAX_MB nothing is saved;
+//       LEONIDA_PIPELINE_CACHE=off saves and loads nothing;
 //   3. a file that is not a pipeline cache, then a path that cannot be written: the device still creates every
 //      pipeline, and the first is replaced by a real cache.
 // The shaders are hand-written SPIR-V no-ops that differ in their workgroup size, so each PSO is a pipeline of its own.
@@ -242,12 +244,16 @@ int main() {
     }
     EXPECT(fs::is_regular_file(session_file));
 
+    const auto saved_at = fs::last_write_time(session_file);
+    const auto saved_size = fs::file_size(session_file);
     const Session second = run_session(d, dir, root_blob);
     EXPECT(second.ok);
     print("session 2, cache saved by session 1", second);
     EXPECT(second.stats.loaded_bytes > 0);
     EXPECT(second.stats.pipelines == pipeline_count);
     EXPECT(second.stats.cache_hits == pipeline_count);
+    // Every pipeline came from the cache, so there was nothing to save: the file is not rewritten.
+    EXPECT(fs::last_write_time(session_file) == saved_at && fs::file_size(session_file) == saved_size);
 
     // A file that is not a pipeline cache is ignored and then replaced by a real one.
     {
@@ -262,6 +268,19 @@ int main() {
     EXPECT(fs::file_size(session_file) > 100);
     const Session fourth = run_session(d, dir, root_blob);
     EXPECT(fourth.ok && fourth.stats.cache_hits == pipeline_count);
+
+    // A cache over LEONIDA_PIPELINE_CACHE_MAX_MB is not saved, and "off" saves and loads nothing.
+    const fs::path limited = dir / "limited.bin";
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE", limited.c_str()));
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_MAX_MB", L"0"));
+    const Session sixth = run_session(d, dir, root_blob);
+    EXPECT(sixth.ok && sixth.stats.pipelines == pipeline_count);
+    EXPECT(!fs::exists(limited));
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_MAX_MB", nullptr));
+    EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE", L"off"));
+    const Session seventh = run_session(d, dir, root_blob);
+    EXPECT(seventh.ok && seventh.stats.pipelines == pipeline_count && seventh.stats.loaded_bytes == 0);
+    EXPECT(!fs::exists(dir / "off"));
 
     // A path nothing can be saved to costs the session nothing but the save.
     const fs::path unwritable = dir / "a_directory";
