@@ -651,13 +651,15 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
 def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=None, include_known=False):
     """Greedy instruction deletion minimizer, retaining only instructions needed for the mismatch."""
     current = list(lines)
+    original_kind = output_kind(lines)
     def reduce(tmp, context):
         i = 0
         while i < len(current):
             trial = current[:i] + current[i + 1:]
             try:
-                status, _, _, _ = run_one(trial, "ps_f64_shrink", tmp, oracle, context, include_known)
-                if status == "mismatch":
+                status, _, trial_expected, _ = run_one(trial, "ps_f64_shrink", tmp, oracle, context, include_known)
+                if (trial and status == "mismatch" and trial_expected == expected
+                        and output_kind(trial) == original_kind):
                     current[:] = trial
                     continue
             except GPUUnavailable:
@@ -735,9 +737,22 @@ def self_test():
         with tempfile.TemporaryDirectory(prefix="f64-self-test-") as tmp:
             status, _, expected, actual = run_one(lines, "ps_f64_self_test_negative", tmp)
         reduced = shrink(lines, expected)
-        caught = (status == "mismatch" and not equivalent(expected, actual, output_kind(lines)) and len(reduced) == 1
-                  and reduced[0].startswith("v_trunc_f64 "))
-        print(f"{'ok' if caught else 'FAIL'} planted translator mismatch is caught and shrinkable")
+        with tempfile.TemporaryDirectory(prefix="f64-self-test-shrunk-") as tmp:
+            reduced_status, _, reduced_expected, reduced_actual = run_one(
+                reduced, "ps_f64_self_test_negative_shrunk", tmp)
+        caught = (
+            status == "mismatch"
+            and not equivalent(expected, actual, output_kind(lines))
+            and bool(reduced)
+            and len(reduced) < len(lines)
+            and output_kind(reduced) == output_kind(lines)
+            and any(line.startswith("v_trunc_f64 ") for line in reduced)
+            and reduced_status == "mismatch"
+            and reduced_expected == expected
+            and reduced_actual is not None
+            and not equivalent(reduced_expected, reduced_actual, output_kind(reduced))
+        )
+        print(f"{'ok' if caught else 'FAIL'} planted translator mismatch is caught, preserved and shrinkable")
     finally:
         globals()["translate"] = original
     return all(tests) and caught
