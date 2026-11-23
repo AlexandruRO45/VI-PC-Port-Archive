@@ -583,6 +583,59 @@ int main() {
               "HANDLE_CLOSING carries each handle's own context");
     }
 
+    // A request keeps its headers, so the WinHttpAddRequestHeaders modifiers fail where the host's winhttp.dll does
+    // (Windows 10 22H2, no send).
+    {
+        const HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        const HINTERNET connection = connect(session, L"example.invalid", 80, 0);
+        LPCWSTR accept[] = {L"text/plain", L"application/json", nullptr};
+        const HINTERNET request =
+            open_request(connection, L"GET", L"/h", nullptr, L"http://referrer.invalid/", accept, 0);
+        const HINTERNET other = open_request(connection, L"GET", L"/h", nullptr, WINHTTP_NO_REFERER,
+                                             WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        const auto adds = [&](HINTERNET handle, LPCWSTR headers, DWORD modifiers) {
+            return add_headers(handle, headers, static_cast<DWORD>(-1), modifiers) != FALSE;
+        };
+        const auto fails = [&](HINTERNET handle, LPCWSTR headers, DWORD modifiers, DWORD error) {
+            SetLastError(0);
+            return add_headers(handle, headers, static_cast<DWORD>(-1), modifiers) == FALSE && GetLastError() == error;
+        };
+        constexpr DWORD kAdd = WINHTTP_ADDREQ_FLAG_ADD;
+        constexpr DWORD kAddIfNew = WINHTTP_ADDREQ_FLAG_ADD_IF_NEW;
+        constexpr DWORD kReplace = WINHTTP_ADDREQ_FLAG_REPLACE;
+        constexpr DWORD kNotFound = ERROR_WINHTTP_HEADER_NOT_FOUND;
+        constexpr DWORD kExists = ERROR_WINHTTP_HEADER_ALREADY_EXISTS;
+
+        check(fails(request, L"X-Missing: 1", kReplace, kNotFound),
+              "WINHTTP_ADDREQ_FLAG_REPLACE of a missing header fails with ERROR_WINHTTP_HEADER_NOT_FOUND");
+        check(adds(request, L"X-Dup: 1", kAdd) && fails(request, L"x-dup: 2", kAddIfNew, kExists) &&
+                  fails(request, L"X-Dup: 2", kAddIfNew | kAdd, kExists),
+              "ADD_IF_NEW of a header there, in any case, fails with ERROR_WINHTTP_HEADER_ALREADY_EXISTS");
+        check(fails(request, L"Accept: */*", kAddIfNew, kExists) && fails(request, L"Referer: x", kAddIfNew, kExists),
+              "the referrer and accept types given to WinHttpOpenRequest are request headers");
+        check(adds(other, L"X-Dup: 1", kAddIfNew) && fails(other, L"X-Dup: 2", kAddIfNew, kExists) &&
+                  fails(other, L"Accept: x", kReplace, kNotFound),
+              "each request has its own headers");
+        check(adds(request, L"X-Dup: 2", kAdd) && adds(request, L"X-Dup: 3", kReplace) &&
+                  adds(request, L"X-Dup:", kReplace) && adds(request, L"x-dup: ", kReplace) &&
+                  fails(request, L"X-Dup:", kReplace, kNotFound),
+              "REPLACE with an empty value removes one header of that name at a time");
+        check(fails(request, L"X-New:", kAdd | kReplace, kNotFound) && adds(request, L"X-New: 1", kAdd | kReplace) &&
+                  fails(request, L"X-New: 2", kAddIfNew, kExists),
+              "ADD | REPLACE adds a missing header unless its value is empty");
+        check(fails(request, L"X-A1: 1\r\nX-New: 3\r\nX-A2: 1", kAddIfNew, kExists) &&
+                  fails(request, L"X-A1: 2", kAddIfNew, kExists) && adds(request, L"X-A2: 2", kAddIfNew),
+              "a header block stops at its first failing line and keeps the lines before it");
+        check(adds(request, L"X-Co: a", WINHTTP_ADDREQ_FLAG_COALESCE) &&
+                  adds(request, L"X-Co: b", WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON) &&
+                  adds(request, L"X-Co:", kReplace) && fails(request, L"X-Co:", kReplace, kNotFound),
+              "COALESCE merges into the header there instead of adding another");
+        close(other);
+        close(request);
+        close(connection);
+        close(session);
+    }
+
     // WinHttpCrackUrl is parsing only and stays the host's.
     {
         wchar_t host[64] = {}, path[64] = {};

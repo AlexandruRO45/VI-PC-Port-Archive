@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "shims.h"
 
@@ -43,6 +44,8 @@ namespace {
 
 enum class Kind { Session, Connect, Request };
 
+using Header = std::pair<std::wstring, std::wstring>;
+
 struct Handle {
     Kind kind = Kind::Session;
     Handle* parent = nullptr;  // holds one reference on the parent
@@ -50,10 +53,11 @@ struct Handle {
     std::atomic<long> refs{1};  // the handle's own reference, dropped by WinHttpCloseHandle
     std::atomic<bool> closed{false};
 
-    std::mutex mutex;  // guards the three below
+    std::mutex mutex;  // guards the four below
     WINHTTP_STATUS_CALLBACK callback = nullptr;
     DWORD notifications = 0;
     DWORD_PTR context = 0;
+    std::vector<Header> headers;
 
     std::wstring server;  // Connect: for the log
     INTERNET_PORT port = 0;
@@ -115,7 +119,8 @@ void release(Handle* h) {
     }
 }
 
-HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nullptr, INTERNET_PORT port = 0) {
+HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nullptr, INTERNET_PORT port = 0,
+                      std::vector<Header> headers = {}) {
     std::wstring host = server ? server : L"";
     auto* h = new (std::nothrow) Handle;
     if (!h) {
@@ -126,6 +131,7 @@ HINTERNET make_handle(Kind kind, Handle* parent, bool async, LPCWSTR server = nu
     // Publish connection metadata before live() / HANDLE_CREATED: the callback can use or close the handle inline.
     h->server = std::move(host);
     h->port = port;
+    h->headers = std::move(headers);
     h->kind = kind;
     h->parent = parent;
     h->async = async;
@@ -210,14 +216,23 @@ HINTERNET WINAPI open_connection(HINTERNET session, LPCWSTR server, INTERNET_POR
     return make_handle(Kind::Connect, s, s->async, server, port);  // keeps the reference on the session
 }
 
-HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD) {
+HINTERNET WINAPI open_request(HINTERNET connection, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR referrer, LPCWSTR* accept_types,
+                              DWORD) {
     DWORD error = 0;
     Handle* c = acquire(connection, false, true, false, error);
     if (!c) {
         SetLastError(error);
         return nullptr;
     }
-    return make_handle(Kind::Request, c, c->async);  // keeps the reference on the connection
+    std::vector<Header> headers;
+    if (referrer && *referrer) headers.emplace_back(L"Referer", referrer);
+    if (accept_types && *accept_types) {
+        std::wstring accept = *accept_types;
+        for (LPCWSTR* type = accept_types + 1; *type; ++type) accept.append(L", ").append(*type);
+        headers.emplace_back(L"Accept", std::move(accept));
+    }
+    // Keeps the reference on the connection.
+    return make_handle(Kind::Request, c, c->async, nullptr, 0, std::move(headers));
 }
 
 BOOL WINAPI send_request(HINTERNET request, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR context) {
@@ -281,7 +296,7 @@ bool is_header_name_char(wchar_t ch) {
 // a null or empty block (count == 0), embedded NULs, a non-empty line with no ':', an empty header name (": v"),
 // or any non-token character (whitespace, control, separator, or non-ASCII) in a header name fail with
 // ERROR_INVALID_PARAMETER; a non-empty block containing only blank lines ("\r\n") is accepted by the host.
-// A length of (DWORD)-1 means the text is NUL-terminated. Nothing is stored: no request is ever sent.
+// A length of (DWORD)-1 means the text is NUL-terminated.
 bool header_block_valid(LPCWSTR headers, DWORD length) {
     if (!headers) return false;
     const size_t count = length == static_cast<DWORD>(-1) ? wcslen(headers) : static_cast<size_t>(length);
@@ -308,13 +323,58 @@ bool header_block_valid(LPCWSTR headers, DWORD length) {
     return true;
 }
 
-BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length, DWORD) {
+// As the host's winhttp.dll (Windows 10 22H2): REPLACE and COALESCE act on the first header of that name.
+DWORD add_header(std::vector<Header>& headers, const std::wstring& line, DWORD modifiers) {
+    const size_t colon = line.find(L':');
+    std::wstring name = line.substr(0, colon);
+    size_t start = colon + 1;
+    if (start < line.size() && (line[start] == L' ' || line[start] == L'\t')) ++start;
+    std::wstring value = line.substr(start);
+    auto it = headers.begin();
+    while (it != headers.end() && _wcsicmp(it->first.c_str(), name.c_str()) != 0) ++it;
+    const bool found = it != headers.end();
+    if (found && (modifiers & WINHTTP_ADDREQ_FLAG_ADD_IF_NEW)) return ERROR_WINHTTP_HEADER_ALREADY_EXISTS;
+    if (modifiers & WINHTTP_ADDREQ_FLAG_REPLACE) {
+        if (found && value.empty())
+            headers.erase(it);
+        else if (found)
+            it->second = std::move(value);
+        else if ((modifiers & WINHTTP_ADDREQ_FLAG_ADD) && !value.empty())
+            headers.emplace_back(std::move(name), std::move(value));
+        else
+            return ERROR_WINHTTP_HEADER_NOT_FOUND;
+        return ERROR_SUCCESS;
+    }
+    const bool semicolon = (modifiers & WINHTTP_ADDREQ_FLAG_COALESCE_WITH_SEMICOLON) != 0;
+    if (found && (semicolon || (modifiers & WINHTTP_ADDREQ_FLAG_COALESCE_WITH_COMMA))) {
+        it->second.append(semicolon ? L"; " : L", ").append(value);
+        return ERROR_SUCCESS;
+    }
+    headers.emplace_back(std::move(name), std::move(value));
+    return ERROR_SUCCESS;
+}
+
+BOOL WINAPI add_request_headers(HINTERNET request, LPCWSTR headers, DWORD length, DWORD modifiers) {
     DWORD error = 0;
     Handle* r = acquire(request, false, false, true, error);
     if (!r) return fail(error);
+    if (!header_block_valid(headers, length)) {
+        release(r);
+        return fail(ERROR_INVALID_PARAMETER);
+    }
+    const size_t count = length == static_cast<DWORD>(-1) ? wcslen(headers) : static_cast<size_t>(length);
+    {
+        std::lock_guard lock(r->mutex);
+        for (size_t i = 0; i < count && error == ERROR_SUCCESS;) {
+            const size_t start = i;
+            while (i < count && headers[i] != L'\r' && headers[i] != L'\n') ++i;
+            const std::wstring line(headers + start, i - start);
+            while (i < count && (headers[i] == L'\r' || headers[i] == L'\n')) ++i;
+            if (!line.empty()) error = add_header(r->headers, line, modifiers);
+        }
+    }
     release(r);
-    if (!header_block_valid(headers, length)) return fail(ERROR_INVALID_PARAMETER);
-    return TRUE;
+    return error == ERROR_SUCCESS ? TRUE : fail(error);
 }
 
 // Measured the same way: valid on session and request handles (connect handles fail with
