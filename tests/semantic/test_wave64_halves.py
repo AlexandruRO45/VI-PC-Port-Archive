@@ -62,6 +62,12 @@ PRO = ["s_mov_b64 s[10:11], exec"]           # the program is wave64 (a 64-bit o
 LANE_ID = ["v_mbcnt_lo_u32_b32 v10, -1, 0", "v_mbcnt_hi_u32_b32 v10, -1, v10"]   # the lane id, 0..63 in the wave
 EPI_VS = ["v_mov_b32_e32 v5, 0", "exp pos0 v5, v5, v5, v5 done", "exp param0 v6, v7, v5, v5", "s_endpgm"]
 EPI_PS = ["exp mrt0 v6, v7, v5, v5 done vm", "s_endpgm"]
+# a compiler's `break` loop (SHADER-821): s[16:17] collects the lanes that left; v9 is the per-lane trip count
+BREAK_LOOP = ["v_and_b32_e32 v4, 3, v0", "v_add_nc_u32_e32 v10, 1, v4", "v_mov_b32_e32 v9, 0",
+              "s_mov_b64 s[16:17], 0",
+              "v_add_nc_u32_e32 v9, 1, v9", "v_cmp_ge_u32_e32 vcc, v9, v10", "s_or_b64 s[16:17], vcc, s[16:17]",
+              "s_andn2_b64 exec, exec, s[16:17]", "s_cbranch_execnz -5",
+              "s_or_b64 exec, exec, s[16:17]"]
 
 
 def vs(body, prologue=PRO):
@@ -349,6 +355,20 @@ class Classification(unittest.TestCase):
             "v_cmp_eq_u32_e32 vcc, 0, v0", "s_mov_b32 s5, 7", "s_cbranch_vccz 1", "s_add_u32 s5, s5, 1",
             "v_mov_b32_e32 v6, s5"]), "C")
 
+    # -- SHADER-821: a compiler's `break` loop accumulates the lanes that left in an SGPR pair; its bits are lane-local
+    def test_a_break_loop_lane_mask(self):
+        self.tier("ps_a_break", ps(BREAK_LOOP + ["v_mov_b32_e32 v6, v9"]), "A", [], [])
+
+    def test_c_break_loop_mask_read_as_scalar(self):
+        # the same pair read as a scalar (its lane count) differs between the wave and a half
+        self.tier("ps_c_break_bcnt", ps(BREAK_LOOP + ["s_bcnt1_i32_b64 s5, s[16:17]", "v_mov_b32_e32 v6, s5"]), "C")
+
+    def test_c_break_loop_or_with_a_non_compare_mask(self):
+        # OR-ing a copy of EXEC (not a v_cmp result) sets bits of lanes that are off: not lane-local
+        lines = list(BREAK_LOOP)
+        lines[lines.index("s_or_b64 s[16:17], vcc, s[16:17]")] = "s_or_b64 s[16:17], s[10:11], s[16:17]"
+        self.tier("ps_c_break_or_exec", ps(lines + ["v_mov_b32_e32 v6, v9"]), "C")
+
     def test_c_exec_skip_defines_scalar_read_later(self):
         self.tier("ps_c_stale_exec", ps([
             "v_cmp_eq_u32_e32 vcc, 0, v0", "s_and_saveexec_b64 s[12:13], vcc", "s_mov_b32 s5, 7",
@@ -401,6 +421,13 @@ class Execution(unittest.TestCase):
         (tier, reasons, idioms), asm = meta_of(name, lines)
         whole, halves = run_cut(asm, 64, push), run_cut(asm, 32, push)
         return tier, out_param(whole), out_param(halves)
+
+    def test_a_break_loop_lane_mask_runs_the_same(self):
+        # SHADER-821: each lane loops 1..4 times; the halves leave the loop at different trip counts
+        tier, whole, halves = self.run_both("vs_a_break", vs(BREAK_LOOP + ["v_mov_b32_e32 v6, v9"]))
+        self.assertEqual(tier, "A")
+        self.assertEqual(whole, halves)
+        self.assertEqual(len({w for w in whole if w is not None}), 4)
 
     def test_a_vertex_invariant(self):
         tier, whole, halves = self.run_both("vs_a_skip", vs([

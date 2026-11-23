@@ -1367,6 +1367,39 @@ class Analysis:
         return ev
 
     # ---- control dependence on wave-wide votes ----
+    LANE_LOCAL_OPS = ("s_or_b64", "s_andn2_b64", "s_andn2_b64_e32")
+
+    def lane_local_defs(self):
+        """(block, index) -> the SGPR-pair register keys of a def that leaves every inactive lane's bit unchanged:
+        `s_or_b64 D, M, D` (either order) or `s_andn2_b64 D, D, M`, where M is VCC or an SGPR pair that a v_cmp
+        (not v_cmpx) wrote earlier in the same block with no EXEC write after it. A v_cmp writes 0 for the lanes
+        that are off, so OR-ing or AND-NOT-ing M changes only the bits of active lanes (SHADER-821: a compiler's
+        `break` loop accumulates the lanes that left in such a pair)."""
+        out = {}
+        for b, blk in enumerate(self.blocks):
+            zero_off = {}                            # register key tuple -> True while it holds a v_cmp result
+            for i, ins in enumerate(blk):
+                op = base_op(ins["op"])
+                dests, srcs, d2, _ = operands(ins)
+                written = [r for d in dests for r in _regs(d)] + list(d2)
+                if op in ("s_or_b64", "s_andn2_b64") and len(dests) == 1 and len(srcs) == 2:
+                    dk = tuple(_regs(dests[0]))
+                    a0, a1 = tuple(_regs(srcs[0])), tuple(_regs(srcs[1]))
+                    m = (a1 if a0 == dk else a0 if a1 == dk and op == "s_or_b64" else None)
+                    if dk and len(dk) == 2 and all(isinstance(r, tuple) and r[0] == "s" for r in dk) and m \
+                            and zero_off.get(m):
+                        out[(b, i)] = dk
+                if "exec" in written:
+                    zero_off.clear()
+                for k in list(zero_off):
+                    if any(r in k for r in written):
+                        del zero_off[k]
+                if op.startswith("v_cmp") and not op.startswith("v_cmpx"):
+                    key = ("vcc",) if "vcc" in d2 else tuple(_regs(dests[0])) if dests else None
+                    if key:
+                        zero_off[key] = True
+        return out
+
     def stale_uses(self):
         n = self.n
         if not n or not self.voted:
@@ -1437,6 +1470,7 @@ class Analysis:
 
         def sregs(x):
             return [r for r in _regs(x) if r != "exec" and not (isinstance(r, tuple) and r[0] == "v")]
+        lane_local = self.lane_local_defs()
         entry = [None] * n
         entry[0] = {}
         work = [0]
@@ -1480,9 +1514,15 @@ class Analysis:
                         and ins["args"][1].get("k") == "vgpr" and ins["args"][1]["r"] in self.pure_spill_vgprs \
                         and ins["args"][2].get("k") == "imm":
                     read.add(("spill", ins["args"][1]["r"], ins["args"][2]["v"] & 63))
+                # a lane mask accumulated by lane-local defs (SHADER-821) has the same bit for every lane in the
+                # wave and in a half, so a read that only uses it as a lane mask (an EXEC write, or the next
+                # lane-local def) is not stale; a scalar use of the same register still is
+                mask_use = (b, i) in lane_local or any(r == "exec" for d in dests for r in _regs(d))
                 for r in read:
                     rd = st.get(r, frozenset({(-1, 0)}))
                     if len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd):
+                        if mask_use and all(r in lane_local.get(d, ()) for d in rd if d[0] >= 0 and ctrl[d[0]]):
+                            continue
                         stale.add((id(ins), r))
                 if base_op(ins["op"]) in ("s_movrels_b32", "s_movrels_b64") and any(
                         isinstance(r, tuple) and r[0] == "s" and len(rd) > 1 and any(d[0] >= 0 and ctrl[d[0]] for d in rd)
