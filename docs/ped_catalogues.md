@@ -190,3 +190,15 @@ python -I tools/ped_catalogues.py inspect <catalogue.pso|catalogue.0drp> --limit
 python -I tools/ped_catalogues.py resolve <file|dir|archive.rpf> --name <drawable_name> --cull-only --json
 python -I tools/ped_catalogues.py kit example.pso --id 0x00000001 --json
 ```
+
+### Export a textured skinned kit
+
+```powershell
+python -I tools/ped_kit_glb.py example.pso --id 0x00000001 --index parts.sqlite --skeleton decoded/ped/model.json --out outfit.glb
+```
+
+Build the local SQLite index with `viewer_parts_index.py` from [ASSET-375](https://github.com/ItsNotRexed/Leonida/pull/4763), supplying the model and TTPF texture manifests. Each selected drawable needs a ready indexed GLB from a decoded skinned component. Point the model manifest's `Glb` field at that geometry file. Its adjacent `model.json` must identify the same drawable and geometry and refer to its exported graphics buffers. The skeleton input is a decoded master skeleton in the format used by `skinned_glb.py`. Paths in the index refer to the machine on which it was built.
+
+The exporter matches a selected drawable to the indexed 64-bit hash of its original-case name stem. It looks up each selected albedo and normal by its full TTPF asset key, decodes the DDS to PNG and embeds it in the corresponding component material. It uses the first UV set and preserves the skin, weights and bind matrices. The fourth catalogue hash has no established glTF material slot.
+
+Each component-wide texture override needs an unambiguous material slot. The exporter honors an explicit source material's alpha mode and mask cutoff. Conflicting selections on the same drawable, missing inputs, ambiguous matches and catalogue warnings are reported before the output is written. An entirely empty member contributes no geometry. A component with no selected textures uses the default clay material.
