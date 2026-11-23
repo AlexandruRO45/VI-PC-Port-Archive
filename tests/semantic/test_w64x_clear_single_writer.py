@@ -479,11 +479,13 @@ def hybrid_program(size):
 
 
 def tail_program(size):
-    """Several waves: the first wave's loop (4 times) is a mini scheduler, which the other waves sit out, and
-    everything from there on, with an s_endpgm on either side of the branch, is the tail scheduler: the first wave
-    stores and ends in its first round, the other waves go around their loop twice after that."""
+    """Several waves: a loop every wave runs 3 times is a mini scheduler, and everything after the exchange that
+    follows it, a branch with a loop and an s_endpgm on either side, is the tail scheduler: the first wave goes
+    around its loop 4 times, the other waves around theirs twice. (The planner joins the two sides of such a branch
+    into one tail scheduler, so the mini scheduler in front of it has to be a loop of its own.)"""
     return setup(size) + [
         "v_readfirstlane_b32 s19, v0",
+        "s_mov_b32 s23, 3"] + loop("c", 5, "s23") + [
         "v_readlane_b32 s22, v4, 3",
         "v_add_nc_u32_e32 v4, s22, v4",
         "s_cmp_lt_u32 s19, 64",
@@ -557,6 +559,7 @@ def waves_expect(kind, size):
                     value[t] += got
             counts += min(8, len(wave)) + min(2, len(wave))
         elif kind == "tail":
+            counts += run_loop(value, wave, 5, 3)
             got = lane(3)
             for t in wave:
                 value[t] += got
@@ -618,8 +621,8 @@ class EveryRoundStartHasOneWriterPerWord(unittest.TestCase):
         for size in WAVES_SIZES:
             with self.subTest(size=size):
                 gen, spv, memory, barriers = run_workgroup("tail", tail_program(size), size)
-                self.assertEqual(steps(gen), ["inline_block", "mini_scheduler", "tail_scheduler"])
-                self.assertEqual([step[-1] for step in gen.emulate_plan["steps"][1:]], [False, False])
+                self.assertEqual(steps(gen), ["inline_block", "mini_scheduler", "inline_block", "tail_scheduler"])
+                self.assertEqual([step[-1] for step in gen.emulate_plan["steps"][1::2]], [False, False])
                 self.assertIn("%x_round = OpLabel", spv)
                 self.assertGreater(barriers, 20)
                 self.assertEqual(memory, waves_expect("tail", size))
