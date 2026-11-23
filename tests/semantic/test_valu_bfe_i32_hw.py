@@ -17,7 +17,7 @@ import math
 import os
 import struct
 import sys
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -50,11 +50,12 @@ def ref_bfe_i32(base: int, offset: int, width: int) -> int:
     return field & MASK32
 
 
-def run_ps_bfe_i32(instructions: Sequence[str]) -> list[int]:
+def run_ps_bfe_i32(instructions: Sequence[str], name: str = "ps_bfe_i32_test") -> list[int]:
     """Translate and execute a synthetic pixel shader, returning mrt0 output words."""
     lines = list(instructions) + ["exp mrt0 v3, v3, v3, v3 done vm", "s_endpgm"]
-    spvasm = support.translate_lines("ps_bfe_i32_test", lines)
+    spvasm = support.translate_lines(name, lines)
     return support.mrt0_words(spvasm)
+
 
 class TestReferenceOracleAndTranslator(unittest.TestCase):
     def test_basic_signed_bitfield_extract(self):
@@ -74,7 +75,7 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
             "v_mov_b32 v1, 4",
             "v_mov_b32 v2, 8",
             "v_bfe_i32 v3, v0, v1, v2",
-        ])
+        ], name="ps_bfe_basic")
         self.assertEqual(words[0], 0x67)
 
     def test_translator_sign_extended_negative(self):
@@ -83,8 +84,93 @@ class TestReferenceOracleAndTranslator(unittest.TestCase):
             "v_mov_b32 v1, 2",
             "v_mov_b32 v2, 4",
             "v_bfe_i32 v3, v0, v1, v2",
-        ])
+        ], name="ps_bfe_sign_ext_neg")
         self.assertEqual(words[0], 0xFFFFFFFC)
+
+    def test_translator_sign_bit_31_single_bit(self):
+        """Extract sign bit from bit 31, sign-extending 1-bit negative to 0xFFFFFFFF."""
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_bit31_single")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
+    def test_translator_sign_bit_propagation_various_widths(self):
+        """Test sign-bit propagation across 4, 8, 16, 17, and 31-bit fields."""
+        cases = [
+            (0xFFFFFFF8, 0, 4, 0xFFFFFFF8),   # 4-bit field, bit 3 is 1 -> -8
+            (0xFFFFFF80, 0, 8, 0xFFFFFF80),   # 8-bit field, bit 7 is 1 -> -128
+            (0xFFFF8000, 0, 16, 0xFFFF8000), # 16-bit field, bit 15 is 1 -> -32768
+            (0x00010000, 0, 17, 0xFFFF0000), # 17-bit field, bit 16 is 1 -> -65536
+            (0x7FFFFFFF, 0, 31, 0xFFFFFFFF), # 31-bit field, bit 30 is 1 -> -1
+        ]
+        for base, off, wid, expected in cases:
+            with self.subTest(base=hex(base), off=off, wid=wid):
+                words = run_ps_bfe_i32([
+                    f"v_mov_b32 v0, {base:#x}",
+                    f"v_mov_b32 v1, {off}",
+                    f"v_mov_b32 v2, {wid}",
+                    "v_bfe_i32 v3, v0, v1, v2",
+                ], name=f"ps_bfe_prop_{off}_{wid}")
+                self.assertEqual(words[0], expected)
+
+    def test_translator_width_zero_yields_zero(self):
+        """Verify that zero width yields 0 even for negative values."""
+        words1 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xFFFFFFFF",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_w0_all1")
+        self.assertEqual(words1[0], 0)
+
+        words2 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 0",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_w0_b31")
+        self.assertEqual(words2[0], 0)
+
+    def test_translator_register_supplied_width_mask_31(self):
+        """Verify register-supplied width with 5-bit masking (49 & 31 = 17) and sign extension."""
+        # Tyler Straub regression case: width 49 in VGPR masks to 17 bits.
+        # Bit 16 of 0x00010000 is 1, so 17-bit extract sign-extends to 0xFFFF0000.
+        words_49 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x00010000",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 49",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_wid49")
+        self.assertEqual(words_49[0], 0xFFFF0000)
+
+        # Width 33 in VGPR masks to 1 bit (33 & 31 = 1). Bit 0 is 0 -> 0.
+        words_33 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x00010000",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 33",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_wid33")
+        self.assertEqual(words_33[0], 0)
+
+    def test_translator_sgpr_and_imm_operands(self):
+        """Verify execution with SGPR and immediate operands for base, offset, and width."""
+        words_sgpr = run_ps_bfe_i32([
+            "s_mov_b32 s0, 0xFFFFFFF0",
+            "s_mov_b32 s1, 2",
+            "v_mov_b32 v0, s0",
+            "v_bfe_i32 v3, v0, s1, 4",
+        ], name="ps_bfe_sgpr_operands")
+        self.assertEqual(words_sgpr[0], 0xFFFFFFFC)
+
+        words_lit = run_ps_bfe_i32([
+            "s_mov_b32 s2, 4",
+            "v_mov_b32 v0, 0xFFFFFFF0",
+            "v_bfe_i32 v3, v0, 2, s2",
+        ], name="ps_bfe_mixed_imm")
+        self.assertEqual(words_lit[0], 0xFFFFFFFC)
 
 
 class RegType(Enum):
@@ -246,8 +332,31 @@ class TestScalarInterpreter(unittest.TestCase):
             "v_bfe_i32 v3, v0, v1, v2",
             "v_bfe_i32 v3, v3, v4, v5",
         ]
-        words = run_ps_bfe_i32(lines)
+        words = run_ps_bfe_i32(lines, name="ps_bfe_chain")
         self.assertEqual(words[0], 0x7)
+
+    def test_scalar_interpreter_signed_negative_chain(self):
+        """Cross-check scalar interpreter with translator execution on negative values."""
+        interp = ScalarInterpreter()
+        interp.state.vgprs[0] = 0xFFFFFFF0
+        interp.state.vgprs[1] = 2
+        interp.state.vgprs[2] = 4
+        insn = VBfeI32Instruction(
+            dst=Operand.vgpr(3),
+            src0=Operand.vgpr(0),
+            src1=Operand.vgpr(1),
+            src2=Operand.vgpr(2),
+        )
+        res = interp.step(insn)
+        self.assertEqual(res, 0xFFFFFFFC)
+
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xFFFFFFF0",
+            "v_mov_b32 v1, 2",
+            "v_mov_b32 v2, 4",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_interp_neg")
+        self.assertEqual(words[0], res)
 
 
 class WaveSize(Enum):
@@ -350,7 +459,7 @@ class TestRegisterAliasing(unittest.TestCase):
             "v_mov_b32 v2, 8",
             "v_bfe_i32 v0, v0, v1, v2",
             "v_mov_b32 v3, v0",
-        ])
+        ], name="ps_alias_dst_s0")
         self.assertEqual(words[0], 0x67)
 
     def test_alias_dst_equals_src1(self):
@@ -361,7 +470,7 @@ class TestRegisterAliasing(unittest.TestCase):
             "v_mov_b32 v2, 8",
             "v_bfe_i32 v1, v0, v1, v2",
             "v_mov_b32 v3, v1",
-        ])
+        ], name="ps_alias_dst_s1")
         self.assertEqual(words[0], 0x67)
 
     def test_alias_dst_equals_src2(self):
@@ -372,19 +481,60 @@ class TestRegisterAliasing(unittest.TestCase):
             "v_mov_b32 v2, 8",
             "v_bfe_i32 v2, v0, v1, v2",
             "v_mov_b32 v3, v2",
-        ])
+        ], name="ps_alias_dst_s2")
         self.assertEqual(words[0], 0x67)
 
+    def test_alias_dst_equals_src0_signed_negative(self):
+        """v0 = v_bfe_i32 v0, v1, v2 with sign extension into destination."""
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xFFFFFFF0",
+            "v_mov_b32 v1, 2",
+            "v_mov_b32 v2, 4",
+            "v_bfe_i32 v0, v0, v1, v2",
+            "v_mov_b32 v3, v0",
+        ], name="ps_alias_dst_s0_neg")
+        self.assertEqual(words[0], 0xFFFFFFFC)
+
+    def test_alias_dst_equals_src1_signed_negative(self):
+        """v1 = v_bfe_i32 v0, v1, v2 with sign extension into offset register."""
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v1, v0, v1, v2",
+            "v_mov_b32 v3, v1",
+        ], name="ps_alias_dst_s1_neg")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
+    def test_alias_dst_equals_src2_signed_negative(self):
+        """v2 = v_bfe_i32 v0, v1, v2 with sign extension into width register."""
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x7FFFFFFF",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 31",
+            "v_bfe_i32 v2, v0, v1, v2",
+            "v_mov_b32 v3, v2",
+        ], name="ps_alias_dst_s2_neg")
+        self.assertEqual(words[0], 0xFFFFFFFF)
+
     def test_alias_quadruple_collision(self):
-        # v0 = v_bfe_i32 v0, v0, v0
-        # If v0 = 0x00000005, offset=5&31=5, width=5&31=5:
-        # 5 >> 5 is 0 -> result 0
         words = run_ps_bfe_i32([
             "v_mov_b32 v0, 5",
             "v_bfe_i32 v0, v0, v0, v0",
             "v_mov_b32 v3, v0",
-        ])
+        ], name="ps_alias_quad_5")
         self.assertEqual(words[0], ref_bfe_i32(5, 5, 5))
+
+    def test_alias_self_collision_all_negative(self):
+        """v0 = v_bfe_i32 v0, v0, v0 where v0 = 0xFFFFFFFF (-1)."""
+        # offset = 31 & 31 = 31, width = 31 & 31 = 31.
+        # (-1 >> 31) & ((1<<31)-1) = 1. Sign-extended from 31 bits -> 0xFFFFFFFF.
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xFFFFFFFF",
+            "v_bfe_i32 v0, v0, v0, v0",
+            "v_mov_b32 v3, v0",
+        ], name="ps_alias_self_neg")
+        self.assertEqual(words[0], 0xFFFFFFFF)
 
 
 @dataclass
@@ -403,7 +553,6 @@ def classify_integer_status(val: int) -> IntegerStatusFlags:
 
 class TestConditionCodesAndStatus(unittest.TestCase):
     def test_vcc_and_scc_preservation(self):
-        # v_bfe_i32 is a VALU instruction and does not clobber SCC or VCC
         interp = ScalarInterpreter()
         interp.state.scc = 1
         interp.state.vcc = 0x123456789ABCDEF0
@@ -423,17 +572,14 @@ class TestConditionCodesAndStatus(unittest.TestCase):
         self.assertEqual(interp.state.vcc, 0x123456789ABCDEF0)
 
     def test_status_flag_classification(self):
-        # Zero extraction
         s_zero = classify_integer_status(ref_bfe_i32(0xFFFFFFFF, 0, 0))
         self.assertTrue(s_zero.zero)
         self.assertFalse(s_zero.negative)
 
-        # Negative sign-extended result
         s_neg = classify_integer_status(ref_bfe_i32(0x80000000, 31, 1))
         self.assertFalse(s_neg.zero)
         self.assertTrue(s_neg.negative)
 
-        # Positive non-zero result
         s_pos = classify_integer_status(ref_bfe_i32(0x12345678, 4, 8))
         self.assertFalse(s_pos.zero)
         self.assertFalse(s_pos.negative)
@@ -451,7 +597,7 @@ class TestBoundaryExtremes(unittest.TestCase):
             "v_mov_b32 v1, 31",
             "v_mov_b32 v2, 1",
             "v_bfe_i32 v3, v0, v1, v2",
-        ])
+        ], name="ps_bfe_float_sign")
         self.assertEqual(words[0], 0xFFFFFFFF)
 
         # Extract exponent of -1.0 (bits 23..30, width=8):
@@ -464,27 +610,94 @@ class TestBoundaryExtremes(unittest.TestCase):
             "v_mov_b32 v1, 23",
             "v_mov_b32 v2, 8",
             "v_bfe_i32 v3, v0, v1, v2",
-        ])
+        ], name="ps_bfe_float_exp")
         self.assertEqual(words_exp[0], 127)
 
     def test_nan_and_inf_bit_patterns(self):
         # +inf (0x7F800000): sign bit is 0
         self.assertEqual(ref_bfe_i32(0x7F800000, 31, 1), 0)
+        words_pinf = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x7F800000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_pinf")
+        self.assertEqual(words_pinf[0], 0)
+
         # -inf (0xFF800000): sign bit is 1 -> 0xFFFFFFFF
         self.assertEqual(ref_bfe_i32(0xFF800000, 31, 1), 0xFFFFFFFF)
+        words_ninf = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xFF800000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_ninf")
+        self.assertEqual(words_ninf[0], 0xFFFFFFFF)
+
         # qNaN (0x7FC00000): sign bit is 0
         self.assertEqual(ref_bfe_i32(0x7FC00000, 31, 1), 0)
+        words_qnan = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x7FC00000",
+            "v_mov_b32 v1, 31",
+            "v_mov_b32 v2, 1",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_qnan")
+        self.assertEqual(words_qnan[0], 0)
 
     def test_integer_overflow_extremes(self):
         # 0x7FFFFFFF: width=31 field bits 0..30 are all 1s.
         # Bit 30 is the sign bit of the 31-bit field: it is 1, so the result is sign-extended to -1.
         self.assertEqual(ref_bfe_i32(0x7FFFFFFF, 0, 31), 0xFFFFFFFF)
+        words_7fff = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x7FFFFFFF",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 31",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_7fffffff_w31")
+        self.assertEqual(words_7fff[0], 0xFFFFFFFF)
+
         # 0x3FFFFFFF: bits 0..30, sign bit (bit 30) = 0 -> stays positive
         self.assertEqual(ref_bfe_i32(0x3FFFFFFF, 0, 31), 0x3FFFFFFF)
+        words_3fff = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x3FFFFFFF",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 31",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_3fffffff_w31")
+        self.assertEqual(words_3fff[0], 0x3FFFFFFF)
+
         # 0x80000000 (INT_MIN): bit 31 is 1, lower 31 bits are all 0
         self.assertEqual(ref_bfe_i32(0x80000000, 0, 31), 0)
+        words_8000 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 31",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_80000000_w31")
+        self.assertEqual(words_8000[0], 0)
+
         # width=32 is masked mod 32 to give 0, so result is 0
         self.assertEqual(ref_bfe_i32(0x80000000, 0, 32), 0)
+        words_w32 = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0x80000000",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 32",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_80000000_w32")
+        self.assertEqual(words_w32[0], 0)
+
+    def test_translator_width_past_31_cut(self):
+        """When offset + width > 32, width cuts to 32 - offset."""
+        # offset = 30, width = 16 -> width cut to 32 - 30 = 2 bits.
+        # base = 0xC0000000 (bits 30..31 are 11b = 3).
+        # Bit 1 of 2-bit field is 1 -> sign-extended to 0xFFFFFFFF (-1).
+        words = run_ps_bfe_i32([
+            "v_mov_b32 v0, 0xC0000000",
+            "v_mov_b32 v1, 30",
+            "v_mov_b32 v2, 16",
+            "v_bfe_i32 v3, v0, v1, v2",
+        ], name="ps_bfe_cut_past31")
+        self.assertEqual(words[0], 0xFFFFFFFF)
 
 
 class TestNegativeControlsAndMutation(unittest.TestCase):
@@ -504,10 +717,6 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
             Operand.sgpr(106)
 
     def test_mutation_unsigned_vs_signed_bfe(self):
-        # Unsigned bitfield extract does not sign-extend:
-        # For base=0x80000000, offset=31, width=1:
-        # Signed BFE returns 0xFFFFFFFF (-1)
-        # Unsigned BFE returns 0x1
         val = 0x80000000
         signed_result = ref_bfe_i32(val, 31, 1)
         unsigned_result = (val >> 31) & 1
@@ -516,9 +725,6 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         self.assertEqual(unsigned_result, 1)
 
     def test_mutation_dropped_sign_extension(self):
-        # If sign extension step (field -= 1 << width) is omitted:
-        # base=0xFFFFFFF0, offset=2, width=4 -> raw field is 0xC (12)
-        # With sign extension it is -4 (0xFFFFFFFC)
         raw_field = (0xFFFFFFF0 >> 2) & 0xF
         proper_result = ref_bfe_i32(0xFFFFFFF0, 2, 4)
         self.assertNotEqual(raw_field, proper_result)
@@ -526,15 +732,12 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         self.assertEqual(proper_result, 0xFFFFFFFC)
 
     def test_mutation_offset_and_width_mask(self):
-        # Offset and width must be masked mod 32:
-        # offset=36 & 31 = 4; width=40 & 31 = 8
         res_masked = ref_bfe_i32(0x12345678, 36, 40)
         res_direct = ref_bfe_i32(0x12345678, 4, 8)
         self.assertEqual(res_masked, res_direct)
         self.assertEqual(res_masked, 0x67)
 
     def test_rejection_invalid_operands_in_translator(self):
-        # Too few arguments to v_bfe_i32 causes a translator error
         bad_lines = [
             "v_bfe_i32 v3, v0, 1",
             "exp mrt0 v3, v3, v3, v3 done vm",
@@ -542,6 +745,39 @@ class TestNegativeControlsAndMutation(unittest.TestCase):
         ]
         with self.assertRaises(Exception):
             support.translate_lines("ps_bfe_bad_args", bad_lines)
+
+    def test_spirv_emission_opbitfieldsextract(self):
+        """Verify that support.translate_lines emits OpBitFieldSExtract and NOT OpBitFieldUExtract."""
+        lines = [
+            "v_mov_b32 v0, 0x12345678",
+            "v_mov_b32 v1, 4",
+            "v_mov_b32 v2, 8",
+            "v_bfe_i32 v3, v0, v1, v2",
+            "exp mrt0 v3, v3, v3, v3 done vm",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bfe_spirv_emit", lines)
+        self.assertIn("OpBitFieldSExtract", spv)
+        self.assertNotIn("OpBitFieldUExtract", spv)
+
+    def test_mutation_detection_signed_vs_unsigned_hardware_execution(self):
+        """Verify that hardware execution distinguishes OpBitFieldSExtract from unsigned extract."""
+        test_vectors = [
+            (0x80000000, 31, 1, 0xFFFFFFFF, 1),
+            (0xFFFFFFF0, 2, 4, 0xFFFFFFFC, 12),
+            (0x00010000, 0, 17, 0xFFFF0000, 0x00010000),
+            (0x7FFFFFFF, 0, 31, 0xFFFFFFFF, 0x7FFFFFFF),
+        ]
+        for base, off, wid, signed_exp, unsigned_val in test_vectors:
+            with self.subTest(base=hex(base), off=off, wid=wid):
+                words = run_ps_bfe_i32([
+                    f"v_mov_b32 v0, {base:#x}",
+                    f"v_mov_b32 v1, {off}",
+                    f"v_mov_b32 v2, {wid}",
+                    "v_bfe_i32 v3, v0, v1, v2",
+                ], name=f"ps_bfe_mut_check_{off}_{wid}")
+                self.assertEqual(words[0], signed_exp)
+                self.assertNotEqual(words[0], unsigned_val)
 
 
 if __name__ == "__main__":
