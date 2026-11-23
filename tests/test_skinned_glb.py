@@ -312,6 +312,21 @@ class SkinnedGlbTest(unittest.TestCase):
         # The second palette entry is the added helper joint (index 3).
         self.assertEqual(struct.unpack_from("<4H", j0, 0), (1, 3, 0, 0))
 
+    def test_component_own_bone_without_bind_matrix_uses_parent_bind(self):
+        own = [{"name": "GM_TEST_L_UpperArm01_O", "parent_name": "SKEL_L_UpperArm"}]
+        skeleton = _skeleton_dir(self.root)
+        component = _component(self.root, own_skeleton=own)
+        payload, stats = skinned_glb.build_skinned_glb(skeleton, [component])
+        self.assertEqual(stats["component_joints"], 1)
+        gltf, _binary = skinned_glb.read_glb(self._write(payload))
+        skin = gltf["skins"][0]
+        helper = skin["joints"][3]
+        node = gltf["nodes"][helper]
+        self.assertEqual(node["name"], "GM_TEST_L_UpperArm01_O")
+        # No bind matrix on the record: the helper takes its parent's bind, so its local matrix is identity.
+        self.assertNotIn("matrix", node)
+        self.assertIn(helper, gltf["nodes"][skin["joints"][2]].get("children", []))
+
     def test_inverse_bind_round_trip(self):
         gltf, binary, _stats = self._build()
         skin = gltf["skins"][0]
