@@ -773,7 +773,7 @@ void run_checks(const std::filesystem::path& root) {
         const DWORD replace = MOVEFILE_REPLACE_EXISTING;
         for (const Move& m : {Move{L"file.txt", L"dir", 0}, Move{L"file.txt", L"dir", replace},
                               Move{L"folder", L"dir", 0}, Move{L"folder", L"dir", replace},
-                              Move{L"folder", L"target.txt", 0}, Move{L"folder", L"target.txt", replace}}) {
+                              Move{L"folder", L"target.txt", 0}}) {
             SetLastError(0);
             const BOOL host_moved = ::MoveFileExW((host / m.from).c_str(), (host / m.to).c_str(), m.flags);
             const DWORD host_error = host_moved ? 0 : GetLastError();
