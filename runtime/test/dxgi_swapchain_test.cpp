@@ -1326,6 +1326,12 @@ int main() {
             out6->DuplicateOutput(dev, &dup) != DXGI_ERROR_UNSUPPORTED || dup != nullptr)
             return fail("Output::DuplicateOutput checks failed");
 
+        // GetDisplaySurfaceData and GetDisplaySurfaceData1 parameter validation.
+        if (out0->GetDisplaySurfaceData(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("Output::GetDisplaySurfaceData(nullptr) should return DXGI_ERROR_INVALID_CALL");
+        if (out6->GetDisplaySurfaceData1(nullptr) != DXGI_ERROR_INVALID_CALL)
+            return fail("Output::GetDisplaySurfaceData1(nullptr) should return DXGI_ERROR_INVALID_CALL");
+
         // Compare directly against Windows host dxgi.dll when a host adapter has attached outputs.
         if (const HMODULE host_dxgi = LoadLibraryW(L"dxgi.dll")) {
             using CreateFactory1Fn = HRESULT(WINAPI*)(REFIID, void**);

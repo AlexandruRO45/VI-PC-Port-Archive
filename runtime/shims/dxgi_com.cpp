@@ -945,8 +945,12 @@ public:
     }
     HRESULT STDMETHODCALLTYPE SetGammaControl(const DXGI_GAMMA_CONTROL*) override { return DXGI_ERROR_INVALID_CALL; }
     HRESULT STDMETHODCALLTYPE GetGammaControl(DXGI_GAMMA_CONTROL*) override { return DXGI_ERROR_INVALID_CALL; }
-    HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface*) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface* surface) override {
+        return surface ? S_OK : DXGI_ERROR_INVALID_CALL;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface* destination) override {
+        return destination ? S_OK : DXGI_ERROR_INVALID_CALL;
+    }
     HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* stats) override {
         if (!stats) return DXGI_ERROR_INVALID_CALL;
         std::memset(stats, 0, sizeof(*stats));
@@ -968,7 +972,9 @@ public:
         *closest = SUCCEEDED(hr) ? to_mode_desc1(best) : DXGI_MODE_DESC1{};
         return hr;
     }
-    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData1(IDXGIResource*) override { return DXGI_ERROR_INVALID_CALL; }
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData1(IDXGIResource* destination) override {
+        return destination ? S_OK : DXGI_ERROR_INVALID_CALL;
+    }
     HRESULT STDMETHODCALLTYPE DuplicateOutput(IUnknown* device, IDXGIOutputDuplication** dup) override {
         if (dup) *dup = nullptr;
         if (!device || !dup) return E_INVALIDARG;
