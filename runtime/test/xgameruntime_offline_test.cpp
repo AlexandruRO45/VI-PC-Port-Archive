@@ -117,6 +117,32 @@ int main() {
     check(at<ErrorDialog>(ui, 14)(ui, &async, static_cast<HRESULT>(0x80830003), "save") == S_OK && finished(&async) &&
               at<AsyncOnly>(ui, 15)(ui, &async) == S_OK,
           "an error dialog is logged and dismissed");
+
+    // Text entry (17-19): answered with the default text, as if OK were pressed without typing.
+    using TextAsync = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, const char*, const char*, const char*, uint32_t, uint32_t);
+    using TextSize = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t*);
+    using TextResult = HRESULT(STDMETHODCALLTYPE*)(void*, XAsyncBlock*, uint32_t, char*, uint32_t*);
+    char text[32] = {};
+    uint32_t text_size = 0, text_used = 0;
+    async = XAsyncBlock{};
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", "Save name", "Save 1", 0, 16) == S_OK && finished(&async) &&
+              at<TextSize>(ui, 18)(ui, &async, &text_size) == S_OK && text_size == 7 &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK &&
+              std::strcmp(text, "Save 1") == 0 && text_used == 7,
+          "text entry is answered with the default text; ResultSize and resultTextBufferUsed count the terminator");
+    async = XAsyncBlock{};
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "Save 1", 0, 4) == S_OK && finished(&async) &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK && std::strcmp(text, "Save") == 0,
+          "a default text longer than maxTextLength is cut to it");
+    async = XAsyncBlock{};
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, nullptr, 0, 16) == S_OK && finished(&async) &&
+              at<TextSize>(ui, 18)(ui, &async, &text_size) == S_OK && text_size == 1 &&
+              at<TextResult>(ui, 19)(ui, &async, sizeof(text), text, &text_used) == S_OK && text[0] == 0 && text_used == 1,
+          "no default text: an empty answer");
+    async = XAsyncBlock{};   // its own call: xtaskqueue releases a call whose result buffer is too small
+    check(at<TextAsync>(ui, 17)(ui, &async, "Name", nullptr, "Save 1", 0, 16) == S_OK && finished(&async) &&
+              FAILED(at<TextResult>(ui, 19)(ui, &async, 3, text, &text_used)) && text_used == 0,
+          "a buffer shorter than ResultSize fails");
     check(at<NoArgs>(ui, 7)(ui) == E_FAIL, "a profile card is not available offline");
     check(at<NoArgs>(ui, 20)(ui) == E_NOTIMPL, "an unknown slot answers E_NOTIMPL");
 
