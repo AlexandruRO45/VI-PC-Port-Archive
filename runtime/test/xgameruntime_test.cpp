@@ -930,7 +930,11 @@ void check_run_time_load() {
         id = 0;
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
               "nested initialize preserves inline config");
-        check(uninit_api() == S_OK && uninit_api() == S_OK, "uninitialize both references");
+        const HRESULT first_uninit = uninit_api();
+        id = 0;
+        check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == S_OK && id == 0xCAFEBABEu,
+              "inline config remains after first uninitialize");
+        check(first_uninit == S_OK && uninit_api() == S_OK, "uninitialize both references");
         id = 0;
         check(game && reinterpret_cast<TitleId>(slot(game, 3))(game, &id) == E_FAIL,
               "inline config is cleared after uninitialize");
