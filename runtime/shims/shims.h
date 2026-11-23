@@ -67,6 +67,9 @@ using ModuleFind = bool (*)(void* ctx, const ModuleQuery& query, uint64_t& base,
 using ModuleProc = void* (*)(void* ctx, uint64_t base, const std::string& name);
 
 void add_module_lookup(void* ctx, ModuleLookup fn, ModuleFind find = nullptr, ModuleProc proc = nullptr);
+// "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
+// address in hex. Used by the startup trace (startup_trace.h).
+std::string module_offset(uint64_t address);
 void remove_module_lookup(void* ctx);
 
 // The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.
@@ -78,6 +81,22 @@ bool find_mapped_module(const ModuleQuery& query, uint64_t& base, std::wstring* 
 // GetProcAddress on a mapped module, `base` 0 being the main executable: true when a live Loader maps it, with
 // `address` its answer (null if it doesn't export `name`); false when none does and Windows is to answer.
 bool mapped_proc_address(uint64_t base, const std::string& name, void*& address);
+
+// Run-time LoadLibrary / GetModuleHandle / GetProcAddress / FreeLibrary for bundled package DLLs managed by a live
+// Loader. Registered in Loader::Loader and removed in Loader::~Loader.
+struct BundledModuleOps {
+    void* (*find_loaded)(void* ctx, const std::string& dll_lower);
+    void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
+    void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
+    bool (*owns_handle)(void* ctx, void* module);
+};
+void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
+void remove_bundled_loader(void* ctx);
+
+void* find_loaded_bundled_module(const std::string& dll_lower);
+void* load_bundled_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
+bool owns_bundled_module_handle(void* module);
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

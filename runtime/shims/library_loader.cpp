@@ -17,16 +17,18 @@
 // Loaders (rt::shims::find_mapped_module, mapped_image_base, mapped_proc_address), with Windows' name rules and return
 // conventions; NULL is the EXE `gta6rt --run` runs (Loader::set_main_module), and without one it stays Windows' answer.
 //
-// Every other module goes to the host unchanged. Only images mapped by the loader see these: they are bound through the
-// registry, the runtime's own code calls the host directly.
+// Every other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
+// loader see these: they are bound through the registry, the runtime's own code calls the host directly.
 #include <windows.h>
 
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "shims.h"
 
@@ -74,6 +76,25 @@ std::string module_name(std::string path) {
     if (!path.empty() && path.back() == '.') path.pop_back();
     else if (path.find('.') == std::string::npos) path += ".dll";
     return path;
+}
+
+std::string host_module_name(HMODULE module) {
+    std::lock_guard lock(loader_mutex());
+    static auto* names = new std::map<HMODULE, std::string>;
+    if (auto it = names->find(module); it != names->end()) return it->second;
+
+    std::vector<wchar_t> path(MAX_PATH);
+    for (;;) {
+        const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+        if (!length) return {};
+        if (length < path.size()) {
+            const std::string name = module_name(narrow(path.data()));
+            names->emplace(module, name);
+            return name;
+        }
+        if (path.size() == 32768) return {};
+        path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
+    }
 }
 
 }  // namespace
@@ -197,29 +218,62 @@ bool module_handle_ex_arguments(DWORD flags, const void* name, HMODULE* out) {
     return true;
 }
 
+constexpr DWORD kDataFileLoadFlags =
+    LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+
+HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled) {
+    handled = false;
+    if (HMODULE h = owned_handle(path)) {
+        handled = true;
+        return h;
+    }
+    const std::string dll = module_name(path);
+    if (!dll.empty()) {
+        if (void* h = load_bundled_module(dll, static_cast<uint32_t>(flags), handled); handled)
+            return reinterpret_cast<HMODULE>(h);
+    }
+    return nullptr;
+}
+
 HMODULE WINAPI load_library_a(LPCSTR name) {
-    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    if (name) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(name, 0, handled);
+        if (handled) return h;
+    }
     return LoadLibraryA(name);
 }
 
 HMODULE WINAPI load_library_w(LPCWSTR name) {
-    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    if (name) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(narrow(name), 0, handled);
+        if (handled) return h;
+    }
     return LoadLibraryW(name);
 }
 
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
-    if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
+    if (name && (flags & kDataFileLoadFlags) == 0) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(name, flags, handled);
+        if (handled) return h;
+    }
     return LoadLibraryExA(name, file, flags);
 }
 
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
-    if (HMODULE h = name ? owned_handle(narrow(name)) : nullptr) return h;
+    if (name && (flags & kDataFileLoadFlags) == 0) {
+        bool handled = false;
+        HMODULE h = load_shim_or_bundled(narrow(name), flags, handled);
+        if (handled) return h;
+    }
     return LoadLibraryExW(name, file, flags);
 }
 
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), then for a
-// mapped image, and NULL is the main executable when a Loader has one. A hit leaves the last error alone, as Windows
-// does.
+// mapped image, bundled package modules a run-time LoadLibrary mapped included, and NULL is the main executable when
+// a Loader has one. A hit leaves the last error alone, as Windows does.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
     if (HMODULE h = name ? owned_handle(name) : nullptr) return h;
     if (HMODULE h = mapped_module_a(name)) return h;
@@ -293,39 +347,76 @@ std::string proc_key(LPCSTR name) {
 // doesn't export fails as in Windows: a name with ERROR_PROC_NOT_FOUND, an ordinal with ERROR_INVALID_ORDINAL, a null
 // name with ERROR_INVALID_PARAMETER. A hit leaves the last error alone.
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
-    const Pseudo* p = pseudo(module);
-    if (!p) {
-        void* fn = nullptr;
-        if (!mapped_proc_address(reinterpret_cast<uint64_t>(module), name ? proc_key(name) : std::string(), fn))
-            return GetProcAddress(module, name);
-        if (!fn)
-            SetLastError(!name                  ? ERROR_INVALID_PARAMETER
-                         : IS_INTRESOURCE(name) ? ERROR_INVALID_ORDINAL
-                                                : ERROR_PROC_NOT_FOUND);
-        return reinterpret_cast<FARPROC>(fn);
-    }
-    if (!name) {
+    if (const Pseudo* p = pseudo(module)) {
+        if (!name) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
+        const std::string what = proc_key(name);
+        if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
+        {
+            static auto* m = new std::mutex;
+            static auto* seen = new std::set<std::string>;
+            std::lock_guard lock(*m);
+            if (seen->insert(p->dll + "!" + what).second)
+                std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
+        }
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    const std::string what = proc_key(name);
-    if (void* fn = find(p->dll, what)) return reinterpret_cast<FARPROC>(fn);
-    {
-        static auto* m = new std::mutex;
-        static auto* seen = new std::set<std::string>;
-        std::lock_guard lock(*m);
-        if (seen->insert(p->dll + "!" + what).second)
-            std::fprintf(stderr, "[rt] loader: GetProcAddress(%s, %s): not served\n", p->dll.c_str(), what.c_str());
+
+    void* mapped = nullptr;
+    if (mapped_proc_address(reinterpret_cast<uint64_t>(module), name ? proc_key(name) : std::string(), mapped)) {
+        if (!mapped)
+            SetLastError(!name                  ? ERROR_INVALID_PARAMETER
+                         : IS_INTRESOURCE(name) ? ERROR_INVALID_ORDINAL
+                                                : ERROR_PROC_NOT_FOUND);
+        return reinterpret_cast<FARPROC>(mapped);
     }
-    SetLastError(ERROR_PROC_NOT_FOUND);
-    return nullptr;
+
+    if (!name) {
+        if (owns_bundled_module_handle(module)) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return nullptr;
+        }
+        return GetProcAddress(module, name);
+    }
+
+    const std::string what = proc_key(name);
+    bool owns_handle = false;
+    void* fn = get_bundled_proc_address(module, what, owns_handle);
+    if (owns_handle) {
+        if (fn) return reinterpret_cast<FARPROC>(fn);
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return nullptr;
+    }
+    if (module && !IS_INTRESOURCE(name)) {
+        const DWORD error = GetLastError();
+        const std::string dll = host_module_name(module);
+        void* shim = dll.empty() ? nullptr : find(dll, what);
+        SetLastError(error);
+        if (shim) return reinterpret_cast<FARPROC>(shim);
+    }
+    return GetProcAddress(module, name);
 }
 
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
-    // Nor is a mapped image before its Loader goes, and GetModuleHandleEx counted no reference to release.
-    if (module && mapped_image(module, nullptr)) return TRUE;
+    // Nor are mapped modules: they stay live until ~Loader detaches them, and GetModuleHandleEx counted no reference
+    // to release.
+    if (owns_bundled_module_handle(module)) return TRUE;
     return FreeLibrary(module);
+}
+
+// DisableThreadLibraryCalls(hinstance) from a mapped image's DllMain. The real function only accepts a module the
+// Windows loader mapped, so for ours it fails, and a DllMain that returns its result (the MSVC runtime's satellite
+// DLLs do) fails Loader::initialise() with "DllMain returned FALSE". Owned and mapped modules answer TRUE. The loader
+// sends no thread events to a DllMain, so there is nothing further to switch off; every other handle goes to the
+// real function.
+BOOL WINAPI disable_thread_calls(HMODULE module) {
+    if (pseudo(module)) return TRUE;
+    if (owns_bundled_module_handle(module)) return TRUE;
+    return DisableThreadLibraryCalls(module);
 }
 
 #define LOADER(dll)                                                                         \
@@ -340,7 +431,8 @@ BOOL WINAPI free_library(HMODULE module) {
     {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
     {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
-    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)}
+    {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
+    {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}
 
 }  // namespace
 }  // namespace rt::shims::library_loader
