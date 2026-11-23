@@ -125,6 +125,24 @@ Report the executable name, the workflow run and its commit, your GPU and driver
 the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
 Label it as a single-test run so the result is easy to distinguish from a full suite run.
 
+## Check the device first
+
+`tools/turing_atlas.py` records what the device can do before a run is read: the `vulkaninfo -j` profile (best-ranked
+GPU) for the subgroup size, its stages and `subgroup_size_control`, mesh shaders, fragment-shader barycentrics,
+`VK_KHR_maintenance8`, `VK_EXT_descriptor_heap` and `storageInputOutput16`, plus four hand-written modules
+(`compute32`, `ballot64`, `f16_input`, `maintenance8_offset`) assembled and `spirv-val`'d at `--target-env vulkan1.4`
+and a malformed control that has to be rejected:
+
+```sh
+python -I tools/turing_atlas.py [--out atlas.json]
+```
+
+It needs `vulkaninfo`, `spirv-as` and `spirv-val`, but no build and no game files, and the JSON atlas (stdout by
+default) is what to attach to a report. The feature fields say which tests the sections below skip on your driver. It
+exits 2 when the known-good `compute32` module does not validate or the malformed control is accepted, because then
+the assembler/validator gate says nothing about the other three cases; without `spirv-as`/`spirv-val` it reports the
+cases as skipped and still exits 0. `tests/test_turing_atlas.py` covers those decisions.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
