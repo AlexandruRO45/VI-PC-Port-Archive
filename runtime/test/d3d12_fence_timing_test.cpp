@@ -196,6 +196,51 @@ int check_held_cpu_signal(ID3D12Device* device, ID3D12CommandQueue* queue) {
     return 0;
 }
 
+// D3D-496 case 1: a fence released right after a postponed CPU Signal. Each iteration uses a fresh fence F: queue A
+// Wait(gate, i) + Signal(F, 1), CPU F->Signal(2) (held behind A's Signal), queue B Wait(F, 2) + Signal(done, i). Even
+// iterations release F before opening the gate, so the GPU cannot have reached 1; odd ones open the gate and release F
+// 0-1.9 ms later. The host runtime runs B's batch every time (an application may release a fence right after using
+// it; a queue Wait/Signal takes no COM reference). On the layer, a release before the GPU reached 1 lost the postponed
+// Signal, and remove_fence then dropped B's held batch: every even iteration, and 16-24 of 200 racing ones with #4663 +
+// #4282. With a released fence's wait counted as reached (D3D-496 case 2), B runs every time. `label` names the device.
+int check_released_postponed_signal(ID3D12Device* device, ID3D12CommandQueue* queue, const char* label) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    Ref<ID3D12CommandQueue> queue_b;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue_b.p))));
+    Ref<ID3D12Fence> gate, done;
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gate.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&done.p))));
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    constexpr int iterations = 200;
+    int ran = 0;
+    for (int i = 1; i <= iterations; ++i) {
+        ID3D12Fence* f = nullptr;
+        EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&f))));
+        EXPECT(SUCCEEDED(queue->Wait(gate.p, UINT64(i))));
+        EXPECT(SUCCEEDED(queue->Signal(f, 1)));
+        EXPECT(SUCCEEDED(f->Signal(2)));  // postponed: A's Signal(1) is not reached yet
+        EXPECT(SUCCEEDED(queue_b->Wait(f, 2)));
+        EXPECT(SUCCEEDED(queue_b->Signal(done.p, UINT64(i))));
+        if (i % 2 == 0) {
+            f->Release();  // before the GPU can reach A's Signal(1)
+            EXPECT(SUCCEEDED(gate->Signal(UINT64(i))));
+        } else {
+            EXPECT(SUCCEEDED(gate->Signal(UINT64(i))));
+            const UINT64 spin_until = qpc() + UINT64(frequency.QuadPart) * UINT64(i % 20) / 10000;  // (i%20) x 100 us
+            while (qpc() < spin_until) {
+            }
+            f->Release();
+        }
+        Event event;
+        EXPECT(SUCCEEDED(done->SetEventOnCompletion(UINT64(i), event.h)));
+        if (event.set_within(2000)) ++ran;
+    }
+    std::printf("fence released after a postponed CPU Signal (%s): B's batch ran %d/%d\n", label, ran, iterations);
+    EXPECT(ran == iterations);
+    return 0;
+}
+
 int check_luid(ID3D12Device* device) {
     const LUID luid = device->GetAdapterLuid();
     EXPECT(luid.LowPart || luid.HighPart);
@@ -314,6 +359,14 @@ int main() {
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
         EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
+        EXPECT(check_released_postponed_signal(device.p, queue.p, "Vulkan layer") == 0);
+        // The host runtime is the reference for D3D-496 case 1: it runs B's batch every time.
+        Ref<ID3D12Device> host;
+        if (SUCCEEDED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)))) {
+            Ref<ID3D12CommandQueue> host_queue;
+            EXPECT(SUCCEEDED(host->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&host_queue.p))));
+            EXPECT(check_released_postponed_signal(host.p, host_queue.p, "host runtime") == 0);
+        }
         EXPECT(check_luid(device.p) == 0);
         EXPECT(check_custom_heap_properties(device.p) == 0);
     }
