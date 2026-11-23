@@ -775,8 +775,9 @@ The compute path, end to end:
   - Shader programs (FSSM blobs) are copied in as the code base.
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
   `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
-  translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
+  table; section 3.5, D3D-448, spilling trailing compute parameters past `s31` into the `s[0:1]` spill array staged in
+  the GPU address arena). A signature neither can place (such as exceeding the 64-dword D3D12 cost limit) is refused with
+  both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
   invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
@@ -1708,8 +1709,9 @@ Taken together this disagrees with the packing above (from s0, two dwords per ta
 **Console layout, measured for compute (D3D-448).** `rt::rootsig::pack_stage` lays the parameters out for one stage:
 in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
 CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
-below 4 GiB). A parameter that does not fit goes, with every later one, to the spill array behind `s[0:1]`
-(section 7), which is not modelled, so such a signature is refused. How each part is known:
+below 4 GiB). A parameter that does not fit goes, with every later one, to the packed spill array behind `s[0:1]`
+(section 7); `pack_stage(Stage::Compute)` models that spill array and the compute path stages it in the GPU address
+arena (`s[0:1]`), while non-compute stages still refuse spills. How each part is known:
 - **Compute, base s4: measured three ways.**
   - The console compiler's output (section 7).
   - The package's FidelityFX DLL, whose 29 compute containers carry their `RTS0` next to the console-compiled
@@ -1770,9 +1772,10 @@ Still open: which CBV index lands in which pair. The four pairs do appear in dec
 package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
 about the visibility question below.
 
-Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
-refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
-`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
+Spill policy: graphics signatures (`pack()` and non-compute `pack_stage`) needing more than 32 user SGPRs, and any
+signature exceeding the 64-dword D3D12 cost limit, are refused loudly (`pack` returns the offending parameter) instead
+of being truncated. Compute signatures spill trailing parameters past `s31` into the `s[0:1]` packed spill array
+(section 7).
 
 Measured (D3D-315): zero below-base spill-pointer candidates in the translated shaders.
 `python -I tools/root_spill_census.py <spirv/index.json> --carve <dxbc/index.json> --expect-no-spill` exits 0 on

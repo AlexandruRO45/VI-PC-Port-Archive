@@ -363,9 +363,11 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        std::uint32_t compute_spill_offset = rt::rootsig::kNoSpill;  // compute: dword offset in s[0:1] spill array
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob
+    std::uint32_t compute_spill_dwords = 0;
     bool graphics_ok = true;
     bool compute_ok = true;
 };

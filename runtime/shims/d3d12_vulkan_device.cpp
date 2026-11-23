@@ -5183,6 +5183,22 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        state_.context->set_root_spill_stager(
+            [this](const void* data, std::size_t bytes, std::uint64_t& console_va, std::shared_ptr<void>& hold) -> bool {
+                if (!data || !bytes || !state_.arena.mapped) return false;
+                VkDeviceSize offset = 0;
+                if (!state_.arena_allocate(bytes, 16, offset, DeviceState::arena_buffer)) {
+                    log_once("GPU address arena full (raise LEONIDA_ARENA_MB); compute spill size in bytes:",
+                             int(std::min<std::size_t>(bytes, INT_MAX)));
+                    return false;
+                }
+                std::memcpy(state_.arena.mapped + offset, data, bytes);
+                console_va = offset;
+                hold = std::shared_ptr<void>(state_.arena.mapped + offset, [this, offset, bytes](void*) {
+                    state_.arena_release(offset, bytes, DeviceState::arena_buffer);
+                });
+                return true;
+            });
         return true;
     }
 
@@ -5193,6 +5209,7 @@ public:
                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.context->set_root_spill_stager(nullptr);
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
@@ -5748,6 +5765,7 @@ public:
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;
         layout.compute_ok = compute.ok;
+        layout.compute_spill_dwords = compute.ok ? compute.spill_dwords : 0;
         for (std::size_t i = 0; i < parsed.sig.params.size(); ++i) {
             std::uint32_t first = UINT32_MAX;
             for (std::uint32_t d = 0; packed.ok && d < packed.dword_count; ++d)
@@ -5756,7 +5774,8 @@ public:
                     break;
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         compute.ok ? compute.spill_dword[i] : rt::rootsig::kNoSpill});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(

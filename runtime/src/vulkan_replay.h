@@ -901,6 +901,9 @@ struct ReplayFunctions {
     // device addresses, not console VAs. This stages one that stays alive until the submission completes and returns
     // its device address. A GPU-written list is refused as unsupported; a bad entry is invalid_copy.
     std::function<ReplayResult(const BuildAccelerationStructure&, VkDeviceAddress&)> prepare_khr_instances;
+    // Stages a packed compute root-signature spill array in the GPU address arena for the lifetime of this
+    // submission and returns its console VA (offset in the arena, bound via s[0:1]).
+    std::function<bool(const std::uint32_t* dwords, std::size_t count, std::uint64_t& console_va)> stage_root_spill;
     // XDXR BVH4 builds (xdxr_build.h), used instead of the KHR ones when set: `xdxr_check` refuses inputs the builder
     // cannot read while the list is prepared, `xdxr_record` records the build.
     std::function<bool(const BuildAccelerationStructure&)> xdxr_check;
@@ -1020,6 +1023,7 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
+    std::uint64_t spill_va = 0;  // staged compute root spill array console VA (s[0:1]); 0 when none
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
@@ -3028,6 +3032,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
                 if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
+                if (!ind->spill_data.empty()) {
+                    if (!vk.stage_root_spill ||
+                        !vk.stage_root_spill(ind->spill_data.data(), ind->spill_data.size(), p.spill_va))
+                        return ReplayResult::unsupported;
+                }
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3077,6 +3086,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!pipeline || !pipeline->pipeline) return ReplayResult::unresolved_resource;
             if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
+            if (!dispatch->spill_data.empty()) {
+                if (!vk.stage_root_spill ||
+                    !vk.stage_root_spill(dispatch->spill_data.data(), dispatch->spill_data.size(), p.spill_va))
+                    return ReplayResult::unsupported;
+            }
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -3929,6 +3943,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     if (ind->pipeline) {
                         ShaderUserData data{};
                         std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                        if (p.spill_va != 0) {
+                            data.s[0] = static_cast<std::uint32_t>(p.spill_va);
+                            data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
+                        }
                         data.heap_base = vk.heap_base;
                         data.code_base = p.pipeline.code_base;
                         vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);
@@ -4014,6 +4032,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             ShaderUserData data{};
             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            if (p.spill_va != 0) {
+                data.s[0] = static_cast<std::uint32_t>(p.spill_va);
+                data.s[1] = static_cast<std::uint32_t>(p.spill_va >> 32);
+            }
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.pipeline);

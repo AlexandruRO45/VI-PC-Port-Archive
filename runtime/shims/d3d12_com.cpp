@@ -842,6 +842,7 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             cmd.user_data = compute_.data;
+            cmd.spill_data = compute_.spill;
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1086,6 +1087,7 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        std::vector<std::uint32_t> spill;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1101,6 +1103,7 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.spill.assign((is_compute(state) && layout && layout->compute_ok) ? layout->compute_spill_dwords : 0, 0);
         if (signature && !state.layout) stub("ID3D12GraphicsCommandList::Set*RootSignature(foreign root signature)");
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
@@ -1127,12 +1130,20 @@ private:
         return &state.layout->parameters[index];
     }
 
-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
+    // Dwords beyond the 32 user registers are what the console spills to memory; graphics keeps stubbing until its
+    // spill pointer SGPR is measured, while compute writes into state.spill for the s[0:1] array.
     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
         if (dword < rt::rootsig::kMaxUserSgprs)
             state.data[dword] = value;
         else
             stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+    }
+
+    void write_spill(RootState& state, std::uint32_t dword, std::uint32_t value) {
+        if (dword < state.spill.size())
+            state.spill[dword] = value;
+        else
+            check(false);
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1156,6 +1167,11 @@ private:
         if (!p) return;
         if (!data || std::uint64_t(offset) + count > p->constant_count) return check(false);
         const auto* values = static_cast<const std::uint32_t*>(data);
+        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
+            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
+            for (UINT i = 0; i < count; ++i) write_spill(state, p->compute_spill_offset + offset + i, values[i]);
+            return;
+        }
         const std::uint32_t first = first_dword(state, *p);
         for (UINT i = 0; i < count; ++i) write(state, first + offset + i, values[i]);
     }
@@ -1167,6 +1183,13 @@ private:
             return;
         const RootArgumentLayout::Parameter* p = parameter(state, index, type);
         if (!p) return;
+        if (is_compute(state) && p->compute_offset == rt::rootsig::kNoSgpr) {
+            if (p->compute_spill_offset == rt::rootsig::kNoSpill) return check(false);
+            write_spill(state, p->compute_spill_offset, std::uint32_t(va));
+            if (type != rt::rootsig::ParamType::Table)
+                write_spill(state, p->compute_spill_offset + 1, std::uint32_t(va >> 32));
+            return;
+        }
         const std::uint32_t first = first_dword(state, *p);
         write(state, first, std::uint32_t(va));
         // In the compute layout a descriptor table is one dword, the 32-bit VA of its first descriptor (the heaps
@@ -1319,7 +1342,7 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z}));
+        check(list_.dispatch({compute_pipeline_, compute_.data, x, y, z, compute_.spill}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.

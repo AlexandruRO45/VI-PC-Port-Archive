@@ -1247,6 +1247,14 @@ public:
         replay_.zero_size = size;
     }
 
+    // Stages packed compute root-signature spill buffers in the GPU address arena for the duration of a submission.
+    using RootSpillStager =
+        std::function<bool(const void* data, std::size_t bytes, std::uint64_t& console_va, std::shared_ptr<void>& hold)>;
+    void set_root_spill_stager(RootSpillStager stager) {
+        std::unique_lock lock(resource_mutex_);
+        root_spill_stager_ = std::move(stager);
+    }
+
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
     void set_color_attachment_format(std::function<bool(VkFormat)> check) {
         std::unique_lock lock(resource_mutex_);
@@ -1682,6 +1690,7 @@ private:
     bool order_timestamp_copies_ = false;
     VkPhysicalDeviceMemoryProperties occlusion_resolve_memory_{};
     ReplayFunctions replay_;
+    RootSpillStager root_spill_stager_;
     std::unique_ptr<PredicateReducer> predicate_reducer_;
     std::unique_ptr<PredicatedBufferCopier> predicated_copier_;
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
@@ -2166,6 +2175,7 @@ private:
             std::vector<KhrInstanceStage> stages;
             ~KhrGuard() { queue->recycle_khr_stages(stages); }
         } khr_guard{this};
+        std::vector<std::shared_ptr<void>> spill_holds;
         std::function<void(bool)> bindless_commit;
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
@@ -2208,6 +2218,17 @@ private:
                                                                    VkDeviceAddress& address) {
             return stage_khr_instances(replay, build, khr_guard.stages, address);
         };
+        if (context_.root_spill_stager_) {
+            replay.stage_root_spill = [this, &spill_holds](const std::uint32_t* dwords, std::size_t count,
+                                                           std::uint64_t& console_va) {
+                if (!dwords || !count) return false;
+                std::shared_ptr<void> hold;
+                if (!context_.root_spill_stager_(dwords, count * sizeof(std::uint32_t), console_va, hold))
+                    return false;
+                if (hold) spill_holds.push_back(std::move(hold));
+                return true;
+            };
+        }
         std::uint64_t captures = 0;
         for (const auto* list : lists)
             for (const auto& command : list->commands())
@@ -2379,6 +2400,8 @@ private:
         if (!slot) return ReplayResult::unsupported;
         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
         khr_guard.stages.clear();
+        slot->root_spills = std::move(spill_holds);         // freed when this slot completes
+        spill_holds.clear();
         command_buffer = slot->buffer;
         // MoltenVK writes a timestamp at the end of a Metal encoder and resolves it with a blit that nothing orders
         // after that write, so a copy in the same or the next command buffer reads the old value (docs section 4.6).
@@ -2399,6 +2422,7 @@ private:
                 ordered_timestamps = true;
             };
         const auto discard = [&] {
+            slot->root_spills.clear();
             if (context_.vk.vkResetCommandBuffer(command_buffer, 0) == VK_SUCCESS) slot->ticket = 0;
         };
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2787,6 +2811,7 @@ private:
         std::unique_ptr<IndirectDispatchCounter::Batch> counted_dispatch;
         std::unique_ptr<PredicateReducer::Batch> predicate; // retained until this slot completes
         std::vector<KhrInstanceStage> khr_instances;  // KHR ARRAY_OF_POINTERS staging, same lifetime
+        std::vector<std::shared_ptr<void>> root_spills;  // compute spill-array arena holds, same lifetime
     };
 
     struct PendingBindings {
@@ -2948,6 +2973,7 @@ private:
             if (slot.ticket > done) continue;
             slot.segments.clear();
             recycle_khr_stages(slot.khr_instances);
+            slot.root_spills.clear();
             for (VkEvent event : slot.events)
                 if (context_.vk.vkResetEvent(context_.device(), event) == VK_SUCCESS) free_events_.push_back(event);
                 else context_.vk.vkDestroyEvent(context_.device(), event, nullptr);

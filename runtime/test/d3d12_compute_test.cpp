@@ -306,6 +306,7 @@ int main() {
     std::vector<std::uint32_t> cbv_a_out(elements), cbv_oob_out(elements), cbv_b_out(elements), cbv_null_out(elements);
     std::vector<std::uint32_t> srv_raw_a(elements), srv_raw_b(elements), srv_struct_a(elements),
         srv_struct_b(elements), srv_typed(elements), srv_null(elements);
+    std::vector<std::uint32_t> spill_first(elements), spill_second(elements);
     {
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = d.instance_proc;
@@ -939,6 +940,79 @@ int main() {
             std::memcpy(srv_null.data(), rb + 5 * bytes, bytes);
         }
 
+        // Compute root-signature spill array (s[0:1]): [0] 27 constants (s4..s30), [1] root UAV (spill 0..1),
+        // [2] 1-CBV table (spill 2, verifying monotonic spill with s31 still unused), [3] 2 constants (spill 3..4).
+        {
+            D3D12_DESCRIPTOR_RANGE spill_range{D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 1, 0, 0};
+            D3D12_ROOT_PARAMETER spill_params[4] = {};
+            spill_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            spill_params[0].Constants = {0, 0, 27};
+            spill_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            spill_params[1].Descriptor = {0, 0};
+            spill_params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            spill_params[2].DescriptorTable = {1, &spill_range};
+            spill_params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            spill_params[3].Constants = {2, 0, 2};
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC spill_desc{};
+            spill_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
+            spill_desc.Desc_1_0 = {4, spill_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+            const auto spill_blob = serialize(spill_desc);
+            EXPECT(!spill_blob.empty());
+
+            Ref<ID3D12RootSignature> spill_root;
+            EXPECT(SUCCEEDED(
+                device->CreateRootSignature(0, spill_blob.data(), spill_blob.size(), IID_PPV_ARGS(&spill_root.p))));
+            D3D12_COMPUTE_PIPELINE_STATE_DESC spill_pso_desc{};
+            spill_pso_desc.pRootSignature = spill_root.p;
+            spill_pso_desc.CS = {container.data(), container.size()};
+            Ref<ID3D12PipelineState> spill_pso;
+            EXPECT(SUCCEEDED(device->CreateComputePipelineState(&spill_pso_desc, IID_PPV_ARGS(&spill_pso.p))));
+
+            Ref<ID3D12Resource> spill_readback;
+            const auto spill_rb_desc = buffer_desc(2 * bytes, D3D12_RESOURCE_FLAG_NONE);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &spill_rb_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&spill_readback.p))));
+
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, spill_pso.p)));
+            // out_b ended the earlier dispatch pass in COPY_SOURCE; restore it to UNORDERED_ACCESS before writing.
+            const auto b_to_uav =
+                transition(out_b.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            list->ResourceBarrier(1, &b_to_uav);
+            list->SetDescriptorHeaps(1, heaps);
+            list->SetComputeRootSignature(spill_root.p);
+            list->SetComputeRoot32BitConstant(0, 11u, 0);   // s4
+            list->SetComputeRoot32BitConstant(0, 29u, 26);  // s30
+            list->SetComputeRootUnorderedAccessView(1, va_a);
+            list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{gpu});
+            const std::uint32_t spill_c1[2] = {100u, 7u};
+            list->SetComputeRoot32BitConstants(3, 2, spill_c1, 0);
+            list->Dispatch(1, 1, 1);
+
+            // Second dispatch updates spilled parameters on the same command list: must stage an isolated spill slice.
+            list->SetComputeRootUnorderedAccessView(1, va_b);
+            const std::uint32_t spill_c2[2] = {500u, 13u};
+            list->SetComputeRoot32BitConstants(3, 2, spill_c2, 0);
+            list->Dispatch(1, 1, 1);
+
+            D3D12_RESOURCE_BARRIER spill_barriers[2] = {
+                transition(out_a.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(out_b.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+            list->ResourceBarrier(2, spill_barriers);
+            list->CopyBufferRegion(spill_readback.p, 0, out_a.p, 0, bytes);
+            list->CopyBufferRegion(spill_readback.p, bytes, out_b.p, 0, bytes);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 4)));
+            EXPECT(SUCCEEDED(fence->SetEventOnCompletion(4, nullptr)));
+
+            void* spill_res = nullptr;
+            EXPECT(SUCCEEDED(spill_readback->Map(0, nullptr, &spill_res)));
+            std::memcpy(spill_first.data(), spill_res, bytes);
+            std::memcpy(spill_second.data(), static_cast<const std::uint8_t*>(spill_res) + bytes, bytes);
+        }
+
         for (auto* r : {&out_a, &out_b, &out_c, &constants, &readback}) r->reset();
         pso67.reset();
         unknown67.reset();
@@ -1016,6 +1090,16 @@ int main() {
                 "typed (24 + 40 OOB-zero) matched; negative controls flipped %u/32 (raw B), %u/32 (struct B), %u/32 "
                 "(null)\n",
                 raw_diff, struct_diff, null_diff);
+    for (std::uint32_t i = 0; i < elements; ++i) {
+        const std::uint32_t want_1 = 11u + 29u + 100u + 7u * i + table_values[i % 4u];
+        const std::uint32_t want_2 = 11u + 29u + 500u + 13u * i + table_values[i % 4u];
+        if ((spill_first[i] != want_1 || spill_second[i] != want_2) && mismatches++ < 4)
+            std::fprintf(stderr, "spill element %u: got %u and %u, want %u and %u\n", i, spill_first[i],
+                         spill_second[i], want_1, want_2);
+    }
+    EXPECT(!mismatches);
+    std::printf("compute root spill (s[0:1]): %u/%u elements matched across two isolated dispatches\n", elements,
+                elements);
     if (d.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;

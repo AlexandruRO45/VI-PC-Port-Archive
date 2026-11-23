@@ -373,13 +373,15 @@ struct ResolveSubresource {
 };
 
 // Dispatch, with what it uses captured when it is recorded: the pipeline (an opaque id the replay resolves) and
-// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5).
+// the 32 user-data dwords the root arguments produced (s0..s31 of the translated shader, section 3.5), plus any
+// spilled compute root arguments packed for the array behind s[0:1].
 struct Dispatch {
     std::uintptr_t pipeline;
     std::array<std::uint32_t, 32> user_data;
     std::uint32_t x;
     std::uint32_t y;
     std::uint32_t z;
+    std::vector<std::uint32_t> spill_data;
 };
 
 // D3D12_VIEWPORT.
@@ -601,6 +603,7 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    std::vector<std::uint32_t> spill_data;
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
