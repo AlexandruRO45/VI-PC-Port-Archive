@@ -1293,9 +1293,12 @@ The runtime allocates image keys from `0x100000000` (4 GiB) in 256-byte steps, a
   removes staging and host/console address translation from the bring-up path.
   - A memory type is only tried when its heap can hold the whole allocation (`memory_type_order` in
     `runtime/src/vulkan_memory.h`, beside D3D-96's `resizable_bar`). Without Resizable BAR the only `DEVICE_LOCAL | HOST_VISIBLE` type sits in a
-    heap of 256 MiB or less (214 MiB on an RTX 3090 with driver 616.56), so the 256 MiB default arena lands in
-    system memory there. Asking that heap for it broke VUID-vkAllocateMemory-pAllocateInfo-01713 even though the
-    driver returned `VK_SUCCESS` (reported by CharlyRien).
+    heap of 256 MiB or less. Where that heap is smaller than the 256 MiB default arena (214 MiB on an RTX 3090 with
+    driver 616.56), the arena lands in system memory. Asking that heap for it broke
+    VUID-vkAllocateMemory-pAllocateInfo-01713 even though the driver returned `VK_SUCCESS` (reported by CharlyRien).
+    Where it is exactly 256 MiB (AMD without Smart Access Memory, RADV without Resizable BAR), the arena fits and
+    tries that heap first. If the driver already uses part of the window, that allocation fails and the arena moves
+    on to system memory. Which of the two happens there hasn't been measured (found by wilu222).
 - M4+: allocate the arena `DEVICE_LOCAL` and stage CPU writes (descriptor heaps, shader blobs, buffer uploads)
   through a host-visible staging buffer, copied before the commands that use them. The hash table is not in the
   arena either: it is a normal storage buffer in `DEVICE_LOCAL` memory, uploaded from a mapped staging copy before
