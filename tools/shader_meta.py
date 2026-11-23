@@ -146,22 +146,24 @@ def _const_of(sym, a):
 
 def _split_operands(ins):
     """Return (read_sgprs, write_sgprs) for one parsed instruction."""
-    op = base_op(ins["op"])
+    raw_op = ins["op"]
+    op = base_op(raw_op)
     a = ins["args"]
     if not a:
         return [], []
     if op.startswith(NO_SGPR_DST):
         reads = [r for x in a for r in _sgpr_regs(x)]
         return reads, []
-    if op.startswith("v_cmpx_"):
-        # e32 has 2 source operands; e64 has dst in a[0] and 2 sources in a[1:3].
+    if op.startswith("v_cmpx_") or op.startswith("v_cmp_"):
+        # e32 has 2 source operands; e64 has dst in a[0] and 2 sources in a[1:3]. shader_disasm decodes wave32,
+        # so a wave64 / 64-bit mask SDST printed as `sN` really occupies `sN:sN+1`; without the high half a
+        # following `s_and_saveexec_b64 s[6:7], s[4:5]` looks like a read of an undefined s5 (const32).
         if len(a) <= 2:
             return [r for x in a for r in _sgpr_regs(x)], []
-        return [r for x in a[1:] for r in _sgpr_regs(x)], _sgpr_regs(a[0])
-    if op.startswith("v_cmp_"):
-        if len(a) <= 2:
-            return [r for x in a for r in _sgpr_regs(x)], []
-        return [r for x in a[1:] for r in _sgpr_regs(x)], _sgpr_regs(a[0])
+        writes = _sgpr_regs(a[0])
+        if "_e64" in raw_op or any(t in op for t in ("_u64", "_i64", "_f64", "_b64")):
+            writes = writes + [r + 1 for r in writes]
+        return [r for x in a[1:] for r in _sgpr_regs(x)], writes
     if op in SGPR_RMW:
         reads = [r for x in a for r in _sgpr_regs(x)]
         return reads, _sgpr_regs(a[0])

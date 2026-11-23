@@ -44,5 +44,23 @@ class MovkTest(unittest.TestCase):
         self.assertEqual(step({"op": "s_movk_i32", "args": [sgpr(4), sgpr(6)]}).get(4), None)
 
 
+class Wave64MaskSdst(unittest.TestCase):
+    """A wave64/64-bit compare SDST printed as one SGPR still occupies the next register."""
+
+    def ins(self, op):
+        return {"op": op, "args": [sgpr(4), {"k": "vgpr", "r": 0, "n": 1},
+                                   {"k": "vgpr", "r": 1, "n": 1}]}
+
+    def test_e64_and_64_bit_compares_write_both_halves(self):
+        for op in ("v_cmp_gt_f32_e64", "v_cmpx_gt_f32_e64", "v_cmp_gt_u64"):
+            with self.subTest(op=op):
+                _reads, writes = shader_meta._split_operands(self.ins(op))
+                self.assertEqual(writes, [4, 5])
+
+    def test_e32_compare_writes_one_mask_word(self):
+        _reads, writes = shader_meta._split_operands(self.ins("v_cmp_gt_f32"))
+        self.assertEqual(writes, [4])
+
+
 if __name__ == "__main__":
     unittest.main()
