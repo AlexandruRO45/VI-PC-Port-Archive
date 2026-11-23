@@ -319,7 +319,7 @@ def has_main_guard(source):
         left, right = test.left, test.comparators[0]
         if not ((is_name(left) and is_main(right)) or (is_main(left) and is_name(right))):
             continue
-        if any(isinstance(item, ast.Call) for item in ast.walk(node)):
+        if any(isinstance(item, ast.Call) for stmt in node.body for item in ast.walk(stmt)):
             return True
     return False
 
@@ -370,6 +370,13 @@ class RepositoryRegistrationTest(unittest.TestCase):
                      if job_of(ROOT, f, self.rules) == "stdlib" and not has_main_guard(read(ROOT, f))]
         self.assertEqual(guardless, [], "the check loop runs these with python -I, which executes no test:\n" +
                          "\n".join(f"  {f}: no `if __name__ == \"__main__\":` block" for f in guardless))
+
+    def test_main_guard_ignores_calls_in_else(self):
+        source = 'if __name__ == "__main__":\n    pass\nelse:\n    unittest.main()\n'
+        self.assertFalse(has_main_guard(source))
+
+        source = 'if "__main__" == __name__:\n    if True:\n        unittest.main()\n'
+        self.assertTrue(has_main_guard(source))
 
     def test_the_semantic_job_installs_what_its_spirv_gated_tests_need(self):
         # A test that skips without spirv-as / spirv-val runs only where something installed them. The runner images
