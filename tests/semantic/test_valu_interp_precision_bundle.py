@@ -293,6 +293,19 @@ class TestInterpP1LVF16Channels(unittest.TestCase):
             words = support.mrt0_words(spv)
             self.assertEqual(len(words), 4)
 
+class TestInterpP1LVF16Translator(unittest.TestCase):
+    def test_p1lv_f16_translator_pipeline(self):
+        code = [
+            "v_interp_p1lv_f16 v14, v0, attr8.z",
+            "v_interp_p2_f16 v14, v1, attr8.z, v14",
+            "exp mrt0, v14, v14, v14, v14 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_p1lv_trans", code)
+        self.assertIn("OpEntryPoint Fragment", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(len(words), 4)
+
 
 if __name__ == "__main__":
     unittest.main()
