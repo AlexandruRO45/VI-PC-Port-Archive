@@ -386,6 +386,20 @@ class TestSSubbU32ChainingAndPropagation(unittest.TestCase):
         self.assertEqual((r_lo, r_hi), (0xFFFFFFFF, 2))
         self.assertEqual(bout2, 0)
 
+class TestSSubbU32Translator(unittest.TestCase):
+    def test_translator_s_subb_u32_execution(self) -> None:
+        body = [
+            "s_mov_b32 s4, 0",
+            "s_sub_u32 s5, s4, 1",        # produces borrow = 1 in SCC
+            "s_mov_b32 s6, 50",
+            "s_subb_u32 s7, s6, 10",      # 50 - 10 - 1 = 39
+            "v_mov_b32_e32 v1, s7",
+            "buffer_store_dword v1, v30, s[0:3], 0 offen",
+        ]
+        results = run_cs(body, name="cs_s_subb_u32")
+        for l in range(32):
+            self.assertEqual(results[l], 39)
+
 
 if __name__ == "__main__":
     unittest.main()
