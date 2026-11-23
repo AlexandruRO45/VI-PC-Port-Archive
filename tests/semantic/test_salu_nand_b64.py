@@ -535,6 +535,69 @@ class SaluNandB64ConditionCodesTests(unittest.TestCase):
         self.assertEqual(res, MASK64)
         self.assertEqual(state.scc, 1)
 
+class SaluNandB64Ieee754EdgeCasesTests(unittest.TestCase):
+    """IEEE 754 floating-point edge cases and boundary bit patterns for s_nand_b64."""
+
+    @staticmethod
+    def float_to_u64(f: float) -> int:
+        return struct.unpack("<Q", struct.pack("<d", f))[0]
+
+    @staticmethod
+    def u64_to_float(u: int) -> float:
+        return struct.unpack("<d", struct.pack("<Q", u & MASK64))[0]
+
+    def test_ieee754_double_special_values(self):
+        specials = {
+            "+0.0": 0x00000000_00000000,
+            "-0.0": 0x80000000_00000000,
+            "+1.0": 0x3FF00000_00000000,
+            "-1.0": 0xBFF00000_00000000,
+            "+inf": 0x7FF00000_00000000,
+            "-inf": 0xFFF00000_00000000,
+            "qNaN": 0x7FF80000_00000000,
+            "sNaN": 0x7FF00000_00000001,
+            "min_subnormal": 0x00000000_00000001,
+            "max_subnormal": 0x000FFFFF_FFFFFFFF,
+            "max_finite":    0x7FEFFFFF_FFFFFFFF,
+        }
+        for name1, u1 in specials.items():
+            for name2, u2 in specials.items():
+                with self.subTest(s0=name1, s1=name2):
+                    res = ref_nand_b64(u1, u2)
+                    expected = (~(u1 & u2)) & MASK64
+                    self.assertEqual(res, expected)
+                    self.assertEqual(ref_scc(res), 1 if expected != 0 else 0)
+
+    def test_ieee754_sign_bit_inversion(self):
+        neg_zero = 0x80000000_00000000
+        # NAND with itself inverts the sign bit and sets all other bits
+        res = ref_nand_b64(neg_zero, neg_zero)
+        self.assertEqual(res, 0x7FFFFFFF_FFFFFFFF)
+        self.assertEqual(ref_scc(res), 1)
+
+    def test_ieee754_exponent_mask_preservation(self):
+        exp_mask = 0x7FF00000_00000000
+        one_d = 0x3FF00000_00000000
+        res = ref_nand_b64(exp_mask, one_d)
+        self.assertEqual(res, (~0x3FF00000_00000000) & MASK64)
+        self.assertEqual(ref_scc(res), 1)
+
+    def test_ieee754_no_flush_to_zero(self):
+        subnormal = 0x00000000_0000000F
+        all_ones = MASK64
+        res = ref_nand_b64(subnormal, all_ones)
+        self.assertEqual(res, (~subnormal) & MASK64)
+        self.assertEqual(res & 0xF, 0x0)
+        self.assertEqual((res >> 4) & 0xF, 0xF)
+
+    def test_ieee754_packed_f32_pairs(self):
+        f0 = struct.unpack("<I", struct.pack("<f", 0.0))[0]
+        f1 = struct.unpack("<I", struct.pack("<f", -0.0))[0]
+        packed = (f1 << 32) | f0
+        res = ref_nand_b64(packed, packed)
+        self.assertEqual(res, (~packed) & MASK64)
+        self.assertEqual(ref_scc(res), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
