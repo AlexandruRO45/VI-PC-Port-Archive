@@ -2,12 +2,13 @@
 
     python -I tests/test_rdna2spirv_cli.py
 
-Standard library only: the output tests substitute the SPIR-V tools and use synthetic input.
+Synthetic inputs only. The end-to-end retry test also needs SPIRV-Tools on PATH.
 """
 import argparse
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -379,15 +380,79 @@ class ValidatedOutput(unittest.TestCase):
 
     def test_missing_dispatch_invalidates_completed_shard(self):
         src = self.src.with_name("cs_dispatch.s")
-        self.src.rename(src)
-        (self.src.parent.parent / "ps_fixture.dxbc").rename(self.src.parent.parent / "cs_dispatch.dxbc")
+        src.write_bytes(self.src.read_bytes())
+        container = self.src.parent.parent / "ps_fixture.dxbc"
+        shutil.copyfile(container, container.with_name("cs_dispatch.dxbc"))
         part = self.out / "index.part0.json"
-        part.write_bytes(b"{}")
-        result = subprocess.run([sys.executable, "-I", TOOL, str(src), "--out", str(self.out),
-                                 "--shard", "0/1"], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("1 of 1 selected shaders missing required inputs", result.stderr)
-        self.assertFalse(part.exists())
+        stale = self.out / "cs_dispatch.spv"
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                selection = src
+                if interrupted:
+                    # The compute input retires its module, then the next listing hits a read error.
+                    container.unlink()
+                    container.mkdir()
+                    selection = src.parent
+                stale.write_bytes(b"old compute")
+                self.module.write_bytes(b"previous pixel")
+                part.write_bytes(b'{"cs_dispatch": {}, "ps_fixture": {}}')
+                self.index.write_bytes(part.read_bytes())
+                result = subprocess.run([sys.executable, "-I", TOOL, str(selection), "--out", str(self.out),
+                                         "--shard", "0/1"], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("missing translation input", result.stderr)
+                if interrupted:
+                    self.assertIn("ps_fixture.dxbc", result.stderr)
+                self.assertFalse(part.exists())
+                self.assertFalse(self.index.exists())
+                self.assertFalse(stale.exists())
+                self.assertEqual(self.module.read_bytes(), b"previous pixel")
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "requires SPIRV-Tools")
+    def test_failed_shard_retry_cannot_be_merged(self):
+        def run(out, *args, hide_tools=False):
+            env = os.environ.copy()
+            if hide_tools:
+                env["PATH"] = str(self.out)
+            return subprocess.run([sys.executable, "-I", TOOL, str(self.src.parent),
+                                   "--out", str(out), *args], env=env, capture_output=True, text=True)
+
+        def success(out, *args):
+            result = run(out, *args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+        def snapshot(out):
+            return {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+
+        self.src.with_name("ps_other.s").write_bytes(self.src.read_bytes())
+        shutil.copyfile(self.src.parent.parent / "ps_fixture.dxbc", self.src.parent.parent / "ps_other.dxbc")
+        for shard in ("0/2", "1/2"):
+            success(self.out, "--shard", shard)
+        success(self.out, "--merge")
+        baseline = snapshot(self.out)
+        self.assertEqual(set(json.loads(self.index.read_bytes())), {"ps_fixture", "ps_other"})
+        for assembler in ("spirv-as", "python"):
+            with self.subTest(assembler=assembler):
+                value = 1 if assembler == "spirv-as" else 2
+                self.src.write_bytes(f"\tv_mov_b32_e32 v0, {value}\n\ts_endpgm\n".encode())
+                result = run(self.out, "--shard", "0/2", "--assembler", assembler, hide_tools=True)
+                self.assertFalse(self.index.exists())
+                merge = run(self.out, "--merge")
+                self.assertEqual(merge.returncode, 2, merge.stdout)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("SPIRV-Tools", result.stderr)
+                self.assertFalse((self.out / "index.part0.json").exists())
+                for name in ("ps_fixture.spv", "ps_other.spv", "shard1.json", "index.part1.json"):
+                    self.assertEqual((self.out / name).read_bytes(), baseline[name], name)
+                success(self.out, "--shard", "0/2")
+                success(self.out, "--merge")
+                self.assertNotEqual(self.module.read_bytes(), baseline[self.module.name])
+                baseline = snapshot(self.out)
+        fresh = self.out.with_name("fresh")
+        for shard in ("0/2", "1/2"):
+            success(fresh, "--shard", shard)
+        success(fresh, "--merge")
+        self.assertEqual(snapshot(self.out), snapshot(fresh))
 
     def test_missing_assembler_is_one_setup_error(self):
         err = io.StringIO()

@@ -17084,6 +17084,16 @@ def merge_shard_parts(out):
     return merged
 
 
+def _run_spirv_tool(cmd, **kwargs):
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except FileNotFoundError as exc:
+        # Windows CreateProcess omits the executable name from WinError 2.
+        if getattr(exc, "winerror", None) == 2 and exc.filename is None:
+            exc.filename = cmd[0]
+        raise
+
+
 def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
     """Keep the assembled module out of the final path until validation succeeds.
 
@@ -17113,7 +17123,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
             except OSError as exc:
                 result = subprocess.CompletedProcess(["spirv-as"], 1, "", f"error: cannot read {sa}: {exc}")
             else:
-                result = subprocess.run(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
+                result = _run_spirv_tool(["spirv-as", "-", "-o", tmp.name, "--target-env", "vulkan1.2"],
                                         input=source, capture_output=True, cwd=folder)
                 # stdin is bytes, so the output is too; a test double may already answer in text.
                 if isinstance(result.stdout, bytes):
@@ -17122,7 +17132,7 @@ def assemble_spirv(sa, sv, asm_text=None, assembler="spirv-as"):
                     result.stderr = result.stderr.decode("utf-8", "replace")
         if result.returncode == 0:
             # Offset on non-gather: VK_KHR_maintenance8
-            result = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
+            result = _run_spirv_tool(["spirv-val", "--target-env", "vulkan1.2", "--allow-offset-texture-operand",
                                      tmp.name], capture_output=True, text=True, cwd=folder)
         if result.returncode == 0:
             tmp.replace(sv)
@@ -17303,19 +17313,9 @@ def main():
         write_index(os.path.join(a.out, "index.json"), merged)
         print(f"merged {len(merged)} entries")
         return 0
-    if os.path.isfile(a.src) and a.src.endswith(".s"):
-        files = [a.src]
-    elif os.path.isdir(a.src):
-        with os.scandir(a.src) as entries:
-            files = sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
-    else:
+    single_file = os.path.isfile(a.src) and a.src.endswith(".s")
+    if not single_file and not os.path.isdir(a.src):
         ap.error(f"{a.src} is not a .s file or a folder of .s files")
-    files = files[: a.limit] if a.limit is not None else files
-    shard = None
-    if a.shard:
-        si, sn = a.shard
-        files = files[si::sn]
-        shard = si
     # Writing translations into the input folder mixes them with the .s inputs (and a rerun then scans its
     # own output); refuse it before mkdir, the index or any module is written. --merge above is exempt: its
     # src is not read, and merging parts in place is how a shard run finishes.
@@ -17327,6 +17327,26 @@ def main():
         os.makedirs(a.out, exist_ok=True)
     except OSError as e:  # a trailing separator on a file, or a symlink changed since the check above
         ap.error(f"cannot create {a.out}: {e.strerror or e}")
+    shard = None
+    idx_path = os.path.join(a.out, "index.json")
+    if a.shard:
+        shard, sn = a.shard
+        part = os.path.join(a.out, f"index.part{shard}.json")
+        # Resume trusts the part, and consumers trust the merged index. Withdraw both
+        # before scanning or modifying outputs, even if a retry is killed mid-shader.
+        Path(part).unlink(missing_ok=True)
+        Path(idx_path).unlink(missing_ok=True)
+        write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
+        idx_path = part
+    if single_file:
+        files = [a.src]
+    else:
+        with os.scandir(a.src) as entries:
+            files = sorted(e.path for e in entries if e.name.endswith(".s") and e.is_file())
+    if a.limit is not None:
+        files = files[:a.limit]
+    if shard is not None:
+        files = files[shard::sn]
     why, ok, valid = Counter(), 0, 0
     meta = {}
     invalid = set()
@@ -17391,7 +17411,6 @@ def main():
         if a.no_asm and os.path.exists(sa):
             os.remove(sa)
     import json as _js
-    idx_path = os.path.join(a.out, f"index.part{shard}.json" if shard is not None else "index.json")
     old = {}
     if shard is None and os.path.isfile(idx_path) and a.limit is None and len(files) < 1000:
         with open(idx_path, encoding="utf-8") as f:
@@ -17399,12 +17418,7 @@ def main():
         for name in invalid:
             old.pop(name, None)
     old.update(meta)
-    if shard is not None:   # a marker beside the part, so --merge can tell a complete set from a partial one
-        write_index(os.path.join(a.out, SHARD_MARKER.format(index=shard)), {"index": shard, "count": sn})
-    if shard is not None and missing_inputs:
-        # A part is a completion marker for make_game's resume. Retry this slice after repair.
-        Path(idx_path).unlink(missing_ok=True)
-    else:
+    if shard is None or not missing_inputs:
         write_index(idx_path, old)
     if shard is None:
         import spirv_stubs
