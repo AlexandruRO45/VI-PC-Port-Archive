@@ -1591,7 +1591,10 @@ if(TARGET Vulkan::Headers)
       add_custom_command(
         OUTPUT ${LEONIDA_MA_FILES}
         COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_MA_DIR}
+        # build.py shifts only cs_* sources: VS/PS keep their graphics fixture layout, while cs_ma's D3D12 root
+        # arguments start at s4 (rt::rootsig::pack_stage, D3D-448).
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_MA_DIR} vs_ma ps_ma cs_ma
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py

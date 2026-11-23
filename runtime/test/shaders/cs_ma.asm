@@ -3,8 +3,9 @@
 ; fssm-at: 0x150
 ; fssm-data: 0x4d5f5343 0x3d414d5f
 ; Multi-argument ExecuteIndirect compute shader: out[g] = (((g + a) ^ b) + c) - d for g = 64 * group + lane, written
-; through a root UAV (the root signature [0] four 32-bit constants a, b, c, d = s0..s3, [1] a root UAV = s[4:5]; the
-; workgroup id is s6, as in cs_m4_indirect). Run: d3d12_indirect_multiarg_test.
+; through a root UAV. The source layout is [0] four 32-bit constants a, b, c, d = s0..s3, [1] a root UAV = s[4:5],
+; and workgroup id s6, as in cs_m4_indirect. CMake builds this D3D12 fixture with LEONIDA_USER_DATA_SHIFT=4, so the
+; runtime layout is constants s4..s7, root UAV s[8:9], workgroup id s10. Run: d3d12_indirect_multiarg_test.
 s_lshl_b32 s7, s6, 6
 v_add_nc_u32_e32 v1, s7, v0
 v_add_nc_u32_e32 v2, s0, v1

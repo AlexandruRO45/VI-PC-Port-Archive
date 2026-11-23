@@ -1681,6 +1681,11 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
     if (!desc || !desc->pArgumentDescs || desc->NumArgumentDescs == 0 || desc->ByteStride == 0) return E_INVALIDARG;
     const RootArgumentLayout* layout = root_signature ? root_signature_layout(root_signature) : nullptr;
     if (root_signature && !layout) return E_INVALIDARG;  // a root signature of another device
+    // A root argument precedes the action in the record, but its user-data offset depends on that final action:
+    // DISPATCH uses the measured compute layout and draws keep the graphics layout. D3D12 requires the action last,
+    // so select the bind point from the final descriptor before translating any arguments.
+    const bool compute_arguments =
+        desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     auto sig = std::make_shared<leonida::IndirectSignature>();
     std::uint32_t offset = 0;
     bool action = false, root_arguments = false, index_buffer = false;
@@ -1699,10 +1704,15 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
             const RootArgumentLayout::Parameter& p = layout->parameters[index];
             if (descriptor_type && p.descriptor_type != descriptor_type) return E_INVALIDARG;
             if (!count || std::uint64_t(dest) + count > limit) return E_INVALIDARG;
-            a.user_dword = p.user_offset + dest;
+            if (!(compute_arguments ? layout->compute_ok : layout->graphics_ok)) return E_NOTIMPL;
+            const std::uint32_t base = compute_arguments ? p.compute_offset : p.user_offset;
+            if (base == rt::rootsig::kNoSgpr) return E_NOTIMPL;
+            const std::uint64_t first = std::uint64_t(base) + dest;
             a.dwords = count;
             // Dwords past the 32 user registers are what the console spills to memory (not modelled).
-            return std::uint64_t(a.user_dword) + count > rt::rootsig::kMaxUserSgprs ? E_NOTIMPL : S_OK;
+            if (first + count > rt::rootsig::kMaxUserSgprs) return E_NOTIMPL;
+            a.user_dword = static_cast<std::uint32_t>(first);
+            return S_OK;
         };
         HRESULT hr = S_OK;
         switch (arg.Type) {

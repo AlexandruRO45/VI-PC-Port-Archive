@@ -560,6 +560,50 @@ int main() {
             using T = D3D12_INDIRECT_ARGUMENT_TYPE;
             const auto C = [](UINT index, UINT dest, UINT count) { return argument(D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, index, dest, count); };
             const auto A = [](T type, UINT index = 0) { return argument(type, index); };
+            // The final action selects the root-argument layout even though the root arguments precede it. Graphics
+            // keeps pack() (constants s0..s3, UAV s10:s11 for this signature); compute uses pack_stage() from s4
+            // (constants s4..s7, UAV s13:s14). Pin both a constant subrange and a 64-bit root view before the GPU run.
+            const auto indirect_root_dwords = [&](T view, UINT parameter, T action) {
+                const D3D12_INDIRECT_ARGUMENT_DESC args[] = {
+                    C(0, 1, 2), A(view, parameter), A(action)};
+                const UINT action_bytes = action == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH
+                                              ? sizeof(D3D12_DISPATCH_ARGUMENTS)
+                                              : sizeof(D3D12_DRAW_ARGUMENTS);
+                const D3D12_COMMAND_SIGNATURE_DESC desc{8 + 8 + action_bytes, 3, args, 0};
+                std::shared_ptr<const leonida::IndirectSignature> packed;
+                std::array<UINT, 2> offsets{UINT_MAX, UINT_MAX};
+                if (SUCCEEDED(rt::d3d12::build_indirect_signature(&desc, layer_root.p, packed)) && packed &&
+                    packed->arguments.size() == 3) {
+                    offsets = {packed->arguments[0].user_dword, packed->arguments[1].user_dword};
+                }
+                return offsets;
+            };
+            struct OffsetCase {
+                T view;
+                UINT parameter, graphics, compute;
+            };
+            for (const OffsetCase& c : {OffsetCase{D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW, 1, 4, 8},
+                                        OffsetCase{D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, 3, 8, 11},
+                                        OffsetCase{D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 4, 10, 13}}) {
+                EXPECT((indirect_root_dwords(c.view, c.parameter, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW) ==
+                        std::array<UINT, 2>{1, c.graphics}));
+                EXPECT((indirect_root_dwords(c.view, c.parameter, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) ==
+                        std::array<UINT, 2>{5, c.compute}));
+            }
+            // This signature fits graphics at s0..s28 but spills past compute's s4..s31 budget. It must be refused
+            // for an indirect dispatch before kNoSgpr can take part in offset arithmetic.
+            D3D12_ROOT_PARAMETER spill_param{};
+            spill_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            spill_param.Constants = {0, 0, 29};
+            Ref<ID3D12RootSignature> graphics_only_root;
+            EXPECT(make_root(1, &spill_param, graphics_only_root));
+            const D3D12_INDIRECT_ARGUMENT_DESC spill_args[] = {
+                C(0, 1, 1), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)};
+            const D3D12_COMMAND_SIGNATURE_DESC spill_desc{16, 2, spill_args, 0};
+            std::shared_ptr<const leonida::IndirectSignature> spill_signature;
+            EXPECT(rt::d3d12::build_indirect_signature(&spill_desc, graphics_only_root.p, spill_signature) ==
+                       E_NOTIMPL &&
+                   !spill_signature);
             const std::vector<SignatureCase> signature_cases = {
                 {"draw", {A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 16, false},
                 {"draw with a root signature", {A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 16, true},
@@ -577,6 +621,12 @@ int main() {
                 {"SRV on the CBV parameter", {A(D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW, 1), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 24, true},
                 {"UAV + dispatch", {A(D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 4), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 20, true},
                 {"constants + UAV + dispatch", {C(0, 0, 4), A(D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 4), A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 36, true},
+                {"constant subrange + UAV + draw",
+                 {C(0, 1, 2), A(D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 4),
+                  A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 32, true},
+                {"constant subrange + UAV + dispatch",
+                 {C(0, 1, 2), A(D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW, 4),
+                  A(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)}, 28, true},
                 {"vertex buffer + index buffer + draw indexed", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 0), A(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)}, 52, false},
                 {"vertex buffer + draw indexed, no root", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 31), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED)}, 36, false},
                 {"vertex buffer slot 32", {A(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW, 32), A(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW)}, 32, false},
