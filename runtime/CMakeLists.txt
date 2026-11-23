@@ -777,8 +777,8 @@ if(BUILD_TESTING)
     )
 
     set(attach_order_fixtures dll_attach_cycle_a dll_attach_cycle_b dll_attach_cycle_seed
-      dll_attach_failure_root dll_attach_failure_b dll_attach_failure_c)
-    foreach(target dll_attach_a dll_attach_b dll_attach_importer ${attach_order_fixtures})
+      dll_attach_failcycle_a dll_attach_failcycle_b dll_attach_failcycle_seed)
+    foreach(target dll_attach_a dll_attach_b ${attach_order_fixtures})
       if(target IN_LIST attach_order_fixtures)
         add_library(${target} SHARED test/fixtures/dll_attach_order.cpp)
       else()
@@ -793,26 +793,22 @@ if(BUILD_TESTING)
         ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
     endforeach()
     target_compile_definitions(dll_attach_a PRIVATE ATTACH_DLL_A)
-    target_compile_definitions(dll_attach_importer PRIVATE ATTACH_DLL_IMPORTER)
-    target_link_libraries(dll_attach_importer PRIVATE dll_attach_a)
     # The import-only fixtures have no relocations, so give them distinct preferred bases.
     target_link_options(dll_attach_b PRIVATE /BASE:0x181000000)
-    target_link_options(dll_attach_importer PRIVATE /BASE:0x182000000)
-    # Link B against a stand-in import library for A, then link the actual A against B.
-    set_target_properties(dll_attach_cycle_seed PROPERTIES OUTPUT_NAME dll_attach_cycle_a
-      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/cycle-seed"
-      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/cycle-seed")
-    target_compile_definitions(dll_attach_cycle_seed PRIVATE ATTACH_CYCLE_SEED)
-    target_compile_definitions(dll_attach_cycle_a PRIVATE ATTACH_CYCLE ATTACH_CYCLE_A)
-    target_compile_definitions(dll_attach_cycle_b PRIVATE ATTACH_CYCLE)
-    target_link_libraries(dll_attach_cycle_b PRIVATE dll_attach_cycle_seed)
-    target_link_libraries(dll_attach_cycle_a PRIVATE dll_attach_cycle_b)
+    # Static cycles: link B against a stand-in import library for A, then link the actual A against B. The second
+    # cycle's A returns FALSE from DllMain after B attached.
+    foreach(cycle cycle failcycle)
+      set_target_properties(dll_attach_${cycle}_seed PROPERTIES OUTPUT_NAME dll_attach_${cycle}_a
+        RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/${cycle}-seed"
+        ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}/${cycle}-seed")
+      target_compile_definitions(dll_attach_${cycle}_seed PRIVATE ATTACH_CYCLE_SEED)
+      target_compile_definitions(dll_attach_${cycle}_a PRIVATE ATTACH_CYCLE_A)
+      target_link_libraries(dll_attach_${cycle}_b PRIVATE dll_attach_${cycle}_seed)
+      target_link_libraries(dll_attach_${cycle}_a PRIVATE dll_attach_${cycle}_b)
+    endforeach()
+    target_compile_definitions(dll_attach_failcycle_a PRIVATE ATTACH_A_FAILS)
     target_link_options(dll_attach_cycle_b PRIVATE /BASE:0x183000000)
-    target_compile_definitions(dll_attach_failure_root PRIVATE ATTACH_FAILURE_ROOT)
-    target_compile_definitions(dll_attach_failure_b PRIVATE ATTACH_FAILURE_B)
-    target_link_libraries(dll_attach_failure_b PRIVATE dll_attach_failure_root dll_attach_failure_c)
-    target_link_options(dll_attach_failure_b PRIVATE /BASE:0x184000000)
-    target_link_options(dll_attach_failure_c PRIVATE /BASE:0x185000000)
+    target_link_options(dll_attach_failcycle_b PRIVATE /BASE:0x184000000)
     add_executable(dll_reentrant_attach_test
       test/dll_reentrant_attach_test.cpp
       src/pe_loader.cpp
@@ -823,8 +819,8 @@ if(BUILD_TESTING)
     target_compile_definitions(dll_reentrant_attach_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dll_reentrant_attach_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
     target_link_libraries(dll_reentrant_attach_test PRIVATE psapi)
-    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b dll_attach_importer
-      dll_attach_cycle_a dll_attach_failure_b)
+    add_dependencies(dll_reentrant_attach_test dll_attach_a dll_attach_b
+      dll_attach_cycle_a dll_attach_failcycle_a)
     set_target_properties(dll_reentrant_attach_test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}")
     add_test(NAME dll_reentrant_attach COMMAND dll_reentrant_attach_test
       WORKING_DIRECTORY "$<TARGET_FILE_DIR:dll_reentrant_attach_test>")
@@ -1275,6 +1271,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
+  add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
+  target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
+  add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
@@ -2802,6 +2802,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_clear_formats_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_clear_formats COMMAND d3d12_clear_formats_test)
     set_tests_properties(d3d12_clear_formats PROPERTIES SKIP_RETURN_CODE 77)
+
+    # SetDescriptorHeaps validation, Reset/ClearState/bundle parity, lifetime pinning, direct-index flags.
+    add_executable(d3d12_set_descriptor_heaps_test test/d3d12_set_descriptor_heaps_test.cpp)
+    target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
+    set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)

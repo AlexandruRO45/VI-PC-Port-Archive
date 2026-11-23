@@ -9,7 +9,6 @@
 namespace {
 bool mutual_load(const std::filesystem::path& dir) {
     rt::Loader loader(dir);
-    auto& importer = loader.load(dir / "dll_attach_importer.dll");
     auto& a = loader.load(dir / "dll_attach_a.dll");
     loader.initialise();
 
@@ -34,12 +33,7 @@ bool mutual_load(const std::filesystem::path& dir) {
     const bool ok = attaches_a == 1 && attaches_b == 1;
     std::printf("%s: DLL_PROCESS_ATTACH counts A=%d B=%d (expected A=1 B=1)\n",
                 ok ? "PASS" : "FAIL", attaches_a, attaches_b);
-    using DependencyReady = BOOL(WINAPI*)();
-    const auto dependency_was_ready =
-        reinterpret_cast<DependencyReady>(importer.exports.at("dependency_was_ready"));
-    const bool in_order = dependency_was_ready() != FALSE;
-    std::printf("%s: static importer observed completed attach of A\n", in_order ? "PASS" : "FAIL");
-    return ok && in_order;
+    return ok;
 }
 
 bool static_cycle(const std::filesystem::path& dir) {
@@ -54,36 +48,21 @@ bool static_cycle(const std::filesystem::path& dir) {
     return ok;
 }
 
-bool failed_dependency(const std::filesystem::path& dir) {
+// A's DllMain returns FALSE after B attached: the image stays mapped as before, so B's import of A still works.
+bool static_cycle_failing_a(const std::filesystem::path& dir) {
     rt::Loader loader(dir);
-    auto& root = loader.load(dir / "dll_attach_failure_root.dll");
-    loader.initialise();
-    using FailureChecked = int(WINAPI*)();
-    const bool ok = reinterpret_cast<FailureChecked>(root.exports.at("failure_checked"))() &&
-                    !loader.find_loaded_module("dll_attach_failure_b.dll");
-    std::printf("%s: nested load failed and startup never attached B\n", ok ? "PASS" : "FAIL");
-    return ok;
-}
-
-bool failed_retry(const std::filesystem::path& dir) {
-    rt::Loader loader(dir);
-    auto& root = loader.load(dir / "dll_attach_failure_root.dll");
-    const auto original = loader.load(dir / "dll_attach_failure_c.dll").base;
-    // Root's nested load of B reaches the already mapped C before startup would attach C.
-    SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", nullptr);
-    loader.initialise();
-    using FailureChecked = int(WINAPI*)();
-    MEMORY_BASIC_INFORMATION info{};
-    const bool unloaded = reinterpret_cast<FailureChecked>(root.exports.at("failure_checked"))() &&
-                          !loader.find_loaded_module("dll_attach_failure_c.dll") &&
-                          !loader.owns_module_handle(original) &&
-                          VirtualQuery(original, &info, sizeof info) && info.State == MEM_FREE;
-    if (!SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", L"1")) return false;
-    bool handled = false;
-    const auto retry = loader.load_runtime_module("dll_attach_failure_c.dll", 0, handled);
-    SetEnvironmentVariableW(L"LEONIDA_TEST_ATTACH_RETRY", nullptr);
-    const bool ok = unloaded && handled && retry && retry == loader.find_loaded_module("dll_attach_failure_c.dll");
-    std::printf("%s: failed pre-mapped DLL was unloaded and a fresh load succeeded\n", ok ? "PASS" : "FAIL");
+    loader.load(dir / "dll_attach_failcycle_a.dll");
+    auto& b = loader.load(dir / "dll_attach_failcycle_b.dll");
+    bool failed = false;
+    try {
+        loader.initialise();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    using CallPeer = BOOL(WINAPI*)();
+    reinterpret_cast<CallPeer>(b.exports.at("call_peer"))();
+    const bool ok = failed && loader.find_loaded_module("dll_attach_failcycle_a.dll");
+    std::printf("%s: FALSE from A in a static cycle reported, B still calls A\n", ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -112,10 +91,9 @@ int main() {
         const auto dir = std::filesystem::current_path();
         const bool mutual_ok = mutual_load(dir);
         const bool cycle_ok = static_cycle(dir);
-        const bool failure_ok = failed_dependency(dir);
-        const bool retry_ok = failed_retry(dir);
+        const bool failing_ok = static_cycle_failing_a(dir);
         const bool detach_ok = nested_detach(dir);
-        return mutual_ok && cycle_ok && failure_ok && retry_ok && detach_ok ? 0 : 9;
+        return mutual_ok && cycle_ok && failing_ok && detach_ok ? 0 : 9;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());
         return 1;

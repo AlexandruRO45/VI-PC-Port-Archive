@@ -36,8 +36,8 @@ struct Module {
     uint32_t size = 0;
     uint32_t entry_rva = 0;
     bool relocated = false;
-    bool attaching = false;  // process attach is on the stack under the loader mutex
-    std::atomic<bool> initialised{false};
+    std::atomic<bool> attaching{false};  // process attach is on the stack; a reentrant load must not attach it again
+    bool initialised = false;
 
     // The image's exception directory (.pdata), registered with RtlAddFunctionTable by load() so that exception
     // dispatch and stack walks can unwind through its frames. Removed when the loader is destroyed.
@@ -49,7 +49,6 @@ struct Module {
     bool dynamic_load = false;
 
     std::vector<ImportRecord> imports;
-    std::vector<Module*> dependencies;  // bundled imports, including forwarder targets
     std::map<std::string, void*> exports;           // by name, plus "#ordinal"
     std::map<std::string, std::string> forwarders;  // same keys, holding "module.symbol" for re-exports
 
@@ -96,7 +95,7 @@ public:
 
     // The order initialise() runs modules in: each module after every module it imports (a cycle is broken at the
     // module that closed it). modules() is mapping order, which puts an importer before its imports.
-    const std::vector<Module*>& initialisation_order() const { return attach_queue_; }
+    const std::vector<Module*>& initialisation_order() const { return init_order_; }
 
     // Runs each loaded module's TLS callbacks and then its DllMain(DLL_PROCESS_ATTACH), dependencies first.
     // Only DLLs get DllMain called: an EXE's entry point is the caller's to run. Throws on a corrupt TLS
@@ -124,34 +123,35 @@ public:
     // Run-time module lookup/loading used by the library_loader shim for bundled package DLLs.
     void* find_loaded_module(const std::string& dll_lower) const;
     void* load_runtime_module(const std::string& dll_lower, uint32_t flags, bool& handled);
+    // The same by the module's native basename (any Unicode name, matched case-insensitively as Windows matches
+    // module names), for the W entries of LoadLibrary / GetModuleHandle.
+    void* find_loaded_module_w(const std::wstring& basename) const;
+    void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
 
 private:
-    void initialise(Module& m, bool attach_dependencies = true);
-    void detach(Module& m);
-    void release_mapping(Module& m);
-    void reject_attach(Module& m);
-    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_ or names_mutex_
-    void forget_module(const std::filesystem::path& path);
+    void initialise(Module& m);
+    static void set_initialised(Module& m, bool value);
+    Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
+    Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
+    void* load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
+                                 const std::string& display);        // caller holds mutex_
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);
     void* resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal);
-    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth, std::vector<Module*>& dependencies);
+    void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
     void register_unwind(Module& m);
 
     mutable std::recursive_mutex mutex_;
     std::filesystem::path game_dir_;
-    // TLS callbacks can look up a mapped name without waiting for a load that is setting up TLS.
-    mutable std::shared_mutex names_mutex_;  // leaf lock, acquired for writes under mutex_
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
-    std::vector<Module*> attach_queue_;  // dependencies first, see initialisation_order()
-    std::vector<Module*> init_order_;    // successful attach completion order
-    std::vector<Module*> rejected_;     // owns unloaded Module records still referenced by bound dependencies
+    std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
+    std::vector<Module*> attach_done_;  // in the order process attach completed; detach runs it backwards
     int runtime_loads_ = 0;  // > 0 while a run-time load or forwarder maps modules (under mutex_): they are dynamic
 
     // What find_address reads: one entry per mapped image, added once its memory exists. Under ranges_mutex_, a leaf
