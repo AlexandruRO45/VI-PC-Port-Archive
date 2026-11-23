@@ -1354,6 +1354,32 @@ int main() {
                                         if (SUCCEEDED(cur->GetDesc(&cur_desc)) &&
                                             std::wcscmp(hod.DeviceName, cur_desc.DeviceName) == 0)
                                             found_name = true;
+                                        if (found_name && GetEnvironmentVariableW(L"LEONIDA_COMPARE_OUTPUT_COLOR", nullptr, 0)) {
+                                            IDXGIOutput6* host6 = nullptr;
+                                            IDXGIOutput6* shim6 = nullptr;
+                                            DXGI_OUTPUT_DESC1 native_color{}, shim_color{};
+                                            const bool queried =
+                                                SUCCEEDED(hout0->QueryInterface(IID_PPV_ARGS(&host6))) &&
+                                                SUCCEEDED(cur->QueryInterface(IID_PPV_ARGS(&shim6))) &&
+                                                SUCCEEDED(host6->GetDesc1(&native_color)) &&
+                                                SUCCEEDED(shim6->GetDesc1(&shim_color));
+                                            if (shim6) shim6->Release();
+                                            if (host6) host6->Release();
+                                            if (!queried || native_color.BitsPerColor != shim_color.BitsPerColor ||
+                                                native_color.ColorSpace != shim_color.ColorSpace) {
+                                                std::fprintf(stderr, "Output color mismatch: native %u bpc / %u, shim %u bpc / %u\n",
+                                                             native_color.BitsPerColor, unsigned(native_color.ColorSpace),
+                                                             shim_color.BitsPerColor, unsigned(shim_color.ColorSpace));
+                                                cur->Release();
+                                                hout0->Release();
+                                                hadp->Release();
+                                                hfac->Release();
+                                                FreeLibrary(host_dxgi);
+                                                return fail("IDXGIOutput6::GetDesc1 color differs from native DXGI");
+                                            }
+                                            std::printf("IDXGIOutput6::GetDesc1 matches native DXGI: %u bpc, color space %u\n",
+                                                        native_color.BitsPerColor, unsigned(native_color.ColorSpace));
+                                        }
                                         cur->Release();
                                     }
                                 }

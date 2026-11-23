@@ -16,6 +16,7 @@
 #include <string>
 #include <tuple>
 #include <vector>
+#include <wrl/client.h>
 
 namespace rt::dxgi {
 namespace {
@@ -876,6 +877,34 @@ void wait_for_vblank() {
 }
 
 // Win32/DXGI-backed IDXGIOutput6 reporting desktop monitor descriptors and display modes.
+bool native_output_desc(HMONITOR monitor, DXGI_OUTPUT_DESC1& desc) {
+    if (!monitor) return false;
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    static const auto create = []() -> CreateFactory {
+        const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return dxgi ? reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    }();
+    Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+    if (!create || FAILED(create(IID_PPV_ARGS(factory.GetAddressOf())))) return false;
+    for (UINT i = 0;; ++i) {
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+        if (FAILED(factory->EnumAdapters1(i, adapter.GetAddressOf()))) return false;
+        for (UINT j = 0;; ++j) {
+            Microsoft::WRL::ComPtr<IDXGIOutput> output;
+            if (FAILED(adapter->EnumOutputs(j, output.GetAddressOf()))) break;
+            DXGI_OUTPUT_DESC base{};
+            if (FAILED(output->GetDesc(&base)) || base.Monitor != monitor) continue;
+            Microsoft::WRL::ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 native{};
+            if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&native))) {
+                desc = native;
+                return true;
+            }
+        }
+    }
+}
+
+
 class Output final : public IDXGIOutput6 {
 public:
     Output(IDXGIAdapter* parent, DisplayInfo info) : parent_(parent), info_(info) {
@@ -1005,11 +1034,13 @@ public:
         std::memset(desc, 0, sizeof(*desc));
         DXGI_OUTPUT_DESC base{};
         fill_base_desc(base);
+        const bool have_native = native_output_desc(base.Monitor, *desc);
         std::memcpy(desc->DeviceName, base.DeviceName, sizeof(desc->DeviceName));
         desc->DesktopCoordinates = base.DesktopCoordinates;
         desc->AttachedToDesktop = base.AttachedToDesktop;
         desc->Rotation = base.Rotation;
         desc->Monitor = base.Monitor;
+        if (have_native) return S_OK;
         desc->BitsPerColor = 8;
         desc->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         // Standard sRGB / ITU-R BT.709 primaries and baseline SDR luminance.
