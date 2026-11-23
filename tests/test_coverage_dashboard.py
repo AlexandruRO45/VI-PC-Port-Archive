@@ -111,6 +111,66 @@ class TestCoverageDashboard(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", tool_script, "--output", out_svg, "--check"], capture_output=True, text=True)
             self.assertEqual(r.returncode, 1, "Check mode should fail if file is missing")
 
+    def test_empty_files_produce_zero_change(self):
+        """Replicate shdann's scenario: 0, 380, 381, 400 empty test files produce zero change."""
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            sem = Path(tmp) / "tests" / "semantic"
+            sem.mkdir(parents=True)
+            results = []
+            for n in (0, 380, 381, 400):
+                for i in range(n):
+                    (sem / f"test_{i}.py").touch()
+                cov = coverage_dashboard.get_rdna2_coverage(tmp)
+                vop3_cov = cov["categories"][0][1]
+                vop3_tot = cov["categories"][0][2]
+                results.append((n, vop3_cov, vop3_tot, cov["covered"], cov["total"]))
+
+            # Assert VOP3 and total counts are completely identical across all empty file counts
+            baseline = results[0]
+            for n, v_cov, v_tot, t_cov, t_tot in results:
+                self.assertEqual(v_cov, baseline[1], f"VOP3 covered drifted at n={n}: {v_cov} vs {baseline[1]}")
+                self.assertEqual(v_tot, baseline[2], f"VOP3 total drifted at n={n}: {v_tot} vs {baseline[2]}")
+                self.assertEqual(t_cov, baseline[3], f"Total covered drifted at n={n}: {t_cov} vs {baseline[3]}")
+                self.assertEqual(t_tot, baseline[4], f"Total forms drifted at n={n}: {t_tot} vs {baseline[4]}")
+
+    def test_unrelated_code_and_comments_produce_zero_change(self):
+        """Verify that Python comments, docstrings, or non-opcode variables produce zero change."""
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            sem = Path(tmp) / "tests" / "semantic"
+            sem.mkdir(parents=True)
+            base_cov = coverage_dashboard.get_rdna2_coverage(tmp)
+
+            # File with comments, docstring, and arbitrary python
+            (sem / "test_unrelated.py").write_text(
+                '# Just a comment\n"""Module docstring with words."""\nx = 100\ndef helper():\n    return x\n',
+                encoding="utf-8"
+            )
+            new_cov = coverage_dashboard.get_rdna2_coverage(tmp)
+            self.assertEqual(base_cov["categories"], new_cov["categories"])
+            self.assertEqual(base_cov["covered"], new_cov["covered"])
+
+    def test_genuine_lowered_opcode_exercises_category(self):
+        """Verify that genuine unexercised lowered RDNA2 opcodes increment their respective category."""
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            sem = Path(tmp) / "tests" / "semantic"
+            sem.mkdir(parents=True)
+            base_cov = coverage_dashboard.get_rdna2_coverage(tmp)
+
+            trans_ops = coverage_dashboard.get_translator_lowered_opcodes()
+            unexercised_vop3 = [
+                op for op in trans_ops
+                if coverage_dashboard.classify_rdna2_instruction(op) == "VOP3"
+                and op not in coverage_dashboard._BASE_EXERCISED_OPCODES
+            ]
+            if unexercised_vop3:
+                target_op = unexercised_vop3[0]
+                (sem / "test_new_vop3.py").write_text(f'asm = ["{target_op} v0, v1, v2"]\n', encoding="utf-8")
+                new_cov = coverage_dashboard.get_rdna2_coverage(tmp)
+                self.assertEqual(new_cov["categories"][0][1], base_cov["categories"][0][1] + 1)
+
 
 if __name__ == "__main__":
     unittest.main()

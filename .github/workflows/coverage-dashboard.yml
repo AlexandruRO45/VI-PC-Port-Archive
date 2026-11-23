@@ -30,10 +30,12 @@ jobs:
           python-version: '3.12'
 
       - name: Regenerate coverage dashboard SVG
+        shell: bash
         run: |
           python3 -I tools/coverage_dashboard.py --output docs/coverage/dashboard.svg
 
       - name: Commit and push if changed
+        shell: bash
         run: |
           if ! git diff --quiet docs/coverage/dashboard.svg; then
             git config user.name "github-actions[bot]"

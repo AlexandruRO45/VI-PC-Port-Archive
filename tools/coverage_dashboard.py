@@ -50,55 +50,183 @@ def get_git_metadata(repo_root=REPO_ROOT):
     return commit_sha, commit_date
 
 
+MNEMONIC = re.compile(r"^((s|v|ds|buffer|tbuffer|global|flat|scratch|image)(_[a-z0-9]+)+|exp)$")
+
+BASE_RDNA2_CATALOG = [
+    # (Category, BaselineCovered, Total)
+    ("VOP3", 150, 425),
+    ("SDWA", 54, 220),
+    ("FLAT", 0, 133),
+    ("MIMG", 3, 111),
+    ("DPP8", 43, 100),
+    ("VOP1", 34, 81),
+    ("MUBUF", 0, 73),
+    ("SOP2", 51, 51),
+    ("VOP2", 30, 47),
+    ("SOPP", 6, 37),
+    ("SOPK", 22, 27),
+    ("SOP1", 31, 65),
+    ("DS", 0, 154),
+    ("SMEM", 5, 84),
+    ("VOPC", 62, 190),
+]
+
+BASE_RDNA2_SMALL_ITEMS = [
+    ("VOP3P", 29, 29),
+    ("SOPC", 18, 18),
+    ("MTBUF", 0, 16),
+    ("VINTRP", 2, 3),
+    ("EXP", 1, 1),
+]
+
+
+def classify_rdna2_instruction(op):
+    """Classify an RDNA2 opcode mnemonic into its instruction family category."""
+    op = op.lower()
+    if op.endswith("_sdwa"):
+        return "SDWA"
+    if op.endswith("_dpp8") or op.endswith("_dpp16") or op.endswith("_dpp"):
+        return "DPP8"
+    if op.startswith("ds_"):
+        return "DS"
+    if op.startswith("buffer_"):
+        return "MUBUF"
+    if op.startswith("tbuffer_"):
+        return "MTBUF"
+    if op.startswith("image_"):
+        return "MIMG"
+    if op.startswith("flat_") or op.startswith("global_") or op.startswith("scratch_"):
+        return "FLAT"
+    if op == "exp":
+        return "EXP"
+    if op.startswith("v_interp_"):
+        return "VINTRP"
+    if op.startswith("v_cmp_") or op.startswith("v_cmpx_"):
+        return "VOPC"
+    if op.startswith("v_pk_"):
+        return "VOP3P"
+    if op.startswith("s_cmp_"):
+        return "SOPC"
+    if op.startswith("s_load_") or op.startswith("s_buffer_load_"):
+        return "SMEM"
+    if (op.startswith("s_cbranch_") or op.startswith("s_branch") or
+        op.startswith("s_endpgm") or op in ("s_nop", "s_waitcnt", "s_barrier", "s_trap", "s_sethalt", "s_sleep")):
+        return "SOPP"
+    if op.startswith("s_movk_") or op.startswith("s_setreg_") or op.startswith("s_getreg_"):
+        return "SOPK"
+    if op.startswith("s_"):
+        if any(op.startswith(p) for p in (
+            "s_add_", "s_sub_", "s_and_", "s_or_", "s_xor_", "s_nand_", "s_nor_",
+            "s_xnor_", "s_lshl_", "s_lshr_", "s_ashr_", "s_mul_", "s_bfe_", "s_bfm_"
+        )):
+            return "SOP2"
+        return "SOP1"
+    if op.startswith("v_"):
+        if any(op.startswith(p) for p in (
+            "v_add3_", "v_lshl_add_", "v_fma_", "v_mad_", "v_alignbit_", "v_alignbyte_", "v_cube", "v_perm_"
+        )) or op.endswith("_e64"):
+            return "VOP3"
+        if any(op.startswith(p) for p in (
+            "v_mov_", "v_not_", "v_bfrev_", "v_cls_", "v_clz_", "v_ctz_", "v_fract_",
+            "v_trunc_", "v_ceil_", "v_floor_", "v_round_", "v_rcp_", "v_rsq_",
+            "v_sqrt_", "v_exp_", "v_log_"
+        )):
+            return "VOP1"
+        return "VOP2"
+    return None
+
+
+def extract_exercised_semantic_opcodes(semantic_dir):
+    """Extract distinct genuine RDNA2 instruction mnemonics exercised in non-empty semantic test fixtures."""
+    exercised = set()
+    if not os.path.isdir(semantic_dir):
+        return exercised
+
+    for fname in os.listdir(semantic_dir):
+        if not (fname.startswith("test_") and fname.endswith(".py")):
+            continue
+        fpath = os.path.join(semantic_dir, fname)
+        try:
+            if os.path.getsize(fpath) == 0:
+                continue
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            if not content.strip():
+                continue
+            for word in re.findall(r"\b[a-z0-9_]+\b", content.lower()):
+                if MNEMONIC.match(word):
+                    exercised.add(word)
+        except Exception:
+            continue
+    return exercised
+
+
+def get_translator_lowered_opcodes(repo_root=REPO_ROOT):
+    """Extract opcodes lowered/handled by tools/rdna2spirv.py."""
+    translator_path = os.path.join(repo_root, "tools", "rdna2spirv.py")
+    if not os.path.exists(translator_path):
+        translator_path = os.path.join(REPO_ROOT, "tools", "rdna2spirv.py")
+    if not os.path.exists(translator_path):
+        return set()
+
+    opcodes = set()
+    try:
+        with open(translator_path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+        for word in re.findall(r"\b[a-z0-9_]+\b", content.lower()):
+            if MNEMONIC.match(word):
+                opcodes.add(word)
+    except Exception:
+        pass
+    return opcodes
+
+
+# Cache base exercised opcodes from the real repository fixtures
+_REPO_SEMANTIC_DIR = os.path.join(REPO_ROOT, "tests", "semantic")
+_BASE_EXERCISED_OPCODES = extract_exercised_semantic_opcodes(_REPO_SEMANTIC_DIR)
+
+
 def get_rdna2_coverage(repo_root=REPO_ROOT):
-    """Collect GFX1030 (RDNA2) instruction-form coverage."""
-    # Standard catalog of GFX1030 forms and their baselines
-    catalog = [
-        # (Category, Covered, Total)
-        ("VOP3", 150, 425),
-        ("SDWA", 54, 220),
-        ("FLAT", 0, 133),
-        ("MIMG", 3, 111),
-        ("DPP8", 43, 100),
-        ("VOP1", 34, 81),
-        ("MUBUF", 0, 73),
-        ("SOP2", 51, 51),
-        ("VOP2", 30, 47),
-        ("SOPP", 6, 37),
-        ("SOPK", 22, 27),
-        ("SOP1", 31, 65),
-        ("DS", 0, 154),
-        ("SMEM", 5, 84),
-        ("VOPC", 62, 190),
-    ]
+    """Collect GFX1030 (RDNA2) instruction-form coverage.
 
-    small_items = [
-        ("VOP3P", 29, 29),
-        ("SOPC", 18, 18),
-        ("MTBUF", 0, 16),
-        ("VINTRP", 2, 3),
-        ("EXP", 1, 1),
-    ]
+    Empty, comment-only, or unrelated Python files produce zero changes.
+    Only distinct lowered RDNA2 instruction forms actually exercised by test fixtures
+    contribute to instruction coverage.
+    """
+    catalog = [list(item) for item in BASE_RDNA2_CATALOG]
+    cat_map = {item[0]: idx for idx, item in enumerate(catalog)}
 
-    # Dynamically verify semantic test additions
+    small_items = [list(item) for item in BASE_RDNA2_SMALL_ITEMS]
+    small_map = {item[0]: idx for idx, item in enumerate(small_items)}
+
     semantic_dir = os.path.join(repo_root, "tests", "semantic")
     if os.path.isdir(semantic_dir):
-        extra_tests = len([f for f in os.listdir(semantic_dir) if f.startswith("test_") and f.endswith(".py")])
-        # Base count was 380 semantic tests; extra tests add to verified rules
-        if extra_tests > 380:
-            bonus = min(extra_tests - 380, 20)
-            # Credit to VOP3
-            catalog[0] = ("VOP3", catalog[0][1] + bonus, catalog[0][2])
+        exercised = extract_exercised_semantic_opcodes(semantic_dir)
+        translator_ops = get_translator_lowered_opcodes(repo_root)
 
-    tot_cov = sum(c for _, c, _ in catalog) + sum(c for _, c, _ in small_items)
-    tot_all = sum(t for _, _, t in catalog) + sum(t for _, _, t in small_items)
+        # Genuine newly exercised lowered opcodes beyond base fixtures
+        new_ops = (exercised & translator_ops) - _BASE_EXERCISED_OPCODES
+        for op in sorted(new_ops):
+            group = classify_rdna2_instruction(op)
+            if group in cat_map:
+                idx = cat_map[group]
+                catalog[idx][1] = min(catalog[idx][2], catalog[idx][1] + 1)
+            elif group in small_map:
+                idx = small_map[group]
+                small_items[idx][1] = min(small_items[idx][2], small_items[idx][1] + 1)
+
+    catalog_tuples = [(c[0], c[1], c[2]) for c in catalog]
+    small_tuples = [(s[0], s[1], s[2]) for s in small_items]
+
+    tot_cov = sum(c for _, c, _ in catalog_tuples) + sum(c for _, c, _ in small_tuples)
+    tot_all = sum(t for _, _, t in catalog_tuples) + sum(t for _, _, t in small_tuples)
     return {
         "title": "gfx1030 (RDNA2) forms",
         "covered": tot_cov,
         "total": tot_all,
         "skipped": 0,
-        "categories": catalog,
-        "small_items": small_items,
+        "categories": catalog_tuples,
+        "small_items": small_tuples,
     }
 
 
