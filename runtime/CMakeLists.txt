@@ -802,6 +802,8 @@ if(BUILD_TESTING)
   endif()
   if(TARGET xs_proxy_mock_test)
     add_test(NAME xs_proxy_mock COMMAND xs_proxy_mock_test)
+    add_test(NAME xs_proxy_mock_slots COMMAND xs_proxy_mock_test --env-slots)
+    add_test(NAME xs_proxy_mock_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
     # The guard region's setup failing (one process each: the tables are built once per process).
     add_test(NAME xs_proxy_mock_no_reserve COMMAND xs_proxy_mock_test --fail-virtualalloc)
     add_test(NAME xs_proxy_mock_no_protect COMMAND xs_proxy_mock_test --fail-virtualprotect)

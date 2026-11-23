@@ -14,11 +14,13 @@ namespace rt::d3d12 {
 
 struct XboxPresentPlaneParameters;
 
-// The queue slots named by LEONIDA_PRESENTX_SLOT, LEONIDA_PRESENTX_SUSPEND_SLOT and LEONIDA_PRESENTX_RESUME_SLOT.
-// 0 means "not configured". Read once, on the first queue call past the public chain, so the feature is inert
-// (a branch that is not taken) when the variables are unset.
+// The queue slots named by LEONIDA_PRESENTX_SLOT, LEONIDA_PRESENTX_SLOT_ALT, LEONIDA_PRESENTX_SUSPEND_SLOT and
+// LEONIDA_PRESENTX_RESUME_SLOT. 0 means "not configured". The public HLE reports PresentX at both 30 and 32; with
+// LEONIDA_CAPTURE set those two are the defaults, so a first capture run needs no other variable. Read once, on the
+// first queue call past the public chain, so the feature is inert (a branch that is not taken) when unset.
 struct PresentXRouteConfig {
     unsigned present_slot = 0;
+    unsigned present_slot_alt = 0;
     unsigned suspend_slot = 0;
     unsigned resume_slot = 0;
 };

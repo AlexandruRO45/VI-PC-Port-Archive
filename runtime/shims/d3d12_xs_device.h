@@ -7,6 +7,17 @@
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
+//             D3D12_COMMAND_QUEUE_DESC's (public HLE).
+//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
+//             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
+//             in the console call (public HLE; the PC six-argument form differs).
+//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
+//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
+//             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+// The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
+// be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
+// LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
 //   slot 13   CheckFeatureSupport keeps the PC signature, but a D3D12_OPTIONS request with a structure larger than
 //             the PC's (0x40 against 0x3C, measured on a retail console title) is answered from the PC runtime's
 //             structure with the extra bytes zeroed; the PC runtime refuses that size. See d3d12_console_feature.h.
@@ -21,16 +32,18 @@
 // wrapper and compares it with a hidden-pointer call against the real heap.
 //
 // Every other PC device slot is forwarded by a generated thunk that swaps `this` to the PC device. The proxy's
-// vtable therefore follows the PC device order, with slots 62 and 76 deliberately shadowed. The full Xbox vtable
-// order is not known from the spec; slots beyond the PC device's own vtable return E_NOTIMPL and log once.
+// vtable therefore follows the PC device order, with slots 62 and 76 and the public HLE's 48/73/78/79/80 deliberately
+// shadowed. The full Xbox vtable order is not known from the spec; slots beyond the PC device's own vtable return
+// E_NOTIMPL and log once.
 //
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
+// first four argument words and refused with E_NOTIMPL. The public HLE reports PresentX at queue 30 and 32: those are
+// routed when LEONIDA_PRESENTX_SLOT names one (or both, under LEONIDA_CAPTURE), otherwise they are refused like any
+// other tail slot. A slot past the table faults on the vtable read inside a reserved, never-committed region, and the
+// fault is logged with the slot. That the console keeps the public slots is an assumption
+// (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
 // (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
@@ -82,8 +95,9 @@ ID3D12Device* device_proxy_real_device(const void* device);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14, 31/34/35/45/46/50 (proxies unwrapped),
-// 32 and 36 (fence proxies), 62, 67 and 76. Slot 10 is intentionally false: the measured 9/10 handle conversion is on
-// the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy handles for the allocator proxy.
+// 32 and 36 (fence proxies), 48/73 and 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76.
+// Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
