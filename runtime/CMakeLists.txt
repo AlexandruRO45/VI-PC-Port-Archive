@@ -2122,6 +2122,8 @@ if(TARGET Vulkan::Headers)
                                  LEONIDA_TEST_VRS_PS_SPV="${LEONIDA_TEST_VRS_PS}"
                                  LEONIDA_TEST_VRS_PS_DEPTH_SPV="${LEONIDA_TEST_VRS_PS_DEPTH}")
       target_compile_options(d3d12_vrs_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_vrs COMMAND d3d12_vrs_test)
+      set_tests_properties(d3d12_vrs PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "glslangValidator not found: d3d12_compute_test, d3d12_draw_test, d3d12_set0_compute_test and d3d12_vrs_test are not built")
     endif()

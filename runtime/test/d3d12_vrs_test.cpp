@@ -16,7 +16,7 @@
 // A device with less than 144 bytes of push constants refuses every PSO until #224's uniform-buffer tail exists;
 // there only the feature answers and the Close results are checked, and the test says so.
 // The shaders are GLSL written to the translator's contract; no game data. LEONIDA_VK_VALIDATION=1 runs the test
-// under VK_LAYER_KHRONOS_validation.
+// under VK_LAYER_KHRONOS_validation. ctest runs it as d3d12_vrs; without a usable Vulkan device it skips (77).
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -93,7 +93,12 @@ bool host_options(const LUID& luid, D3D12_FEATURE_DATA_D3D12_OPTIONS6& options6,
 int run(const std::filesystem::path& library, const std::vector<std::uint8_t>& vs, const std::vector<std::uint8_t>& ps,
         const std::vector<std::uint8_t>& ps_depth, bool shading_rate) {
     vktest::Device d;
-    EXPECT(d.create(false, shading_rate));
+    const auto device_status = d.initialize(false, shading_rate);
+    if (device_status == vktest::DeviceStatus::unavailable) {
+        std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
+        return 77;
+    }
+    EXPECT(device_status == vktest::DeviceStatus::ready);
     std::printf("%s VK_KHR_fragment_shading_rate (pipeline %d, attachment %d)\n", shading_rate ? "with" : "without",
                 d.fragment_shading_rate, d.attachment_fragment_shading_rate);
     if (shading_rate && !d.fragment_shading_rate) {
