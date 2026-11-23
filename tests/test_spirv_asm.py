@@ -177,6 +177,45 @@ class SpirvAsmUnitTests(unittest.TestCase):
             self.assertEqual(len(words), len(ref_words))
             self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
 
+    def test_intel_alias_declarations_take_the_optional_name(self):
+        # SPV_INTEL_memory_access_aliasing: both declarations end in an optional IdRef naming the
+        # alias domain or scope. spirv-as accepts it, spirv-dis prints it, and the table must too.
+        asm = (
+            "OpCapability Shader\n"
+            "OpCapability MemoryAccessAliasingINTEL\n"
+            'OpExtension "SPV_INTEL_memory_access_aliasing"\n'
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%uint = OpTypeInt 32 0\n"
+            "%n = OpConstant %uint 7\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "%d_plain = OpAliasDomainDeclINTEL\n"
+            "%d_named = OpAliasDomainDeclINTEL %n\n"
+            "%s_plain = OpAliasScopeDeclINTEL %n\n"
+            "%s_named = OpAliasScopeDeclINTEL %n %n\n"
+            "%list = OpAliasScopeListDeclINTEL %n %n\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(asm, target_env="vulkan1.2")
+        _validate(spv)
+        words = struct.unpack(f"<{len(spv) // 4}I", spv)
+        self.assertIn(0x00031717, words)   # %d_named: opcode, result id, name
+        self.assertIn(0x00041718, words)   # %s_named: opcode, result id, required id, name
+        if SPIRV_AS:
+            with tempfile.TemporaryDirectory() as d:
+                sa, sv = os.path.join(d, "m.spvasm"), os.path.join(d, "m.spv")
+                with open(sa, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(asm)
+                subprocess.run([SPIRV_AS, sa, "-o", sv, "--target-env", "vulkan1.2"], check=True)
+                with open(sv, "rb") as f:
+                    ref_words = struct.unpack(f"<{os.path.getsize(sv) // 4}I", f.read())
+            self.assertEqual(words[:2] + words[3:], ref_words[:2] + ref_words[3:])
+
     def test_translated_shaders_validate_and_match_spirv_as(self):
         # Translate diverse synthetic shaders (PS ALU/dot4/f16/branches, CS LDS/atomics/wave64-emulate)
         # and verify every binary assembled by spirv_asm passes spirv-val.
