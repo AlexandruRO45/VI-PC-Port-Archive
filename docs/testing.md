@@ -109,6 +109,22 @@ python -I runtime/test/shaders/check.py <out dir> <unzipped runtime-windows>
 
 The artifact belongs to the commit that built it, so run the scripts from that commit as well (see the note above).
 
+#### Run one test from the Windows artifact
+
+For a focused GPU check without building locally, extract the artifact and open
+PowerShell in the directory containing the test executable. Keep the extracted
+files together so the test can find any fixtures relative to that directory.
+For example, to run the synthetic depth/stencil resolve test without game files:
+
+```powershell
+.\d3d12_depth_resolve_test.exe
+Write-Output "Test exit code: $LASTEXITCODE"
+```
+
+Report the executable name, the workflow run and its commit, your GPU and driver,
+the exit code, and the test summary in [#166](https://github.com/ItsNotRexed/Leonida/issues/166).
+Label it as a single-test run so the result is easy to distinguish from a full suite run.
+
 ## Run them
 
 The whole suite, assembled, translated and run in one go:
@@ -352,7 +368,10 @@ Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not
 runs them anyway, set `LEONIDA_MESH_COMPUTE=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1` on a
 32-wide GPU (every mesh shader is wave64). The mesh shaders are then translated with `--mesh-compute`, dispatched as
 compute and drawn by a generated vertex shader (`docs/design.md`, "Mesh shaders as compute"), so the device needs
-`bufferDeviceAddress` and `shaderInt64` instead.
+`bufferDeviceAddress` instead, and `shaderInt64` for a module that declares `Int64`. The standalone tools
+(`vk_harness`, `vk_compute_test`, `vk_texture_test`, `vk_store_test`, `vk_bindless_test`) read the modules'
+capabilities first: they enable `shaderInt64` only for one that declares `Int64` (or `Int64Atomics`), and report 77
+(SKIP, with the reason) when the device lacks it.
 
 ## Without a GPU: Mesa llvmpipe
 

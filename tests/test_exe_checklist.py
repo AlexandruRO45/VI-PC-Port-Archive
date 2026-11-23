@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -100,14 +101,44 @@ class ExeChecklist(unittest.TestCase):
             self.assertEqual(ec.main(["--root", self.root, "--gdk-calls", os.path.join(self.root, "missing.json")]), 1)
         self.assertIn("cannot read", stderr.getvalue())
 
+    def assert_report_output_rejected(self, reports, output):
+        original = [report.read_bytes() for report in reports]
+        args = ["--root", self.root, "--out", str(output)]
+        for report in reports:
+            args.extend(["--gdk-calls", str(report)])
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                ec.main(args)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("would overwrite", stderr.getvalue())
+        self.assertEqual([report.read_bytes() for report in reports], original)
+
+    def test_out_cannot_overwrite_any_input_report(self):
+        first = Path(self.root, "first.json")
+        second = Path(self.root, "second.json")
+        first.write_bytes(b'{"classes": []}')
+        second.write_bytes(b'{"images": []}')
+        self.assert_report_output_rejected([first, second], second)
+
+    def test_out_cannot_overwrite_a_hard_link_to_an_input_report(self):
+        report = Path(self.root, "report.json")
+        alias = Path(self.root, "output.md")
+        report.write_bytes(b'{"classes": []}')
+        try:
+            os.link(report, alias)
+        except (OSError, NotImplementedError) as err:
+            self.skipTest(f"hard links unavailable: {err}")
+        self.assert_report_output_rejected([report], alias)
+
     def test_this_repository(self):
         notes = ec.collect(ROOT)
         self.assertTrue(notes)
         for n in notes:
             self.assertTrue(n["text"].strip(), n)
             self.assertGreater(n["line"], 0)
-        # the store shim's unverified sizes are on the list, from the source and from the docs
-        self.assertTrue(any(n["file"] == "runtime/shims/xgameruntime_store.cpp" and "STORE_SKU_ID_SIZE" in n["text"]
+        # the store shim's remaining unverified sizes (SKU_ID_SIZE, trial-id bound) are on the list
+        self.assertTrue(any(n["file"] == "runtime/shims/xgameruntime_store.cpp" and "SKU_ID_SIZE" in n["text"]
                             for n in notes))
         self.assertTrue(any(n["file"] == "docs/runtime_imports.md" and n["kind"] == "UNVERIFIED" for n in notes))
 
