@@ -648,8 +648,10 @@ noperspective on SV_Position), flat otherwise. Synthetic tests: `tests/test_ps_i
 
 ## Baseline already recorded
 
-- `reports/manifest.json`: SHA-256 of all 108 files in `Documents\GTA6` (208.5 GiB). Run
-  `python -I tools\manifest.py verify <game>` to check a copy against it.
+- `reports/manifest.json`: SHA-256 of all 108 files in `Documents\GTA6` (208.5 GiB). The same table is
+  tracked as `game/xbox-1.0.2.1.json`, so a copy is checked with
+  `python -I tools\manifest.py verify <game> --manifest game\xbox-1.0.2.1.json` (`reports/` is a local run's
+  folder and is not in the repository).
 - `reports/rpf_probe.json`: all 22 archives are **RPF9**. Five have tables that look packed or encrypted (`levels`,
   `movies`, `core_bvh4`, `navmeshes`, `data`).
 - `reports/pe/`: the 16 bundled DLLs are plain x86-64 PE with no encrypted sections. Through the loader their
