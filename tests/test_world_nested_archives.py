@@ -1,6 +1,7 @@
 """Nested RPF9 resources reach the world readers through synthetic CLI inputs."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -88,6 +89,31 @@ class NestedArchivesTest(unittest.TestCase):
         self.assertEqual({row["source"] for row in doc["archetypes"]}, expected)
         found = I.T.scan(str(self.input))
         self.assertEqual(set(found), expected)
+
+    @unittest.skipUnless(os.sep == "/", "literal backslashes require POSIX filenames")
+    def test_literal_backslash_archive_name_keeps_a_distinct_source_key(self):
+        expected = set()
+        for name, data in ((r"north\scene.rpf", I.interiors()), ("north/scene.rpf", I.placements())):
+            _, spans = self.archive(name, [data])
+            expected.add(f"{name}/{spans[0][0]:012x}")
+        resources = list(F.WA.iter_resources(str(self.input)))
+        self.assertEqual(len(resources), 2)
+        with self.subTest(reader="iterator"):
+            self.assertEqual({row["file"] for row, _ in resources}, expected)
+        with self.subTest(reader="interiors"):
+            found = I.T.scan(str(self.input))
+            self.assertEqual(set(found), expected)
+            self.assertEqual(sum(len(defs) for defs, _ in found.values()), 2)
+            self.assertEqual(sum(len(placements) for _, placements in found.values()), 3)
+
+        names = self.root / "names.json"
+        names.write_text(json.dumps(I.NAMES), encoding="utf-8", newline="\n")
+        output = self.root / "interiors.json"
+        self.cli("world_interior_names.py", self.input, "--names", names, "--out", output)
+        summary = json.loads(output.read_text(encoding="utf-8"))["summary"]
+        self.assertEqual(summary["interior_definitions"], 2)
+        self.assertEqual(summary["placements"], 3)
+        self.assertEqual(summary["keys_naming_an_interior"], 2)
 
     def test_archives_and_actual_carved_files_are_each_read_once(self):
         self.archive("scene.rpf", [F.maptypes([(F.ROCK, 2, *F.ROCK_BOX)])])

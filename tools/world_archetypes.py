@@ -151,7 +151,7 @@ def iter_resources(path, start=None, limit=None):
             # retaining its position among carved resources, and map the archive only once for all its rows.
             for _ in range(len(selected) - 1):
                 next(row_iter)
-            source = os.path.relpath(p, path).replace("\\", "/")
+            source = os.path.relpath(p, path).replace(os.sep, "/")
             for row, data in _archive_resources(p, selected):
                 # Source keys must distinguish resources within an archive and equal offsets in different
                 # archives. This virtual child of a regular file cannot name a carved file in the same tree.

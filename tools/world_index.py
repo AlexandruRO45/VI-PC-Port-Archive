@@ -496,6 +496,7 @@ def scan_path(path, start=None, limit=None, max_inflate=CAP, collect=None, *, di
     """Scan an RPF9 archive, or every carved file in a directory.
 
     ``on_archive(path, rows)`` optionally receives the rows of each archive reached in a directory scan.
+    The same row objects are appended contiguously to the result in their existing order.
     Continuation files already consumed by a carved resource are not reconsidered as archives.
     """
     if directory_files is not None or os.path.isdir(path):
