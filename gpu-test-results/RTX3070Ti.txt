@@ -1,0 +1,15 @@
+GPU:        NVIDIA GeForce RTX 3070 Ti (Ampere, 8 GB), subgroup 32..32
+Driver:     NVIDIA 621.01 (driverVersion 621.1.0.0), Vulkan 1.4.357
+Subgroup:   32..32
+OS:         Windows 11 Pro 10.0.26300
+Commit:     dde82f27e (main, 2026-11-23)
+Tools:      llvm-mc 21.1.8 (scripts/build_llvm_mc.ps1), SPIRV-Tools v2026.4 (Vulkan SDK 1.4.363.0), CMake 3.31.6-msvc6 + Ninja from VS 2022 Build Tools (scripts/build_runtime.ps1, RelWithDebInfo), Python 3.15.0
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (6 mesh fixtures not built: ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3)
+check.py:   176 of 211 pass, 35 skipped
+run_gpu_tests.py: native 192/241 passed, 48 skipped, 1 failed; LEONIDA_W64_EMULATE=1 223/241 passed, 17 skipped, 1 failed
+Failed:     ms_wave_info_s3: at (0,0) got (-1,-1,-1,-1), want (0.0078,0.0078,0.5,1.0), native and emulated. Not flaky here: 3 of 3 isolated --filter reruns fail the same way. Same signature as #6172 (round-44 mesh regression, fixed by #5741/#5855) and as the flaky RX 9070 GRE entry; docs/testing.md (llvmpipe note, #3838) records NVIDIA giving the expected frame for this test earlier, so this may be a regression on NVIDIA.
+Skipped:    the expected ones for a 32-wide device (wave64 tests without emulation, 64-wide fragment subgroup not available) and the documented "run by d3d12_*_test" cases.
+Notes:
+- 247/247 shaders translated and passed spirv-val inside run_gpu_tests.py (native and emulated runs).
+- PC (tools/pc_checker.py --cli --check): Intel Core i5-14400F, NVIDIA GeForce RTX 3070 Ti (8 GB VRAM), 32 GB RAM.
+- AI-assisted (Claude Code): built main at dde82f27e, ran build.py, check.py and run_gpu_tests.py (native + emulated) on this GPU, and the isolated reruns of the one failure.
