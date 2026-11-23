@@ -104,8 +104,10 @@ def pixel_inputs(blob):
     """Return the pixel-input records as dicts, in table order.
 
     Keys: semantic, mask, index, slot, flags.  An empty list means the blob has no table (the byte
-    at 0x138 is not 6) or the blob is too short to hold one.
+    at 0x138 is not 6), is too short to hold one, or does not begin with the FSSM magic.
     """
+    if blob[:4] != MAGIC:
+        return []
     out = []
     offset = TABLE_OFFSET
     while offset + RECORD_SIZE <= len(blob) and blob[offset] == RECORD_KIND:
@@ -147,7 +149,7 @@ def read_name(method):
 
 def directory_ok(blob):
     """True when offset + size == next offset in the section directory (0x120/0x12C/0x130)."""
-    if len(blob) < DIRECTORY_NEXT + 4:
+    if len(blob) < DIRECTORY_NEXT + 4 or blob[:4] != MAGIC:
         return False
     return _u32(blob, DIRECTORY_OFFSET) + _u32(blob, DIRECTORY_SIZE) == _u32(blob, DIRECTORY_NEXT)
 
@@ -182,17 +184,19 @@ def binding_table(blob):
     bytes after the name, which are not parsed here.  None means the tail is shorter than the
     layout, lacks the filler or sentinel, or has a malformed length or prefix.
     """
-    if len(blob) < CODE_END + 8:
+    if len(blob) < CODE_END + 8 or blob[:4] != MAGIC:
         return None
     code_end = _u64(blob, CODE_END)
     if code_end == CODE_END_UNSET:
         code_end = _u64(blob, CODE_OFFSET) + _u64(blob, CODE_SIZE)
     start = code_end + TAIL_PAD
-    if code_end > len(blob) or start + TAIL_HEADER > len(blob):
+    if code_end < CODE_END + 8 or code_end > len(blob) or start + TAIL_HEADER > len(blob):
         return None
     if blob[code_end:start] != struct.pack("<I", TAIL_FILLER) * 4:
         return None
-    header = _u32(blob, start)
+    header, header_zero = struct.unpack_from("<II", blob, start)
+    if header_zero != 0:
+        return None
     offset = start + TAIL_HEADER
     records = []
     while offset + BINDING_SIZE <= len(blob) and _u32(blob, offset) != BINDING_SENTINEL:
@@ -255,7 +259,7 @@ def files_of(path):
     return [
         full
         for name in sorted(os.listdir(path))
-        if name.endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
+        if name.lower().endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
     ]
 
 

@@ -96,6 +96,16 @@ class PixelInputTest(unittest.TestCase):
         b = blob([record(1, 0xF, 0, 0, 0x02), record(2, 0xF, 1, 1, 0x08)])
         self.assertEqual(fssm_header.interpolants(b), (2, 0))
 
+    def test_non_fssm_blob_has_no_records(self):
+        # A zero-prefixed synthetic header or non-FSSM buffer whose byte 0x138 happens to be 6
+        # (e.g. a compute header's PGM_RSRC2 low byte) must not be read as a pixel-input table.
+        non_fssm = bytearray(blob([record(1, 0xF, 0, 0, 0x12)]))
+        non_fssm[0:4] = b"\x00\x00\x00\x00"
+        self.assertEqual(fssm_header.pixel_inputs(bytes(non_fssm)), [])
+        self.assertEqual(fssm_header.interpolants(bytes(non_fssm)), (0, 0))
+        non_fssm[0:4] = b"NOPE"
+        self.assertEqual(fssm_header.pixel_inputs(bytes(non_fssm)), [])
+
 
 class ReadMethodTest(unittest.TestCase):
     """Flags bits 0-1, the read method: 1 = v_interp_mov (flat), 2 = v_interp_p1/p2 (interpolated); SHADER-181."""
@@ -135,6 +145,13 @@ class DirectoryTest(unittest.TestCase):
 
     def test_short_blob_is_not_ok(self):
         self.assertFalse(fssm_header.directory_ok(b"FSSM"))
+
+    def test_non_fssm_blob_is_not_ok(self):
+        # An all-zero non-FSSM buffer has 0 + 0 == 0 at 0x120/0x12C/0x130, which is not a valid FSSM directory.
+        self.assertFalse(fssm_header.directory_ok(bytes(0x148)))
+        bad_magic = bytearray(blob(directory=(0x100, 0x20, 0x120)))
+        bad_magic[0:4] = b"NOPE"
+        self.assertFalse(fssm_header.directory_ok(bytes(bad_magic)))
 
 
 class WaveSizeTest(unittest.TestCase):
@@ -219,6 +236,26 @@ class BindingTableTest(unittest.TestCase):
     def test_short_blob_is_rejected(self):
         self.assertIsNone(fssm_header.binding_table(b"FSSM"))
 
+    def test_non_fssm_magic_is_rejected(self):
+        bad_magic = bytearray(tail_blob([(1, 2, 3, 4, 5)], b"x"))
+        bad_magic[0:4] = b"NOPE"
+        self.assertIsNone(fssm_header.binding_table(bytes(bad_magic)))
+
+    def test_code_end_inside_fssm_header_is_rejected(self):
+        # A post-code binding table cannot start inside the FSSM header (< 0xF0).
+        self.assertIsNone(fssm_header.binding_table(tail_blob(tail_at=0x10, declared_end=0x10)))
+        in_header = bytearray(tail_blob(tail_at=0x120))
+        struct.pack_into("<Q", in_header, 0xC0, 0x20)
+        struct.pack_into("<Q", in_header, 0xC8, 0x10)
+        struct.pack_into("<Q", in_header, 0xE8, fssm_header.CODE_END_UNSET)
+        self.assertIsNone(fssm_header.binding_table(bytes(in_header)))
+
+    def test_nonzero_tail_header_second_word_is_rejected(self):
+        # The 8-byte tail header at +0x10 is {u32 header, u32 0}.
+        bad_hdr = bytearray(tail_blob([(1, 2, 3, 4, 5)], b"x"))
+        struct.pack_into("<I", bad_hdr, 0x120 + 20, 1)
+        self.assertIsNone(fssm_header.binding_table(bytes(bad_hdr)))
+
 
 class CliTest(unittest.TestCase):
     def setUp(self):
@@ -268,10 +305,13 @@ class CliTest(unittest.TestCase):
 
     def test_ignores_fssm_subdirectories_and_reports_read_errors_cleanly(self):
         os.makedirs(os.path.join(self.fssm_dir, "nested.fssm"))
+        with open(os.path.join(self.fssm_dir, "C.FSSM"), "wb") as f:
+            f.write(blob(first=0))
         p = subprocess.run([sys.executable, "-I", TOOL, self.fssm_dir, "--json"],
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["a.fssm", "b.fssm"])
+        self.assertEqual([row["name"] for row in json.loads(p.stdout)["files"]], ["C.FSSM", "a.fssm", "b.fssm"])
+        os.remove(os.path.join(self.fssm_dir, "C.FSSM"))
 
         err = PermissionError(13, "Permission denied", os.path.join(self.fssm_dir, "a.fssm"))
         with mock.patch("fssm_header.summarize", side_effect=err):
