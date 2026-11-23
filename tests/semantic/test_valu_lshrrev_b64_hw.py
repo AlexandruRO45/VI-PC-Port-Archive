@@ -251,5 +251,128 @@ class TestVLshrrevB64ScalarInterpreter(unittest.TestCase):
         self.assertEqual(self.rf.vgprs[5], (expected >> 32) & MASK32)
 
 
+class SIMDState:
+    def __init__(self, num_lanes: int = 32, exec_mask: int = 0xFFFFFFFF):
+        if num_lanes not in (32, 64):
+            raise ValueError(f"Unsupported lane count {num_lanes}, must be 32 or 64")
+        self.num_lanes = num_lanes
+        self.exec_mask = exec_mask
+        self.vgprs = [[0] * num_lanes for _ in range(256)]
+        self.sgprs = [0] * 106
+
+    def read_lane32(self, op: Operand, lane: int) -> int:
+        if op.reg_type == RegType.VGPR:
+            return self.vgprs[op.index][lane] & MASK32
+        elif op.reg_type == RegType.SGPR:
+            return self.sgprs[op.index] & MASK32
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK32
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+    def read_lane64(self, op: Operand, lane: int) -> int:
+        if op.reg_type == RegType.VGPR:
+            lo = self.vgprs[op.index][lane] & MASK32
+            hi = self.vgprs[op.index + 1][lane] & MASK32
+            return (hi << 32) | lo
+        elif op.reg_type == RegType.SGPR:
+            lo = self.sgprs[op.index] & MASK32
+            hi = self.sgprs[op.index + 1] & MASK32
+            return (hi << 32) | lo
+        elif op.reg_type == RegType.IMM:
+            return op.value & MASK64
+        raise ValueError(f"Unknown reg_type: {op.reg_type}")
+
+
+class SIMDInterpreter:
+    @staticmethod
+    def execute(state: SIMDState, inst: VLshrrevB64Instruction) -> list[int]:
+        results = []
+        for lane in range(state.num_lanes):
+            lane_active = (state.exec_mask >> lane) & 1
+            if lane_active:
+                sh = state.read_lane32(inst.shift, lane)
+                val = state.read_lane64(inst.src, lane)
+                res = ref_lshrrev_b64(sh, val)
+                state.vgprs[inst.dst.index][lane] = res & MASK32
+                state.vgprs[inst.dst.index + 1][lane] = (res >> 32) & MASK32
+                results.append(res)
+            else:
+                lo = state.vgprs[inst.dst.index][lane] & MASK32
+                hi = state.vgprs[inst.dst.index + 1][lane] & MASK32
+                results.append((hi << 32) | lo)
+        return results
+
+
+class TestVLshrrevB64SIMDDivergence(unittest.TestCase):
+    """SIMD multi-lane divergence and 32/64-bit EXEC masking."""
+
+    def test_simd_wave32_full_exec(self):
+        state = SIMDState(num_lanes=32, exec_mask=0xFFFFFFFF)
+        val = 0x8000000000000000
+        for i in range(32):
+            state.vgprs[2][i] = val & MASK32
+            state.vgprs[3][i] = (val >> 32) & MASK32
+            state.vgprs[4][i] = i
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 0, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        for i in range(32):
+            expected = ref_lshrrev_b64(i, val)
+            self.assertEqual(res[i], expected)
+            self.assertEqual(state.vgprs[0][i], expected & MASK32)
+            self.assertEqual(state.vgprs[1][i], (expected >> 32) & MASK32)
+
+    def test_simd_wave32_divergent_mask(self):
+        mask = 0x55555555
+        state = SIMDState(num_lanes=32, exec_mask=mask)
+        val = 0xFFFFFFFFFFFFFFFF
+        for i in range(32):
+            state.vgprs[0][i] = 0xDEADBEEF
+            state.vgprs[1][i] = 0xCAFEBABE
+            state.vgprs[2][i] = val & MASK32
+            state.vgprs[3][i] = (val >> 32) & MASK32
+            state.vgprs[4][i] = 4
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 0, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        expected_active = ref_lshrrev_b64(4, val)
+        expected_inactive = (0xCAFEBABE << 32) | 0xDEADBEEF
+        for i in range(32):
+            if i % 2 == 0:
+                self.assertEqual(res[i], expected_active)
+            else:
+                self.assertEqual(res[i], expected_inactive)
+
+    def test_simd_wave64_partial_exec(self):
+        mask = 0x00000000FFFFFFFF
+        state = SIMDState(num_lanes=64, exec_mask=mask)
+        val = 0x123456789ABCDEF0
+        for i in range(64):
+            state.vgprs[0][i] = 0x11111111
+            state.vgprs[1][i] = 0x22222222
+            state.vgprs[2][i] = val & MASK32
+            state.vgprs[3][i] = (val >> 32) & MASK32
+            state.vgprs[4][i] = 8
+        inst = VLshrrevB64Instruction(
+            dst=Operand(RegType.VGPR, 0, size=2),
+            shift=Operand(RegType.VGPR, 4, size=1),
+            src=Operand(RegType.VGPR, 2, size=2),
+        )
+        res = SIMDInterpreter.execute(state, inst)
+        expected_active = ref_lshrrev_b64(8, val)
+        expected_inactive = (0x22222222 << 32) | 0x11111111
+        for i in range(64):
+            if i < 32:
+                self.assertEqual(res[i], expected_active)
+            else:
+                self.assertEqual(res[i], expected_inactive)
+
+
 if __name__ == "__main__":
     unittest.main()
