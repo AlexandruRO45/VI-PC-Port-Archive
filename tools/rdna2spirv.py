@@ -15988,6 +15988,28 @@ def fspx_wave_size(path, name):
     return None if not isinstance(wave32, bool) else (32 if wave32 else 64)
 
 
+def trailing_data_block(path, info):
+    """Whether the listing's code range ends right before a constant-data block (shader_disasm.data_block_start):
+    the range ends after an s_endpgm, the next dword is a count N, and the dword N + 1 later is the closing
+    s_endpgm. Such a listing has no undecodable word, but its range still holds dead instructions (an s_nop after
+    an unconditional branch, the s_nop run / second s_endpgm after the last reachable s_endpgm). Before the block
+    was cut off, the listing had undecodable words and went through reachable_code, which dropped them."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        m = HDR.match(f.readline())
+    if not m:
+        return False
+    start, end = int(m.group(2), 16), int(m.group(3), 16)
+    fssm, code, _ = native_paths(path, info["name"])
+    if end <= start or not (os.path.isfile(fssm) or os.path.isfile(code)):
+        return False
+    blob = native_blob(path, info["name"])
+    if end + 4 > len(blob) or blob[end - 4:end] != b"\x00\x00\x81\xbf":
+        return False
+    n = struct.unpack_from("<I", blob, end)[0]
+    close = end + 4 + 4 * n
+    return n < (1 << 16) and close + 4 <= len(blob) and blob[close:close + 4] == b"\x00\x00\x81\xbf"
+
+
 def translate(path):
     info = parse_file(path)
     stage = stage_of(info["name"], path)
@@ -16035,6 +16057,9 @@ def translate(path):
             raise Unsupported("reachable instruction with normalized encoding")
     else:
         check_printed_encodings(path, info)
+        if trailing_data_block(path, info):
+            # Entry-reachable code only, as when the data words were still in the range (same blocks, same ids).
+            insns = reachable_code(fold_far_branches(insns))
     g = Gen(stage, hoist_reg_ptrs=True, cache_active=True)
     g.exec_static_true = not any(writes_exec(i) for i in insns)
     if stage in ("vs", "ms"):   # --f16-interp-fallback places the decoded halves clear of every param
