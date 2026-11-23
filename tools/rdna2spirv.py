@@ -9624,6 +9624,10 @@ class Gen:
             sv = a[1]
             if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
                 lo, hi = self.load_reg(sv["k"], sv["r"]), self.load_reg(sv["k"], sv["r"] + 1)
+            elif sv.get("f64_literal") and 0 <= sv["v"] <= 0xFFFFFFFF:
+                # A literal dword is bits 63:32 of the operand ("f64 literal sources"); a hand-written 64-bit
+                # literal below keeps its whole value.
+                lo, hi = self.cu(0), self.cu(sv["v"])
             elif sv["k"] in ("imm", "fimm"):
                 bits = (struct.unpack("<Q", struct.pack("<d", float(sv["v"])))[0]
                         if sv["k"] == "fimm" else sv["v"] & 0xFFFFFFFFFFFFFFFF)
