@@ -12,6 +12,7 @@
 #include <cwchar>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -92,22 +93,32 @@ public:
 
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, UINT size, const void* data) override {
         if (!data) return remove(guid) ? S_OK : S_FALSE;
-        PrivateData entry{guid, {}, nullptr, false};
-        const auto* bytes = static_cast<const std::uint8_t*>(data);
-        entry.bytes.assign(bytes, bytes + size);
-        store(std::move(entry));
-        return S_OK;
+        // Out of memory is E_OUTOFMEMORY, never an exception across the COM boundary; an existing entry is kept.
+        try {
+            PrivateData entry{guid, {}, nullptr, false};
+            const auto* bytes = static_cast<const std::uint8_t*>(data);
+            entry.bytes.assign(bytes, bytes + size);
+            store(std::move(entry));
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
     }
 
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID guid, const IUnknown* object) override {
-        IUnknown* held = const_cast<IUnknown*>(object);
-        std::shared_ptr<IUnknown> reference;
-        if (held) {
-            held->AddRef();
-            reference = std::shared_ptr<IUnknown>(held, [](IUnknown* p) { p->Release(); });
+        try {
+            IUnknown* held = const_cast<IUnknown*>(object);
+            std::shared_ptr<IUnknown> reference;
+            if (held) {
+                held->AddRef();
+                // If the control-block allocation fails, shared_ptr invokes the deleter.
+                reference = std::shared_ptr<IUnknown>(held, [](IUnknown* p) { p->Release(); });
+            }
+            store(PrivateData{guid, {}, std::move(reference), true});
+            return S_OK;
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
         }
-        store(PrivateData{guid, {}, std::move(reference), true});
-        return S_OK;
     }
 
     // SetName is SetPrivateData with WKPDID_D3DDebugObjectNameW and the name with its terminator, as D3D12 documents

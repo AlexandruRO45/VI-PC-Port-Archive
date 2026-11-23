@@ -2,8 +2,24 @@
 #include "../shims/d3d12_com_object.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <future>
+#include <new>
 #include <thread>
+#include <utility>
+
+// Fail one ordinary allocation on this test thread. Keep the injection confined to this executable.
+static thread_local bool fail_next_allocation = false;
+
+void* operator new(std::size_t size) {
+    if (!std::exchange(fail_next_allocation, false)) {
+        if (void* memory = std::malloc(size ? size : 1)) return memory;
+    }
+    throw std::bad_alloc{};
+}
+
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace rt::d3d12 {
 void stub(const char*) {}
@@ -98,13 +114,63 @@ bool concurrent_remove() {
            owner.GetPrivateData(kInterface, &size, nullptr) == DXGI_ERROR_NOT_FOUND && size == 0;
 }
 
+bool allocation_failure_keeps_interface() {
+    Payload original, replacement;
+    Owner owner;
+    if (owner.SetPrivateDataInterface(kInterface, &original) != S_OK) return false;
+
+    fail_next_allocation = true;
+    const HRESULT set = owner.SetPrivateDataInterface(kInterface, &replacement);
+    fail_next_allocation = false;
+    if (set != E_OUTOFMEMORY || original.refs != 2 || replacement.refs != 1) return false;
+
+    UINT size = sizeof(IUnknown*);
+    IUnknown* result = nullptr;
+    const HRESULT get = owner.GetPrivateData(kInterface, &size, &result);
+    const ULONG refs = result ? result->Release() : 0;
+    return get == S_OK && size == sizeof(result) && result == &original && refs == 2 &&
+           owner.SetPrivateData(kInterface, 0, nullptr) == S_OK && original.refs == 1;
+}
+
+bool allocation_failure_leaves_new_key_absent() {
+    Owner owner;
+    // A null interface needs no shared ownership allocation. The first allocation grows the entry vector.
+    fail_next_allocation = true;
+    const HRESULT set = owner.SetPrivateDataInterface(kInterface, nullptr);
+    fail_next_allocation = false;
+    UINT size = 1;
+    return set == E_OUTOFMEMORY &&
+           owner.GetPrivateData(kInterface, &size, nullptr) == DXGI_ERROR_NOT_FOUND && size == 0;
+}
+
+bool allocation_failure_keeps_bytes() {
+    Owner owner;
+    UINT value = kExpected;
+    if (owner.SetPrivateData(kValue, sizeof(value), &value) != S_OK) return false;
+
+    const UINT replacement = kExpected + 1;
+    fail_next_allocation = true;
+    const HRESULT set = owner.SetPrivateData(kValue, sizeof(replacement), &replacement);
+    fail_next_allocation = false;
+    UINT size = sizeof(value);
+    value = 0;
+    return set == E_OUTOFMEMORY && owner.GetPrivateData(kValue, &size, &value) == S_OK && size == sizeof(value) &&
+           value == kExpected;
+}
+
 }  // namespace
 
 int main() {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     const bool reentry = reentrant_replace();
     const bool removal = concurrent_remove();
+    const bool failed_replacement = allocation_failure_keeps_interface();
+    const bool failed_insert = allocation_failure_leaves_new_key_absent();
+    const bool failed_bytes = allocation_failure_keeps_bytes();
     std::printf("AddRef reentry and replacement: %s\n", reentry ? "PASS" : "FAIL");
     std::printf("Concurrent removal during AddRef: %s\n", removal ? "PASS" : "FAIL");
-    return reentry && removal ? 0 : 1;
+    std::printf("Allocation failure keeps the old interface: %s\n", failed_replacement ? "PASS" : "FAIL");
+    std::printf("Allocation failure leaves the new key absent: %s\n", failed_insert ? "PASS" : "FAIL");
+    std::printf("Allocation failure keeps the old bytes: %s\n", failed_bytes ? "PASS" : "FAIL");
+    return reentry && removal && failed_replacement && failed_insert && failed_bytes ? 0 : 1;
 }
