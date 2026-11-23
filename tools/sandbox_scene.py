@@ -39,9 +39,9 @@ def select_rows(rows, center, radius, limit):
         dx, dy = row["_pos"][0] - cx, row["_pos"][1] - cy
         d = math.hypot(dx, dy)
         if d <= radius:
-            near.append((d, row))
-    near.sort(key=lambda t: t[0])
-    return [row for _, row in near[:limit]]
+            near.append(row)
+    near.sort(key=lambda row: math.hypot(row["_pos"][0] - cx, row["_pos"][1] - cy))
+    return near if limit is None or limit >= len(near) else near[:limit]
 
 
 def draw_rows(rotation, scale_xy, scale_z, position):
