@@ -789,5 +789,36 @@ class TestVRsqF32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_rsq_f32(float("inf")), 0.0)
 
 
+def ref_sqrt_f32(src: float) -> float:
+    """Bit-accurate reference oracle for RDNA2 v_sqrt_f32 (sqrt(x))."""
+    if math.isnan(src) or src < 0.0:
+        return float("nan")
+    if src == 0.0:
+        return src
+    if math.isinf(src):
+        return float("inf")
+    return math.sqrt(src)
+
+
+class TestVSqrtF32Reference(unittest.TestCase):
+    """Reference mathematical oracle verification for v_sqrt_f32."""
+
+    def test_reference_squares(self):
+        self.assertEqual(ref_sqrt_f32(0.0), 0.0)
+        self.assertEqual(ref_sqrt_f32(1.0), 1.0)
+        self.assertEqual(ref_sqrt_f32(4.0), 2.0)
+        self.assertEqual(ref_sqrt_f32(9.0), 3.0)
+        self.assertEqual(ref_sqrt_f32(16.0), 4.0)
+        self.assertEqual(ref_sqrt_f32(25.0), 5.0)
+
+    def test_reference_edge_cases(self):
+        res_neg_zero = ref_sqrt_f32(-0.0)
+        self.assertEqual(res_neg_zero, -0.0)
+        self.assertEqual(math.copysign(1.0, res_neg_zero), -1.0)
+        self.assertTrue(math.isnan(ref_sqrt_f32(-4.0)))
+        self.assertEqual(ref_sqrt_f32(float("inf")), float("inf"))
+        self.assertTrue(math.isnan(ref_sqrt_f32(float("nan"))))
+
+
 if __name__ == "__main__":
     unittest.main()
