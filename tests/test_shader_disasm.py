@@ -528,7 +528,43 @@ class DisasmStopsEarlyTest(unittest.TestCase):
         self.assertIn(os.path.join(self.src, "s00.fssm"), p.stderr)
         self.assertIn("error: the relay did not answer", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
+        self.assertIn("2 shader(s) were not started", p.stderr)
         self.assertEqual(os.listdir(self.out), [])
+
+    def test_a_listing_written_after_the_run_ended_does_not_hide_that_it_ended(self):
+        """With several workers, a shader in flight when the tenth failure closes the pool can still answer."""
+        other = b"\x01\x00\x80\xbf\x00\x00\x81\xbf"   # s_nop 1 first: the slow shader, known to the fake by its input
+        for i in range(30):
+            self.write(f"s{i:02d}", other if i == 0 else CODE)
+        calls = os.path.join(self.dir, "calls")
+        p, _ = self.run_tool("import sys, time\n"
+                             "def count():\n"                       # another worker may be rewriting it
+                             "    try:\n"
+                             "        return int(open(%r).read())\n"
+                             "    except (OSError, ValueError):\n"
+                             "        return 0\n"
+                             "data = sys.stdin.read().strip()\n"
+                             "if data == %r:\n"
+                             "    print('\\ts_endpgm ; encoding: [0x00,0x00,0x81,0xbf]')\n"
+                             "elif data.startswith('0x01'):\n"       # answers once ten shaders have failed
+                             "    for _ in range(11000):            # under 110 s, inside the default time limit\n"                             "        if count() >= 10:\n"
+                             "            break\n"
+                             "        time.sleep(0.01)\n"
+                             "    print(%r)\n"
+                             "else:\n"
+                             "    n = count() + 1\n"                  # before the open below empties the file
+                             "    open(%r, 'w').write(str(n))\n"
+                             "    sys.stderr.write('error: the relay did not answer\\n')\n"
+                             "    sys.exit(1)\n" % (calls, PROBE, ASM, calls),
+                             "--jobs", "2")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn("'clean': 1", p.stdout)
+        self.assertIn("'failed': 10", p.stdout)
+        self.assertEqual(len(p.stderr.splitlines()), 1, p.stderr)
+        self.assertIn("gave no disassembly for 10 shaders in a row with no listing between them", p.stderr)
+        self.assertIn(os.path.join(self.src, "s01.fssm"), p.stderr)
+        self.assertIn("19 shader(s) were not started", p.stderr)
+        self.assertEqual(len(os.listdir(self.out)), 1)
 
     def test_failed_shaders_apart_from_each_other_do_not_end_the_run(self):
         """Three failures in twelve, each with a listing after it, are three failed shaders as before."""

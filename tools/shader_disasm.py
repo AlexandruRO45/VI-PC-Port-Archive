@@ -37,6 +37,7 @@ FAILED = []                    # (path, first stderr line) for shaders that prod
 IN_A_ROW = [0, None]           # of those: how many since the last listing was written, and the first of them
 IN_A_ROW_LOCK = threading.Lock()
 EXECUTOR = [None]              # the pool main() runs; the worker that counts the tenth failure in a row closes it
+ENDED = [None]                 # the first failure of the run of ten that ended the run; a later listing keeps it
 
 MC = mc_command()
 DEFAULT_MC_TIMEOUT = 120.0     # seconds one llvm-mc call may take: the largest shader of a 1.0.2.1 corpus took 5.7 s
@@ -221,6 +222,8 @@ def no_disassembly(path: str, reason: str) -> None:
             IN_A_ROW[1] = (path, reason)
         IN_A_ROW[0] += 1
         ended = IN_A_ROW[0] == MAX_IN_A_ROW
+        if ended:
+            ENDED[0] = IN_A_ROW[1]
     if ended and EXECUTOR[0] is not None:
         EXECUTOR[0].shutdown(wait=False, cancel_futures=True)   # the shaders still queued are not started
 
@@ -320,6 +323,7 @@ def main():
     from collections import Counter
     res = Counter()
     IN_A_ROW[:] = [0, None]    # a second main() in one process counts from its own shaders
+    ENDED[0] = None
     total = len(files)
     every_stem = {os.path.splitext(os.path.basename(p))[0] for p in files}   # before --skip-existing narrows files
     if a.skip_existing:
@@ -331,6 +335,7 @@ def main():
             else:
                 pending.append(path)
         files = pending
+    not_started = 0
     if files:
         if a.backend == "llvm-mc":
             probe(a.mcpu)
@@ -343,15 +348,18 @@ def main():
                 except RuntimeError:     # a worker has already ended the run
                     break
         EXECUTOR[0] = None
+        ran = sum(1 for fut in futures if not fut.cancelled())   # queued behind ten failures in a row: never started
+        not_started = len(files) - ran
         for fut in futures:
-            if not fut.cancelled():      # queued behind ten failures in a row: never started
+            if not fut.cancelled():
                 res.update((fut.result(),))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")
-    if IN_A_ROW[0] >= MAX_IN_A_ROW:
-        path, reason = IN_A_ROW[1]
+    if ENDED[0] is not None:   # not IN_A_ROW: a shader in flight when the pool closed can still write a listing
+        path, reason = ENDED[0]
+        left = f"{not_started} shader(s) were not started. " if not_started else ""
         fail(f"llvm-mc gave no disassembly for {MAX_IN_A_ROW} shaders in a row with no listing between them, "
-             f"first {path}: {reason}. It has stopped working, so the run ended here; once it answers again, the "
-             f"next run resumes with --skip-existing")
+             f"first {path}: {reason}. It has stopped working, so the run ended here. {left}"
+             f"Once it answers again, the next run resumes with --skip-existing")
     if FAILED:
         path, reason = FAILED[0]
         fail(f"{len(FAILED)} shader(s) produced no disassembly, first {path}: {reason}")
