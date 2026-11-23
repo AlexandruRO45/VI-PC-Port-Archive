@@ -1,7 +1,7 @@
 // Checks the registered xg_xs.dll shim against the call shapes measured in the game executable (runtime/shims/xg_xs.cpp).
 //
 // Both exports are resolved through rt::shims::find, so this is the table the runtime installs. The checks:
-// - XGSuggestSwizzleMode returns S_OK and writes 0x101 for 2D textures (0x100 for linear/1D), E_INVALIDARG on bad input.
+// - XGSuggestSwizzleMode returns S_OK and writes 0x10A (SW_64KB_D) for 2D textures (0x100 for linear/1D), E_INVALIDARG on bad input.
 // - XGCreateTextureComputer returns S_OK with a ref-counted computer whose slots 2 (GetResourceLayout), 8/9
 //   (CopyIntoSubresource / CopyFromSubresource) and 10 (GetResourceTiling) match runtime/src/xg_layout.h.
 // - Invalid descriptions return E_INVALIDARG while still storing a safe fallback computer in *out for callers that do
@@ -60,7 +60,7 @@ int main() {
 
     uint32_t mode = 0;
     check(suggest(&desc, 0, &mode) == S_OK, "XGSuggestSwizzleMode returns S_OK for a valid 2D texture");
-    check(mode == leonida::xg::kLayoutSw64KbD, "XGSuggestSwizzleMode suggests 0x101 (SW_64KB_D) for 2D");
+    check(mode == leonida::xg::kLayoutSw64KbD, "XGSuggestSwizzleMode suggests 0x10A (SW_64KB_D) for 2D");
     check(suggest(nullptr, 0, &mode) == E_INVALIDARG, "XGSuggestSwizzleMode(nullptr, ...) is E_INVALIDARG");
 
     desc.layout = mode;

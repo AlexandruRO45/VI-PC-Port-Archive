@@ -6,8 +6,9 @@
 // XG_RESOURCE_LAYOUT / XG_PLANE_LAYOUT / XG_MIPLEVEL_LAYOUT geometry and observed call shapes: callers allocate
 // 0x1B38 bytes for GetResourceLayout, copy 0x6C8-byte plane records from layout+0x18, index 0x70-byte mip records
 // from plane+0x38 reading +0x00/+0x10/+0x1C, and write 0x100|hw_mode directly into the XGSuggestSwizzleMode out word):
-// - XgResourceDesc (0x38 bytes): identical field layout to D3D12_RESOURCE_DESC, with console layout words 0x100|mode
-//   in `layout` (0x100 linear, 0x101 SW_64KB_D, 0x102 SW_4KB_S, 0x10A reserved 64 KiB tiled).
+// - XgResourceDesc (0x38 bytes): identical field layout to D3D12_RESOURCE_DESC, with console layout words
+//   0x100|ADDR_SW_MODE in `layout` (0x100 SW_LINEAR, 0x105 SW_4KB_S, 0x106 SW_4KB_D, 0x109 SW_64KB_S,
+//   0x10A SW_64KB_D; legacy words 0x101/0x102 are also accepted for compatibility with main's D3D12 shim).
 // - XgResourceLayout (0x1B38 bytes): 0x18-byte header + 4 XgPlaneLayout entries (0x6C8 bytes each).
 // - XgPlaneLayout (0x6C8 bytes): 0x38-byte header (bytes_per_slice at +0x10) + 15 XgMipLevelLayout entries (0x70 bytes).
 // - XgMipLevelLayout (0x70 bytes): size_bytes (+0x00), offset_bytes (+0x08), slice_2d_size_bytes (+0x10),
@@ -37,15 +38,19 @@ namespace leonida::xg {
 inline constexpr std::uint32_t kMaxPlanes = 4;
 inline constexpr std::uint32_t kMaxMips = 15;
 
-// Console D3D12_TEXTURE_LAYOUT / XG swizzle mode values (0x100 | hw_mode).
+// Console D3D12_TEXTURE_LAYOUT / XG swizzle mode values (0x100 | AMD GFX10 ADDR_SW_MODE).
 inline constexpr std::uint32_t kLayoutUnknown = 0;
 inline constexpr std::uint32_t kLayoutRowMajor = 1;
 inline constexpr std::uint32_t kLayout64KbUndefinedSwizzle = 2;
 inline constexpr std::uint32_t kLayout64KbStandardSwizzle = 3;
-inline constexpr std::uint32_t kLayoutLinear = 0x100;
-inline constexpr std::uint32_t kLayoutSw64KbD = 0x101;
-inline constexpr std::uint32_t kLayoutSw4KbS = 0x102;
-inline constexpr std::uint32_t kLayoutSw64KbReserved = 0x10A;
+inline constexpr std::uint32_t kLayoutLinear = 0x100;         // ADDR_SW_LINEAR (0)
+inline constexpr std::uint32_t kLayoutSw256BS = 0x101;        // ADDR_SW_256B_S (1); legacy 64 KiB alias in main's D3D12 shim
+inline constexpr std::uint32_t kLayoutSw256BD = 0x102;        // ADDR_SW_256B_D (2); legacy 4 KiB alias
+inline constexpr std::uint32_t kLayoutSw4KbS = 0x105;         // ADDR_SW_4KB_S (5)
+inline constexpr std::uint32_t kLayoutSw4KbD = 0x106;         // ADDR_SW_4KB_D (6)
+inline constexpr std::uint32_t kLayoutSw64KbS = 0x109;        // ADDR_SW_64KB_S (9)
+inline constexpr std::uint32_t kLayoutSw64KbD = 0x10A;        // ADDR_SW_64KB_D (10)
+inline constexpr std::uint32_t kLayoutSw64KbReserved = kLayoutSw64KbD;
 
 // D3D12_RESOURCE_DIMENSION values.
 inline constexpr std::uint32_t kDimBuffer = 1;
@@ -295,9 +300,12 @@ constexpr bool is_known_layout(std::uint32_t layout) {
     case kLayout64KbUndefinedSwizzle:
     case kLayout64KbStandardSwizzle:
     case kLayoutLinear:
-    case kLayoutSw64KbD:
+    case kLayoutSw256BS:
+    case kLayoutSw256BD:
     case kLayoutSw4KbS:
-    case kLayoutSw64KbReserved:
+    case kLayoutSw4KbD:
+    case kLayoutSw64KbS:
+    case kLayoutSw64KbD:
         return true;
     default:
         return false;
@@ -310,13 +318,18 @@ constexpr bool is_linear_layout(std::uint32_t layout, std::uint32_t dimension) {
 }
 
 constexpr bool is_4kb_layout(std::uint32_t layout) {
-    return layout == kLayoutSw4KbS;
+    return layout == kLayoutSw4KbS || layout == kLayoutSw4KbD || layout == kLayoutSw256BD;
+}
+
+constexpr bool is_explicit_console_swizzle(std::uint32_t layout) {
+    return layout == kLayoutSw256BS || layout == kLayoutSw256BD ||
+           layout == kLayoutSw4KbS || layout == kLayoutSw4KbD ||
+           layout == kLayoutSw64KbS || layout == kLayoutSw64KbD;
 }
 
 constexpr std::uint32_t effective_tile_mode(const XgResourceDesc& desc) {
     if (is_linear_layout(desc.layout, desc.dimension)) return kLayoutLinear;
-    if (desc.layout == kLayoutSw4KbS) return kLayoutSw4KbS;
-    if (desc.layout == kLayoutSw64KbReserved) return kLayoutSw64KbReserved;
+    if (is_explicit_console_swizzle(desc.layout)) return desc.layout;
     return kLayoutSw64KbD;
 }
 
@@ -348,7 +361,8 @@ constexpr bool valid_tiling_bpe(std::uint32_t bpe) {
 
 }  // namespace detail
 
-// Suggests a console swizzle layout word (0x100 linear, 0x101 SW_64KB_D) for a texture description.
+// Suggests a console swizzle layout word (0x100 SW_LINEAR, 0x10A SW_64KB_D, or preserves an explicit known console
+// swizzle word) for a texture description.
 inline bool suggest_swizzle_mode(const XgResourceDesc& desc, std::uint32_t /*flags*/, std::uint32_t& out_mode) {
     FormatInfo fmt{};
     std::uint32_t mips = 0, height = 0, depth_or_array = 0;
@@ -357,7 +371,7 @@ inline bool suggest_swizzle_mode(const XgResourceDesc& desc, std::uint32_t /*fla
         out_mode = kLayoutLinear;
         return true;
     }
-    if (desc.layout == kLayoutSw4KbS || desc.layout == kLayoutSw64KbReserved) {
+    if (detail::is_explicit_console_swizzle(desc.layout)) {
         out_mode = desc.layout;
         return true;
     }
@@ -618,8 +632,9 @@ inline bool transfer_subresource(const XgResourceDesc& desc, const XgResourceLay
     // TiledSurface2D cannot address 3D tiles and stepping z * slice_2d_size_bytes would overrun ml.size_bytes.
     if (is_3d) return false;
 
-    // Swizzled 2D slices (GFX10 SW_64KB_D or SW_4KB_S) via TiledSurface2D.
-    const gfx10::TileMode mode = (ml.tile_mode == kLayoutSw4KbS) ? gfx10::TileMode::sw_4kb_s : gfx10::TileMode::sw_64kb_d;
+    // Swizzled 2D slices via TiledSurface2D (exact RbPlus patterns for 0x105 SW_4KB_S and 0x10A SW_64KB_D;
+    // 0x106/0x109/legacy words use the matching 4 KiB or 64 KiB tile pattern).
+    const gfx10::TileMode mode = is_4kb_layout(ml.tile_mode) ? gfx10::TileMode::sw_4kb_s : gfx10::TileMode::sw_64kb_d;
     gfx10::TiledSurface2D surf{};
     if (!gfx10::TiledSurface2D::make(mode, bpe, ml.width_elements, ml.height_elements, surf)) return false;
     if (surf.tiled_size() > ml.size_bytes || surf.tiled_size() > ml.slice_2d_size_bytes) return false;

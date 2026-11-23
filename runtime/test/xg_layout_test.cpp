@@ -35,11 +35,11 @@ XgResourceDesc make_2d(std::uint64_t w, std::uint32_t h, std::uint16_t array_siz
 }  // namespace
 
 int main() {
-    // 1. XGSuggestSwizzleMode: 2D -> 0x101 (SW_64KB_D), 1D / linear -> 0x100, invalid -> false.
+    // 1. XGSuggestSwizzleMode: 2D -> 0x10A (SW_64KB_D), 1D / linear -> 0x100, explicit console modes preserved, invalid -> false.
     {
         std::uint32_t mode = 0;
         const auto d2d = make_2d(512, 512, 1, 1, 28 /* R8G8B8A8_UNORM */, kLayoutUnknown);
-        CHECK(suggest_swizzle_mode(d2d, 0, mode) && mode == kLayoutSw64KbD);
+        CHECK(suggest_swizzle_mode(d2d, 0, mode) && mode == kLayoutSw64KbD && mode == 0x10Au);
 
         auto dlin = d2d;
         dlin.layout = kLayoutLinear;
@@ -50,9 +50,12 @@ int main() {
         d1d.height = 1;
         CHECK(suggest_swizzle_mode(d1d, 0, mode) && mode == kLayoutLinear);
 
-        auto d4k = d2d;
-        d4k.layout = kLayoutSw4KbS;
-        CHECK(suggest_swizzle_mode(d4k, 0, mode) && mode == kLayoutSw4KbS);
+        for (const std::uint32_t explicit_mode :
+             {kLayoutSw256BS, kLayoutSw256BD, kLayoutSw4KbS, kLayoutSw4KbD, kLayoutSw64KbS, kLayoutSw64KbD}) {
+            auto de = d2d;
+            de.layout = explicit_mode;
+            CHECK(suggest_swizzle_mode(de, 0, mode) && mode == explicit_mode);
+        }
 
         auto bad = d2d;
         bad.format = 9999;
@@ -150,21 +153,40 @@ int main() {
         CHECK(roundtrip == src);
     }
 
-    // 4. Swizzled 4 KiB (0x102) R16G16B16A16_FLOAT round-trip.
+    // 4. Swizzled 4 KiB (0x105 SW_4KB_S) and 64 KiB standard (0x109 SW_64KB_S) R16G16B16A16_FLOAT round-trips,
+    //    plus legacy 0x101/0x102 compatibility.
     {
-        const auto desc = make_2d(64, 32, 1, 2, 10 /* RGBA16F */, kLayoutSw4KbS);
-        XgResourceLayout layout{};
-        CHECK(compute_resource_layout(desc, layout));
-        CHECK(layout.plane[0].mip_layout[0].tile_mode == kLayoutSw4KbS);
-        CHECK(layout.base_alignment_bytes == kSmallTileAlignment);
+        for (const std::uint32_t lay4k : {kLayoutSw4KbS, kLayoutSw4KbD, kLayoutSw256BD}) {
+            const auto desc = make_2d(64, 32, 1, 2, 10 /* RGBA16F */, lay4k);
+            XgResourceLayout layout{};
+            CHECK(compute_resource_layout(desc, layout));
+            CHECK(layout.plane[0].mip_layout[0].tile_mode == lay4k);
+            CHECK(layout.base_alignment_bytes == kSmallTileAlignment);
 
-        std::vector<std::byte> res(static_cast<std::size_t>(layout.size_bytes), std::byte{0});
-        std::vector<std::byte> src(64 * 8 * 32);
-        for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::byte>((i * 13u + 3u) & 0xFFu);
-        CHECK(copy_into_subresource(desc, layout, res.data(), 0, 0, src.data(), 64 * 8, 0));
-        std::vector<std::byte> dst(src.size(), std::byte{0});
-        CHECK(copy_from_subresource(desc, layout, dst.data(), 0, 0, res.data(), 64 * 8, 0));
-        CHECK(dst == src);
+            std::vector<std::byte> res(static_cast<std::size_t>(layout.size_bytes), std::byte{0});
+            std::vector<std::byte> src(64 * 8 * 32);
+            for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::byte>((i * 13u + 3u) & 0xFFu);
+            CHECK(copy_into_subresource(desc, layout, res.data(), 0, 0, src.data(), 64 * 8, 0));
+            std::vector<std::byte> dst(src.size(), std::byte{0});
+            CHECK(copy_from_subresource(desc, layout, dst.data(), 0, 0, res.data(), 64 * 8, 0));
+            CHECK(dst == src);
+        }
+
+        for (const std::uint32_t lay64k : {kLayoutSw64KbS, kLayoutSw64KbD, kLayoutSw256BS}) {
+            const auto desc = make_2d(64, 32, 1, 2, 10 /* RGBA16F */, lay64k);
+            XgResourceLayout layout{};
+            CHECK(compute_resource_layout(desc, layout));
+            CHECK(layout.plane[0].mip_layout[0].tile_mode == lay64k);
+            CHECK(layout.base_alignment_bytes == kTileAlignment);
+
+            std::vector<std::byte> res(static_cast<std::size_t>(layout.size_bytes), std::byte{0});
+            std::vector<std::byte> src(64 * 8 * 32);
+            for (std::size_t i = 0; i < src.size(); ++i) src[i] = static_cast<std::byte>((i * 17u + 9u) & 0xFFu);
+            CHECK(copy_into_subresource(desc, layout, res.data(), 0, 0, src.data(), 64 * 8, 0));
+            std::vector<std::byte> dst(src.size(), std::byte{0});
+            CHECK(copy_from_subresource(desc, layout, dst.data(), 0, 0, res.data(), 64 * 8, 0));
+            CHECK(dst == src);
+        }
     }
 
     // 5. 3D volume texture (linear copy round-trip; swizzled 3D layout succeeds while tiled 3D copy is refused

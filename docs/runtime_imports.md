@@ -166,8 +166,10 @@ The game executable imports two functions from `xg_xs.dll`, the console's textur
 (4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). `runtime/shims/xg_xs.cpp` and the
 portable model in `runtime/src/xg_layout.h` implement both exports and slots 0 (`AddRef`), 1 (`Release`), 2
 (`GetResourceLayout`), 8 (`CopyIntoSubresource`), 9 (`CopyFromSubresource`) and 10 (`GetResourceTiling`):
-`XGSuggestSwizzleMode` returns `0x101` (`SW_64KB_D`) for tiled 2D/3D textures and `0x100` for 1D/linear textures, and
-`XGCreateTextureComputer` returns a reference-counted computer backed by `gfx10_tiling.h` and `resource_tiling.h`.
+`XGSuggestSwizzleMode` returns `0x10A` (`0x100 | ADDR_SW_64KB_D`) for tiled 2D/3D textures, `0x100` (`SW_LINEAR`) for
+1D/linear textures, and preserves explicit known `0x100 | ADDR_SW_MODE` layout words (`0x105` `SW_4KB_S`, `0x106`
+`SW_4KB_D`, `0x109` `SW_64KB_S`, `0x10A` `SW_64KB_D`, plus legacy `0x101`/`0x102`), while `XGCreateTextureComputer`
+returns a reference-counted computer backed by `gfx10_tiling.h` and `resource_tiling.h`.
 Mips are laid out largest-first with whole-tile alignment (no console mip-tail packing yet, matching the open status in
 `docs/d3d12_vulkan.md`), unknown layout words are rejected with `E_INVALIDARG`, and swizzled 3D or multisampled
 (`sample_count > 1`) subresource copies are refused without modifying caller buffers until 3D/MSAA transfers are
