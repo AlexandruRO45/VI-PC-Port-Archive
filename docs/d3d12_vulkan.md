@@ -2101,7 +2101,9 @@ The trace will enumerate them.
   `--mesh-compute` (docs/design.md, "Mesh shaders as compute").
   - **PSO:** the MS entry must have a `mesh_compute` layout (`E_NOTIMPL` with a log otherwise). Its module becomes a
     compute pipeline, with the device's set 0 where it declares bindings and its translated subgroup size. The
-    graphics pipeline gets, in place of the mesh stage, the vertex shader `runtime/src/mesh_compute_vs.h` builds
+    same translation also runs on a GPU with native mesh support. If both translations of the program are in the
+    index, a mesh-capable GPU prefers the native one.
+    The graphics pipeline gets, in place of the mesh stage, the vertex shader `runtime/src/mesh_compute_vs.h` builds
     from the layout (the module `tools/mesh_compute_vs.py` writes, instruction for instruction): a vertex pipeline
     with input assembly and no vertex input. Both layouts take the 152-byte block, the output address in dwords
     36..37.

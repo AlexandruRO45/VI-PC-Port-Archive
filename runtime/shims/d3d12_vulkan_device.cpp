@@ -3199,23 +3199,6 @@ public:
                      desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
             return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
         if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
-        // Without VK_EXT_mesh_shader a mesh PSO runs through --mesh-compute (rdna2spirv.py, #1053): the mesh shader
-        // as a compute pipeline writing one output slot per workgroup, drawn by a vertex shader built here
-        // (mesh_compute_vs.h). Its MS entry must be such a module (checked below), and both take 152 bytes of push
-        // constants. The dispatch is recorded on the Direct queue, whose family must then have compute.
-        const bool mesh_compute = mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT);
-        if (mesh_compute && device_.info.max_push_constants_size &&
-            device_.info.max_push_constants_size < sizeof(leonida::MeshComputeUserData)) {
-            log_once("--mesh-compute PSOs need 152 bytes of push constants; maxPushConstantsSize",
-                     int(device_.info.max_push_constants_size));
-            return E_NOTIMPL;
-        }
-        if (mesh_compute && !device_.direct_family_computes()) {
-            log_once("--mesh-compute PSOs dispatch on the Direct queue, whose family has no VK_QUEUE_COMPUTE_BIT; "
-                     "family",
-                     int(device_.info.queue_family));
-            return E_NOTIMPL;
-        }
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
             return E_NOTIMPL;
@@ -3272,10 +3255,8 @@ public:
             std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
         };
-        // --mesh-compute: the MS entry is looked up as "ms", and its Vulkan stage is the vertex shader drawing its
-        // slots.
-        const VkShaderStageFlagBits ms_bit = mesh_compute ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_MESH_BIT_EXT;
-        Stage stages[3] = {mesh ? Stage{"ms", ms_bit, *ms}
+        const bool native_mesh = device_.info.mesh_shader && vk.vkCmdDrawMeshTasksEXT;
+        Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
                                 : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
@@ -3315,11 +3296,25 @@ public:
             // inputs fed by this input layout (else the layout check below reports it).
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !mesh;
             stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
+                if (stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT)
+                    return native_mesh ? !e.mesh_compute : e.mesh_compute.has_value();
                 return !vertex || layout_feeds(e, desc.InputLayout);
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
                 return E_INVALIDARG;
+            }
+            if (stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT) {
+                if (stage.entry->mesh_compute) {
+                    // The translated module runs as compute even if this GPU also supports a native mesh stage.
+                    // The graphics stage is the generated vertex shader that reads its output slots.
+                    stage.bit = VK_SHADER_STAGE_VERTEX_BIT;
+                } else if (!native_mesh) {
+                    std::fprintf(stderr, "[rt] d3d12: %s: mesh-shader PSOs need VK_EXT_mesh_shader, which the device has "
+                                         "not enabled, or mesh shaders translated with --mesh-compute\n",
+                                 stage.entry->name.c_str());
+                    return E_NOTIMPL;
+                }
             }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
@@ -3384,12 +3379,19 @@ public:
         // so a PS reading halves must read each of them there (a subset is fine: the rest go unread). Moving them per
         // pipeline, as tools/mesh_compute_vs.py's pair_f16_halves does, is not built yet.
         std::vector<std::uint32_t> mesh_compute_words;
+        const bool mesh_compute = mesh && vs_stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
         if (mesh_compute) {
             const leonida::ShaderEntry& ms_entry = *vs_stage.entry;
-            if (!ms_entry.mesh_compute) {
-                std::fprintf(stderr, "[rt] d3d12: %s: mesh-shader PSOs need VK_EXT_mesh_shader, which the device has "
-                                     "not enabled, or mesh shaders translated with --mesh-compute\n",
-                             ms_entry.name.c_str());
+            if (device_.info.max_push_constants_size &&
+                device_.info.max_push_constants_size < sizeof(leonida::MeshComputeUserData)) {
+                log_once("--mesh-compute PSOs need 152 bytes of push constants; maxPushConstantsSize",
+                         int(device_.info.max_push_constants_size));
+                return E_NOTIMPL;
+            }
+            if (!device_.direct_family_computes()) {
+                log_once("--mesh-compute PSOs dispatch on the Direct queue, whose family has no VK_QUEUE_COMPUTE_BIT; "
+                         "family",
+                         int(device_.info.queue_family));
                 return E_NOTIMPL;
             }
             // Its subgroup operations are exact only at the size it was translated for: refused where the compute
@@ -5712,7 +5714,7 @@ public:
     bool mesh_compute_tier() {
         const leonida::ShaderLibrary* library = state_.library();
         const std::uint32_t push_limit = state_.info.max_push_constants_size;
-        return !state_.info.mesh_shader && library && library->mesh_compute_count() &&
+        return library && library->mesh_compute_count() &&
                state_.info.buffer_device_address &&
                (!push_limit || push_limit >= sizeof(leonida::MeshComputeUserData)) &&
                state_.direct_family_computes() &&

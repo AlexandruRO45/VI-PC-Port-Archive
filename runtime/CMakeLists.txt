@@ -2201,8 +2201,9 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_m5_mesh_chunks COMMAND d3d12_m5_mesh_test --max-draw-indirect-count 3)
       add_test(NAME d3d12_m5_mesh_compute COMMAND d3d12_m5_mesh_test --mesh-compute)
       add_test(NAME d3d12_m5_mesh_compute_single COMMAND d3d12_m5_mesh_test --mesh-compute --single-calls)
+      add_test(NAME d3d12_m5_mesh_compute_with_ext COMMAND d3d12_m5_mesh_test --mesh-compute-with-ext)
       set_tests_properties(d3d12_m5_mesh d3d12_m5_mesh_fallbacks d3d12_m5_mesh_chunks d3d12_m5_mesh_compute
-                           d3d12_m5_mesh_compute_single PROPERTIES SKIP_RETURN_CODE 77)
+                           d3d12_m5_mesh_compute_single d3d12_m5_mesh_compute_with_ext PROPERTIES SKIP_RETURN_CODE 77)
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes

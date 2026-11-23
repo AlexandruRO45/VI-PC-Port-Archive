@@ -37,6 +37,7 @@
 // DispatchMesh is the mesh-as-compute pass and its slot draw, and ExecuteIndirect(DISPATCH_MESH) the prepass that
 // writes each record's indirect dispatch and draw on the GPU (vulkan_mesh_indirect.h). Count buffers need no
 // drawIndirectCount there (the prepass reads the count), so I2..I4 always run. The same CPU reference, error 0.
+// --mesh-compute-with-ext runs the same translated library with native mesh support exposed to the layer.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -141,15 +142,21 @@ Constants constants(UINT first, unsigned r, unsigned g) { return {first, float(r
 
 int main(int argc, char** argv) {
     bool single_calls = false, no_count_buffers = false, mesh_compute = false;
+    bool compute_with_ext = false;
     std::uint32_t max_draw_count = 0;  // 0: the device's maxDrawIndirectCount
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--single-calls") == 0) single_calls = true;
         else if (std::strcmp(argv[i], "--no-count-buffers") == 0) no_count_buffers = true;
         else if (std::strcmp(argv[i], "--mesh-compute") == 0) mesh_compute = true;
+        else if (std::strcmp(argv[i], "--mesh-compute-with-ext") == 0) {
+            mesh_compute = true;
+            compute_with_ext = true;
+        }
         else if (std::strcmp(argv[i], "--max-draw-indirect-count") == 0 && i + 1 < argc)
             max_draw_count = std::uint32_t(std::strtoul(argv[++i], nullptr, 10));
         else {
-            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers] [--mesh-compute] "
+            std::fprintf(stderr, "usage: d3d12_m5_mesh_test [--single-calls] [--no-count-buffers] "
+                                 "[--mesh-compute | --mesh-compute-with-ext] "
                                  "[--max-draw-indirect-count N]\n");
             return 2;
         }
@@ -159,6 +166,10 @@ int main(int argc, char** argv) {
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips
     if (device_status != vktest::DeviceStatus::ready) return 1;
+    if (compute_with_ext && !d.mesh_shader) {
+        std::printf("SKIP: testing a compute translation with native mesh support requires VK_EXT_mesh_shader\n");
+        return 77;
+    }
 
     const std::filesystem::path root_dir = mesh_compute ? LEONIDA_TEST_M5_MESH_COMPUTE_DIR : LEONIDA_TEST_M5_MESH_DIR;
     leonida::ShaderLibrary library;
@@ -217,6 +228,12 @@ int main(int argc, char** argv) {
         Ref<ID3D12CommandSignature> sig;
         EXPECT(make_device(false, device));
         if (mesh_compute) {
+            const UINT limit = rt::d3d12::device_max_push_constants_size(device.p);
+            if (limit && limit < 152) {
+                EXPECT(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig) == E_NOTIMPL && !sig.p);
+                std::printf("SKIP: the compute translation needs 152 push-constant bytes and this GPU has %u\n", limit);
+                return 77;
+            }
             EXPECT(SUCCEEDED(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig)) && sig.p);
         } else {
             EXPECT(mesh_signature(device.p, sizeof(D3D12_DISPATCH_MESH_ARGUMENTS), sig) == E_NOTIMPL && !sig.p);
@@ -250,6 +267,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool counts = mesh_compute || (d.draw_indirect_count && !no_count_buffers);
+    const bool expose_mesh_extension = !mesh_compute || compute_with_ext;
     if (!d.multi_draw_indirect || single_calls) std::printf("note: no multiDrawIndirect: the layer issues one call per record\n");
     if (!counts) std::printf("note: no drawIndirectCount: the count-buffer calls (I2, I3, I4) are not run\n");
 
@@ -258,7 +276,7 @@ int main(int argc, char** argv) {
     const char* subgroup = "?";
     {
         Ref<ID3D12Device> device;
-        EXPECT(make_device(!mesh_compute, device));
+        EXPECT(make_device(expose_mesh_extension, device));
         if (rt::d3d12::device_push_constants_need_fallback(device.p)) {
             std::printf("SKIP: the PSOs need 144 push-constant bytes and this GPU has %u\n",
                         rt::d3d12::device_max_push_constants_size(device.p));
@@ -344,6 +362,7 @@ int main(int argc, char** argv) {
             if (mesh_compute) subgroup = "--mesh-compute, wave64 emulation";
             for (const auto& request : *requests) {
                 if (request.stage != VK_SHADER_STAGE_MESH_BIT_EXT) continue;
+                EXPECT(!mesh_compute);
                 mesh_request = true;
                 if (request.outcome != ms_request.outcome) {
                     std::fprintf(stderr, "the mesh PSO's subgroup outcome %d is not the predicted %d\n",
@@ -679,11 +698,12 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("mesh tier 1%s, translated wave64 mesh shader (128 threads, %s): DispatchMesh 4x2x2, 3x1x1, 1x1x1 and "
-                "an empty grid, %u mismatched pixels; ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched "
+    std::printf("mesh tier 1 %s VK_EXT_mesh_shader, translated wave64 mesh shader (128 threads, %s): "
+                "DispatchMesh 4x2x2, 3x1x1, 1x1x1 and an empty grid, %u mismatched pixels; "
+                "ExecuteIndirect DISPATCH_MESH, %u records drawn%s, %u mismatched "
                 "pixels; compute-written records: %u drawn, %u mismatched pixels; wrong-kind indirect draws fail at "
                 "execution\n",
-                mesh_compute ? " without VK_EXT_mesh_shader" : "", subgroup, direct_mismatches, records_drawn,
+                expose_mesh_extension ? "with" : "without", subgroup, direct_mismatches, records_drawn,
                 counts ? " (count buffers included)" : " (no count buffers)", indirect_mismatches, computed_records,
                 computed_mismatches);
     if (d.validation_errors()) {
