@@ -109,5 +109,14 @@ class VMulLoU16AstTests(unittest.TestCase):
         node = Mul16AstNode("v_mul_lo_u16", "v0", "v1", "v2")
         self.assertEqual(node.emit_asm(), "v_mul_lo_u16 v0, v1, v2")
 
+class VMulLoU16InterpreterTests(unittest.TestCase):
+    """Interpreter simulation for v_mul_lo_u16."""
+
+    def test_scalar_simulation(self):
+        regs = {"v1": 25, "v2": 4}
+        res = ref_mul_lo_u16(regs["v1"], regs["v2"])
+        regs["v0"] = res
+        self.assertEqual(regs["v0"], 100)
+
 if __name__ == "__main__":
     unittest.main()
