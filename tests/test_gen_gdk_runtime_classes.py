@@ -2,10 +2,14 @@
 
     python -I tests/test_gen_gdk_runtime_classes.py
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -79,6 +83,56 @@ class BuildTests(unittest.TestCase):
     def test_a_folder_without_com_is_an_oserror(self):
         with self.assertRaises(OSError):
             gen.build(self.dir)
+
+
+class MainTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.docs = write_docs(os.path.join(self.dir, "docs"))
+
+    def run_args(self, *args):
+        err = io.StringIO()
+        with mock.patch("sys.argv", ["gen_gdk_runtime_classes.py", *args]), \
+                contextlib.redirect_stderr(err):
+            code = gen.main()
+        return code, err.getvalue()
+
+    def test_out_parent_folder_is_created(self):
+        out = os.path.join(self.dir, "build", "nested", "classes.json")
+        code, err = self.run_args(self.docs, "--out", out)
+        self.assertEqual((code, err), (0, ""))
+        with open(out, encoding="utf-8", newline="") as f:
+            text = f.read()
+        self.assertNotIn("\r\n", text)
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(json.loads(text)["classes"]["CXTest"]["implements"], ["IXTest"])
+
+    def test_a_folder_named_out_is_refused(self):
+        folder = os.path.join(self.dir, "named.json")
+        os.makedirs(folder)
+        with self.assertRaises(SystemExit):
+            self.run_args(self.docs, "--out", folder)
+        self.assertEqual(os.listdir(folder), [])
+
+    def test_unwritable_out_is_one_error_line(self):
+        blocker = os.path.join(self.dir, "not_a_folder")
+        with open(blocker, "wb") as f:
+            f.write(b"keep me")
+        code, err = self.run_args(self.docs, "--out", os.path.join(blocker, "classes.json"))
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err)
+        self.assertNotIn("Traceback", err)
+        with open(blocker, "rb") as f:
+            self.assertEqual(f.read(), b"keep me")
+
+    def test_unreadable_docs_is_one_line(self):
+        code, err = self.run_args(self.dir, "--out", os.path.join(self.dir, "classes.json"))
+        self.assertEqual(code, 1)
+        self.assertIn("cannot read the docs", err)
+        self.assertNotIn("Traceback", err)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "classes.json")))
 
 
 if __name__ == "__main__":
