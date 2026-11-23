@@ -48,6 +48,8 @@ TARGET_ENV_VERSION = {
 _ID_KINDS = frozenset(("IdRef", "IdResult", "IdResultType", "IdScope", "IdMemorySemantics"))
 _EXT_SETS = {
     "GLSL.std.450": GLSL_STD_450,
+    # Khronos extinst.nonsemantic.debugprintf.grammar.json defines one opcode.
+    "NonSemantic.DebugPrintf": {"DebugPrintf": 1},
 }
 
 # Precompute fixed-arity pure-Id instructions (e.g. OpIAdd, OpFMul, OpSelect, OpStore, OpBranch)

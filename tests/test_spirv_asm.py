@@ -126,6 +126,38 @@ class SpirvAsmUnitTests(unittest.TestCase):
         self.assertIn(0x80000000, words)
         self.assertIn(0x3FC00000, words)  # 0x1.8p+0 = 1.5f
 
+    def test_nonsemantic_debug_printf_named_opcode(self):
+        asm = (
+            "OpCapability Shader\n"
+            'OpExtension "SPV_KHR_non_semantic_info"\n'
+            '%dbg = OpExtInstImport "NonSemantic.DebugPrintf"\n'
+            "OpMemoryModel Logical GLSL450\n"
+            'OpEntryPoint GLCompute %main "main"\n'
+            "OpExecutionMode %main LocalSize 1 1 1\n"
+            '%message = OpString "hello"\n'
+            '%format = OpString "value=%u other=%u"\n'
+            "%void = OpTypeVoid\n"
+            "%fn = OpTypeFunction %void\n"
+            "%uint = OpTypeInt 32 0\n"
+            "%first = OpConstant %uint 7\n"
+            "%second = OpConstant %uint 19\n"
+            "%main = OpFunction %void None %fn\n"
+            "%entry = OpLabel\n"
+            "%short = OpExtInst %void %dbg DebugPrintf %message\n"
+            "%long = OpExtInst %void %dbg DebugPrintf %format %first %second\n"
+            "OpReturn\n"
+            "OpFunctionEnd\n"
+        )
+        spv = spirv_asm.assemble(asm)
+        self.assertEqual(spv, spirv_asm.assemble(asm.replace("%dbg DebugPrintf ", "%dbg 1 ")))
+        _validate(spv)
+        if SPIRV_AS:
+            ref = subprocess.run(
+                [SPIRV_AS, "--target-env", "vulkan1.2", "-o", "-", "-"],
+                input=asm.encode("utf-8"), capture_output=True, check=True,
+            ).stdout
+            self.assertEqual(spv[:8] + spv[12:], ref[:8] + ref[12:])
+
     def test_hex_float_inf_nan_and_string_escapes_match_spirv_as(self):
         # Regression tests for PR #2251 review (@FreddyxS):
         # 1) Width-aware hex-float Inf and NaN payload spellings (f16, f32, f64).
