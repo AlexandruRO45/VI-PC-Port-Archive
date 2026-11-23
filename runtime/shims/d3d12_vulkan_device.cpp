@@ -842,6 +842,11 @@ struct DeviceState {
     std::mutex cbv_heap_mutex;
     std::map<VkDeviceSize, VkDeviceSize> cbv_heaps;
     static constexpr VkDeviceSize kTableScanDescriptors = 1024;  // per table and submission
+    // A console shader can read slots past the ranges its root signature declares: on the retail boot a vertex shader
+    // reads slot 2 of a table declared with one slot. The layer does not know which slots a bound shader reads, so a
+    // table is scanned (and its title-written slots pulled in) over at least this many slots, never past its heap.
+    // 16 slots are 512 bytes compared per bound table and submission.
+    static constexpr std::uint32_t kTableScanMinimum = 16;
 
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
@@ -854,9 +859,9 @@ struct DeviceState {
             if (it == cbv_heaps.begin()) return;
             --it;
             if (table_va >= it->second) return;
-            end = std::min<VkDeviceSize>(
-                it->second, table_va + VkDeviceSize(std::min<std::uint32_t>(descriptors, kTableScanDescriptors)) *
-                                           kDescriptorSize);
+            const std::uint32_t slots =
+                std::max(std::min<std::uint32_t>(descriptors, kTableScanDescriptors), kTableScanMinimum);
+            end = std::min<VkDeviceSize>(it->second, table_va + VkDeviceSize(slots) * kDescriptorSize);
         }
         auto& aliases = leonida::title_va_aliases();
         // Slots the title wrote in its own backing of this heap, if it gave the heap one.

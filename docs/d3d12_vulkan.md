@@ -1510,7 +1510,7 @@ therefore replaces such an address, wherever it sees one, by the console VA of a
 |---|---|
 | Root CBV/SRV/UAV (`Set*Root*View`) | when the argument is set |
 | CBV and buffer SRV/UAV V#s the layer writes (`Create*View`, slot 70, counter V#s included) | when the descriptor is written |
-| Buffer V#s the title writes into a shader-visible CBV/SRV/UAV heap itself | before each `ExecuteCommandLists`, in place, for the tables the submitted lists bind and only the slots their root signatures declare |
+| Buffer V#s the title writes into a shader-visible CBV/SRV/UAV heap itself | before each `ExecuteCommandLists`, in place, for the tables the submitted lists bind, over the slots their root signatures declare and at least 16 (see below) |
 
 The copies:
 - A **slot-133 buffer** whose pages cannot be imported is the per-submission shadow, and the shadow is an **arena
@@ -1531,6 +1531,13 @@ The title's own VA is still what `GetGPUVirtualAddress` answers, and vertex, ind
 still resolve it through the buffer VA index, which knows slot-133 buffers by that VA. The copies are one way: what
 the GPU writes into a copy does not reach the title's pages. A pointer the title hides elsewhere (a raw VA inside its
 constant data that a shader dereferences) is not seen by the layer and keeps the title's VA.
+
+**How many slots a table scan covers.** A console shader can read slots past the ranges its root signature
+declares. On the retail boot, a vertex shader reads slot 2 of a table declared with one slot. The layer does not know
+which slots a bound shader reads. So a table is scanned (and its title-written slots pulled in) over at least 16
+slots, never past the end of its heap (`kTableScanMinimum`). 16 covers the measured case with room to spare, at 512
+bytes compared per bound table and submission. The exact bound would be the slots the bound shaders load from the
+table pointer. Only the shader translation knows those, and it would first have to record them per pipeline.
 
 Why not give each buffer its own BDA and set `heap_base = 0`? Because 25,865 of the 26,503 shaders (97.6%)
 truncate descriptor-table pointers to 32 bits, and host BDAs are not guaranteed to be below 4 GB. The arena keeps console VAs low and stable.

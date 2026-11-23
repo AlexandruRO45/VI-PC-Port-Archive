@@ -110,7 +110,8 @@ public:
     }
 
     // Before a submission: the device rewrites the buffer V#s of the `descriptors` slots the root signature declares
-    // for the table at `table_va` (a console VA in one of its shader-visible CBV/SRV/UAV heaps).
+    // for the table at `table_va` (a console VA in one of its shader-visible CBV/SRV/UAV heaps), and of at least
+    // DeviceState::kTableScanMinimum slots, since a console shader can read past the declared ranges.
     void scan_table(std::uint64_t table_va, std::uint32_t descriptors) {
         TableScanner scanner;
         void* context;

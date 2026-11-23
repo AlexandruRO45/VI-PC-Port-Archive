@@ -326,7 +326,7 @@ int check_title_memory(Context& c, int& checks) {
                                                        D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                        IID_PPV_ARGS(&readback.p))));
 
-    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8,
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32,
                                                D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     Ref<ID3D12DescriptorHeap> heap;
     EXPECT(SUCCEEDED(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap.p))));
@@ -355,9 +355,16 @@ int check_title_memory(Context& c, int& checks) {
     auto image_like = raw_vsharp(ring_va + 0x4000);
     image_like[3] |= 0x8u << 28;  // TYPE: an image
     std::memcpy(reinterpret_cast<void*>(cpu + 4 * inc), image_like.data(), sizeof(image_like));
-    std::uint8_t before3[32], before4[32];
+    // Slot 5: a V# the CPU writes past every bound table's declared slot, as a console shader reads past the ranges
+    // its root signature declares; the scan covers at least 16 slots, so it is rewritten. Slot 20: 16 slots past the
+    // last bound table (slot 4), outside every scan, so it keeps its bytes (the negative control).
+    const auto v5 = raw_vsharp(ring_va + 0x5000);
+    std::memcpy(reinterpret_cast<void*>(cpu + 5 * inc), v5.data(), sizeof(v5));
+    std::memcpy(reinterpret_cast<void*>(cpu + 20 * inc), v5.data(), sizeof(v5));
+    std::uint8_t before3[32], before4[32], before20[32];
     std::memcpy(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
     std::memcpy(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
+    std::memcpy(before20, reinterpret_cast<const void*>(cpu + 20 * inc), 32);
 
     // The ring's data, written before the submission (after the descriptors, as a title fills its ring per frame).
     for (UINT i = 0; i < ring_bytes / 4; ++i) ring[i] = 0xC0000000u + i * 7u;
@@ -423,6 +430,8 @@ int check_title_memory(Context& c, int& checks) {
     const bool rewritten = vsharp_base(cpu) < c.arena;
     const bool arena_kept = !std::memcmp(before3, reinterpret_cast<const void*>(cpu + 3 * inc), 32);
     const bool image_kept = !std::memcmp(before4, reinterpret_cast<const void*>(cpu + 4 * inc), 32);
+    const bool past_declared = vsharp_base(cpu + 5 * inc) < c.arena;
+    const bool past_window_kept = !std::memcmp(before20, reinterpret_cast<const void*>(cpu + 20 * inc), 32);
     std::printf("title memory (a constant ring): CPU-written table V# %u/%u (rewritten before the submission: %s), "
                 "created CBV %u/%u, root view %u/%u; negative controls: arena V# kept %s, T#-shaped slot kept %s; "
                 "translated: %llu table V#, %llu created, %llu root\n",
@@ -434,6 +443,9 @@ int check_title_memory(Context& c, int& checks) {
                 static_cast<unsigned long long>(aliases.translated(leonida::TitleVaAliases::root_view) - root_before));
     EXPECT(raw_ok == kElements && cbv_ok == kElements && root_ok == kElements);
     EXPECT(rewritten && arena_kept && image_kept);
+    std::printf("table scan window: a V# past the declared slot rewritten %s, a V# past the 16-slot window kept %s\n",
+                past_declared ? "yes" : "no", past_window_kept ? "yes" : "no");
+    EXPECT(past_declared && past_window_kept);
     // Left alone and counted: committed memory that is not the title's (the runtime's own, say), and a title range
     // with no committed page.
     const std::uint64_t untranslated_before = aliases.untranslated(leonida::TitleVaAliases::created_view);
