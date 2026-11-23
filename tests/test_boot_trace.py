@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -96,8 +97,29 @@ D3D12 = [
 
 
 def deep_json_record():
-    depth = sys.getrecursionlimit() * 2
-    return '{"kind":"future_event","detail":' + '[' * depth + '0' + ']' * depth + '}'
+    # Builtin decoder depth is not necessarily sys.getrecursionlimit(), and -I
+    # starts a fresh interpreter. Verify the same bounded fixture on both.
+    probe = (
+        "import json, sys\n"
+        "try:\n"
+        "    json.loads(sys.stdin.read())\n"
+        "except RecursionError:\n"
+        "    sys.exit(11)\n"
+    )
+    for depth in (1024, 2048, 4096, 8192):
+        record = '{"kind":"future_event","detail":' + '[' * depth + '0' + ']' * depth + '}'
+        try:
+            json.loads(record)
+        except RecursionError:
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", probe], input=record,
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 11:
+                return record
+            if result.returncode != 0:
+                raise RuntimeError(f"decoder probe failed: {result.stderr}")
+    return None
 
 
 class BootTraceTests(unittest.TestCase):
@@ -116,6 +138,12 @@ class BootTraceTests(unittest.TestCase):
     def write_lines(self, path, lines):
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+
+    def rejected_deep_record(self):
+        record = deep_json_record()
+        if record is None:
+            self.skipTest("JSON decoder accepted all bounded depth probes")
+        return record
 
     def test_startup_summary(self):
         self.write(self.startup, STARTUP)
@@ -180,9 +208,7 @@ class BootTraceTests(unittest.TestCase):
 
     def test_deep_json_does_not_hide_surrounding_events(self):
         # The runtime does not emit deeply nested records, but a damaged or foreign trace can contain one.
-        deep = deep_json_record()
-        with self.assertRaises(RecursionError):
-            json.loads(deep)
+        deep = self.rejected_deep_record()
         self.write_lines(self.startup, [
             '{"kind":"trace_open","pid":7}', deep, '{"kind":"exit","code":42}',
         ])
@@ -196,7 +222,7 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
 
     def test_only_deep_json_reports_no_valid_event(self):
-        deep = deep_json_record()
+        deep = self.rejected_deep_record()
         self.write_lines(self.startup, [deep])
         self.write_lines(self.d3d12, ["[d3d12-trace] #1 CreateDevice ok"])
         out, err = io.StringIO(), io.StringIO()
@@ -208,7 +234,7 @@ class BootTraceTests(unittest.TestCase):
 
     def test_deep_json_real_cli_preserves_other_events(self):
         self.write_lines(self.startup, [
-            '{"kind":"trace_open","pid":7}', deep_json_record(), '{"kind":"exit","code":42}',
+            '{"kind":"trace_open","pid":7}', self.rejected_deep_record(), '{"kind":"exit","code":42}',
         ])
         result = subprocess.run(
             [sys.executable, "-I", os.path.join(ROOT, "tools", "boot_trace.py"), self.startup, "--json"],
@@ -218,6 +244,54 @@ class BootTraceTests(unittest.TestCase):
         trace = json.loads(result.stdout)["startup"]
         self.assertEqual((trace["bad_lines"], trace["bad_line_numbers"], trace["exit"]), (1, [2], 42))
         self.assertEqual(result.stderr, "")
+
+    def test_injected_decoder_recursion_error_is_counted(self):
+        bad = '{"kind":"synthetic_recursion_error"}'
+        self.write_lines(self.startup, [
+            '{"kind":"trace_open","pid":7}', bad, '{"kind":"exit","code":42}',
+        ])
+        real_loads = json.loads
+
+        def decode(line):
+            if line == bad:
+                raise RecursionError("synthetic decoder failure")
+            return real_loads(line)
+
+        with mock.patch.object(bt.json, "loads", side_effect=decode):
+            trace = bt.parse_startup(self.startup)
+        self.assertEqual((trace["events"], trace["bad_lines"], trace["bad_line_numbers"]), (2, 1, [2]))
+        self.assertEqual((trace["pid"], trace["exit"]), (7, 42))
+
+    def test_deep_fixture_probe_requires_both_decoders_to_reject(self):
+        def decode(record):
+            if record.count("[") >= 2048:
+                raise RecursionError("simulated parent limit")
+            return {}
+
+        with mock.patch.object(bt.json, "loads", side_effect=decode), mock.patch.object(
+            subprocess, "run", side_effect=[mock.Mock(returncode=0), mock.Mock(returncode=11)]
+        ) as probe:
+            record = deep_json_record()
+        self.assertEqual(record.count("["), 4096)
+        self.assertEqual(probe.call_count, 2)
+
+    def test_deep_fixture_skips_if_no_bounded_probe_is_rejected(self):
+        with mock.patch.object(bt.json, "loads", return_value={}), mock.patch.object(
+            subprocess, "run"
+        ) as probe:
+            self.assertIsNone(deep_json_record())
+            probe.assert_not_called()
+        with mock.patch(__name__ + ".deep_json_record", return_value=None):
+            with self.assertRaises(unittest.SkipTest):
+                self.rejected_deep_record()
+
+    def test_parseable_nested_json_is_not_rejected(self):
+        depth = 64
+        record = '{"kind":"future_event","detail":' + '[' * depth + '0' + ']' * depth + '}'
+        self.write_lines(self.startup, [record])
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual((trace["events"], trace["bad_lines"]), (1, 0))
+        self.assertEqual(trace["kinds"]["future_event"], 1)
 
     def test_truncated_line_is_counted_not_fatal(self):
         self.write(self.startup, STARTUP)
