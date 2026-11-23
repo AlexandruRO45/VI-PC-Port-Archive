@@ -319,9 +319,10 @@ W64X_DUMPS = [("cs_dpp_w64", [1, 0, 3, 2, 5, 4, 7, 6]),
               ("cs_w64x_andn2_exec", [1, 16, 32, 4144, 2052, 3, 8, 1544]),
               # s_and/s_or_saveexec_b64 (VCC and SGPR-pair sources), s_andn2_saveexec/wrexec_b64 (SGPR pair): D, EXEC, SCC
               ("cs_w64x_saveexec_b64", [6160, 12304, 5120, 2088, 6168, 8192, 7176, 1837171])]
-# A 40-thread group (one partial wave) cannot use --require-wave64 (full subgroups), so it asks for subgroup size 64.
+# Partial groups ask for subgroup size 64 without --require-wave64's full-subgroup requirement.
 W64X_PARTIAL = [("cs_w64x_partial", [40, 40, 528, 0, 0, 532, 539, 524820]),
-                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0])]
+                ("cs_w64x_partial_scmp", [0, 1, 0, 1, 1, 1, 1, 0]),
+                ("cs_w64x_partial_second", [64, 33, 97, 289, 32, 1, 97, 289])]
 PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_legacy_mul": (0, 0, 0, 0x40c00000),
               "ps_mul_legacy_denorm": (0, 0, 0, 0x80000000),
@@ -670,7 +671,7 @@ def mesh_v5_test(tools, spirv, raw):
 
 
 def partial_wave_test(tools, spirv, name, expected_words):
-    """A group smaller than a wave: run with subgroup size 64 requested (no full subgroups); None if the device
+    """A workgroup with a partial wave: request subgroup size 64 (no full subgroups); None if the device
     has no 64-wide subgroup. With LEONIDA_W64_EMULATE=1 it asks for 32 instead, the width the emulation is for, so
     a device that defaults to 64 (AMD) runs the emulated path at 32 too (#166)."""
     shader = os.path.join(spirv, name + ".spv")
