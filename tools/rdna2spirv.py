@@ -357,6 +357,10 @@ class Gen:
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
+        # Partial wave (a compute or mesh group whose size is not a multiple of the wave size): (wave size, group
+        # size), else None. Its last wave has lanes that were never launched; see unl_words / shadow_pre.
+        self.partial = None
+        self.vcc_half = None       # partial: "%vcc" / "%vcc_hi" while put_mask writes one half of VCC
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
@@ -397,6 +401,15 @@ class Gen:
 
     def emit(self, s):
         self.body.append("         " + s)
+        if self.partial and s.startswith(("OpStore %vcc ", "OpStore %vcc_hi ")):
+            # As in store_reg: a VCC write resets the never-launched bits to 0 (shadow_post_op may set them again).
+            # %vcc holds the whole mask, so a store to it is a write of both words, unless put_mask writes one half.
+            if s.startswith("OpStore %vcc_hi "):
+                words = ["%vcc_hi"]
+            else:
+                words = [self.vcc_half] if self.vcc_half else ["%vcc", "%vcc_hi"]
+            for w in words:
+                self.body.append(f"         OpStore {w}_s {self.cu(0)}")
         if s.startswith("OpStore %active "):
             if self.exec_static_true:
                 raise RuntimeError(f"OpStore %active emitted with exec_static_true: {s}")
@@ -444,6 +457,10 @@ class Gen:
                 self.desc_cache = {k: v for k, v in self.desc_cache.items() if not (k[0] <= r < k[0] + k[1])}
         p = self.reg_ptr(kind, r)
         self.emit(f"OpStore {p} {val}")
+        if kind == "sgpr" and self.partial and (r in self.ever_mask or r >= self.SGPRS):
+            # A write that sets no shadow of its own (a VALU compare, a data load) leaves the never-launched lanes'
+            # bits 0; shadow_post sets it again after the SALU mask ops.
+            self.emit(f"OpStore {self.shadow_ptr(r)} {self.cu(0)}")
 
     def imm_val(self, a):
         """Integer literal value if 'a' is an immediate or known SGPR constant, else None."""
@@ -5692,6 +5709,234 @@ class Gen:
         slots = lane_masks.parked(blocks[0], self.lane_masks)
         self.parked = {slot: self.SGPRS + i for i, slot in enumerate(slots)}
 
+    # ---- never-launched lanes of a partial wave ----
+    # A compute or mesh group whose size is not a multiple of the wave size ends in a partial wave: lanes c..W-1
+    # (c = group size mod W) were never launched. In a scalar register they are bits like any other: 0 in EXEC and in
+    # a VALU compare's result, but a SALU op computes them with the rest of the word, so s_not_b64 of VCC sets them
+    # (SCC 1, s_bcnt1 counts them). They are not invocations here, so their bits are kept in a shadow word per
+    # scalar register (%sgpr_s, %vcc_s, %vcc_hi_s): the register's bits at the never-launched positions (the bits at
+    # launched positions are don't-care). Every write resets it to 0 (store_reg, emit), which is what a VALU or data
+    # write leaves there; shadow_post_op sets it after a SALU bitwise op to the same op over the sources' shadows. A
+    # data register's shadow is its value, a constant's the constant, EXEC's 0. It is run-time state next to the
+    # register, so it follows branches, joins and loops as the register does. Only a partial-wave module
+    # (self.partial) has it; every other module is unchanged.
+    SHADOW_B64 = {"s_and_b64": "and", "s_or_b64": "or", "s_xor_b64": "xor", "s_andn2_b64": "andn2",
+                  "s_orn2_b64": "orn2", "s_nand_b64": "nand", "s_nor_b64": "nor", "s_xnor_b64": "xnor",
+                  "s_not_b64": "not", "s_mov_b64": "mov", "s_wqm_b64": "wqm", "s_cselect_b64": "csel"}
+    SHADOW_B32 = {k.replace("_b64", "_b32"): v for k, v in SHADOW_B64.items()}
+    SHADOW_SCC = ("and", "or", "xor", "andn2", "orn2", "nand", "nor", "xnor", "not", "wqm")    # SCC = D != 0
+
+    def shadow_ptr(self, r):
+        p = self.tmp()
+        self.emit(f"{p} = OpAccessChain %_ptr_Function_uint %sgpr_s {self.cu(r)}")
+        return p
+
+    def unl_words(self):
+        """(lo, hi): the never-launched lanes of this invocation's wave as mask bits; 0 in a full wave."""
+        w, n = self.partial
+        c = n % w
+        ul = ((1 << w) - 1) & ~((1 << c) - 1)
+        wid, last, lo, hi = (self.tmp() for _ in range(4))
+        self.emit(f"{wid} = OpShiftRightLogical %uint {self.local_index()} {self.cu(w.bit_length() - 1)}")
+        self.emit(f"{last} = OpIEqual %bool {wid} {self.cu(n // w)}")
+        self.emit(f"{lo} = OpSelect %uint {last} {self.cu(ul & 0xFFFFFFFF)} {self.cu(0)}")
+        self.emit(f"{hi} = OpSelect %uint {last} {self.cu(ul >> 32)} {self.cu(0)}")
+        return lo, hi
+
+    def shadow_word(self, a, word):
+        """The shadow of 32-bit word `word` (0 or 1) of operand `a`, or None for an operand that has none."""
+        k = a["k"]
+        if k == "sgpr":
+            r = a["r"] + word
+            if r in self.cur_masks:
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint {self.shadow_ptr(r)}")
+                return v
+            return self.load_reg("sgpr", r)            # data (or a constant 0 / -1): the same bits everywhere
+        if k == "special":
+            t = a.get("t", "")
+            if t.startswith("exec") or t == "null":
+                return self.cu(0)
+            if t in ("vcc", "vcc_lo", "vcc_hi"):
+                hi = word == 1 or t == "vcc_hi"
+                var = "%vcc_hi" if hi else "%vcc"
+                # A wave32 vcc_hi is plain data, and so is a VCC that holds no lane mask here.
+                shadowed = "vcc" in self.cur_masks and (self.wave64 or not hi)
+                v = self.tmp()
+                self.emit(f"{v} = OpLoad %uint {var + '_s' if shadowed else var}")
+                return v
+            return None
+        if k == "imm":
+            v = a["v"] & 0xFFFFFFFFFFFFFFFF
+            return self.cu((v >> 32) if word else v)
+        return None
+
+    def shadow_words(self, a, wide):
+        """(lo, hi) shadow of a 64-bit operand (wide), or (word, word) of a 32-bit one; None without a shadow."""
+        if wide:
+            lo, hi = self.shadow_word(a, 0), self.shadow_word(a, 1)
+            return None if lo is None or hi is None else (lo, hi)
+        w = self.shadow_word(a, 0)
+        return None if w is None else (w, w)
+
+    def shadow_fn(self, kind, xs, scc):
+        """One word of `kind` over the source shadows xs (scc: SCC before the op, for s_cselect)."""
+        if kind == "mov":
+            return xs[0]
+        if kind == "not":
+            r = self.tmp()
+            self.emit(f"{r} = OpNot %uint {xs[0]}")
+            return r
+        if kind == "wqm":
+            return self.wqm_word(xs[0])
+        if kind == "csel":
+            b, r = self.tmp(), self.tmp()
+            self.emit(f"{b} = OpINotEqual %bool {scc} {self.cu(0)}")
+            self.emit(f"{r} = OpSelect %uint {b} {xs[0]} {xs[1]}")
+            return r
+        x, y = xs
+        if kind in ("andn2", "orn2"):
+            n = self.tmp()
+            self.emit(f"{n} = OpNot %uint {y}")
+            y = n
+        base = {"and": "OpBitwiseAnd", "andn2": "OpBitwiseAnd", "nand": "OpBitwiseAnd", "or": "OpBitwiseOr",
+                "orn2": "OpBitwiseOr", "nor": "OpBitwiseOr", "xor": "OpBitwiseXor", "xnor": "OpBitwiseXor"}[kind]
+        r = self.tmp()
+        self.emit(f"{r} = {base} %uint {x} {y}")
+        if kind in ("nand", "nor", "xnor"):
+            t, r = r, self.tmp()
+            self.emit(f"{r} = OpNot %uint {t}")
+        return r
+
+    def shadow_half(self, a):
+        """The word of the wave a 32-bit SALU op works on: 'lo', 'hi', or None when its operands disagree."""
+        if not self.wave64:
+            return "lo"
+        halves = {h for h in (self.mask_half(x) for x in a if x["k"] in ("sgpr", "special")) if h}
+        if len(halves) > 1:
+            return None
+        return halves.pop() if halves else "lo"
+
+    def shadow_pre(self, ins):
+        """Before a SALU instruction in a partial-wave module: read what the step after it needs (the sources'
+        shadows, before the destination may overwrite one of them). Returns that step, or None."""
+        op, a = base_op(ins["op"]), ins["args"]
+        kind = self.SHADOW_B64.get(op) or self.SHADOW_B32.get(op)
+        if kind is not None:
+            wide = op.endswith("_b64")
+            srcs = a[1:2] if kind in ("mov", "not", "wqm") else a[1:3]
+            if len(a) < 1 + len(srcs):
+                return None
+            sh = [self.shadow_words(x, wide) for x in srcs]
+            if any(x is None for x in sh):
+                return None
+            exact = kind == "wqm" and self.holds_lane_mask(srcs[0])
+            if exact:
+                # s_wqm of a lane mask fills a quad from all four of its bits. Where the launch ends inside a quad,
+                # some of them are never-launched bits, which no invocation holds (quad_any would read an absent
+                # one), and the shadow's don't-care bits at launched positions must not spread into them. So the
+                # whole word is gathered (launched bits and shadow at the never-launched positions) and the result
+                # taken from it: each lane's bit, the shadow and SCC (shadow_post_op, in place of the instruction).
+                lo, hi = self.wave_mask(srcs[0])
+                sh = [(lo, hi) if wide else ((hi, hi) if self.shadow_half(a) == "hi" else (lo, lo))]
+            scc = None
+            if kind == "csel":
+                scc = self.tmp()
+                self.emit(f"{scc} = OpLoad %uint %scc")
+            half = None if wide else self.shadow_half(a)
+            post = lambda: self.shadow_post_op(kind, wide, a[0], sh, scc, half, exact)  # noqa: E731
+            post.replaces = bool(exact)          # the whole instruction (quad_any would read absent invocations)
+            return post
+        if op in ("s_cmp_eq_u32", "s_cmp_lg_u32", "s_cmp_eq_u64", "s_cmp_lg_u64") and \
+                any(self.holds_lane_mask(x) for x in a[:2]):
+            wide = op.endswith("u64")
+            sh = [self.shadow_words(x, wide) for x in a[:2]]
+            half = "both" if wide else self.shadow_half(a[:2])
+            if any(x is None for x in sh) or half is None:
+                return None
+            return lambda: self.shadow_post_cmp(op.startswith("s_cmp_eq"), sh, half)
+        return None
+
+    def shadow_post_op(self, kind, wide, d, sh, scc, half, exact=None):
+        """After a SALU bitwise op: store the destination's shadow, and add its never-launched bits to SCC.
+        exact: in place of the instruction, an s_wqm of a lane mask whose whole words `sh` holds: each lane's bit,
+        the shadow and SCC all come from the result."""
+        words = [self.shadow_fn(kind, [x[i] for x in sh], scc) for i in range(2 if wide else 1)]
+        if exact:
+            lane, up, word, sh5, shr, bit, v = (self.tmp() for _ in range(7))
+            self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
+            if wide:
+                self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                self.emit(f"{word} = OpSelect %uint {up} {words[1]} {words[0]}")
+            else:
+                self.emit(f"{word} = OpCopyObject %uint {words[0]}")
+            self.emit(f"{sh5} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh5}")
+            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+            self.emit(f"{v} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+            if wide or d["k"] == "sgpr":
+                self.mask_dst(d, v)
+            else:
+                self.put_mask(d, v, half if self.wave64 else None)
+        if d["k"] == "sgpr":
+            for i, w in enumerate(words[:d.get("n", 1)]):
+                self.emit(f"OpStore {self.shadow_ptr(d['r'] + i)} {w}")
+        elif d["k"] == "special" and d.get("t") in ("vcc", "vcc_lo", "vcc_hi"):
+            if wide:
+                self.emit(f"OpStore %vcc_s {words[0]}")
+                self.emit(f"OpStore %vcc_hi_s {words[1]}")
+            else:
+                self.emit(f"OpStore {'%vcc_hi_s' if d['t'] == 'vcc_hi' else '%vcc_s'} {words[0]}")
+        if exact:
+            if self.cur_scc_live:
+                nz = words[0]
+                if wide:
+                    nz = self.tmp()
+                    self.emit(f"{nz} = OpBitwiseOr %uint {words[0]} {words[1]}")
+                z = self.tmp()
+                self.emit(f"{z} = OpSelect %uint {self.tmp_bool_nz(nz)} {self.cu(1)} {self.cu(0)}")
+                self.emit(f"OpStore %scc {z}")
+            return
+        if kind not in self.SHADOW_SCC or not self.cur_scc_live or (not wide and half is None):
+            return
+        # The op's own SCC (D != 0) is exact over the launched lanes (a vote, or the value of a data op); the
+        # never-launched bits are ORed in. For a data op the shadow is the result itself, so this changes nothing.
+        lo, hi = self.unl_words()
+        if wide:
+            m0, m1, m = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{m0} = OpBitwiseAnd %uint {words[0]} {lo}")
+            self.emit(f"{m1} = OpBitwiseAnd %uint {words[1]} {hi}")
+            self.emit(f"{m} = OpBitwiseOr %uint {m0} {m1}")
+        else:
+            m = self.tmp()
+            self.emit(f"{m} = OpBitwiseAnd %uint {words[0]} {hi if half == 'hi' else lo}")
+        cur, any_, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{cur} = OpLoad %uint %scc")
+        self.emit(f"{any_} = OpSelect %uint {self.tmp_bool_nz(m)} {self.cu(1)} {self.cu(0)}")
+        self.emit(f"{r} = OpBitwiseOr %uint {cur} {any_}")
+        self.emit(f"OpStore %scc {r}")
+
+    def shadow_post_cmp(self, eq, sh, half):
+        """After s_cmp_eq/lg of a lane mask: the words must also agree at the never-launched positions."""
+        lo, hi = self.unl_words()
+        diffs = []
+        for i, ul in ((0, lo), (1, hi)):
+            if half not in ("both", "hi" if i else "lo"):
+                continue
+            x, m = self.tmp(), self.tmp()
+            self.emit(f"{x} = OpBitwiseXor %uint {sh[0][i]} {sh[1][i]}")
+            self.emit(f"{m} = OpBitwiseAnd %uint {x} {ul}")
+            diffs.append(m)
+        if len(diffs) == 2:
+            o = self.tmp()
+            self.emit(f"{o} = OpBitwiseOr %uint {diffs[0]} {diffs[1]}")
+            diffs = [o]
+        same, cur, r = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{same} = OpIEqual %bool {diffs[0]} {self.cu(0)}")
+        self.emit(f"{cur} = OpLoad %uint %scc")
+        self.emit(f"{r} = OpSelect %uint {same} {cur} {self.cu(1 - int(eq))}")
+        self.emit(f"OpStore %scc {r}")
+
     def mask_half(self, a):
         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
         if a["k"] == "special":
@@ -5771,7 +6016,24 @@ class Gen:
         """The whole wave's lane mask in operand `a` as real bits: (lanes 0-31, lanes 32-63). A register holds
         only this lane's bit (all ones or zero), so each lane puts its bit at its own position and the subgroup
         (= the wave) ORs them together. For the instructions that look at a mask as a whole: until 2026-11-21
-        they saw the one lane, so the lane count of a wave was 64 or 0 and its first lane 0 or none."""
+        they saw the one lane, so the lane count of a wave was 64 or 0 and its first lane 0 or none. In a partial
+        wave the never-launched lanes' bits come from the register's shadow (shadow_word)."""
+        lo, hi = self.wave_mask_launched(a)
+        if not self.partial:
+            return lo, hi
+        sh = self.shadow_words(a, a["k"] != "sgpr" or a.get("n", 1) == 2)
+        if sh is None:
+            return lo, hi
+        out = []
+        for word, s_w, ul in zip((lo, hi), sh, self.unl_words()):
+            m, o = self.tmp(), self.tmp()
+            self.emit(f"{m} = OpBitwiseAnd %uint {s_w} {ul}")
+            self.emit(f"{o} = OpBitwiseOr %uint {word} {m}")
+            out.append(o)
+        return tuple(out)
+
+    def wave_mask_launched(self, a):
+        """wave_mask over the launched lanes only."""
         self.uses_subgroup = True
         special = a["k"] == "special" and a.get("t", "").startswith("exec")
         key = None
@@ -5889,7 +6151,9 @@ class Gen:
                 self.emit(f"{inh} = {'OpUGreaterThanEqual' if h else 'OpULessThan'} %bool {lane} {self.cu(32)}")
                 self.emit(f"{cur} = OpLoad %uint %vcc")
                 self.emit(f"{new} = OpSelect %uint {inh} {v} {cur}")
+                self.vcc_half = "%vcc_hi" if h else "%vcc"
                 self.emit(f"OpStore %vcc {new}")
+                self.vcc_half = None
             return
         self.mask_dst(d, v)
 
@@ -6389,6 +6653,13 @@ class Gen:
         if self.emulate:
             self.x_memory_order(base_op(ins["op"]))
         self.cur_either = self.lane_either.get(id(ins), ())
+        if self.partial and ins["op"].startswith("s_"):
+            post = self.shadow_pre(ins)
+            if post is not None:
+                if not getattr(post, "replaces", False):
+                    self._insn(ins)
+                post()
+                return None
         if ins["op"].endswith("_dpp"):
             return self.dpp_insn(ins)
         if not ins["op"].endswith("_sdwa"):
@@ -7890,7 +8161,13 @@ class Gen:
                 # A lane mask parked there by v_writelane (a saved EXEC, when the shader ran out of SGPRs): this
                 # lane's bit comes back, from the slot the write kept it in. The shuffle would hand every lane
                 # the bit of the one lane the mask was parked in.
+                sh = None
+                if self.partial and a[0]["k"] == "sgpr":
+                    sh = self.tmp()
+                    self.emit(f"{sh} = OpLoad %uint {self.shadow_ptr(self.parked[slot[1:]])}")
                 self.dst(a[0], self.load_reg("sgpr", self.parked[slot[1:]]))
+                if sh is not None:
+                    self.emit(f"OpStore {self.shadow_ptr(a[0]['r'])} {sh}")
                 return
             if slot and slot[1:] in self.w64_scalar_spills:
                 # SHADER-10: wave64_halves proved this VGPR is pure scalar-spill storage (never read as a vector
@@ -7915,7 +8192,10 @@ class Gen:
             self.uses_subgroup = True
             val, ln = self.src_u(a[1]), self.src_u(a[2])
             if slot and slot[1:] in self.parked:        # somewhere a mask is fetched back from this lane: keep ours
+                sh = self.shadow_word(a[1], 0) if self.partial else None
                 self.store_reg("sgpr", self.parked[slot[1:]], val)
+                if sh is not None:
+                    self.emit(f"OpStore {self.shadow_ptr(self.parked[slot[1:]])} {sh}")
             me, m, eq, old, r = (self.tmp() for _ in range(5))
             if self.stage in ("cs", "ms") or self.wave32_fragment:
                 # Wave32 fragments use their lane within either half of a wider Vulkan subgroup.
@@ -15164,6 +15444,10 @@ def assemble(gen):
           *(["%mode_r16 = OpVariable %_ptr_Function_uint Function %c0"] if gen.round_mode else []),
           "%active = OpVariable %_ptr_Function_bool Function %true",
           *[f"{var} = OpVariable {ptr} Function" for var, ptr in gen.eager_vars]]
+    if gen.partial:
+        fn += ["%sgpr_s = OpVariable %_ptr_Function_arr_s Function %null_s",
+               "%vcc_s = OpVariable %_ptr_Function_uint Function %c0",
+               "%vcc_hi_s = OpVariable %_ptr_Function_uint Function %c0"]
     if gen.vm_latch:
         fn += ["%vm_mask = OpVariable %_ptr_Function_bool Function %true",
                "%vm_set = OpVariable %_ptr_Function_bool Function %false"]
@@ -16723,6 +17007,11 @@ def translate(path):
         insns = [i for i in insns if base_op(i["op"]) != "s_swappc_b64"]
     user_limit = g.cs["user"] if g.cs else USER_SGPRS
     sys_sgprs = (3,) if stage in ("ms", "gs") else ()
+    if stage in ("cs", "ms"):
+        size = (g.cs or g.ms)["size"]
+        group, wave = size[0] * size[1] * size[2], 64 if g.wave64 else 32
+        if group % wave:
+            g.partial = (wave, group)
     if WAVE64_EMULATE and g.wave64 and stage in ("cs", "ms"):
         g.emulate = True
         size = (g.cs or g.ms)["size"]
