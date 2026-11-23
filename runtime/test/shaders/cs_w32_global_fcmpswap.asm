@@ -1,3 +1,4 @@
+; regen_fixtures: this source has a translator fixture in tests/semantic/fixtures/disasm
 ; global_atomic_fcmpswap (#3153, Gen.float_cmpswap_loop): vdata is {DATA, CMP}, the compare is a float compare (-0
 ; matches +0, a NaN never matches, not even its own bits), and the CAS loop stays exact when lanes contend.
 ; Global addresses are heap offsets (s[20:21] = P = 0x80, v30 = 0). Seeds (MUBUF stores through the V# in s[0:3]):
