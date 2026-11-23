@@ -11,6 +11,13 @@ container fields are reported here; no game data is included. SCARAB's own count
 (25,321 extracted streams, 25,782 parseable blobs, 25,889 payloads) come from a different
 title build and are not directly comparable.
 
+Run `python -I tools/fssm_hash_report.py <carved-dxbc-directory>` for an optional
+aggregate JSON report. It inflates every XDAT tag-0x0D payload and compares four
+fields of its descriptor with bytes 0–1, 4–7, 8–9 and 12–15 of the enclosing
+`HASH` digest. A match covers those 12 bytes. Missing parts, malformed inputs
+and mismatches have separate counts. Exit status 0 requires a nonempty scan
+with every container and payload checked successfully.
+
 The short version:
 
 - The FSSM unwrap is **not the same** as `tools/fssm_unpack.py`. Leonida parses the XDAT

@@ -25,6 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import fssm_unpack  # noqa: E402
+import fssm_hash_report  # noqa: E402
 import shader_disasm  # noqa: E402
 
 CODE_OFF = 0x100
@@ -64,7 +65,7 @@ def xbch(payload: bytes) -> bytes:
             + compressed)
 
 
-def dxbc_with(entries, hdr: int = 0x24) -> bytes:
+def dxbc_with(entries, hdr: int = 0x24, hash_part=None) -> bytes:
     """A DXBC-shaped container with the given XDAT entries.
 
     The 195 duplicate containers use four entries and keep the header word at 0x24; the fourth
@@ -91,7 +92,7 @@ def dxbc_with(entries, hdr: int = 0x24) -> bytes:
         dxil[off:off + len(payload)] = payload
         off += len(payload)
 
-    chunk = 0x24
+    chunk = 0x24 if hash_part is None else 0x28
     out = bytearray(chunk + 8 + len(dxil))
     out[0:4] = b"DXBC"
     struct.pack_into("<I", out, 28, 1)                # chunk count
@@ -99,7 +100,40 @@ def dxbc_with(entries, hdr: int = 0x24) -> bytes:
     out[chunk:chunk + 4] = b"DXIL"
     struct.pack_into("<I", out, chunk + 4, len(dxil))
     out[chunk + 8:chunk + 8 + len(dxil)] = dxil
+    if hash_part is not None:
+        struct.pack_into("<III", out, 28, 2, chunk, len(out))
+        out.extend(b"HASH" + struct.pack("<I", len(hash_part)) + hash_part)
     return bytes(out)
+
+
+class HashReportTest(unittest.TestCase):
+    def test_checks_all_payloads_and_only_the_measured_bytes(self):
+        blob = bytearray(fssm())
+        struct.pack_into("<6I", blob, CODE_OFF + 0x10, 0xd5800100, 0x03fe1111, 0x07060504,
+                         0xd5800908, 0x03ff2222, 0x0f0e0d0c)
+        digest = bytes(range(16))
+        wrong = bytearray(blob)
+        for index in (0, 1, 8, 9, 10, 11, 12, 13, 20, 21, 22, 23):
+            with self.subTest(index=index):
+                wrong[:] = blob
+                wrong[CODE_OFF + 0x10 + index] ^= 1
+                entries = [(0x0D, payload) for payload in (blob, wrong, b"invalid", blob)]
+                data = dxbc_with(entries, hash_part=bytes(4) + digest)
+                self.assertEqual(fssm_hash_report.inspect_container(data),
+                                 dict(containers=1, payloads=4, matched=2, mismatched=1,
+                                      invalid_payload=1, multi_payload_containers=1))
+
+    def test_missing_and_short_parts(self):
+        for part, reason in ((None, "missing_hash"), (bytes(16), "invalid_hash")):
+            data = dxbc_with([(0x0D, fssm())], hash_part=part)
+            self.assertEqual(fssm_hash_report.inspect_container(data),
+                             dict(containers=1, payloads=1, no_comparable_hash=1, **{reason: 1}))
+        data = dxbc_with([], hash_part=bytes(20))
+        self.assertEqual(fssm_hash_report.inspect_container(data)["missing_xbch"], 1)
+        self.assertEqual(fssm_hash_report.inspect_container(data.replace(b"XDAT", b"stub"))["missing_xdat"], 1)
+        self.assertEqual(fssm_hash_report.inspect_container(data.replace(b"DXIL", b"stub"))["missing_dxil"], 1)
+        data = dxbc_with([(0x0D, fssm()[:CODE_OFF + 0x27])], hash_part=bytes(20))
+        self.assertEqual(fssm_hash_report.inspect_container(data)["invalid_descriptor"], 1)
 
 
 class CodeRangeTest(unittest.TestCase):
