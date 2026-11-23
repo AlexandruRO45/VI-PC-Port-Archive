@@ -17,8 +17,12 @@ AMD_DGPU = ('03:00.0 "Display controller [0380]" '
             '"Advanced Micro Devices, Inc. [AMD/ATI] [1002]" "Navi 32 [747e]"')
 NVIDIA = ('01:00.0 "3D controller [0302]" "NVIDIA Corporation [10de]" '
           '"AD104 [GeForce RTX 4070] [2786]"')
+NVIDIA_GENERIC = ('01:00.0 "VGA compatible controller [0300]" '
+                  '"NVIDIA Corporation [10de]" "GA102 [2208]"')
 VULKAN_IGPU = {"device": "AMD Radeon 780M Graphics (RADV PHOENIX)",
                "vendor_id": 0x1002, "device_id": 0x1900}
+VULKAN_NVIDIA = {"device": "NVIDIA GeForce RTX 3080 Ti",
+                 "vendor_id": 0x10de, "device_id": 0x2208}
 
 
 def pci_output(cmd, report):
@@ -38,7 +42,7 @@ class LinuxGpuIdentification(unittest.TestCase):
             return vulkan if isinstance(vulkan, str) else json.dumps(vulkan)
 
         with mock.patch.object(pc.sys, "platform", "linux"), \
-                mock.patch.object(pc.shutil, "which", return_value="nvidia-smi" if smi else None), \
+                mock.patch.object(pc.shutil, "which", return_value="nvidia-smi" if smi is not None else None), \
                 mock.patch.object(pc, "_run", side_effect=output) as run:
             result = pc.detect_gpus()
         return result, run
@@ -65,6 +69,19 @@ class LinuxGpuIdentification(unittest.TestCase):
     def test_ambiguous_duplicate_pci_ids_keep_the_pci_names(self):
         result, _ = self.detect(pci=AMD_IGPU + "\n" + AMD_IGPU.replace("65:00.0", "66:00.0"))
         self.assertEqual(result, [("AMD HawkPoint1", None)] * 2)
+
+    def test_nvidia_codename_resolves_without_smi_results(self):
+        for smi in (None, ""):
+            with self.subTest(smi=smi):
+                result, _ = self.detect(pci=NVIDIA_GENERIC, vulkan=VULKAN_NVIDIA, smi=smi)
+                self.assertEqual(result, [(VULKAN_NVIDIA["device"], None)])
+
+    def test_duplicate_nvidia_pci_ids_keep_both_fallbacks_without_smi_results(self):
+        pci = NVIDIA_GENERIC + "\n" + NVIDIA_GENERIC.replace("01:00.0", "02:00.0")
+        for smi in (None, ""):
+            with self.subTest(smi=smi):
+                result, _ = self.detect(pci=pci, vulkan=VULKAN_NVIDIA, smi=smi)
+                self.assertEqual(result, [("NVIDIA GA102", None)] * 2)
 
     def test_failed_or_malformed_vulkan_report_keeps_pci_fallback(self):
         for report in ("", "not JSON", "[]", "null", "{}",

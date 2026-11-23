@@ -527,6 +527,7 @@ def detect_gpus() -> list:
             pass
     else:
         pci_gpus = []
+        smi_reported_nvidia = any("nvidia" in name.lower() for name, _ in gpus)
         for line in _run(["lspci", "-mm", "-nn"]).splitlines():
             try:
                 tok = shlex.split(line)
@@ -544,7 +545,7 @@ def detect_gpus() -> list:
                 product += f" {device_id:04x}"  # keep the only identity an old PCI database knows
             br = re.search(r"\[(.+)\]", product)
             name = f"{vname} {br.group(1) if br else product}"
-            if vname == "NVIDIA" and any("nvidia" in g[0].lower() for g in gpus):
+            if vname == "NVIDIA" and smi_reported_nvidia:
                 continue  # already reported by nvidia-smi
             pci_gpus.append((len(gpus), (vendor_id, device_id)))
             gpus.append((name, None))
