@@ -12,11 +12,16 @@
 
 static int fail_after_new = -1;
 void* operator new(std::size_t n) {
-    if (fail_after_new == 0) {
-        fail_after_new = -1;
-        throw std::bad_alloc();
+    // Only count batch item storage. MSVC Debug also allocates an iterator proxy in the vector's noexcept
+    // default constructor; failing that bookkeeping allocation would terminate before drain can copy an item.
+    constexpr auto item_size = sizeof(leonida::DeferredDeletionQueue::Item);
+    if (n >= item_size && n % item_size == 0) {
+        if (fail_after_new == 0) {
+            fail_after_new = -1;
+            throw std::bad_alloc();
+        }
+        if (fail_after_new > 0) --fail_after_new;
     }
-    if (fail_after_new > 0) --fail_after_new;
     if (void* p = std::malloc(n ? n : 1)) return p;
     throw std::bad_alloc();
 }
