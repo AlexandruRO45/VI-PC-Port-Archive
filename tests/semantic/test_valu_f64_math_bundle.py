@@ -430,5 +430,39 @@ class VMinF64TranslatorTests(unittest.TestCase):
         except rdna2spirv.Unsupported as caught:
             self.assertIn("v_min_f64", str(caught))
 
+# -----------------------------------------------------------------------------
+# Opcode 5: v_max_f64
+# -----------------------------------------------------------------------------
+def oracle_max_f64(a_bits: int, b_bits: int) -> int:
+    """Reference mathematical oracle for v_max_f64 (IEEE 754 maxNum NaN suppression)."""
+    a_nan = is_nan_u64(a_bits)
+    b_nan = is_nan_u64(b_bits)
+    if a_nan and b_nan:
+        return F64_QNAN
+    if a_nan:
+        return b_bits
+    if b_nan:
+        return a_bits
+    # Handle signed zeros: +0.0 > -0.0
+    if a_bits == F64_NEG_ZERO and b_bits == F64_POS_ZERO:
+        return F64_POS_ZERO
+    if a_bits == F64_POS_ZERO and b_bits == F64_NEG_ZERO:
+        return F64_POS_ZERO
+    fa = u64_to_f64(a_bits)
+    fb = u64_to_f64(b_bits)
+    return a_bits if fa > fb else b_bits
+
+
+class VMaxF64OracleTests(unittest.TestCase):
+    def test_max_basic(self):
+        self.assertEqual(oracle_max_f64(f64_to_u64(10.0), f64_to_u64(20.0)), f64_to_u64(20.0))
+
+    def test_max_signed_zeros(self):
+        self.assertEqual(oracle_max_f64(F64_NEG_ZERO, F64_POS_ZERO), F64_POS_ZERO)
+
+    def test_max_nan_suppression(self):
+        # max(NaN, x) == x
+        self.assertEqual(oracle_max_f64(F64_QNAN, f64_to_u64(5.0)), f64_to_u64(5.0))
+
 if __name__ == "__main__":
     unittest.main()
