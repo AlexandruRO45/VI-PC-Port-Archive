@@ -2739,13 +2739,15 @@ def main() -> int:
                   "the build needs the folder that holds MicrosoftGame.Config)")
         return 0
     game = os.path.abspath(a.game or (pick_game() if a.pick else choose_game()))
+    if a.check:
+        check(game, a.full_check)
+        return 0
+
     out = os.path.abspath(a.out or default_out())
     work = os.path.abspath(a.work or os.path.join(out, "work"))
     require_folder("--out", out)
     require_folder("--work", work)
     v = check(game, a.full_check)
-    if a.check:
-        return 0
     # Resolve existing parents too: a not-yet-created destination can be under a junction or symlink.
     real_game = os.path.normcase(os.path.realpath(game))
     is_game_drive_root = os.path.splitdrive(real_game)[1] in ("\\", "/")

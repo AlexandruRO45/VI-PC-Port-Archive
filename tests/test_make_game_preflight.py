@@ -148,6 +148,18 @@ class GameCheckTest(PreflightTestBase):
         self.assert_fails(make_game.check, "nonexistent_dir_0xdeadbeef", full=False,
                           match="Game folder not found: nonexistent_dir_0xdeadbeef")
 
+    def test_check_option_ignores_unused_output_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = os.path.join(tmp, "Leonida")
+            with open(output, "wb"):
+                pass
+            argv = ["make_game.py", "--check", "--game", tmp]
+            with mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(make_game, "default_out", return_value=output), \
+                 mock.patch.object(make_game, "check") as check:
+                self.assertEqual(make_game.main(), 0)
+            check.assert_called_once_with(tmp, False)
+
     def test_check_option_reports_each_version_probe_mismatch(self):
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "MicrosoftGame.Config"), "wb") as config:
