@@ -165,6 +165,23 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(info["insns"][4]["args"][2]["t"], "off")
         self.assertEqual(info["insns"][4]["mods"], ["offset:-4"])
 
+    def test_exp_null_target_matches_shader_ir(self):
+        # exp null off, off, off, off done vm (target 9; encoding verified against llvm-mc) and
+        # exp mrt0 v6, v7, v8, v9 done vm. shader_ir.operand() reads `null` as a special operand and
+        # `mrt0` as a target; decode_bytes must give the same dicts as parsing llvm-mc's text.
+        code = bytes([0x90, 0x18, 0x00, 0xF8, 0x00, 0x00, 0x00, 0x00,
+                      0x0F, 0x18, 0x00, 0xF8, 0x06, 0x07, 0x08, 0x09])
+        info = rdna2_decode.decode_bytes(code)
+        self.assertEqual(info["invalid"], 0)
+        null_exp, mrt_exp = info["insns"]
+        self.assertEqual(null_exp["args"][0], shader_ir.operand("null"))
+        self.assertEqual(null_exp["args"][0]["k"], "special")
+        self.assertEqual(mrt_exp["args"][0], shader_ir.operand("mrt0"))
+        self.assertEqual(mrt_exp["args"][0]["k"], "target")
+        lines = rdna2_decode.disasm_bytes(code)[0].splitlines()
+        self.assertTrue(lines[0].split(";")[0].split() == ["exp", "null", "off,", "off,", "off,", "off", "done", "vm"],
+                        lines[0])
+
     def test_roundtrip_binary_to_spirv_and_interpreter(self):
         # Synthetic pixel shader binary: v_mov_b32 v0, 1.0; v_add_f32 v1, v0, 2.0; exp mrt0 v0, v1, v0, v1 done vm; s_endpgm
         w_mov = (0x3F << 25) | (0 << 17) | (1 << 9) | 242        # v0 = 1.0
