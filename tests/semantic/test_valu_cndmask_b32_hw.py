@@ -202,5 +202,43 @@ class TestValuCndmaskB32AST(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_instruction("v_cndmask_b32 v0, v1, v2, v3, v4")
 
+# --- Section 3: Deterministic Scalar Instruction Interpreter ---
+
+class LaneState:
+    def __init__(self) -> None:
+        self.vgprs: List[int] = [0] * 256
+        self.vcc_bit: int = 0
+
+
+class ValuInterpreter:
+    def __init__(self, num_lanes: int = 32) -> None:
+        self.num_lanes = num_lanes
+        self.lanes = [LaneState() for _ in range(num_lanes)]
+        self.sgprs: List[int] = [0] * 106
+
+    def execute_cndmask(self, dst_idx: int, src0_idx: int, src1_idx: int) -> None:
+        """Execute VOP2 v_cndmask_b32 using each lane's VCC bit."""
+        for lane in self.lanes:
+            s0 = lane.vgprs[src0_idx]
+            s1 = lane.vgprs[src1_idx]
+            lane.vgprs[dst_idx] = ref_v_cndmask_b32(s0, s1, lane.vcc_bit)
+
+
+class TestValuCndmaskB32ScalarInterpreter(unittest.TestCase):
+    """Commit 3: Deterministic scalar instruction interpreter tests."""
+
+    def test_interpreter_lane_selection(self) -> None:
+        interp = ValuInterpreter(num_lanes=32)
+        for i, lane in enumerate(interp.lanes):
+            lane.vgprs[1] = 0x11111111 * (i + 1)
+            lane.vgprs[2] = 0x22222222 * (i + 1)
+            lane.vcc_bit = 1 if i % 2 == 1 else 0
+
+        interp.execute_cndmask(dst_idx=0, src0_idx=1, src1_idx=2)
+
+        for i, lane in enumerate(interp.lanes):
+            expected = 0x22222222 * (i + 1) if (i % 2 == 1) else 0x11111111 * (i + 1)
+            self.assertEqual(lane.vgprs[0], expected & MASK32)
+
 if __name__ == "__main__":
     unittest.main()
