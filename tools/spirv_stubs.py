@@ -256,14 +256,18 @@ def main(argv=None):
     spirv_dir = argv[0]
     idx_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(idx_path):
-        sys.exit(f"missing {idx_path}")
+        print(f"ERROR: cannot read {idx_path}: no such file", file=sys.stderr)
+        return 2
     try:
         with open(idx_path, encoding="utf-8") as f:
             index = json.load(f)
     except (OSError, ValueError) as e:
-        sys.exit(f"cannot read {idx_path}: {e}")
+        print(f"ERROR: cannot read {idx_path}: {e}", file=sys.stderr)
+        return 2
     if not isinstance(index, dict):
-        sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")
+        print(f"ERROR: cannot read {idx_path}: expected a JSON object of shader -> metadata entries",
+              file=sys.stderr)
+        return 2
     try:
         written = generate_for_index(spirv_dir, index)
     except (OSError, ValueError, struct.error) as e:

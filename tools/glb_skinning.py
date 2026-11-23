@@ -1100,7 +1100,7 @@ def main(argv=None):
     except OSError as exc:
         detail = exc.strerror or str(exc)
         print(f"ERROR: cannot read {args.glb}: {detail}", file=sys.stderr)
-        return 1
+        return 2
     try:
         report = analyze_glb(data)
     except (ValueError, TypeError, struct.error) as exc:

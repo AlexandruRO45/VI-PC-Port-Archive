@@ -1008,6 +1008,9 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     reports, used = [], set()
     for path in a.image:
+        if not os.path.isfile(path):
+            print(f"ERROR: cannot read {path}: no such file", file=sys.stderr)
+            return 2
         try:
             r = report(path, table, served)
         except (PeFormatError, OSError) as e:
