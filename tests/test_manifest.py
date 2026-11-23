@@ -707,5 +707,23 @@ class ManifestBelowNormalTest(unittest.TestCase):
         manifest.below_normal()
 
 
+class ManifestDeepJsonTest(unittest.TestCase):
+    def test_deeply_nested_json_raises_manifest_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "deep.json")
+            with open(bad, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[" * 50_000 + "]" * 50_000)
+            with self.assertRaises(manifest.ManifestError) as ctx:
+                manifest.load_manifest(bad)
+            self.assertIn("is not valid JSON", str(ctx.exception))
+            err = io.StringIO()
+            with unittest.mock.patch.object(sys, "argv", ["manifest.py", "verify", tmp, "--manifest", bad]), \
+                    contextlib.redirect_stderr(err):
+                rc = manifest.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+            self.assertIn("is not valid JSON", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

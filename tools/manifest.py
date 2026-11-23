@@ -197,7 +197,7 @@ def load_manifest(manifest: str) -> dict:
     with open(manifest, encoding="utf-8") as f:
         try:
             doc = json.load(f, object_pairs_hook=_reject_duplicate_keys)
-        except ValueError as error:  # JSONDecodeError, duplicate keys, or UnicodeDecodeError for non-UTF-8
+        except (ValueError, RecursionError) as error:  # JSONDecodeError, duplicate keys, UnicodeDecodeError, or nesting limit
             raise ManifestError(f"{manifest} is not valid JSON ({error}); create it again") from None
     files = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(files, dict):
