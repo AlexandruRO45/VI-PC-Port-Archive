@@ -14,6 +14,7 @@
 
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <thread>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -247,6 +248,53 @@ void on_fault(int sig, siginfo_t* info, void* uc) {
     _exit(128 + sig);
 }
 }  // namespace
+
+// LEONIDA_THREAD_DUMP=<seconds>: after that long, every thread's rip and the module return addresses on its stack, to
+// see where a hung title waits (lldb does not stop under Rosetta). Read through Mach, so no guest state is touched.
+void dump_threads_after(unsigned seconds) {
+    std::thread([seconds] {
+        sleep(seconds);
+        thread_act_array_t threads;
+        mach_msg_type_number_t count = 0;
+        if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) return;
+        const thread_act_t self = mach_thread_self();
+        std::string out;
+        auto fmt = [](const char* f, auto... v) { char b[200]; const int n = snprintf(b, sizeof b, f, v...); write(2, b, n); return std::string(); };
+        fmt("host: dumping %u threads\n", count);
+        for (mach_msg_type_number_t t = 0; t < count; ++t) {
+            if (threads[t] == self) continue;
+            fmt("host: thread %u\n", t);
+            x86_thread_state64_t ss;
+            mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
+            thread_suspend(threads[t]);  // Rosetta only hands out the x86 state of a stopped thread
+            const kern_return_t kr = thread_get_state(threads[t], x86_THREAD_STATE64, reinterpret_cast<thread_state_t>(&ss), &n);
+            thread_resume(threads[t]);
+            if (kr) {
+                out += fmt("host: thread %u state error %d\n", t, kr);
+                continue;
+            }
+            const uint64_t rm = code_base(ss.__rip);
+            mach_vm_size_t got = 0;
+            out += fmt("host: thread %u rip=0x%llx", t, ss.__rip);
+            if (rm) out += fmt(" (module 0x%llx +0x%llx)", rm, ss.__rip - rm);
+            if (Dl_info di; !rm && dladdr(reinterpret_cast<void*>(ss.__rip), &di) && di.dli_sname) out += fmt(" %s", di.dli_sname);
+            if (char path[256]; !rm && mach_vm_read_overwrite(mach_task_self(), ss.__rdi, sizeof path - 1,
+                                                                reinterpret_cast<mach_vm_address_t>(path), &got) == KERN_SUCCESS) {
+                path[got] = 0;
+                if (path[0] == '/') out += fmt(" path=%s", path);
+            }
+            out += fmt("\n");
+            uint64_t stack[512];
+            got = 0;
+            if (mach_vm_read_overwrite(mach_task_self(), ss.__rsp, sizeof stack,
+                                       reinterpret_cast<mach_vm_address_t>(stack), &got) != KERN_SUCCESS)
+                continue;
+            for (size_t i = 0, shown = 0; i < got / 8 && shown < 16; ++i)
+                if (uint64_t m = code_base(stack[i]); m && stack[i] != m)
+                    out += fmt("host:   stack[%zu] module 0x%llx +0x%llx\n", i, m, stack[i] - m), ++shown;
+        }
+    }).detach();
+}
 
 // ---- unimplemented imports --------------------------------------------------------------------------------
 // Each missing import gets a stub `mov rcx, name; mov rax, trap; jmp rax`, so the image loads and only a call that
@@ -575,6 +623,7 @@ int main(int argc, char** argv) {
     sa.sa_sigaction = on_fault;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP}) sigaction(sig, &sa, nullptr);
+    if (const char* d = getenv("LEONIDA_THREAD_DUMP")) dump_threads_after(static_cast<unsigned>(atoi(d)));
     g_peb = static_cast<uint8_t*>(calloc(1, 0x1000));
     Module* exe = load_pe(real, false);
     g_image = exe->base;

@@ -1,5 +1,5 @@
 // The UCRT pieces a retail game imports that differ from the host libc (32-bit long, UTF-16 wchar_t, the MS rand),
-// plus GameInputCreate by ordinal and a ReadFile at an OVERLAPPED offset. Exit code 0, or the number of the first check that failed.
+// plus GameInputCreate by ordinal a ReadFile at an OVERLAPPED offset, sscanf with MS sizes. Exit code 0, or the number of the first check that failed.
 #include <windows.h>
 #include <math.h>
 #include <stdio.h>
@@ -43,6 +43,14 @@ int main(void) {
     LARGE_INTEGER size;
     if (!GetFileSizeEx(f, &size) || size.QuadPart != 7) return 12;
     CloseHandle(f);
+    long a = 0;
+    long long b = 0;
+    double d = 0;
+    char word[8] = {0};
+    int used = 0;
+    if (sscanf("12 -7 2.5 ok", "%ld %lld %lf %7s%n", &a, &b, &d, word, &used) != 4 || a != 12 || b != -7 || d != 2.5 ||
+        strcmp(word, "ok") || used != 12 || sscanf("", "%d", &used) != EOF)
+        return 13;
     DeleteFileW(L"crt_probe.tmp");
     return 0;
 }

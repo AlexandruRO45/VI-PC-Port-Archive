@@ -2,6 +2,8 @@
 // host FILE* (the UCRT's FILE is opaque to callers). Guest function pointers are entered through call_guest.
 #include "host.h"
 
+#include <algorithm>
+#include <cctype>
 #include <unistd.h>
 
 #include <cstdio>
@@ -203,6 +205,73 @@ int32_t stdio_common_vsprintf_s(uint64_t o, char* buf, uint64_t count, const cha
     return -1;
 }
 
+// sscanf with the MS sizes (long is 4 bytes, L is a double): each conversion is handed to the host sscanf on its
+// own, followed by %n to learn how much input it took. ponytail: narrow strings only (%ls/%ws/%S stop the scan).
+int32_t stdio_common_vsscanf(uint64_t, const char* buf, uint64_t len, const char* fmt, void*, char* va) {
+    const std::string in(buf, std::min<uint64_t>(len, std::strlen(buf)));
+    auto next = [&va]() { void* p; std::memcpy(&p, va, 8); va += 8; return p; };
+    size_t at = 0;
+    int32_t stored = 0;
+    bool converted = false;
+    for (const char* f = fmt; *f; ++f) {
+        if (std::isspace(static_cast<unsigned char>(*f))) {
+            while (at < in.size() && std::isspace(static_cast<unsigned char>(in[at]))) ++at;
+            continue;
+        }
+        if (*f != '%' || f[1] == '%') {
+            if (*f == '%') ++f;
+            if (at >= in.size() || in[at] != *f) break;
+            ++at;
+            continue;
+        }
+        std::string spec = "%";
+        ++f;
+        const bool skip = *f == '*';
+        if (skip) spec += *f++;
+        while (std::isdigit(static_cast<unsigned char>(*f))) spec += *f++;
+        int longs = 0, shorts = 0;
+        bool wide = false, wide64 = false;
+        for (;; ++f) {
+            if (*f == 'l') ++longs;
+            else if (*f == 'h') ++shorts;
+            else if (*f == 'L' || *f == 'w') wide = *f == 'w', ++longs;
+            else if (*f == 'z' || *f == 'j' || *f == 't') wide64 = true;
+            else if (f[0] == 'I' && f[1] == '6' && f[2] == '4') wide64 = true, f += 2;
+            else if (f[0] == 'I' && f[1] == '3' && f[2] == '2') f += 2;
+            else if (*f == 'I') wide64 = true;
+            else break;
+        }
+        const char conv = *f;
+        if (!conv) break;
+        const bool is_float = std::strchr("eEfgGaA", conv), is_text = std::strchr("sc[S", conv);
+        if (is_text && (longs || wide || conv == 'S')) break;
+        if (conv == 'n') {
+            if (!skip) *static_cast<int32_t*>(next()) = static_cast<int32_t>(at);
+            continue;
+        }
+        if (is_float) spec += longs ? "l" : "";
+        else if (!is_text && conv != 'p') spec += wide64 || longs >= 2 ? "ll" : shorts >= 2 ? "hh" : shorts ? "h" : "";
+        if (conv == '[') {
+            spec += *f++;
+            if (*f == '^') spec += *f++;
+            if (*f == ']') spec += *f++;
+            while (*f && *f != ']') spec += *f++;
+            if (!*f) break;
+        }
+        spec += *f;
+        spec += "%n";
+        int took = -1;
+        if (at >= in.size() && conv != 'c') break;  // input ran out
+        if (skip) std::sscanf(in.c_str() + at, spec.c_str(), &took);
+        else std::sscanf(in.c_str() + at, spec.c_str(), next(), &took);
+        if (took < 0) break;
+        converted = true;
+        at += static_cast<size_t>(took);
+        if (!skip) ++stored;
+    }
+    return !converted && at >= in.size() ? -1 : stored;  // EOF only when input ran out before any conversion
+}
+
 // The wide forms: the format and the output are UTF-16. ponytail: ASCII formats.
 std::string narrow_fmt(const char16_t* f) {
     std::string n;
@@ -346,7 +415,7 @@ Exports crt_exports() {
         EXPORT_AS(STR, "strncmp", crt_strncmp), EXPORT_AS(STR, "wcsncmp", crt_wcsncmp),
         EXPORT_AS(STR, "strcpy_s", crt_strcpy_s),
         EXPORT_AS(IO, "__stdio_common_vsprintf", stdio_common_vsprintf),
-        EXPORT_AS(IO, "__stdio_common_vsprintf_s", stdio_common_vsprintf_s),
+        EXPORT_AS(IO, "__stdio_common_vsprintf_s", stdio_common_vsprintf_s), EXPORT_AS(IO, "__stdio_common_vsscanf", stdio_common_vsscanf),
         EXPORT_AS(IO, "__stdio_common_vswprintf", stdio_common_vswprintf),
         EXPORT_AS(IO, "__stdio_common_vswprintf_s", stdio_common_vswprintf_s),
         EXPORT_AS(IO, "__stdio_common_vsnwprintf_s", stdio_common_vsnwprintf_s),

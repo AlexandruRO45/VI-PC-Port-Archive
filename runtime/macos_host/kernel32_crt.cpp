@@ -627,7 +627,7 @@ int VirtualProtect(void* addr, uint64_t size, uint32_t prot, uint32_t* old) {
     return mprotect(reinterpret_cast<void*>(a), size + (reinterpret_cast<uintptr_t>(addr) - a), p) == 0;
 }
 int QueryPerformanceFrequency(int64_t* f) {
-    *f = 1000000000;  // QueryPerformanceCounter counts nanoseconds
+    *f = 10000000;  // QueryPerformanceCounter counts 100 ns ticks, the 10 MHz of Windows 10+ and the console
     return 1;
 }
 uint64_t GetTickCount64() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000; }
@@ -719,6 +719,19 @@ HANDLE OpenProcess(uint32_t, int, uint32_t pid) {
     if (kill(static_cast<pid_t>(pid), 0) != 0 && errno != EPERM) return nullptr;
     return new Object{Object::Event};
 }
+// A title opens its own thread (to keep a real handle to it). ponytail: another thread's id is refused; a registry
+// of threads by id when a title opens one.
+HANDLE OpenThread(uint32_t, int, uint32_t tid) {
+    if (tid == thread_id()) return duplicate_object(reinterpret_cast<void*>(-2));
+    set_last_error(87 /* ERROR_INVALID_PARAMETER */);
+    return nullptr;
+}
+int32_t GetUserDefaultGeoName(char16_t* name, int32_t count) {  // ISO 3166 code, with its terminator
+    if (count == 0) return 3;
+    if (count < 3) return 0;
+    name[0] = u'U', name[1] = u'S', name[2] = 0;
+    return 3;
+}
 // No suspend or constrained-mode events on a Mac: the registration succeeds and never calls back.
 uint32_t register_app_notification(void*, void*, void** out) { return *out = reinterpret_cast<void*>(1), 0; }
 void unregister_app_notification(void*) {}
@@ -786,7 +799,7 @@ Exports kernel32_crt_exports() {
         K(GetSystemInfo), K(GetNativeSystemInfo), K(GetCurrentProcessorNumber), K(FlushProcessWriteBuffers),
         K(GetCurrentThread), K(DuplicateHandle), K(SwitchToThread), K(AddVectoredExceptionHandler), K(EncodePointer), K(CreateEventW), K(CreateEventA), K(CreateEventExW), K(CreateSemaphoreW), K(CreateSemaphoreExW),
         K(SetEvent), K(ResetEvent), K(AreFileApisANSI), K(FormatMessageA), K(LocalFree), K(GetTempPathW),
-        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), K(OpenProcess), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
+        EXPORT("ntdll.dll", wine_get_version), EXPORT("dxgi.dll", CreateDXGIFactory1), EXPORT_AS("d3d12.dll", "#102", D3D12GetDebugInterface), EXPORT_AS("gameinput.dll", "#1", GameInputCreate), K(CreateMutexA), K(ReleaseMutex), K(InitializeCriticalSection), EXPORT_AS("kernel32.dll", "SetThreadPriority", set_ok), EXPORT_AS("kernel32.dll", "SetProcessPriorityBoost", set_ok), EXPORT_AS("kernel32.dll", "GetThreadPriority", thread_priority), EXPORT_AS("kernel32.dll", "ResumeThread", resume_thread), EXPORT_AS("kernel32.dll", "SuspendThread", suspend_thread), K(GetThreadGroupAffinity), K(SetThreadGroupAffinity), K(GetProcessId), K(OpenProcess), K(OpenThread), K(GetUserDefaultGeoName), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "RegisterAppStateChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-0.dll", "UnregisterAppStateChangeNotification", unregister_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "RegisterAppConstrainedChangeNotification", register_app_notification), EXPORT_AS("api-ms-win-core-psm-appnotify-l1-1-1.dll", "UnregisterAppConstrainedChangeNotification", unregister_app_notification), EXPORT_AS("msvcp140.dll", "?_Random_device@std@@YAIXZ", random_device), EXPORT("gameinput.dll", GameInputCreate), K(ReleaseSemaphore), K(WaitForSingleObjectEx), K(WaitForSingleObject), K(WaitForMultipleObjects), K(ExitThread), K(FreeLibraryAndExitThread),
         K(GetExitCodeThread), EXPORT("advapi32.dll", OpenProcessToken), EXPORT("advapi32.dll", OpenThreadToken), K(DecodePointer),
     };
 }

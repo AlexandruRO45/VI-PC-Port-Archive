@@ -305,7 +305,7 @@ int CloseHandle(HANDLE h) {
 }
 void Sleep(uint32_t ms) { usleep(ms * 1000u); }
 int QueryPerformanceCounter(int64_t* out) {
-    *out = static_cast<int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+    *out = static_cast<int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 100);
     return 1;
 }
 void GetSystemTimeAsFileTime(uint64_t* ft) {  // 100 ns ticks since 1601-01-01
