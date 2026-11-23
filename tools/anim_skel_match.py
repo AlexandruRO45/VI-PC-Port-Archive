@@ -167,8 +167,12 @@ def main(argv=None):
     report = match(names, skeletons)
     print_report(report)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:            # a read-only file or a full disk: one line, not a traceback
+            print("anim_skel_match: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            return 2
     return 0
 
 
