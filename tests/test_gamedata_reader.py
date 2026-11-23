@@ -329,6 +329,26 @@ class Run(unittest.TestCase):
         with open(os.path.join(out, next(f for f in files if f.startswith("CSyntheticRoot"))), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["label"], "synthetic_name")
 
+    def test_cli_exports_nonfinite_floats_as_json_strings(self):
+        xml = os.path.join(self.tmp.name, "values.xml")
+        out = os.path.join(self.tmp.name, "json")
+        with open(xml, "wb") as f:
+            f.write(b'<CValues><maximum value="inf"/><minimum value="-inf"/>'
+                    b'<vector x="nan" y="1.5"/><array content="float_array">0 nan inf -inf</array></CValues>')
+        result = self._cli(xml, "--out", out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        def reject_constant(token):
+            self.fail(f"Non-JSON constant in export: {token}")
+
+        with open(os.path.join(out, "CValues_values.xml.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f, parse_constant=reject_constant), {
+                "maximum": "inf",
+                "minimum": "-inf",
+                "vector": ["nan", 1.5],
+                "array": [0, "nan", "inf", "-inf"],
+            })
+
     def test_exports_all_documents_with_the_same_basename(self):
         targets = []
         for index in range(1, 4):

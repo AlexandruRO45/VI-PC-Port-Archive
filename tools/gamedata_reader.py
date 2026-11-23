@@ -25,12 +25,13 @@ field, not the document.
 prints counts only: documents read, roots, the elements each convention covered, ``type`` classes seen, and
 documents that are not well-formed XML (tail-only or truncated carves), with the reason. ``--out DIR`` writes one JSON
 file per document: those files hold the game's data and stay on the local machine (CONTRIBUTING.md). Standard
-library only.
+library only. JSON exports use the strings "nan", "inf" and "-inf" for non-finite floats.
 Usage: `python -I tools/gamedata_reader.py --help` lists the options.
 """
 import argparse
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -260,6 +261,17 @@ def documents(targets):
     return gx.load_documents(targets)
 
 
+def _json_value(value):
+    """Keep non-finite float values distinguishable in strict JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return value
+
+
 def run(targets, root_filter=None, out_dir=None, reader=None):
     """Read every document; returns a summary of counts (no names of entries, no values)."""
     reader = reader or Reader()
@@ -289,7 +301,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
                 suffix += 1
             written_names.add(filename.casefold())
             with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(value, f, indent=1, default=str)
+                json.dump(_json_value(value), f, indent=1, default=str, allow_nan=False)
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
             "elements_by_convention": dict(reader.stats), "type_classes": len(reader.types),
