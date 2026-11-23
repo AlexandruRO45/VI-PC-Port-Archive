@@ -519,5 +519,23 @@ class TestDsWriteB8SIMD(unittest.TestCase):
             self.assertEqual(wave.lds.read_u8(i * 4), 0x50 + i)
 
 
+# ------------------------------------------------------------------------------
+# ds_write_b8 Negative Controls & Hardware Translator Execution
+# ------------------------------------------------------------------------------
+
+class TestDsWriteB8HardwareTranslator(unittest.TestCase):
+    def test_hardware_translator_execution(self):
+        body = [
+            "v_mov_b32_e32 v1, 0",
+            "v_mov_b32_e32 v2, 0x5a",
+            "ds_write_b8 v1, v2 offset:3",
+            "s_waitcnt lgkmcnt(0)",
+            "ds_read_u8 v3, v1 offset:3",
+            "s_waitcnt lgkmcnt(0)",
+        ] + L.store("v3", 0)
+        mem = L.run(body, lanes=1)
+        self.assertEqual(L.out(mem, 0, 0), 0x5A)
+
+
 if __name__ == '__main__':
     unittest.main()
