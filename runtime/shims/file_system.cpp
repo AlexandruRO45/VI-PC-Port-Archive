@@ -1462,8 +1462,9 @@ DWORD WINAPI get_compressed_file_size_a(LPCSTR name, LPDWORD high) {
 //
 // Both files are brought into the overlay (copied up when only the package has them) and the host's ReplaceFile runs
 // there; a replacement that only the package had is then deleted by a marker, since ReplaceFile consumes it. The backup,
-// when asked for, is written in the overlay. Errors for a missing file, a folder, and a backup whose folder is missing
-// are the host's (ERROR_FILE_NOT_FOUND, ERROR_ACCESS_DENIED, ERROR_UNABLE_TO_REMOVE_REPLACED); a mix of console and host
+// when asked for, is written in the overlay. Errors for a missing file, a missing folder, a folder, and a backup whose
+// folder is missing are the host's (ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_ACCESS_DENIED,
+// ERROR_UNABLE_TO_REMOVE_REPLACED), the replaced file checked before the replacement; a mix of console and host
 // paths fails with ERROR_NOT_SAME_DEVICE, as MoveFile does.
 BOOL WINAPI replace_file_w(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD flags, LPVOID exclude,
                            LPVOID reserved) {
@@ -1483,7 +1484,12 @@ BOOL WINAPI replace_file_w(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup
     if (r.game.empty() || r.overlay.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
     if (dst.empty() || src.empty() || (backup && bak.empty())) return fail_bool(ERROR_ACCESS_DENIED);
     const View dst_view = view(r, dst), src_view = view(r, src);
-    if (dst_view.kind == Kind::None || src_view.kind == Kind::None) return fail_bool(ERROR_FILE_NOT_FOUND);
+    // The host checks the replaced file first, and a missing folder (or a file where a folder should be) is
+    // ERROR_PATH_NOT_FOUND rather than ERROR_FILE_NOT_FOUND.
+    if (dst_view.kind == Kind::None)
+        return fail_bool(is_folder(r, parent_of(dst)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND);
+    if (src_view.kind == Kind::None)
+        return fail_bool(is_folder(r, parent_of(src)) ? ERROR_FILE_NOT_FOUND : ERROR_PATH_NOT_FOUND);
     if (dst_view.kind == Kind::Directory || src_view.kind == Kind::Directory) return fail_bool(ERROR_ACCESS_DENIED);
 
     std::filesystem::path backup_path;

@@ -1120,6 +1120,20 @@ void run_checks(const std::filesystem::path& root) {
         const BOOL removed_by_game_path = rmdir_w(L"GAME:\\.gta6rt-temp");
         check(removed_by_game_path != FALSE || GetLastError() != ERROR_ACCESS_DENIED,
               "only a T: path names the T:\\ root: GAME:\\.gta6rt-temp is not refused as a drive root");
+        // The free-space and name queries find T:\ before anything is written there too.
+        fresh_overlay();
+        {
+            const auto free_t = resolve<GetDiskFreeSpaceExWFn>("kernel32.dll", "GetDiskFreeSpaceExW");
+            const auto long_t = resolve<PathNameWFn>("kernel32.dll", "GetLongPathNameW");
+            const auto short_t = resolve<PathNameWFn>("kernel32.dll", "GetShortPathNameW");
+            ULARGE_INTEGER t_total{};
+            check(free_t && free_t(L"T:\\", nullptr, &t_total, nullptr) != FALSE && t_total.QuadPart != 0,
+                  "on a fresh overlay GetDiskFreeSpaceExW(T:\\) answers");
+            wchar_t t_buffer[MAX_PATH] = {};
+            check(long_t && long_t(L"T:\\", t_buffer, MAX_PATH) == 3 && std::wstring(t_buffer) == L"T:\\" && short_t &&
+                      short_t(L"T:\\", nullptr, 0) == 4,
+                  "on a fresh overlay GetLongPathNameW/GetShortPathNameW find T:\\");
+        }
         rt::fs::configure(package, overlay);
 
         h = create_w(L"T:\\cache\\scratch.bin", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
@@ -1556,6 +1570,20 @@ void run_checks(const std::filesystem::path& root) {
         check(game_replace(L"GAME:\\replace\\target.txt", L"GAME:\\replace\\nope.txt", nullptr) ==
                   host_replace(L"a.txt", L"nope.txt", nullptr),
               "a missing replacement fails with the host's error");
+        check(game_replace(L"GAME:\\nodir\\a.txt", L"GAME:\\replace\\b.txt", nullptr) ==
+                  host_replace(L"nodir\\a.txt", L"b.txt", nullptr),
+              "a replaced file whose folder is missing fails with the host's error");
+        check(game_replace(L"GAME:\\replace\\target.txt", L"GAME:\\nodir\\b.txt", nullptr) ==
+                  host_replace(L"a.txt", L"nodir\\b.txt", nullptr),
+              "a replacement whose folder is missing fails with the host's error");
+        check(game_replace(L"GAME:\\replace\\nope.txt", L"GAME:\\nodir\\b.txt", nullptr) ==
+                      host_replace(L"nope.txt", L"nodir\\b.txt", nullptr) &&
+                  game_replace(L"GAME:\\nodir\\a.txt", L"GAME:\\replace\\nope.txt", nullptr) ==
+                      host_replace(L"nodir\\a.txt", L"nope.txt", nullptr),
+              "the replaced file is checked before the replacement, as on the host");
+        check(game_replace(L"GAME:\\replace\\target.txt\\x.txt", L"GAME:\\replace\\b.txt", nullptr) ==
+                  host_replace(L"a.txt\\x.txt", L"b.txt", nullptr),
+              "a file where a folder should be fails with the host's error");
         check(game_replace(L"GAME:\\replace", L"GAME:\\replace\\b.txt", nullptr) == host_replace(L"dir", L"b.txt", nullptr),
               "a folder as the replaced file fails with the host's error");
         check(game_replace(L"GAME:\\replace\\target.txt", L"GAME:\\replace\\b.txt", L"GAME:\\nodir\\bk.txt") ==

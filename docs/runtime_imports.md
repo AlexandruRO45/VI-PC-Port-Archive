@@ -167,9 +167,10 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
   the file a read would open.
 - `ReplaceFile*` brings both files into the overlay (copying up what only the package has) and runs the host's
   `ReplaceFile` there. A replacement that only the package had is then deleted by a marker, and the backup is written
-  in the overlay. A missing file, a folder and a backup whose folder is missing fail with the host's errors
-  (`ERROR_FILE_NOT_FOUND`, `ERROR_ACCESS_DENIED`, `ERROR_UNABLE_TO_REMOVE_REPLACED`; CTest `file_system` compares them);
-  a mix of console and host paths fails with `ERROR_NOT_SAME_DEVICE`, as `MoveFile*` does.
+  in the overlay. A missing file, a missing folder, a folder and a backup whose folder is missing fail with the
+  host's errors (`ERROR_FILE_NOT_FOUND`, `ERROR_PATH_NOT_FOUND`, `ERROR_ACCESS_DENIED`,
+  `ERROR_UNABLE_TO_REMOVE_REPLACED`; CTest `file_system` compares them), the replaced file checked before the
+  replacement as the host does; a mix of console and host paths fails with `ERROR_NOT_SAME_DEVICE`, as `MoveFile*` does.
 - Not mapped yet: `CreateFile3` (Windows 11 24H2 and later), `CreateHardLink*`, `CreateSymbolicLink*`,
   `FindFirstChangeNotification*`/`ReadDirectoryChangesW` (handle-based, but opened by path) and `SetCurrentDirectory*`
   with a console path (a title's current folder on `GAME:` would need relative paths resolved against it).
