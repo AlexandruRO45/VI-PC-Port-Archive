@@ -39,14 +39,19 @@ hardware oracle is unavailable or the GPU is not GFX10. Nothing here reads game 
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # name: (GFX10 unified buffer format code, kind, bits of the x channel). The codes are the translator's FORMATS
 # table (tools/rdna2spirv.py); 10_10_10_2 (50) holds x in its low 10 bits.
@@ -275,11 +280,40 @@ def self_test():
 
 
 def write_report(path, doc):
-    """Write the JSON report, creating its folder; one ERROR line instead of a traceback on failure."""
+    """Stage a complete JSON report; keep the previous file if publish fails. One ERROR line on failure."""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        destination = os.path.realpath(path)
+        parent = os.path.dirname(destination) or "."
+        try:
+            mode = os.stat(destination).st_mode
+        except FileNotFoundError:
+            mode = None
+        if mode is not None and not stat.S_ISREG(mode):
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(doc, f, indent=1)
+            return True
+        if mode is not None:
+            # Retain the direct writer's permission check without truncating the report.
+            os.close(os.open(destination, os.O_WRONLY))
+
+        staged = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".d16_format_probe-", suffix=".tmp",
+        )
+        try:
+            with staged:
+                json.dump(doc, staged, indent=1)
+            if os.name != "nt":
+                os.chmod(staged.name, published_mode(destination))
+            replace_retry(staged.name, destination)
+        finally:
+            try:
+                os.unlink(staged.name)
+            except FileNotFoundError:
+                pass
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
         return False

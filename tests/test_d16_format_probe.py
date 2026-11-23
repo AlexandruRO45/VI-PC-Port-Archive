@@ -303,6 +303,17 @@ class ReportPathTests(unittest.TestCase):
             with open(blocker, "rb") as f:
                 self.assertEqual(f.read(), b"keep me")
 
+    def test_out_write_failure_preserves_previous_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            previous = '{"previous": true}\n'
+            path = os.path.join(tmp, "keep.json")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            with mock.patch.object(probe, "replace_retry", side_effect=OSError(13, "Permission denied")):
+                self.assertFalse(probe.write_report(path, {"new": True}))
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+
 
 if __name__ == "__main__":
     unittest.main()
