@@ -502,6 +502,24 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("1 passed, 0 failed, 0 skipped under Wine (1 tests)", out)
 
+    def test_required_name_fails_when_any_test_with_that_name_does_not_pass(self):
+        entries = [
+            ctest_entry("required", self.command("bad.py")),
+            ctest_entry("required", self.command("ok.py")),
+        ]
+        for result in ("fail", "skip"):
+            for statuses in ((result, "pass"), ("pass", result)):
+                with self.subTest(statuses=statuses):
+                    summary = self.root / f"{result}-{statuses[0]}.md"
+                    with mock.patch.object(rwt, "run_test", side_effect=[(s, "") for s in statuses]):
+                        code, out, _ = self.run_main(entries, "--require", "required", "--summary", str(summary))
+                    self.assertEqual(code, 1, out)
+                    self.assertIn("required tests that did not pass: required", out)
+                    self.assertIn("(2 tests)", out)
+                    text = summary.read_text(encoding="utf-8")
+                    self.assertIn("| `required` | pass | yes |", text)
+                    self.assertIn(f"| `required` | {result} | yes |", text)
+
     def test_relative_root_launches_the_artifact_from_its_working_directory(self):
         (self.artifact / "check_cwd.py").write_text(
             "from pathlib import Path\nassert Path.cwd() == Path(__file__).resolve().parent\n",

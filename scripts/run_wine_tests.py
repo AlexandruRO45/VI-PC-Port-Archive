@@ -362,7 +362,10 @@ def main() -> int:
             failed_setups = tuple(names[setup] for setup in setups[index] if results_by_index[setup] == "fail")
             status, detail = run_test(tests[index], args, wine, failed_setups=failed_setups)
             results_by_index[index] = status
-            results[name] = status
+            # CTest allows the same name in different directories. A required
+            # name passes only when every test with that name passes.
+            if name not in results or results[name] == "pass" or status == "fail":
+                results[name] = status
             print(f"[{status.upper()}] {name}", flush=True)
             if status != "pass":
                 for line in detail.rstrip().splitlines()[-40:]:
@@ -370,9 +373,9 @@ def main() -> int:
 
     missing = [n for n in args.require if n not in results]
     failed_required = [n for n in args.require if results.get(n) != "pass"]
-    counts = {s: sum(1 for v in results.values() if v == s) for s in ("pass", "fail", "skip")}
+    counts = {s: sum(1 for v in results_by_index.values() if v == s) for s in ("pass", "fail", "skip")}
     print(f"\n{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped under Wine "
-          f"({len(results)} tests)")
+          f"({len(tests)} tests)")
     for n in missing:
         print(f"required test not listed by the Windows build: {n}")
     if failed_required:
@@ -385,7 +388,8 @@ def main() -> int:
                 f.write(f"### Windows tests under {args.label or 'Wine'}\n\n")
                 f.write(f"{counts['pass']} passed, {counts['fail']} failed, {counts['skip']} skipped.\n\n")
                 f.write("| Test | Result | Required |\n|---|---|---|\n")
-                for name, status in results.items():
+                for index, status in results_by_index.items():
+                    name = names[index]
                     f.write(f"| `{name}` | {status} | {'yes' if name in args.require else ''} |\n")
                 f.write("\n")
         except OSError as e:
