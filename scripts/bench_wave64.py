@@ -3,7 +3,8 @@
     python -I scripts/bench_wave64.py [--build DIR] [--llvm-mc PATH] [--groups N] [--reps N] [--procs N] [--shader NAME]
 
 Three configurations: AMD with its native 64-wide subgroup (no flag), AMD with --wave64-emulate, NVIDIA with
---wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). Each runs `procs` processes of
+--wave64-emulate (the GPU is chosen with VK_LOADER_DRIVERS_SELECT='*amd*,*radeon*' / '*nv*'). The benchmark subprocesses
+ignore the inherited single-device filter LEONIDA_VK_DEVICE. Each configuration runs `procs` processes of
 vk_compute_test with VKC_BENCH=`reps` timed dispatches of `groups` workgroups; the table gives the median over all
 dispatches, the spread of the per-process medians (other programs share the GPU, so look at it), the number of
 translated segments (static: blocks + continuation segments; every continuation segment is one more workgroup barrier
@@ -55,6 +56,7 @@ def segments(spv: str) -> tuple[int, int] | None:
 
 def run(tools, spv, groups, reps, driver, emulate):
     env = dict(os.environ, VK_LOADER_DRIVERS_SELECT=driver, VKC_BENCH=str(reps))
+    env.pop("LEONIDA_VK_DEVICE", None)
     args = [os.path.join(tools, COMPUTE_TEST), spv, str(groups), "dump"]
     if not emulate:
         args.append("--require-wave64")

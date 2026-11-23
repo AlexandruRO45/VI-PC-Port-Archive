@@ -102,6 +102,21 @@ class ArgumentValidation(unittest.TestCase):
 
 
 class DriverSelectors(unittest.TestCase):
+    def test_configured_driver_does_not_inherit_the_single_device_filter(self):
+        output = "bench ms: median=1.0 min=0.9 max=1.1\nbench out fnv1a: abc\n0 mismatches\n"
+        for _, driver, emulate in bench_wave64.CONFIGS:
+            with self.subTest(driver=driver, emulate=emulate), \
+                    patch.dict(os.environ, {"LEONIDA_VK_DEVICE": "a single GPU"}, clear=True), \
+                    patch.object(bench_wave64.subprocess, "run") as launch:
+                launch.return_value.stdout = output
+                launch.return_value.stderr = ""
+                launch.return_value.returncode = 0
+                bench_wave64.run("build", "fixture.spv", 1, 1, driver, emulate)
+                env = launch.call_args.kwargs["env"]
+                self.assertEqual(env["VK_LOADER_DRIVERS_SELECT"], driver)
+                self.assertNotIn("LEONIDA_VK_DEVICE", env)
+                self.assertEqual(os.environ["LEONIDA_VK_DEVICE"], "a single GPU")
+
     @staticmethod
     def _matches(selector, manifest):
         return any(fnmatch.fnmatch(manifest, pat) for pat in selector.split(","))
