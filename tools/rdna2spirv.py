@@ -18,6 +18,7 @@ Usage (needs spirv-as/spirv-val on PATH, from the Vulkan SDK or spirv-tools):
 Writes <name>.spvasm for each translated shader and <name>.spv only for validated modules.
 Prints coverage and validation results.
 """
+from __future__ import annotations
 import argparse
 import hashlib
 import os
@@ -6628,7 +6629,7 @@ class Gen:
                 word = self.tmp()
                 self.emit(f"{word} = OpCompositeExtract %uint {words} {index}")
                 self.dst({"k": "vgpr", "r": dst["r"] + index, "n": 1}, word)
-        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64"):
+        elif op in ("v_add_f64", "v_cvt_f32_f64", "v_rcp_f64", "v_rsq_f64", "v_sqrt_f64", "v_mul_f64"):
             # f64: register pairs as doubles (shaderFloat64). neg/abs modifiers apply to the double.
             def f64(sv):
                 if sv["k"] in ("vgpr", "sgpr") and sv.get("n") == 2:
@@ -6660,7 +6661,11 @@ class Gen:
                 self.emit(f"{r} = OpFConvert %float {x}")
                 self.dst(a[0], self.tou(self.clamp_mods(r, mods)))
             else:
-                if op == "v_add_f64":
+                if op == "v_mul_f64":
+                    x, y = f64(a[1]), f64(a[2])
+                    r = self.tmp()
+                    self.emit(f"{r} = OpFMul %double {x} {y}")
+                elif op == "v_add_f64":
                     x, y = f64(a[1]), f64(a[2])
                     r = self.tmp()
                     self.emit(f"{r} = OpFAdd %double {x} {y}")
