@@ -516,6 +516,17 @@ def parse_gpu_log(text):
     return rows, summary
 
 
+def split_gpu_log(spec):
+    """Prefer a complete file path, then the longest existing path before '='."""
+    path = spec
+    while not os.path.isfile(path):
+        path, separator, _ = path.rpartition("=")
+        if not separator:
+            path, _, label = spec.partition("=")
+            return path, label
+    return path, spec[len(path) + 1:]
+
+
 def collect_gpu(col, logs):
     col.panel("gpu", "GPU tests (hand-written RDNA2 programs)", "test programs")
     if not logs:
@@ -523,7 +534,7 @@ def collect_gpu(col, logs):
         return
     changed = max(t for t in (last_commit_time("runtime/test/shaders"), last_commit_time("tools/rdna2spirv.py"), 0) if t is not None)
     for spec in logs:
-        path, _, label = spec.partition("=")
+        path, label = split_gpu_log(spec)
         if not os.path.isfile(path):
             col.source("gpu_log", path, "missing")
             continue
