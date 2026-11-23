@@ -508,5 +508,80 @@ class TestSAndn2B32RegisterAliasing(unittest.TestCase):
         self.assertEqual(state.exec_lo, 0)
         self.assertEqual(state.scc, 0)
 
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes (SCC) and Flag Propagation
+# -----------------------------------------------------------------------------
+
+class TestSAndn2B32ConditionCodes(unittest.TestCase):
+    """Unit tests for condition code (SCC) generation and state transitions."""
+
+    def test_scc_transition_0_to_0(self):
+        state = ScalarState()
+        state.scc = 0
+        state.sgprs[0] = 0
+        state.sgprs[1] = ALL32
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_transition_0_to_1(self):
+        state = ScalarState()
+        state.scc = 0
+        state.sgprs[0] = 1
+        state.sgprs[1] = 0
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_transition_1_to_1(self):
+        state = ScalarState()
+        state.scc = 1
+        state.sgprs[0] = 0x8000_0000
+        state.sgprs[1] = 0
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 1)
+
+    def test_scc_transition_1_to_0(self):
+        state = ScalarState()
+        state.scc = 1
+        state.sgprs[0] = 0x1234_5678
+        state.sgprs[1] = 0x1234_5678
+        instr = SAndn2B32Instruction(
+            dst=RegOperand(RegisterKind.SGPR, index=2),
+            src0=RegOperand(RegisterKind.SGPR, index=0),
+            src1=RegOperand(RegisterKind.SGPR, index=1),
+        )
+        ScalarInterpreter.step(instr, state)
+        self.assertEqual(state.scc, 0)
+
+    def test_scc_bitfield_boundaries(self):
+        cases = [
+            (0x8000_0000, 0, 1),
+            (0x0000_0001, 0, 1),
+            (0x5555_5555, 0xAAAA_AAAA, 1),
+            (0x5555_5555, 0x5555_5555, 0),
+            (0x0000_0000, 0x0000_0000, 0),
+            (0xFFFF_FFFF, 0x0000_0000, 1),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, 0),
+        ]
+        for s0, s1, expected_scc in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                d, scc = s_andn2_b32_oracle(s0, s1)
+                self.assertEqual(scc, expected_scc)
+                self.assertEqual(scc, 1 if d != 0 else 0)
+
 if __name__ == "__main__":
     unittest.main()
