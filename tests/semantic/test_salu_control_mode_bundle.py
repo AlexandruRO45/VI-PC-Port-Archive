@@ -243,6 +243,18 @@ class TestSetPrioTranslator(unittest.TestCase):
         self.assertIn("OpCapability Shader", spv)
         si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
 
+class TestSleepOracle(unittest.TestCase):
+    def test_oracle_sleep_cycles(self):
+        self.assertEqual(model_sleep(0), 0)
+        self.assertEqual(model_sleep(1), 64)
+        self.assertEqual(model_sleep(10), 640)
+
+    def test_translator_sleep_oracle(self):
+        prog = ["s_sleep 0", "s_endpgm"]
+        spv = support.translate_lines("cs_sleep_oracle", prog, fssm=saveexec_run.fssm())
+        self.assertIn("OpCapability Shader", spv)
+        si.run_workgroup(spv, 64, 64, inputs_for=lambda i: {"%wg_id": (0,0,0), "%local_id": (i,0,0), "%sg_lane": i}, push_constants=[0]*32, memory={})
+
 
 if __name__ == "__main__":
     unittest.main()
