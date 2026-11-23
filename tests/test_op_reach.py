@@ -2,10 +2,12 @@
 
     python -I tests/test_op_reach.py
 
-Every input is built here (three tiny .s listings and an index.json). No game data.
+Every input is built here (five tiny .s listings, an index.json and FSSM headers with only the magic and the
+wave flag). No game data.
 """
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,22 @@ def build(root):
     with open(index, "w", encoding="utf-8") as f:
         json.dump([{"name": s, "file": s + ".dxbc", "stage": s.split("_")[1]} for s in LISTINGS], f)
     return disasm, index
+
+
+# Compiled wave size per listing; e_cs has no sidecar header.
+WAVES = {"a_ps": 64, "b_vs": 64, "c_cs": 32, "d_cs": 64}
+
+
+def build_fssm(root):
+    fssm = os.path.join(root, "fssm")
+    os.makedirs(fssm)
+    for stem, wave in WAVES.items():
+        header = bytearray(0x100)
+        header[:4] = b"FSSM"
+        struct.pack_into("<I", header, 0xD4, 0x20 if wave == 32 else 0)
+        with open(os.path.join(fssm, stem + ".fssm"), "wb") as f:
+            f.write(header)
+    return fssm
 
 
 def run(*args):
@@ -113,6 +131,41 @@ class OpReachTests(unittest.TestCase):
         os.makedirs(empty)
         p = run(empty)
         self.assertEqual(p.returncode, 1)
+        self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+
+    def test_patterns_match_printed_names(self):
+        r = op_reach.census(self.disasm)
+        rows = {row["op"]: row for row in op_reach.report(r, ["*_dpp", "*_sdwa", "v_cndmask_b32_e*", "v_add_f16_sdwa"])}
+        self.assertEqual((rows["*_dpp"]["shaders"], rows["*_dpp"]["instructions"]), (1, 1))
+        self.assertEqual((rows["*_sdwa"]["shaders"], rows["*_sdwa"]["instructions"]), (1, 1))
+        self.assertEqual((rows["v_cndmask_b32_e*"]["shaders"], rows["v_cndmask_b32_e*"]["instructions"]), (2, 3))
+        # without a wildcard a suffixed name is its base name: every encoding counts
+        self.assertEqual((rows["v_add_f16"]["shaders"], rows["v_add_f16"]["instructions"]), (1, 2))
+        # a pattern never matches the data words after the last s_endpgm
+        self.assertEqual(op_reach.report(r, ["s_cmov*"])[0]["shaders"], 0)
+
+    def test_wave_split_from_the_fssm_headers(self):
+        fssm = build_fssm(self._tmp.name)
+        r = op_reach.census(self.disasm, op_reach.stages_of(self.index), fssm)
+        self.assertEqual(r["listings_by_wave"], {"w32": 1, "w64": 3, "w?": 1})
+        self.assertEqual(r["listings_by_stage_wave"], {"cs/w32": 1, "cs/w64": 1, "cs/w?": 1, "ps/w64": 1, "vs/w64": 1})
+        rows = {row["op"]: row for row in op_reach.report(r, ["v_cndmask_b32", "v_cvt_pkrtz_f16_f32", "v_cvt_f16_f32"])}
+        self.assertEqual(rows["v_cndmask_b32"]["by_wave"], {"w64": 2})
+        self.assertEqual(rows["v_cndmask_b32"]["by_stage_wave"], {"ps/w64": 1, "vs/w64": 1})
+        self.assertEqual(rows["v_cvt_pkrtz_f16_f32"]["by_wave"], {"w32": 1})
+        self.assertEqual(rows["v_cvt_f16_f32"]["by_wave"], {"w?": 1})      # no sidecar
+
+    def test_cli_fssm(self):
+        fssm = build_fssm(self._tmp.name)
+        out = os.path.join(self._tmp.name, "w.json")
+        p = run(self.disasm, "*_dpp", "--fssm", fssm, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            doc = json.load(f)
+        self.assertEqual(doc["listings_by_wave"], {"w32": 1, "w64": 3, "w?": 1})
+        self.assertEqual(doc["rows"][0]["by_wave"], {"w64": 1})
+        p = run(self.disasm, "--fssm", os.path.join(self._tmp.name, "no-such-fssm"))
+        self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
 
 
