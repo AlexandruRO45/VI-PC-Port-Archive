@@ -330,5 +330,38 @@ class VCvtPknormI16F16TranslatorTests(unittest.TestCase):
         self.assertEqual(word & 0xFFFF, 0x7FFF)
         self.assertEqual((word >> 16) & 0xFFFF, 0x8001)
 
+# -----------------------------------------------------------------------------
+# Opcode 3: v_cvt_pknorm_u16_f16
+# -----------------------------------------------------------------------------
+
+def ref_norm16_u16(u: int) -> int:
+    f = bits_to_f16(u & MASK16)
+    if math.isnan(f):
+        return 0
+    cl = max(0.0, min(1.0, f))
+    val = round(cl * 65535.0)
+    return val & MASK16
+
+
+def ref_cvt_pknorm_u16_f16(s0: int, s1: int, sel: tuple[int, int] = (0, 0), dhi: bool = False) -> int:
+    h0 = (s0 >> (16 * sel[0])) & MASK16
+    h1 = (s1 >> (16 * sel[1])) & MASK16
+    n0 = ref_norm16_u16(h0)
+    n1 = ref_norm16_u16(h1)
+    res = (n1 << 16) | n0
+    if dhi:
+        res = (res << 16) & MASK32
+    return res & MASK32
+
+
+class VCvtPknormU16F16OracleTests(unittest.TestCase):
+    def test_cardinals(self):
+        res = ref_cvt_pknorm_u16_f16(0x3C00, 0x3800)
+        self.assertEqual(res & 0xFFFF, 0xFFFF)
+        self.assertEqual((res >> 16) & 0xFFFF, 0x8000)
+
+    def test_zeros_and_negatives(self):
+        self.assertEqual(ref_cvt_pknorm_u16_f16(0x0000, 0xBC00), 0x00000000)
+
 if __name__ == '__main__':
     unittest.main()
