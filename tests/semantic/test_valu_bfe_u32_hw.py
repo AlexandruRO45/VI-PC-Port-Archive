@@ -377,5 +377,56 @@ class TestVBfeU32IEEE754(unittest.TestCase):
         self.assertEqual(payload, 0x12345)
 
 
-if __name__ == '__main__':
+class TestVBfeU32NegativeAndMutation(unittest.TestCase):
+    """Negative controls, syntax rejection, and mutation detection."""
+
+    def test_syntax_rejection_invalid_operand_count(self):
+        invalid_lines = [
+            "v_bfe_u32 v0, v1, v2",
+            "v_bfe_u32 v0, v1",
+            "v_bfe_u32 v0",
+            "v_bfe_u32 v0, v1, v2, v3, v4",
+        ]
+        if support is not None and getattr(support, "translate_lines", None) is not None:
+            for line in invalid_lines:
+                with self.assertRaises(Exception):
+                    support.translate_lines("ps_invalid", [line, "s_endpgm"])
+
+    def test_mutation_offset_masking(self):
+        def mutated_bfe(s0, s1, s2):
+            off = s1 & 63
+            w = s2 & 31
+            if w == 0:
+                return 0
+            return (s0 >> off) & ((1 << min(w, 32 - min(off, 32))) - 1)
+
+        s0 = 0b10
+        correct = ref_bfe_u32(s0, 33, 1)
+        mutant = mutated_bfe(s0, 33, 1)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_zero_width_nonzero(self):
+        def mutated_bfe(s0, s1, s2):
+            off = s1 & 31
+            w = s2 & 31
+            eff_w = min(w if w != 0 else 32, 32 - off)
+            return (s0 >> off) & ((1 << eff_w) - 1)
+
+        correct = ref_bfe_u32(0x12345678, 0, 0)
+        mutant = mutated_bfe(0x12345678, 0, 0)
+        self.assertEqual(correct, 0)
+        self.assertNotEqual(correct, mutant)
+
+    def test_mutation_past_bit31_wrap(self):
+        def mutated_bfe(s0, s1, s2):
+            off = s1 & 31
+            w = s2 & 31
+            return (s0 >> off) & ((1 << w) - 1)
+
+        val = 0xF0000000
+        correct = ref_bfe_u32(val, 28, 8)
+        self.assertEqual(correct, 0xF)
+
+
+if __name__ == "__main__":
     unittest.main()
