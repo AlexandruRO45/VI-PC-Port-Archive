@@ -110,7 +110,8 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi",
                 "cs_w32_i16_clamp", "cs_w32_cvt_flr_rpi",
-                "cs_w32_minmax3_16", "cs_w32_lds_atomics")
+                "cs_w32_minmax3_16", "cs_w32_lds_atomics",
+                "cs_w32_div_fmas", "cs_w32_div_fixup")
 # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
 # narrower (Mesa llvmpipe: 8) can't produce their words. They are skipped there, as ps_bitmask_perm is. They run with
 # 32 lanes requested (WAVE32_LANE_ENV), as run_gpu_tests.py does: a device with a range like 8..32 (Intel ANV) may
@@ -156,6 +157,10 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
             ("cs_w32_minmax3_16", [0xDEADFFFE, 0xDEAD0003, 0xDEAD0001, 0xDEAD0001, 0xDEADFFFE, 0xDEAD0003, 0xBEEFC000, 0xBEEF3C00]),
             # ds_inc/dec/rsub_u32 and ds_min/max_f32, returning and left values (cs_w32_lds_atomics.asm header)
             ("cs_w32_lds_atomics", [5, 5, 7, 0x40200000, 0x80000000, 6, 0x3FC00000, 0]),
+            # v_div_fmas f32/f64, VCC scaling and modifiers (cs_w32_div_fmas.asm header)
+            ("cs_w32_div_fmas", [0, 0x41B00000, 0x41A00000, 0, 0, 0, 0, 0x40360000]),
+            # v_div_fixup f16/f64 special cases (cs_w32_div_fixup.asm header)
+            ("cs_w32_div_fixup", [0xBEEFFE00, 0xBEEF7C00, 0xBEEF0000, 0xBEEF3E00, 0, 0xFFF80000, 0, 0x3FF80000]),
             ("cs_w32_salu64", [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE]),
             # SHADER-85: 8-bit LDS reads into one half of a VGPR, the other half kept
             ("cs_w32_lds_u8_d16", [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234]),

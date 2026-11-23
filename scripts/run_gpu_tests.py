@@ -1160,7 +1160,8 @@ def run_suite(a, work: str) -> int:
                       "cs_barrier_loop", "cs_w64x_andn2_exec", "cs_w64x_saveexec_b64", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
                       "cs_mask_vgpr_exec",
                       "cs_w32_i16_clamp", "cs_w32_cvt_flr_rpi",
-                      "cs_w32_minmax3_16", "cs_w32_lds_atomics"):
+                      "cs_w32_minmax3_16", "cs_w32_lds_atomics",
+                      "cs_w32_div_fmas", "cs_w32_div_fixup"):
             cs_dump_wants = {
                 "cs_store": [0x400080FF, 0xE00003FF, 0x3C004000, 0xEEEEEEEE, 0x40003C00, 0xBC003800, 0x40FF8000, 0x3FF00000],
                 # base + soffset + imm (cs_smem_soffset_imm.asm); out[4..7] are seeds the shader leaves alone
@@ -1193,6 +1194,10 @@ def run_suite(a, work: str) -> int:
                 "cs_w32_minmax3_16": [0xDEADFFFE, 0xDEAD0003, 0xDEAD0001, 0xDEAD0001, 0xDEADFFFE, 0xDEAD0003, 0xBEEFC000, 0xBEEF3C00],
                 # ds_inc/dec/rsub_u32 and ds_min/max_f32, returning and left values (cs_w32_lds_atomics.asm header)
                 "cs_w32_lds_atomics": [5, 5, 7, 0x40200000, 0x80000000, 6, 0x3FC00000, 0],
+                # v_div_fmas f32/f64, VCC scaling and modifiers (cs_w32_div_fmas.asm header)
+                "cs_w32_div_fmas": [0, 0x41B00000, 0x41A00000, 0, 0, 0, 0, 0x40360000],
+                # v_div_fixup f16/f64 special cases (cs_w32_div_fixup.asm header)
+                "cs_w32_div_fixup": [0xBEEFFE00, 0xBEEF7C00, 0xBEEF0000, 0xBEEF3E00, 0, 0xFFF80000, 0, 0x3FF80000],
                 "cs_w32_salu64": [0x1E6A2C48, 0x1234, 0xFFFFFFFF, 0x100, 47, 48, 0xFFFF8000, 0xFFFFFFFE],
                 # SHADER-85: ds_read_u8/i8_d16[_hi] (cs_w32_lds_u8_d16.asm header)
                 "cs_w32_lds_u8_d16": [0xBEEF00FF, 0x00FF1234, 0xBEEFFF80, 0xFF801234, 0xBEEF007F, 0x007F1234, 0xBEEF0080, 0xFFFF1234],
@@ -1285,7 +1290,8 @@ def run_suite(a, work: str) -> int:
                                   "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8",
                                   "cs_dpp_ops", "cs_dpp_bound", "cs_dpp_bank", "cs_dpp_fi", "cs_w32_andn2_exec",
                                   "cs_w32_i16_clamp", "cs_w32_cvt_flr_rpi",
-                                  "cs_w32_minmax3_16", "cs_w32_lds_atomics") and not emulated and not partial
+                                  "cs_w32_minmax3_16", "cs_w32_lds_atomics",
+                                  "cs_w32_div_fmas", "cs_w32_div_fixup") and not emulated and not partial
             if partial and not emulated:
                 cs_env = dict(os.environ, VKC_SUBGROUP_SIZE="64")
             if name in WAVE32_LANE_DUMPS:   # 32 lanes even without index.json, as check.py requests (#774)
