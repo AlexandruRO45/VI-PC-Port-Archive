@@ -70,6 +70,8 @@ def check_output(code, output):
         problems.append(f"exit code {code}")
     if "tiny_frame: OK" not in lines:
         problems.append("the guest did not print `tiny_frame: OK`")
+    if "tiny_frame: PASS all 32 pixels are the clear colour (64, 128, 191, 255)" not in lines:
+        problems.append("the guest did not confirm the clear colour of all 32 pixels")
     if any(line.startswith("tiny_frame: FAIL") for line in lines):
         problems.append("the guest reported a failed check")
     if "game exited with code 0" not in lines:
@@ -86,6 +88,15 @@ def check_output(code, output):
     missing = ordered_subsequence(EXPECTED, [f"{method} {outcome}" for method, outcome in entries])
     if missing:
         problems.append(f"the trace has no `{missing}` at its place in the first-frame order")
+    return problems
+
+
+def check_xbox_startup_routes(output):
+    lines = output.splitlines()
+    problems = []
+    for slot, method in ((48, "CreateCommandQueueX"), (73, "CreateCommandListX")):
+        if not any(line.startswith(f"[rt] d3d12_xs: device slot {slot} routed to {method} ") for line in lines):
+            problems.append(f"the device proxy did not route slot {slot} to {method}")
     return problems
 
 
@@ -111,6 +122,8 @@ def main():
     parser.add_argument("loader")
     parser.add_argument("guest")
     parser.add_argument("--probe", help="a Vulkan device test; its exit code 77 skips this test")
+    parser.add_argument("--xbox-startup", action="store_true",
+                        help="create the queue and list through the Xbox device slots")
     parser.add_argument("--queue-test-settings", action="store_true",
                         help="also set the queue test settings (docs/testing.md), which the game's device must ignore")
     parser.add_argument("--runner", action="append", default=[],
@@ -127,11 +140,18 @@ def main():
     environment = dict(os.environ, LEONIDA_D3D12="vulkan")
     if options.queue_test_settings:
         environment.update(QUEUE_TEST_SETTINGS)
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
-                         cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    command = [*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"]
+    if options.xbox_startup:
+        # The guest calls the default slot numbers even if the developer has remapped them for a local trace.
+        for route in ("FRAME_INTERVAL", "SCHEDULE_EVENT", "WAIT_EVENT", "QUEUE_X", "LIST_X"):
+            environment.pop(f"LEONIDA_XS_{route}_SLOT", None)
+        command.extend(["--", "--xbox-startup"])
+    run = subprocess.run(command, cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
     output = run.stdout + run.stderr
     problems = check_output(run.returncode, output)
+    if options.xbox_startup:
+        problems += check_xbox_startup_routes(output)
     if options.queue_test_settings:
         problems += check_queue_test_settings_ignored(output)
     if problems:

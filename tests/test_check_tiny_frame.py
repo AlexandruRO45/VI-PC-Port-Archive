@@ -26,6 +26,21 @@ class CheckOutputTest(unittest.TestCase):
     def test_a_passing_run_has_no_problems(self):
         self.assertEqual(check.check_output(0, good_output()), [])
 
+    def test_xbox_startup_requires_both_device_routes(self):
+        routes = ("[rt] d3d12_xs: device slot 48 routed to CreateCommandQueueX (args ...)",
+                  "[rt] d3d12_xs: device slot 73 routed to CreateCommandListX (args ...)")
+        errors = ("the device proxy did not route slot 48 to CreateCommandQueueX",
+                  "the device proxy did not route slot 73 to CreateCommandListX")
+        for present, expected in ((routes, []), ([routes[0]], [errors[1]]), ([routes[1]], [errors[0]]),
+                                  ([], list(errors))):
+            with self.subTest(routes=present):
+                output = good_output() + "\n".join(present)
+                self.assertEqual(check.check_xbox_startup_routes(output), expected)
+
+    def test_ok_and_complete_trace_still_require_the_pixel_readback(self):
+        output = good_output().replace("(64, 128, 191, 255)", "(0, 0, 0, 0)")
+        self.assertEqual(check.check_output(0, output), ["the guest did not confirm the clear colour of all 32 pixels"])
+
     def test_crlf_output_and_calls_between_the_expected_ones_are_accepted(self):
         output = good_output(extra_trace=["XboxID3D12CommandQueue::GetDesc called"]).replace("\n", "\r\n")
         self.assertEqual(check.check_output(0, output), [])

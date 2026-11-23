@@ -2838,6 +2838,11 @@ if(TARGET Vulkan::Headers)
                  "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --queue-test-settings
                  ${_trace_runner})
         set_tests_properties(run_tiny_frame_queue_test_settings PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME run_tiny_frame_xbox_startup COMMAND "${Python3_EXECUTABLE}" -I
+                 "${CMAKE_CURRENT_SOURCE_DIR}/test/check_tiny_frame.py" "$<TARGET_FILE:gta6rt>"
+                 "$<TARGET_FILE:tiny_frame>" "--probe=$<TARGET_FILE:d3d12_com_test>" --xbox-startup
+                 ${_trace_runner})
+        set_tests_properties(run_tiny_frame_xbox_startup PROPERTIES SKIP_RETURN_CODE 77)
       endif()
     endif()
 

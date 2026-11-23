@@ -5,8 +5,9 @@
 // a committed render target, a clear, a copy into a readback buffer, Signal and a fence wait, Map, and a check of
 // every pixel. It then returns from main with the device, the queue and the fence still alive, as a title's exit
 // does. With LEONIDA_D3D12=vulkan (check_tiny_frame.py sets it) that device is the Vulkan-backed one, so this is the
-// loader, the game thread, the Xbox-ABI proxies and the Vulkan device in one process. Hand-written test code, public
-// D3D12 API only; no game data and no shader.
+// loader, the game thread, the Xbox-ABI proxies and the Vulkan device in one process. The hand-written fixture
+// uses no game data or shaders. With --xbox-startup it calls the public HLE's device slots 48 and 73 to create the
+// queue and the PC graphics-command-list interface used for the clear and readback.
 #include <windows.h>
 #include <d3d12.h>
 
@@ -37,12 +38,33 @@ int finish() {
 // GetCPUDescriptorHandleForHeapStart returns it through a hidden pointer, which the heap proxy does not serve.
 using HeapStartFn = std::uint64_t(__stdcall*)(void* heap);
 
+struct XboxQueueDesc {
+    D3D12_COMMAND_QUEUE_DESC pc;
+    std::uint32_t extra_words[4];
+};
+static_assert(sizeof(XboxQueueDesc) == 32);
+
+struct XboxListDesc {
+    D3D12_COMMAND_LIST_TYPE type;
+    std::uint32_t second_word;
+};
+static_assert(sizeof(XboxListDesc) == 8);
+
+using CreateQueueXFn = HRESULT(WINAPI*)(ID3D12Device*, const XboxQueueDesc*, REFIID, void**);
+using CreateListXFn = HRESULT(WINAPI*)(ID3D12Device*, const XboxListDesc*, ID3D12CommandAllocator*,
+                                      ID3D12PipelineState*, REFIID, void**);
+
 constexpr UINT kWidth = 8, kHeight = 4;
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const bool xbox_startup = argc == 2 && std::strcmp(argv[1], "--xbox-startup") == 0;
+    if (argc != 1 && !xbox_startup) {
+        check(false, "expected --xbox-startup or no guest arguments");
+        return finish();
+    }
 
     // The entry point's second argument is a block the shim logs and does not interpret; a title passes its own.
     std::uint32_t params[24] = {};
@@ -60,12 +82,28 @@ int main() {
     ID3D12Fence* fence = nullptr;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    check(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) && queue, "a direct command queue");
+    const auto* slots = xbox_startup ? *reinterpret_cast<void* const* const*>(device) : nullptr;
+    if (xbox_startup) {
+        const XboxQueueDesc desc{queue_desc, {}};
+        hr = reinterpret_cast<CreateQueueXFn>(slots[48])(device, &desc, IID_PPV_ARGS(&queue));
+        if (!check(SUCCEEDED(hr) && queue, "Xbox slot 48 creates a direct command queue"))
+            std::printf("tiny_frame: CreateCommandQueueX hr=0x%08lx\n", static_cast<unsigned long>(hr));
+    } else {
+        check(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue))) && queue, "a direct command queue");
+    }
     check(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) &&
               allocator, "a command allocator");
-    if (allocator)
-        check(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
-                                                  IID_PPV_ARGS(&list))) && list, "a command list");
+    if (allocator) {
+        if (xbox_startup) {
+            const XboxListDesc desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0};
+            hr = reinterpret_cast<CreateListXFn>(slots[73])(device, &desc, allocator, nullptr, IID_PPV_ARGS(&list));
+            if (!check(SUCCEEDED(hr) && list, "Xbox slot 73 creates a graphics command list"))
+                std::printf("tiny_frame: CreateCommandListX hr=0x%08lx\n", static_cast<unsigned long>(hr));
+        } else {
+            check(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr,
+                                                      IID_PPV_ARGS(&list))) && list, "a command list");
+        }
+    }
     check(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))) && fence, "a fence");
 
     ID3D12DescriptorHeap* rtv_heap = nullptr;
