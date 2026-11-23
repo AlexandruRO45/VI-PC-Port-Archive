@@ -110,7 +110,42 @@ int main() {
     expect(run(rect_color, not_zeroed, vk, &fresh) == ReplayResult::success && clears == 0,
            "not_zeroed image: no zero-clear needed");
 
+    // The queue decides whether the implicit zero-clear may use vkCmdClearColorImage: a compute queue can, a copy
+    // (transfer-only) queue cannot, although its barriers keep the CLEAR stage for vkCmdUpdateBuffer.
+    vk = functions();
+    vk.clear_color_image = clear_color;
+    vk.queue_stages = leonida::detail::queue_stages_compute;
+    leonida::LayoutTracker on_compute;
+    on_compute.track(1, color, VK_IMAGE_LAYOUT_UNDEFINED);
+    expect(run(rect_color, color, vk, &on_compute) == ReplayResult::success && clears == 1,
+           "compute queue: an UNDEFINED colour image is zero-cleared with vkCmdClearColorImage");
+    vk.queue_stages = leonida::detail::queue_stages_copy;
+    leonida::LayoutTracker on_copy;
+    on_copy.track(1, color, VK_IMAGE_LAYOUT_UNDEFINED);
+    expect(run(rect_color, color, vk, &on_copy) == ReplayResult::success && clears == 0,
+           "copy queue: no vkCmdClearColorImage, which a transfer-only family cannot run");
+
+    // A barrier recorded for a copy queue keeps COPY and CLEAR (vkCmdUpdateBuffer, vkCmdFillBuffer) and loses what
+    // the transfer family lacks; a CLEAR-only scope stays CLEAR instead of widening to ALL_COMMANDS.
+    {
+        leonida::ReplayFunctions copy{};
+        copy.queue_stages = leonida::detail::queue_stages_copy;
+        VkPipelineStageFlags2 stages =
+            VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        VkAccessFlags2 access = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+        leonida::detail::restrict_to_queue(copy, stages, access);
+        expect(stages == (VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT) &&
+                   access == VK_ACCESS_2_TRANSFER_WRITE_BIT,
+               "copy queue barrier: COPY | CLEAR and TRANSFER_WRITE kept, COMPUTE_SHADER and SHADER_WRITE dropped");
+        stages = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+        access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        leonida::detail::restrict_to_queue(copy, stages, access);
+        expect(stages == VK_PIPELINE_STAGE_2_CLEAR_BIT && access == VK_ACCESS_2_TRANSFER_WRITE_BIT,
+               "copy queue barrier: a CLEAR-only scope stays CLEAR");
+    }
+
     if (failures) return 1;
-    std::printf("replay_clear_gate_test: whole-view and implicit zero-clears refused without their function\n");
+    std::printf("replay_clear_gate_test: whole-view and implicit zero-clears refused without their function; image "
+                "clears only on graphics and compute queues; copy-queue barriers keep CLEAR\n");
     return 0;
 }

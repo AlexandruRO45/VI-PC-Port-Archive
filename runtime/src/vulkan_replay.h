@@ -1260,12 +1260,19 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
     }
 }
 
+// The stages a barrier keeps on a copy or compute queue (restrict_to_queue). A copy queue keeps CLEAR:
+// vkCmdUpdateBuffer (WriteBufferImmediate) and vkCmdFillBuffer run in the synchronization2 CLEAR stage, and a
+// transfer-only family supports it. Without CLEAR, a barrier whose first scope names it is cut down to COPY, and the
+// update is no longer ordered before a later copy: synchronization validation reports READ_AFTER_WRITE for
+// vkCmdUpdateBuffer, then a COPY-only barrier, then vkCmdCopyBuffer on a transfer-only family, and nothing with
+// COPY | CLEAR (RTX 3060, NVIDIA 610.88). Clearing an image is a separate question: vkCmdClearColorImage needs a
+// graphics or compute family, so initialize() asks for COMPUTE_SHADER, not CLEAR.
 inline constexpr VkPipelineStageFlags2 queue_stages_copy =
     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
-    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
-inline constexpr VkPipelineStageFlags2 queue_stages_compute =
-    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+    VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT |
     VK_PIPELINE_STAGE_2_CLEAR_BIT;
+inline constexpr VkPipelineStageFlags2 queue_stages_compute =
+    queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
 
 inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
     if (!vk.queue_stages) return;
@@ -1490,7 +1497,10 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
-        const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
+        // vkCmdClearColorImage runs on a graphics or compute queue: no queue_stages, or COMPUTE_SHADER in them. A copy
+        // queue has CLEAR for vkCmdUpdateBuffer and vkCmdFillBuffer, but it cannot clear an image.
+        const bool can_clear =
+            !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT) && color);
         const bool compressed = fmt.block > 1 || (!can_clear && color);
         if (resource.not_zeroed || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
