@@ -397,6 +397,21 @@ class TestCli(unittest.TestCase):
                 self.assertIn(missing, p.stderr)
                 self.assertEqual(p.stdout, "")
 
+    def test_non_psin_file_is_one_error_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "00000001.bin")
+            for blob in (b"not a psin", b""):
+                with open(path, "wb") as f:
+                    f.write(blob)
+                for extra in ([], ["--json"]):
+                    p = subprocess.run([sys.executable, "-I", TOOL, path, *extra],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertEqual(p.stdout, "")
+                    self.assertEqual(p.stderr.count("\n"), 1, p.stderr)
+                    self.assertIn(f"ERROR: {path}: not a PSIN container", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+
     def test_unlistable_folder_is_one_line(self):
         with tempfile.TemporaryDirectory() as tmp:
             # A folder that cannot be listed (no permission); patched so the test runs the same on every OS.
