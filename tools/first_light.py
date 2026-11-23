@@ -680,6 +680,10 @@ def check_image(data: bytes, manifest: dict) -> dict:
             raise AssertionError(f"{field} must contain exactly four RGBA values")
 
     width, height = manifest["width"], manifest["height"]
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise AssertionError(
+            f"image dimensions must be positive integers, got {width!r}x{height!r}"
+        )
 
     def pixel_offset(point, field: str) -> int:
         if (

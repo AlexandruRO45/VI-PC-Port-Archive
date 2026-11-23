@@ -499,6 +499,42 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
 
+    def test_rejects_non_positive_dimensions(self):
+        # width or height of zero must be an AssertionError, not a ZeroDivisionError
+        # from `covered / (width * height)`, and negative dims must not pass the oracle.
+        for bad in (
+            {"width": 0, "height": 4},
+            {"width": 4, "height": 0},
+            {"width": 0, "height": 0},
+            {"width": -1, "height": 4},
+            {"width": 4, "height": -1},
+            {"width": -2, "height": -3},
+        ):
+            with self.subTest(dimensions=bad):
+                manifest = self.manifest | bad
+                with self.assertRaises(AssertionError):
+                    check_image(b"", manifest)
+
+    def test_rejects_non_integer_dimensions(self):
+        for bad in (
+            {"width": True, "height": 4},
+            {"width": 4, "height": True},
+            {"width": 4.0, "height": 4},
+            {"width": 4, "height": 4.0},
+            {"width": "4", "height": 4},
+        ):
+            with self.subTest(dimensions=bad):
+                manifest = self.manifest | bad
+                with self.assertRaises(AssertionError):
+                    check_image(b"", manifest)
+
+    def test_accepts_positive_integer_dimensions(self):
+        manifest = self.manifest | {"width": 1, "height": 1}
+        # 1x1 image of clear pixels: ratio 0.0 within [0.2, 0.5]? No — 0.0 < 0.2,
+        # so coverage is rejected, but dimensions themselves are accepted (no ZeroDivisionError).
+        with self.assertRaises(AssertionError):
+            check_image(struct.pack("<4f", *([CLEAR] * 4)), manifest)
+
 
 class ProbeCoordinateTests(unittest.TestCase):
     rgba = (0.25, 0.75, 0.0, 1.0)
