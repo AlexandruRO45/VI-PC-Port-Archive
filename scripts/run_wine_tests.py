@@ -226,12 +226,14 @@ def run_test(test: dict, args, wine: list[str], *, failed_setups: tuple[str, ...
     skip_patterns = regex_list(props.get("SKIP_REGULAR_EXPRESSION", []))
     required = regex_list(props.get("PASS_REGULAR_EXPRESSION", []))
     forbidden = regex_list(props.get("FAIL_REGULAR_EXPRESSION", []))
+    # CTest discards carriage returns immediately before a newline. Preserve the raw diagnostics.
+    regex_output = re.sub(r"(?<!\r)\r+\n", "\n", out)
     # A required match takes the place of the exit code. A forbidden match overrides either kind of success.
     try:
-        if any(re.search(pattern, out, re.DOTALL) for pattern in skip_patterns):
+        if any(re.search(pattern, regex_output, re.DOTALL) for pattern in skip_patterns):
             return "skip", f"matched CTest SKIP_REGULAR_EXPRESSION: {detail}"
-        passed = any(re.search(pattern, out, re.DOTALL) for pattern in required) if required else code == 0
-        if any(re.search(pattern, out, re.DOTALL) for pattern in forbidden):
+        passed = any(re.search(pattern, regex_output, re.DOTALL) for pattern in required) if required else code == 0
+        if any(re.search(pattern, regex_output, re.DOTALL) for pattern in forbidden):
             passed = False
     except re.error as e:
         return "fail", f"invalid output regular expression: {e}\n{detail}"
