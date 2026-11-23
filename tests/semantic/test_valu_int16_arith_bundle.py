@@ -90,6 +90,18 @@ class TestVAddI16Interpreter(unittest.TestCase):
         self.assertEqual(res, 0x7FFF)
         self.assertEqual(state.vgpr[1], 0x7FFF)
 
+class TestVAddI16EdgeCases(unittest.TestCase):
+    def test_extremum_bounds(self):
+        self.assertEqual(ref_v_add_i16(0x7FFF, 0x7FFF, clamp=True), 0x7FFF)
+        self.assertEqual(ref_v_add_i16(0x8000, 0x8000, clamp=True), 0x8000)
+
+    def test_simd_multi_lane_divergence(self):
+        lanes_a = [i * 500 for i in range(64)]
+        lanes_b = [i * 200 for i in range(64)]
+        res = [ref_v_add_i16(a, b) for a, b in zip(lanes_a, lanes_b)]
+        expected = [(i * 700) & MASK16 for i in range(64)]
+        self.assertEqual(res, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
