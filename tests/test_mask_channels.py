@@ -27,13 +27,17 @@ def image():
     return bytes(px)
 
 
-def rgba8_dds(width, height, payload):
+def dx10_dds(width, height, payload, dxgi):
     header = bytearray(128)
     header[0:4] = b"DDS "
     struct.pack_into("<IIII", header, 4, 124, 0x1007, height, width)
     struct.pack_into("<II", header, 76, 32, 0x4)                       # DDPF_FOURCC
     header[84:88] = b"DX10"
-    return bytes(header) + struct.pack("<IIIII", 28, 3, 0, 1, 0) + payload  # R8G8B8A8_UNORM
+    return bytes(header) + struct.pack("<IIIII", dxgi, 3, 0, 1, 0) + payload
+
+
+def rgba8_dds(width, height, payload):
+    return dx10_dds(width, height, payload, 28)  # R8G8B8A8_UNORM
 
 
 class MaskChannelTests(unittest.TestCase):
@@ -79,6 +83,30 @@ class MaskChannelTests(unittest.TestCase):
                     finally:
                         sys.stderr = saved_err
                 self.assertEqual(cm.exception.code, 2)
+
+    def test_bc4_bc5_count_only_stored_components(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, out = os.path.join(tmp, "mask.dds"), os.path.join(tmp, "counts.json")
+            for dxgi, signed, has_green in ((80, False, False), (81, True, False),
+                                            (83, False, True), (84, True, True)):
+                with self.subTest(dxgi=dxgi):
+                    # Endpoints map to bytes 128 and 255 in both UNORM and SNORM.
+                    endpoints = bytes((0, 127) if signed else (128, 255))
+                    # The second endpoint occurs at one texel in R and two in G.
+                    payload = endpoints + (1).to_bytes(6, "little")
+                    if has_green:
+                        payload += endpoints + (1 << 3 | 1 << 6).to_bytes(6, "little")
+                    with open(path, "wb") as fh:
+                        fh.write(dx10_dds(4, 4, payload, dxgi))
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(mc.main([path, "--thresholds", "200", "--json", out]), 0)
+                    with open(out, encoding="utf-8") as fh:
+                        channels = json.load(fh)["channels"]
+                    stats = {key: (row["min"], row["max"], row["thresholds"]["200"]["cover"])
+                             for key, row in channels.items()}
+                    self.assertEqual(stats, {"R": (128, 255, 1 / 16),
+                                             "G": (128, 255, 2 / 16) if has_green else (0, 0, 0),
+                                             "B": (0, 0, 0), "A": (255, 255, 1)})
 
     def test_json_cannot_replace_the_input(self):
         with tempfile.TemporaryDirectory() as tmp:

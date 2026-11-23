@@ -714,6 +714,7 @@ def _decode_bc4(
     height: int,
     *,
     signed: bool = False,
+    grayscale: bool = True,
 ) -> bytes:
     blocks_x = (width + 3) // 4
     blocks_y = (height + 3) // 4
@@ -739,7 +740,10 @@ def _decode_bc4(
             pos += 8
 
             r_lut = lut_fn(rq & 0xFF, (rq >> 8) & 0xFF)
-            px = tuple(bytes((v, v, v, 255)) for v in r_lut)
+            if grayscale:
+                px = tuple(bytes((v, v, v, 255)) for v in r_lut)
+            else:
+                px = tuple(bytes((v, 0, 0, 255)) for v in r_lut)
             r_idx = rq >> 16
 
             px0 = bx * 4
@@ -771,6 +775,7 @@ def _decode_bc5(
     height: int,
     *,
     signed: bool = False,
+    reconstruct_z: bool = True,
 ) -> bytes:
     blocks_x = (width + 3) // 4
     blocks_y = (height + 3) // 4
@@ -783,7 +788,7 @@ def _decode_bc5(
     unpack = _UNPACK_BC5
     lut_fn = _bc_interp_lut_snorm if signed else _bc_interp_lut
     use_lut = width * height >= 4096 or _BC5_Z_LUT is not None
-    z_lut = _get_bc5_z_lut() if use_lut else None
+    z_lut = _get_bc5_z_lut() if reconstruct_z and use_lut else None
     pos = offset
 
     for by in range(blocks_y):
@@ -803,9 +808,9 @@ def _decode_bc5(
             g_idx = gq >> 16
 
             px0 = bx * 4
-            max_x = width - px0
+            max_x = min(4, width - px0)
             dst = row_base + px0 * 4
-            if z_lut is not None and max_x >= 4:
+            if z_lut is not None and max_x == 4:
                 for ty in range(max_y):
                     rr = (r_idx >> (ty * 12)) & 0xFFF
                     gr = (g_idx >> (ty * 12)) & 0xFFF
@@ -832,10 +837,10 @@ def _decode_bc5(
                     for tx in range(max_x):
                         r = r_lut[(rr >> (tx * 3)) & 7]
                         g = g_lut[(gr >> (tx * 3)) & 7]
-                        z = z_lut[(r << 8) | g] if z_lut is not None else _bc5_z_direct(r, g)
                         out[d] = r
                         out[d + 1] = g
-                        out[d + 2] = z
+                        if reconstruct_z:
+                            out[d + 2] = z_lut[(r << 8) | g] if z_lut is not None else _bc5_z_direct(r, g)
                         out[d + 3] = 255
                         d += 4
                     dst += row_stride
@@ -1059,7 +1064,7 @@ def _unpremultiply_rgba(rgba: bytes, srgb: bool) -> bytes:
     return bytes(out)
 
 
-def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
+def _decode_dds(data: bytes, *, bc45_preview: bool = True) -> tuple[int, int, bytes, bool]:
     info, masks, alpha_mode = _parse_header_internal(data)
     srgb = info["dxgi_format"] in _SRGB_DXGI_FORMATS
     width = int(info["width"])  # type: ignore[arg-type]
@@ -1082,14 +1087,10 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
         rgba = _decode_bc2(data, offset, width, height)
     elif fmt == "BC3":
         rgba = _decode_bc3(data, offset, width, height)
-    elif fmt == "BC4":
-        rgba = _decode_bc4(data, offset, width, height, signed=False)
-    elif fmt == "BC4_SNORM":
-        rgba = _decode_bc4(data, offset, width, height, signed=True)
-    elif fmt == "BC5":
-        rgba = _decode_bc5(data, offset, width, height, signed=False)
-    elif fmt == "BC5_SNORM":
-        rgba = _decode_bc5(data, offset, width, height, signed=True)
+    elif fmt in ("BC4", "BC4_SNORM"):
+        rgba = _decode_bc4(data, offset, width, height, signed=fmt == "BC4_SNORM", grayscale=bc45_preview)
+    elif fmt in ("BC5", "BC5_SNORM"):
+        rgba = _decode_bc5(data, offset, width, height, signed=fmt == "BC5_SNORM", reconstruct_z=bc45_preview)
     elif fmt == "R11G11B10_FLOAT":
         flags = struct.unpack_from("<I", data, 8)[0]
         pitch = struct.unpack_from("<I", data, 20)[0] if flags & DDSD_PITCH else 0
@@ -1113,9 +1114,13 @@ def _decode_dds(data: bytes) -> tuple[int, int, bytes, bool]:
     return width, height, rgba, srgb
 
 
-def decode_dds(data: bytes) -> tuple[int, int, bytes]:
-    """Decode mip 0 into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data)
+def decode_dds(data: bytes, *, bc45_preview: bool = True) -> tuple[int, int, bytes]:
+    """Decode mip 0 into top-down row-major RGBA8 with straight alpha.
+
+    With bc45_preview=False, BC4 returns (R, 0, 0, 255) and BC5 returns (R, G, 0, 255).
+    By default BC4 is shown as grayscale and BC5 as a normal map with reconstructed Z.
+    """
+    width, height, rgba, _ = _decode_dds(data, bc45_preview=bc45_preview)
     return width, height, rgba
 
 

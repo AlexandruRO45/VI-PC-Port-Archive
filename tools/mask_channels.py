@@ -2,7 +2,9 @@
 
     python -I tools/mask_channels.py <texture.dds> [--thresholds 64,128,192] [--json FILE]
 
-The DDS is decoded with ``dds_png.decode_dds`` (stored values, no sRGB transfer). For each of R, G, B and A the
+BC4 supplies R and BC5 supplies R and G. Missing color components are reported as 0 and alpha as 255 for both.
+Their signed (SNORM) components are mapped from [-1, 1] to [0, 255], with zero at 128.
+The DDS is decoded with ``dds_png.decode_dds`` (no sRGB transfer). For each of R, G, B and A the
 tool prints the minimum, maximum, mean and number of distinct values, and for each threshold the share of texels
 at or above it, the number of 4-connected blobs of such texels and the share of them in the largest blob. A
 constant channel carries nothing a selector could pick; a channel of a few large blobs is a broad layer and one of
@@ -90,7 +92,7 @@ def main(argv=None) -> int:
     if a.json and same_file(a.dds, a.json):
         ap.error("--json names the input texture; writing it would replace the DDS")
     with open(a.dds, "rb") as fh:
-        width, height, rgba = dds_png.decode_dds(fh.read())
+        width, height, rgba = dds_png.decode_dds(fh.read(), bc45_preview=False)
     counts = channel_counts(width, height, rgba, thresholds)
     print(f"{width}x{height}")
     for name, row in counts.items():
