@@ -14,14 +14,13 @@
 //     WINHTTP_OPTION_CONTEXT_VALUE).
 //   - Reading a response (WinHttpReceiveResponse, WinHttpQueryHeaders, WinHttpQueryDataAvailable, WinHttpReadData) and
 //     WinHttpWriteData fail with ERROR_WINHTTP_INCORRECT_HANDLE_STATE: no request ever got that far.
-//   - Options, timeouts and request headers are accepted. WINHTTP_OPTION_CONTEXT_VALUE is kept per handle and
-//     WINHTTP_OPTION_HANDLE_TYPE answered; WinHttpQueryOption reports ERROR_WINHTTP_INVALID_OPTION for the rest.
+//   - Options, timeouts and request headers are accepted. Supported handle options are stored and queried locally.
 //   - A status callback set on a handle is inherited by the handles created under it, as in WinHTTP, and so is
 //     the handle's WINHTTP_OPTION_CONTEXT_VALUE as it is when the child is made.
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CREATED is reported when a child handle is made, and
 //     WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING once per handle, last, after WinHttpCloseHandle and any callback still
 //     running for it.
-//   - WinHttpCrackUrl only parses a string, so it is the host's.
+//   - URL parsing and creation use the host; proxy discovery stays offline.
 // Each refused server is logged once ("[rt] winhttp: offline, refused <host>:<port>"), which says what a title tried
 // to reach. Only images mapped by the loader see these: they are bound through the registry, the runtime's own code
 // calls the host directly.
@@ -50,14 +49,28 @@ struct Handle {
     std::atomic<long> refs{1};  // the handle's own reference, dropped by WinHttpCloseHandle
     std::atomic<bool> closed{false};
 
-    std::mutex mutex;  // guards the three below
+    std::mutex mutex;  // guards mutable options and callback state
     WINHTTP_STATUS_CALLBACK callback = nullptr;
     DWORD notifications = 0;
     DWORD_PTR context = 0;
+    DWORD resolve_timeout = 0, connect_timeout = 0, send_timeout = 0, receive_timeout = 0;
+    DWORD security_flags = 0, max_redirects = 0;
 
     std::wstring server;  // Connect: for the log
     INTERNET_PORT port = 0;
 };
+
+DWORD* stored_option(Handle* h, DWORD option) {
+    switch (option) {
+    case WINHTTP_OPTION_RESOLVE_TIMEOUT: return &h->resolve_timeout;
+    case WINHTTP_OPTION_CONNECT_TIMEOUT: return &h->connect_timeout;
+    case WINHTTP_OPTION_SEND_TIMEOUT: return &h->send_timeout;
+    case WINHTTP_OPTION_RECEIVE_TIMEOUT: return &h->receive_timeout;
+    case WINHTTP_OPTION_SECURITY_FLAGS: return &h->security_flags;
+    case WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS: return &h->max_redirects;
+    default: return nullptr;
+    }
+}
 
 // Intentionally immortal: a mapped DLL can close handles from DLL_PROCESS_DETACH, after normal statics are gone.
 std::mutex& live_mutex() {
@@ -324,8 +337,18 @@ BOOL WINAPI set_timeouts(HINTERNET handle, int resolve, int connect, int send, i
     DWORD error = 0;
     Handle* h = acquire(handle, true, false, true, error);
     if (!h) return fail(error);
+    if (resolve < -1 || connect < -1 || send < -1 || receive < -1) {
+        release(h);
+        return fail(ERROR_INVALID_PARAMETER);
+    }
+    {
+        std::lock_guard lock(h->mutex);
+        h->resolve_timeout = static_cast<DWORD>(resolve);
+        h->connect_timeout = static_cast<DWORD>(connect);
+        h->send_timeout = static_cast<DWORD>(send);
+        h->receive_timeout = static_cast<DWORD>(receive);
+    }
     release(h);
-    if (resolve < -1 || connect < -1 || send < -1 || receive < -1) return fail(ERROR_INVALID_PARAMETER);
     return TRUE;
 }
 
@@ -348,6 +371,12 @@ BOOL WINAPI set_option(HINTERNET handle, DWORD option, LPVOID buffer, DWORD leng
         }
         std::lock_guard lock(h->mutex);
         h->context = *static_cast<const DWORD_PTR*>(buffer);
+    } else if (buffer) {
+        std::lock_guard lock(h->mutex);
+        if (DWORD* value = stored_option(h, option); value && length >= sizeof(*value))
+            std::memcpy(value, buffer, sizeof(*value));
+        else if (option == WINHTTP_OPTION_CALLBACK && length >= sizeof(h->callback))
+            std::memcpy(&h->callback, buffer, sizeof(h->callback));
     }
     release(h);
     return TRUE;
@@ -360,6 +389,7 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
     if (!h) return fail(error);
     DWORD_PTR value_ptr = 0;
     DWORD value_dword = 0;
+    WINHTTP_STATUS_CALLBACK value_callback = nullptr;
     const void* value = nullptr;
     DWORD size = 0;
     if (option == WINHTTP_OPTION_CONTEXT_VALUE) {
@@ -367,6 +397,16 @@ BOOL WINAPI query_option(HINTERNET handle, DWORD option, LPVOID buffer, LPDWORD 
         value_ptr = h->context;
         value = &value_ptr;
         size = sizeof(value_ptr);
+    } else if (option == WINHTTP_OPTION_CALLBACK) {
+        std::lock_guard lock(h->mutex);
+        value_callback = h->callback;
+        value = &value_callback;
+        size = sizeof(value_callback);
+    } else if (DWORD* stored = stored_option(h, option)) {
+        std::lock_guard lock(h->mutex);
+        value_dword = *stored;
+        value = &value_dword;
+        size = sizeof(value_dword);
     } else if (option == WINHTTP_OPTION_HANDLE_TYPE) {
         value_dword = h->kind == Kind::Session   ? WINHTTP_HANDLE_TYPE_SESSION
                       : h->kind == Kind::Connect ? WINHTTP_HANDLE_TYPE_CONNECT
@@ -430,6 +470,32 @@ BOOL WINAPI crack_url(LPCWSTR url, DWORD length, DWORD flags, LPURL_COMPONENTS c
     return host(url, length, flags, components);
 }
 
+BOOL WINAPI create_url(LPURL_COMPONENTS components, DWORD flags, LPWSTR url, LPDWORD length) {
+    using Fn = BOOL(WINAPI*)(LPURL_COMPONENTS, DWORD, LPWSTR, LPDWORD);
+    static Fn host = [] {
+        const HMODULE m = LoadLibraryExW(L"winhttp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return m ? reinterpret_cast<Fn>(GetProcAddress(m, "WinHttpCreateUrl")) : nullptr;
+    }();
+    if (!host) return fail(ERROR_PROC_NOT_FOUND);
+    return host(components, flags, url, length);
+}
+
+BOOL WINAPI get_ie_proxy_config(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG* config) {
+    if (!config) return fail(ERROR_INVALID_PARAMETER);
+    *config = {};
+    return TRUE;
+}
+
+BOOL WINAPI get_proxy_for_url(HINTERNET handle, LPCWSTR, WINHTTP_AUTOPROXY_OPTIONS*, WINHTTP_PROXY_INFO*) {
+    DWORD error = 0;
+    Handle* h = acquire(handle, true, false, false, error);
+    if (!h) return fail(error);
+    release(h);
+    return fail(ERROR_WINHTTP_AUTODETECTION_FAILED);
+}
+
+BOOL WINAPI check_platform() { return TRUE; }
+
 }  // namespace rt::winhttp
 
 namespace {
@@ -453,4 +519,8 @@ SHIM_TABLE(winhttp_offline,
     {"winhttp.dll", "WinHttpSetStatusCallback", reinterpret_cast<void*>(&set_status_callback)},
     {"winhttp.dll", "WinHttpCloseHandle", reinterpret_cast<void*>(&close_handle)},
     {"winhttp.dll", "WinHttpCrackUrl", reinterpret_cast<void*>(&crack_url)},
+    {"winhttp.dll", "WinHttpCreateUrl", reinterpret_cast<void*>(&create_url)},
+    {"winhttp.dll", "WinHttpGetIEProxyConfigForCurrentUser", reinterpret_cast<void*>(&get_ie_proxy_config)},
+    {"winhttp.dll", "WinHttpGetProxyForUrl", reinterpret_cast<void*>(&get_proxy_for_url)},
+    {"winhttp.dll", "WinHttpCheckPlatform", reinterpret_cast<void*>(&check_platform)},
 );

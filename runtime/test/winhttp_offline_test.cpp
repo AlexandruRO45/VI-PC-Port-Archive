@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <vector>
 
 #include "shims.h"
@@ -219,6 +220,28 @@ int main() {
               rt::shims::find("winhttp.dll", "WinHttpQueryDataAvailable") &&
               rt::shims::find("winhttp.dll", "WinHttpWriteData"),
           "all 16 WinHTTP imports of the package resolve through the registry");
+    const auto create = resolve<BOOL(WINAPI*)(LPURL_COMPONENTS, DWORD, LPWSTR, LPDWORD)>("WinHttpCreateUrl");
+    const auto ie_proxy = resolve<BOOL(WINAPI*)(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*)>("WinHttpGetIEProxyConfigForCurrentUser");
+    const auto proxy = resolve<BOOL(WINAPI*)(HINTERNET, LPCWSTR, WINHTTP_AUTOPROXY_OPTIONS*, WINHTTP_PROXY_INFO*)>("WinHttpGetProxyForUrl");
+    const auto platform = resolve<BOOL(WINAPI*)()>("WinHttpCheckPlatform");
+    check(create && ie_proxy && proxy && platform, "URL and offline proxy exports resolve");
+    if (create && ie_proxy && proxy && platform) {
+        URL_COMPONENTS parts = {}; parts.dwStructSize = sizeof(parts);
+        parts.lpszScheme = const_cast<LPWSTR>(L"https"); parts.dwSchemeLength = 5;
+        parts.lpszHostName = const_cast<LPWSTR>(L"example.invalid"); parts.dwHostNameLength = 15;
+        wchar_t url[128] = {}; DWORD len = 128;
+        check(create(&parts, 0, url, &len) && std::wcsstr(url, L"example.invalid"), "create URL locally");
+        WINHTTP_CURRENT_USER_IE_PROXY_CONFIG config = {};
+        check(ie_proxy(&config) && !config.fAutoDetect && !config.lpszAutoConfigUrl && !config.lpszProxy &&
+              !config.lpszProxyBypass, "proxy configuration is empty");
+        check(platform() != FALSE, "platform is supported");
+        HINTERNET session = open(L"test", WINHTTP_ACCESS_TYPE_NO_PROXY, nullptr, nullptr, 0);
+        WINHTTP_AUTOPROXY_OPTIONS opts = {}; WINHTTP_PROXY_INFO info = {};
+        SetLastError(0);
+        check(proxy(session, L"https://example.invalid", &opts, &info) == FALSE &&
+              GetLastError() == ERROR_WINHTTP_AUTODETECTION_FAILED, "proxy discovery fails offline");
+        close(session);
+    }
     check(rt::shims::owns_dll("winhttp.dll"), "winhttp.dll is a module the shims own (LoadLibrary gets a pseudo-handle)");
     if (!(open && connect && open_request && send && close && set_callback)) {
         std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures + 1);
@@ -329,11 +352,31 @@ int main() {
         check(query_option(request, WINHTTP_OPTION_CONTEXT_VALUE, nullptr, &needed) == FALSE &&
                   GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed == sizeof(DWORD_PTR),
               "a query without a buffer reports the size it needs");
-        DWORD flags = 0, flags_size = sizeof(flags);
+        const DWORD options[] = {WINHTTP_OPTION_RESOLVE_TIMEOUT, WINHTTP_OPTION_CONNECT_TIMEOUT,
+                                 WINHTTP_OPTION_SEND_TIMEOUT, WINHTTP_OPTION_RECEIVE_TIMEOUT,
+                                 WINHTTP_OPTION_SECURITY_FLAGS, WINHTTP_OPTION_MAX_HTTP_AUTOMATIC_REDIRECTS};
+        check(set_timeouts(request, 11, 22, 33, 44) != FALSE, "set distinct timeouts");
+        for (int i = 0; i < 6; ++i) {
+            DWORD v = i < 4 ? static_cast<DWORD>((i + 1) * 11) : static_cast<DWORD>(i + 50);
+            if (i >= 4) check(set_option(request, options[i], &v, sizeof(v)) != FALSE, "set stored option");
+            DWORD out = 0, size = sizeof(out);
+            check(query_option(request, options[i], &out, &size) != FALSE && out == v, "stored option round trips");
+            v += 7;
+            check(set_option(request, options[i], &v, sizeof(v)) != FALSE, "set option directly");
+            out = 0; size = sizeof(out);
+            check(query_option(request, options[i], &out, &size) != FALSE && out == v, "direct option round trips");
+        }
+        WINHTTP_STATUS_CALLBACK cb = &on_status, cb_out = nullptr;
+        DWORD cb_size = sizeof(cb_out);
+        check(set_option(request, WINHTTP_OPTION_CALLBACK, &cb, sizeof(cb)) != FALSE &&
+              query_option(request, WINHTTP_OPTION_CALLBACK, &cb_out, &cb_size) != FALSE && cb_out == cb,
+              "callback option round trips");
+        cb = nullptr;
+        set_option(request, WINHTTP_OPTION_CALLBACK, &cb, sizeof(cb));
+        DWORD unknown = 0, unknown_size = sizeof(unknown);
         SetLastError(0);
-        check(query_option(request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, &flags_size) == FALSE &&
-                  GetLastError() == ERROR_WINHTTP_INVALID_OPTION,
-              "other options are not answered");
+        check(query_option(request, 0xffffffff, &unknown, &unknown_size) == FALSE &&
+              GetLastError() == ERROR_WINHTTP_INVALID_OPTION, "unknown option remains invalid");
         DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
         check(set_option(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols)) != FALSE,
               "but setting them is accepted");
