@@ -654,9 +654,14 @@ buffer (`BindlessSet::flush_needs_idle()`) first waits for the device to be idle
 buffers, so no running lookup misses (D3D-76). That wait stalls every queue, which is correct but slow if the game
 destroys textures every frame; a per-queue wait is open.
 
-A typed 3D color target supports default and explicit RTVs. The default covers mip 0; `FirstWSlice` and
-`WSize` select the depth slices in an explicit view's mip. `d3d12_clear_test --volume` checks full and
-rectangular clears of overlapping slice ranges against both Windows WARP and expected RGBA bytes.
+Typed 3D color targets support default and explicit RTVs. Typeless 3D color targets require an explicit,
+renderable format in the resource's format family and its format list when present. The default RTV covers mip
+0. `FirstWSlice` and `WSize` select the depth slices in an explicit RTV's mip for clears and draws. Vulkan
+attachment views select those slices while layout transitions cover the whole mip. Draws and attachment clears
+report unsupported when their rendering layer count exceeds the device's `maxFramebufferLayers`.
+`d3d12_clear_test --volume` compares typed clears with WARP,
+`d3d12_typeless_rtv_test` compares typeless volume readbacks with WARP, and `d3d12_draw_test` checks the slice
+selected by typed UNORM and typeless sRGB RTVs.
 
 The compute path, end to end:
 - `runtime/src/shader_library.h` finds the translated SPIR-V for a shader the game hands to D3D12 (section 3.6).
@@ -840,7 +845,7 @@ therefore every translated shader that declares bindings; tessellation, geometry
 multisampled pipelines, several viewports, primitive restart; subgroup size for mesh pipelines (the decision covers them, no mesh PSO exists to chain it into), and for wave64 vertex, geometry and, on a GPU that cannot require 64 for pixel shaders (NVIDIA), pixel shaders, which have no emulation (SHADER-10);
 the game's present entry point (DXGI factory/swapchain or `PresentX`; the presenter above is what either
 calls), HDR and fullscreen; buffer and constant-buffer views (UAV clears read the descriptor bytes, so they do
-not wait on view creation), typeless volume RTVs, depth-stencil resolves to a destination offset other than
+not wait on view creation), depth-stencil resolves to a destination offset other than
 the source rectangle's;
 default-heap buffers are not zero-filled yet; a fence cannot be signalled to a lower value (Vulkan timelines only
 increase; such a signal is reported and dropped); a CPU `Signal` above a queue `Signal` the GPU has not reached

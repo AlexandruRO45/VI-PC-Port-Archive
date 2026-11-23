@@ -262,8 +262,28 @@ int main() {
     EXPECT(rejects(wrong, {1, 2, 0, 1, ColorViewFormat::rgba8_uint}, ReplayResult::invalid_subresource));
     wrong = binding; wrong.array_layers = 2;
     EXPECT(rejects(wrong, {1, 0, 1, 2, ColorViewFormat::rgba8_srgb}, ReplayResult::invalid_subresource));
-    wrong = binding; wrong.volume = true;
-    EXPECT(rejects(wrong, {1, 0, 0, 1, ColorViewFormat::rgba8_srgb}));
+    {
+        auto volume = binding;
+        volume.volume = true;
+        volume.depth = 8;
+        volume.mip_levels = 3;
+        CommandList list;
+        EXPECT(list.clear_render_target({1, 1, 1, 2, ColorViewFormat::rgba8_srgb}, color) && list.close());
+        auto capped = vk;
+        capped.max_framebuffer_layers = 2;
+        EXPECT(run(list, volume, capped) == ReplayResult::success);
+        EXPECT(requested_format == VK_FORMAT_R8G8B8A8_SRGB && requested_range.baseMipLevel == 1);
+        EXPECT(requested_range.baseArrayLayer == 1 && requested_range.layerCount == 2 && rendering_layers == 2);
+        capped.max_framebuffer_layers = 1;
+        EXPECT(run(list, volume, capped) == ReplayResult::unsupported);
+        EXPECT(!image_clears && !attachment_clears && requested_format == VK_FORMAT_UNDEFINED);
+
+        CommandList full_mip;
+        EXPECT(full_mip.clear_render_target({1, 1, 0, 4, ColorViewFormat::rgba8_unorm}, color) && full_mip.close());
+        EXPECT(run(full_mip, volume, capped) == ReplayResult::success);
+        EXPECT(image_clears == 1 && attachment_clears == 0);
+        checks += 2;
+    }
     {
         auto msaa = binding; msaa.samples = 4;
         for (const auto [format, expected] : formats) {

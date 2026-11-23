@@ -874,6 +874,104 @@ int main() {
             }
         }
 
+        // A draw without a layer output writes the first slice of its RTV. With a nonzero
+        // FirstWSlice, that is not W=0. Compare both mips so a bad range cannot pass by clipping.
+        {
+            constexpr UINT width = 4, depth = 8, target_mip = 1, target_slice = 2;
+            D3D12_RESOURCE_DESC volume_desc = rt_desc;
+            volume_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            volume_desc.Width = volume_desc.Height = width;
+            volume_desc.DepthOrArraySize = depth;
+            volume_desc.MipLevels = 2;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[2]{};
+            UINT64 bytes = 0;
+            inner->GetCopyableFootprints(&volume_desc, 0, 2, 0, footprints, nullptr, nullptr, &bytes);
+            EXPECT(bytes && bytes != UINT64_MAX);
+            Ref<ID3D12Resource> volume_readback;
+            const auto volume_readback_desc = buffer_desc(bytes);
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE,
+                &volume_readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&volume_readback.p))));
+            void* tint = nullptr;
+            EXPECT(SUCCEEDED(upload->Map(0, nullptr, &tint)));
+            const float dim_red[] = {0.25f, 0, 0};
+            std::memcpy(static_cast<std::uint8_t*>(tint) + 3072, dim_red, sizeof(dim_red));
+            upload->Unmap(0, nullptr);
+            const D3D12_VIEWPORT volume_viewport{0, 0, width / 2.0f, width / 2.0f, 0, 1};
+            const D3D12_RECT volume_scissor{0, 0, width / 2, width / 2};
+            for (bool typeless : {false, true}) {
+                volume_desc.Format = typeless ? DXGI_FORMAT_R8G8B8A8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+                Ref<ID3D12Resource> volume;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &volume_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&volume.p))));
+                auto draw_desc = fullscreen_desc;
+                draw_desc.RTVFormats[0] = typeless ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+                Ref<ID3D12PipelineState> volume_pso;
+                EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&draw_desc, IID_PPV_ARGS(&volume_pso.p))));
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, volume_pso.p)));
+
+                D3D12_RENDER_TARGET_VIEW_DESC view{};
+                view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+                view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                for (UINT mip = 0; mip < 2; ++mip) {
+                    view.Texture3D = {mip, 0, UINT_MAX};
+                    device->CreateRenderTargetView(volume.p, &view, rtv);
+                    list->ClearRenderTargetView(rtv, blue, 0, nullptr);
+                }
+                view.Format = draw_desc.RTVFormats[0];
+                view.Texture3D = {target_mip, target_slice, typeless ? UINT_MAX : 2u};
+                device->CreateRenderTargetView(volume.p, &view, rtv);
+                list->SetGraphicsRootSignature(root.p);
+                list->SetGraphicsRootConstantBufferView(1, upload_va + 3072);
+                list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list->RSSetViewports(1, &volume_viewport);
+                list->RSSetScissorRects(1, &volume_scissor);
+                list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+                list->DrawInstanced(3, 1, 0, 0);
+                const auto to_readback = transition(volume.p, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+                list->ResourceBarrier(1, &to_readback);
+                for (UINT mip = 0; mip < 2; ++mip) {
+                    D3D12_TEXTURE_COPY_LOCATION src_volume{volume.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, {}};
+                    D3D12_TEXTURE_COPY_LOCATION dst_volume{volume_readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, {}};
+                    src_volume.SubresourceIndex = mip;
+                    dst_volume.PlacedFootprint = footprints[mip];
+                    list->CopyTextureRegion(&dst_volume, 0, 0, 0, &src_volume, nullptr);
+                }
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                const UINT64 finished = typeless ? 71 : 70;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, finished)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(finished, nullptr)));
+                void* volume_pixels = nullptr;
+                EXPECT(SUCCEEDED(volume_readback->Map(0, nullptr, &volume_pixels)) && volume_pixels);
+                unsigned volume_mismatches = 0;
+                for (UINT mip = 0; mip < 2; ++mip) {
+                    const auto& footprint = footprints[mip];
+                    const auto& f = footprint.Footprint;
+                    const auto* base = static_cast<const std::uint8_t*>(volume_pixels) + footprint.Offset;
+                    for (UINT slice = 0; slice < f.Depth; ++slice) {
+                        const bool drawn = mip == target_mip && slice == target_slice;
+                        const std::array<std::uint8_t, 4> want{std::uint8_t(drawn ? (typeless ? 137 : 64) : 0),
+                                                               0, std::uint8_t(drawn ? 0 : 255), 255};
+                        for (UINT y = 0; y < f.Height; ++y) {
+                            const auto* row = base + (slice * f.Height + y) * f.RowPitch;
+                            for (UINT x = 0; x < f.Width; ++x) {
+                                const auto* got = row + x * 4;
+                                if (std::equal(want.begin(), want.end(), got)) continue;
+                                if (volume_mismatches++ == 0)
+                                    std::fprintf(stderr, "volume draw format %d mip %u W %u texel %u,%u mismatch\n",
+                                                 int(draw_desc.RTVFormats[0]), mip, slice, x, y);
+                            }
+                        }
+                    }
+                }
+                volume_readback->Unmap(0, nullptr);
+                EXPECT(!volume_mismatches);
+            }
+            std::printf("3D RTV draws: typed UNORM and typeless sRGB matched across both mips and every W slice\n");
+        }
+
         // A draw without a topology is invalid; Close reports it.
         EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, pso.p)));
         list->SetGraphicsRootSignature(root.p);

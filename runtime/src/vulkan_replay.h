@@ -778,6 +778,7 @@ struct ReplayFunctions {
     // Optional; a list that needs a missing one is rejected with ReplayResult::unsupported.
     PFN_vkCmdPipelineBarrier2 pipeline_barrier2 = nullptr;  // enhanced barriers
     VkPipelineStageFlags2 queue_stages = 0;
+    std::uint32_t max_framebuffer_layers = UINT32_MAX;
     PFN_vkCmdBeginRendering begin_rendering = nullptr;      // rectangle clears
     PFN_vkCmdEndRendering end_rendering = nullptr;
     PFN_vkCmdClearAttachments clear_attachments = nullptr;
@@ -1098,7 +1099,7 @@ inline int typeless_view_family(VkFormat format) {
 // The format a color view clears or renders in. A view of the resource's own format keeps it (a typeless resource
 // has none, so it needs an explicit one). A typeless resource, or one created with a castable-format list (its image
 // is mutable and lists the view formats), may be viewed in another format of its family: the image is mutable, so
-// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was). A volume keeps its own format.
+// the view reinterprets its bits (D3D-275; before it only the RGBA8 family was).
 inline VkFormat color_view_format(const ResourceBinding& resource, const TargetView& target) {
     if (target.format == ColorViewFormat::resource)
         return resource.typeless ? VK_FORMAT_UNDEFINED : resource.format;
@@ -1107,7 +1108,7 @@ inline VkFormat color_view_format(const ResourceBinding& resource, const TargetV
     if (!family) return VK_FORMAT_UNDEFINED;
     if (!resource.typeless && !resource.castable_view_formats)
         return format == resource.format ? format : VK_FORMAT_UNDEFINED;
-    if (family != typeless_view_family(resource.format) || resource.volume || resource.depth != 1)
+    if (family != typeless_view_family(resource.format) || (!resource.volume && resource.depth != 1))
         return VK_FORMAT_UNDEFINED;
     return format;
 }
@@ -1127,6 +1128,16 @@ inline bool view_range(const ResourceBinding& resource, const TargetView& view, 
         return false;
     out = {aspects, view.mip, 1, view.first_layer, view.layer_count};
     return true;
+}
+
+// The attachment view uses W slices; the layout tracker and transfer commands use the whole 3D mip.
+inline VkImageSubresourceRange attachment_view_range(const ResourceBinding& resource, const TargetView& view,
+                                                     VkImageSubresourceRange range) {
+    if (resource.volume) {
+        range.baseArrayLayer = view.first_layer;
+        range.layerCount = view.layer_count;
+    }
+    return range;
 }
 
 // Without separate depth/stencil layouts both planes of a combined image move together.
@@ -1981,10 +1992,19 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (a.binding.samples != pipeline->samples) return ReplayResult::invalid_subresource;
         if (!view_range(a.binding, target, VK_IMAGE_ASPECT_COLOR_BIT, a.range)) return ReplayResult::invalid_subresource;
         ResourceBinding viewed = a.binding;
-        if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED) viewed.format = pipeline->color_formats[slot];
-        a.view = vk.image_view(viewed, a.range);
+        const VkFormat pipeline_format = pipeline->color_formats[slot];
+        if (a.binding.volume) {
+            viewed.format = color_view_format(a.binding, target);
+            if (viewed.format == VK_FORMAT_UNDEFINED ||
+                (pipeline_format != VK_FORMAT_UNDEFINED && viewed.format != pipeline_format))
+                return ReplayResult::invalid_subresource;
+        } else if (pipeline_format != VK_FORMAT_UNDEFINED) {
+            viewed.format = pipeline_format;
+        }
+        const auto attachment_range = attachment_view_range(a.binding, target, a.range);
+        a.view = vk.image_view(viewed, attachment_range);
         if (!a.view) return ReplayResult::unsupported;
-        shrink(a.binding, target, a.range);
+        shrink(a.binding, target, attachment_range);
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
@@ -2006,6 +2026,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                   std::uint32_t(std::max(0.0f, draw.viewport.y + draw.viewport.height))};
     }
     p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+    if (p.layers > vk.max_framebuffer_layers &&
+        std::any_of(p.colors.begin(), p.colors.end(), [](const auto& a) { return a.binding.volume; }))
+        return ReplayResult::unsupported;
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
@@ -2391,13 +2414,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.skip = true;
                 return ReplayResult::success;
             }
-            VkImageSubresourceRange range = p.range;
+            if (p.binding.volume && target.layer_count > vk.max_framebuffer_layers)
+                return ReplayResult::unsupported;
+            auto range = detail::attachment_view_range(p.binding, target, p.range);
             range.aspectMask = view_aspects;
-            if (p.binding.volume) {
-                // A 2D-array attachment view of a 3D image selects W slices here.
-                range.baseArrayLayer = target.first_layer;
-                range.layerCount = target.layer_count;
-            }
             ResourceBinding view_binding = p.binding;
             if (p.clear_format != VK_FORMAT_UNDEFINED) view_binding.format = p.clear_format;
             p.view = vk.image_view(view_binding, range);

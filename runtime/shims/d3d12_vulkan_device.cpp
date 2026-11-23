@@ -394,10 +394,11 @@ bool is_tiled_layout(D3D12_TEXTURE_LAYOUT layout) {
 // A volume RTV covers W slices of one mip. UINT_MAX extends through the last slice of that mip.
 leonida::TargetView volume_rtv(leonida::ResourceId id, const D3D12_RESOURCE_DESC& resource,
                                const D3D12_RENDER_TARGET_VIEW_DESC* view) {
-    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) || vulkan_format(resource.Format, false).typeless)
-        return {};
-    if (view && (view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D ||
-                 (view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format))) return {};
+    if (!(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return {};
+    if (view && view->ViewDimension != D3D12_RTV_DIMENSION_TEXTURE3D) return {};
+    // CreateRenderTargetView validates the requested format against the typeless resource's family.
+    if (view && view->Format != DXGI_FORMAT_UNKNOWN && view->Format != resource.Format &&
+        !vulkan_format(resource.Format, false).typeless) return {};
     const D3D12_TEX3D_RTV slices = view ? view->Texture3D : D3D12_TEX3D_RTV{0, 0, UINT_MAX};
     if (slices.MipSlice >= resource.MipLevels) return {};
     const UINT depth = std::max(1u, UINT(resource.DepthOrArraySize) >> slices.MipSlice);
@@ -4363,6 +4364,8 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
+        if (properties.limits.maxFramebufferLayers)
+            state_.context->set_max_framebuffer_layers(properties.limits.maxFramebufferLayers);
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -5313,13 +5316,16 @@ public:
                     const bool array_2d = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                     const bool ms = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMS;
                     const bool ms_array = msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY;
+                    const bool volume = !msaa && desc && desc->ViewDimension == D3D12_RTV_DIMENSION_TEXTURE3D;
                     const UINT plane = plain_2d ? desc->Texture2D.PlaneSlice :
                         array_2d ? desc->Texture2DArray.PlaneSlice : 0;
                     const bool dim_ok = ((plain_1d || array_1d) && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D) ||
                                         ((plain_2d || array_2d || ms || ms_array) &&
-                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+                                         rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) ||
+                                        (volume && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D);
                     // Subtraction keeps malformed layer ranges from overflowing during validation.
-                    if (!dim_ok || plane || !view.resource || view.mip >= rd.MipLevels ||
+                    const bool volume_format_allowed = !volume || !r || !r->has_view_format_list() || listed;
+                    if (!dim_ok || plane || !volume_format_allowed || !view.resource || view.mip >= rd.MipLevels ||
                         !view.layer_count || view.first_layer >= rd.DepthOrArraySize ||
                         view.layer_count > rd.DepthOrArraySize - view.first_layer ||
                         !(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {

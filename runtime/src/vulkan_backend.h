@@ -1092,6 +1092,10 @@ public:
         std::unique_lock lock(resource_mutex_);
         replay_.color_attachment_format = std::move(check);
     }
+    void set_max_framebuffer_layers(std::uint32_t layers) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.max_framebuffer_layers = layers;
+    }
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;

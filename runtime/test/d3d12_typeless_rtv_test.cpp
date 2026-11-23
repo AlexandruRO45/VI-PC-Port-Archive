@@ -33,7 +33,10 @@ struct ClearOptions {
     std::uint64_t predicate = 0;
     D3D12_PREDICATION_OP operation = D3D12_PREDICATION_OP_EQUAL_ZERO;
     bool overwrite_predicate = false;
+    bool volume = false;
 };
+
+constexpr UINT volume_depth = 8;
 
 bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT rect_format, bool partial,
                     bool rewrite, bool uav, std::vector<unsigned char>& pixels,
@@ -70,10 +73,10 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     D3D12_HEAP_PROPERTIES heap_properties{};
     heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC texture{};
-    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture.Dimension = options.volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     texture.Width = width;
     texture.Height = height;
-    texture.DepthOrArraySize = array ? 4 : 1;
+    texture.DepthOrArraySize = options.volume ? volume_depth : array ? 4 : 1;
     texture.MipLevels = options.automatic_mips ? 0 : array || mip_chain ? 3 : 1;
     texture.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     texture.SampleDesc.Count = 1;
@@ -85,7 +88,7 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     CHECK(resolved.MipLevels == (array || mip_chain || options.automatic_mips ? 3 : 1));
     CHECK(resolved.DepthOrArraySize == texture.DepthOrArraySize);
     texture = resolved; // MipLevels=0 must be resolved before counting/reading subresources.
-    const UINT count = texture.MipLevels * texture.DepthOrArraySize;
+    const UINT count = texture.MipLevels * (options.volume ? 1 : texture.DepthOrArraySize);
     std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> placed(count);
     UINT64 total = 0;
     device->GetCopyableFootprints(&texture, 0, count, 0, placed.data(), nullptr, nullptr, &total);
@@ -105,7 +108,17 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     const D3D12_CPU_DESCRIPTOR_HANDLE other{handle.ptr + device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)};
     D3D12_RENDER_TARGET_VIEW_DESC view{};
     view.ViewDimension = array ? D3D12_RTV_DIMENSION_TEXTURE2DARRAY : D3D12_RTV_DIMENSION_TEXTURE2D;
-    if (array || mip_chain) {
+    if (options.volume) {
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        view.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        const FLOAT seed[] = {0, 0, 1, 1};
+        for (UINT level = 0; level < texture.MipLevels; ++level) {
+            view.Texture3D = {level, 0, UINT_MAX};
+            device->CreateRenderTargetView(image.p, &view, handle);
+            list->ClearRenderTargetView(handle, seed, 0, nullptr);
+        }
+        view.Texture3D = {mip, first_layer, layer_count};
+    } else if (array || mip_chain) {
         // Give every subresource a distinct sentinel before touching the selected view.
         view.Format = DXGI_FORMAT_R8G8B8A8_UINT;
         for (UINT layer = 0; layer < texture.DepthOrArraySize; ++layer) {
@@ -203,8 +216,8 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
     pixels.clear();
     for (const auto& footprint : placed) {
         const auto& f = footprint.Footprint;
-        for (UINT y = 0; y < f.Height; ++y) {
-            const auto* row = static_cast<unsigned char*>(mapped) + footprint.Offset + y * f.RowPitch;
+        for (UINT row_index = 0; row_index < f.Height * f.Depth; ++row_index) {
+            const auto* row = static_cast<unsigned char*>(mapped) + footprint.Offset + row_index * f.RowPitch;
             pixels.insert(pixels.end(), row, row + f.Width * bytes);
         }
     }
@@ -214,14 +227,14 @@ bool clear_and_read(ID3D12Device* device, DXGI_FORMAT whole_format, DXGI_FORMAT 
 }
 bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view,
                   UINT16 mips = 1, UINT16 layers = 1, UINT samples = 1,
-                  const DXGI_FORMAT* cast_list = nullptr, UINT32 cast_count = 0) {
+                  const DXGI_FORMAT* cast_list = nullptr, UINT32 cast_count = 0, bool volume = false) {
     Ref<ID3D12Resource> resource;
     D3D12_HEAP_PROPERTIES heap_properties{D3D12_HEAP_TYPE_DEFAULT};
     if (cast_count) {
         Ref<ID3D12Device10> device10;
         CHECK(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&device10.p))));
         D3D12_RESOURCE_DESC1 tex1{};
-        tex1.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tex1.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         tex1.Width = tex1.Height = 4;
         tex1.DepthOrArraySize = layers;
         tex1.MipLevels = mips;
@@ -233,7 +246,7 @@ bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12
             IID_PPV_ARGS(&resource.p))));
     } else {
         D3D12_RESOURCE_DESC texture{};
-        texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texture.Width = texture.Height = 4;
         texture.DepthOrArraySize = layers;
         texture.MipLevels = mips;
@@ -254,7 +267,12 @@ bool rejects_view(ID3D12Device* device, DXGI_FORMAT resource_format, const D3D12
     const auto handle = heap->GetCPUDescriptorHandleForHeapStart();
     // For the supported shape, overwrite a valid slot too: rejection must not leave its old RTV active.
     D3D12_RENDER_TARGET_VIEW_DESC seed{};
-    seed.ViewDimension = samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+    if (volume) {
+        seed.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        seed.Texture3D = {0, 0, 1};
+    } else {
+        seed.ViewDimension = samples > 1 ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+    }
     seed.Format = resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS ? DXGI_FORMAT_R8G8B8A8_UNORM : resource_format;
     device->CreateRenderTargetView(resource.p, &seed, handle);
     device->CreateRenderTargetView(resource.p, view, handle);
@@ -460,6 +478,42 @@ int main() {
             // The signed vectors avoid ambiguous half-step normalized inputs.
             return format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? 1 : 0;
         };
+        // A 3D resource has one subresource per mip. Check the whole volume, including every untouched W slice.
+        for (const auto format : formats) {
+            constexpr UINT mip = 1;
+            constexpr std::array<unsigned char, 4> seed{0, 0, 255, 255};
+            for (const auto [first, layers] : {std::pair{1u, 1u}, std::pair{2u, UINT_MAX}}) {
+                ClearOptions options{};
+                options.volume = true;
+                std::vector<unsigned char> actual, expected;
+                if (!clear_and_read(ours.p, format, format, true, true, false, actual,
+                                    mip, first, layers, false, true, options) ||
+                    !clear_and_read(host.p, format, format, true, true, false, expected,
+                                    mip, first, layers, false, true, options) ||
+                    actual.size() != expected.size()) return 1;
+                std::size_t offset = 0;
+                for (UINT level = 0; level < 3; ++level) {
+                    const UINT slice_bytes = std::max(1u, 5u >> level) * std::max(1u, 3u >> level) * 4;
+                    for (UINT slice = 0; slice < (volume_depth >> level); ++slice) {
+                        const bool selected = level == mip && slice >= first && slice - first < layers;
+                        for (UINT byte = 0; byte < slice_bytes; ++byte, ++offset) {
+                            if (offset < actual.size() &&
+                                (selected
+                                    ? std::abs(int(actual[offset]) - int(expected[offset])) <= tolerance_for(format)
+                                    : actual[offset] == seed[byte % 4] && expected[offset] == seed[byte % 4]))
+                                continue;
+                            std::fprintf(stderr, "volume format %d mip %u W slice %u byte %u mismatch\n",
+                                         int(format), level, slice, byte);
+                            return 1;
+                        }
+                    }
+                }
+                if (offset != actual.size()) return 1;
+                ++comparisons;
+            }
+        }
+        std::printf("typeless volume RTV: %zu WARP comparisons, all untouched W slices and mips matched\n",
+                    formats.size() * 2);
         const auto compare = [&](DXGI_FORMAT full, DXGI_FORMAT rect, bool partial, bool uav) {
             std::vector<unsigned char> actual, expected;
             if (!clear_and_read(ours.p, full, rect, partial, true, uav, actual) ||
@@ -612,6 +666,29 @@ int main() {
         std::printf("typeless subresource regressions: %u mixed-format/automatic-mip/predicate cases; conditional rendering %s\n",
                     regressions, vk.conditional_rendering ? "enabled" : "unavailable (predicated cases skipped)");
         if (mismatches) return 1;
+        D3D12_RENDER_TARGET_VIEW_DESC invalid_volume{};
+        invalid_volume.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+        invalid_volume.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        const std::array<D3D12_TEX3D_RTV, 4> invalid_ranges{{{3, 0, 1}, {1, 4, 1}, {1, 3, 2}, {1, 1, 0}}};
+        for (const auto range : invalid_ranges) {
+            invalid_volume.Texture3D = range;
+            if (!rejects_view(ours.p, DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid_volume,
+                              3, volume_depth, 1, nullptr, 0, true)) return 1;
+            ++rejected;
+        }
+        invalid_volume.Texture3D = {1, 1, 1};
+        for (const auto format : {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_R16G16_UNORM}) {
+            invalid_volume.Format = format;
+            if (!rejects_view(ours.p, DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid_volume,
+                              3, volume_depth, 1, nullptr, 0, true)) return 1;
+            ++rejected;
+        }
+        // A same-family format absent from the image's explicit format list cannot make a Vulkan image view.
+        const DXGI_FORMAT volume_cast_list[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
+        invalid_volume.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        if (!rejects_view(ours.p, DXGI_FORMAT_R8G8B8A8_TYPELESS, &invalid_volume, 3, volume_depth, 1,
+                          volume_cast_list, 1, true)) return 1;
+        ++rejected;
         const auto rejects = [&](DXGI_FORMAT resource_format, const D3D12_RENDER_TARGET_VIEW_DESC* view,
                                  UINT16 mips = 1, UINT16 layers = 1, UINT samples = 1,
                                  const DXGI_FORMAT* cast_list = nullptr, UINT32 cast_count = 0) {
