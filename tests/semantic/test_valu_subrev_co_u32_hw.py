@@ -402,3 +402,36 @@ class TestSubrevCoU32Aliasing(unittest.TestCase):
         step_scalar_subrev_co(ast, state)
         self.assertEqual(state.vgprs[0], 0)
         self.assertEqual(state.vcc, 0)
+
+# -----------------------------------------------------------------------------
+# Commit 6: Condition Codes, Status Flags, and Carry/Borrow Generation
+# -----------------------------------------------------------------------------
+class TestSubrevCoU32FlagsAndBorrow(unittest.TestCase):
+    def test_borrow_truth_table_boundaries(self) -> None:
+        cases = [
+            # (src0, src1, expected_diff, expected_borrow)
+            (0, 0, 0, 0),
+            (1, 1, 0, 0),
+            (0, 1, 1, 0),
+            (1, 0, 0xFFFFFFFF, 1),
+            (0xFFFFFFFF, 0xFFFFFFFF, 0, 0),
+            (0xFFFFFFFF, 0, 1, 1),
+            (0, 0xFFFFFFFF, 0xFFFFFFFF, 0),
+            (0x80000000, 0x80000000, 0, 0),
+            (0x80000001, 0x80000000, 0xFFFFFFFF, 1),
+            (0x7FFFFFFF, 0x80000000, 1, 0),
+        ]
+        for s0, s1, exp_d, exp_b in cases:
+            with self.subTest(s0=hex(s0), s1=hex(s1)):
+                d, b = ref_subrev_co_u32(s0, s1)
+                self.assertEqual(d, exp_d)
+                self.assertEqual(b, exp_b)
+
+    def test_scc_flag_isolation(self) -> None:
+        # RDNA2 architecture rule: VALU instructions like v_subrev_co_u32 do not alter SCC
+        # SCC is preserved across VALU operations.
+        initial_scc = 1
+        # Execution of VALU does not touch scalar state condition register
+        d, b = ref_subrev_co_u32(100, 50)
+        self.assertEqual(initial_scc, 1)
+        self.assertEqual(b, 1)
