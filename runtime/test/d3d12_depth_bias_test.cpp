@@ -118,8 +118,9 @@ int main() {
         Ref<ID3D12RootSignature> root;
         EXPECT(SUCCEEDED(device->CreateRootSignature(0, root_blob.data(), root_blob.size(), IID_PPV_ARGS(&root.p))));
 
-        // Three pipelines over one recipe. The PSO's static bias is a huge constant factor with a small clamp, so
-        // the applied bias is exactly the clamp. dyn_a and dyn_b take RSSetDepthBias; plain does not.
+        // Four pipelines over one recipe. The PSO's static bias is a huge constant factor with a small clamp, so
+        // the applied bias is exactly the clamp. dyn_a and dyn_b take RSSetDepthBias; plain does not; dyn_zero is
+        // a dynamic one with no bias of its own.
         const D3D12_INPUT_ELEMENT_DESC elements[1] = {
             {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
         D3D12_GRAPHICS_PIPELINE_STATE_DESC base{};
@@ -141,7 +142,7 @@ int main() {
         base.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         base.DSVFormat = dsv_format;
         base.SampleDesc.Count = 1;
-        Ref<ID3D12PipelineState> dyn_a, dyn_b, plain;
+        Ref<ID3D12PipelineState> dyn_a, dyn_b, plain, dyn_zero;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = base;
         desc.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
         desc.RasterizerState.DepthBiasClamp = texel_k(10);
@@ -151,6 +152,10 @@ int main() {
         desc = base;
         desc.RasterizerState.DepthBiasClamp = texel_k(30);  // no flag: RSSetDepthBias must not touch it
         EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&plain.p))));
+        desc = base;
+        desc.Flags = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
+        desc.RasterizerState.DepthBias = 0;  // dynamic, with no bias of its own: the slope scenario starts here
+        EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&dyn_zero.p))));
 
         // The triangle: z = 0.25 + (x + 1) / 4, clockwise in D3D screen space, covering the screen.
         const SlopeVertex vertices[3] = {{-1, -1, 0.25f}, {-1, 3, 0.25f}, {3, -1, 1.25f}};
@@ -344,8 +349,10 @@ int main() {
         EXPECT(end_pass() == 0);
         check("explicit zero override", passing_columns(0));
         // The slope-scaled factor: the depth slope it multiplies is implementation-approximate, so only bounds. A
-        // factor of 1 over this triangle's slope (1/128 per pixel) is 2 columns of bias, if computed exactly.
-        EXPECT(begin_pass(dyn_a.p, false) == 0);
+        // factor of 1 over this triangle's slope (1/128 per pixel) is 2 columns of bias, if computed exactly. The
+        // pass starts from dyn_zero, which has no bias of its own: a call the layer ignored, or one that dropped the
+        // slope factor, lands on the unbiased line, outside these bounds.
+        EXPECT(begin_pass(dyn_zero.p, false) == 0);
         EXPECT(set_bias(0.0f, 0.0f, 1.0f) == 0);
         EXPECT(end_pass() == 0);
         {
@@ -363,7 +370,7 @@ int main() {
         }
 
         for (auto* r : {&upload, &readback, &target, &depth}) r->reset();
-        for (auto* p : {&dyn_a, &dyn_b, &plain}) p->reset();
+        for (auto* p : {&dyn_a, &dyn_b, &plain, &dyn_zero}) p->reset();
         root.reset();
         rtv_heap.reset();
         dsv_heap.reset();
