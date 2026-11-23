@@ -601,5 +601,69 @@ class TestValuRcpF64Aliasing(unittest.TestCase):
         self.assertIn("OpCapability Float64", spv)
         self.assertIn("OpFDiv %double", spv)
 
+# ---------------------------------------------------------------------------
+# Phase 6: Condition Codes, Status Flags, and Floating-Point Classification
+# ---------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class F64ClassificationFlags:
+    zero: bool
+    negative: bool
+    infinite: bool
+    nan: bool
+    subnormal: bool
+
+
+def classify_f64(bits: int) -> F64ClassificationFlags:
+    """Classify 64-bit IEEE 754 float result."""
+    exp = (bits >> 52) & 0x7FF
+    mant = bits & 0x000FFFFFFFFFFFFF
+    is_neg = bool(bits & SIGN_BIT64)
+
+    is_zero = (exp == 0 and mant == 0)
+    is_subnormal = (exp == 0 and mant != 0)
+    is_inf = (exp == 0x7FF and mant == 0)
+    is_nan = (exp == 0x7FF and mant != 0)
+
+    return F64ClassificationFlags(
+        zero=is_zero,
+        negative=is_neg,
+        infinite=is_inf,
+        nan=is_nan,
+        subnormal=is_subnormal,
+    )
+
+
+class TestValuRcpF64StatusFlags(unittest.TestCase):
+    """Phase 6: Unit tests for condition codes and float classification."""
+
+    def test_status_flags_zero_result(self) -> None:
+        flags = classify_f64(f64_to_u64(0.0))
+        self.assertTrue(flags.zero)
+        self.assertFalse(flags.negative)
+        self.assertFalse(flags.infinite)
+
+    def test_status_flags_negative_zero(self) -> None:
+        flags = classify_f64(f64_to_u64(-0.0))
+        self.assertTrue(flags.zero)
+        self.assertTrue(flags.negative)
+
+    def test_status_flags_infinity(self) -> None:
+        flags = classify_f64(f64_to_u64(float("inf")))
+        self.assertTrue(flags.infinite)
+        self.assertFalse(flags.negative)
+
+        flags_neg = classify_f64(f64_to_u64(float("-inf")))
+        self.assertTrue(flags_neg.infinite)
+        self.assertTrue(flags_neg.negative)
+
+    def test_status_flags_nan(self) -> None:
+        flags = classify_f64(f64_to_u64(float("nan")))
+        self.assertTrue(flags.nan)
+
+    def test_status_flags_subnormal(self) -> None:
+        flags = classify_f64(0x0000000000000001)
+        self.assertTrue(flags.subnormal)
+
 if __name__ == "__main__":
     unittest.main()
