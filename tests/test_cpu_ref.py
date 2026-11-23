@@ -566,6 +566,27 @@ class CpuRefTest(unittest.TestCase):
                 self.assertIn(option, result.stderr)
                 self.assertIn("N=VALUE", result.stderr)
 
+    def test_out_of_range_lane_is_a_cli_error(self):
+        path = self.write("s_endpgm")
+        for lane in ("100", "-1", "64"):
+            with self.subTest(lane=lane):
+                result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, path, "--lane", lane],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--lane", result.stderr)
+                self.assertIn("0..63", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_parse_only_ignores_an_out_of_range_lane(self):
+        # --parse-only reports parsed instructions and never selects a hardware lane, so an
+        # out-of-range --lane must not turn a parse that main accepts into a CLI error.
+        path = self.write("s_endpgm")
+        result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, path, "--parse-only", "--lane", "100"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("instructions parsed", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

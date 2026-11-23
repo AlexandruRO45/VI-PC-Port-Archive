@@ -837,6 +837,11 @@ def main(argv=None):
             print(f"error: {e}", file=sys.stderr)
             return 1
 
+    # --lane only selects a hardware lane for execution; --parse-only never reads it, so an
+    # out-of-range value is rejected here, not before the parse-only branch above.
+    if args.lanes == 1 and not 0 <= args.lane < 64:
+        ap.error("--lane must be in 0..63")
+
     try:
         result = run(args.listing, inputs)
     except (CpuRefError, OSError) as e:
