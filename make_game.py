@@ -121,10 +121,14 @@ def py(tool: str, *args) -> None:
 
 def tool_available(cmd: str) -> bool:
     """A PATH name, a path, or a whole command line such as 'wsl -e /usr/lib/llvm-21/bin/llvm-mc'."""
-    cmd = cmd.strip().strip('"')
-    if os.path.isfile(cmd):
+        cmd = cmd.strip()
+    if os.path.isfile(cmd.strip('"')):
         return True
-    head = cmd.split()[0].strip('"') if cmd.split() else ""
+    try:
+        parts = shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        parts = cmd.split()
+    head = parts[0].strip('"') if parts else ""
     return bool(head and (shutil.which(head) or os.path.isfile(head)))
 
 
