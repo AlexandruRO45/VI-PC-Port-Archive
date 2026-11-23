@@ -406,6 +406,23 @@ class NamesTest(unittest.TestCase):
             with open(sibling, "rb") as f:
                 self.assertEqual(f.read(), b"pre-existing sibling")
 
+    def test_main_uses_same_report_path_for_folding_alias(self):
+        import contextlib
+        import io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "tiny.rpf")
+            make_archive(arc)
+            alias = os.path.join(tmp, "TINY.RPF")
+            err = io.StringIO()
+            with mock.patch.object(rpf9_names, "same_report_path", return_value=True) as mocked, \
+                    mock.patch.object(sys, "argv", ["rpf9_names.py", arc, alias, "--quiet"]), \
+                    contextlib.redirect_stderr(err):
+                rc = rpf9_names.main()
+            self.assertEqual(rc, 2)
+            self.assertIn("input archive", err.getvalue())
+            mocked.assert_called_once_with(arc, alias)
+
 
 if __name__ == "__main__":
     unittest.main()
