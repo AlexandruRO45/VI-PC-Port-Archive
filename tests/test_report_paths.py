@@ -85,6 +85,15 @@ class SamePathTests(unittest.TestCase):
         got = report_paths.same_report_path(self.p("new", "B.json"), self.p("new", "b.json"))
         self.assertEqual(got, insensitive or os.path.normcase("A") == os.path.normcase("a"))
 
+    def test_windows_trailing_space_or_dot_in_a_new_name_collides(self):
+        # Win32 drops trailing spaces and dots from the last component, so all these would write one file.
+        if sys.platform != "win32":
+            self.skipTest("only Windows drops trailing spaces and dots")
+        for spelling in ("new.json ", "new.json.", "new.json .. "):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(report_paths.same_report_path(self.p("new.json"), self.p(spelling)))
+                self.assertEqual(report_paths.path_key(self.p("new.json")), report_paths.path_key(self.p(spelling)))
+
 
 class MacVolumeTests(unittest.TestCase):
     """The macOS branch: pathconf says whether the volume folds case. Patched, so it runs anywhere."""
