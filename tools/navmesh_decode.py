@@ -479,7 +479,7 @@ def split_array(b, at, stride, total):
         o = offset_of(p)
         if o is None or o + stride * count > len(b) or _u32(b, sp + 4 * i) != acc:
             return None
-        if i + 1 < nblocks and count != per:
+        if count > per or (i + 1 < nblocks and count != per):
             return None
         out.append((o, count))
         acc += count

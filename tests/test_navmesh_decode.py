@@ -538,6 +538,36 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["navmesh"]["split_blocks_max"]["0x70"], 2)
         self.assertEqual(doc["navmesh"]["split_blocks_max"]["0x98"], 2)
 
+    def test_split_array_final_block_has_the_same_capacity(self):
+        stride = 2
+        capacity = nd.SPLIT_BLOCK // stride
+        for counts, valid in (
+            ((0,), True),
+            ((capacity,), True),
+            ((capacity, capacity - 1), True),
+            ((capacity, capacity), True),
+            ((capacity + 1,), False),
+            ((capacity, capacity + 1), False),
+            ((capacity - 1, 1), False),
+        ):
+            with self.subTest(counts=counts):
+                descriptor, blocks = 8, 56
+                starts = blocks + 16 * len(counts)
+                payload = starts + 4 * len(counts)
+                data = bytearray(payload + stride * sum(counts))
+                struct.pack_into("<Q", data, 0, BASE + descriptor)
+                struct.pack_into("<6Q", data, descriptor, 0, sum(counts), BASE + blocks, BASE + starts, len(counts), 0)
+                expected = []
+                index = 0
+                for i, count in enumerate(counts):
+                    at = payload + stride * index
+                    struct.pack_into("<QQ", data, blocks + 16 * i, BASE + at, count)
+                    struct.pack_into("<I", data, starts + 4 * i, index)
+                    expected.append((at, count))
+                    index += count
+                result = nd.split_array(data, 0, stride, sum(counts))
+                self.assertEqual(result, expected if valid else None)
+
     def test_malformed_and_adversarial_inputs(self):
         streams = []
         # 1. Corrupt 0DRP: overlapping q38, bad enum, bad n4e, dirty reserved, NaN/Inf bounds.
