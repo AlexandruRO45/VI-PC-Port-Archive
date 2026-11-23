@@ -349,14 +349,43 @@ def match_version(game: str):
     return next((v for v in versions() if not probe_mismatches(game, v)), None)
 
 
-def load_version(game: str) -> dict:
+def partial_version(game: str):
+    """The version a folder most closely resembles without matching every probe, or None.
+
+    An incomplete copy can have some of a version's small probe files present with the right size while others are
+    missing or wrong. Naming that version (and what is missing) is more useful than reporting every supported
+    version as a total mismatch.
+    """
+    best = None  # (number of matching probes, version, mismatches)
+    for version in versions():
+        mismatches = probe_mismatches(game, version)
+        probes = [name for name in PROBES if name in version.get("files", {})]
+        if not mismatches or not probes:
+            continue
+        matching = len(probes) - len(mismatches)
+        if matching <= 0:
+            continue
+        if best is None or matching > best[0]:
+            best = (matching, version, mismatches)
+    return (best[1], best[2]) if best is not None else None
+
+
+def load_version(game: str):
+    version = match_version(game)
+    if version is not None:
+        return version
+
+    partial = partial_version(game)
+    notes = "".join("\n%s" % container_message(p, h) for p, h in containers_in(game))
+    if partial is not None:
+        version, mismatches = partial
+        fail("This looks like a partial match for %s %s: the folder has some of its probe files but not all of "
+             "them.\n    " % (version["title"], version["version"]) + "\n    ".join(mismatches) + notes)
+
     reports = []
     for version in versions():
         mismatches = probe_mismatches(game, version)
-        if not mismatches:
-            return version
-        reports.append(f"  {version['title']} {version['version']}\n    " + "\n    ".join(mismatches))
-    notes = "".join(f"\n{container_message(p, h)}" for p, h in containers_in(game))
+        reports.append("  %s %s\n    " % (version["title"], version["version"]) + "\n    ".join(mismatches))
     fail("This doesn't look like a supported version of the game. Point --game at the folder that holds "
          "MicrosoftGame.Config and the .rpf archives.\nSupported:\n"
          + "\n".join(reports or ["  No version manifests found."]) + notes)
