@@ -4782,6 +4782,44 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The COPY and COMPUTE families without graphics, where a copy between a buffer and a depth or stencil aspect needs
+// VK_KHR_maintenance10 and the format's *_COPY_ON_{TRANSFER,COMPUTE}_QUEUE feature. The features of the depth and
+// stencil formats are read once here; without maintenance10 such a copy is refused on those families (measured: an
+// RTX 4070 SUPER, 32.0.16.1742, leaves a D32S8 stencil upload on its transfer family unwritten, and lacks the
+// stencil feature for D32S8 even with maintenance10). d3d12_copy_queue_depth_test covers both answers.
+void register_off_graphics_families(leonida::VulkanContext& context, const VulkanDeviceInfo& info,
+                                    const std::vector<VkQueueFamilyProperties>& queues) {
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+    const auto format_properties = info.maintenance10 ? reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceFormatProperties2")) : nullptr;
+#endif
+    for (const std::uint32_t family : {info.copy_family, info.compute_family}) {
+        if (family >= queues.size() || (queues[family].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+        leonida::OffGraphicsCopies copies;  // empty: no depth or stencil copy with a buffer on this family
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+        const bool compute = (queues[family].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        const VkFormatFeatureFlags2 depth = compute ? VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+                                                    : VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+        const VkFormatFeatureFlags2 stencil = compute ? VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+                                                      : VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+        if (format_properties) {
+            for (const VkFormat format : {VK_FORMAT_D16_UNORM, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT,
+                                          VK_FORMAT_S8_UINT, VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
+                                          VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+                VkFormatProperties3 features{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+                VkFormatProperties2 properties{VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, &features};
+                format_properties(info.physical, format, &properties);
+                const VkImageAspectFlags aspects =
+                    ((features.optimalTilingFeatures & depth) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u) |
+                    ((features.optimalTilingFeatures & stencil) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+                if (aspects) copies.add(format, aspects);
+            }
+        }
+#endif
+        context.set_off_graphics_family(family, copies);
+    }
+}
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -4906,18 +4944,19 @@ public:
         }
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
+        // The queue families, once: the transfer-only family, predication, the families without graphics and the
+        // timestamps below.
+        std::uint32_t queue_count = 0;
+        queue_families(info.physical, &queue_count, nullptr);
+        std::vector<VkQueueFamilyProperties> queues(queue_count);
+        queue_families(info.physical, &queue_count, queues.data());
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
-            const auto families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
-                info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-            if (properties && families) {
+            if (properties) {
                 VkPhysicalDeviceProperties limits{};
                 properties(info.physical, &limits);
-                std::uint32_t count = 0;
-                families(info.physical, &count, nullptr);
-                std::vector<VkQueueFamilyProperties> queues(count);
-                families(info.physical, &count, queues.data());
+                const auto count = static_cast<std::uint32_t>(queues.size());
                 if (info.copy_family < count && !(queues[info.copy_family].queueFlags & VK_QUEUE_COMPUTE_BIT))
                     state_.context->set_transfer_only_family(info.copy_family);
                 if (info.queue_family < count && (queues[info.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
@@ -4926,6 +4965,7 @@ public:
                 }
             }
         }
+        register_off_graphics_families(*state_.context, info, queues);
         if (info.host_image_copy) load_host_image_copy(get_device);
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
@@ -4964,12 +5004,8 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
-        std::uint32_t family_count = 0;
-        queue_families(info.physical, &family_count, nullptr);
-        std::vector<VkQueueFamilyProperties> families(family_count);
-        queue_families(info.physical, &family_count, families.data());
-        if (info.queue_family < family_count) {
-            const auto& family = families[info.queue_family];
+        if (info.queue_family < queues.size()) {
+            const auto& family = queues[info.queue_family];
             if (family.timestampValidBits)
                 state_.context->set_timestamp_period(properties.limits.timestampPeriod);
             // MoltenVK (1.4.2 and 1.4.3 measured) resolves a timestamp before the write that precedes it lands, unless
@@ -5009,7 +5045,7 @@ public:
 
         const bool sparse_aliasing = state_.context->vk.vkQueueBindSparse && info.features.sparseBinding &&
             info.features.sparseResidencyAliased && properties.sparseProperties.residencyNonResidentStrict &&
-            info.queue_family < family_count && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
+            info.queue_family < queues.size() && (queues[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
         state_.sparse_image_tiles = sparse_aliasing && info.features.sparseResidencyImage2D &&
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
         if (sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer) {
@@ -9276,6 +9312,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
     }
 #endif
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+    // Depth and stencil copies with a buffer on COPY and COMPUTE queues of a family without graphics (the context's
+    // set_off_graphics_family); without it they are refused there. Only on a Vulkan 1.3 device: the format features
+    // it is read with (VkFormatProperties3) are core there, and need VK_KHR_format_feature_flags2 on 1.2.
+    VkPhysicalDeviceMaintenance10FeaturesKHR maintenance10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+    if (v13.core && has_device_extension(VK_KHR_MAINTENANCE_10_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance10};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.maintenance10 = maintenance10.maintenance10 == VK_TRUE;
+        if (info.maintenance10) {
+            maintenance10.pNext = *v13.next();
+            *v13.next() = &maintenance10;
+        }
+    }
+#endif
 
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     // VK_KHR_shader_fma: OpFmaKHR is a single-rounding multiply-add in SPIR-V (GLSL.std.450 Fma may round twice).
@@ -9414,6 +9465,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
     if (info.maintenance8) device_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+#endif
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+    if (info.maintenance10) device_extensions.push_back(VK_KHR_MAINTENANCE_10_EXTENSION_NAME);
 #endif
 #ifdef VK_KHR_SHADER_FMA_EXTENSION_NAME
     if (info.shader_fma) device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);

@@ -800,6 +800,27 @@ enum class ReplayResult {
     unsupported
 };
 
+// A queue family without graphics (a transfer-only or async-compute family): the depth and stencil aspects each format
+// may copy with a buffer there, from VK_KHR_maintenance10's *_COPY_ON_{TRANSFER,COMPUTE}_QUEUE features
+// (VUID-vkCmdCopyBufferToImage-commandBuffer-07739 and -11781, VUID-vkCmdCopyImageToBuffer-commandBuffer-10216). A
+// format not listed, or an empty table (no maintenance10), copies neither aspect there.
+struct OffGraphicsCopies {
+    struct Format {
+        VkFormat format = VK_FORMAT_UNDEFINED;
+        VkImageAspectFlags aspects = 0;
+    };
+    std::array<Format, 8> formats{};
+    std::uint32_t count = 0;
+    void add(VkFormat format, VkImageAspectFlags aspects) {
+        if (count < formats.size()) formats[count++] = {format, aspects};
+    }
+    bool allows(VkFormat format, VkImageAspectFlags aspect) const {
+        for (std::uint32_t i = 0; i < count; ++i)
+            if (formats[i].format == format) return (formats[i].aspects & aspect) == aspect;
+        return false;
+    }
+};
+
 struct ReplayFunctions {
     // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
     // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
@@ -936,6 +957,10 @@ struct ReplayFunctions {
     // `bytes` of transfer scratch that stays alive until the submission completes (vulkan_scratch.h): depth <-> colour
     // copies go through it, image to buffer to image. Without it such a copy is unsupported.
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // Set (owned by the context) when the queue's family has no graphics: a copy between a buffer and a depth or
+    // stencil aspect runs only where it allows the format and aspect, and is refused as unsupported otherwise (without
+    // the feature NVIDIA leaves a D32S8 stencil upload unwritten). Null: a family with graphics.
+    const OffGraphicsCopies* off_graphics = nullptr;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -1646,6 +1671,13 @@ inline void emit_buffer_fill(const ReplayFunctions& vk, VkCommandBuffer command_
         vk.copy_buffer(command_buffer, buffer, buffer, 1, &copy);
         filled += step;
     }
+}
+
+// A copy between a buffer and `aspect` of `image` may run on this queue: always on a family with graphics, and on one
+// without only where the format has the feature (ReplayFunctions::off_graphics).
+inline bool buffer_aspect_copy_allowed(const ReplayFunctions& vk, const ResourceBinding& image, VkImageAspectFlags aspect) {
+    aspect &= depth_stencil_aspects;
+    return !vk.off_graphics || !aspect || vk.off_graphics->allows(image.format, aspect);
 }
 
 // The one plane of one subresource a texture copy location names.
@@ -2766,6 +2798,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // A depth plane footprint of a D24 texture stored as D32: words of 24-bit UNORM, floats in the image.
                 const bool upload = texture_copy->src.footprint;
                 const ResourceBinding& image = upload ? p.binding : p.source;
+                // A footprint of a depth or stencil aspect on a family without graphics (ReplayFunctions). This covers
+                // the D24 depth plane too: its conversion pass below also ends in a copy with the D32 depth aspect.
+                if (result == ReplayResult::success && !p.buffer_image_copies.empty() &&
+                    !detail::buffer_aspect_copy_allowed(vk, image, p.buffer_image_copies[0].imageSubresource.aspectMask))
+                    return ReplayResult::unsupported;
                 if (result == ReplayResult::success && texture_copy->tile_footprint && !p.buffer_image_copies.empty() &&
                     p.buffer_image_copies.front().bufferOffset % 4 && !detail::stage_unaligned_tile(vk, p, upload))
                     return ReplayResult::unsupported;
@@ -2825,6 +2862,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     total += (VkDeviceSize(c.extent.width) * c.extent.height * c.extent.depth *
                                   c.srcSubresource.layerCount * texel + 15) / 16 * 16;
                 }
+                // Both halves copy with a buffer, so the depth or stencil side obeys the family's rule.
+                if (!detail::buffer_aspect_copy_allowed(vk, p.source, p.image_copies[0].srcSubresource.aspectMask) ||
+                    !detail::buffer_aspect_copy_allowed(vk, p.binding, p.image_copies[0].dstSubresource.aspectMask))
+                    return ReplayResult::unsupported;
                 VkDeviceSize base = 0;
                 if (!texel || !vk.copy_scratch || !vk.copy_scratch(total, p.staged, base))
                     return ReplayResult::unsupported;

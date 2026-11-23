@@ -1362,6 +1362,14 @@ public:
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
 
+    // A queue family without graphics, where a copy between a buffer and a depth or stencil aspect runs only for the
+    // formats and aspects `copies` lists (ReplayFunctions::off_graphics). Families not listed have graphics. Set before
+    // the first queue executes: queues read the table without the lock.
+    void set_off_graphics_family(std::uint32_t family, const OffGraphicsCopies& copies) {
+        std::unique_lock lock(resource_mutex_);
+        off_graphics_families_[family] = copies;
+    }
+
     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
         std::unique_lock lock(resource_mutex_);
         bindless_prepare_ = std::move(prepare);
@@ -1687,6 +1695,7 @@ private:
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
+    std::unordered_map<std::uint32_t, OffGraphicsCopies> off_graphics_families_;  // node addresses stay put
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -2204,6 +2213,9 @@ private:
         replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
+        if (const auto family = context_.off_graphics_families_.find(family_);
+            family != context_.off_graphics_families_.end())
+            replay.off_graphics = &family->second;
         replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
                                                                    VkDeviceAddress& address) {
             return stage_khr_instances(replay, build, khr_guard.stages, address);

@@ -7101,6 +7101,13 @@ int main() {
                 ext_query.pNext = &m8;
             }
 #endif
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+            VkPhysicalDeviceMaintenance10FeaturesKHR m10{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_10_FEATURES_KHR};
+            if (has(VK_KHR_MAINTENANCE_10_EXTENSION_NAME)) {
+                m10.pNext = ext_query.pNext;
+                ext_query.pNext = &m10;
+            }
+#endif
             VkPhysicalDeviceShaderClockFeaturesKHR clock{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
             if (has(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
                 clock.pNext = ext_query.pNext;
@@ -7126,6 +7133,18 @@ int main() {
             EXPECT(answers.ROVsSupported == BOOL(made->fragment_shader_interlock));
             EXPECT(answers.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation ==
                    BOOL(made->shader_output_layer && made->shader_output_viewport_index));
+#ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME
+            // Depth and stencil copies with a buffer on families without graphics (d3d12_copy_queue_depth_test),
+            // enabled on a Vulkan 1.3 device only (VkFormatProperties3).
+            {
+                VkPhysicalDeviceProperties api{};
+                if (const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        made->get_instance_proc(made->instance, "vkGetPhysicalDeviceProperties")))
+                    properties(made->physical, &api);
+                const bool core13 = api.apiVersion >= VK_API_VERSION_1_3;
+                EXPECT(made->maintenance10 == (core13 && m10.maintenance10 == VK_TRUE));
+            }
+#endif
         }
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;

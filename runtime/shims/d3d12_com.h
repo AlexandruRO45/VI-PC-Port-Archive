@@ -154,6 +154,9 @@ struct VulkanDeviceInfo {
     bool fragment_shader_barycentric = false;
     bool fragment_shader_interlock = false;
     bool maintenance8 = false;
+    // VK_KHR_maintenance10 with its feature: COPY and COMPUTE queues on a family without graphics may copy between a
+    // buffer and a depth or stencil aspect where the format has the *_COPY_ON_{TRANSFER,COMPUTE}_QUEUE feature.
+    bool maintenance10 = false;
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
