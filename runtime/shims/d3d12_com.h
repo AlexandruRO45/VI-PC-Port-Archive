@@ -64,7 +64,9 @@ HRESULT set_event_on_multiple_fence_completion(leonida::VulkanContext& context, 
                                                const UINT64* values, UINT count,
                                                D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event);
 
-std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context);
+std::shared_ptr<const leonida::TileHeapAllocation> tile_heap(ID3D12Heap* heap, const leonida::VulkanContext& context,
+                                                           bool image, std::uint32_t memory_types);
+bool is_sparse_image(ID3D12Resource* resource);
 
 // The Vulkan objects a D3D12 device runs on. Vulkan 1.3 with dynamicRendering, synchronization2, timelineSemaphore
 // and (when separate_depth_stencil_layouts is set) separateDepthStencilLayouts enabled.
@@ -85,6 +87,10 @@ struct VulkanDeviceInfo {
     bool separate_depth_stencil_layouts = true;
     std::uint32_t max_push_constants_size = 0;
     bool push_constants_need_fallback = false;
+    // maxBufferSize and maxMemoryAllocationSize, which cap the GPU address arena (src/arena_size.h). 0: read from
+    // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
+    VkDeviceSize max_buffer_size = 0;
+    VkDeviceSize max_memory_allocation_size = 0;
     // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
     // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
     leonida::SubgroupSizeCaps subgroup;
@@ -106,6 +112,13 @@ struct VulkanDeviceInfo {
     // rejected at ExecuteCommandLists.
     bool conditional_rendering = false;
     bool storage_buffer_8bit = false; // storageBuffer8BitAccess enabled: byte-granular predicated buffer copies.
+    // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
+    // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
+    bool conservative_rasterization = false;
+    // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
+    // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
+    // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).
+    bool inner_coverage_abi = false;
     // VK_EXT_host_image_copy and its hostImageCopy feature are enabled on `device`: WriteToSubresource and
     // ReadFromSubresource on textures in CPU-visible heaps copy on the CPU instead of through a staging submit.
     bool host_image_copy = false;
@@ -113,6 +126,8 @@ struct VulkanDeviceInfo {
     // `rdna2spirv.py --fma khr` (OpFmaKHR, capability FMAKHR in the index) can be created. Without it only the
     // default `--fma glsl` shaders can.
     bool shader_fma = false;
+    bool shader_subgroup_clock = false;
+    bool shader_device_clock = false;
     // The caller enabled textureCompressionBC on this logical device.
     bool texture_compression_bc = false;
     // Optional device features the caller enabled. Without occlusionQueryPrecise, D3D12_QUERY_TYPE_OCCLUSION counts
@@ -126,10 +141,12 @@ struct VulkanDeviceInfo {
     // present, which PresentX's ImmediateThresholdPercent uses.
     bool swapchain_maintenance1 = false;
     // VK_EXT_swapchain_colorspace is enabled on the instance (with `presentation`): the surface can list its HDR10
-    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are clipped to SDR.
+    // (ST.2084) formats, which a PresentX plane in HDR10 uses. Without it HDR10 planes are tone mapped to SDR.
     bool swapchain_colorspace = false;
     // VK_EXT_image_view_min_lod and its minLod feature are enabled on the logical device.
     bool image_view_min_lod = false;
+    // VK_KHR_vertex_attribute_divisor or VK_EXT_vertex_attribute_divisor with vertexAttributeInstanceRateDivisor.
+    bool vertex_attribute_divisor = false;
     // Pixel-shader extensions translated shaders can declare, each enabled with its feature where the GPU has it:
     // VK_KHR_fragment_shader_barycentric (BaryCoordKHR / PerVertexKHR reads), VK_EXT_fragment_shader_interlock
     // (fragmentShaderPixelInterlock: POPS shaders run in PixelInterlockOrderedEXT) and VK_KHR_maintenance8 (texel
@@ -159,8 +176,7 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
-    // The translator's output folder (spirv/index.json + <name>.spv) for pipeline creation; empty: the
-    // LEONIDA_SHADERS environment variable.
+    // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
     // `device`: samplers with custom border colours pass them through to Vulkan. Without it, custom border
@@ -178,7 +194,9 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
-// GetDevice must return. No reference is taken: the outer object owns the device.
+// GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's
+// IDXGIDevice1 pointer (what create_device_proxy returns for that IID); the proxy itself becomes the outer. For a
+// proxy it also makes the proxy's IDXGIDevice1::GetAdapter return this layer's adapter (d3d12_xs_device.h).
 void set_device_outer(ID3D12Device* device, IUnknown* outer);
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
@@ -224,10 +242,22 @@ bool device_upload_in_vram(ID3D12Device* device);
 // True when the device can map reserved buffers onto its D3D12 heaps.
 bool device_sparse_buffer_tiles(ID3D12Device* device);
 
+// The size in bytes of the device's GPU address arena, or 0 without one. For tests.
+std::uint64_t device_arena_size(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.
 VkDescriptorSet bindless_set(ID3D12Device* device);
+// What the bindless set did without waiting (D3D-314): table generations made because a flush grew the table or
+// changed live entries, the retired ones not freed yet, and vkDeviceWaitIdle calls made for it (always 0 unless
+// LEONIDA_BINDLESS_IDLE_WAIT=1 restores the old wait, to compare frame times). All 0 without a bindless set.
+struct BindlessStats {
+    std::uint64_t generations_made = 0;
+    std::uint64_t retired_pending = 0;
+    std::uint64_t device_idle_waits = 0;
+};
+BindlessStats bindless_stats(ID3D12Device* device);
 VkDescriptorSetLayout bindless_set_layout(ID3D12Device* device);
 // The bindless index the descriptor hash table holds for the 8 key dwords of a T# (or the 4 of an S# followed by
 // 0xFFFFFFFF x4), 0 (the fallback) when it has none or `device` has no such set. For tests.
@@ -252,6 +282,9 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue);
 // Creates a Vulkan-backed IDXGIFactory4 bound to `device`'s VulkanContext, instance, physical device, and queue.
 // Its CreateSwapChainForHwnd registers swapchain backbuffers directly with the device's VulkanContext.
 HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out);
+
+// SDRWhiteLevel of DISPLAYCONFIG_SDR_WHITE_LEVEL (1000 = 80 nits) to nits.
+float sdr_white_nits_from_level(unsigned long level);
 
 // Puts back buffers of a device from create_vulkan_device* into a window (leonida::VulkanPresenter), for the
 // presentation front end the game uses (DXGI or PresentX, still open). Holds a reference to the device.
@@ -278,6 +311,10 @@ public:
     bool hdr_active() const;
     void force_hdr_encoding(bool on);
     std::uint64_t composed_presents() const;  // presents that went through the compose pass
+    // Nits of SDR white the user set in Windows for the output the window is on (DISPLAYCONFIG_SDR_WHITE_LEVEL), or 0 when
+    // it cannot be read (no window, no display config, not Windows). Only meaningful while hdr_active().
+    float display_sdr_white_nits() const;
+    void set_window(HWND window) { window_ = window; }
     bool tear_supported() const;
     bool last_present_tore() const;
     std::uint64_t tear_presents() const;
@@ -285,12 +322,14 @@ public:
     bool enable_capture();
     // See VulkanPresenter::set_abort: polled while a present waits for a swapchain image.
     void set_abort(std::function<bool()> abort);
+    // See VulkanPresenter::read_back: false after a present skipped while the window is minimised, too.
     bool read_back(std::vector<std::uint8_t>& pixels, VkExtent2D* extent, VkFormat* format);
     VkExtent2D extent() const;
     std::uint64_t presented() const;
 
 private:
     IUnknown* device_;
+    HWND window_ = nullptr;
     std::unique_ptr<leonida::VulkanPresenter> presenter_;
 };
 
@@ -300,15 +339,23 @@ bool device_has_swapchain_colorspace(ID3D12Device* device);
 // Null when `device` is not a Vulkan device created with presentation, or the window cannot be presented to.
 std::unique_ptr<WindowPresenter> create_window_presenter(ID3D12Device* device, HWND window);
 
-// Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read, as
-// rt::rootsig::pack() lays them out (docs section 3.5). Built when a Vulkan device creates the root signature.
+// Where each root parameter's arguments go in the 32 user-data dwords the translated shaders read (docs section
+// 3.5). Built when a Vulkan device creates the root signature. A signature can be bound at either bind point, so it
+// carries both layouts:
+//   - graphics: rt::rootsig::pack() (from s0, two dwords per table; D3D-448 keeps it until per-stage user-data windows
+//     exist, because a mesh shader (s16) and a pixel shader (s8) share one push-constant block);
+//   - compute: rt::rootsig::pack_stage(Stage::Compute), the measured console layout (from s4, one dword per table).
+// A layout that refuses the signature is marked unusable; binding the signature there invalidates the list.
 struct RootArgumentLayout {
     struct Parameter {
         rt::rootsig::ParamType type;
-        std::uint32_t user_offset;     // first dword; unused for a parameter with no dwords
+        std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
+        std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
     };
     std::vector<Parameter> parameters;
+    bool graphics_ok = true;
+    bool compute_ok = true;
 };
 
 // For the command list: the argument layout of a root signature from a Vulkan device, and the id it records for a

@@ -223,6 +223,10 @@ class NameDictionary:
             return False
         if any(ord(ch) < 0x20 for ch in name):
             return False
+        try:
+            name.encode("utf-8")
+        except UnicodeEncodeError:   # a lone surrogate (JSON \ud800 escape, XML &#xD800;) has no UTF-8 form to hash
+            return False
         table = self.derived if derived else self.names
         h = joaat(name)
         table.setdefault(h, set()).add(name)
@@ -399,10 +403,13 @@ class NameDictionary:
 
 def build_dictionary(manifests=(), scans=(), names_files=(), xml_files=(), *,
                      derive_lod: bool = False, rpf9_names=()) -> NameDictionary:
+    def scan_failed(error):
+        raise error
+
     dictionary = NameDictionary()
     for path in manifests:
         if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
+            for root, dirs, files in os.walk(path, onerror=scan_failed):
                 dirs.sort()
                 if "manifest.json" in files and os.path.basename(root).lower() == "models":
                     dictionary.add_manifest(os.path.join(root, "manifest.json"))
@@ -483,12 +490,12 @@ def resolve_maps(rows, dictionary: NameDictionary, *, include_derived: bool = Fa
 
 def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: bool = False) -> dict:
     if not isinstance(data, dict):
-        return {}
+        raise ValueError("expected an archetype report object")
     raw = data.get("archetypes")
     if not isinstance(raw, dict):
         raw = data.get("hashes")
     if not isinstance(raw, dict):
-        return {}
+        raise ValueError("expected an archetypes or hashes table")
     keys = data.get("keys") if isinstance(data.get("keys"), dict) else data.get("key64")
     if not isinstance(keys, dict):
         keys = {}
@@ -512,7 +519,7 @@ def resolve_archetypes(data, dictionary: NameDictionary, *, include_derived: boo
         try:
             h = int(str(raw_hash), 16) & MASK32
             count = int(raw_count)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if count <= 0:
             continue
@@ -551,11 +558,27 @@ def _load_json(path: str) -> dict:
         return json.load(handle)
 
 
+def _build_input_paths(args):
+    for path in (*args.manifest, *args.scan, *args.names, *args.rpf9_names, *args.xml):
+        yield path
+    if os.path.exists(args.out):
+        for path in args.manifest:
+            if os.path.isdir(path):
+                for root, dirs, files in os.walk(path):
+                    dirs.sort()
+                    if "manifest.json" in files and os.path.basename(root).lower() == "models":
+                        yield os.path.join(root, "manifest.json")
+
+
 def _build(args) -> int:
     if not (args.manifest or args.scan or args.names or args.xml or args.rpf9_names):
         print("build: at least one --manifest/--scan/--names/--rpf9-names/--xml source is required",
               file=sys.stderr)
         return 2
+    for path in _build_input_paths(args):
+        if same_report_path(args.out, path):
+            raise ValueError(
+                f"build: --out {args.out} would overwrite input {path}")
     dictionary = build_dictionary(args.manifest, args.scan, args.names, args.xml,
                                   derive_lod=args.derive_lod, rpf9_names=args.rpf9_names)
     counts = dictionary.counts()
@@ -588,8 +611,11 @@ def _resolve(args) -> int:
         report["maps"] = dict(maps)
     archetypes = collections.Counter()
     for path in args.archetypes:
-        data = _load_json(path)
-        stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        try:
+            data = _load_json(path)
+            stats = resolve_archetypes(data, dictionary, include_derived=args.include_derived)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from None
         for key, value in stats.items():
             archetypes[key] += value
     if args.archetypes:

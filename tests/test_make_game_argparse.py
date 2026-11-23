@@ -253,9 +253,10 @@ class StageValidationAndSequencingTest(unittest.TestCase):
         self.assertIsNotNone(manager.assets.call_args.kwargs["dump_jobs"])
         manager.runtime.assert_called_once_with(
             os.path.abspath(self.game_dir), os.path.abspath(self.out_dir), unittest.mock.ANY, None,
-            unittest.mock.ANY)
+            unittest.mock.ANY, work=os.path.abspath(self.work_dir))
         manager.pipelines.assert_called_once_with(
-            os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY)
+            os.path.abspath(self.work_dir), os.path.abspath(self.out_dir), unittest.mock.ANY,
+            runtime_build=None)
 
     def test_single_stage_execution_isolates_stages(self):
         for stage in ("shaders", "assets", "runtime", "pipelines"):
@@ -451,6 +452,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
             audio_dir = os.path.join(out, "audio")
             os.makedirs(audio_dir, exist_ok=True)
             with open(os.path.join(audio_dir, "audio_manifest.json"), "w", encoding="utf-8") as f:
@@ -479,6 +482,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             ogg_dir = os.path.join(out, "audio", "ogg")
             wav_dir = os.path.join(out, "audio", "wav")
@@ -512,6 +517,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
             audio = os.path.join(out, "audio")
             os.makedirs(os.path.join(audio, "xma"), exist_ok=True)
             os.makedirs(game, exist_ok=True)
@@ -536,6 +543,8 @@ class WavValidationTest(unittest.TestCase):
                     os.makedirs(p, exist_ok=True)
                     with open(os.path.join(p, "manifest.json"), "w", encoding="utf-8") as f:
                         f.write("{}")
+                    with open(os.path.join(p, make_game.DECODER_RECORD), "w", encoding="utf-8") as f:
+                        f.write(make_game.decoder_digest())
 
             manifest_dir = os.path.join(out, "audio")
             os.makedirs(manifest_dir, exist_ok=True)
@@ -612,7 +621,7 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
 
     @patch.object(sys, "version_info", (3, 12, 0))
     def test_preflight_space_calculation_and_failure(self):
-        # Shaders needs 30GB, Assets needs 300GB -> 330GB total
+        # Shaders needs 30GB, Assets needs 370GB -> 400GB total
         def fake_which(cmd):
             if cmd in ("dotnet", "llvm-mc", "spirv-as", "spirv-val"):
                 return f"/bin/{cmd}"
@@ -623,12 +632,12 @@ class PathContainmentAndDiskSpaceTest(unittest.TestCase):
                 with patch("make_game.ensure_submodule"):
                     with patch("os.makedirs"):
                         with patch("shutil.disk_usage") as mock_disk:
-                            mock_disk.return_value = MagicMock(free=100 * (2**30))  # 100 GB available < 330 GB
+                            mock_disk.return_value = MagicMock(free=100 * (2**30))  # 100 GB available < 400 GB
                             with patch("sys.stderr", new_callable=io.StringIO) as mock_err:
                                 with self.assertRaises(SystemExit) as ctx:
                                     make_game.preflight(["shaders", "assets"], work="C:/work")
                                 self.assertEqual(ctx.exception.code, 1)
-                                self.assertIn("about 330 GB is needed", mock_err.getvalue())
+                                self.assertIn("about 400 GB is needed", mock_err.getvalue())
 
 
 class ToolAvailableTest(unittest.TestCase):

@@ -57,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import anim_clips  # noqa: E402
 import anim_index  # noqa: E402
 import glb_writer  # noqa: E402
+from pool_workers import process_workers  # noqa: E402
 import skin_streams  # noqa: E402
 
 SYSTEM = 0x50000000
@@ -193,6 +194,13 @@ def read_skeleton(sys, drawable):
         require(parent == 0xFFFF or parent < i, f"bone {i} parent {parent} is not an earlier bone")
         m = struct.unpack_from("<16f", sys, inverse + 64 * i)
         require(all(math.isfinite(v) for v in m) and m[3] == m[7] == m[11] == 0, f"inverse bind matrix {i}")
+        # RageSkeleton.cs:109 also refuses a degenerate matrix. The stored last column is (0, 0, 0, 1),
+        # so the 4x4 determinant is the determinant of the upper-left 3x3 linear part. As in the C#,
+        # abs() keeps mirrored binds; the epsilon rejects clearly non-invertible ones, not just float32 zero.
+        det = (m[0] * (m[5] * m[10] - m[6] * m[9])
+               - m[1] * (m[4] * m[10] - m[6] * m[8])
+               + m[2] * (m[4] * m[9] - m[5] * m[8]))
+        require(math.isfinite(det) and abs(det) >= 1e-12, f"inverse bind matrix {i} determinant")
         joints.append({
             "hash": u32(sys, r + 0x1C), "name": c_string(sys, r + 0x30), "parent": None if parent == 0xFFFF else parent,
             "rotation": struct.unpack_from("<4f", sys, r), "translation": struct.unpack_from("<3f", sys, r + 0x10),
@@ -387,11 +395,23 @@ def bind_part(meshes, joints, max_influences=8):
 # ---------------------------------------------------------------- clips
 
 
+def contiguous_rows(m, offset):
+    end = min(len(m), offset + (64 << 20))
+    while 0 <= offset < end and anim_index.ZHDR.match(m, offset):
+        data, used = skin_streams.inflate_at(m, offset, end)
+        if data is None or len(data) < 64:
+            break
+        yield anim_index.classify(data, offset, used)
+        offset = (offset + used + 15) & ~15
+
+
 def load_dictionary(path, offset):
     """Parse the clip dictionary whose root stream starts at `offset` -> (System, dictionary)."""
-    rows, _walk = anim_index.scan_rpf(path, offset, 64 << 20)
     with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        groups, _unresolved, _gaps = anim_clips.group(m, rows[:4])
+        streams = contiguous_rows(m, offset)
+        first = next(streams, None)
+        rows = [first] if first is not None else []
+        groups, _unresolved, _gaps = anim_clips.group(m, rows, first_row_only=True, continuation_rows=streams)
     require(groups and rows[groups[0][0]]["offset"] == offset, f"no clip dictionary starts at 0x{offset:x}")
     data = b""
     with open(path, "rb") as fh:
@@ -416,7 +436,13 @@ def select_clips(dictionary, wanted):
         return clips
     out = []
     for w in wanted:
-        hits = [c for c in clips if clip_label(c) == w or (w.lower().startswith("0x") and c["hash"] == int(w, 16))]
+        wanted_hash = None
+        if w.lower().startswith("0x"):
+            try:
+                wanted_hash = int(w, 16)
+            except ValueError:
+                wanted_hash = None
+        hits = [c for c in clips if clip_label(c) == w or (wanted_hash is not None and c["hash"] == wanted_hash)]
         require(hits, f"clip {w!r} is not in the dictionary")
         out.extend(hits)
     return out
@@ -435,8 +461,18 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
         rate = entry["rate"] if entry["rate"] and math.isfinite(entry["rate"]) and entry["rate"] > 0 else 1.0
         step = anim["duration"] / (frames - 1) if frames > 1 and anim["duration"] > 0 else 1.0 / 30
         start = entry["start"] if math.isfinite(entry["start"]) else 0.0
-        end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] > start else anim["duration"]
-        keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4] or [0]
+        end = entry["end"] if math.isfinite(entry["end"]) and entry["end"] >= start else anim["duration"]
+        if end == start:
+            keep = [min(range(frames), key=lambda k: abs(k * step - start))] if frames else []
+            single_pose = True
+        else:
+            keep = [k for k in range(frames) if start - 1e-4 <= k * step <= end + 1e-4]
+            single_pose = not keep
+            if single_pose:
+                target_time = 0.5 * (start + end)
+                keep = [min(range(frames), key=lambda k: abs(k * step - target_time))] if frames else []
+        if not keep:
+            continue
         tally["animations"] += 1
         for t, (bone, ttype, fmt) in enumerate(anim["tracks"]):
             path = TRACK_PATHS.get(ttype)
@@ -460,7 +496,10 @@ def clip_channels(s, dictionary, clip, joint_by_hash, root_motion, tally):
             if (target, path) in channels:
                 tally["tracks_overridden"] += 1
             # a frame kept by the 1e-4 tolerance before `start` would get a slightly negative time
-            channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
+            if single_pose:
+                channels[(target, path)] = [(0.0, tuple(tracks[t][k])) for k in keep]
+            else:
+                channels[(target, path)] = [(max(0.0, (k * step - start) / rate), tuple(tracks[t][k])) for k in keep]
     return channels
 
 
@@ -531,9 +570,10 @@ def build(joints, meshes, clips, *, root_motion=True, generator="Leonida anim_gl
     for name, channels in clips:
         samplers, out_channels = [], []
         for (target, path), keys in sorted(channels.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
-            times = [t for t, _v in keys]
+            time_bytes = _floats([t for t, _v in keys])
+            times = struct.unpack(f"<{len(keys)}f", time_bytes)
             require(all(b > a for a, b in zip(times, times[1:])), "key times are not increasing")
-            tv = _view(buf, views, _floats(times))
+            tv = _view(buf, views, time_bytes)
             ta = _accessor(accessors, tv, COMPONENT_FLOAT, len(times), "SCALAR", min=[min(times)], max=[max(times)])
             values = [x for _t, v in keys for x in v]
             vv = _view(buf, views, _floats(values))
@@ -668,7 +708,7 @@ def coverage(args):
         groups, _unresolved, _gaps = anim_clips.group(m, rows)
     segments = [[anim_clips.segment(rows, k) for k in parts] for _root, parts in groups]
     hashes = sorted({j["hash"] for j in joints})
-    jobs = max(1, args.jobs)
+    jobs = process_workers(max(1, args.jobs))   # a pool takes at most 61 workers on Windows
     slices = [(args.anim, segments[i::jobs], hashes) for i in range(jobs)]
     total = collections.Counter()
     if jobs == 1:
@@ -705,6 +745,8 @@ def main(argv=None):
         for i in inputs:
             if os.path.exists(o) and same_path(i, o):
                 ap.error(f"{o} is an input; refusing to overwrite it")
+    if args.report and os.path.isdir(args.report):
+        ap.error(f"--report is a directory: {args.report}")
     if args.out and args.report and same_path(args.out, args.report):
         ap.error("the GLB and the report are the same path")
     if args.coverage:
@@ -723,9 +765,13 @@ def main(argv=None):
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     if args.report:
-        with open(args.report, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1, sort_keys=True)
-            f.write("\n")
+        try:
+            with open(args.report, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1, sort_keys=True)
+                f.write("\n")
+        except OSError as e:
+            print(f"ERROR: cannot write report {args.report}: {e.strerror or e}", file=sys.stderr)
+            return 2
     print(json.dumps({k: v for k, v in report.items() if k in ("counts", "skeleton", "seconds")}, sort_keys=True))
     return 0
 

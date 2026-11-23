@@ -9,6 +9,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -22,6 +23,32 @@ def load_tool():
 
 
 WN = load_tool()
+
+
+class ManifestEnumerationTest(unittest.TestCase):
+    def test_an_unreadable_subtree_does_not_replace_the_dictionary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifests = os.path.join(directory, "manifests")
+            os.mkdir(manifests)
+            blocked = os.path.join(manifests, "blocked")
+            output = os.path.join(directory, "dictionary.json")
+            with open(output, "wb") as f:
+                f.write(b"existing dictionary")
+            names = os.path.join(directory, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("synthetic_model\n")
+
+            def walk(root, onerror=None):
+                if onerror:
+                    onerror(PermissionError(13, "Permission denied", blocked))
+                return iter(())
+
+            with mock.patch.object(WN.os, "walk", walk), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--manifest", manifests, "--names", names, "--out", output]), 1)
+            self.assertIn(blocked, err.getvalue())
+            with open(output, "rb") as f:
+                self.assertEqual(f.read(), b"existing dictionary")
 
 
 class HashTest(unittest.TestCase):
@@ -214,6 +241,16 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(stats["verified_entities"], 10)
         self.assertEqual(stats["unresolved_entities"], 2)
 
+    def test_archetype_counts_skip_overflowing_values(self):
+        name = WN.joaat_hex("synthetic_prop")
+        data = json.loads(f'{{"archetypes":{{"00000100":1e309,"00000200":-1e309,"{name}":7}}}}')
+
+        stats = WN.resolve_archetypes(data, self.dictionary)
+
+        self.assertEqual(stats["entities"], 7)
+        self.assertEqual(stats["unique_hashes"], 1)
+        self.assertEqual(stats["resolved_exact_entities"], 7)
+
     def test_archetype_32_only_is_rejected_by_key64(self):
         dictionary = WN.NameDictionary()
         dictionary.add("PLAYER")
@@ -257,6 +294,21 @@ class CliTest(unittest.TestCase):
             d.add_xml(xml)
             self.assertEqual(sorted(n for names in d.to_json()["names"].values() for n in names),
                              ["First", "Real", "Real.rpf", "RealName"])
+
+    def test_a_lone_surrogate_name_is_skipped_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "m.json")
+            xml = os.path.join(tmp, "n.xml")
+            out = os.path.join(tmp, "out.json")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                handle.write('{"Items": [{"Name": "bad\\ud800x"}, {"Name": "fine"}]}')
+            with open(xml, "w", encoding="utf-8") as handle:
+                handle.write("<root><name>one</name><name>bad&#xD800;x</name><name>two</name></root>")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(WN.main(["build", "--manifest", manifest, "--xml", xml, "--out", out]), 0)
+            with open(out, encoding="utf-8") as handle:
+                names = json.load(handle)["names"]
+            self.assertEqual(sorted(n for group in names.values() for n in group), ["fine", "one", "two"])
 
     def test_xml_unescape_is_strict(self):
         self.assertEqual(WN._xml_unescape("A&amp;B&#x26;C&#38;D&lt;"), "A&B&C&D<")
@@ -309,6 +361,35 @@ class CliTest(unittest.TestCase):
                 self.assertNotEqual(WN.main(["resolve", "--dict", dictionary, "--maps", maps, "--out", out]), 0)
             self.assertIn(maps, err.getvalue())
             self.assertFalse(os.path.exists(out))
+
+    def test_resolve_requires_a_recognized_archetype_table(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dictionary = os.path.join(tmp, "names.json")
+            archetypes = os.path.join(tmp, "archetypes.json")
+            out = os.path.join(tmp, "report.json")
+            with open(dictionary, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(WN.NameDictionary().to_json(), f)
+
+            args = ["resolve", "--dict", dictionary, "--archetypes", archetypes, "--out", out]
+            for wrong in ([], {"summary": {}}, {"archetypes": []}):
+                with self.subTest(report=wrong):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(wrong, f)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(WN.main(args), 1)
+                    self.assertIn(archetypes, stderr.getvalue())
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertFalse(os.path.exists(out))
+
+            for field in ("archetypes", "hashes"):
+                with self.subTest(field=field):
+                    with open(archetypes, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({field: {}}, f)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(WN.main(args), 0)
+                    with open(out, encoding="utf-8") as f:
+                        self.assertEqual(json.load(f)["archetypes"]["entities"], 0)
 
     def test_resolve_out_refuses_to_overwrite_an_input(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -405,6 +486,70 @@ class CliTest(unittest.TestCase):
             with open(report, encoding="utf-8") as handle:
                 result = json.load(handle)
             self.assertEqual(result["maps"]["name_resolved"], 1)
+
+    def test_build_out_refuses_to_overwrite_an_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "manifest.json")
+            scan = os.path.join(tmp, "scan.json")
+            names = os.path.join(tmp, "names.txt")
+            rpf9 = os.path.join(tmp, "rpf9_names.json")
+            xml = os.path.join(tmp, "common.xml")
+            models_dir = os.path.join(tmp, "assets", "archive", "models")
+            os.makedirs(models_dir)
+            dir_manifest = os.path.join(models_dir, "manifest.json")
+
+            with open(manifest, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"Items": [{"Name": "synthetic_m.#dr"}]}, handle)
+            with open(dir_manifest, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"Items": [{"Name": "synthetic_dir_m.#dr"}]}, handle)
+            with open(scan, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"entries": [{"Path": "models/synthetic_s._dr_at_0000000000000010.r9modeldata"}]}, handle)
+            with open(names, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("synthetic_n\n")
+            with open(rpf9, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump({"files": [{"names": ["synthetic_r.#dr"]}]}, handle)
+            with open(xml, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write("<root><name>synthetic_x</name></root>\n")
+
+            cases = [
+                ("manifest", ["--manifest", manifest], manifest),
+                ("manifest_dir", ["--manifest", os.path.join(tmp, "assets")], dir_manifest),
+                ("scan", ["--scan", scan], scan),
+                ("names", ["--names", names], names),
+                ("rpf9_names", ["--rpf9-names", rpf9], rpf9),
+                ("xml", ["--xml", xml], xml),
+            ]
+            for label, prefix, source in cases:
+                with self.subTest(input=label):
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    out_buf, err_buf = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                        self.assertEqual(WN.main(["build", *prefix, "--out", source]), 1)
+                    self.assertIn(f"would overwrite input {source}", err_buf.getvalue())
+                    self.assertEqual(out_buf.getvalue(), "")
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
+
+            # A hard link to either a direct input or a discovered directory manifest is refused too.
+            for label, prefix, source, link_name in (
+                ("manifest_hardlink", ["--manifest", manifest], manifest, "manifest_link.json"),
+                ("dir_manifest_hardlink", ["--manifest", os.path.join(tmp, "assets")], dir_manifest, "dir_link.json"),
+            ):
+                hardlink = os.path.join(tmp, link_name)
+                try:
+                    os.link(source, hardlink)
+                except OSError:
+                    self.skipTest("hard links unsupported on this filesystem")
+                with self.subTest(input=label):
+                    with open(source, "rb") as handle:
+                        original = handle.read()
+                    err_buf = io.StringIO()
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_buf):
+                        self.assertEqual(WN.main(["build", *prefix, "--out", hardlink]), 1)
+                    self.assertIn(f"would overwrite input {source}", err_buf.getvalue())
+                    with open(source, "rb") as handle:
+                        self.assertEqual(handle.read(), original)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@ import json
 import os
 import struct
 import sys
+from collections.abc import Callable
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 
@@ -156,6 +158,25 @@ def test_dds_header_is_a_dx10_texture2d():
 
 # ---- export_one ----
 
+def test_r16_export_scores_words_across_a_byte_boundary(eq: Callable[[int], None], tmp_path: Path) -> None:
+    carve = tmp_path / "carve"
+    out = tmp_path / "out"
+    eq(2)
+    offsets, _, _ = T.detile_offsets(2, 4, 4)
+    top = np.tile(np.arange(254, 258, dtype="<u2"), 4)
+    # The smaller mip's tile also contains padding. As a 4x4 candidate, its
+    # alternating word values look smoother when the high byte is scored separately.
+    lower_and_padding = np.tile(np.array([0xFF00, 0xFF05], dtype="<u2"), 8)
+    data = b"".join(tile(values.view(np.uint8).reshape(-1, 2), offsets, 4096)
+                    for values in (lower_and_padding, top))
+    write_blob(carve, "x.rpf", 0x1000, data)
+    record = texture(56, "R16_UNORM", 4, 4, 2)
+
+    assert T.export_one(record, carve, out, {}) == "ok:last"
+    dds = (out / "x.rpf" / record["export"]["file"]).read_bytes()
+    assert dds[148:] == top.tobytes()
+
+
 def build_case(eq, tmp_path, fmt, top_first):
     """A 64x64 texture with two mips: a smooth top mip and a noise mip, in either order in the GPU blob."""
     bpe, blk = T.FMT[fmt]
@@ -270,6 +291,26 @@ def test_blob_cache_is_reused_for_the_same_blob(eq, tmp_path):
     os.remove(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"))  # a second read would fail
     t2 = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2)
     assert T.export_one(t2, carve, str(tmp_path / "out"), cache) == "ok:first"
+
+
+def test_blob_cache_distinguishes_different_gpu_chains_at_same_offset(eq, tmp_path):
+    carve, expected = build_case(eq, tmp_path, 10, top_first=True)
+    with open(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"), "rb") as f:
+        blob = f.read()
+    os.remove(os.path.join(carve, "x.rpf", f"{0x1000:012x}.bin"))
+    cut = 12345
+    write_blob(carve, "x.rpf", 0x1000, blob[:cut])
+    write_blob(carve, "x.rpf", 0x9000, blob[cut:])
+    cache = {}
+    out = str(tmp_path / "out")
+    short = texture(10, "R16G16B16A16_FLOAT", 16, 16, mips=1, gpu=0x1000, gpu_size=cut)
+    assert T.export_one(short, carve, out, cache) == "ok:first"
+    chained = texture(10, "R16G16B16A16_FLOAT", 64, 64, mips=2, q_index=4,
+                      gpu=0x1000, gpu_size=len(blob),
+                      gpu_chain=[[0x1000, cut], [0x9000, len(blob) - cut]])
+    assert T.export_one(chained, carve, out, cache) == "ok:first"
+    with open(os.path.join(out, "x.rpf", chained["export"]["file"]), "rb") as f:
+        assert f.read()[148:] == expected
 
 
 @pytest.mark.parametrize("fmt", [9999, 6, 7, 8])  # 6-8: 12-byte R32G32B32 has no SW_4K_S equation
@@ -504,6 +545,37 @@ def test_stale_export_entry_is_not_counted(eq, tmp_path, monkeypatch, capsys):
     out, code, text = png_main(tmp_path, monkeypatch, capsys, [t], carve, "--png")
     assert text.splitlines()[0].startswith("1 textures: {'error:FileNotFoundError': 1}")
     assert text.splitlines()[1] == "png: {}"
+
+def test_texture_io_error_fails_the_run_but_preserves_successes(eq, tmp_path, monkeypatch, capsys):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    good = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    missing = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2, gpu=0x5000)
+    index = tmp_path / "index.json"
+    index.write_text(json.dumps([good, missing]), encoding="utf-8")
+    out = tmp_path / "out"
+    _argv(monkeypatch, index, carve, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "1 texture(s) could not be read or written" in captured.err
+    assert "000000005000.bin" in captured.err
+    assert "error:FileNotFoundError" in captured.out
+    exported, failed = json.loads((out / "export_log.json").read_text(encoding="utf-8"))
+    assert (out / "x.rpf" / exported["export"]["file"]).is_file()
+    assert "export" not in failed
+
+
+def test_main_reports_export_log_write_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    (out / "export_log.json").mkdir(parents=True)
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    captured = capsys.readouterr()
+    assert "ERROR: cannot write" in captured.err
+    assert "export_log.json" in captured.err
+    assert not captured.out
+
 
 # ---- bad index / --out guards (#1607's class in main) ----
 

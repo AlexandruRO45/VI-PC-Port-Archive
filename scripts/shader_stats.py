@@ -59,7 +59,7 @@ def load_stats(path):
     """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
     with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, strict=True)
         header = reader.fieldnames or []
         missing = [c for c in REQUIRED if c not in header]
         if missing:
@@ -69,6 +69,8 @@ def load_stats(path):
             raise ValueError(f"line 1: duplicated required header column(s): {', '.join(duplicates)}")
         for row in reader:
             line = reader.line_num
+            if None in row:
+                raise ValueError(f"line {line}: row has more fields than the header")
             absent = [c for c in REQUIRED if row[c] is None]
             if absent:
                 raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")
@@ -165,7 +167,10 @@ def main():
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
         if os.path.isfile(src):
-            rows.append(shader_row(name, stage, st, src))
+            try:
+                rows.append(shader_row(name, stage, st, src))
+            except OSError as e:
+                sys.exit(f"{src}: {e.strerror or e}")
     if not rows:
         sys.exit("no shader is in both the statistics and the disasm folder")
     if "--details" in sys.argv:
@@ -199,4 +204,8 @@ def main():
 
 
 if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())
