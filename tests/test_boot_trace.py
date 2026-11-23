@@ -181,6 +181,15 @@ class BootTraceTests(unittest.TestCase):
         self.assertEqual(trace["bad_lines"], 1)
         self.assertEqual(trace["bad_line_numbers"], [len(STARTUP) + 1])
 
+    def test_deeply_nested_line_is_counted_not_fatal(self):
+        self.write(self.startup, STARTUP)
+        with open(self.startup, "a", encoding="utf-8") as f:
+            f.write("[" * 100000 + "]" * 100000 + "\n")
+        trace = bt.parse_startup(self.startup)
+        self.assertEqual(trace["events"], len(STARTUP))
+        self.assertEqual(trace["bad_lines"], 1)
+        self.assertEqual(trace["bad_line_numbers"], [len(STARTUP) + 1])
+
     def test_crlf_and_non_object_lines_are_counted(self):
         self.write(
             self.startup,
