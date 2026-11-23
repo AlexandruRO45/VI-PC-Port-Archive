@@ -184,6 +184,60 @@ class ProbeCliTests(unittest.TestCase):
                 pr.main(["--modes", "game_i0_d3,not_a_mode"])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_rejected_or_malformed_oracle_results_are_harness_errors(self):
+        class ShortResultOracle(FakeOracle):
+            def run(self, kernels):
+                return super().run(kernels)[:-1]
+
+        class ExtraResultOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                return res + [res[-1]]
+
+        class RejectedKernelOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                res[0] = "assembler rejected: invalid instruction"
+                return res
+
+        class TruncatedWordsOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                res[0] = res[0][:-1]
+                return res
+
+        class NoneResultOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                res[0] = None
+                return res
+
+        class DictWithoutWordsOracle(FakeOracle):
+            def run(self, kernels):
+                res = super().run(kernels)
+                res[0] = {}
+                return res
+
+        for oracle, expected_msg in (
+            (ShortResultOracle(), "the hardware runner returned 5 results for 6 kernels"),
+            (ExtraResultOracle(), "the hardware runner returned 7 results for 6 kernels"),
+            (RejectedKernelOracle(), "wave32 game_i0_d3 v_cvt_f64_i32: assembler rejected: invalid instruction"),
+            (NoneResultOracle(), "wave32 game_i0_d3 v_cvt_f64_i32: no result"),
+            (DictWithoutWordsOracle(), "wave32 game_i0_d3 v_cvt_f64_i32: no result"),
+            (TruncatedWordsOracle(), "wave32 game_i0_d3 v_cvt_f64_i32: expected 60 words, got 59"),
+        ):
+            with self.subTest(msg=expected_msg):
+                with tempfile.TemporaryDirectory() as work:
+                    report = os.path.join(work, "err.json")
+                    code, out, _err = run_main(["--modes", "game_i0_d3", "--waves", "32", "--json", report], oracle)
+                    self.assertEqual(code, 2)
+                    self.assertTrue(oracle.closed)
+                    self.assertIn(f"harness error: {expected_msg}", out)
+                    with open(report, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    self.assertEqual(len(data["harness_errors"]), 1)
+                    self.assertIn(expected_msg.split(": ")[-1], data["harness_errors"][0]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

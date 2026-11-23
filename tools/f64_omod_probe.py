@@ -173,12 +173,38 @@ def expected_words(plain, mod, kind, descriptor):
 
 
 def evaluate(modes, waves, meta, raw_results):
+    summary = {"total_cases": 0, "scaling_gated_on": 0, "scaling_gated_off": 0,
+               "scaling_changed_value": 0, "clamp_changed_value": 0,
+               "mismatches": 0, "wave_diffs": 0, "first_mismatches": [], "first_wave_diffs": [],
+               "harness_errors": []}
+    if len(raw_results) != len(meta):
+        summary["harness_errors"].append({
+            "error": f"the hardware runner returned {len(raw_results)} results for {len(meta)} kernels"})
+        return summary
+
     measured = {}
     for (wave, mode_name, op, kind, cases), result in zip(meta, raw_results):
-        words = [w & 0xFFFFFFFF for w in (result["words"] if isinstance(result, dict) else result)]
+        step = word_count(kind)
+        want_words = len(cases) * len(MODS) * step
+        if result is None or isinstance(result, str):
+            summary["harness_errors"].append({
+                "wave": wave, "mode": mode_name, "op": op,
+                "error": "no result" if result is None else result})
+            continue
+        raw_words = result.get("words") if isinstance(result, dict) else result
+        if raw_words is None or isinstance(raw_words, str):
+            summary["harness_errors"].append({
+                "wave": wave, "mode": mode_name, "op": op,
+                "error": "no result" if raw_words is None else raw_words})
+            continue
+        if len(raw_words) != want_words:
+            summary["harness_errors"].append({
+                "wave": wave, "mode": mode_name, "op": op,
+                "error": f"expected {want_words} words, got {len(raw_words)}"})
+            continue
+        words = [w & 0xFFFFFFFF for w in raw_words]
         # A 16-bit destination writes only bits [15:0]; the rest of the register is untouched residue.
         mask = 0xFFFF if kind == "f16" else 0xFFFFFFFF
-        step = word_count(kind)
         per_mod = {mod: [] for mod in MODS}
         index = 0
         for _ in cases:
@@ -187,10 +213,8 @@ def evaluate(modes, waves, meta, raw_results):
                 index += step
         measured[(wave, mode_name, op)] = (cases, per_mod)
 
-    summary = {"total_cases": 0, "scaling_gated_on": 0, "scaling_gated_off": 0,
-               "scaling_changed_value": 0, "clamp_changed_value": 0,
-               "mismatches": 0, "wave_diffs": 0, "first_mismatches": [], "first_wave_diffs": [],
-               "harness_errors": []}
+    if summary["harness_errors"]:
+        return summary
     for mode_name in modes:
         for op, _form, kind, cases in OPS:
             step = word_count(kind)
@@ -316,6 +340,14 @@ def main(argv=None) -> int:
     if args.json and not write_report(args.json, {
             "device": str(oracle.device), "arch": oracle.arch, "modes": modes, "waves": waves,
             "mods": list(MODS), "ops": [op for op, *_ in OPS], **summary}):
+        return 2
+
+    if summary["harness_errors"]:
+        for err in summary["harness_errors"][:5]:
+            if "wave" in err:
+                print(f"harness error: wave{err['wave']} {err['mode']} {err['op']}: {err['error']}")
+            else:
+                print(f"harness error: {err['error']}")
         return 2
 
     print(f"{summary['total_cases']} cases across {len(modes)} mode(s) x {len(MODS)} modifier forms "
