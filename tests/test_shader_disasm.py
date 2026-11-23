@@ -6,12 +6,17 @@ shader was reported "clean" (and make_game.py translated nothing). The probe now
 
     python -I tests/test_shader_disasm.py
 """
+import io
 import json
 import os
+import runpy
+import stat as stat_mod
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
@@ -179,6 +184,59 @@ class DisasmInputTest(unittest.TestCase):
     def write(self, name: str, data: bytes) -> None:
         with open(os.path.join(self.src, name), "wb") as f:
             f.write(data)
+
+    def test_skip_existing_rebuilds_a_listing_removed_before_metadata_read(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        listing = os.path.join(out, "one.s")
+        with open(listing, "w", encoding="utf-8", newline="\n") as f:
+            f.write("completed listing\n")
+
+        real_stat = os.stat
+
+        def stat(path, *, follow_symlinks=True, **kwargs):
+            if path == listing and not follow_symlinks:
+                os.unlink(listing)
+            return real_stat(path, follow_symlinks=follow_symlinks, **kwargs)
+
+        stdout = io.StringIO()
+        with (patch.object(os, "stat", stat),
+              patch.dict(os.environ, LLVM_MC=self.mc), patch.object(sys, "path", sys.path[:]),
+              patch.object(sys, "argv", [TOOL, self.src, "--out", out, "--skip-existing"]),
+              redirect_stdout(stdout), self.assertRaises(SystemExit) as exit_status):
+            runpy.run_path(TOOL, run_name="__main__")
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("'clean': 1", stdout.getvalue())
+        with open(listing, encoding="utf-8") as f:
+            self.assertIn("s_endpgm", f.read())
+
+    def test_skip_existing_rebuilds_a_symlinked_listing(self):
+        self.write("one.fssm", fssm())
+        out = os.path.join(self.dir, "out")
+        os.mkdir(out)
+        listing = os.path.join(out, "one.s")
+        with open(listing, "w", encoding="utf-8", newline="\n") as f:
+            f.write("completed listing\n")
+
+        real_stat = os.stat
+
+        def stat(path, *, follow_symlinks=True, **kwargs):
+            res = real_stat(path, follow_symlinks=follow_symlinks, **kwargs)
+            if path == listing and not follow_symlinks:
+                return os.stat_result((stat_mod.S_IFLNK | 0o777, *res[1:]))
+            return res
+
+        stdout = io.StringIO()
+        with (patch.object(os, "stat", stat),
+              patch.dict(os.environ, LLVM_MC=self.mc), patch.object(sys, "path", sys.path[:]),
+              patch.object(sys, "argv", [TOOL, self.src, "--out", out, "--skip-existing"]),
+              redirect_stdout(stdout), self.assertRaises(SystemExit) as exit_status):
+            runpy.run_path(TOOL, run_name="__main__")
+        self.assertEqual(exit_status.exception.code, 0)
+        self.assertIn("'clean': 1", stdout.getvalue())
+        with open(listing, encoding="utf-8") as f:
+            self.assertIn("s_endpgm", f.read())
 
     def test_skip_existing_only_reuses_published_nonempty_listings(self):
         for name in ("kept", "empty", "unfinished"):

@@ -13,6 +13,7 @@ Set LLVM_MC to llvm-mc's path, or to a whole command such as
 """
 import argparse
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -238,7 +239,12 @@ def main():
         pending = []
         for path in files:
             listing = output_path(path, out)
-            if not os.path.islink(listing) and os.path.isfile(listing) and os.path.getsize(listing) > 0:
+            # Check the type and size of the directory entry without following a symlink.
+            try:
+                metadata = os.stat(listing, follow_symlinks=False)
+            except OSError:
+                metadata = None
+            if metadata is not None and stat.S_ISREG(metadata.st_mode) and metadata.st_size > 0:
                 res["reused"] += 1
             else:
                 pending.append(path)
