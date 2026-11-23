@@ -170,5 +170,12 @@ class VMadI16OracleTests(unittest.TestCase):
         # -5 * -4 + (-10) = 20 - 10 = 10
         self.assertEqual(ref_mad_i16(u16(-5), u16(-4), u16(-10)), 10)
 
+class VMadI16AstTests(unittest.TestCase):
+    """AST modeling for v_mad_i16."""
+
+    def test_ast_emission(self):
+        node = Mul16AstNode("v_mad_i16", "v3", "v0", "v1", "v2")
+        self.assertEqual(node.emit_asm(), "v_mad_i16 v3, v0, v1, v2")
+
 if __name__ == "__main__":
     unittest.main()
