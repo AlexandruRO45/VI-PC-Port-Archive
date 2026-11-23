@@ -219,5 +219,22 @@ class TestVSadU32HardwareTranslator(unittest.TestCase):
         self.assertEqual(run_hw_sad_u32(200, 300, 50), 150)
 
 
+def ref_sad_u16(s0: int, s1: int, s2: int) -> int:
+    """Reference mathematical oracle for RDNA2 v_sad_u16."""
+    h0 = abs((s0 & 0xFFFF) - (s1 & 0xFFFF))
+    h1 = abs(((s0 >> 16) & 0xFFFF) - ((s1 >> 16) & 0xFFFF))
+    return ((s2 & MASK32) + h0 + h1) & MASK32
+
+
+class TestVSadU16Reference(unittest.TestCase):
+    """Reference oracle unit tests for v_sad_u16."""
+
+    def test_reference_canonical(self):
+        self.assertEqual(ref_sad_u16(0x00200064, 0x00100032, 5), 71)
+
+    def test_reference_zero_diff(self):
+        self.assertEqual(ref_sad_u16(0x12345678, 0x12345678, 100), 100)
+
+
 if __name__ == "__main__":
     unittest.main()
