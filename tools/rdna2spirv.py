@@ -392,7 +392,8 @@ class Gen:
     def emit(self, s):
         self.body.append("         " + s)
         if s.startswith("OpStore %active "):
-            assert not self.exec_static_true, f"OpStore %active emitted with exec_static_true: {s}"
+            if self.exec_static_true:
+                raise RuntimeError(f"OpStore %active emitted with exec_static_true: {s}")
             self._active_ssa = s.split()[2]
         elif s.endswith("= OpLabel"):
             self._active_ssa = None
@@ -15026,14 +15027,20 @@ def reachable_code(insns, code_end=None):
 
 
 def writes_exec(ins):
-    """Whether an instruction can change EXEC: v_cmpx, saveexec / wrexec, or EXEC as the destination (first operand
-    of everything but the compares, which only read it there)."""
+    """Whether an instruction can change EXEC: v_cmpx, saveexec / wrexec, or EXEC in any destination operand
+    (operand 0 of everything but compares, plus operand 1 of VOP3b two-destination ops like v_add_co_u32,
+    v_sub_co_u32, v_mad_u64_u32, and v_div_scale_f32 whose second operand is the scalar carry/flag destination)."""
     op, a = ins["op"], ins["args"]
-    if op.startswith("v_cmpx") or "saveexec" in op or "wrexec" in op:
+    bop = base_op(op)
+    if bop.startswith("v_cmpx") or "saveexec" in bop or "wrexec" in bop:
         return True
-    if op.startswith(("s_cmp_", "s_cmpk_", "s_bitcmp")):
+    if bop.startswith(("s_cmp_", "s_cmpk_", "s_bitcmp")):
         return False
-    return bool(a) and a[0]["k"] == "special" and a[0]["t"].startswith("exec")
+    if a and a[0]["k"] == "special" and a[0]["t"].startswith("exec"):
+        return True
+    if bop in VOP3_TWO_DESTS and len(a) > 1 and a[1]["k"] == "special" and a[1]["t"].startswith("exec"):
+        return True
+    return False
 
 
 def exec_changes_after_vm(blocks, succ):

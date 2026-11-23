@@ -260,6 +260,29 @@ class ActiveCacheTests(unittest.TestCase):
         self.assertNotEqual(b1, b2)
         self.assertEqual(sum(1 for ln in g.body if "= OpLoad %bool %active" in ln), 2)
 
+    def test_vop3b_carry_out_to_exec_disables_static_true(self):
+        """VOP3b two-destination ops (e.g. v_add_co_u32) whose second operand is EXEC must disable exec_static_true."""
+        lines = [
+            "v_mov_b32 v0, 5",
+            "v_mov_b32 v1, -1",
+            "v_add_co_u32 v2, exec_lo, v1, v0",
+            "exp mrt0 v0, v2, v2, v2 done vm",
+            "s_endpgm",
+        ]
+        spvasm = support.translate_lines("ps_vop3b_exec_carry", lines)
+        _validate_spirv(spvasm)
+        self.assertIn("OpStore %active ", spvasm)
+
+        # Also check writes_exec directly across VOP3_TWO_DESTS vs read-only EXEC sources.
+        vgpr = lambda r: {"k": "vgpr", "r": r, "n": 1}
+        sgpr = lambda r: {"k": "sgpr", "r": r, "n": 1}
+        ex = {"k": "special", "t": "exec_lo"}
+        for op in ("v_add_co_u32", "v_sub_co_u32_e64", "v_add_co_ci_u32_e64", "v_mad_u64_u32", "v_div_scale_f32"):
+            self.assertTrue(rdna2spirv.writes_exec({"op": op, "args": [vgpr(2), ex, vgpr(1), vgpr(0)]}), op)
+        # Reading exec_lo as a source operand in a normal op must NOT be treated as an EXEC write.
+        self.assertFalse(rdna2spirv.writes_exec({"op": "s_mov_b32", "args": [sgpr(0), ex]}))
+        self.assertFalse(rdna2spirv.writes_exec({"op": "s_and_b32", "args": [sgpr(0), ex, sgpr(1)]}))
+
 
 if __name__ == "__main__":
     unittest.main()
