@@ -586,5 +586,17 @@ class TestSBfmB64ASTInterpreter(unittest.TestCase):
         self.assertEqual(state.sgprs[3], 0xFF)
 
 
+class TestSBfmB64Bounds(unittest.TestCase):
+    """64-bit mask wrapping and boundary handling for s_bfm_b64."""
+
+    def test_width_and_offset_modulo_64(self):
+        # width 64 mod 64 = 0
+        self.assertEqual(ref_bfm_b64(64, 0), 0)
+        # width 63, offset 0 -> 0x7FFFFFFFFFFFFFFF
+        self.assertEqual(ref_bfm_b64(63, 0), 0x7FFFFFFF_FFFFFFFF)
+        # offset 64 mod 64 = 0
+        self.assertEqual(ref_bfm_b64(8, 64), 0xFF)
+
+
 if __name__ == "__main__":
     unittest.main()
