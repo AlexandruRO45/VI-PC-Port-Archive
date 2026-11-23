@@ -108,6 +108,15 @@ class HeapIndexCensus(unittest.TestCase):
         bases = {(r["base"], r["ptr"]) for r in g["loads"]}
         self.assertEqual(bases, {("system s[2:3]", "ptr64"), ("user s[0:1]", "ptr64")})
 
+    def test_descriptor_use_before_its_load_in_listing_order(self):
+        load = [("s_load_dwordx4 s[20:23], s[8:9], 0", 8), ("s_waitcnt lgkmcnt(0)", 4)]
+        use = [("buffer_load_dword v0, off, s[20:23], 0", 8), ("s_endpgm", 4)]
+        self.work.add("straight", "ps", SFI0_RES, load + use)
+        # Jump over the consumer to the load, then branch back to the consumer. Both shaders execute load, use, end.
+        self.work.add("reordered", "ps", SFI0_RES, [("s_branch 3", 4)] + use + load + [("s_branch -7", 4)])
+        rows = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]["loads"]
+        self.assertEqual(rows, [{"base": "user s[8:9]", "ptr": "ptr64", "role": "V#", "offset": "static", "count": 2}])
+
     def test_pointer_loaded_from_memory(self):
         self.work.add("ps_ld", "ps", 0, [
             ("s_mov_b32 s9, 0", 4),

@@ -269,6 +269,8 @@ def analyse(insns, stage, user_count):
                 work.append(s)
 
     loads = {}
+    # A reachable consumer can occur earlier in the listing than its producer.
+    roles_by_pc = defaultdict(set)
 
     def on_load(pc, op, lo, hi, off):
         rlo, dyn_lo = root(lo)
@@ -293,11 +295,11 @@ def analyse(insns, stage, user_count):
             offset = ("static", off[1])
         else:
             offset = ("dynamic", None)
-        loads[pc] = {"op": op, "base": base, "ptr": ptr, "offset": offset, "roles": set()}
+        loads[pc] = {"op": op, "base": base, "ptr": ptr, "offset": offset, "roles": roles_by_pc[pc]}
 
     def on_use(tag, role):
-        if tag is not None and tag[0] == "ld" and tag[2] == 0 and tag[1] in loads:
-            loads[tag[1]]["roles"].add(role)
+        if tag is not None and tag[0] == "ld" and tag[2] == 0:
+            roles_by_pc[tag[1]].add(role)
 
     for b in range(len(blocks)):
         if entry[b] is None:
