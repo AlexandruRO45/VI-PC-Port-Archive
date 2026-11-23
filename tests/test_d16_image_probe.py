@@ -4,7 +4,7 @@ when the oracle tools are present and the GPU is GFX10, and is skipped otherwise
 import io
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import struct
@@ -199,6 +199,18 @@ class Cli(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", str(TOOLS / "d16_image_probe.py"), *args],
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, args)
+
+    def test_a_json_that_cannot_be_written_is_one_error_line(self):
+        """A --json that names a folder, or whose folder does not exist, is refused before the sweep runs."""
+        with tempfile.TemporaryDirectory() as d:
+            for bad in (d, os.path.join(d, "missing", "r.json")):
+                err = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=FakeOracle()), \
+                        redirect_stdout(io.StringIO()), redirect_stderr(err):
+                    rc = ip.main(["--formats", "unorm8", "--waves", "32", "--json", bad])
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertIn("--json", err.getvalue())
+                self.assertNotIn("Traceback", err.getvalue())
 
 
 class OnHardware(unittest.TestCase):

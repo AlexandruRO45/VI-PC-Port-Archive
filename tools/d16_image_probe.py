@@ -42,8 +42,8 @@ Usage:
     python -I tools/d16_image_probe.py --self-test
 
 Exit 0 when the sweep ran (which rule the hardware follows is a finding), 1 when wave32 and wave64 disagree, 2 on a
-harness error (a control failed, a kernel without its words), 77 when the oracle is unavailable or the GPU is not
-GFX10. Nothing here reads game files.
+harness error (a control failed, a kernel without its words) or on a --json it cannot write, 77 when the oracle is
+unavailable or the GPU is not GFX10. Nothing here reads game files.
 """
 import argparse
 import json
@@ -369,6 +369,14 @@ def main(argv=None):
     if bad or not fmts or not 0 < a.frac < 1:
         ap.error("unknown or out of range: " + ", ".join(bad or ["--frac must be in (0, 1)"]))
     waves = [int(w) for w in a.waves.split(",")]
+    if a.json:
+        if os.path.isdir(a.json):
+            print(f"ERROR: --json is a folder: {a.json}", file=sys.stderr)
+            return 2
+        parent = os.path.dirname(os.path.abspath(a.json))
+        if not os.path.isdir(parent):
+            print(f"ERROR: --json folder does not exist: {parent}", file=sys.stderr)
+            return 2         # refused before the sweep, which takes the GPU for minutes
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -409,8 +417,12 @@ def main(argv=None):
     finally:
         oracle.close()
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        try:
+            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(report, f, indent=1)
+        except OSError as e:  # a locked or read-only report used to end the run in a traceback
+            print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return rc
 
 
