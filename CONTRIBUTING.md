@@ -47,10 +47,12 @@ methods are still open.
 - `loader_test` writes small PE images to a `leonida_loader_test` folder in `%TEMP%`. Antivirus that blocks newly
   written executables makes it stop with that reason; exclude the folder or set `LEONIDA_TEST_DIR` to one it skips.
 - Tool checks: `python -m compileall -q make_game.py tools tests`. The optional
-  `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module (and, for compute shaders, a
-  pipeline) for every translated shader and reports failures plus the saved cache path.
+  `vk_pipeline_check <spirv dir> [cache.bin] [--jobs N]` creates a module and a compute or graphics
+  pipeline for every translated shader (`--stage cs|graphics` narrows it) and reports failures plus the saved
+  cache path.
 - GPU tests are small hand-written RDNA2 programs in `runtime/test/shaders`. `build.py` there turns them into
-  SPIR-V (it needs `llvm-mc`, so WSL or a Linux container), and `check.py` runs them on your GPU and compares
+  SPIR-V (it needs an `llvm-mc` with AMDGPU support: a native Windows build from `scripts/build_llvm_mc.ps1`,
+  WSL or a Linux container), and `check.py` runs them on your GPU and compares
   the results. A new test gets its expected values in the comment at its top and a check in `check.py`.
   [docs/testing.md](docs/testing.md) has the setup per OS and the problems testers have run into.
 - Say what you tested and on which GPU in the pull request.
