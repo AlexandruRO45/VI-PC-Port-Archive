@@ -35,8 +35,10 @@ false, the shaders are translated with --f16-interp-fallback.
 fragment_shader_barycentric and mesh_shader are the fragmentShaderBarycentric and meshShader features themselves, each
 only where the device also lists its extension (VK_KHR_fragment_shader_barycentric, VK_EXT_mesh_shader), as the
 runtime checks: AMD's Windows driver (26.11.2) fills VkPhysicalDeviceMeshShaderFeaturesEXT with ones on an RX 5700 XT,
-which has no VK_EXT_mesh_shader. Where either is false, make_game.py translates with the fallback that stands in for it: --bary-fallback (a pass-through
-geometry shader feeds the raw barycentrics) and --mesh-compute (mesh shaders as compute shaders and a draw).
+which has no VK_EXT_mesh_shader. Both are null when the extension list can't be read (make_game.py then keeps the
+flags the last translation used). Where either is false, make_game.py translates with the fallback that stands in for
+it: --bary-fallback (a pass-through geometry shader feeds the raw barycentrics) and --mesh-compute (mesh shaders as
+compute shaders and a draw).
 
 max_push_constants_size is VkPhysicalDeviceProperties.limits.maxPushConstantsSize in bytes. The default shader
 contract uses 144 bytes (152 with --mesh-compute); where a device reports less (e.g. 128 on AMD's Windows driver for
@@ -189,20 +191,28 @@ def physical_devices(vk, instance):
     raise RuntimeError("vkEnumeratePhysicalDevices repeatedly returned VK_INCOMPLETE")
 
 
-def device_extensions(vk: ctypes.CDLL, device: ctypes.c_void_p) -> set[bytes]:
-    """Read one device's extension names, retrying if the list changed between calls."""
+def query_device_extensions(vk: ctypes.CDLL, device: ctypes.c_void_p) -> set[bytes] | None:
+    """Read one device's extension names, retrying if the list changed between calls; None when the driver's
+    enumeration fails, so a failure isn't read as a device without extensions."""
     for _ in range(3):
         count = ctypes.c_uint32()
         result = vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), None)
-        if result != 0 or not count.value:
-            break
+        if result != 0:
+            return None
+        if not count.value:
+            return set()
         props = (ExtensionProperties * count.value)()
         result = vk.vkEnumerateDeviceExtensionProperties(device, None, ctypes.byref(count), props)
         if result == 0:
             return {entry.extensionName for entry in props[:count.value]}
         if result != VK_INCOMPLETE:
-            break
-    return set()
+            return None
+    return None
+
+
+def device_extensions(vk: ctypes.CDLL, device: ctypes.c_void_p) -> set[bytes]:
+    """One device's extension names, empty when they can't be read."""
+    return query_device_extensions(vk, device) or set()
 
 
 MICROSOFT_VENDOR_ID = 0x1414   # Dozen and the Basic Render Driver; no native GPU driver uses it
@@ -299,13 +309,16 @@ def query(*, stage_caps=False) -> dict:
                 chosen_rank = rank
                 # A feature counts only with its extension listed: AMD's Windows driver fills
                 # VkPhysicalDeviceMeshShaderFeaturesEXT with ones on RDNA1, which has no VK_EXT_mesh_shader.
-                extensions = device_extensions(vk, d)
+                # None when the enumeration failed: both features are then unknown, not absent.
+                extensions = query_device_extensions(vk, d)
                 chosen = (dev_name,
                           subgroup.subgroupSize, subgroup.supportedStages, sg.minSubgroupSize, sg.maxSubgroupSize,
                           sg.requiredSubgroupSizeStages, sg.maxComputeWorkgroupSubgroups,
                           bool(u32(f13, F13_SUBGROUP_SIZE_CONTROL)),
                           bool(u32(bary, 16)) and u32(drv, 16) != VK_DRIVER_ID_MOLTENVK,
+                          None if extensions is None else
                           bool(u32(bary, 16)) and b"VK_KHR_fragment_shader_barycentric" in extensions,
+                          None if extensions is None else
                           bool(u32(mesh, MESH_FEATURES_MESH_SHADER)) and b"VK_EXT_mesh_shader" in extensions,
                           int.from_bytes(raw[PROPS_MAX_PUSH_CONSTANTS_SIZE:PROPS_MAX_PUSH_CONSTANTS_SIZE + 4], "little"),
                           int.from_bytes(raw[PROPS_VENDOR_ID:PROPS_VENDOR_ID + 4], "little"),

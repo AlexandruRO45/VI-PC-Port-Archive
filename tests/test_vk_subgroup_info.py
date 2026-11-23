@@ -845,6 +845,20 @@ class QueryTest(unittest.TestCase):
                 self.assertIs(res["fragment_shader_barycentric"], want_bary)
                 self.assertIs(res["mesh_shader"], want_mesh)
 
+    def test_failed_extension_query_leaves_the_features_unknown(self):
+        """An enumeration error isn't an empty extension list: both fields are None (make_game keeps the flags
+        of the last translation), where reading it as 'no extensions' turned both fallbacks on."""
+        device = FakeDevice(fragment_shader_barycentric=True, mesh_shader=True,
+                            extension_names=(b"VK_KHR_fragment_shader_barycentric", b"VK_EXT_mesh_shader"))
+        res, _vk = self._run_query(device)
+        self.assertEqual((res["fragment_shader_barycentric"], res["mesh_shader"]), (True, True))
+        out_of_host_memory = -1
+        with mock.patch.object(FakeVulkan, "_enumerate_device_extension_properties", return_value=out_of_host_memory):
+            res, _vk = self._run_query(device)
+        self.assertIsNone(res["fragment_shader_barycentric"])
+        self.assertIsNone(res["mesh_shader"])
+        self.assertEqual(res["device"], device.name)  # the rest of the answer is unaffected
+
     def test_stage_caps_preserve_graphics_stage_bits(self):
         supported = 0x01 | 0x08 | 0x10 | 0x20
         required = 0x10 | 0x20
