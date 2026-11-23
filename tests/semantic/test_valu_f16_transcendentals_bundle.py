@@ -285,6 +285,21 @@ class TestVExpF16SIMDAndIEEE(unittest.TestCase):
         res = ref_v_exp_f16(0x3C00)
         self.assertIsInstance(res, int)
 
+class TestVExpF16Translation(unittest.TestCase):
+    def test_spirv_emission(self) -> None:
+        if support is None or rdna2spirv is None:
+            self.skipTest("support/rdna2spirv not available")
+        lines = [
+            "v_mov_b32 v0, 0x3C00",
+            "v_exp_f16 v1, v0",
+            "exp mrt0, v1, v1, v1, v1 done",
+            "s_endpgm",
+        ]
+        spv = support.translate_lines("ps_bundle_v_exp_f16", lines)
+        self.assertIn("OpEntryPoint", spv)
+        words = support.mrt0_words(spv)
+        self.assertEqual(words[0] & MASK16, 0x4000)
+
 
 if __name__ == "__main__":
     unittest.main()
