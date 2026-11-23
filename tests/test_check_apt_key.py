@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import chdir
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -25,7 +26,11 @@ LLVM = "6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
 
 # A stand-in for `gpg --batch --show-keys --with-colons FILE`: prints FILE, or fails like gpg on a file starting "junk".
 FAKE_GPG = """import sys
-data = open(sys.argv[-1], encoding="utf-8").read()
+path = sys.argv[-1]
+if path.startswith("-"):
+    sys.stderr.write("gpg: expected a disk filename.\\n")
+    sys.exit(2)
+data = open(path, encoding="utf-8").read()
 if data.startswith("junk"):
     sys.stderr.write("gpg: no valid OpenPGP data found.\\n")
     sys.exit(2)
@@ -101,6 +106,14 @@ class CheckWithStandInGpg(unittest.TestCase):
         problem = check_apt_key.check(self.key(listing((WINEHQ, []))), WINEHQ,
                                       (os.path.join(self.dir, "no-such-gpg"),))
         self.assertIsNotNone(problem)
+
+    def test_relative_dash_prefixed_names_are_read_as_files(self):
+        with chdir(self.dir):
+            for name in ("-example.asc", "-"):
+                with self.subTest(name=name):
+                    with open(name, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(listing((WINEHQ, [])))
+                    self.assertIsNone(check_apt_key.check(name, WINEHQ, self.gpg))
 
 
 class CommandLine(unittest.TestCase):

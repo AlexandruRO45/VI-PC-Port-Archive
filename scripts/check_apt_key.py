@@ -42,7 +42,11 @@ def primary_fingerprints(colons):
 
 def show_keys(path, gpg=("gpg",)):
     """`gpg --show-keys --with-colons` output for the key file at `path` (it lists the file, importing nothing)."""
-    result = subprocess.run([*gpg, "--batch", "--show-keys", "--with-colons", path],
+    # GnuPG treats a bare "-" as stdin and other leading dashes as options.
+    keyfile = os.fsdecode(path)
+    if keyfile.startswith("-"):
+        keyfile = os.path.join(os.curdir, keyfile)
+    result = subprocess.run([*gpg, "--batch", "--show-keys", "--with-colons", keyfile],
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise ValueError(f"gpg could not read {path}: {result.stderr.strip() or 'exit ' + str(result.returncode)}")
