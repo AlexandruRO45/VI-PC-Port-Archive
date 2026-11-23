@@ -464,10 +464,14 @@ def _sample_track(values, frame, path):
         require(norm > 0.0 and math.isfinite(norm), "cannot interpolate an invalid rotation quaternion")
         return tuple(x / norm for x in q)
 
+    # A full clip stores these keys as float32. Near a 180-degree turn that
+    # rounding can change the dot's sign, so choose its playback arc before
+    # normalizing, using the same serialized endpoints as a glTF consumer.
+    a, b = (struct.unpack("<4f", struct.pack("<4f", *q)) for q in (a, b))
+    if sum(x * y for x, y in zip(a, b)) < 0.0:
+        b = tuple(-x for x in b)
     a, b = unit(a), unit(b)
     dot = sum(x * y for x, y in zip(a, b))
-    if dot < 0.0:
-        b, dot = tuple(-x for x in b), -dot
     if dot > 0.9995:
         return unit(tuple(x + amount * (y - x) for x, y in zip(a, b)))
     angle = math.acos(min(dot, 1.0))

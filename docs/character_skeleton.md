@@ -257,6 +257,9 @@ it does and why:
   Positive-duration exports include both window boundaries and the interior source frames:
   translation and scale boundaries use linear interpolation, and rotations use shortest-path
   quaternion interpolation, following [glTF's LINEAR sampler rules](https://registry.khronos.org/glTF/specs/2.0/glTF-2.0.html#interpolation).
+  Rotation boundaries use the serialized float32 source keys to choose that path; rounding can
+  otherwise make full and trimmed clips choose opposite arcs near a 180-degree turn. Exact source
+  frames retain their original float32 values.
 - The whole skeleton sits under one node that turns RAGE Z-up into glTF Y-up. Skinned mesh nodes
   sit at the scene root, because glTF ignores a skinned mesh node's own transform.
 
