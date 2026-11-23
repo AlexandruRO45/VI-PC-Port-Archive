@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -168,6 +169,11 @@ constexpr std::size_t linear_surface_size(std::uint32_t width, std::uint32_t hei
 namespace detail {
 
 template <std::uint32_t Bpe>
+struct Element {
+    std::byte raw[Bpe];
+};
+
+template <std::uint32_t Bpe>
 void detile_typed(std::span<const std::byte> tiled, std::span<std::byte> linear,
                   std::uint32_t blocks_w, std::uint32_t blocks_h, std::uint32_t tiles_x) {
     constexpr const auto& lut = []() constexpr -> const auto& {
@@ -180,20 +186,25 @@ void detile_typed(std::span<const std::byte> tiled, std::span<std::byte> linear,
 
     constexpr std::uint32_t tile_w = lut.tile_w;
     constexpr std::uint32_t tile_h = lut.tile_h;
+    constexpr std::uint32_t shift_w = std::countr_zero(tile_w);
+    constexpr std::uint32_t mask_w = tile_w - 1;
+    constexpr std::uint32_t shift_h = std::countr_zero(tile_h);
+    constexpr std::uint32_t mask_h = tile_h - 1;
 
     for (std::uint32_t y = 0; y < blocks_h; ++y) {
-        const std::uint32_t ty = y / tile_h;
-        const std::uint16_t intra_y = lut.lut_y[y % tile_h];
+        const std::uint32_t ty = y >> shift_h;
+        const std::uint16_t intra_y = lut.lut_y[y & mask_h];
         const std::size_t macro_y_base = static_cast<std::size_t>(ty) * tiles_x * tile_size_in_bytes;
-        const std::size_t linear_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        std::size_t linear_off = static_cast<std::size_t>(y) * blocks_w * Bpe;
 
         for (std::uint32_t x = 0; x < blocks_w; ++x) {
-            const std::uint32_t tx = x / tile_w;
-            const std::uint16_t intra_x = lut.lut_x[x % tile_w];
+            const std::uint32_t tx = x >> shift_w;
+            const std::uint16_t intra_x = lut.lut_x[x & mask_w];
             const std::size_t tiled_off = macro_y_base + static_cast<std::size_t>(tx) * tile_size_in_bytes + (intra_x | intra_y);
-            const std::size_t linear_off = linear_row + static_cast<std::size_t>(x) * Bpe;
 
-            std::memcpy(&linear[linear_off], &tiled[tiled_off], Bpe);
+            *reinterpret_cast<Element<Bpe>*>(&linear[linear_off]) =
+                *reinterpret_cast<const Element<Bpe>*>(&tiled[tiled_off]);
+            linear_off += Bpe;
         }
     }
 }
@@ -211,20 +222,25 @@ void tile_typed(std::span<const std::byte> linear, std::span<std::byte> tiled,
 
     constexpr std::uint32_t tile_w = lut.tile_w;
     constexpr std::uint32_t tile_h = lut.tile_h;
+    constexpr std::uint32_t shift_w = std::countr_zero(tile_w);
+    constexpr std::uint32_t mask_w = tile_w - 1;
+    constexpr std::uint32_t shift_h = std::countr_zero(tile_h);
+    constexpr std::uint32_t mask_h = tile_h - 1;
 
     for (std::uint32_t y = 0; y < blocks_h; ++y) {
-        const std::uint32_t ty = y / tile_h;
-        const std::uint16_t intra_y = lut.lut_y[y % tile_h];
+        const std::uint32_t ty = y >> shift_h;
+        const std::uint16_t intra_y = lut.lut_y[y & mask_h];
         const std::size_t macro_y_base = static_cast<std::size_t>(ty) * tiles_x * tile_size_in_bytes;
-        const std::size_t linear_row = static_cast<std::size_t>(y) * blocks_w * Bpe;
+        std::size_t linear_off = static_cast<std::size_t>(y) * blocks_w * Bpe;
 
         for (std::uint32_t x = 0; x < blocks_w; ++x) {
-            const std::uint32_t tx = x / tile_w;
-            const std::uint16_t intra_x = lut.lut_x[x % tile_w];
+            const std::uint32_t tx = x >> shift_w;
+            const std::uint16_t intra_x = lut.lut_x[x & mask_w];
             const std::size_t tiled_off = macro_y_base + static_cast<std::size_t>(tx) * tile_size_in_bytes + (intra_x | intra_y);
-            const std::size_t linear_off = linear_row + static_cast<std::size_t>(x) * Bpe;
 
-            std::memcpy(&tiled[tiled_off], &linear[linear_off], Bpe);
+            *reinterpret_cast<Element<Bpe>*>(&tiled[tiled_off]) =
+                *reinterpret_cast<const Element<Bpe>*>(&linear[linear_off]);
+            linear_off += Bpe;
         }
     }
 }
