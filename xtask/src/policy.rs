@@ -2033,6 +2033,56 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A TMPDIR is unseen when any directory above it is ignored, however
+    /// deep: `/outer/` covers `outer/deep/er`, and a negation under it
+    /// (`!/outer/deep/`) re-includes nothing, since git never looks inside
+    /// an ignored directory. `**/nested/**` ignores what is in `sub/nested`,
+    /// though not `sub/nested` itself, and is enough; `scratch/**`, with a
+    /// slash before its end, is anchored to the top and leaves `sub/scratch`
+    /// visible, so that is refused. Under
+    /// `core.ignoreCase=true` the rule `/UPPER/` ignores `upper`, as the
+    /// full check reads it; without it, `upper` is visible and refused.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_ignored_ancestors_and_case() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["config", "core.ignoreCase", "false"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/outer/\n!/outer/deep/\nscratch/**\n**/nested/**\n/UPPER/\n",
+        )
+        .unwrap();
+        let deep = root.join("outer/deep/er");
+        let scratch = root.join("sub/scratch");
+        let nested = root.join("sub/nested");
+        let upper = root.join("upper");
+        let visible = root.join("visible");
+        for dir in [&deep, &scratch, &nested, &upper, &visible] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [visible.clone(), upper.clone(), deep.clone()]);
+        assert_eq!(tmp.path().parent(), Some(deep.as_path()));
+        let tmp_nested = tempdir_in_first(root, [scratch.clone(), nested.clone()]);
+        assert_eq!(tmp_nested.path().parent(), Some(nested.as_path()));
+        for dir in [&visible, &upper, &scratch] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+
+        git_str(root, &["config", "core.ignoreCase", "true"]);
+        let tmp_upper = tempdir_in_first(root, [visible.clone(), upper.clone()]);
+        assert_eq!(tmp_upper.path().parent(), Some(upper.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_nested.path(), tmp_upper.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "visible/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
