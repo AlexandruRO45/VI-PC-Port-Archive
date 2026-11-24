@@ -70,8 +70,12 @@ pub(crate) enum C {
     CopyBackUs,
     SrvMaterializations,
     SrvMaterializationUs,
+    /// Questions for written pages shared by several host copies' ranges in
+    /// one private reservation, and the ranges they answered.
+    SharedSpans,
+    SharedRanges,
 }
-const COUNTERS: usize = C::SrvMaterializationUs as usize + 1;
+const COUNTERS: usize = C::SharedRanges as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -230,6 +234,8 @@ pub(crate) fn log(frames: f64) {
         copyback_ms = ms(value(C::CopyBackUs)),
         srv_materializations = value(C::SrvMaterializations),
         srv_materialization_ms = ms(value(C::SrvMaterializationUs)),
+        shared_spans = value(C::SharedSpans),
+        shared_ranges = value(C::SharedRanges),
         "shadow traffic per frame"
     );
     let RefreshStats { ranges, failed } = REFRESH

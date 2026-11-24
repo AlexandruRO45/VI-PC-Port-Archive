@@ -1375,6 +1375,89 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 
 /// Refresh live mirrored SRVs after deferred title writes and before
 /// GPU work. Retain the resources until the submission has finished.
+/// Brings host copies' ready ranges up to date. Ranges of several copies
+/// that lie close together in one private reservation (the world has many
+/// small title buffers placed side by side) share one question for written
+/// pages; the rest goes through each copy's own grouping
+/// (`Shadow::update_ready`).
+fn refresh_across(per: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) -> usize {
+    use crate::watch::PAGE;
+    const SPAN_GAP: usize = 1 << 20;
+    #[cfg(feature = "diagnostics")]
+    {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var_os("VICTORY_NO_SHARED_SPANS").is_some());
+        if off {
+            return per.iter().map(|(s, r)| s.update_ready(r)).sum();
+        }
+    }
+    let mut flat: Vec<(usize, usize, usize)> = per
+        .iter()
+        .enumerate()
+        .flat_map(|(i, (_, r))| r.iter().map(move |&(a, e)| (a, e, i)))
+        .collect();
+    flat.sort_unstable();
+    let mut rest: Vec<Vec<(usize, usize)>> = vec![Vec::new(); per.len()];
+    let mut copied = 0;
+    let mut at = 0;
+    // The last reservation looked up: ranges in it need no new question
+    // (each is a system call, under Wine a round trip).
+    let mut last: Option<crate::watch::Allocation> = None;
+    while at < flat.len() {
+        let (lo, mut hi, first) = flat[at];
+        let page = lo / PAGE * PAGE;
+        if !last.is_some_and(|a| a.is_live() && a.start <= page && page < a.end) {
+            last = crate::watch::allocation(page);
+        }
+        let reservation = last.filter(|a| a.is_private_span(lo, hi));
+        let (mut next, mut shared) = (at + 1, false);
+        if let Some(a) = reservation {
+            while next < flat.len()
+                && flat[next].0 <= hi + SPAN_GAP
+                && a.is_private_span(lo, flat[next].1.max(hi))
+            {
+                hi = hi.max(flat[next].1);
+                shared |= flat[next].2 != first;
+                next += 1;
+            }
+        }
+        let group = &flat[at..next];
+        let answer = (shared && group.iter().all(|&(_, _, i)| !per[i].0.not_watched()))
+            .then(|| {
+                let after = group
+                    .iter()
+                    .map(|&(a, e, i)| per[i].0.floor(a, e))
+                    .min()
+                    .unwrap_or(u64::MAX);
+                crate::watch::grouped_writes(lo, hi, after, reservation)
+            })
+            .flatten();
+        if let Some((now, written)) = answer {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::SharedSpans, 1);
+                add(C::SharedRanges, group.len() as u64);
+            }
+            for &(a, e, i) in group {
+                let k = written.partition_point(|&(page, _)| page < a / PAGE);
+                copied += per[i].0.answered(a, e, now, &written[k..]);
+            }
+        } else {
+            for &(a, e, i) in group {
+                rest[i].push((a, e));
+            }
+        }
+        at = next;
+    }
+    for (i, ranges) in rest.iter().enumerate() {
+        if !ranges.is_empty() {
+            copied += per[i].0.update_ready(ranges);
+        }
+    }
+    copied
+}
+
 fn refresh_direct_srvs(
     heaps: &[ViewHeapUse],
     sampled: Option<&SampledRanges>,
@@ -1404,13 +1487,15 @@ fn refresh_direct_srvs(
     let snapshots = with_srv_ranges(&selection, |snapshots| {
         let mut current: Option<&Arc<crate::shadow::Shadow>> = None;
         let mut uncovered = Vec::new();
+        // Each copy's ready ranges, refreshed together below.
+        let mut per: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         #[cfg(feature = "diagnostics")]
         let (mut requested, mut visits, mut remaining) = (0usize, 0u64, 0usize);
         visit_direct_ranges(snapshots, |shadow, from, to| {
             if let Some(previous) = current
                 && !Arc::ptr_eq(previous, shadow)
             {
-                copied += previous.update_ranges(&uncovered);
+                per.push((previous.clone(), previous.ready(&uncovered)));
                 uncovered.clear();
             }
             current = Some(shadow);
@@ -1428,8 +1513,9 @@ fn refresh_direct_srvs(
             }
         });
         if let Some(shadow) = current {
-            copied += shadow.update_ranges(&uncovered);
+            per.push((shadow.clone(), shadow.ready(&uncovered)));
         }
+        copied += refresh_across(&per);
         #[cfg(feature = "diagnostics")]
         {
             add(C::DirectRanges, visits);
