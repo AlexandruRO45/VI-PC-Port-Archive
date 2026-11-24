@@ -3894,6 +3894,75 @@ mod tests {
     }
 
     #[test]
+    fn full_semantic_tables_are_read_to_their_last_entry() {
+        let n = MAX_SEMANTICS as usize;
+        // Each table at its limit ends exactly where its count is stored.
+        assert_eq!(PS_INPUTS + 8 * n, PS_INPUT_COUNT);
+        assert_eq!(VS_INPUTS + 5 * n, VS_INPUT_COUNT);
+        assert_eq!(VS_OUTPUTS + 6 * n, VS_OUTPUT_COUNT);
+
+        // 32 pixel inputs, input k in row k read as attribute 31 - k.
+        let mut ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        for k in 0..n {
+            let attr = (n - 1 - k) as u8;
+            ps[e + PS_INPUTS + 8 * k..][..8].copy_from_slice(&[6, k as u8, 0xf, attr, 0, 0, 0, 0]);
+        }
+        ps[e + PS_INPUT_COUNT..][..4].copy_from_slice(&MAX_SEMANTICS.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&ps))])).unwrap()[0];
+        let StageIo::Ps { inputs, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert_eq!(inputs.len(), n);
+        assert_eq!((inputs[n - 1].row, inputs[n - 1].attr), (31, 0));
+
+        // 32 vertex inputs, x-w of input k in v4 + 4k, and 32 outputs,
+        // output k param 31 - k in row k.
+        let mut vs = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let e = stage_data_at(&vs, HwStage::Vs);
+        let regs = e - RECORD_SIZE as usize + RECORD_REGS;
+        vs[regs..][..4].copy_from_slice(&256u32.to_le_bytes());
+        for k in 0..n {
+            let vgpr = 4 + 4 * k as u8;
+            vs[e + VS_INPUTS + 5 * k..][..5].copy_from_slice(&[6, k as u8, 0xf, vgpr, 0]);
+            let param = (n - 1 - k) as u8;
+            vs[e + VS_OUTPUTS + 6 * k..][..6].copy_from_slice(&[6, k as u8, param, 0, 0, 0]);
+        }
+        for count_at in [VS_INPUT_COUNT, VS_OUTPUT_COUNT] {
+            vs[e + count_at..][..4].copy_from_slice(&MAX_SEMANTICS.to_le_bytes());
+        }
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&vs))])).unwrap()[0];
+        let StageIo::Vs { inputs, outputs } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert_eq!((inputs.len(), outputs.len()), (n, n));
+        assert_eq!((inputs[n - 1].row, inputs[n - 1].vgpr), (31, 128));
+        assert_eq!((outputs[n - 1].row, outputs[n - 1].param), (31, 0));
+
+        // A mesh program reads the same 32 outputs, the odd ones
+        // per-primitive: rows repeat across the two signatures only.
+        let mut ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        for k in 0..n {
+            let param = k as u8 | if k % 2 == 1 { 0x80 } else { 0 };
+            let row = (k / 2) as u8;
+            ms[e + VS_OUTPUTS + 6 * k..][..6].copy_from_slice(&[6, row, param, 0, 0, 0]);
+        }
+        ms[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&MAX_SEMANTICS.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&ms))])).unwrap()[0];
+        let StageIo::Ms(m) = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        assert_eq!(m.outputs.len(), n);
+        assert_eq!((m.outputs[n - 1].row, m.outputs[n - 1].param), (15, 0x9F));
+
+        // The last entry is checked like the others: a 32nd output reusing
+        // the first's parameter is refused.
+        ms[e + VS_OUTPUTS + 6 * (n - 1) + 2] = 0x80;
+        assert_eq!(refused_blob(&xbch(&ms)), "vertex outputs share a parameter");
+    }
+
+    #[test]
     fn merged_stages_read_no_stage_data() {
         // Merged stages keep their stage data in another layout: bytes that
         // would be refused as vertex or pixel data are not read at all.
