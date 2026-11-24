@@ -741,6 +741,8 @@ static FUNCTIONS: Table<24> = {
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
+mod dump;
+#[cfg(windows)]
 mod library;
 #[cfg(windows)]
 mod make;
