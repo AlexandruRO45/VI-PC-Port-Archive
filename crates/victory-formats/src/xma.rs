@@ -1512,4 +1512,186 @@ mod tests {
             assert!(errors == 0 && snr > 40.0);
         }
     }
+
+    /// The frame reader takes bits MSB first across byte boundaries, signs
+    /// `n`-bit fields from their top bit, reads zeros past the data and
+    /// reports an overread only once it has passed `end`.
+    #[test]
+    fn bits_read_msb_first_and_zero_past_the_data() {
+        let data = [0b1010_1100, 0b0101_0011, 0xff, 0x00, 0x81];
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: data.len() * 8,
+        };
+        assert_eq!(b.read(0), 0);
+        assert_eq!(b.consumed(), 0);
+        assert!(b.bit());
+        assert!(!b.bit());
+        assert_eq!(b.read(5), 0b10110);
+        // Crosses into the second byte: 0 then 0101.
+        assert_eq!(b.read(5), 0b00101);
+        assert_eq!(b.consumed(), 12);
+        // 0011 1111 -> as 8-bit signed, positive.
+        assert_eq!(b.signed(8), 0b0011_1111);
+        // 1111 0000 -> -16.
+        assert_eq!(b.signed(8), -16);
+        // 32 bits from a bit offset: 0000 1000 0001 then zeros past the end.
+        assert_eq!(b.consumed(), 28);
+        assert_eq!(b.peek32(), 0b0000_1000_0001 << 20);
+        assert_eq!(b.read(32), 0b0000_1000_0001 << 20);
+        assert_eq!(b.consumed(), 60);
+        assert!(b.overread());
+        assert_eq!(b.read(32), 0);
+
+        // `end` is the last bit that may be read, not one past it.
+        let mut b = Bits {
+            data: &data,
+            pos: 0,
+            end: 7,
+        };
+        b.read(7);
+        assert!(!b.overread());
+        b.read(1);
+        assert!(b.overread());
+
+        // Every width reads back what `put_bits` wrote, at every bit offset.
+        for n in 1..=32u32 {
+            for at in 0..8 {
+                let value = 0xdead_beefu32 >> (32 - n);
+                let mut data = [0u8; 8];
+                put_bits(&mut data, at, n, value);
+                let mut b = Bits {
+                    data: &data,
+                    pos: at,
+                    end: 64,
+                };
+                assert_eq!(b.read(n), value, "{n} bits at {at}");
+                let mut b = Bits {
+                    data: &data,
+                    pos: at,
+                    end: 64,
+                };
+                let signed = ((value << (32 - n)) as i32) >> (32 - n);
+                assert_eq!(b.signed(n), signed, "{n} signed bits at {at}");
+            }
+        }
+    }
+
+    /// Every Huffman table is a complete prefix code, so any 32 bits decode
+    /// to a symbol, and each symbol reads back from its own code. The
+    /// symbol offsets match FFmpeg's (`scale` centred on 0, `vec4`/`vec2`
+    /// counting the escape as -1).
+    #[test]
+    fn huffman_tables_are_complete_prefix_codes() {
+        let c = codes();
+        let tables: [(&str, &Vlc, usize); 7] = [
+            ("scale", &c.scale, SCALE.len()),
+            ("scale_rl", &c.scale_rl, SCALE_RL.len()),
+            ("coef0", &c.coef[0], COEF0_SYMS.len()),
+            ("coef1", &c.coef[1], COEF1.len()),
+            ("vec4", &c.vec4, VEC4_SYMS.len()),
+            ("vec2", &c.vec2, VEC2.len()),
+            ("vec1", &c.vec1, VEC1.len()),
+        ];
+        for (name, vlc, len) in tables {
+            assert_eq!(vlc.codes.len(), len, "{name}");
+            let mut kraft = 0u64;
+            for w in vlc.codes.windows(2) {
+                assert!(w[0].0 < w[1].0, "{name}: codes in order");
+            }
+            for &(code, n, symbol) in &vlc.codes {
+                assert!((1..=32).contains(&n), "{name}: length {n}");
+                assert_eq!(
+                    code as u64 & ((1u64 << (32 - n)) - 1),
+                    0,
+                    "{name}: code is left-aligned"
+                );
+                kraft += 1 << (32 - n);
+                // The code itself, then all ones under it: both decode to
+                // this symbol and consume exactly its length.
+                for tail in [0, (1u64 << (32 - n)) - 1] {
+                    let bytes = ((code as u64 | tail) as u32).to_be_bytes();
+                    let mut b = Bits {
+                        data: &bytes,
+                        pos: 0,
+                        end: 32,
+                    };
+                    assert_eq!(vlc.read(&mut b), symbol, "{name}");
+                    assert_eq!(b.consumed(), n as usize, "{name}");
+                }
+            }
+            assert_eq!(kraft, 1 << 32, "{name}: complete code");
+        }
+        let symbols = |v: &Vlc| v.codes.iter().map(|c| c.2).collect::<Vec<_>>();
+        let scale = symbols(&c.scale);
+        assert_eq!(*scale.iter().min().unwrap(), -60);
+        assert_eq!(*scale.iter().max().unwrap(), SCALE.len() as i32 - 61);
+        assert_eq!(*symbols(&c.vec4).iter().min().unwrap(), -1);
+        assert_eq!(*symbols(&c.vec2).iter().min().unwrap(), -1);
+    }
+
+    /// `ff_wma_get_large_val`: 0, 10, 110 and 111 prefixes select 8, 16,
+    /// 24 and 31 value bits.
+    #[test]
+    fn large_values_take_8_16_24_or_31_bits() {
+        for (prefix, plen, n) in [
+            (0u32, 1u32, 8u32),
+            (0b10, 2, 16),
+            (0b110, 3, 24),
+            (0b111, 3, 31),
+        ] {
+            let value = 0x5a5a_5a5au32 >> (32 - n);
+            let mut data = [0u8; 8];
+            put_bits(&mut data, 0, plen, prefix);
+            put_bits(&mut data, plen as usize, n, value);
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end: 64,
+            };
+            assert_eq!(large_value(&mut b), value, "{n} bits");
+            assert_eq!(b.consumed(), (plen + n) as usize);
+        }
+    }
+
+    /// Small helpers: `log2` floors and treats 0 as 1, `to_i16` rounds and
+    /// saturates, and the sine windows rise from near 0 to near 1 with
+    /// `w[i]² + w[n-1-i]² = 1` (the Princen-Bradley condition).
+    #[test]
+    fn log2_samples_and_windows() {
+        for (v, l) in [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (3, 1),
+            (4, 2),
+            (511, 8),
+            (512, 9),
+            (usize::MAX, usize::BITS - 1),
+        ] {
+            assert_eq!(log2(v), l, "log2({v})");
+        }
+        assert_eq!(to_i16(0.0), 0);
+        assert_eq!(to_i16(0.5), 16384);
+        assert_eq!(to_i16(-1.0), -32768);
+        assert_eq!(to_i16(1.0), 32767);
+        assert_eq!(to_i16(-2.0), -32768);
+        assert_eq!(to_i16(1e30), 32767);
+        assert_eq!(to_i16(f32::NAN), 0);
+        assert_eq!(to_i16(1.4 / 32768.0), 1);
+        assert_eq!(to_i16(-1.6 / 32768.0), -2);
+        for (i, w) in windows().iter().enumerate() {
+            let n = 128 << i;
+            assert_eq!(w.len(), n);
+            assert!(w[0] > 0.0 && w[0] < 0.02 && w[n - 1] > 0.9999 && w[n - 1] <= 1.0);
+            for k in 0..n {
+                if k > 0 {
+                    assert!(w[k] > w[k - 1]);
+                }
+                let sum = w[k] * w[k] + w[n - 1 - k] * w[n - 1 - k];
+                assert!((sum - 1.0).abs() < 1e-6, "window {n} at {k}");
+            }
+        }
+    }
 }
