@@ -1099,6 +1099,41 @@ unsafe extern "system" fn write_marker(list: &List, address: u64, value: u32, fl
     if let Err(error) = result { state.error = error.code(); }
 }
 
+// GTA reads mips of GPU-only textures back to the CPU through this entry:
+// (dest address, source address, byte count, flags). Both are guest GPU
+// virtual addresses, so the copy becomes a buffer-to-buffer region copy over
+// the imported guest pages.
+unsafe extern "system" fn copy_address(list: &List, dest: u64, source: u64, bytes: u32, flags: u32) {
+    let mut state = recording(list);
+    if !state.can_record(&list.native) { return; }
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    crate::diagnostics::log_once(&FIRST, || format!(
+        "slot 62 address copy dest={dest:#x} source={source:#x} bytes={bytes} flags={flags:#x}"));
+    if bytes == 0 { return; }
+    let result = (|| -> windows::core::Result<bool> {
+        let owner = parent(&list.parent);
+        let (Some(dst), dst_va) = (unsafe { device::command_buffer_address(owner, dest, bytes.into())? }) else { return Ok(false) };
+        let (Some(src), src_va) = (unsafe { device::command_buffer_address(owner, source, bytes.into())? }) else { return Ok(false) };
+        raytracing::retain(&state, &[&dst, &src])?;
+        let dst_offset = dst_va - unsafe { dst.GetGPUVirtualAddress() };
+        let src_offset = src_va - unsafe { src.GetGPUVirtualAddress() };
+        unsafe { list.native.CopyBufferRegion(&dst, dst_offset, &src, src_offset, bytes.into()) };
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {}
+        Ok(false) => {
+            static SKIPPED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&SKIPPED, || format!(
+                "slot 62 address copy skipped: unmapped dest={dest:#x} or source={source:#x}"));
+        }
+        Err(error) => {
+            static FAILED: std::sync::Once = std::sync::Once::new();
+            crate::diagnostics::log_once(&FAILED, || format!("slot 62 address copy failed: {:?}", error.code()));
+        }
+    }
+}
+
 static LIST_SLOTS: Slots<149> = {
     let mut slots = child_slots::<ID3D12GraphicsCommandList, ListData, 149>();
     slots[8] = crate::slot!(get_type);
@@ -1143,6 +1178,7 @@ static LIST_SLOTS: Slots<149> = {
     slots[54] = crate::slot!(depth::clear_uav::<true>);
     slots[55] = crate::slot!(discard);
     slots[59] = crate::slot!(execute_indirect);
+    slots[62] = crate::slot!(copy_address);
     slots[67] = crate::slot!(flush_texture_cache);
     slots[68] = crate::slot!(graphics::depth_bounds);
     slots[71] = crate::slot!(write_marker);
