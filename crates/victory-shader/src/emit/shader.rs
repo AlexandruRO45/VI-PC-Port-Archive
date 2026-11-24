@@ -25,6 +25,9 @@ pub(crate) mod flags {
     pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// 64-bit atomics on typed resources, and on ones from the descriptor heap.
+    pub const ATOMIC_INT64_TYPED: u64 = 1 << 27;
+    pub const ATOMIC_INT64_HEAP: u64 = 1 << 32;
 }
 
 pub(crate) struct Types {
@@ -718,6 +721,12 @@ impl Shader {
         }
         if self.flags & flags::SAMPLER_HEAP != 0 {
             features |= 0x400_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_TYPED != 0 {
+            features |= 0x40_0000;
+        }
+        if self.flags & flags::ATOMIC_INT64_HEAP != 0 {
+            features |= 0x1000_0000;
         }
         let sfi0 = features.to_le_bytes();
         let signature = |elements: &[SigElement], input| {
