@@ -1233,7 +1233,7 @@ impl<'a> Lower<'a> {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
             }
-            Operand::Const(c) => crate::resource::inline(c)
+            Operand::Const(c) => crate::gfx10::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
             Operand::Literal(x) => Ok(self.s.m.i32(x)),
@@ -2361,7 +2361,7 @@ impl<'a> Lower<'a> {
                 }
                 Some(op) if h == 0 => l.operand(inst, op),
                 Some(Operand::Const(k)) => {
-                    let x = crate::resource::inline(*k).ok_or("a special operand")?;
+                    let x = crate::gfx10::inline(*k).ok_or("a special operand")?;
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
                 }
                 _ => Ok(l.s.m.i32(0)),
@@ -4152,13 +4152,17 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
+                let why = "a select on an untracked mask";
+                let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+                    return Err(why);
                 };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
+                let lo = inst.read(Reg::S(code)).ok_or(why)?;
+                let hi = if self.x.native.wave64 {
+                    Some(inst.read(Reg::S(code + 1)).ok_or(why)?)
+                } else {
+                    None
+                };
+                let m = self.x.st.mask_bits(lo, hi).ok_or(why)?;
                 let cond = self.boolean(m, c)?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -4203,6 +4207,13 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                if let Some(scalar) = inst.writes.first().and_then(|w| self.x.st.spills.get(&w.1)) {
+                    let r = match *scalar {
+                        crate::ir::ScalarDword::Const(x) => self.s.m.i32(x),
+                        crate::ir::ScalarDword::Value(x) => self.i32_of(x)?,
+                    };
+                    return int(self, r);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -4287,7 +4298,7 @@ impl<'a> Lower<'a> {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }
             Operand::Const(k @ 128..=208) => {
-                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let x = crate::gfx10::inline(k).ok_or("a special operand")?;
                 Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
             }
             _ => {
@@ -5092,7 +5103,7 @@ impl<'a> Lower<'a> {
                 };
                 let sel = match v.src.get(2) {
                     Some(&Operand::Literal(x)) => x,
-                    Some(&Operand::Const(k)) => crate::resource::inline(k).ok_or(name)?,
+                    Some(&Operand::Const(k)) => crate::gfx10::inline(k).ok_or(name)?,
                     _ => {
                         // A computed selector: each byte picked at run time.
                         let (a, b, sv) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -7035,6 +7046,38 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    #[test]
+    fn selects_use_masks_restored_from_vgpr_lanes() {
+        for wave64 in [false, true] {
+            let mut words = vec![
+                0xD4C2_0002,
+                0x0002_0080, // v_cmp_eq_u32 s2 (or s[2:3]), 0, v0
+                0xD761_0002,
+                0x0001_0602, // v_writelane_b32 v2, s2, 3
+            ];
+            if wave64 {
+                words.extend([0xD761_0002, 0x0001_0803]); // v_writelane_b32 v2, s3, 4
+            }
+            words.extend([0xD760_0004, 0x0001_0702]); // v_readlane_b32 s4, v2, 3
+            if wave64 {
+                words.extend([0xD760_0005, 0x0001_0902]); // v_readlane_b32 s5, v2, 4
+            }
+            words.extend([
+                0xD501_0001,
+                0x0011_0280, // v_cndmask_b32 v1, 0, 1, s4 (or s[4:5])
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            let mut lowered = lower_wave(&words, vec![], vec![], wave64).unwrap();
+            if let Ok(mut validator) = super::super::validator::Validator::load(
+                super::super::validator::Validator::default_path().as_deref(),
+            ) {
+                validator.validate(&mut lowered.dxil).unwrap();
+            }
+        }
     }
 
     /// Root parameter `slot` in user SGPRs from `user_data` on.

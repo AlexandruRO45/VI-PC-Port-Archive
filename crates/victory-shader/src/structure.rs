@@ -21,7 +21,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, ScalarDword, VCC, Value};
 
 /// A per-lane boolean: a node of [`Bools`]. Equal functions are equal nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -353,6 +353,8 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// Scalar lane reads whose VGPR value is a proven scalar spill.
+    pub(crate) spills: HashMap<Value, ScalarDword>,
 }
 
 impl Structured {
@@ -395,6 +397,7 @@ struct Lanes<'a> {
     defs: Map<Value, (usize, usize)>,
     /// Block and index of each phi value.
     phis: Map<Value, (usize, usize)>,
+    spills: HashMap<Value, ScalarDword>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
     unresolved: HashSet<Value>,
     b: Bools,
@@ -460,6 +463,20 @@ impl<'a> Lanes<'a> {
                 }
             }
         }
+        let spills = blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|i| i.name() == "v_readlane_b32")
+            .filter_map(|i| {
+                let scalar = crate::ir::restored_scalar(
+                    i,
+                    p.wave64,
+                    |v| defs.get(&v).map(|&(b, i)| &blocks[b].insts[i]),
+                    |v| phis.get(&v).map(|&(b, i)| &blocks[b].phis[i]),
+                )?;
+                Some((i.writes.first()?.1, scalar))
+            })
+            .collect();
         Ok(Lanes {
             p,
             order,
@@ -467,6 +484,7 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
+            spills,
             unresolved: HashSet::new(),
             b: Bools::new(),
             masks: Map::default(),
@@ -632,8 +650,13 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
+            spills: self.spills,
             bools: self.b,
             exits,
             guards,
@@ -673,6 +696,17 @@ impl<'a> Lanes<'a> {
         }
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
+        }
+        // A lane restored from a scalar spill has the original mask's
+        // lane bit, even if that VGPR lane is now outside EXEC.
+        if let (Some(&ScalarDword::Value(lo)), Some(&ScalarDword::Value(hi))) =
+            (self.spills.get(&k.0), self.spills.get(&k.1))
+        {
+            let (m, derived) = self.mask((lo, hi));
+            if derived {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
         }
         let p = self.p;
         let (m, derived) = match self.join(k) {

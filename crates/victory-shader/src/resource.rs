@@ -13,8 +13,8 @@
 //! parameters, by data flow: copies, phis that agree, and additions.
 
 use crate::ShaderError;
-use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::gfx10::{Fields, NULL, Operand, inline};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, ScalarDword as Moved, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
@@ -394,7 +394,17 @@ impl<'a> Tracer<'a> {
                 }
                 for inst in &block.insts {
                     for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        let new = match copy_source(inst, k).or_else(|| {
+                            crate::ir::restored_scalar(
+                                inst,
+                                self.p.wave64,
+                                |v| self.def(v),
+                                |v| {
+                                    let (b, i) = self.phis[v.0 as usize]?;
+                                    Some(&self.p.blocks[b].phis[i])
+                                },
+                            )
+                        }) {
                             Some(Moved::Const(c)) => Some(Term::Const(c)),
                             Some(Moved::Value(s)) => o[s.0 as usize],
                             None => Some(Term::Value(v)),
@@ -1597,84 +1607,6 @@ impl<'a> Tracer<'a> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
-    Const(u32),
-    Value(Value),
-}
-
-impl Tracer<'_> {
-    /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
-    /// lane, found by following the VGPR's `v_writelane_b32` writes.
-    fn restored(&self, inst: &Inst) -> Option<Moved> {
-        let Fields::Valu(v) = &inst.fields else {
-            return None;
-        };
-        if inst.name() != "v_readlane_b32" {
-            return None;
-        }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
-            return None;
-        };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
-    }
-
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
-    }
-}
-
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
-    match op {
-        Operand::Const(c) => inline(c),
-        Operand::Literal(x) => Some(x),
-        _ => None,
-    }
-}
-
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -1704,25 +1636,6 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
                 ((low as i32) >> 31) as u32
             }))
         }
-        _ => None,
-    }
-}
-
-/// The 32-bit value of an inline constant operand.
-pub(crate) fn inline(code: u8) -> Option<u32> {
-    let float = |f: f32| Some(f.to_bits());
-    match code {
-        128..=192 => Some(u32::from(code) - 128),
-        193..=208 => Some((192 - i32::from(code)) as u32),
-        240 => float(0.5),
-        241 => float(-0.5),
-        242 => float(1.0),
-        243 => float(-1.0),
-        244 => float(2.0),
-        245 => float(-2.0),
-        246 => float(4.0),
-        247 => float(-4.0),
-        248 => Some(0x3E22_F983),
         _ => None,
     }
 }

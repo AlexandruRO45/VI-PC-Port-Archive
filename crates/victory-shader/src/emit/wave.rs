@@ -306,7 +306,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
-                Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
+                Operand::Const(c) => one(crate::gfx10::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
             }
@@ -319,7 +319,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 continue;
             };
             let l = match *lane {
-                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Const(c) => crate::gfx10::inline(c),
                 Operand::Literal(x) => Some(x),
                 _ => None,
             };
@@ -412,7 +412,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 // Lanes of each row read the other row of their half; lane
                 // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
-                    Some(&Operand::Const(c)) => crate::resource::inline(c),
+                    Some(&Operand::Const(c)) => crate::gfx10::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
@@ -496,7 +496,7 @@ fn constant(inst: &Inst) -> Option<u64> {
     };
     match *src.first()? {
         Operand::Const(c) => {
-            let x = crate::resource::inline(c)?;
+            let x = crate::gfx10::inline(c)?;
             Some(if (x as i32) < 0 {
                 u64::MAX
             } else {
