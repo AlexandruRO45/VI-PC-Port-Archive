@@ -3411,6 +3411,9 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
     assert!(in_a != 0 && in_b != 0 && u.is_sparse(in_a) && u.is_sparse(in_b), "XMem graphics buffers must live in sparse VRAM");
 
     // 3. Coherent Window 3 allocations: spilled root argument table + output buffer + io/res
+    // a block first, so the table's address has nonzero low bits whatever ran before: the
+    // scalar loads must not add s0 to it (their SOFFSET is NULL, 0x7D; an encoded 0 is s0)
+    let _ahead = u.alloc(0x1_0000, 256).unwrap();
     let arg_table = u.alloc(0x1_0000, 256).unwrap() as usize;
     let out_buf = u.alloc(0x1_0000, 256).unwrap() as usize;
     let io_buf = u.alloc(0x1_0000, 256).unwrap() as usize;
@@ -3434,10 +3437,10 @@ fn gpu_sparse_vram_descriptors_buffers_and_xmem() {
 
     // Translate + DXC-compile RDNA2 compute shader (4 windows, 32-bit descriptor table with hi = 0)
     let p = prog(&[
-        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0)], None), // s[0:1] -> Window 3 root arg table
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 20), ("SBASE", 0), ("OFFSET", 0), ("SOFFSET", 0x7D)], None), // s[0:1] -> Window 3 root arg table
         ("S_MOV_B32", "ENC_SOP1", &[("SDST", 5), ("SSRC0", 128)], None), // s5 = 0 (32-bit descriptor table pointer)
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
-        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 2), ("OFFSET", 0), ("SOFFSET", 0x7D)], None), // s[4:5] + 0 -> Window 0 sparse desc slot 0
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 2), ("OFFSET", 32), ("SOFFSET", 0x7D)], None), // s[4:5] + 32 -> Window 0 sparse desc slot 1
         ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("VDATA", 1), ("VADDR", 0), ("SRSRC", 2), ("SOFFSET", 128), ("IDXEN", 1)], None),
         ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", 20), ("VSRC1", 1)], None),
         ("BUFFER_STORE_DWORD", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 3), ("SOFFSET", 128), ("IDXEN", 1)], None),
