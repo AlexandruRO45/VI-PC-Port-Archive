@@ -188,16 +188,24 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
 pub(super) unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
-    let mut used_dynamic = false;
-    let create = |desc| if stream {
+    create_graphics_pso_tracked_with(desc, ppv, || dynamic_depth_bias_supported(this), |desc| if stream {
         real::dev_create_graphics_pso_stream(this, desc, riid, ppv)
     } else {
         real::dev_create_graphics_pso(this, desc, riid, ppv)
-    };
+    })
+}
+
+pub(super) unsafe fn create_graphics_pso_tracked_with(
+    desc: *const c_void,
+    ppv: *mut *mut c_void,
+    dynamic_supported: impl Fn() -> bool,
+    create: impl Fn(*const c_void) -> HRESULT,
+) -> HRESULT {
+    let mut used_dynamic = false;
     let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
         let already_dynamic = rd32(&orig.0, PSO_FLAGS) & FLAG_DYNAMIC_DEPTH_BIAS != 0;
-        let want_dynamic = !already_dynamic && rd32(&orig.0, SO_ENTRIES) == 0 && dynamic_depth_bias_supported(this);
+        let want_dynamic = !already_dynamic && rd32(&orig.0, SO_ENTRIES) == 0 && dynamic_supported();
         if want_dynamic {
             let mut dyn_desc = orig;
             enable_dynamic_depth_bias(&mut dyn_desc.0);

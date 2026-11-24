@@ -5195,6 +5195,18 @@ unsafe fn put<T>(to: &mut T, from: &[u8]) {
     std::ptr::copy_nonoverlapping(from.as_ptr(), to as *mut T as *mut u8, n);
 }
 
+/// Dispatch the decoded stream through the same tracked graphics path as a plain graphics PSO.
+fn dispatch_stream_pipeline(
+    pipeline: StreamPipeline,
+    graphics: impl FnOnce(*const c_void) -> HRESULT,
+    compute: impl FnOnce(*const c_void) -> HRESULT,
+) -> Option<HRESULT> {
+    match pipeline {
+        StreamPipeline::Graphics(d) => Some(graphics(&*d as *const _ as *const c_void)),
+        StreamPipeline::Compute(d) => Some(compute(&*d as *const _ as *const c_void)),
+        StreamPipeline::Unknown => None,
+    }
+}
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
@@ -5209,10 +5221,12 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
     } else if let Some(hr) = translated {
         return hr;
     }
-    match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return super::device_x::create_graphics_pso_tracked(this, &*d as *const _ as *const c_void, riid, ppv, true),
-        StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
-        StreamPipeline::Unknown => {}
+    if let Some(hr) = dispatch_stream_pipeline(
+        stream_pipeline(desc),
+        |d| super::device_x::create_graphics_pso_tracked(this, d, riid, ppv, true),
+        |d| dev_create_compute_pso(this, d, riid, ppv),
+    ) {
+        return hr;
     }
     let hr = finish_pso(this, f, desc, riid, ppv);
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
@@ -5904,6 +5918,33 @@ mod fallback_stream_tests {
         stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &u32::MAX);
         assert_eq!(stream.shader_bytes(), 18);
         assert_ne!(stream.0.len(), stream.shader_bytes(), "the stream stores bytecode descriptors, not code");
+    }
+
+    #[test]
+    fn graphics_stream_dispatches_to_tracked_creation() {
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC { SampleMask: 0x1234_5678, ..Default::default() };
+        let dummy_pso = 0x7e57_8760usize as *mut c_void;
+        let mut out = std::ptr::null_mut();
+        let out_ptr = &mut out as *mut *mut c_void;
+        let calls = std::cell::Cell::new(0);
+        let result = dispatch_stream_pipeline(
+            StreamPipeline::Graphics(Box::new(desc)),
+            |p| unsafe {
+                super::super::device_x::create_graphics_pso_tracked_with(p, out_ptr, || false, |sent| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!((*(sent as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC)).SampleMask, 0x1234_5678);
+                    *out_ptr = dummy_pso;
+                    0
+                })
+            },
+            |_| panic!("graphics stream must not use compute creation"),
+        );
+        assert_eq!(result, Some(0));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out, dummy_pso);
+        assert!(super::super::device_x::base_depth_bias_info(dummy_pso as usize).is_some());
+        super::super::device_x::forget_base(dummy_pso as usize);
+        assert_eq!(dispatch_stream_pipeline(StreamPipeline::Unknown, |_| panic!(), |_| panic!()), None);
     }
 
     /// A stream whose SizeInBytes ends inside its last subobject's payload (a VS subobject with
