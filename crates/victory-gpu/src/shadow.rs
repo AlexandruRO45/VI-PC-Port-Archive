@@ -544,20 +544,68 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
+const LOOSE_MAX_COUNT: usize = 64;
+const LOOSE_MAX_BYTES: u64 = 256 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+#[derive(Default)]
+struct Loose {
+    entries: BTreeMap<(u64, u64), (u64, Arc<Shadow>)>,
+    clock: u64,
+}
+
+impl Loose {
+    fn trim(&mut self, count: usize, bytes: u64) -> Vec<Arc<Shadow>> {
+        let mut cold: Vec<_> = self.entries.iter()
+            .filter(|(_, (_, v))| Arc::strong_count(v) == 1)
+            .map(|(&key, (used, _))| (*used, key)).collect();
+        cold.sort_unstable();
+        let mut total: u64 = self.entries.keys().map(|&(_, len)| len).sum();
+        let mut released = Vec::new();
+        for (_, key) in cold {
+            if self.entries.len() <= count && total <= bytes { break; }
+            let (_, copy) = self.entries.remove(&key).unwrap();
+            released.push(copy);
+            total -= key.1;
+        }
+        if !released.is_empty() { changed(); }
+        released
+    }
+}
+
+static LOOSE: Mutex<Loose> = Mutex::new(Loose { entries: BTreeMap::new(), clock: 0 });
+
+/// VA reuse makes old loose windows stale. Active lists keep their own Arc.
+pub(crate) fn evict_loose(first: usize, len: usize) {
+    if len == 0 { return; }
+    let end = first.saturating_add(len) as u64;
+    let mut cache = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let keys: Vec<_> = cache.entries.keys().copied()
+        .filter(|&(a, n)| a < end && (first as u64) < a.saturating_add(n)).collect();
+    let released: Vec<_> = keys.iter().filter_map(|k| cache.entries.remove(k)).collect();
+    if !released.is_empty() { changed(); }
+    drop(cache);
+    drop(released);
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let len = end.checked_next_multiple_of(WINDOW)?.checked_sub(start)?;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    map.clock = map.clock.wrapping_add(1);
+    let now = map.clock;
+    if let Some((used, shadow)) = map.entries.get_mut(&(start, len)) {
+        *used = now;
         return Some(shadow.clone());
     }
+    let total: u64 = map.entries.keys().map(|&(_, n)| n).sum();
+    let released = if map.entries.len() >= LOOSE_MAX_COUNT || total.saturating_add(len) > LOOSE_MAX_BYTES {
+        map.trim(48, (192u64 << 20).min(LOOSE_MAX_BYTES.saturating_sub(len)))
+    } else { Vec::new() };
+    // Drop detached copies after releasing the cache lock: their trackers
+    // can acquire the change journal mutex.
+    drop(map);
+    drop(released);
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // SAFETY: a live buffer.
@@ -568,7 +616,11 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
-    map.insert((start, len), shadow.clone());
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, existing)) = map.entries.get(&(start, len)) {
+        return Some(existing.clone());
+    }
+    map.entries.insert((start, len), (now, shadow.clone()));
     changed();
     Some(shadow)
 }
@@ -659,7 +711,7 @@ fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Every host copy of title memory made so far (buffers and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
     let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).entries.values().map(|(_, s)| s.clone()));
     all
 }
 
@@ -674,8 +726,8 @@ pub(crate) fn near(va: u64) -> String {
         LOOSE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .entries.values()
+            .map(|(_, s)| (s.gpu, s.start, s.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();

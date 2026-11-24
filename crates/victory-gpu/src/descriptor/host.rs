@@ -355,9 +355,18 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
+        let end = at.saturating_add(n).min(self.dynamic) as usize;
+        let mut old = Vec::new();
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(held) = kept.get_mut(first as usize..self.count as usize + end) {
+                old.extend(held.iter_mut().filter_map(Option::take));
+            }
             slots.fill(false);
+        }
+        drop(guard);
+        if !old.is_empty() {
+            crate::host::retire(old);
         }
     }
 
@@ -483,7 +492,8 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
+            drop(kept);
+            if let Some(old) = old {
                 crate::host::retire(old);
             }
         }
@@ -516,9 +526,9 @@ impl HostHeap {
     }
 
     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
-    /// resource view and a raw unordered access view of the first `bytes`
-    /// (a multiple of 4) of `buffer`, which they hold; null views for no
-    /// buffer.
+    /// resource view and raw unordered access view. These page-table-only
+    /// slots borrow the buffer: submission pins keep it live until the fence,
+    /// and the table is rebuilt before using a stale slot.
     pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
         let Some(host) = host() else { return };
         // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
@@ -555,8 +565,8 @@ impl HostHeap {
             host.device
                 .CreateUnorderedAccessView(buffer, None, Some(&uav), self.cpu(index + 1));
         }
-        self.keep(index, buffer.map(|b| (b.clone(), None)));
-        self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
+        self.keep(index, None);
+        self.keep(index + 1, None);
         self.write_stride(index, 4);
         self.write_stride(index + 1, 4);
     }
@@ -1455,9 +1465,13 @@ mod tests {
             heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
             assert_eq!(references(&buffer), 2, "ours and the slot's");
             heap.make_null(slot);
-            assert!(references(&buffer) >= 2, "the slot's, retired");
-            crate::host::release_retired();
-            assert_eq!(references(&buffer), 1, "ours");
+            assert_eq!(references(&buffer), 1, "idle retirement releases immediately");
+            let separate = HostHeap::new(false, 4).unwrap();
+            let slot = separate.dynamic(1).unwrap();
+            separate.raw_view_at(slot, Some(&buffer), 0, 256, false);
+            assert_eq!(references(&buffer), 2, "ours and the dynamic slot's");
+            separate.release(slot, 1);
+            assert_eq!(references(&buffer), 1, "free dynamic slots hold no resource");
         }
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();

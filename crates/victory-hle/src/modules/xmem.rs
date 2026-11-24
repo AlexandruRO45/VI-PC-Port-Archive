@@ -7,6 +7,8 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod lazy;
+
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
@@ -21,7 +23,7 @@ use windows_sys::Win32::System::Memory::{
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
-    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc2,
 };
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
@@ -136,23 +138,40 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
-    // SAFETY: the title's own arguments, cleaned of console bits; the
-    // parameter points at `requirements`, which outlives the call.
-    let at = unsafe {
-        VirtualAlloc2(
-            GetCurrentProcess(),
-            base,
-            size,
-            kind,
-            protect,
-            if constrained {
-                &mut parameter
-            } else {
-                std::ptr::null_mut()
-            },
-            constrained.into(),
-        )
+    let mut reserve = |kind| {
+        // SAFETY: cleaned title arguments; parameter and requirements live through this call.
+        unsafe {
+            VirtualAlloc2(GetCurrentProcess(), base, size, kind, protect,
+                if constrained { &mut parameter } else { std::ptr::null_mut() },
+                constrained.into())
+        }
     };
+    let eligible = !placeholder && kind & MEM_COMMIT != 0 && size >= lazy::MIN
+        && matches!(protect, PAGE_READWRITE | windows_sys::Win32::System::Memory::PAGE_READONLY)
+        && lazy::enabled();
+    let mut at = std::ptr::null_mut();
+    if eligible && constrained {
+        let reserved = reserve(kind & !MEM_COMMIT);
+        if !reserved.is_null() {
+            if lazy::register(reserved as usize, size, protect) {
+                at = reserved;
+            } else {
+                VirtualFree(reserved, 0, MEM_RELEASE);
+            }
+        }
+    } else if eligible && kind & MEM_RESERVE == 0 && lazy::register(base as usize, size, protect) {
+        at = base;
+    }
+    if at.is_null() {
+        if !constrained && kind & MEM_COMMIT != 0 {
+            lazy::explicit(base as usize, size, 0, || {
+                at = reserve(kind);
+                !at.is_null()
+            });
+        } else {
+            at = reserve(kind);
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -289,10 +308,20 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
-    // shortcut: the host heap's addresses lie above 2^40, unlike the
-    // console's; nothing seen builds ray-tracing structures in this memory
-    // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
-    // reservation below 2^40 if one does.
+    if size >= lazy::MIN && layout.align() <= 64 << 10 && lazy::enabled() {
+        let align = layout.align();
+        let base = heap_reserve(layout.size()).cast::<u8>();
+        if !base.is_null() {
+            // SAFETY: original VA is at least 64 KiB aligned; the header
+            // commits only the first chunk. The rest stays untouched.
+            unsafe {
+                let user = base.add(align);
+                user.sub(HEADER).cast::<[usize; 2]>().write([layout.size(), align | 1]);
+                return user.cast();
+            }
+        }
+    }
+    // Small default allocations keep the host allocator.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
@@ -318,11 +347,17 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            let n = windows_sys::Win32::System::Memory::VirtualQuery(address, &mut info, size_of_val(&info));
+            heap_release(address, if n == 0 { 0 } else { info.RegionSize });
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & 1 != 0 {
+            heap_release(user.sub(align & !1).cast(), size);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -813,7 +848,7 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    if !VirtualAlloc(base as *mut c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
         return true;
     }
     let error = std::io::Error::last_os_error();
@@ -978,7 +1013,58 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+extern "system" fn VirtualAlloc(at: *mut c_void, len: usize, kind: u32, protection: u32) -> *mut c_void {
+    // SAFETY: forwarded unchanged from the title.
+    let alloc = || unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(at, len, kind, protection) };
+    if at.is_null() || kind & MEM_COMMIT == 0 {
+        return alloc();
+    }
+    let mut result = std::ptr::null_mut();
+    lazy::explicit(at as usize, len, 0, || {
+        result = alloc();
+        !result.is_null()
+    });
+    result
+}
+
+extern "system" fn VirtualFree(at: *mut c_void, len: usize, kind: u32) -> BOOL {
+    lazy::explicit(at as usize, len, kind, || {
+        // SAFETY: forwarded unchanged; serialize against the VEH.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(at, len, kind) != 0 }
+    }).into()
+}
+
+extern "system" fn VirtualQueryEx(process: HANDLE, at: *const c_void, out: *mut MEMORY_BASIC_INFORMATION, len: usize) -> usize {
+    // SAFETY: forwarded unchanged from the title.
+    let n = unsafe { windows_sys::Win32::System::Memory::VirtualQueryEx(process, at, out, len) };
+    // SAFETY: successful query filled a whole record at `out`.
+    if n >= size_of::<MEMORY_BASIC_INFORMATION>() && process == unsafe { GetCurrentProcess() } {
+        lazy::logical_query(at as usize, unsafe { &mut *out });
+    }
+    n
+}
+
+pub(super) extern "system" fn heap_reserve(bytes: usize) -> *mut c_void {
+    XMemVirtualAlloc(std::ptr::null_mut(), bytes, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE)
+}
+
+pub(super) extern "system" fn heap_release(base: *mut c_void, bytes: usize) {
+    if VirtualFree(base, 0, MEM_RELEASE) != 0 {
+        victory_gpu::title_memory_remapped(base as usize, bytes);
+    }
+}
+
+pub(crate) fn host_memory_module() -> HleModule {
+    HleModule {
+        name: "memory",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+        exports: vec![hle_export!(VirtualAlloc), hle_export!(VirtualFree), hle_export!(VirtualQueryEx)],
+    }
+}
+
 pub(crate) fn module() -> HleModule {
+    victory_gpu::on_kernel_write(lazy::before_write);
+    victory_gpu::on_lazy_reserved(lazy::overlaps);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],
@@ -1060,8 +1146,7 @@ mod tests {
             )
         };
         assert_eq!(watched, 0);
-        // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
         assert_eq!(query(p).flags, 0);
         // No address field: above the 32-bit range and below 2^40, where
         // the console keeps it.
@@ -1074,8 +1159,7 @@ mod tests {
         );
         assert!(!p.is_null() && (p as usize) >= 1 << 32, "{p:p}");
         assert!((p as usize) + (16 << 30) <= 1 << 40, "{p:p}");
-        // SAFETY: our own reservation.
-        assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
+        assert_ne!(VirtualFree(p, 0, MEM_RELEASE), 0);
     }
 
     #[test]

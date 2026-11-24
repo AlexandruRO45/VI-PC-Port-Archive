@@ -200,7 +200,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
         None => guard.0 = Some(crate::host::host()?.new_list().ok()?),
     }
     let list = guard.0.as_ref()?;
-    let mut recorded = false;
+    let mut buffers = Vec::new();
     let mut done = std::collections::HashSet::new();
     for viewed in heaps {
         // Held while uploading: the title releasing a texture (and its
@@ -213,9 +213,9 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
             let Some(texture) = crate::resource::host_resource(r as This) else {
                 continue;
             };
-            if crate::texture::upload_changed(list, r as This, texture) {
+            if let Some(buffer) = crate::texture::upload_changed(list, r as This, texture) {
+                buffers.push(buffer);
                 crate::list::ensure_state(list, r as This, SHADER_RESOURCE);
-                recorded = true;
                 #[cfg(feature = "diagnostics")]
                 UPLOADED.fetch_add(1, Relaxed);
             }
@@ -223,7 +223,7 @@ pub(crate) fn uploads(heaps: &[Arc<Viewed>]) -> Option<Uploads> {
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    (!buffers.is_empty()).then_some(Uploads(guard, buffers))
 }
 
 /// The upload list, used under its lock only.
@@ -233,7 +233,10 @@ pub(crate) struct Holder(Option<HostList>);
 unsafe impl Send for Holder {}
 
 /// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+pub(crate) struct Uploads(
+    std::sync::MutexGuard<'static, Holder>,
+    #[allow(dead_code)] Vec<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
+);
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {

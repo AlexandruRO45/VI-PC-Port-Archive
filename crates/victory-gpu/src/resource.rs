@@ -561,11 +561,22 @@ pub(crate) struct Memory {
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+    reservation: Option<(NonNull<u8>, usize, ReleaseHeap)>,
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
+
+type ReserveHeap = extern "system" fn(usize) -> *mut c_void;
+type ReleaseHeap = extern "system" fn(*mut c_void, usize);
+static HEAP_RESERVATION: std::sync::OnceLock<(ReserveHeap, ReleaseHeap)> = std::sync::OnceLock::new();
+
+/// Runtime-backed heaps must be zero-filled on first touch and releasable
+/// by the original reservation base, not the aligned address we expose.
+pub fn use_heap_reservation(reserve: ReserveHeap, release: ReleaseHeap) {
+    let _ = HEAP_RESERVATION.set((reserve, release));
+}
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
@@ -624,6 +635,7 @@ impl Memory {
             ptr,
             layout,
             attributes: Some(attributes),
+            reservation: None,
         })
     }
 
@@ -634,6 +646,21 @@ impl Memory {
 
     pub(crate) fn address(&self) -> u64 {
         self.ptr.as_ptr() as u64
+    }
+
+    fn for_heap(info: AllocationInfo) -> Result<Memory, HRESULT> {
+        let Some(&(reserve, release)) = HEAP_RESERVATION.get().filter(|_| info.size >= 2 << 20) else {
+            return Self::new(info);
+        };
+        let layout = Layout::from_size_align(info.size as usize, info.alignment as usize).map_err(|_| E_INVALIDARG)?;
+        let bytes = layout.size().checked_add(layout.align() - 1).ok_or(E_INVALIDARG)?;
+        let base = NonNull::new(reserve(bytes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        let Some(at) = (base.as_ptr() as usize).checked_next_multiple_of(layout.align()) else {
+            release(base.as_ptr().cast(), bytes);
+            return Err(E_OUTOFMEMORY);
+        };
+        Ok(Self { ptr: NonNull::new(at as *mut u8).unwrap(), layout, attributes: None,
+            reservation: Some((base, bytes, release)) })
     }
 
     fn new(info: AllocationInfo) -> Result<Memory, HRESULT> {
@@ -649,12 +676,17 @@ impl Memory {
             ptr,
             layout,
             attributes: None,
+            reservation: None,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        if let Some((base, bytes, release)) = self.reservation.take() {
+            release(base.as_ptr().cast(), bytes);
+            return;
+        }
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -693,7 +725,7 @@ pub(crate) extern "system" fn create_heap(
         size: desc.size,
         alignment: desc.alignment.max(KIB_64),
     };
-    let memory = match Memory::new(info) {
+    let memory = match Memory::for_heap(info) {
         Ok(memory) => memory,
         Err(hr) => return hr,
     };
@@ -1425,6 +1457,9 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+        }
+        if let Some(copy) = self.host.take() {
+            crate::host::retire(copy);
         }
     }
 }
