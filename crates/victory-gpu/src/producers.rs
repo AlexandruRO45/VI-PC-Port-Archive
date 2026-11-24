@@ -10,7 +10,8 @@
 //! a reader that runs reading one of them, with the shader that was dropped.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::descriptor::View;
 
@@ -48,14 +49,20 @@ impl Target {
 
 struct Write {
     what: Target,
-    writer: String,
+    /// Shared: a read that finds it clones it.
+    writer: Arc<str>,
     frame: u64,
 }
 
 const MAX_WRITES: usize = 8192;
 
 static WRITES: Mutex<VecDeque<Write>> = Mutex::new(VecDeque::new());
-static SEEN: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+/// Whether [`WRITES`] holds anything (stored with it locked): a read checks
+/// this first, so the common case, nothing dropped, takes no lock.
+static PENDING: AtomicBool = AtomicBool::new(false);
+/// A (reader, dropped writer) pair already logged.
+type Pair = (String, Arc<str>);
+static SEEN: Mutex<Option<HashSet<Pair>>> = Mutex::new(None);
 
 thread_local! {
     /// The pipeline the draw or dispatch being bound on this thread runs.
@@ -93,21 +100,34 @@ fn target_of(view: &View) -> Option<Target> {
     }
 }
 
+/// Forgets what dropped work wrote before the frame before `frame` (the
+/// last presented): that is history, the title has moved on.
+fn prune(writes: &mut VecDeque<Write>, frame: u64) {
+    writes.retain(|w| w.frame + 2 > frame);
+}
+
+/// Notes whether `writes` (the locked [`WRITES`]) holds anything, for
+/// [`read`]'s check before the lock.
+fn settle(writes: &VecDeque<Write>) {
+    PENDING.store(!writes.is_empty(), Ordering::Relaxed);
+}
+
+/// Notes what dropped work `writer` would have written.
 fn record(what: Target, writer: &str) {
     let frame = crate::queue::presented();
     let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    // What the frame before last dropped is history: the title has moved on.
-    writes.retain(|w| w.frame + 2 > frame);
+    prune(&mut writes, frame);
     if writes.len() >= MAX_WRITES {
         writes.pop_front();
     }
-    if !writes.iter().any(|w| w.what == what && w.writer == writer) {
+    if !writes.iter().any(|w| w.what == what && &*w.writer == writer) {
         writes.push_back(Write {
             what,
-            writer: writer.to_owned(),
+            writer: writer.into(),
             frame,
         });
     }
+    settle(&writes);
 }
 
 /// Dropped work `writer` would have written through `view`.
@@ -131,8 +151,12 @@ pub(crate) fn live_write(view: &View) {
     if !on() {
         return;
     }
-    if let Some(what) = target_of(view) {
-        clear_written(&mut WRITES.lock().unwrap_or_else(|e| e.into_inner()), what);
+    if PENDING.load(Ordering::Relaxed)
+        && let Some(what) = target_of(view)
+    {
+        let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        clear_written(&mut writes, what);
+        settle(&writes);
     }
 }
 
@@ -176,28 +200,31 @@ fn clear_written(writes: &mut VecDeque<Write>, what: Target) {
 
 /// A draw that runs renders to title texture `resource`.
 pub(crate) fn live_target(resource: usize) {
-    if on() && resource != 0 {
-        WRITES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|w| w.what != Target::Texture(resource));
+    if on() && resource != 0 && PENDING.load(Ordering::Relaxed) {
+        let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        writes.retain(|w| w.what != Target::Texture(resource));
+        settle(&writes);
     }
 }
 
 /// Work that runs reads through `view`: logs it once per (reader, dropped
-/// writer) if only dropped work wrote that.
+/// writer) if only dropped work wrote that. History (see [`prune`]) is
+/// forgotten first, so it is never logged against a reader.
 pub(crate) fn read(view: &View) {
-    if !on() {
+    if !on() || !PENDING.load(Ordering::Relaxed) {
         return;
     }
     let Some(what) = target_of(view) else { return };
-    let hits: Vec<(String, Target)> = WRITES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|w| w.what.overlaps(what))
-        .map(|w| (w.writer.clone(), w.what))
-        .collect();
+    let hits: Vec<(Arc<str>, Target)> = {
+        let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut writes, crate::queue::presented());
+        settle(&writes);
+        writes
+            .iter()
+            .filter(|w| w.what.overlaps(what))
+            .map(|w| (w.writer.clone(), w.what))
+            .collect()
+    };
     if hits.is_empty() {
         return;
     }
@@ -224,7 +251,7 @@ mod tests {
     fn missing(what: Target) -> Write {
         Write {
             what,
-            writer: "synthetic dispatch".to_owned(),
+            writer: "synthetic dispatch".into(),
             frame: 9,
         }
     }
@@ -252,9 +279,24 @@ mod tests {
             assert!(
                 writes
                     .iter()
-                    .all(|write| write.writer == "synthetic dispatch" && write.frame == 9)
+                    .all(|write| &*write.writer == "synthetic dispatch" && write.frame == 9)
             );
         }
+    }
+
+    #[test]
+    fn writes_before_the_frame_before_last_are_forgotten() {
+        let mut writes: VecDeque<_> = (7..=10)
+            .map(|frame| Write {
+                frame,
+                ..missing(Target::Texture(frame as usize))
+            })
+            .collect();
+        prune(&mut writes, 10);
+        let frames: Vec<u64> = writes.iter().map(|w| w.frame).collect();
+        assert_eq!(frames, [9, 10]);
+        prune(&mut writes, 13);
+        assert!(writes.is_empty());
     }
 
     #[test]
