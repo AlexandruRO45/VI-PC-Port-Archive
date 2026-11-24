@@ -1747,3 +1747,43 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         refused.err()
     );
 }
+
+#[cfg(windows)]
+fn dump_cube_dxil(container: &[u8]) -> Option<String> {
+    let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
+    };
+    if !dxc.exists() {
+        return None;
+    }
+    let file = std::env::temp_dir().join(format!("victory-cube-{}.dxil", std::process::id()));
+    std::fs::write(&file, container).ok()?;
+    let out = std::process::Command::new(dxc)
+        .arg("-dumpbin")
+        .arg(&file)
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&file);
+    assert!(
+        out.status.success(),
+        "dxc -dumpbin failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(windows)]
+#[test]
+fn v_cube_flushes_subnormals_in_dxil() {
+    let [w0, w1] = vop3(0x145, 0, vgpr(1), vgpr(2), vgpr(3));
+    let Some(text) = dump_cube_dxil(&build_valu_cs(&[w0, w1]).dxil) else {
+        eprintln!("no dxc.exe; DXIL check skipped");
+        return;
+    };
+    let flushes = text
+        .lines()
+        .filter(|line| line.contains("and i32") && line.contains("2139095040"))
+        .count();
+    assert!(flushes >= 4, "cube flushes x, y, z and the result");
+}
