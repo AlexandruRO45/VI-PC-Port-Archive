@@ -2750,6 +2750,102 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_folder_setting_at_or_under_a_socket_device_or_file_dot_dot_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end. Kept short: a socket path is
+        // limited to about a hundred bytes.
+        let scratch = std::env::temp_dir().join(format!("vc-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("gta")).unwrap();
+        let exe = scratch.join("gta").join("default.xex");
+        std::fs::write(&exe, b"").unwrap();
+        let sock = scratch.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let env = |k: &'static str, v: PathBuf| {
+            let cache = scratch.join("cache");
+            let data = scratch.join("data");
+            move |key: &str| match key {
+                _ if key == k => Some(v.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let refused = |k: &'static str, v: PathBuf| {
+            Config::resolve(FilePaths::default(), None, env(k, v))
+                .unwrap_err()
+                .to_string()
+        };
+
+        // A socket is neither a folder nor a file: it gets the plain "not a
+        // directory" error, not the "is a file" hint pointing at its parent.
+        let err = refused("VICTORY_GAME_DIR", sock.clone());
+        assert!(
+            err.contains(&format!(
+                "the game folder {} (from VICTORY_GAME_DIR) is not a directory; set \
+                 VICTORY_GAME_DIR",
+                sock.display()
+            )),
+            "{err}"
+        );
+        assert!(
+            !err.contains("is a file") && !err.contains("perhaps"),
+            "{err}"
+        );
+
+        // A folder still to create below a socket or a device names the
+        // blocking path, as it does for a file.
+        let below = sock.join("victory");
+        let err = refused("VICTORY_CACHE_DIR", below.clone());
+        assert!(
+            err.contains(&format!(
+                "the cache folder {} (from VICTORY_CACHE_DIR) cannot be a folder because {} is \
+                 not a directory",
+                below.display(),
+                sock.display()
+            )),
+            "{err}"
+        );
+        let err = refused("VICTORY_DATA_DIR", PathBuf::from("/dev/null/victory"));
+        assert!(
+            err.contains("cannot be a folder because /dev/null is not a directory"),
+            "{err}"
+        );
+
+        // `..` after a file does not climb back out of it: the OS refuses
+        // `default.xex/..` just as it refuses `default.xex/saves`, so the
+        // file is named as the blocker and nothing is created next to it.
+        let climbed = exe.join("..").join("saves");
+        let err = refused("VICTORY_DATA_DIR", climbed.clone());
+        assert!(
+            err.contains(&format!(
+                "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because {} is \
+                 not a directory",
+                climbed.display(),
+                exe.display()
+            )),
+            "{err}"
+        );
+        assert!(!scratch.join("gta").join("saves").exists());
+
+        // The same `..` after a real folder is fine.
+        assert!(
+            Config::resolve(
+                FilePaths::default(),
+                None,
+                env(
+                    "VICTORY_GAME_DIR",
+                    scratch.join("gta").join("..").join("gta")
+                )
+            )
+            .is_ok()
+        );
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_folder_setting_through_a_link_that_leads_nowhere_is_refused() {
         // A scratch folder under the system temp folder, never the
         // repository; removed at the end.
