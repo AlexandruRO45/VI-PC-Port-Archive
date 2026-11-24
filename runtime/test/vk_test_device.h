@@ -118,7 +118,6 @@ public:
     bool conservative_rasterization = false; // VK_EXT_conservative_rasterization enabled where available
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
-    bool draw_indirect_count = false;   // Vulkan 1.2 drawIndirectCount is enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -379,8 +378,6 @@ public:
         VkPhysicalDeviceVulkan12Features enable12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &enable11};
         enable12.timelineSemaphore = VK_TRUE;
         enable12.separateDepthStencilLayouts = VK_TRUE;
-        draw_indirect_count = request_mesh_shader && features12.drawIndirectCount == VK_TRUE;
-        enable12.drawIndirectCount = draw_indirect_count;
         buffer_device_address = request_buffer_device_address && features12.bufferDeviceAddress == VK_TRUE;
         enable12.bufferDeviceAddress = buffer_device_address;
         storage_buffer_8bit = features12.storageBuffer8BitAccess == VK_TRUE;

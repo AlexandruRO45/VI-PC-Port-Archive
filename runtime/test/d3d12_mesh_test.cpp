@@ -100,6 +100,7 @@ D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {
 int main() {
     vktest::Device d;
     d.request_mesh_shader = true;
+    d.request_buffer_device_address = true;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) {
         std::fprintf(stderr, "SKIP: no usable Vulkan 1.3 device\n");
@@ -140,7 +141,6 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
-        info.draw_indirect_count = d.draw_indirect_count;
         info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };
@@ -194,12 +194,7 @@ int main() {
 
     constexpr UINT size = 64;
     std::vector<std::uint8_t> pixels(size * 256);
-    VkPhysicalDeviceProperties properties{};
-    const auto physical_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
-        d.instance_proc(d.instance, "vkGetPhysicalDeviceProperties"));
-    EXPECT(physical_properties);
-    physical_properties(d.physical, &properties);
-    const bool counted_mesh = d.draw_indirect_count && properties.limits.maxDrawIndirectCount == UINT32_MAX;
+    const bool counted_mesh = d.buffer_device_address;
     {
         Ref<ID3D12Device> device;
         Ref<ID3D12RootSignature> root;
@@ -321,8 +316,8 @@ int main() {
         const MeshRecord mesh_args[] = {{{0, 0, 0}, 0}, {{1, 1, 2}, 0}, {{2, 2, 1}, 0}};
         std::memcpy(up + mesh_args_offset, mesh_args, sizeof(mesh_args));
         constexpr UINT count_upload_offset = mesh_args_offset + sizeof(mesh_args);
-        const UINT mesh_count = 1;
-        std::memcpy(up + count_upload_offset, &mesh_count, sizeof(mesh_count));
+        const UINT mesh_counts[] = {1, UINT32_MAX};
+        std::memcpy(up + count_upload_offset, mesh_counts, sizeof(mesh_counts));
         const D3D12_GPU_VIRTUAL_ADDRESS upload_va = upload->GetGPUVirtualAddress();
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_argument{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_signature_desc{sizeof(MeshRecord), 1, &mesh_argument, 0};
@@ -369,22 +364,33 @@ int main() {
         list->SetGraphicsRootConstantBufferView(1, upload_va);
         list6->DispatchMesh(0, 1, 1);
         list6->DispatchMesh(2, 2, 1);
-        if (counted_mesh) {
-            list->CopyBufferRegion(count_buffer.p, count_offset, upload.p, count_upload_offset, sizeof(mesh_count));
+        const auto copy_count = [&](UINT offset) {
+            list->CopyBufferRegion(count_buffer.p, count_offset, upload.p, offset, sizeof(UINT));
             const auto to_indirect = transition(count_buffer.p, D3D12_RESOURCE_STATE_COPY_DEST,
                                                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
             list->ResourceBarrier(1, &to_indirect);
-        }
+        };
+        if (counted_mesh) copy_count(count_upload_offset);
         // Mesh draw 2: groups (0,0,0) and (0,0,1), columns 0 and 1 of row 0, moved by (1, -1), green -> the top half
         // of the bottom-right quadrant.
         list->SetGraphicsRoot32BitConstants(0, 2, down_right, 0);
         list->SetGraphicsRootConstantBufferView(1, upload_va + 256);
         // A count of one suppresses the second record, which would paint over the blue pixels below the green band.
-        if (counted_mesh)
+        if (counted_mesh) {
             list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset + sizeof(MeshRecord),
                                   count_buffer.p, count_offset);
-        else
+            const auto to_count_copy = transition(count_buffer.p, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                                                  D3D12_RESOURCE_STATE_COPY_DEST);
+            list->ResourceBarrier(1, &to_count_copy);
+            copy_count(count_upload_offset + sizeof(UINT));
+            // UINT32_MAX must be clamped to one, so only the upper band of the top-right quadrant changes.
+            const float up_right[2] = {1, 0};
+            list->SetGraphicsRoot32BitConstants(0, 2, up_right, 0);
+            list->ExecuteIndirect(mesh_signature.p, 1, upload.p, mesh_args_offset + sizeof(MeshRecord),
+                                  count_buffer.p, count_offset);
+        } else {
             list->ExecuteIndirect(mesh_signature.p, 2, upload.p, mesh_args_offset, nullptr, 0);
+        }
         // The stream's VS PSO: a full-screen triangle through a viewport on the bottom-left quadrant, yellow.
         const D3D12_VIEWPORT bottom_left{0, float(size / 2), float(size / 2), float(size / 2), 0, 1};
         list->RSSetViewports(1, &bottom_left);
@@ -541,10 +547,11 @@ int main() {
     for (UINT row = 0; row < size; ++row) {
         for (UINT col = 0; col < size; ++col) {
             const bool top = row < size / 2, left = col < size / 2;
+            const bool green = !left && ((counted_mesh && row < size / 4) || (!top && row < size * 3 / 4));
             using Pixel = std::array<std::uint8_t, 4>;
             const Pixel want = top && left                            ? Pixel{255, 0, 0, 255}
                                : !top && left                         ? Pixel{255, 255, 0, 255}
-                               : !top && !left && row < size * 3 / 4  ? Pixel{0, 255, 0, 255}
+                               : green                               ? Pixel{0, 255, 0, 255}
                                                                       : Pixel{0, 0, 255, 255};
             const std::uint8_t* got = pixels.data() + row * 256 + col * 4;
             if (std::equal(want.begin(), want.end(), got)) continue;

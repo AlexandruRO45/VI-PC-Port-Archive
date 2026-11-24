@@ -91,6 +91,8 @@ const char* name(leonida::ReplayResult result) {
     case leonida::ReplayResult::invalid_query: return "invalid query";
     case leonida::ReplayResult::invalid_indirect_arguments: return "invalid indirect argument or count buffer range";
     case leonida::ReplayResult::invalid_draw: return "draw kind does not match the pipeline (mesh or vertex)";
+    case leonida::ReplayResult::unsupported_mesh_indirect_count:
+        return "GPU mesh indirect count could not be prepared (requires buffer device addresses and compute scratch)";
     case leonida::ReplayResult::unsupported: return "unsupported";
     }
     return "?";

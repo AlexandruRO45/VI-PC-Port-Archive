@@ -3357,10 +3357,10 @@ Not implemented yet:
   `ExecuteIndirect` call supplies a count buffer for draw or draw-indexed signatures.
 - A single `DISPATCH_MESH` argument is supported on direct lists. Recording captures
   the graphics PSO, root arguments and render targets as `DispatchMesh` does. Vulkan reads the three group counts
-  from the argument buffer at execution, using the signature's byte stride. With a count buffer, Vulkan reads the
-  count on the GPU and clamps it to `MaxCommandCount` through `vkCmdDrawMeshTasksIndirectCountEXT`. This path needs
-  Vulkan's `drawIndirectCount` feature and a `maxDrawIndirectCount` of `UINT32_MAX`, since D3D12 permits the entire
-  `UINT` range in the count buffer before clamping. Fixed counts work on mesh-capable devices without that path.
+  from the argument buffer at execution, using the signature's byte stride. With a count buffer, the same GPU helper
+  as compute indirect dispatch prepares compact mesh records and zeroes those beyond the clamped count before
+  rendering. This requires buffer device addresses and keeps the helper dispatch outside pipeline statistics queries.
+  Fixed counts work on mesh-capable devices without that path.
   Mesh signatures with additional arguments are still unsupported.
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or

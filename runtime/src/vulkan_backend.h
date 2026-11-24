@@ -107,7 +107,6 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCmdDrawMeshTasksIndirectEXT)                                                                         \
-    X(vkCmdDrawMeshTasksIndirectCountEXT)                                                                    \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
@@ -1255,11 +1254,6 @@ public:
     // GPUs, docs/d3d12_vulkan.md section 4.6). Set by the device before any queue uses it.
     bool order_timestamp_copies() const { return order_timestamp_copies_; }
     void set_order_timestamp_copies(bool order) { order_timestamp_copies_ = order; }
-
-    // Set before the device exposes any command queues, after checking the enabled feature and count limit.
-    void enable_mesh_indirect_count() {
-        replay_.draw_mesh_tasks_indirect_count = vk.vkCmdDrawMeshTasksIndirectCountEXT;
-    }
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
