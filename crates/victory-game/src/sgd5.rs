@@ -1859,4 +1859,90 @@ mod tests {
             assert_eq!(r.unpack(), Some(vec![kind; 40]), "kind {kind:#x}");
         }
     }
+
+    #[test]
+    fn every_name_length_a_byte_can_state_is_read_whole() {
+        // Names of 1 to 254 characters: the length byte is a control byte,
+        // then punctuation, a digit, a letter, and past 0x7F unprintable.
+        // Whichever it is, the name it states is read whole, and the record
+        // after it is found with its own name.
+        let mut file = MAGIC.to_vec();
+        let names: Vec<String> = (1..=254)
+            .map(|len| {
+                "PS_"
+                    .chars()
+                    .chain(std::iter::repeat('n'))
+                    .take(len)
+                    .collect()
+            })
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            file.extend(record_bytes(name, 0x32, &[i as u8; 3]));
+        }
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), names.len());
+        for (i, (r, name)) in found.iter().zip(&names).enumerate() {
+            assert_eq!(r.name, Some(name.as_str()), "{} characters", name.len());
+            assert_eq!(r.unpack(), Some(vec![i as u8; 3]));
+        }
+    }
+
+    #[test]
+    fn magic_in_a_name_is_part_of_the_name() {
+        // `SGD5` in a record's name, after the file's own magic: the search
+        // started at the first magic, so the name is read whole and the
+        // records on both sides of it are found.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_before", 0x32, b"before"));
+        file.extend(record_bytes("PS_SGD5_Wrapped", 0x41, b"named SGD5"));
+        file.extend(record_bytes("SGD5", 0x32, b"just the magic"));
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [
+                Some("PS_before"),
+                Some("PS_SGD5_Wrapped"),
+                Some("SGD5"),
+                Some("PS_after")
+            ]
+        );
+        assert_eq!(found[1].kind, 0x41);
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"named SGD5"[..]));
+        assert_eq!(found[2].unpack().as_deref(), Some(&b"just the magic"[..]));
+    }
+
+    #[test]
+    fn records_in_an_archive_are_the_bare_files_shifted() {
+        // The same SGD5 file after 0 to 40 bytes of another file (zeros,
+        // printable bytes that read as length bytes, bytes of the marker):
+        // the same records, with every offset and span moved by as many
+        // bytes, and the same names, kinds and containers.
+        let mut bare = MAGIC.to_vec();
+        bare.extend(record_bytes("VS_Blit_0011aabb_Wrapped", 0x32, b"first"));
+        bare.extend(bare_record(0, 0x3c, b"nameless"));
+        bare.extend(record_bytes(
+            &format!("PS_{}", "x".repeat(40)),
+            0x41,
+            &[7; 300],
+        ));
+        let expected: Vec<_> = records(&bare).collect();
+        assert_eq!(expected.len(), 3);
+        let fills: [&[u8]; 4] = [&[0], b"\x1aPS_x\0", &MARKER, &[0xE7, 0x2A, 0x0D]];
+        for fill in fills {
+            for skip in 0..=40 {
+                let mut archive: Vec<u8> = fill.iter().copied().cycle().take(skip).collect();
+                archive.extend_from_slice(&bare);
+                let found: Vec<_> = records(&archive).collect();
+                assert_eq!(found.len(), expected.len(), "{skip} bytes of {fill:?}");
+                for (r, e) in found.iter().zip(&expected) {
+                    assert_eq!(r.offset, e.offset + skip);
+                    assert_eq!(r.span(), e.span().start + skip..e.span().end + skip);
+                    assert_eq!((r.name, r.kind), (e.name, e.kind));
+                    assert_eq!(r.unpack(), e.unpack());
+                }
+            }
+        }
+    }
 }
