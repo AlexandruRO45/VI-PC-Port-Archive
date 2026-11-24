@@ -345,3 +345,63 @@ The `startup_heartbeat_commit` check starts the heartbeat before loading the pag
 maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
 same process. It releases a separate commit allocation to check that a current-only change
 produces another report.
+
+## Physical pages in shared sections
+
+`XMemAllocatePhysicalPages` pages are 64 KiB slots of 256 MiB pagefile-backed sections. With
+`X2W_XMEM_SHARED_VIEWS=1`, adjacent pages of one mapping call that are adjacent slots share one
+view (`src/xmem_mapped_pages.cpp`). Before, every page had a section and a view of its own, which is
+slow for a start-up batch of about 100,000 pages (measured under Wine: 42.9 s for 100,000 pages,
+82 ms with shared sections and views).
+
+Unmapping a page inside a shared view unmaps that view and maps its other pages again. A thread
+that touches one of those pages in between takes an access violation. A vectored handler retries
+it only when the address is inside a view that the unmap in progress, or the last finished one,
+took apart, the page is recorded and covered by a view once that unmap is over, and the thread
+has not already retried that page for that unmap. Any other fault is passed on, after at most one
+retry.
+
+Shared views are opt-in. The caller chooses before the first mapping call by setting
+`X2W_XMEM_SHARED_VIEWS=1` in the process environment; the shim reads it once, on that call.
+
+| | Default | `X2W_XMEM_SHARED_VIEWS=1` |
+|---|---|---|
+| Views | one per page | one per run of adjacent pages |
+| Fault handler | none | registered by the first mapping call, never removed |
+| `FreeLibrary` | unloads `xmem.dll` | module is pinned and stays until the process ends |
+
+The handler is process-wide, and Windows has no removal that also waits for a dispatch already
+under way, so the opt-in keeps the module, the handler and the shim's state in place for the life
+of the process, also across a host's unload and reload. Nothing is torn down or waited for at DLL
+detach. A host that needs to unload the shim keeps the default. If the handler cannot be
+registered or the module cannot be pinned, the opt-in is refused, logged, and pages get a view
+each.
+
+What the shim records always matches what Windows shows. If an unmap is refused part of the way,
+the views already unmapped are mapped again whole, nothing is removed and the call fails with
+that error. If a surviving page cannot be mapped again, it is forgotten (its bytes stay in the
+section), the batch is unmapped and the call fails. A freed slot is zeroed when it is reused, and
+freed slots are reused in address order so that pages reused together share a view again.
+
+`VirtualQuery` on a page of a shared view reports the view's base as the allocation base and the
+bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
+is not affected: section-backed pages already took the committed, not-aliased path.
+
+- `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
+  earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with
+  holes, moved and reused pages; `VirtualQuery` before and after a view is split; two views of
+  the same pages with writes seen both ways; an unmap refused at each of three steps
+  (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
+  again. Two cases must end in an access violation, the reader without the handler
+  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  whose exit code the parent checks. Those controls and `X2W_XMEM_TEST_FAULT` exist only in a
+  second build of the shim (`xmem_shim_test_controls`, `X2W_XMEM_TEST_CONTROLS`); the check shows
+  that the deployed `xmem.dll` ignores both switches. Four more children cover the lifetime on
+  the deployed shim: without the opt-in, pages mapped with a view each and the shim unloading
+  after that mapping, twice; with it, an unused shim unloads, a used one stays loaded through `FreeLibrary` with an
+  unrelated handled access violation still delivered and the handler still working; `FreeLibrary`
+  is called repeatedly while one thread reads a page and another toggles its neighbour; and the
+  process exits with those two threads still running.
+- `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
+  (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
+  sections, and single-page views.

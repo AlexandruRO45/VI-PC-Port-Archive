@@ -7,6 +7,7 @@
 // methods log their first calls ("x2w-runtime") and forward to the real object.
 //
 // X2W_FAKE_USER=1 additionally answers the user API for one local user (see fake_user below).
+#include "startup_stubs/api_trace.h"
 #include "startup_stubs/local_log.h"
 
 #include <cstdio>
@@ -67,11 +68,59 @@ u64 complete_async(u64 async_block);
 void* storage_object();
 constexpr unsigned long save_provider_data1 = 0x704c3f58;  // hypothesis: the game-save API (first seen: slot 4 with the user handle)
 
+// X2W_TRACE_API=1: one line per provider call with the return code, whether the answer came from the
+// stand-in or the real runtime, and which declared output argument it wrote. Only declared outputs are
+// read: arguments are not probed as pointers, because a handle or size that happens to look like an
+// address would be read as if it were one. A slot with no declared contract reports "out=?" instead.
+bool trace_api() noexcept
+{
+    static const bool on = x2w_local::env_on("X2W_TRACE_API");
+    return on;
+}
+
+// The contract table and the decision about what was observed live in api_trace.h so the decision can
+// be checked by a source-built control without a running title.
+using x2w_api_trace::declared;
+using x2w_api_trace::DeclaredOut;
+using x2w_api_trace::max_outputs;
+using x2w_api_trace::max_snapshot;
+using x2w_api_trace::no_argument;
+
+
 template <int N>
 __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5, u64 s6, u64 s7)
 {
     const bool log_it = N >= 3 && InterlockedIncrement(&call_counts[self->provider][N]) <= 6;
     u64 args[11] = {a, b, c, s0, s1, s2, s3, s4, s5, s6, s7};
+    // Declared outputs are snapshotted so the write is seen rather than assumed; nothing else is read. The
+    // snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a caller-sized buffer
+    // Declared outputs are snapshotted so a write can be observed rather than assumed; nothing else is
+    // read. Each snapshot is bounded by the declared width, so a one-byte flag, a DWORD and a
+    // caller-sized buffer are each compared within their own extent.
+    bool compared[2] = {};
+    std::size_t compared_bytes[2] = {};
+    int compared_index[2] = {no_argument, no_argument};
+    unsigned char before[2][max_snapshot] = {};
+    const DeclaredOut* contract = trace_api() ? declared(provider_ids[self->provider].Data1, N) : nullptr;
+    if (contract) {
+        const auto take = [&](int slot, unsigned char index, unsigned char fixed_bytes, unsigned char size_index) {
+            compared_index[slot] = index;
+            if (index == no_argument || !args[index]) return;
+            std::size_t bytes = fixed_bytes;
+            if (!bytes) {
+                if (size_index == no_argument) return;
+                const u64 capacity = args[size_index];
+                bytes = capacity < max_snapshot ? static_cast<std::size_t>(capacity) : max_snapshot;
+            }
+            if (!bytes || bytes > max_snapshot) return;
+            if (!x2w_local::readable(reinterpret_cast<const void*>(args[index]), bytes)) return;
+            std::memcpy(before[slot], reinterpret_cast<const void*>(args[index]), bytes);
+            compared_bytes[slot] = bytes;
+            compared[slot] = true;
+        };
+        take(0, contract->first, contract->first_bytes, contract->size_argument);
+        take(1, contract->second, contract->second_bytes, no_argument);
+    }
     u64 result = 0;
     bool handled = self->provider == user_provider && fake_user() && user_call(N, args, &result);
     if (!handled && self->provider == gamertag_provider && N == 3 && fake_user()) {
@@ -107,6 +156,24 @@ __declspec(noinline) u64 forward(Proxy* self, u64 a, u64 b, u64 c, u64 s0, u64 s
     const bool about_tracked = N >= 3 && (tracked(a) || tracked(b) || tracked(c));
     const u64 raw_result = result;
     if (about_tracked && !handled && fake_user() && (result & 0xffffffffu) == borrowed_failure) result = 0;
+    if (trace_api()) {
+        unsigned char after[2][max_snapshot] = {};
+        bool current[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            if (!compared[i] || !compared_bytes[i]) continue;
+            if (!x2w_local::readable(reinterpret_cast<const void*>(args[compared_index[i]]), compared_bytes[i])) continue;
+            std::memcpy(after[i], reinterpret_cast<const void*>(args[compared_index[i]]), compared_bytes[i]);
+            current[i] = true;
+        }
+        const x2w_api_trace::Report report = x2w_api_trace::decide(contract, current,
+                                                                  const_cast<const unsigned char (*)[max_snapshot]>(before),
+                                                                  const_cast<const unsigned char (*)[max_snapshot]>(after),
+                                                                  compared_bytes);
+        char out[48] = "?";
+        x2w_api_trace::format(report, contract, out, sizeof(out));
+        x2w_local::logf("x2w-api %08lx::slot%d -> 0x%08x %s out=%s", provider_ids[self->provider].Data1, N,
+                        static_cast<unsigned>(result & 0xffffffffu), handled ? "local" : "real", out);
+    }
     if (log_it || (about_tracked && InterlockedIncrement(&tracked_logged) <= 120))
         x2w_local::logf("x2w-runtime %08lx::slot%d(0x%llx, 0x%llx, 0x%llx | 0x%llx, 0x%llx) -> 0x%llx%s%s from +0x%llx", provider_ids[self->provider].Data1, N,
                         a, b, c, s0, s1, result, handled ? " (local user)" : "",

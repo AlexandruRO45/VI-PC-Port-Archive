@@ -54,6 +54,17 @@ B, AE, E, NE, BE and A may read them. The host must support the instructions
 whose results the original computes: without ABM and BMI1 a processor runs
 LZCNT and TZCNT as BSR and BSF.
 
+BSF and BSR take a 16-, 32- or 64-bit register destination and a register or
+memory source of the same width. A nonzero source gives the index of its lowest
+(BSF) or highest (BSR) set bit and clears ZF. For a zero source ZF is set and
+the destination is left unchanged. The Intel SDM calls that destination
+undefined; AMD documents it as unchanged, and the translation follows the
+unchanged behaviour of the processors measured, 32-bit destinations included:
+a zero source does not clear bits 63:32. A nonzero source zero-extends a 32-bit
+result and keeps bits 63:16 of a 16-bit destination. CF, OF, SF, PF and AF are
+undefined, so only the E and NE conditions may read them and every other
+condition is refused. The destination is read, so it must be defined.
+
 One-operand MUL, IMUL, DIV and IDIV and the sign extensions read and write RAX
 and RDX without naming them. Products of up to 32-bit factors are computed in
 std::uint64_t; 64-bit products and all quotients use the MSVC intrinsics
@@ -209,6 +220,8 @@ SHIFTS = {M.SHL: "<<", M.SHR: ">>", M.SAR: ">>"}
 ROTATES = {M.ROL: "true", M.ROR: "false"}
 # Bit tests, by the C++ operator that writes the selected bit (BT writes nothing).
 BIT_TESTS = {M.BT: None, M.BTS: "|", M.BTR: "& ~", M.BTC: "^"}
+# Bit scans, by the PRELUDE helper that computes the index of the bit found in a nonzero source.
+BIT_SCANS = {M.BSF: "trailing_zeros", M.BSR: "highest_bit"}
 # Bit counts, by the PRELUDE helper that computes each.
 BIT_COUNTS = {M.POPCNT: "count_ones", M.LZCNT: "leading_zeros", M.TZCNT: "trailing_zeros"}
 _CODES = "O NO B AE E NE BE A S NS P NP L GE LE G".split()
@@ -231,7 +244,7 @@ STRING_TRANSFERS = {
 # which only read them.
 FLAG_NEUTRAL = {M.CLZERO, M.MOV, M.MOVZX, M.MOVSX, M.MOVSXD, M.LEA, M.NOP, M.NOT, *SETCC, *CMOVCC, *SIGN_EXTENSIONS,
                 M.MOVSB, M.MOVSW, M.MOVSD, M.MOVSQ, M.STOSB, M.STOSW, M.STOSD, M.STOSQ, M.CLD, M.STD, M.LEAVE}
-FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS}
+FLAG_PRODUCERS = {*ALU, M.CMP, M.TEST, M.INC, M.DEC, M.NEG, *SHIFTS, *BIT_TESTS, *BIT_COUNTS, *BIT_SCANS}
 MAX_FLAG_DISTANCE = 16
 CONDITIONS = {CC.O: "o", CC.NO: "no", CC.P: "p", CC.NP: "np",
               CC.E: "e", CC.NE: "ne", CC.B: "b", CC.AE: "ae", CC.BE: "be", CC.A: "a",
@@ -973,6 +986,13 @@ class Lifter:
             if code not in ("b", "ae"):
                 raise ValueError(f"only CF is defined after {str(producer).split()[0].upper()} at RVA {jcc.ip:#x}")
             return "fb != 0" if code == "b" else "fb == 0"
+        if producer.mnemonic in BIT_SCANS:
+            # fa is the source. ZF is set for a zero source; CF, OF, SF, PF and AF are undefined.
+            if code not in ("e", "ne"):
+                name = str(producer).split()[0].upper()
+                raise ValueError(f"only ZF is defined after {name} at RVA {jcc.ip:#x}")
+            source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
+            return source_zero if code == "e" else f"!({source_zero})"
         if producer.mnemonic in BIT_COUNTS:
             # fa is the source and fb the result.
             source_zero = f"static_cast<{unsigned(self.width(producer))}>(fa) == 0"
@@ -1207,6 +1227,21 @@ class Lifter:
             else:
                 lines.append(self.write(ins, width, f"{a} {BIT_TESTS[mnemonic]}(1ull << {offset})"))
             return " ".join(lines), reads, writes
+        if mnemonic in BIT_SCANS:
+            if width not in (2, 4, 8) or ins.op0_kind != OpKind.REGISTER or ins.op1_kind not in (OpKind.REGISTER, OpKind.MEMORY):
+                raise ValueError(f"unsupported {str(ins).split()[0].upper()} operands at RVA {ins.ip:#x}")
+            note(1)
+            # A zero source leaves the whole destination register as it was, so it is read: 16 bits for a
+            # 16-bit destination, all 64 otherwise (a 32-bit result zero-extends only for a nonzero source).
+            destination = full(ins.op0_register)
+            reads[destination] = max(reads.get(destination, 0), 2 if width == 2 else 8)
+            u = unsigned(width)
+            source = self.operand(ins, 1, width)
+            found = self.write(ins, width, f"{BIT_SCANS[mnemonic]}<{u}>(source)")
+            if sets_flags:
+                self.flags = True
+                return f"fa = {source}; {{ const {u} source = static_cast<{u}>(fa); if (source != 0) {{ {found} }} }}", reads, writes
+            return f"{{ const {u} source = {source}; if (source != 0) {{ {found} }} }}", reads, writes
         if mnemonic in BIT_COUNTS:
             note(1)
             source = self.operand(ins, 1, width)
@@ -2046,6 +2081,10 @@ template <class T> static inline T trailing_zeros(T value) {
     unsigned count = 0;
     while (count < sizeof(T) * 8 && ((static_cast<word>(value) >> count) & 1u) == 0) ++count;
     return static_cast<T>(count);
+}
+// BSR of a nonzero value: the index of its highest set bit.
+template <class T> static inline T highest_bit(T value) {
+    return static_cast<T>(sizeof(T) * 8 - 1 - leading_zeros<T>(value));
 }
 // A read of the function's own frame array, which cannot fault.
 template <class T> static T load(word address) {

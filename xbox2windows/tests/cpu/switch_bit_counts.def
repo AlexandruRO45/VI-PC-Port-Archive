@@ -29,5 +29,5 @@ EXPORTS
     neg_popcnt_undef
     neg_tzcnt_setg
     neg_lzcnt_cmovns
-    neg_bsr
-    neg_bsf
+    neg_bswap64
+    neg_bswap32

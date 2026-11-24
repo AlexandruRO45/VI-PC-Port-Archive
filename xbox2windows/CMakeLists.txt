@@ -112,6 +112,21 @@ target_compile_features(xmem_shim PRIVATE cxx_std_20)
 # Delay-loaded: only XMemGetWorkingSetStatistics uses DXGI and D3DKMT (gdi32).
 target_link_libraries(xmem_shim PRIVATE dxgi gdi32 delayimp OneCore)
 target_link_options(xmem_shim PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
+# The same shim with its test controls compiled in (X2W_XMEM_TEST_CONTROLS): refusing one step of an
+# unmap, and shared views without the fault handler. tests/xmem_page_runs_check.py loads it for the
+# cases that need a control; the deployed xmem.dll has neither switch.
+get_target_property(xmem_shim_sources xmem_shim SOURCES)
+add_library(xmem_shim_test_controls SHARED ${xmem_shim_sources})
+set_target_properties(xmem_shim_test_controls PROPERTIES OUTPUT_NAME xmem
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/xmem-test-controls"
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_definitions(xmem_shim_test_controls PRIVATE X2W_XMEM_TEST_CONTROLS)
+target_include_directories(xmem_shim_test_controls PRIVATE src)
+target_compile_features(xmem_shim_test_controls PRIVATE cxx_std_20)
+target_link_libraries(xmem_shim_test_controls PRIVATE dxgi gdi32 delayimp OneCore)
+target_link_options(xmem_shim_test_controls PRIVATE /DELAYLOAD:dxgi.dll /DELAYLOAD:gdi32.dll)
 add_executable(xmem_shim_check tests/xmem_shim_check.cpp src/adapter_identity.cpp)
 # D3D12 and DXGI are delay-loaded so the exports scenario can check that xmem.dll loads neither.
 target_link_libraries(xmem_shim_check PRIVATE xmem_shim d3d12 dxgi gdi32 delayimp)
@@ -290,6 +305,12 @@ foreach(adapter IN ITEMS hardware warp)
     add_test(NAME startup_null_views_${adapter} COMMAND startup_null_views_check ${adapter})
 endforeach()
 set_tests_properties(startup_null_views_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# The opt-in API trace reads only declared outputs; this checks the decision about what it observed
+# (argument index 0, two outputs, exact and short buffers, same value, partial comparison).
+add_executable(api_trace_check tests/api_trace_check.cpp)
+target_compile_features(api_trace_check PRIVATE cxx_std_17)
+target_include_directories(api_trace_check PRIVATE src)
+add_test(NAME api_trace COMMAND api_trace_check)
 # A view heap larger than the adapter accepts: the stand-in creates the desktop heap at the measured
 # limit and keeps the title's full-size memory. Skips where the adapter accepts the full request.
 add_executable(startup_view_heap_check tests/startup_view_heap_check.cpp)
@@ -317,6 +338,15 @@ add_test(NAME startup_draw_bmp COMMAND startup_draw_bmp_check)
 # Input for the launcher containment check (docs/startup-runtime.md): writes known bytes to both
 # streams and the trap log, reports a known exit code, or holds memory, spawns a child or stays
 # alive so the launch tool's job limits have to stop it.
+# Placed buffers at the boundary between two views of physical pages (src/xmem_mapped_pages.cpp).
+add_executable(xmem_page_runs_device_check tests/xmem_page_runs_device_check.cpp)
+target_compile_features(xmem_page_runs_device_check PRIVATE cxx_std_17)
+target_link_libraries(xmem_page_runs_device_check PRIVATE xmem_shim d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME xmem_page_runs_device_${adapter} COMMAND xmem_page_runs_device_check ${adapter})
+    set_tests_properties(xmem_page_runs_device_${adapter} PROPERTIES TIMEOUT 120)
+endforeach()
+set_tests_properties(xmem_page_runs_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(startup_launch_probe tests/startup_launch_probe.cpp)
 target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 
@@ -1250,6 +1280,11 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_translator_check.py")
     add_test(NAME xmem_shim_mapped_pages COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/xmem_mapped_pages_check.py" "$<TARGET_FILE:xmem_shim>")
+    # Large batches: pages as slots of shared sections, adjacent pages in one view.
+    add_test(NAME xmem_shim_page_runs COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/xmem_page_runs_check.py" "$<TARGET_FILE:xmem_shim>"
+        "$<TARGET_FILE:xmem_shim_test_controls>")
+    set_tests_properties(xmem_shim_page_runs PROPERTIES TIMEOUT 300)
     add_test(NAME docs_links COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/docs_links_check.py")
     # Compile-only: outcome classification and GVN pass shares, no wall-time threshold (#775).
@@ -1782,6 +1817,17 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_switch_bit_counts>" "$<TARGET_FILE:cpu_switch_bit_counts_lifted>")
     # A host without POPCNT, BMI1 or ABM cannot run the original as the reference describes it.
     set_tests_properties(cpu_aot_switch_bit_counts PROPERTIES SKIP_RETURN_CODE 77)
+    # BSF and BSR; the swapped build assembles three exports with the other scan and must follow the exchanged reference.
+    foreach(variant IN ITEMS original swapped)
+        cpu_asm_fixture(cpu_switch_bit_scans_${variant} switch_bit_scans)
+        cpu_translation(cpu_switch_bit_scans_${variant} cpu_switch_aot
+            bsf16_reg,bsf16_mem,bsf32_reg,bsf32_mem,bsf64_reg,bsf64_mem,bsr16_reg,bsr16_mem,bsr32_reg,bsr32_mem,bsr64_reg,bsr64_mem,bsr32_self,bsf16_self,jcc_bsf_e,jcc_bsr_ne,cmov_scans)
+    endforeach()
+    target_compile_definitions(cpu_switch_bit_scans_swapped PRIVATE SWAP_SCANS)
+    add_test(NAME cpu_aot_switch_bit_scans COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/switch_bit_scans_check.py" "$<TARGET_FILE:cpu_register_probe>"
+        "$<TARGET_FILE:cpu_switch_bit_scans_original>" "$<TARGET_FILE:cpu_switch_bit_scans_original_lifted>"
+        "$<TARGET_FILE:cpu_switch_bit_scans_swapped_lifted>")
     # Divides whose results are unused: the translation is also built with /O2, where the compiler would remove a
     # divide that the generated C++ let it remove, and both builds are compared with the original's exception codes.
     cpu_asm_fixture(cpu_dead_div dead_div)
