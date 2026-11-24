@@ -2943,119 +2943,192 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
-        let use_at = self
+        // How the program uses each descriptor slice tells its view kind.
+        // A wide load (`s_load_dwordx8`/`x16`) may carry multiple adjacent
+        // descriptors, so collect every `(first, sites)` slice separately.
+        let mut by_first: BTreeMap<u8, Vec<Site>> = BTreeMap::new();
+        for d in self
             .x
             .res
             .descriptors
             .iter()
             .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
-                })
-            });
-        let Some((at, first)) = use_at else {
-            return Err("a descriptor read only as data");
-        };
-        let src = Source::Loaded { load: site, first };
-        let used = self.used_kind(&src);
-        let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
-        let un = ui.name();
-        let uav = un.contains("store")
-            || un.contains("atomic")
-            || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
-        let (props, image) = match &ui.fields {
-            Fields::Image { dim, .. } => {
-                let kind = match dim {
-                    0 => 1,
-                    1 => 2,
-                    2 => 4,
-                    4 => 6,
-                    5 => 7,
-                    _ => return Err("an image dimension (cube or MSAA)"),
-                };
-                ((kind | u, 0x409), Some(kind))
-            }
-            Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
-                let props = if un.starts_with("buffer_load_format")
-                    || un.starts_with("buffer_store_format")
+        {
+            for l in d.source.leaves() {
+                if let Source::Loaded { load, first } = *l
+                    && load == site
                 {
-                    (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                    return Err("a constant buffer's descriptor read as data");
+                    let sites = by_first.entry(first).or_default();
+                    if !sites.contains(&d.site) {
+                        sites.push(d.site);
+                    }
                 }
-                (props, None)
             }
-            _ => return Err("a scalar memory read as data"),
-        };
-        let h = self.handle(site, &src, false, props)?;
+        }
+        if by_first.is_empty() {
+            return Err("a descriptor read only as data");
+        }
+        let mut written: Vec<Option<V>> = vec![None; count as usize];
+        let mut missing: Vec<Why> = vec![OTHER; count as usize];
         let c = self.cur;
         let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+        for (first, sites) in by_first {
+            let src = Source::Loaded { load: site, first };
+            let used = self.used_kind(&src);
+            // Prefer an Image or Buffer use over Smem when the same slice is
+            // shared, since those carry format/dimension/idxen details.
+            let at = sites
+                .iter()
+                .copied()
+                .find(|&(b, i)| matches!(self.x.p.blocks[b].insts[i].fields, Fields::Image { .. }))
+                .or_else(|| {
+                    sites.iter().copied().find(|&(b, i)| {
+                        matches!(self.x.p.blocks[b].insts[i].fields, Fields::Buffer { .. })
+                    })
+                })
+                .unwrap_or(sites[0]);
+            let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
+            let un = ui.name();
+            let span: u32 = if matches!(ui.fields, Fields::Image { .. }) {
+                8
+            } else {
+                4
+            };
+            let start = u32::from(first).min(count) as usize;
+            let end = u32::from(first).saturating_add(span).min(count) as usize;
+            let uav = used.is_some_and(|u| u.kind == ResourceType::Uav)
+                || sites.iter().any(|&(b, i)| {
+                    let n = self.x.p.blocks[b].insts[i].name();
+                    n.contains("store") || n.contains("atomic")
+                });
+            let u = if uav { 0x1000 } else { 0 };
+            let classified: Result<((u32, u32), Option<u32>), Why> = match &ui.fields {
+                Fields::Image { dim, .. } => match dim {
+                    0 => Ok(((1 | u, 0x409), Some(1))),
+                    1 => Ok(((2 | u, 0x409), Some(2))),
+                    2 => Ok(((4 | u, 0x409), Some(4))),
+                    4 => Ok(((6 | u, 0x409), Some(6))),
+                    5 => Ok(((7 | u, 0x409), Some(7))),
+                    _ => Err("an image dimension (cube or MSAA)"),
+                },
+                Fields::Buffer { idxen, format, .. } => {
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        Err("a constant buffer's descriptor read as data")
+                    } else {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if un.starts_with("buffer_load_format")
+                            || un.starts_with("buffer_store_format")
+                        {
+                            (10 | u, 0x409)
+                        } else if *idxen
+                            && format.is_none()
+                            && stride >= 4
+                            && stride.is_multiple_of(4)
+                        {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        Ok((props, None))
+                    }
+                }
+                Fields::Smem { .. } => match used.map(|u| u.kind) {
+                    Some(ResourceType::Srv | ResourceType::Uav) => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let props = if stride >= 4 && stride.is_multiple_of(4) {
+                            (12 | u, stride)
+                        } else {
+                            (11 | u, 0)
+                        };
+                        Ok((props, None))
+                    }
+                    Some(ResourceType::Cbv) | None => {
+                        Err("a constant buffer's descriptor read as data")
+                    }
+                    Some(ResourceType::Sampler | ResourceType::Other(_)) => {
+                        Err("a scalar memory read as data")
+                    }
+                },
+                _ => Err("a scalar memory read as data"),
+            };
+            let (props, image) = match classified {
+                Ok(v) => v,
+                Err(why) => {
+                    missing[start..end].fill(why);
+                    continue;
+                }
+            };
+            let h = match self.handle(site, &src, false, props) {
+                Ok(h) => h,
+                Err(why) => {
+                    missing[start..end].fill(why);
+                    continue;
+                }
+            };
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = if image.is_some() && !uav {
+                self.s.m.i32(0)
+            } else {
+                self.s.m.undef(i32t)
+            };
+            let d = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+            let words: Vec<(u32, V)> = match image {
+                Some(kind) => {
+                    let one = self.s.m.i32(1);
+                    let w = field(self, 0);
+                    let (height, depth) = match kind {
+                        1 => (one, one),
+                        2 => (field(self, 1), one),
+                        6 => (one, field(self, 1)),
+                        _ => (field(self, 1), field(self, 2)),
+                    };
+                    let levels = if uav { one } else { field(self, 3) };
+                    let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+                    let (w, height, depth, levels) = (
+                        less(self, w),
+                        less(self, height),
+                        less(self, depth),
+                        less(self, levels),
+                    );
+                    let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                    let (k30, k2, k14, k16, mask) = (
+                        k(self, 30),
+                        k(self, 2),
+                        k(self, 14),
+                        k(self, 16),
+                        k(self, 0x3FFF),
+                    );
+                    let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+                    let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+                    let hi = self.s.m.bin(c, Bin::And, hi, mask);
+                    let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+                    let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+                    let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                    let base = k(self, 0xFAC | ty << 28);
+                    let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+                    let d3 = self.s.m.bin(c, Bin::Or, base, last);
+                    vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                }
+                None => vec![(2, field(self, 0))],
+            };
+            for (rel, x) in words {
+                if let Some(slot) = u32::from(first)
+                    .checked_add(rel)
+                    .filter(|&idx| idx < count)
+                {
+                    written[slot as usize] = Some(x);
+                }
             }
-            None => vec![(2, field(self, 0))],
-        };
+        }
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
-            match words.iter().find(|w| w.0 == rel) {
-                Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
+            match written[k as usize] {
+                Some(x) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(v, Val::Missing(missing[k as usize]));
                     }
                 }
             }
@@ -7417,5 +7490,117 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[cfg(windows)]
+    fn validate_dxil(dxil: &mut [u8]) {
+        use crate::emit::validator::Validator;
+        if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+            v.validate(dxil).expect("emitted DXIL must validate");
+        }
+    }
+
+    #[test]
+    fn smem_srv_descriptor_size_reads_as_data() {
+        // Load a 4-dword SRV buffer descriptor from table s0, read from it via
+        // s_buffer_load_dword, and also read its dword 2 (record count) as data.
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            0x8010_0A10, // s_add_u32 s16, s16, s10 (s10 = descriptor dword 2)
+            0x7E02_0210, // v_mov_b32 v1, s16
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        for stride in [0, 16] {
+            let used = vec![UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            let mut lowered = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+            #[cfg(windows)]
+            validate_dxil(&mut lowered.dxil);
+            let _ = lowered;
+        }
+    }
+
+    #[test]
+    fn wide_descriptor_load_resolves_srv_slice_past_cbv() {
+        // One s_load_dwordx8 loads a CBV at dwords 0..4 (s[8:11]) and a raw SRV
+        // at dwords 4..8 (s[12:15]), both used by s_buffer_load_dword. Reading
+        // the SRV's dword 2 (s14) succeeds while reading the CBV's dword 2 (s10)
+        // is still refused as a CBV descriptor read.
+        let make = |size_sgpr: u32| {
+            [
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF40C_0202,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+                0xF420_0404,
+                0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null (CBV)
+                0xF420_0446,
+                0xFA00_0000, // s_buffer_load_dword s17, s[12:15], null (SRV)
+                0x8010_1110, // s_add_u32 s16, s16, s17
+                0x8010_0010 | (size_sgpr << 8), // s_add_u32 s16, s16, s{size_sgpr}
+                0x7E02_0210, // v_mov_b32 v1, s16
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        let used = || {
+            vec![
+                UsedResource {
+                    kind: ResourceType::Cbv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 4,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+            ]
+        };
+        let mut lowered =
+            lower_with(&make(14), vec![root(RootType::Table, 0, 0)], used()).unwrap();
+        #[cfg(windows)]
+        validate_dxil(&mut lowered.dxil);
+        let _ = lowered;
+
+        let Err(err) = lower_with(&make(10), vec![root(RootType::Table, 0, 0)], used()) else {
+            panic!("expected CBV descriptor error");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "a constant buffer's descriptor read as data",
+                    ..
+                }
+            ),
+            "unexpected error: {err}"
+        );
     }
 }
