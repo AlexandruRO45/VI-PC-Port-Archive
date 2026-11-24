@@ -683,14 +683,27 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        let in_used = |slot: u8, dword: u32| {
+            used.iter().any(|u| {
+                u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dword
+            })
+        };
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        // title's slots there have no host slot of their own. So are tables
+        // whose annotated empty or unmakeable slot already holds a mirrored
+        // typed null of another kind: rewriting it in place would change what
+        // earlier draws read.
         for (slot, dword) in used
             .iter()
             .filter(tables)
             .map(|u| (u.slot, u.table_offset_dwords))
-            .chain(stage_views.iter().map(|v| (v.slot, v.dword)))
+            .chain(
+                stage_views
+                    .iter()
+                    .filter(|v| !in_used(v.slot, v.dword))
+                    .map(|v| (v.slot, v.dword)),
+            )
         {
             if fresh.contains(&slot) {
                 continue;
@@ -698,14 +711,17 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(dword) * 4;
+            let handle = table + u64::from(dword) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
                 continue;
             };
-            if index >= host.count() {
+            if index >= host.count()
+                || table_view_props(p, slot, dword)
+                    .is_some_and(|props| host.typed_null_conflict(index, handle, props))
+            {
                 fresh.push(slot);
             }
         }
@@ -717,13 +733,7 @@ impl State {
             }
         }
         for tv in stage_views {
-            if fresh.contains(&tv.slot)
-                || used.iter().any(|u| {
-                    u.root == RootType::Table
-                        && u.slot == tv.slot
-                        && u.table_offset_dwords == tv.dword
-                })
-            {
+            if fresh.contains(&tv.slot) || in_used(tv.slot, tv.dword) {
                 continue;
             }
             self.table_view_entry(tv.slot, tv.dword, p, compute);
