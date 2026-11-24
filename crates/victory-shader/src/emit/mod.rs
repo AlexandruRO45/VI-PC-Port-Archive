@@ -77,9 +77,12 @@
 //!   lane numbers, other lanes or lane masks as numbers cannot declare a
 //!   wave size on the host; its console lanes (64 consecutive flattened
 //!   thread ids per wave) are emulated in group-shared memory, as a wave64
-//!   compute program's are without `WaveSize`. A cross-lane read only some
-//!   lanes reach is refused (it would need a barrier those lanes cannot
-//!   all reach), never run with host lanes.
+//!   compute program's are without `WaveSize`. A program whose only need is
+//!   its own lane number (`v_mbcnt`, quad-local swizzles and DPPs, constant
+//!   lane masks) uses `SV_GroupIndex & 63` directly, with no group-shared
+//!   memory or barriers. A cross-lane read only some lanes reach is refused
+//!   (it would need a barrier those lanes cannot all reach), never run with
+//!   host lanes.
 
 mod bitcode;
 mod container;

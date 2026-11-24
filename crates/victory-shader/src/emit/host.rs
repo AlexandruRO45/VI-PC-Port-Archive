@@ -1016,7 +1016,20 @@ impl Host {
         d: &Dispatch,
         groups: u32,
     ) -> Result<Vec<Vec<u32>>, String> {
-        self.dispatch_impl(root, pso, d, Some(groups))
+        self.dispatch_impl(root, pso, d, Some((groups, 1)))
+    }
+
+    /// Runs `count` mesh dispatches in one command list (dispatch cost, where
+    /// per-list overhead is amortized).
+    pub fn dispatch_mesh_repeat(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        groups: u32,
+        count: u32,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_impl(root, pso, d, Some((groups, count)))
     }
 
     fn dispatch_impl(
@@ -1024,7 +1037,7 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
-        mesh: Option<u32>,
+        mesh: Option<(u32, u32)>,
     ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1415,9 +1428,11 @@ impl Host {
                 }
             }
             match mesh {
-                Some(groups) => {
+                Some((groups, count)) => {
                     let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
-                    list6.DispatchMesh(groups, 1, 1);
+                    for _ in 0..count {
+                        list6.DispatchMesh(groups, 1, 1);
+                    }
                 }
                 None => {
                     let [x, y, z] = d.groups;

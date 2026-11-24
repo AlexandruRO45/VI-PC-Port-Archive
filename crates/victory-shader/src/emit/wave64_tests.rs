@@ -668,7 +668,17 @@ mod gpu {
         std::fs::read(&out).ok()
     }
 
-    fn run_mesh(name: &str, prog: &NativeProgram, groups: u32, uav_dwords: u32, expected: &[u32]) {
+    /// Emits and validates `prog`, then creates the mesh pipeline a
+    /// `DispatchMesh` needs (with a trivial pixel shader).
+    fn mesh_pso(
+        name: &str,
+        prog: &NativeProgram,
+    ) -> Option<(
+        Host,
+        windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+        windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+        HostShader,
+    )> {
         let shader = emit_ms(prog, Wave64Mode::Native)
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         if let Ok(mut v) = super::super::validator::Validator::load(
@@ -679,11 +689,11 @@ mod gpu {
         }
         let Some(ps) = trivial_ps() else {
             eprintln!("{name}: no dxc for a pixel shader; PSO skipped");
-            return;
+            return None;
         };
         let Some(host) = Host::new(false).ok() else {
             eprintln!("{name}: no SM 6.6 device; skipped");
-            return;
+            return None;
         };
         let ps_shader = HostShader {
             stage: HwStage::Ps,
@@ -703,6 +713,13 @@ mod gpu {
         let pso = host
             .mesh_pipeline_with(&root, &shader.dxil, &ps_shader.dxil)
             .unwrap_or_else(|e| panic!("{name}: PSO: {e}"));
+        Some((host, root, pso, shader))
+    }
+
+    fn run_mesh(name: &str, prog: &NativeProgram, groups: u32, uav_dwords: u32, expected: &[u32]) {
+        let Some((host, root, pso, _)) = mesh_pso(name, prog) else {
+            return;
+        };
         let out = host
             .dispatch_mesh(
                 &root,
@@ -1402,5 +1419,226 @@ mod gpu {
         let prog = make_ms_program(&code, 64, 0, 64, 1);
         let expected: Vec<u32> = (0..64u32).map(|i| i + 9).collect();
         run_mesh("ms_no_console_lanes", &prog, 1, 64, &expected);
+    }
+
+    fn psv_mesh_shared(shader: &HostShader) -> u32 {
+        let c = Container::parse(&shader.dxil).unwrap();
+        u32::from_le_bytes(
+            c.part(FourCC::PSV0).unwrap().data[4..8]
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn mesh_lane_only_skips_lds_and_barriers() {
+        for threads in [64u32, 128] {
+            let fast = emit_ms(
+                &make_ms_program(&ms_firstlane_loop_program(1, 8, false), threads, 0, threads, 1),
+                Wave64Mode::Native,
+            )
+            .unwrap();
+            assert_eq!(psv_mesh_shared(&fast), 0, "{threads}-thread lane-only LDS");
+            let emulated = emit_ms(
+                &make_ms_program(&ms_firstlane_loop_program(1, 8, true), threads, 0, threads, 1),
+                Wave64Mode::Native,
+            )
+            .unwrap();
+            assert!(
+                psv_mesh_shared(&emulated) > 0,
+                "{threads}-thread forced exchange has no LDS"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_mesh_fast_path_lane_and_constant_mask() {
+        // Lane number + quad swizzle + a constant lane mask: console lane
+        // arithmetic only, no exchange.
+        for threads in [64u32, 128] {
+            let mut code = Vec::new();
+            code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+            code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+            code.push(v_mov_b32(2, vgpr(0))); // store address = flat id
+            code.extend_from_slice(&ds_op(0x35, 0x1F, 0x08, 1, 0, 3)); // v3 = lane xor 2
+            code.push(v_mov_b32(4, inline_u(0)));
+            code.push(s_and_saveexec_b64(6, 208)); // lanes 4..63
+            let br = code.len();
+            code.push(0);
+            code.push(v_mov_b32(4, inline_u(1)));
+            let after = code.len();
+            code[br] = s_cbranch_execz((after - (br + 1)) as i16);
+            code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+            code.push(v_lshlrev_b32(3, inline_u(8), 3));
+            code.push(v_or_b32(1, vgpr(3), 1));
+            code.push(v_lshlrev_b32(4, inline_u(16), 4));
+            code.push(v_or_b32(1, vgpr(4), 1));
+            emit_ms_uav_store(&mut code, 1, 2);
+            emit_ms_position(&mut code);
+            code.push(S_ENDPGM);
+
+            let prog = make_ms_program(&code, threads, 0, threads, 1);
+            let Some((host, root, pso, shader)) = mesh_pso("fast_lane_mask", &prog) else {
+                return;
+            };
+            assert_eq!(psv_mesh_shared(&shader), 0);
+            let out = host
+                .dispatch_mesh(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: Vec::new(),
+                        views: &[View::RawUav(threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                    1,
+                )
+                .unwrap_or_else(|e| panic!("fast_lane_mask: {e}"));
+            let expected: Vec<u32> = (0..threads)
+                .map(|g| {
+                    let lane = g & 63;
+                    let swz = lane ^ 2;
+                    let guarded = if lane >= 4 { 1 } else { 0 };
+                    lane | (swz << 8) | (guarded << 16)
+                })
+                .collect();
+            assert_eq!(&out[0][..expected.len()], &expected[..], "fast_lane_mask");
+        }
+    }
+
+    /// A loop of `uniform_firstlanes` reads of a uniform value, repeated
+    /// `iters` times; `force_emulation` adds a non-quad swizzle so the
+    /// program keeps the full cross-lane machinery.
+    fn ms_firstlane_loop_program(iters: u32, uniform_firstlanes: usize, force_emulation: bool) -> Vec<u32> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(3, vgpr(0))); // store address = flat id
+        code.push(s_mov_b32(10, LIT));
+        code.push(0x1234);
+        code.push(v_mov_b32(2, 10)); // v2 = uniform 0x1234
+        if force_emulation {
+            // Non-quad swizzle (OR 8 within each 32-lane half): forces the
+            // emulated exchange on top of the first-lane reads.
+            code.extend_from_slice(&ds_op(0x35, 0, 1, 1, 0, 14));
+        }
+        code.push(s_mov_b32(20, inline_u(0)));
+        let loop_start = code.len();
+        for _ in 0..uniform_firstlanes {
+            code.push(v_readfirstlane_b32(12, 2));
+        }
+        code.push(s_add_i32(20, 20, inline_u(1)));
+        code.push(s_cmp_lt_u32(20, inline_u(iters)));
+        let br = code.len();
+        code.push(s_cbranch_scc1(
+            (loop_start as isize - (br + 1) as isize) as i16,
+        ));
+        if force_emulation {
+            code.push(v_or_b32(1, vgpr(14), 1));
+        }
+        code.push(sop2(12, 0x1E, 12, inline_u(16)));
+        code.push(v_or_b32(1, 12, 1));
+        emit_ms_uav_store(&mut code, 1, 3);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+        code
+    }
+
+    /// Non-uniform `v_readfirstlane` (lane 0's value) repeated in a loop, to
+    /// time the emulated exchange's barriers.
+    fn ms_firstlane_nonuniform_loop_program(iters: u32) -> Vec<u32> {
+        let mut code = Vec::new();
+        code.extend_from_slice(&v_mbcnt_lo_u32_b32(1, NEG_ONE, inline_u(0)));
+        code.extend_from_slice(&v_mbcnt_hi_u32_b32(1, NEG_ONE, vgpr(1)));
+        code.push(v_mov_b32(3, vgpr(0))); // store address = flat id
+        code.push(s_mov_b32(21, LIT));
+        code.push(iters);
+        code.push(s_mov_b32(20, inline_u(0)));
+        let loop_start = code.len();
+        for _ in 0..8 {
+            code.push(v_readfirstlane_b32(12, 1)); // lane 0's value
+        }
+        code.push(s_add_i32(20, 20, inline_u(1)));
+        code.push(s_cmp_lt_u32(20, 21));
+        let br = code.len();
+        code.push(s_cbranch_scc1(
+            (loop_start as isize - (br + 1) as isize) as i16,
+        ));
+        code.push(sop2(12, 0x1E, 12, inline_u(16)));
+        code.push(v_or_b32(1, 12, 1));
+        emit_ms_uav_store(&mut code, 1, 3);
+        emit_ms_position(&mut code);
+        code.push(S_ENDPGM);
+        code
+    }
+
+    #[test]
+    fn gpu_mesh_firstlane_exchange_dispatch_cost() {
+        for threads in [64u32, 128] {
+            let prog = make_ms_program(&ms_firstlane_nonuniform_loop_program(1024), threads, 0, threads, 1);
+            let name = format!("bench_firstlane_{threads}");
+            let Some((host, root, pso, _)) = mesh_pso(&name, &prog) else {
+                return;
+            };
+            let dispatch = Dispatch {
+                roots: Vec::new(),
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 1, 1)
+                .unwrap_or_else(|e| panic!("{name}: warmup: {e}"));
+            let count = 5u32;
+            let start = std::time::Instant::now();
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 1, count)
+                .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
+            let per = start.elapsed().as_secs_f64() * 1000.0 / f64::from(count);
+            eprintln!(
+                "{name}: {per:.3} ms per dispatch (1024 loop iterations, 8 non-uniform firstlanes)"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_mesh_lane_only_dispatch_cost() {
+        for (threads, iters, force, label) in [
+            (64u32, 1u32, false, "fast_1"),
+            (128u32, 1u32, false, "fast_1"),
+            (64u32, 64u32, false, "fast_64"),
+            (128u32, 64u32, false, "fast_64"),
+            (64u32, 64u32, true, "emulated_64"),
+            (128u32, 64u32, true, "emulated_64"),
+        ] {
+            let code = ms_firstlane_loop_program(iters, 8, force);
+            let prog = make_ms_program(&code, threads, 0, threads, 1);
+            let name = format!("bench_{threads}_{label}");
+            let Some((host, root, pso, shader)) = mesh_pso(&name, &prog) else {
+                return;
+            };
+            let psv = Container::parse(&shader.dxil).unwrap();
+            let shared = u32::from_le_bytes(
+                psv.part(FourCC::PSV0).unwrap().data[4..8]
+                    .try_into()
+                    .unwrap(),
+            );
+            let dispatch = Dispatch {
+                roots: Vec::new(),
+                views: &[View::RawUav(threads)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            };
+            // Warm up the pipeline, then time a run of dispatches in one list.
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 1, 2)
+                .unwrap_or_else(|e| panic!("{name}: warmup: {e}"));
+            let count = 20u32;
+            let start = std::time::Instant::now();
+            host.dispatch_mesh_repeat(&root, &pso, &dispatch, 1, count)
+                .unwrap_or_else(|e| panic!("{name}: dispatch: {e}"));
+            let per = start.elapsed().as_secs_f64() * 1000.0 / f64::from(count);
+            eprintln!(
+                "{name}: {per:.3} ms per dispatch ({iters} loop iterations, 8 firstlanes; LDS {shared} B)"
+            );
+        }
     }
 }

@@ -939,7 +939,70 @@ impl<'a> Lower<'a> {
                         inst.name() == "v_readlane_b32" && !spills.contains_key(&(b, i))
                     })
                 });
-                if uses_console_lanes() || !sections.is_empty() || has_non_uniform_firstlane {
+                // A mesh program that only needs its console lane number can
+                // use `SV_GroupIndex & 63` directly: `v_mbcnt`, quad-local
+                // swizzles/DPPs and constant lane masks are host-independent.
+                // Scratch and barriers are only needed when another lane's
+                // value (or a 64-bit mask as a number) is actually read.
+                let has_non_quad_swizzle = insts().any(|i| {
+                    if i.name() == "ds_swizzle_b32" {
+                        let Fields::Ds {
+                            offset0, offset1, ..
+                        } = &i.fields
+                        else {
+                            return false;
+                        };
+                        let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
+                        let quad = offset & 0x8000 != 0
+                            || offset & 0x1C == 0x1C
+                                && offset & 0x380 == 0
+                                && offset >> 10 & 0x1F < 4;
+                        !quad
+                    } else {
+                        i.name().contains("permute")
+                    }
+                });
+                let has_non_quad_dpp = insts().any(|i| {
+                    matches!(
+                        &i.fields,
+                        Fields::Valu(v)
+                            if matches!(v.dpp, Some(d) if !matches!(d, Dpp::Row { ctrl: 0..=0xFF, .. }))
+                    )
+                });
+                let has_writelane = insts().any(|i| i.name() == "v_writelane_b32");
+                let has_mask_data = insts().any(|i| reads_mask_as_data(x.st, i));
+                let has_opaque_guard = {
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let mut all: Vec<Bool> = x
+                        .st
+                        .guards
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .copied()
+                        .chain(whens)
+                        .collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(_)))
+                    })
+                };
+                let needs_exchange = !sections.is_empty()
+                    || has_non_uniform_firstlane
+                    || has_unresolved_readlane
+                    || has_writelane
+                    || has_non_quad_swizzle
+                    || has_non_quad_dpp
+                    || has_mask_data
+                    || has_opaque_guard;
+                if needs_exchange {
                     wave64 = Wave64Mode::Emulate;
                     console_lanes = true;
                     virtual_waves = total_threads.div_ceil(64);
@@ -947,7 +1010,9 @@ impl<'a> Lower<'a> {
                     let ballot_dwords = ballot_stride * virtual_waves;
                     let exchange_dwords = if !sections.is_empty()
                         || has_unresolved_readlane
-                        || has_swizzle_or_dpp
+                        || has_non_quad_swizzle
+                        || has_non_quad_dpp
+                        || has_non_uniform_firstlane
                     {
                         64 * virtual_waves
                     } else {
@@ -1480,6 +1545,21 @@ impl<'a> Lower<'a> {
         }
 
         // Emulate mode: find lowest active console lane via atomicMin.
+        // Without a lane guard the lowest active lane is console lane 0:
+        // that lane publishes its value into slot 0 and every lane reads it,
+        // which takes two barriers and no atomics.
+        if self.s.mesh.is_some() && guard.is_none() {
+            self.lds_barrier(self.cur);
+            let zero = self.s.m.i32(0);
+            let is0 = self.s.m.cmp(self.cur, pred::EQ, console_lane, zero);
+            let at = self.begin_guarded(Some(is0));
+            let wptr = self.exchange_ptr(self.cur, vwave, zero);
+            self.s.m.store(self.cur, wptr, val);
+            self.end_guarded(at, &[]);
+            self.lds_barrier(self.cur);
+            let rptr = self.exchange_ptr(self.cur, vwave, zero);
+            return Ok(self.s.m.load(self.cur, rptr));
+        }
         self.lds_barrier(self.cur);
         let k0 = self.s.m.i32(0);
         let kmax = self.s.m.i32(u32::MAX);
@@ -2678,7 +2758,7 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(word).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            Atom::Constant(k) if self.console_lanes || self.s.mesh.is_some() => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
@@ -2692,6 +2772,10 @@ impl<'a> Lower<'a> {
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         let lane = if self.s.threads.is_some() && self.emulating_wave64() {
             self.ensure_wave_ids().1
+        } else if self.s.mesh.is_some() {
+            // A mesh lane is the console's: the flattened thread id's low
+            // six bits, even without emulating its cross-lane reads.
+            self.lane_index()
         } else {
             self.s.op(
                 at,
