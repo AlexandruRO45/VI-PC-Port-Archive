@@ -19,10 +19,21 @@ use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, Usage, UsedResource,
 };
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, Resources, Role, Site, Source, USER_SPILL};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
+
+fn s_load_count(name: &str) -> Option<u32> {
+    match name.strip_prefix("s_load_dword")? {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum Val {
@@ -172,6 +183,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    user_bias: u32,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -879,6 +891,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let min_ud = x.native.layout.iter().map(|p| p.user_data).min().unwrap_or(0);
+        let user_bias = if min_ud >= 16 { u32::from(min_ud) } else { 0 };
         Lower {
             s,
             x,
@@ -898,6 +912,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            user_bias,
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1664,7 +1679,7 @@ impl<'a> Lower<'a> {
             RootType::Constants | RootType::Table => {}
             _ => return Val::Missing("a root descriptor"),
         }
-        let index = u32::from(rp.user_data) + dword;
+        let index = u32::from(rp.user_data) + dword - self.user_bias;
         self.user_reads.insert(
             index,
             UserData {
@@ -3663,8 +3678,13 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
-        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
-            return self.code_smem(inst, a);
+        if let Some(a) = self.scalar.get(&site).copied() {
+            if a.param == CODE {
+                return self.code_smem(inst, a);
+            }
+            if a.param == USER_SPILL {
+                return self.spill_smem(inst, &a);
+            }
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
             if let Some(a) = self.scalar.get(&site).copied()
@@ -3795,6 +3815,44 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `s_load_dword*` from a compute shader's spilled user-data table (`s[0:1]`),
+    /// where `offset 0` holds user-data dword 16 (`layout` starting at `user_data >= 16`).
+    fn spill_smem(&mut self, inst: &Inst, a: &Address) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar load");
+        };
+        let count = s_load_count(inst.name()).ok_or("a scalar load")?;
+        if a.dynamic.is_some() || !a.offset.is_multiple_of(4) {
+            return Err("a dynamic load from spilled user data");
+        }
+        let first_ud = 16 + a.offset / 4;
+        for k in 0..count {
+            let ud = first_ud + k;
+            let entry = self.x.native.layout.iter().enumerate().find_map(|(i, p)| {
+                ud.checked_sub(u32::from(p.user_data))
+                    .filter(|&d| d < p.sgprs)
+                    .map(|d| (i, d))
+            });
+            let val = match entry {
+                Some((param, dword)) => self.user(param, dword),
+                None => Val::Missing("an unused spilled user-data dword"),
+            };
+            match val {
+                Val::I32(x) => self.write(inst, Reg::S(code + k as u8), x, None),
+                Val::Bit(_) | Val::Missing(_) => {
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, val);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `s_load_dword*` directly from a root CBV or root SRV address.
     fn root_descriptor_smem(
         &mut self,
@@ -3809,14 +3867,7 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar load");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load"),
-        };
+        let count = s_load_count(inst.name()).ok_or("a scalar load")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         let constant = a.dynamic.is_none().then_some(a.offset);
@@ -3867,14 +3918,7 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar memory read as data");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar memory read as data"),
-        };
+        let count = s_load_count(inst.name()).ok_or("a scalar memory read as data")?;
         // How the program uses the descriptor tells the view's kind.
         let use_at = self
             .x
@@ -4070,14 +4114,7 @@ impl<'a> Lower<'a> {
         else {
             return Err("a scalar load");
         };
-        let count = match inst.name().strip_prefix("s_load_dword") {
-            Some("") => 1u32,
-            Some("x2") => 2,
-            Some("x4") => 4,
-            Some("x8") => 8,
-            Some("x16") => 16,
-            _ => return Err("a scalar load from the code"),
-        };
+        let count = s_load_count(inst.name()).ok_or("a scalar load from the code")?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {

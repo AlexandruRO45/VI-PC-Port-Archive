@@ -38,6 +38,10 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of a compute shader's spilled user-data table passed in
+/// `s[0:1]` when user data starts at dword 16 (`offset 0` = dword 16).
+pub const USER_SPILL: usize = usize::MAX - 1;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -295,6 +299,8 @@ struct Tracer<'a> {
     phis: Vec<Option<(usize, usize)>>,
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
+    /// Parameter and dword per spilled user-data load value (`s[0:1]`).
+    spilled: Vec<Option<(usize, u32)>>,
     origin: Vec<Term>,
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
@@ -357,11 +363,13 @@ impl<'a> Tracer<'a> {
             defs,
             phis,
             inputs,
+            spilled: vec![None; n],
             origin: Vec::new(),
             lanes,
             rpo,
         };
         t.origin = t.propagate_copies(n)?;
+        t.collect_spilled();
         Ok(t)
     }
 
@@ -443,6 +451,71 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Layout index and dword of `v`, whether arrived in an entry SGPR or
+    /// loaded from the compute `s[0:1]` spill table.
+    fn value_param(&self, v: Value) -> Option<(usize, u32)> {
+        self.spilled[v.0 as usize]
+            .or_else(|| self.inputs[v.0 as usize].and_then(|reg| self.param_of(reg)))
+    }
+
+    fn has_user_spill(&self) -> bool {
+        self.stage == HwStage::Cs
+            && self.layout.iter().any(|p| p.user_data >= 16)
+            && self.param_of(Reg::S(0)).is_none()
+            && self.param_of(Reg::S(1)).is_none()
+    }
+
+    fn spill_entry(&self, ud: u32) -> Option<(usize, u32)> {
+        self.layout.iter().enumerate().find_map(|(i, p)| {
+            ud.checked_sub(u32::from(p.user_data))
+                .filter(|&d| d < p.sgprs)
+                .map(|d| (i, d))
+        })
+    }
+
+    fn collect_spilled(&mut self) {
+        if !self.has_user_spill() {
+            return;
+        }
+        for block in &self.p.blocks {
+            for inst in &block.insts {
+                if inst.name().starts_with("s_buffer_")
+                    || !inst.name().starts_with("s_load_dword")
+                {
+                    continue;
+                }
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    data: Some(Operand::Scalar { code, .. }),
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                let Ok(addr) = self.smem_address(inst, base, *offset, soffset) else {
+                    continue;
+                };
+                if addr.param != USER_SPILL
+                    || addr.dynamic.is_some()
+                    || !addr.offset.is_multiple_of(4)
+                {
+                    continue;
+                }
+                let first_ud = 16 + addr.offset / 4;
+                for &(reg, v) in &inst.writes {
+                    if let Reg::S(r) = reg
+                        && let Some(k) = r.checked_sub(*code)
+                        && let Some(entry) = self.spill_entry(first_ud + u32::from(k))
+                    {
+                        self.spilled[v.0 as usize] = Some(entry);
+                    }
+                }
+            }
+        }
+    }
+
     /// Layout index and dword of the root parameter `reg` holds on entry.
     fn param_of(&self, reg: Reg) -> Option<(usize, u32)> {
         let Reg::S(code) = reg else { return None };
@@ -487,9 +560,9 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+        if let Some((_, dword)) = self.value_param(v) {
+            return match dword {
+                0 => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -497,7 +570,9 @@ impl<'a> Tracer<'a> {
                 _ => dynamic,
             };
         }
-        if self.getpc(v).is_some() {
+        if self.getpc(v).is_some()
+            || (self.inputs[v.0 as usize] == Some(Reg::S(0)) && self.has_user_spill())
+        {
             return Sum {
                 base: Some(v),
                 offset: 0,
@@ -646,22 +721,33 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
+        let dynamic = s.dynamic.or(extra.dynamic);
+        if self.inputs[base.0 as usize] == Some(Reg::S(0)) && self.has_user_spill() {
+            let high = self.p.inputs.iter().find(|i| i.0 == Reg::S(1)).map(|i| i.1);
+            if !self.high_half(hi, high)
+                && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
+            {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: USER_SPILL,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic,
+            });
+        }
         let (param, _) = self
-            .param_of(reg)
+            .value_param(base)
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.descriptor_high(param)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
@@ -670,16 +756,35 @@ impl<'a> Tracer<'a> {
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
         })
     }
 
-    /// `hi` is `high` (0 for a table), possibly plus a carry.
+    fn descriptor_high(&self, param: usize) -> Option<Value> {
+        let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+        self.p
+            .inputs
+            .iter()
+            .find(|i| i.0 == high)
+            .map(|i| i.1)
+            .or_else(|| {
+                self.spilled
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, p)| (*p == Some((param, 1))).then_some(Value(i as u32)))
+            })
+    }
+
+    /// `hi` is `high` (0 for a table), possibly plus a carry or VA mask.
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
         let want = high.map_or(Term::Const(0), Term::Value);
         hi == want
             || matches!(hi, Term::Value(v) if self.sop2(v, &["s_addc_u32"]).is_some_and(
                 |(_, [a, b])| a == want && b == Term::Const(0) || b == want && a == Term::Const(0)
+            ))
+            || matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                |(_, [a, b])| (a == want && matches!(b, Term::Const(_)))
+                    || (b == want && matches!(a, Term::Const(_)))
             ))
     }
 
@@ -709,7 +814,7 @@ impl<'a> Tracer<'a> {
         let Some(v) = dynamic else {
             return "a constant address";
         };
-        if self.inputs[v.0 as usize].is_some() {
+        if self.inputs[v.0 as usize].is_some() || self.spilled[v.0 as usize].is_some() {
             return "an address in an SGPR that is no root parameter";
         }
         if self

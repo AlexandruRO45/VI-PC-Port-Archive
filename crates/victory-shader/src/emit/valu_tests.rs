@@ -2287,3 +2287,121 @@ fn v_cndmask_b32_with_untracked_mask_selects_per_lane() {
         }
     }
 }
+
+#[test]
+fn compute_spilled_user_data_table_resolves_constants_table_and_root_srv() {
+    // Models the Xbox Series X compute spill ABI: `layout` starts at `user_data: 16`,
+    // and the shader receives the spill buffer VA in `s[0:1]`, masks `s3 = s1 & 255`,
+    // copies `s2 = s0`, and loads `layout` entries via `s_load_dword*` from `s[2:3]`.
+    // - slot 0 (user_data 16, 2 dwords): Constants
+    // - slot 1 (user_data 18, 1 dword): Table (RawUav(1) at byte 0)
+    // - slot 2 (user_data 20, 2 dwords): Root SRV (Reads dword 1 -> 0x2000_0003)
+    let mut words = vec![
+        sop2(0x0E, 3, 1, 255), // s_and_b32 s3, s1, literal
+        0xFF,
+        s_mov_b32(2, 0), // s2 = s0
+        // s_load_dwordx8 s[8:15], s[2:3], 0 -> s[8:9]=Consts, s10=Table, s11=pad, s[12:13]=RootSrv
+        0x3D << 26 | 0x03 << 18 | 8 << 6 | (2 >> 1),
+        125 << 25,
+    ];
+    // Read root SRV dword 1 via spilled s[12:13]: s_load_dword s16, s[12:13], 4
+    words.extend_from_slice(&s_load_dword(16, 12, 4));
+    // Sum c0 (s8) + c1 (s9) + srv[1] (s16) in VGPR v0
+    words.push(vop1(0x001, 0, sgpr(8)));
+    words.push((0x25 << 25) | sgpr(9) as u32); // v_add_nc_u32 v0, s9, v0
+    words.push((0x25 << 25) | sgpr(16) as u32); // v_add_nc_u32 v0, s16, v0
+    // Store v0 via spilled Table descriptor: s_mov_b32 s11, 0; s_load_dwordx4 s[20:23], s[10:11], 0
+    words.push(s_mov_b32(11, 0x80));
+    words.extend_from_slice(&s_load_dwordx4(20, 10));
+    words.extend_from_slice(&buffer_store_dword(0, 20, 0));
+    words.push(S_ENDPGM);
+
+    let layout = vec![
+        RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        },
+        RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 18,
+            slot: 1,
+        },
+        RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 20,
+            slot: 2,
+        },
+    ];
+    let used = vec![
+        UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 18,
+            slot: 1,
+        },
+        UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 20,
+            slot: 2,
+        },
+    ];
+    let shader = lower_synthetic_cs(&words, layout, used, 16);
+    assert!(
+        shader.user_data.iter().all(|u| u.index < 8),
+        "expected user_data indices compacted from user_data>=16: {:?}",
+        shader.user_data
+    );
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                (RootType::Constants, 0, 0) => 0x0000_0100,
+                (RootType::Constants, 0, 1) => 0x0000_0020,
+                (RootType::Table, 1, _) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![0, 0x2000_0003, 0, 0] }),
+                    ],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0][0], 0x2000_0123, "{label}: spilled compute user data mismatch");
+    }
+}
