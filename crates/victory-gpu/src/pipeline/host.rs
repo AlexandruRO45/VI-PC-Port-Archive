@@ -517,13 +517,6 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
-            // A refusal that a later attempt at the same module survives is not
-            // a verdict on the module, so `VICTORY_SERIAL_PIPELINES=1` creates
-            // them one at a time: it separates a driver race from a
-            // description we build differently each attempt.
-            static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-            let serial = std::env::var_os("VICTORY_SERIAL_PIPELINES")
-                .map(|_| ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()));
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -531,7 +524,6 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
-            drop(serial);
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {

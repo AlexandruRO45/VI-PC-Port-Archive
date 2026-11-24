@@ -162,6 +162,9 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    // One call into the vendor's compiler at a time with the switch (see
+    // `pipeline::compiler`).
+    let _serial = crate::pipeline::compiler();
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.

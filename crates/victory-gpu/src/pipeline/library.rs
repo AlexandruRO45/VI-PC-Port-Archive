@@ -417,6 +417,25 @@ fn same_name(name: &str) -> MutexGuard<'static, ()> {
     LOADING[at % LOADING.len()].lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// With `VICTORY_SERIAL_PIPELINES=1`: held by every call into the vendor's
+/// compiler, whichever path makes it ([`pipeline`] for the title's own, and
+/// the four lazy ones: the argument clamp, the in-place copy, the plane pass
+/// and the card compare).
+///
+/// The fallback create faults inside `amdxc64` intermittently
+/// (`amdxc64+0x85fd0f`, read of 0x8; boot, frame 184, and not at all on three
+/// later boots), so one call at a time is the experiment that separates a
+/// concurrent entry from a description the compiler misreads. A partial lock
+/// would only make the fault rarer: before 2026-11-24 the switch guarded the
+/// compute branch of `pipeline/host.rs` alone, and the graphics branch, the
+/// mesh stream and those four sites all entered the compiler outside it.
+pub(crate) fn compiler() -> Option<MutexGuard<'static, ()>> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static COMPILING: Mutex<()> = Mutex::new(());
+    ON.get_or_init(|| std::env::var_os("VICTORY_SERIAL_PIPELINES").is_some())
+        .then(|| COMPILING.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// With `VICTORY_LIBRARY_LOCK=1`: held by every library call, as before.
 fn one_call() -> Option<MutexGuard<'static, ()>> {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -512,6 +531,10 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
+    // With `VICTORY_SERIAL_PIPELINES=1` the load, the create and the store of
+    // one pipeline hold the compiler's lock between them, so no other path can
+    // be inside the vendor's compiler meanwhile.
+    let _serial = compiler();
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();

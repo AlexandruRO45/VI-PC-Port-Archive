@@ -749,6 +749,14 @@ mod make;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) mod timing;
 
+/// Held by one call into the vendor's compiler at a time, with
+/// `VICTORY_SERIAL_PIPELINES=1` (`library::compiler`): every path that creates
+/// a pipeline state takes it, including the lazy helpers outside this module.
+#[cfg(windows)]
+pub(crate) fn compiler() -> Option<std::sync::MutexGuard<'static, ()>> {
+    library::compiler()
+}
+
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
 #[cfg(windows)]
