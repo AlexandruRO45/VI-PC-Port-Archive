@@ -64,6 +64,16 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     {
         return Err(ShaderError::Malformed("a thread group past D3D12's limits"));
     }
+    // The size goes into `PSV0` whether or not the program reads LDS, and
+    // was rounded up to dwords and back (overflowing `u32` near its top).
+    if let StageIo::Ms(ms) = &parts.native.io
+        && ms.lds_bytes > MS_SHARED_BYTES
+    {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "mesh group shared memory past D3D12's 28 KB",
+        });
+    }
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad).run() {
@@ -88,6 +98,13 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 fn thread_group_fits([x, y, z]: [u32; 3]) -> bool {
     (1..=1024).contains(&x) && (1..=1024).contains(&y) && (1..=64).contains(&z) && x * y * z <= 1024
 }
+
+/// `D3D12_CS_TGSM_REGISTER_COUNT` dwords: the group shared memory a compute
+/// program may declare. The console's `LDS_SIZE` reaches 64 KB (and its
+/// field 255.5 KB); the validator refuses a module over this.
+const CS_SHARED_BYTES: u32 = 32 * 1024;
+/// The group shared memory a mesh program may declare (`PSV0`'s count too).
+const MS_SHARED_BYTES: u32 = 28 * 1024;
 
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
@@ -2102,6 +2119,11 @@ impl<'a> Lower<'a> {
         }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
+        }
+        // A compute program that allocates more but never reads it still
+        // translates: the host array exists only once LDS is used.
+        if self.s.lds_dwords > CS_SHARED_BYTES / 4 {
+            return Err("group shared memory past D3D12's 32 KB");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
@@ -6621,14 +6643,23 @@ mod tests {
         wave64: bool,
         threads: [u32; 3],
     ) -> Result<Vec<u8>, crate::ShaderError> {
+        dxil_io(words, wave64, StageIo::Cs(ComputeIo { rsrc2: 0, threads }))
+    }
+
+    /// The DXIL of a program of constants with stage data `io`.
+    fn dxil_io(words: &[u32], wave64: bool, io: StageIo) -> Result<Vec<u8>, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let stage = match io {
+            StageIo::Ms(_) => HwStage::Ms,
+            _ => HwStage::Cs,
+        };
         let native = NativeProgram {
-            stage: HwStage::Cs,
+            stage,
             wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo { rsrc2: 0, threads }),
+            io,
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -6686,6 +6717,67 @@ mod tests {
             assert!(
                 dxil_group(&[S_ENDPGM], false, threads).is_ok(),
                 "{threads:?}"
+            );
+        }
+    }
+
+    /// D3D12 caps group shared memory at 32 KB for compute and 28 KB for
+    /// mesh programs; the console's LDS size goes past both (its compute
+    /// field to 255.5 KB, a mesh record's to `u32::MAX`). A compute program
+    /// using LDS past the cap is refused where it does, and one that only
+    /// allocates it still translates. A mesh program's size goes into
+    /// `PSV0` regardless, so it is refused up front; `u32::MAX` used to
+    /// overflow rounding to dwords and back.
+    #[test]
+    fn group_shared_memory_past_d3d12s_limits_is_refused() {
+        // ds_write_b32 v0, v1 (a read whose result is unused is dropped)
+        const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100];
+        let cs = |granules: u32, words: &[u32]| {
+            let io = StageIo::Cs(ComputeIo {
+                rsrc2: granules << 15,
+                threads: [64, 1, 1],
+            });
+            dxil_io(words, false, io).map(|_| ())
+        };
+        let write = [DS_WRITE[0], DS_WRITE[1], S_ENDPGM];
+        for granules in [1, 32, 64] {
+            assert_eq!(cs(granules, &write), Ok(()), "{granules} granules");
+        }
+        for granules in [65, 128, 0x1FF] {
+            assert_eq!(
+                cs(granules, &write),
+                Err(crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "group shared memory past D3D12's 32 KB",
+                }),
+                "{granules} granules"
+            );
+            assert_eq!(cs(granules, &[S_ENDPGM]), Ok(()), "{granules} unused");
+        }
+
+        let ms = |lds_bytes: u32| {
+            let io = StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes,
+            });
+            dxil_io(&[S_ENDPGM], false, io).map(|_| ())
+        };
+        for lds_bytes in [0, 4, 28 * 1024] {
+            assert_eq!(ms(lds_bytes), Ok(()), "{lds_bytes} bytes");
+        }
+        for lds_bytes in [28 * 1024 + 1, 32 * 1024, 64 * 1024, u32::MAX - 2, u32::MAX] {
+            assert_eq!(
+                ms(lds_bytes),
+                Err(crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "mesh group shared memory past D3D12's 28 KB",
+                }),
+                "{lds_bytes} bytes"
             );
         }
     }
