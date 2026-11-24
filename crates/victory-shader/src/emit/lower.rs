@@ -8135,7 +8135,7 @@ impl<'a> Lower<'a> {
                 let off = p.blocks[b].insts.first().map_or(0, |i| i.machine.offset);
                 let x = self
                     .rel_offset(arg, base, &mut local)
-                    .map_err(|what| fail(off, what))?;
+                    .map_err(|what| unsupported(off, what))?;
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(phi_v, incoming);
