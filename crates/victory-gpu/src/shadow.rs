@@ -404,10 +404,19 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
 }
 
-/// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+struct Buffers {
+    by_start: BTreeMap<(u64, usize), Entry>,
+    /// Longest registered buffer length; bounds reverse scans in [`find`].
+    max_len: u64,
+}
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+/// Title buffers by (start address, resource), with their copy once made.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
+    by_start: BTreeMap::new(),
+    max_len: 0,
+});
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -416,41 +425,74 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let Some(end) = start.checked_add(len) else {
         return;
     };
-    buffers().insert((start, resource), Entry { end, shadow: None });
+    let mut state = buffers();
+    let replaced = state
+        .by_start
+        .insert((start, resource), Entry { end, shadow: None });
+    if len >= state.max_len {
+        state.max_len = len;
+    } else if replaced.is_some_and(|old| old.end - start == state.max_len) {
+        state.max_len = state
+            .by_start
+            .iter()
+            .map(|(&(s, _), e)| e.end - s)
+            .max()
+            .unwrap_or(0);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut state = buffers();
+    if let Some(removed) = state.by_start.remove(&(start, resource))
+        && removed.end - start == state.max_len
+    {
+        state.max_len = state
+            .by_start
+            .iter()
+            .map(|(&(s, _), e)| e.end - s)
+            .max()
+            .unwrap_or(0);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    // The innermost buffer holding the range: the largest start at or below
-    // `address` whose end reaches `end`; of equal starts, the smallest end.
-    // Same-start entries are contiguous, so the first covering block found
-    // in start-descending order is the innermost.
+    let required = len.max(1);
+    let end = address.checked_add(required)?;
+    let mut state = buffers();
+    // No registered buffer can cover `[address, end)` if `required > max_len`,
+    // or if its start is below `end - max_len`.
     let mut key: Option<((u64, usize), u64)> = None;
-    for (&k, e) in map.range(..=(address, usize::MAX)).rev() {
-        if let Some((best, bend)) = &key {
-            if best.0 != k.0 {
-                break;
-            }
-            if e.end >= end && e.end < *bend {
+    if required <= state.max_len {
+        let min_start = end.saturating_sub(state.max_len);
+        // The innermost buffer holding the range: the largest start at or below
+        // `address` whose end reaches `end`; of equal starts, the smallest end.
+        // Same-start entries are contiguous, so the first covering block found
+        // in start-descending order is the innermost.
+        for (&k, e) in state
+            .by_start
+            .range((min_start, 0)..=(address, usize::MAX))
+            .rev()
+        {
+            if let Some((best, bend)) = &key {
+                if best.0 != k.0 {
+                    break;
+                }
+                if e.end >= end && e.end < *bend {
+                    key = Some((k, e.end));
+                }
+            } else if e.end >= end {
                 key = Some((k, e.end));
             }
-        } else if e.end >= end {
-            key = Some((k, e.end));
         }
     }
     let Some((key, _)) = key else {
-        drop(map);
+        drop(state);
         return loose(address, end);
     };
-    let entry = map.get_mut(&key)?;
+    let entry = state.by_start.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -512,6 +554,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .by_start
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -548,13 +591,32 @@ mod tests {
     fn overflowing_registrations_do_not_enter_the_map() {
         let start = u64::MAX - 8;
         register(0, start, 9);
-        assert!(!buffers().contains_key(&(start, 0)));
+        assert!(!buffers().by_start.contains_key(&(start, 0)));
     }
 
     #[test]
     fn overflowing_loose_window_is_rejected() {
         assert!(find(u64::MAX, 1).is_none());
         assert!(find(u64::MAX - 1, 1).is_none());
+    }
+
+    #[test]
+    fn max_len_tracks_register_replace_and_unregister() {
+        // Use a distinctive large length above any concurrent test's buffers.
+        let base = 0x7000_0000_0000u64;
+        let big = 0x10_0000_0000u64;
+        let mid = 0x08_0000_0000u64;
+        register(9001, base, mid);
+        assert!(buffers().max_len >= mid);
+        register(9002, base + 0x1000, big);
+        assert_eq!(buffers().max_len, big);
+        // Shrinking the current longest entry recomputes max_len.
+        register(9002, base + 0x1000, 64);
+        assert_eq!(buffers().max_len, mid);
+        // Unregistering the remaining longest entry recomputes max_len again.
+        unregister(9001, base);
+        assert!(buffers().max_len < mid);
+        unregister(9002, base + 0x1000);
     }
 }
 
