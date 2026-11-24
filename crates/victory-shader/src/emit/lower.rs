@@ -7080,8 +7080,9 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == v))
             .ok_or("an SCC without its instruction")?;
-        // `s_*_saveexec` / `s_*_wrexec` write the old EXEC to their scalar
-        // destination before writing the new EXEC; SCC tests the new EXEC.
+        // SCC tests the new EXEC. `s_*_saveexec` also writes a scalar, the
+        // EXEC it replaces, and that write comes first (`s_*_wrexec` writes
+        // the new EXEC to both).
         let mask = inst
             .write(Reg::S(EXEC))
             .and_then(|w| self.x.st.masks.get(&w).copied())
