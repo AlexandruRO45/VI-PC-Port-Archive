@@ -1251,4 +1251,157 @@ mod tests {
             assert_eq!(inline(c), None, "code {c}");
         }
     }
+
+    fn track_err(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        track(&p, layout, stage).unwrap_err()
+    }
+
+    fn unsupported(offset: usize, what: &'static str) -> ShaderError {
+        ShaderError::Unsupported { offset, what }
+    }
+
+    /// An address with no root parameter under it says where it came from:
+    /// a constant, or a dword an earlier load fetched.
+    #[test]
+    fn addresses_without_a_base_name_their_origin() {
+        let err = track_err(
+            &[
+                0xBE82_03FF,
+                0x0000_1000, // s_mov_b32 s2, 0x1000
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0001,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(0xC, "a constant address"));
+        let err = track_err(
+            &[
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xF404_0084,
+                0xFA00_0000, // s_load_dwordx2 s[2:3], s[8:9], null
+                0xF408_0101,
+                0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 8, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(0xC, "an address loaded from memory"));
+    }
+
+    /// Root constants are no address, and a root parameter is no offset:
+    /// neither is taken for a table.
+    #[test]
+    fn root_parameters_in_the_wrong_place_are_refused() {
+        let load = [0xF408_0001, 0xFA00_0000, S_ENDPGM]; // s_load_dwordx4 s[0:3], s[2:3], null
+        assert_eq!(
+            track_err(&load, &[param(Constants, 2, 2)], HwStage::Ps),
+            unsupported(0, "an address from a root parameter that is no address")
+        );
+        let err = track_err(
+            &[
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0101,
+                0x1200_0000, // s_load_dwordx4 s[4:7], s[2:3], s9
+                S_ENDPGM,
+            ],
+            &[param(Table, 2, 1), param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(4, "an offset from a root parameter"));
+    }
+
+    /// One computed term rides on a table's base; a second one, from the
+    /// offset register, is refused rather than dropped.
+    #[test]
+    fn an_address_takes_at_most_one_computed_term() {
+        let words = |soffset: u32| {
+            [
+                0x8002_0A02, // s_add_u32 s2, s2, s10
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0101,
+                soffset, // s_load_dwordx4 s[4:7], s[2:3], soffset
+                S_ENDPGM,
+            ]
+        };
+        let layout = [param(Table, 2, 1)];
+        let r = track_words(&words(0xFA00_0040), &layout, HwStage::Ps);
+        let address = r.scalar[0].1;
+        assert_eq!((address.param, address.offset), (0, 0x40));
+        assert!(address.dynamic.is_some());
+        assert_eq!(
+            track_err(&words(0x1600_0000), &layout, HwStage::Ps), // s11
+            unsupported(8, "an address with two computed terms")
+        );
+    }
+
+    /// A root descriptor's high half is its second SGPR, possibly plus the
+    /// carry of the low half. Anything else added to it is taken as a carry
+    /// only with a computed low term; with a constant offset it is refused.
+    #[test]
+    fn a_root_descriptors_high_half_must_be_its_own() {
+        const LOAD: [u32; 3] = [0xF408_0100, 0xFA00_0000, S_ENDPGM]; // s_load_dwordx4 s[4:7], s[0:1], null
+        let layout = [param(Descriptor, 10, 2)];
+        let run = |prefix: &[u32]| {
+            let code: Vec<u8> = prefix
+                .iter()
+                .chain(&LOAD)
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            track(
+                &crate::ir::build(&code, false, 256).unwrap(),
+                &layout,
+                HwStage::Ps,
+            )
+            .map(|r| r.scalar[0].1)
+        };
+        // Another SGPR as the high half: with the descriptor's own never
+        // read, there is no high half to compare it with.
+        assert_eq!(
+            run(&[
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030C, // s_mov_b32 s1, s12
+            ]),
+            Err(unsupported(8, "a root descriptor without its high half"))
+        );
+        assert_eq!(
+            run(&[
+                0xBE82_030B, // s_mov_b32 s2, s11
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE81_030C, // s_mov_b32 s1, s12
+            ]),
+            Err(unsupported(0xC, "an address with an untracked high half"))
+        );
+        // A constant offset with its carry.
+        assert_eq!(
+            run(&[
+                0x8000_FF0A,
+                0x0000_0040, // s_add_u32 s0, s10, 0x40
+                0x8201_800B, // s_addc_u32 s1, s11, 0
+            ]),
+            Ok(at(0, 0x40))
+        );
+        // A constant offset with more than a carry.
+        assert_eq!(
+            run(&[
+                0x8000_FF0A,
+                0x0000_0040, // s_add_u32 s0, s10, 0x40
+                0x8201_0D0B, // s_addc_u32 s1, s11, s13
+            ]),
+            Err(unsupported(0xC, "an address with an untracked high half"))
+        );
+        // A computed offset: the high half's extra term is its carry.
+        let address = run(&[
+            0x8000_0C0A, // s_add_u32 s0, s10, s12
+            0x8201_0D0B, // s_addc_u32 s1, s11, s13
+        ])
+        .unwrap();
+        assert_eq!((address.param, address.offset), (0, 0));
+        assert!(address.dynamic.is_some());
+    }
 }
