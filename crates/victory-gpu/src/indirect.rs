@@ -820,9 +820,9 @@ void main() {
     /// the ring, in the order of the queue: its dword is 2 + the slot, the
     /// slot holds the piece's bytes from `card_slot_start` on, as they were
     /// when the compare ran (a later change of the copy does not reach it),
-    /// and a piece found differing once the slots are gone is flagged 1 with
-    /// nothing copied. Skewed copies, the partial first piece and the last
-    /// piece are covered.
+    /// and a piece found differing once the count reaches the host's limit
+    /// is flagged 1 with nothing copied. Skewed copies, the partial first
+    /// piece and the last piece are covered.
     #[test]
     fn warp_card_compare_copies_differing_pieces_into_the_ring() {
         let Some(mut warp) = WarpHarness::new() else {
@@ -864,7 +864,11 @@ void main() {
         };
         // SAFETY (each): inside the mappings.
         let taken = || unsafe { ring_ptr.cast::<u32>().read_volatile() };
-        let reset = || unsafe { ring_ptr.cast::<u32>().write_volatile(0) };
+        // As the host makes the ring: no count, the limit at the slots.
+        let reset = || unsafe {
+            ring_ptr.cast::<u32>().write_volatile(0);
+            ring_ptr.cast::<u32>().add(1).write_volatile(SLOTS);
+        };
         let slot = |s: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(SLOT * (s as usize + 1)), SLOT) };
         let flip = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
         for skew in [0u32, 4096] {
@@ -908,7 +912,8 @@ void main() {
             flip(at, content[at] ^ 0x33);
             let before = slot(s)[at - crate::host::card_slot_start(p, skew)];
             assert_eq!(before, content[at] ^ 0x5a);
-            // Now the ring is full: the changed piece is flagged 1, nothing copied.
+            // Now the count is at the limit: the changed piece is flagged
+            // 1, nothing copied.
             let flags = run(&mut warp, 2, skew, SLOTS);
             assert_eq!(flags[p as usize], 1, "skew {skew}: no slot left");
             assert!(taken() > SLOTS);
@@ -920,6 +925,195 @@ void main() {
             reset();
             run(&mut warp, 0, skew, 0);
         }
+    }
+
+    /// The ring goes round (`crate::host::CardAreas`): the count is never
+    /// set back, and a piece found differing gets slot `count % slots` only
+    /// below the limit the host moves on as plans are done with. A
+    /// compare's slots keep its pieces while later compares run, until the
+    /// host has moved the limit past them; a piece past the limit is
+    /// flagged 1 and copied nowhere; told 3, the compare leaves the count
+    /// after the plan's compares at the end of the plan's run, where the
+    /// host reads it. Across 2^32 too.
+    #[test]
+    fn warp_card_compare_ring_goes_round_behind_the_limit() {
+        use crate::host::{CardAreas, ResultRun};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 9;
+        const SLOT: usize = crate::host::CARD_SLOT_BYTES;
+        const SLOTS: u32 = 4;
+        const RESULTS: u64 = 64;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(4 * RESULTS);
+        let (_ring, ring_ptr, ring_gpu) = warp.shared_buffer((SLOT * (SLOTS as usize + 1)) as u64);
+        let mut content: Vec<u8> = (0..size).map(|i| (i * 13 + i / 331) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        let mut areas = CardAreas::new(RESULTS, Some(SLOTS));
+        let ring = ring_ptr.cast::<u32>();
+        // SAFETY (each): the ring's first two dwords, its slots, the copy.
+        let count = || unsafe { ring.read_volatile() };
+        let set_limit = |limit: Option<u32>| {
+            if let Some(limit) = limit {
+                unsafe { ring.add(1).write_volatile(limit) };
+            }
+        };
+        let slot = |s: u32| unsafe { std::slice::from_raw_parts(ring_ptr.add(SLOT * (s as usize + 1)), PIECE) };
+        let change = |content: &mut Vec<u8>, pieces: &[u32]| {
+            for &p in pieces {
+                let at = p as usize * PIECE + 4321;
+                content[at] = content[at].wrapping_add(1);
+                unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            }
+        };
+        // As the host makes the ring.
+        unsafe { ring.write_volatile(0) };
+        set_limit(areas.limit());
+        // A plan's compare as `Host::card_before` records it (the whole
+        // copy in one range, then the count): its run, the dword of each
+        // piece, and what it left at the run's end.
+        let plan = |warp: &mut WarpHarness, areas: &mut CardAreas, mode: u32| -> (ResultRun, Vec<u32>, u32) {
+            let (at, run) = areas.take(u64::from(PIECES), true).expect("room for the plan's results");
+            let end = at + PIECES;
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for d in at..=end {
+                    differs_ptr.cast::<u32>().add(d as usize).write_volatile(0xDEAD);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                let constants = [0u32, 0, size as u32, PIECES, at * 4, mode, SLOTS, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, ring_gpu);
+                warp.list.Dispatch(PIECES.div_ceil(crate::host::CARD_COMPARE_PIECES_PER_GROUP), 1, 1);
+                warp.list.ResourceBarrier(&[uav_barrier()]);
+                let constants = [0u32, 0, 0, 0, end * 4, 3, SLOTS, 0];
+                warp.list.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch(1, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            let read = |d: u32| unsafe { differs_ptr.cast::<u32>().add(d as usize).read_volatile() };
+            (run, (at..end).map(read).collect(), read(end))
+        };
+        // The slots a compare gave, sorted, and the pieces found differing
+        // (sorted), and how many of them got no slot.
+        let found = |flags: &[u32]| {
+            let mut slots: Vec<u32> = flags.iter().filter(|&&f| f >= 2).map(|f| f - 2).collect();
+            slots.sort_unstable();
+            let pieces: Vec<u32> = (0..PIECES).filter(|&p| flags[p as usize] != 0).collect();
+            let without = flags.iter().filter(|&&f| f == 1).count();
+            (slots, pieces, without)
+        };
+        // What each slot holds: the piece given it, as its compare saw it.
+        let mut held: Vec<Option<Vec<u8>>> = vec![None; SLOTS as usize];
+        let give = |held: &mut Vec<Option<Vec<u8>>>, content: &[u8], flags: &[u32]| {
+            for (p, &f) in flags.iter().enumerate() {
+                if f >= 2 {
+                    held[(f - 2) as usize] = Some(content[p * PIECE..(p + 1) * PIECE].to_vec());
+                }
+            }
+        };
+        let kept = |held: &[Option<Vec<u8>>], step: &str| {
+            for (s, bytes) in held.iter().enumerate() {
+                if let Some(bytes) = bytes {
+                    assert!(slot(s as u32) == &bytes[..], "{step}: slot {s} keeps the piece it was given");
+                }
+            }
+        };
+
+        // The hashes, and the count's place in the run.
+        let (run, _, left) = plan(&mut warp, &mut areas, 0);
+        assert_eq!(left, 0, "hashing takes no slot, and the count is left");
+        areas.done(run, Some(left));
+
+        // a: counts 0, 1, 2.
+        change(&mut content, &[1, 2, 3]);
+        let (a, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![0, 1, 2], vec![1, 2, 3], 0), "a");
+        give(&mut held, &content, &flags);
+        kept(&held, "a");
+        assert_eq!((count(), left), (3, 3), "a: the count it left");
+
+        // b, with a in the air: counts 3 and 4; 4 is past the limit.
+        change(&mut content, &[4, 5]);
+        let (b, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![3], vec![4, 5], 1), "b");
+        give(&mut held, &content, &flags);
+        kept(&held, "b");
+        assert_eq!((count(), left), (5, 5), "b: the count it left");
+
+        // a is done with: its slots are free.
+        set_limit(areas.done(a, Some(3)));
+        assert_eq!(areas.limit(), Some(7));
+
+        // c, with b in the air: counts 5 and 6 go round to slots 1 and 2;
+        // 7 would take b's slot 3.
+        change(&mut content, &[6, 7, 8]);
+        let (c, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![1, 2], vec![6, 7, 8], 1), "c");
+        give(&mut held, &content, &flags);
+        kept(&held, "c");
+        assert_eq!((count(), left), (8, 8), "c: the count it left");
+
+        set_limit(areas.done(b, Some(5)));
+        set_limit(areas.done(c, Some(8)));
+        assert_eq!(areas.limit(), Some(12));
+
+        // d: counts 8 and 9, slots 0 and 1.
+        change(&mut content, &[0, 1]);
+        let (d, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![0, 1], vec![0, 1], 0), "d");
+        give(&mut held, &content, &flags);
+        kept(&held, "d");
+        assert_eq!((count(), left), (10, 10), "d: the count it left");
+        set_limit(areas.done(d, Some(10)));
+
+        // Near 2^32: the count as if plans had gone on, merged in steps.
+        let round = u32::MAX / SLOTS * SLOTS;
+        for gone in [1u32 << 30, 2 << 30, 3 << 30, round - 2] {
+            let (_, run) = areas.take(1, true).unwrap();
+            set_limit(areas.done(run, Some(gone)));
+        }
+        unsafe { ring.write_volatile(round - 2) };
+        assert_eq!(areas.limit(), Some(round));
+
+        // e: counts round - 2 and round - 1, slots 2 and 3; round gets none.
+        change(&mut content, &[2, 3, 4]);
+        let (e, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![2, 3], vec![2, 3, 4], 1), "e");
+        give(&mut held, &content, &flags);
+        kept(&held, "e");
+        assert_eq!((count(), left), (round + 1, round + 1), "e: the count it left");
+        set_limit(areas.done(e, Some(left)));
+
+        // f: the last counts below 2^32 get no slot; the count wraps.
+        change(&mut content, &[5, 6, 7]);
+        let (f, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![], vec![5, 6, 7], 3), "f");
+        kept(&held, "f");
+        assert_eq!((count(), left), (0, 0), "f: the count it left");
+        set_limit(areas.done(f, Some(left)));
+        assert_eq!(areas.limit(), Some(SLOTS));
+
+        // g: counts 0 and 1, slots 0 and 1, on from where they were.
+        change(&mut content, &[8, 0]);
+        let (g, flags, left) = plan(&mut warp, &mut areas, 2);
+        assert_eq!(found(&flags), (vec![0, 1], vec![0, 8], 0), "g");
+        give(&mut held, &content, &flags);
+        kept(&held, "g");
+        assert_eq!((count(), left), (2, 2), "g: the count it left");
+        areas.done(g, Some(left));
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
