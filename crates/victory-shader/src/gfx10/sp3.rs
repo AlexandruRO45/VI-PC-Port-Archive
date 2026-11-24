@@ -1054,4 +1054,152 @@ mod tests {
         let names: std::collections::HashSet<String> = (0..78).map(buffer_format).collect();
         assert_eq!(names.len(), 78);
     }
+
+    /// Every DPP16 row control the console has a name for is spelled at both
+    /// ends of its range, and the gaps between them (row_shl:0, row_shr:0,
+    /// row_ror:0, the GFX9 broadcasts, past row_xmask) stay a raw `dpp_ctrl`
+    /// rather than read as a neighbour.
+    #[test]
+    fn dpp_row_controls_name_each_range_at_its_bounds() {
+        // v_mov_b32 v5, v6 with DPP16, full row and bank masks.
+        let dpp = |ctrl: u32| one(&[0x7E0A_02FA, 0xFF00_0006 | ctrl << 8], true);
+        let cases = [
+            (0x000, "quad_perm:[0,0,0,0]"),
+            (0x0E4, "quad_perm:[0,1,2,3]"),
+            (0x0FF, "quad_perm:[3,3,3,3]"),
+            (0x100, "dpp_ctrl:0x100"),
+            (0x101, "row_shl:1"),
+            (0x10F, "row_shl:15"),
+            (0x110, "dpp_ctrl:0x110"),
+            (0x111, "row_shr:1"),
+            (0x11F, "row_shr:15"),
+            (0x120, "dpp_ctrl:0x120"),
+            (0x121, "row_ror:1"),
+            (0x12F, "row_ror:15"),
+            (0x130, "dpp_ctrl:0x130"),
+            (0x13F, "dpp_ctrl:0x13f"),
+            (0x140, "row_mirror"),
+            (0x141, "row_half_mirror"),
+            (0x142, "dpp_ctrl:0x142"),
+            (0x150, "row_share:0"),
+            (0x15F, "row_share:15"),
+            (0x160, "row_xmask:0"),
+            (0x16F, "row_xmask:15"),
+            (0x170, "dpp_ctrl:0x170"),
+            (0x1FF, "dpp_ctrl:0x1ff"),
+        ];
+        for (ctrl, text) in cases {
+            assert_eq!(dpp(ctrl), format!("v_mov_b32 v5, v6 {text}"), "{ctrl:#x}");
+        }
+    }
+
+    /// DPP16 masks are written only when they disable something, each in its
+    /// own hex field, then bound_ctrl and fi; dpp8's fetch-inactive form (the
+    /// 0xEA source) carries fi too.
+    #[test]
+    fn dpp_masks_and_flags_are_written_only_when_set() {
+        let ext = |row: u32, bank: u32, bound: u32, fi: u32| {
+            row << 28 | bank << 24 | bound << 19 | fi << 18 | 0x0E4 << 8 | 6
+        };
+        let dpp = |e: u32| one(&[0x7E0A_02FA, e], true);
+        let base = "v_mov_b32 v5, v6 quad_perm:[0,1,2,3]";
+        assert_eq!(dpp(ext(0xF, 0xF, 0, 0)), base);
+        assert_eq!(dpp(ext(0x3, 0xF, 0, 0)), format!("{base} row_mask:0x3"));
+        assert_eq!(dpp(ext(0xF, 0x5, 0, 0)), format!("{base} bank_mask:0x5"));
+        assert_eq!(
+            dpp(ext(0x0, 0x0, 0, 0)),
+            format!("{base} row_mask:0x0 bank_mask:0x0")
+        );
+        assert_eq!(dpp(ext(0xF, 0xF, 0, 1)), format!("{base} fi:1"));
+        assert_eq!(
+            dpp(ext(0x1, 0xE, 1, 1)),
+            format!("{base} row_mask:0x1 bank_mask:0xe bound_ctrl:1 fi:1")
+        );
+        // dpp8 identity selects, with and without fi.
+        assert_eq!(
+            one(&[0x7E06_02E9, 0xFAC6_8801], true),
+            "v_mov_b32 v3, v1 dpp8:[0,1,2,3,4,5,6,7]"
+        );
+        assert_eq!(
+            one(&[0x7E06_02EA, 0xFAC6_8801], true),
+            "v_mov_b32 v3, v1 dpp8:[0,1,2,3,4,5,6,7] fi:1"
+        );
+    }
+
+    /// SDWA names a destination select and unused-bits mode other than the
+    /// defaults (DWORD, pad), writes clamp before the output modifier (the
+    /// reverse of VOP3), wraps sign extension inside abs and negation, and
+    /// reads an SGPR source through its s0 bit.
+    #[test]
+    fn sdwa_destination_and_source_modifiers() {
+        // v_mov_b32 v1, v2 with SDWA; source selects at DWORD unless set.
+        let sdwa = |ext: u32| one(&[0x7E02_02F9, 0x0606_0002 | ext], true);
+        assert_eq!(sdwa(6 << 8), "v_mov_b32 v1, v2");
+        assert_eq!(
+            sdwa(2 << 11),
+            "v_mov_b32 v1, v2 dst_sel:BYTE_0 dst_unused:UNUSED_PRESERVE"
+        );
+        assert_eq!(
+            sdwa(5 << 8 | 1 << 11),
+            "v_mov_b32 v1, v2 dst_sel:WORD_1 dst_unused:UNUSED_SEXT"
+        );
+        assert_eq!(sdwa(6 << 8 | 3 << 11), "v_mov_b32 v1, v2 dst_unused:?");
+        assert_eq!(sdwa(3 << 8), "v_mov_b32 v1, v2 dst_sel:BYTE_3");
+        assert_eq!(
+            sdwa(6 << 8 | 1 << 13 | 3 << 14),
+            "v_mov_b32 v1, v2 clamp div:2"
+        );
+        assert_eq!(sdwa(6 << 8 | 1 << 14), "v_mov_b32 v1, v2 mul:2");
+        assert_eq!(sdwa(6 << 8 | 1 << 19), "v_mov_b32 v1, sext(v2)");
+        assert_eq!(sdwa(6 << 8 | 7 << 19), "v_mov_b32 v1, -abs(sext(v2))");
+        assert_eq!(sdwa(6 << 8 | 1 << 23), "v_mov_b32 v1, s2");
+        assert_eq!(
+            one(&[0x7E02_02F9, 0x0601_0602], true),
+            "v_mov_b32 v1, v2 src0_sel:BYTE_1"
+        );
+    }
+
+    /// v_permlane*'s opsel bits are fi and bound_ctrl, written as suffixes and
+    /// never as `sel_hi` on a source; another VOP3 instruction's opsel stays a
+    /// source select.
+    #[test]
+    fn permlane_opsel_is_fi_and_bound_ctrl() {
+        // v_permlane16_b32 v1, v2, s3, s4.
+        let src = 0x0010_0702;
+        let permlane = |opsel: u32| one(&[0xD777_0001 | opsel << 11, src], true);
+        assert_eq!(permlane(0), "v_permlane16_b32 v1, v2, s3, s4");
+        assert_eq!(permlane(1), "v_permlane16_b32 v1, v2, s3, s4 fi:1");
+        assert_eq!(permlane(2), "v_permlane16_b32 v1, v2, s3, s4 bound_ctrl:1");
+        assert_eq!(
+            permlane(3),
+            "v_permlane16_b32 v1, v2, s3, s4 fi:1 bound_ctrl:1"
+        );
+        assert_eq!(
+            one(&[0xD778_1801, src], true),
+            "v_permlanex16_b32 v1, v2, s3, s4 fi:1 bound_ctrl:1"
+        );
+    }
+
+    /// Packed math writes each source's half selects only when they differ
+    /// from the default (low for the low half, high for the high), and a
+    /// negation only when it covers both halves.
+    #[test]
+    fn packed_sources_name_their_half_selects() {
+        // v_pk_add_f16 v1, v2, v3; opsel in word 0, opsel_hi and neg in word 1.
+        let pk = |opsel: u32, opsel_hi: u32, neg: u32, neg_hi: u32| {
+            one(
+                &[
+                    0xCC0F_0001 | opsel << 11 | neg_hi << 8,
+                    0x0002_0702 | opsel_hi << 27 | neg << 29,
+                ],
+                true,
+            )
+        };
+        assert_eq!(pk(0, 3, 0, 0), "v_pk_add_f16 v1, v2, v3");
+        assert_eq!(pk(1, 3, 0, 0), "v_pk_add_f16 v1, sel_hi(v2), v3");
+        assert_eq!(pk(0, 1, 0, 0), "v_pk_add_f16 v1, v2, sel_lo(v3)");
+        assert_eq!(pk(2, 1, 0, 0), "v_pk_add_f16 v1, v2, sel_hi_lo(v3)");
+        assert_eq!(pk(0, 3, 1, 1), "v_pk_add_f16 v1, -v2, v3");
+        assert_eq!(pk(1, 3, 2, 2), "v_pk_add_f16 v1, sel_hi(v2), -v3");
+    }
 }
