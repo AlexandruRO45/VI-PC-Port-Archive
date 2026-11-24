@@ -1056,6 +1056,97 @@ mod tests {
         }
     }
 
+    /// The standard DXGI numbers: element bytes by bit width, 4x4 blocks
+    /// for BC1-BC7 (8 bytes for BC1/BC4, 16 for the rest), a stencil plane
+    /// for the depth-stencil families, and nothing for 96-bit, 1-bit,
+    /// packed 4:2:2, video or unassigned numbers. A texture of a format
+    /// without a layout is refused rather than sized wrong.
+    #[test]
+    fn dxgi_formats_have_element_sizes() {
+        let f = |bytes, block, stencil| {
+            Some(Format {
+                bytes,
+                block,
+                stencil,
+            })
+        };
+        for (dxgi, want) in [
+            // R32G32B32A32_FLOAT, R16G16B16A16_FLOAT, R32G32_FLOAT.
+            (2, f(16, 1, false)),
+            (10, f(8, 1, false)),
+            (16, f(8, 1, false)),
+            // D32_FLOAT_S8X24_UINT: 32-bit depth, then a stencil plane.
+            (20, f(4, 1, true)),
+            // R10G10B10A2_UNORM, R8G8B8A8_UNORM, D32_FLOAT, R32_FLOAT.
+            (24, f(4, 1, false)),
+            (28, f(4, 1, false)),
+            (40, f(4, 1, false)),
+            (41, f(4, 1, false)),
+            // D24_UNORM_S8_UINT: depth and stencil kept apart.
+            (45, f(4, 1, true)),
+            // R8G8_UNORM, D16_UNORM, R16_FLOAT, R8_UNORM, A8_UNORM.
+            (49, f(2, 1, false)),
+            (55, f(2, 1, false)),
+            (54, f(2, 1, false)),
+            (61, f(1, 1, false)),
+            (65, f(1, 1, false)),
+            // R9G9B9E5_SHAREDEXP, B8G8R8A8_UNORM, B5G6R5, B4G4R4A4.
+            (67, f(4, 1, false)),
+            (87, f(4, 1, false)),
+            (85, f(2, 1, false)),
+            (115, f(2, 1, false)),
+            // BC1, BC2, BC3, BC4, BC5, BC6H, BC7.
+            (71, f(8, 4, false)),
+            (74, f(16, 4, false)),
+            (77, f(16, 4, false)),
+            (80, f(8, 4, false)),
+            (83, f(16, 4, false)),
+            (95, f(16, 4, false)),
+            (98, f(16, 4, false)),
+            // UNKNOWN, R32G32B32 (96-bit), R1_UNORM, R8G8_B8G8 and
+            // G8R8_G8B8 (4:2:2), NV12 and the other video formats, and
+            // numbers past the console's own.
+            (0, None),
+            (6, None),
+            (66, None),
+            (68, None),
+            (69, None),
+            (103, None),
+            (114, None),
+            (121, None),
+            (191, None),
+            (u32::MAX, None),
+        ] {
+            assert_eq!(format(dxgi), want, "format {dxgi}");
+            let t = Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: dxgi,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            });
+            match want {
+                None => assert_eq!(t, Err(Error::Invalid), "format {dxgi}"),
+                Some(w) => {
+                    let t = t.unwrap_or_else(|e| panic!("format {dxgi}: {e:?}"));
+                    assert_eq!(t.planes.len(), if w.stencil { 2 } else { 1 });
+                    let d = &t.planes[0].layout.desc;
+                    assert_eq!((d.element_bytes, d.block), (w.bytes, w.block));
+                    // A stencil plane is one byte per texel, never blocked.
+                    if let Some(s) = t.planes.get(1) {
+                        assert!(s.stencil);
+                        assert_eq!((s.layout.desc.element_bytes, s.layout.desc.block), (1, 1));
+                        assert!(s.offset >= t.planes[0].layout.size);
+                    }
+                    assert!(t.size >= u64::from(64 / w.block).pow(2) * u64::from(w.bytes));
+                }
+            }
+        }
+    }
+
     /// `mips: 0` asks for the full chain, down to one texel on the largest
     /// side: the array size does not count, a 3D texture's depth does, and
     /// block-compressed formats count texels, not 4x4 blocks. A depth format
