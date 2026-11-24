@@ -19,13 +19,15 @@ thread_local! {
 struct State {
     last_event: Instant,
     registered_workers: u64,
+    pool_workers: u64,
+    pool_ready: bool,
     active_jobs: u64,
     queued_jobs: u64,
     dependency_waiters: u64,
     queued_with_dependency_wait_us: u64,
     queued_with_dependency_wait_periods: u64,
-    all_registered_workers_waiting_with_queue_us: u64,
-    all_registered_workers_waiting_with_queue_periods: u64,
+    all_pool_workers_waiting_with_queue_us: u64,
+    all_pool_workers_waiting_with_queue_periods: u64,
     peak_active_jobs: u64,
     peak_queued_jobs: u64,
     peak_dependency_waiters: u64,
@@ -36,13 +38,15 @@ impl State {
         Self {
             last_event: now,
             registered_workers: 0,
+            pool_workers: 0,
+            pool_ready: false,
             active_jobs: 0,
             queued_jobs: 0,
             dependency_waiters: 0,
             queued_with_dependency_wait_us: 0,
             queued_with_dependency_wait_periods: 0,
-            all_registered_workers_waiting_with_queue_us: 0,
-            all_registered_workers_waiting_with_queue_periods: 0,
+            all_pool_workers_waiting_with_queue_us: 0,
+            all_pool_workers_waiting_with_queue_periods: 0,
             peak_active_jobs: 0,
             peak_queued_jobs: 0,
             peak_dependency_waiters: 0,
@@ -55,20 +59,23 @@ impl State {
 
     fn has_all_registered_workers_waiting_with_queue(&self) -> bool {
         self.queued_jobs > 0
-            && self.registered_workers > 0
-            && self.dependency_waiters >= self.registered_workers
+            && self.pool_ready
+            && self.pool_workers > 0
+            && self.dependency_waiters >= self.pool_workers
     }
 }
 
 struct Snapshot {
     registered_workers: u64,
+    pool_workers: u64,
+    pool_ready: bool,
     active_jobs: u64,
     queued_jobs: u64,
     dependency_waiters: u64,
     queued_with_dependency_wait_us: u64,
     queued_with_dependency_wait_periods: u64,
-    all_registered_workers_waiting_with_queue_us: u64,
-    all_registered_workers_waiting_with_queue_periods: u64,
+    all_pool_workers_waiting_with_queue_us: u64,
+    all_pool_workers_waiting_with_queue_periods: u64,
     peak_active_jobs: u64,
     peak_queued_jobs: u64,
     peak_dependency_waiters: u64,
@@ -107,8 +114,8 @@ impl Tracker {
                 .saturating_add(elapsed_us);
         }
         if state.has_all_registered_workers_waiting_with_queue() {
-            state.all_registered_workers_waiting_with_queue_us = state
-                .all_registered_workers_waiting_with_queue_us
+            state.all_pool_workers_waiting_with_queue_us = state
+                .all_pool_workers_waiting_with_queue_us
                 .saturating_add(elapsed_us);
         }
 
@@ -127,8 +134,8 @@ impl Tracker {
             !had_all_registered_workers_waiting_with_queue
                 && state.has_all_registered_workers_waiting_with_queue();
         if entered_all_registered_workers_backlog {
-            state.all_registered_workers_waiting_with_queue_periods = state
-                .all_registered_workers_waiting_with_queue_periods
+            state.all_pool_workers_waiting_with_queue_periods = state
+                .all_pool_workers_waiting_with_queue_periods
                 .saturating_add(1);
         }
 
@@ -150,14 +157,16 @@ impl Tracker {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         Snapshot {
             registered_workers: state.registered_workers,
+            pool_workers: state.pool_workers,
+            pool_ready: state.pool_ready,
             active_jobs: state.active_jobs,
             queued_jobs: state.queued_jobs,
             dependency_waiters: state.dependency_waiters,
             queued_with_dependency_wait_us: state.queued_with_dependency_wait_us,
             queued_with_dependency_wait_periods: state.queued_with_dependency_wait_periods,
-            all_registered_workers_waiting_with_queue_us: state.all_registered_workers_waiting_with_queue_us,
-            all_registered_workers_waiting_with_queue_periods: state
-                .all_registered_workers_waiting_with_queue_periods,
+            all_pool_workers_waiting_with_queue_us: state.all_pool_workers_waiting_with_queue_us,
+            all_pool_workers_waiting_with_queue_periods: state
+                .all_pool_workers_waiting_with_queue_periods,
             peak_active_jobs: state.peak_active_jobs,
             peak_queued_jobs: state.peak_queued_jobs,
             peak_dependency_waiters: state.peak_dependency_waiters,
@@ -193,12 +202,23 @@ pub(super) fn worker() -> WorkerGuard {
     WorkerGuard
 }
 
+/// Publishes the number of successfully spawned workers once pool creation
+/// has finished. A partially started pool must not be reported as fully blocked.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(super) fn pool_ready(workers: u64) {
+    update(|state| {
+        state.pool_workers = workers;
+        state.pool_ready = true;
+    });
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
         PIPELINE_WORKER.with(|worker| worker.set(false));
         update(|state| {
             state.registered_workers = state.registered_workers.saturating_sub(1);
+            state.pool_workers = state.pool_workers.saturating_sub(1);
         });
     }
 }
@@ -271,13 +291,15 @@ pub(super) fn report() {
     let s = tracker().snapshot();
     tracing::info!(
         registered_workers = s.registered_workers,
+        pool_workers = s.pool_workers,
+        pool_ready = s.pool_ready,
         active_jobs = s.active_jobs,
         queued_jobs = s.queued_jobs,
         dependency_waiters = s.dependency_waiters,
         queued_with_dependency_wait_us = s.queued_with_dependency_wait_us,
         queued_with_dependency_wait_periods = s.queued_with_dependency_wait_periods,
-        all_registered_workers_waiting_with_queue_us = s.all_registered_workers_waiting_with_queue_us,
-        all_registered_workers_waiting_with_queue_periods = s.all_registered_workers_waiting_with_queue_periods,
+        all_pool_workers_waiting_with_queue_us = s.all_pool_workers_waiting_with_queue_us,
+        all_pool_workers_waiting_with_queue_periods = s.all_pool_workers_waiting_with_queue_periods,
         peak_active_jobs = s.peak_active_jobs,
         peak_queued_jobs = s.peak_queued_jobs,
         peak_dependency_waiters = s.peak_dependency_waiters,
@@ -297,6 +319,8 @@ mod tests {
 
         tracker.update_at(start, |s| {
             s.registered_workers = 2;
+            s.pool_workers = 2;
+            s.pool_ready = true;
         });
         tracker.update_at(start + Duration::from_millis(10), |s| {
             s.active_jobs = 2;
@@ -315,14 +339,16 @@ mod tests {
         let s = tracker.snapshot_at(start + Duration::from_millis(150));
         assert_eq!(s.queued_with_dependency_wait_us, 100_000);
         assert_eq!(s.queued_with_dependency_wait_periods, 1);
-        assert_eq!(s.all_registered_workers_waiting_with_queue_us, 70_000);
-        assert_eq!(s.all_registered_workers_waiting_with_queue_periods, 1);
+        assert_eq!(s.all_pool_workers_waiting_with_queue_us, 70_000);
+        assert_eq!(s.all_pool_workers_waiting_with_queue_periods, 1);
         assert_eq!(s.active_jobs, 2);
         assert_eq!(s.dependency_waiters, 1);
         assert_eq!(s.peak_active_jobs, 2);
         assert_eq!(s.peak_queued_jobs, 3);
         assert_eq!(s.peak_dependency_waiters, 2);
         assert_eq!(s.registered_workers, 2);
+        assert_eq!(s.pool_workers, 2);
+        assert!(s.pool_ready);
         assert_eq!(s.queued_jobs, 0);
     }
 
@@ -333,6 +359,8 @@ mod tests {
 
         assert!(!tracker.update_at(start, |s| {
             s.registered_workers = 2;
+            s.pool_workers = 2;
+            s.pool_ready = true;
         }));
         assert!(!tracker.update_at(start + Duration::from_millis(10), |s| {
             s.queued_jobs = 1;
@@ -361,10 +389,56 @@ mod tests {
         }));
 
         let s = tracker.snapshot_at(start + Duration::from_millis(70));
-        assert_eq!(s.all_registered_workers_waiting_with_queue_periods, 2);
+        assert_eq!(s.all_pool_workers_waiting_with_queue_periods, 2);
         assert_eq!(s.queued_jobs, 2);
         assert_eq!(s.dependency_waiters, 2);
         assert_eq!(s.registered_workers, 2);
+    }
+
+    #[test]
+    fn does_not_report_full_backlog_until_every_spawned_worker_waits() {
+        let start = Instant::now();
+        let tracker = Tracker::new_at(start);
+
+        // One worker is registered and waiting, but pool creation has not
+        // finished and another worker may still start.
+        tracker.update_at(start, |s| {
+            s.registered_workers = 1;
+            s.active_jobs = 1;
+            s.dependency_waiters = 1;
+            s.queued_jobs = 1;
+        });
+        assert_eq!(
+            tracker.snapshot_at(start + Duration::from_millis(5))
+                .all_pool_workers_waiting_with_queue_periods,
+            0
+        );
+
+        // The spawn loop has completed with two workers, but the second
+        // worker has not yet entered its shader wait.
+        assert!(!tracker.update_at(start + Duration::from_millis(10), |s| {
+            s.pool_workers = 2;
+            s.pool_ready = true;
+        }));
+        assert_eq!(
+            tracker.snapshot_at(start + Duration::from_millis(15))
+                .all_pool_workers_waiting_with_queue_periods,
+            0
+        );
+
+        // Only after the second worker blocks is the whole pool saturated.
+        assert!(tracker.update_at(start + Duration::from_millis(20), |s| {
+            s.registered_workers = 2;
+            s.active_jobs = 2;
+            s.dependency_waiters = 2;
+        }));
+        let snapshot = tracker.snapshot_at(start + Duration::from_millis(30));
+        assert_eq!(snapshot.all_pool_workers_waiting_with_queue_periods, 1);
+        assert_eq!(snapshot.all_pool_workers_waiting_with_queue_us, 10_000);
+        assert_eq!(snapshot.registered_workers, 2);
+        assert_eq!(snapshot.pool_workers, 2);
+        assert!(snapshot.pool_ready);
+        assert_eq!(snapshot.queued_jobs, 1);
     }
 
     #[test]
@@ -374,6 +448,8 @@ mod tests {
 
         tracker.update_at(start, |s| {
             s.registered_workers = 1;
+            s.pool_workers = 1;
+            s.pool_ready = true;
         });
         tracker.update_at(start + Duration::from_millis(5), |s| {
             s.dependency_waiters = 1;
@@ -395,7 +471,7 @@ mod tests {
         let s = tracker.snapshot_at(start + Duration::from_millis(50));
         assert_eq!(s.queued_with_dependency_wait_us, 30_000);
         assert_eq!(s.queued_with_dependency_wait_periods, 2);
-        assert_eq!(s.all_registered_workers_waiting_with_queue_us, 30_000);
-        assert_eq!(s.all_registered_workers_waiting_with_queue_periods, 2);
+        assert_eq!(s.all_pool_workers_waiting_with_queue_us, 30_000);
+        assert_eq!(s.all_pool_workers_waiting_with_queue_periods, 2);
     }
 }
