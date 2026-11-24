@@ -1005,6 +1005,45 @@ mod tests {
     }
 
     #[test]
+    fn marker_in_padding_belongs_to_the_record_even_if_padding_is_cut_short() {
+        let payload = b"outer";
+        let packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
+        let inner = record_bytes("PS_inner", 0x41, b"inner");
+        let n = (12 + packed.len() + inner.len() + 1) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x09PS_outer\0\x32");
+        file.extend_from_slice(&n.to_le_bytes());
+        let marker = file.len();
+        for v in [0x000D_DCE7, n, payload.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend_from_slice(&inner);
+        let cut = file.len();
+        file.push(0);
+        let end = file.len();
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].span(), marker..end);
+        assert_eq!(found[0].unpack().as_deref(), Some(payload.as_slice()));
+        assert_eq!(found[1].name, Some("PS_after"));
+        assert_eq!(records(&file[..cut]).count(), 0);
+
+        // The first stream ended after five bytes. If the outer header
+        // claims six, the complete record in its padding wins instead.
+        file[marker + 8..marker + 12].copy_from_slice(&6u32.to_le_bytes());
+        for (bytes, names) in [
+            (&file[..], vec![Some("PS_inner"), Some("PS_after")]),
+            (&file[..cut], vec![Some("PS_inner")]),
+        ] {
+            let found: Vec<_> = records(bytes).map(|r| r.name).collect();
+            assert_eq!(found, names);
+        }
+    }
+
+    #[test]
     fn marker_stating_more_than_the_cap_is_not_a_record() {
         // A record stored as is (level 0) inside bytes whose marker states
         // an unpacked size: up to the cap they are a record, which holds
