@@ -294,6 +294,8 @@ extern "win64" fn missing<const KIND: usize, const SLOT: usize>() -> HRESULT {
 /// module.
 #[inline(never)]
 fn caller() -> String {
+    // shortcut: none on Linux yet (the title's images are not the dynamic
+    // loader's, so `dladdr` cannot name them).
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;

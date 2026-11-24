@@ -12,11 +12,17 @@
 //! write access back. The runtime tells us when it maps or unmaps views
 //! ([`title_memory_remapped`]), which resets their protection.
 //!
+//! On Linux nothing is watched yet: [`writes`] answers `None`, so every
+//! copy takes its memory whole (or hashes it).
+//!
 //! shortcut: writes into physical pages through another view (xmem's
 //! `write_physical`, DirectStorage's page destinations) are not seen at
 //! the guarded addresses; they go to the texture pool, whose textures are
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
+
+// The journal and guards serve Windows' answers only, for now.
+#![cfg_attr(not(windows), allow(dead_code))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -48,6 +54,14 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+// shortcut: Linux has no write watch; the soft-dirty bits of
+// `/proc/self/pagemap` (or userfaultfd write protection) would give one.
+#[cfg(not(windows))]
+pub(crate) fn writes(_: usize, _: usize, _: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    None
+}
+
+#[cfg(windows)]
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
@@ -122,6 +136,7 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
+#[cfg(windows)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -157,6 +172,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
 /// block by block if they span views, leaving out any that fail (unmapped).
+#[cfg(windows)]
 fn protect(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -188,6 +204,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
+#[cfg(windows)]
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -210,7 +227,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    #[cfg(windows)]
     open(&mut guards(), at, at + len);
+    #[cfg(not(windows))]
+    let _ = (at, len);
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -230,6 +250,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
+#[cfg(windows)]
 fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -270,6 +291,7 @@ fn install() {
 }
 
 /// Whether `at` is committed read-write memory now.
+#[cfg(windows)]
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
@@ -281,7 +303,7 @@ fn writable(at: usize) -> bool {
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use windows_sys::Win32::System::Memory::{

@@ -115,7 +115,6 @@ extern "win64" fn execute(_: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
-    #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -213,6 +212,15 @@ impl Written {
 }
 
 fn system_timestamp() -> u64 {
+    // Linux: CLOCK_MONOTONIC in 100 ns units, the 10 MHz performance
+    // counter `victory-hle`'s `QueryPerformanceCounter` gives the title.
+    #[cfg(not(windows))]
+    {
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid out pointer.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+        now.tv_sec as u64 * 10_000_000 + now.tv_nsec as u64 / 100
+    }
     #[cfg(windows)]
     {
         let mut count = 0;
@@ -220,8 +228,6 @@ fn system_timestamp() -> u64 {
         unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) };
         count as u64
     }
-    #[cfg(not(windows))]
-    0
 }
 
 /// Frames presented so far.
@@ -245,7 +251,6 @@ extern "win64" fn present(
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
-        #[cfg(windows)]
         let (drawn, dispatched) = {
             static DRAWN: AtomicU64 = AtomicU64::new(0);
             static DISPATCHED: AtomicU64 = AtomicU64::new(0);
@@ -255,8 +260,6 @@ extern "win64" fn present(
                 since(&DISPATCHED, crate::draw::dispatched()),
             )
         };
-        #[cfg(not(windows))]
-        let (drawn, dispatched) = (0, 0);
         tracing::info!(
             frame,
             draws,
@@ -265,17 +268,15 @@ extern "win64" fn present(
             dispatched,
             "frame presented (since the last line: draws and dispatches, and those run on the host)"
         );
-        #[cfg(windows)]
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     if crate::capture::listed(frame) {
         crate::capture::dump_targets(frame);
     }
-    #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
         && let Some(plane) = unsafe { plane_parameters.as_ref() }
@@ -296,13 +297,11 @@ extern "win64" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
-    #[cfg(not(windows))]
-    let _ = (planes, plane_parameters);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(feature = "diagnostics")]
 fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
     static LAST: std::sync::Mutex<(bool, u64, u64)> = std::sync::Mutex::new((false, 0, 0));
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());

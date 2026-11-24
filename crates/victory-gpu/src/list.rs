@@ -115,9 +115,7 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
-    #[cfg(windows)]
     host: Option<crate::host::HostList>,
-    #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
@@ -125,7 +123,6 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
-#[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
     let Some(list) = host_list(this) else { return };
     // SAFETY: the title passes one of our lists.
@@ -134,7 +131,6 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 }
 
 /// The host list behind a title list, if there is a host GPU.
-#[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     if this.is_null() {
         return None;
@@ -215,7 +211,6 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
-        #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
@@ -223,7 +218,6 @@ fn new_list(kind: u32, allocator: This, iid: *const Iid, out: *mut This) -> HRES
                 None
             }
         }),
-        #[cfg(windows)]
         state: Default::default(),
     });
     object::hand_out(LIST, list, iid, &LIST_IIDS, out)
@@ -252,7 +246,6 @@ extern "win64" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "win64" fn close(this: This) -> HRESULT {
-    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -266,13 +259,10 @@ extern "win64" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT 
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     uploads.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    #[cfg(windows)]
     with_state(this, |host, state| {
         host.reset();
         state.reset(pipeline);
     });
-    #[cfg(not(windows))]
-    let _ = (this, pipeline);
     S_OK
 }
 
@@ -291,7 +281,6 @@ pub(crate) struct Barrier {
 
 /// The barrier on host resources, or `None` if it names a resource the host
 /// GPU does not have (buffers so far).
-#[cfg(windows)]
 fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
     use windows::core::Interface;
     let host = |r: This| crate::resource::host_resource(r).map(|h| h.as_raw().cast_const().cast());
@@ -351,7 +340,6 @@ const UAV_BARRIER: Barrier = Barrier {
 
 /// Returns the console's barrier "actions" (none).
 extern "win64" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -387,7 +375,6 @@ extern "win64" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
-#[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
@@ -398,13 +385,10 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     }
 }
 
-#[cfg(windows)]
 const COPY_DEST: u32 = 0x400;
-#[cfg(windows)]
 const COPY_SOURCE: u32 = 0x800;
 
 /// `len` bytes at `offset` of a title buffer, if they are inside it.
-#[cfg(windows)]
 fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     let (data, size) = crate::resource::buffer_bytes(buffer)?;
     let end = offset.checked_add(len)?;
@@ -425,19 +409,15 @@ extern "win64" fn copy_buffer_region(
     src_offset: u64,
     len: u64,
 ) {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
         list.defer_copy(to, from, len as usize);
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
 extern "win64" fn copy_resource(this: This, dst: This, src: This) {
-    #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
             return;
@@ -460,8 +440,6 @@ extern "win64" fn copy_resource(this: This, dst: This, src: This) {
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, src);
 }
 
 extern "win64" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -490,7 +468,6 @@ extern "win64" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
-    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
@@ -580,8 +557,6 @@ extern "win64" fn copy_texture_region(
             )
         };
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, x, y, z, src, source_box);
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments
@@ -606,7 +581,6 @@ extern "win64" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -655,8 +629,6 @@ extern "win64" fn resolve(
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, dst_sub, src, src_sub, format);
 }
 
 #[repr(C)]
@@ -674,7 +646,6 @@ extern "win64" fn clear_rtv(
     count: u32,
     rects: *const Rect,
 ) {
-    #[cfg(windows)]
     {
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
@@ -709,8 +680,6 @@ extern "win64" fn clear_rtv(
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
-    #[cfg(not(windows))]
-    let _ = (this, handle, color, count, rects);
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
@@ -724,7 +693,6 @@ extern "win64" fn clear_dsv(
     count: u32,
     rects: *const Rect,
 ) {
-    #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
@@ -750,14 +718,11 @@ extern "win64" fn clear_dsv(
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
-    #[cfg(not(windows))]
-    let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "win64" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
-    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -772,8 +737,6 @@ extern "win64" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: 
             }
         });
     }
-    #[cfg(not(windows))]
-    let _ = (this, dst, src, len);
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.
@@ -784,13 +747,7 @@ extern "win64" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
 /// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
 /// host has no use for (the ray-tracing builder dispatches this way).
 extern "win64" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
-    #[cfg(windows)]
     state::dispatch(this, x, y, z);
-    #[cfg(not(windows))]
-    {
-        let _ = (this, x, y, z);
-        count_dispatch();
-    }
 }
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
@@ -854,10 +811,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "win64" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
-    #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
-    #[cfg(not(windows))]
-    let _ = this;
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
@@ -903,7 +857,6 @@ extern "win64" fn ignored_state(_: This) {}
 
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
-#[cfg(windows)]
 mod state {
     use super::{This, host_list, with_state};
     use crate::draw::{IndexView, VertexView};
@@ -1090,31 +1043,6 @@ mod state {
 }
 
 /// Without a host GPU every draw state call is ignored.
-#[cfg(not(windows))]
-mod state {
-    pub(super) use super::dispatch;
-    pub(super) use super::draw;
-    pub(super) use super::draw as draw_indexed;
-    pub(super) use super::draw as dispatch_mesh;
-    pub(super) use super::draw as dispatch_mesh_x;
-    pub(super) use super::ignored_state as blend_factor;
-    pub(super) use super::ignored_state as compute_constant;
-    pub(super) use super::ignored_state as compute_constants;
-    pub(super) use super::ignored_state as compute_table;
-    pub(super) use super::ignored_state as compute_view;
-    pub(super) use super::ignored_state as graphics_constant;
-    pub(super) use super::ignored_state as graphics_constants;
-    pub(super) use super::ignored_state as graphics_table;
-    pub(super) use super::ignored_state as graphics_view;
-    pub(super) use super::ignored_state as heaps;
-    pub(super) use super::ignored_state as index_buffer;
-    pub(super) use super::ignored_state as scissors;
-    pub(super) use super::ignored_state as stencil_ref;
-    pub(super) use super::ignored_state as targets;
-    pub(super) use super::ignored_state as topology;
-    pub(super) use super::ignored_state as vertex_buffers;
-    pub(super) use super::ignored_state as viewports;
-}
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1123,10 +1051,6 @@ fn count_draw() {
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
-#[cfg(not(windows))]
-extern "win64" fn draw(_: This) {
-    count_draw();
-}
 
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. Grand Theft Auto VI's signatures (title+0x2479466, 2026-11-24)
@@ -1153,7 +1077,6 @@ extern "win64" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
-    #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
     {
@@ -1164,7 +1087,7 @@ extern "win64" fn execute_indirect(
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
     } else {
-        #[cfg(all(windows, feature = "diagnostics"))]
+        #[cfg(feature = "diagnostics")]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
             address.is_some(),
@@ -1198,10 +1121,6 @@ static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
-#[cfg(not(windows))]
-extern "win64" fn dispatch(_: This) {
-    count_dispatch();
-}
 static DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1223,7 +1142,6 @@ extern "win64" fn wait_value(_: This, _address: u64, _comparison: u32, _referenc
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "win64" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
@@ -1233,8 +1151,6 @@ extern "win64" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
-    #[cfg(not(windows))]
-    let _ = (this, count);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -1258,7 +1174,6 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     if address == 0 {
         return;
     }
-    #[cfg(windows)]
     if let Some(list) = host_list(this) {
         list.defer_write(address as *mut u8, what, bytes);
         return;

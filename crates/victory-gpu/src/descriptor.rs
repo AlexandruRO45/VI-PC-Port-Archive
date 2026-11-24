@@ -10,7 +10,6 @@
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
-#[cfg(windows)]
 pub(crate) mod host;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -55,9 +54,7 @@ pub(crate) struct Heap {
     /// Shader-visible view and sampler heaps get a host heap with the same
     /// descriptor order when a draw first uses them (decision 0007, step
     /// 3); slots written before wait in `pending`.
-    #[cfg(windows)]
     host: std::sync::OnceLock<Option<host::HostHeap>>,
-    #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
 }
 
@@ -75,7 +72,6 @@ impl Heap {
     /// The host heap, made on first use from what the title wrote so far.
     /// Made late because a host view heap the size of Grand Theft Auto VI's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
-    #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
         if let Some(h) = self.host.get() {
             return h.as_ref();
@@ -111,11 +107,9 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
-#[cfg(windows)]
 static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
-#[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
@@ -128,7 +122,6 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap.
-#[cfg(windows)]
 fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
@@ -147,7 +140,6 @@ fn mirror(handle: u64) {
 
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
-#[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
@@ -158,7 +150,6 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
@@ -193,7 +184,6 @@ const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
     /// The view description in the host's type (the same layout).
-    #[cfg(windows)]
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
@@ -202,7 +192,6 @@ impl RtvRecord {
     }
 
     /// The depth view description in the host's type (the same layout).
-    #[cfg(windows)]
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
@@ -213,7 +202,6 @@ impl RtvRecord {
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.
-    #[cfg(windows)]
     fn host_desc<T>(&self, dimension: u32) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
@@ -296,7 +284,6 @@ impl View {
     /// Whether the view reads buffer memory (constant buffers, buffer views
     /// of resources or of memory) or memory the title placed a texture in:
     /// such views get host slots only for draws.
-    #[cfg(windows)]
     fn is_buffer(&self) -> bool {
         match self {
             View::Constant(..) | View::Placed(..) => true,
@@ -375,7 +362,6 @@ fn record(handle: u64, view: View) {
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
-    #[cfg(windows)]
     mirror(handle);
 }
 
@@ -401,7 +387,6 @@ pub(crate) fn forget(resource: usize) {
 }
 
 /// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
@@ -502,7 +487,6 @@ pub(crate) extern "win64" fn copy_simple(_: This, count: u32, dst: u64, src: u64
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
@@ -617,19 +601,14 @@ pub(crate) extern "win64" fn create_heap(
         desc,
         start,
         memory,
-        #[cfg(windows)]
         host: std::sync::OnceLock::new(),
-        #[cfg(windows)]
         pending: Default::default(),
     });
-    #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
-    #[cfg(not(windows))]
-    let _ = visible;
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 

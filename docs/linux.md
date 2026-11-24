@@ -67,10 +67,73 @@ depends on `victory-loader`, never the other way round.
 ## GPU
 
 `victory-gpu` translates D3D12.X to host D3D12 and console shaders to
-DXIL. On Linux the host D3D12 is a D3D12 implementation on Vulkan built as
-a native Linux library and loaded at run time, so the D3D12 code and the
-shader translator stay shared. Its COM methods and ours must agree on the
-calling convention; check before you bind.
+DXIL. On Linux the host D3D12 is vkd3d-proton built as native Linux
+libraries and loaded at run time, so the D3D12 code and the shader
+translator stay shared.
+
+- **Calling convention.** vkd3d-proton's native build defines
+  `STDMETHODCALLTYPE` as nothing (`include/vkd3d_windows.h`): its COM is
+  SysV, which is what `extern "system"` means on Linux, so the
+  `windows` crate's vtables match it. Objects the title receives from
+  the host (root signature blobs, deserializers) are copied into `win64`
+  objects of ours (`victory-gpu/src/root.rs`).
+- **Bindings.** The `windows` crate does not build on Linux (its
+  `windows-future` uses parts of `windows-core` that only exist on
+  Windows). `victory-windows` generates the same `Direct3D`, `D3D12` and
+  `DXGI` bindings with `windows-bindgen` at build time (nothing generated
+  is committed) and supplies the few core items (`PCSTR`, `PCWSTR`,
+  `HSTRING`, `Free`); `victory-gpu` and `victory-shader` name it
+  `windows`. vkd3d-proton's `WCHAR` is 16-bit, so wide names work as is.
+- **Loading.** `victory_shader::hostlib` opens
+  `libvkd3d-proton-d3d12core.so`, then `libvkd3d-proton-d3d12.so`, from
+  `VICTORY_VKD3D` (their directory, or the d3d12 library itself), else
+  the loader's search path. Missing, the runtime warns once and nothing
+  executes, as without a GPU; device tests skip.
+- **Presentation** has no DXGI: vkd3d-proton's command queues answer
+  `IDXGIVkSwapChainFactory` (what its DXGI uses), which takes our
+  `IDXGIVkSurfaceFactory` for the window (`victory-gpu/src/linux.rs`).
+  vkd3d-proton's native instance enables the Wayland, Xlib and XCB
+  surface extensions.
+- **Window and input: SDL3** (`libSDL3.so.0`, run time, `VICTORY_SDL3`):
+  window, Vulkan surface, keyboard, and gamepads with rumble from one
+  library already on most desktops, no crate. winit would need a
+  gamepad library and a surface helper beside it. One thread owns SDL;
+  `victory_gpu::linux::{pad, keys, rumble}` feed `gameinput`.
+- **What it supports.** vkd3d-proton 3.x: feature level 12_x, SM 6.6
+  (DXIL through dxil-spirv), mesh shaders, directly indexed heaps,
+  pipeline libraries. Fences need no event: `SetEventOnCompletion` with
+  none waits.
+- **Not yet:** write watching (every copy of title memory is whole), the
+  DXIL validator and the indirect argument clamp's compiler by default
+  (below), fence events until the handle table registers its `SetEvent`
+  (`victory_gpu::fence::on_set_event`), the debug layer and WARP.
+
+Building vkd3d-proton (meson, ninja, glslang; Vulkan headers come with
+it):
+
+```sh
+git clone --recurse-submodules https://github.com/HansKristian-Work/vkd3d-proton
+cd vkd3d-proton
+meson setup build --buildtype=release --prefix="$HOME/.local/vkd3d-proton"
+ninja -C build install   # if it fails on a generated header, run it again
+export VICTORY_VKD3D="$HOME/.local/vkd3d-proton/lib"
+```
+
+CachyOS packages `vkd3d-proton-git` (unchecked whether as native
+libraries); Arch's `vkd3d` is upstream vkd3d, a different library.
+vkd3d-proton writes `vkd3d-proton.cache` into the working directory
+(`VKD3D_SHADER_CACHE_PATH` moves it).
+
+DXC is optional and opt-in on Linux: `VICTORY_DXIL` names `libdxil.so`
+for `victory translate --validate`, `VICTORY_DXCOMPILER` names
+`libdxcompiler.so` for the indirect argument clamp (without it indirect
+execution is dropped, as when the clamp fails on Windows). Arch's
+`directx-shader-compiler` 1.10.2605 asserts on every shader it compiles
+and its validator traps on some of ours, so neither is loaded unasked.
+
+Tests with a device: `VICTORY_VKD3D=... cargo test -p victory-shader
+--features host -p victory-gpu`; `VICTORY_TEST_WINDOW=1` also presents
+to a window.
 
 ## Status
 
@@ -83,6 +146,6 @@ calling convention; check before you bind.
 | kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
 | Region table (`vm.rs`), kernel32 memory, heap, files at host level, text, locale | done: `kernel32_{memory,heap,file,io,path,text,locale}.rs`; overlapped I/O completes inside the call |
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
-| GPU, window, input | not started |
+| GPU, window, input | device, pipelines, window, pads and keyboard on vkd3d-proton and SDL3; no write watching or default DXC |
 | Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
 | Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |

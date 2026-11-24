@@ -224,6 +224,7 @@ fn user_space() -> (u64, u64) {
             info.lpMaximumApplicationAddress as u64,
         )
     }
+    // x86-64 Linux: 47-bit user space, above the zero page block.
     #[cfg(not(windows))]
     (0x1_0000, 0x7fff_fffe_ffff)
 }

@@ -4,10 +4,15 @@
 //!
 //! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.
+//! On Linux it is DXC's `libdxil.so`, only at `VICTORY_DXIL`: its COM is
+//! SysV with the same slots, but 1.10.2605 traps (`ud2`) on some of our
+//! modules (the stub vertex shader, the VALU tests' compute shaders), so
+//! nothing loads it unasked.
 
 use std::ffi::c_void;
 use std::path::PathBuf;
 
+#[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 type Hresult = i32;
@@ -31,7 +36,7 @@ const IID_IDXC_VALIDATOR: Guid = Guid(
 const IN_PLACE_EDIT: u32 = 1;
 
 type CreateInstance =
-    unsafe extern "win64" fn(*const Guid, *const Guid, *mut *mut c_void) -> Hresult;
+    unsafe extern "system" fn(*const Guid, *const Guid, *mut *mut c_void) -> Hresult;
 
 /// COM object: a pointer to a table of method pointers.
 type Object = *mut *const usize;
@@ -44,7 +49,7 @@ unsafe fn method<F: Copy>(obj: Object, slot: usize) -> F {
 unsafe fn release(obj: Object) {
     if !obj.is_null() {
         // SAFETY: slot 2 of every COM interface is Release.
-        unsafe { method::<unsafe extern "win64" fn(Object) -> u32>(obj, 2)(obj) };
+        unsafe { method::<unsafe extern "system" fn(Object) -> u32>(obj, 2)(obj) };
     }
 }
 
@@ -63,7 +68,7 @@ const IDXC_BLOB: [u8; 16] = [
     0x08, 0xfb, 0xa5, 0x8b, 0x95, 0x51, 0xe2, 0x40, 0xac, 0x58, 0x0d, 0x98, 0x9c, 0x3a, 0x01, 0x02,
 ];
 
-unsafe extern "win64" fn blob_qi(
+unsafe extern "system" fn blob_qi(
     this: *mut Blob,
     iid: *const [u8; 16],
     out: *mut *mut c_void,
@@ -79,25 +84,25 @@ unsafe extern "win64" fn blob_qi(
         }
     }
 }
-unsafe extern "win64" fn blob_ref(_: *mut Blob) -> u32 {
+unsafe extern "system" fn blob_ref(_: *mut Blob) -> u32 {
     1
 }
-unsafe extern "win64" fn blob_ptr(this: *mut Blob) -> *mut u8 {
+unsafe extern "system" fn blob_ptr(this: *mut Blob) -> *mut u8 {
     // SAFETY: `this` is our blob.
     unsafe { (*this).data }
 }
-unsafe extern "win64" fn blob_len(this: *mut Blob) -> usize {
+unsafe extern "system" fn blob_len(this: *mut Blob) -> usize {
     // SAFETY: `this` is our blob.
     unsafe { (*this).len }
 }
 
 #[repr(C)]
 struct BlobVtable {
-    qi: unsafe extern "win64" fn(*mut Blob, *const [u8; 16], *mut *mut c_void) -> Hresult,
-    add_ref: unsafe extern "win64" fn(*mut Blob) -> u32,
-    release: unsafe extern "win64" fn(*mut Blob) -> u32,
-    ptr: unsafe extern "win64" fn(*mut Blob) -> *mut u8,
-    len: unsafe extern "win64" fn(*mut Blob) -> usize,
+    qi: unsafe extern "system" fn(*mut Blob, *const [u8; 16], *mut *mut c_void) -> Hresult,
+    add_ref: unsafe extern "system" fn(*mut Blob) -> u32,
+    release: unsafe extern "system" fn(*mut Blob) -> u32,
+    ptr: unsafe extern "system" fn(*mut Blob) -> *mut u8,
+    len: unsafe extern "system" fn(*mut Blob) -> usize,
 }
 
 static BLOB_VTABLE: BlobVtable = BlobVtable {
@@ -122,6 +127,9 @@ impl Validator {
         if let Some(p) = std::env::var_os("VICTORY_DXIL") {
             return Some(p.into());
         }
+        if cfg!(not(windows)) {
+            return None;
+        }
         let kits = PathBuf::from(r"C:\Program Files (x86)\Windows Kits\10\bin");
         let mut versions: Vec<PathBuf> = std::fs::read_dir(&kits)
             .ok()?
@@ -133,8 +141,23 @@ impl Validator {
         versions.pop()
     }
 
-    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path).
+    /// Loads `path`'s validator (or `dxil.dll` from the DLL search path;
+    /// on Linux, none).
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, String> {
+        let create = Self::create_instance(path)?;
+        let mut object = std::ptr::null_mut();
+        // SAFETY: the export's signature, with valid GUIDs and out pointer.
+        let hr = unsafe { create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object) };
+        if hr < 0 || object.is_null() {
+            return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
+        }
+        Ok(Validator {
+            object: object.cast(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn create_instance(path: Option<&std::path::Path>) -> Result<CreateInstance, String> {
         let name: Vec<u16> = path
             .map_or_else(|| "dxil.dll".into(), |p| p.as_os_str().to_owned())
             .to_string_lossy()
@@ -149,16 +172,18 @@ impl Validator {
             }
             let create = GetProcAddress(module, c"DxcCreateInstance".as_ptr().cast())
                 .ok_or("dxil.dll lacks DxcCreateInstance")?;
-            let create: CreateInstance = std::mem::transmute(create);
-            let mut object = std::ptr::null_mut();
-            let hr = create(&CLSID_DXC_VALIDATOR, &IID_IDXC_VALIDATOR, &mut object);
-            if hr < 0 || object.is_null() {
-                return Err(format!("DxcCreateInstance(validator) failed: {hr:#x}"));
-            }
-            Ok(Validator {
-                object: object.cast(),
-            })
+            Ok(std::mem::transmute::<_, CreateInstance>(create))
         }
+    }
+
+    #[cfg(not(windows))]
+    fn create_instance(path: Option<&std::path::Path>) -> Result<CreateInstance, String> {
+        let path = path.ok_or("no DXIL validator: set VICTORY_DXIL to DXC's libdxil.so")?;
+        let library = crate::hostlib::Library::open(&path)
+            .map_err(|e| format!("cannot load {}: {e}", path.display()))?;
+        let create = library.symbol(c"DxcCreateInstance")?;
+        // SAFETY: the export has this signature.
+        Ok(unsafe { std::mem::transmute::<*mut c_void, CreateInstance>(create) })
     }
 
     /// Validates `container` and signs it in place; the error text if it
@@ -174,7 +199,7 @@ impl Validator {
         // IDxcBlob GetBufferPointer (3) / GetBufferSize (4).
         unsafe {
             let mut result: Object = std::ptr::null_mut();
-            let validate: unsafe extern "win64" fn(
+            let validate: unsafe extern "system" fn(
                 Object,
                 *mut Blob,
                 u32,
@@ -185,17 +210,17 @@ impl Validator {
                 return Err(format!("Validate failed: {hr:#x}"));
             }
             let mut status = 0;
-            let get_status: unsafe extern "win64" fn(Object, *mut Hresult) -> Hresult =
+            let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
             get_status(result, &mut status);
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
-                let get_errors: unsafe extern "win64" fn(Object, *mut Object) -> Hresult =
+                let get_errors: unsafe extern "system" fn(Object, *mut Object) -> Hresult =
                     method(result, 5);
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
-                    let ptr: unsafe extern "win64" fn(Object) -> *const u8 = method(errors, 3);
-                    let len: unsafe extern "win64" fn(Object) -> usize = method(errors, 4);
+                    let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
+                    let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
                     let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
                     text = String::from_utf8_lossy(bytes)
                         .trim_end_matches('\0')
