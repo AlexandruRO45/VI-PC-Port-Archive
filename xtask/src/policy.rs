@@ -2252,6 +2252,94 @@ mod tests {
         super::run(&linked, false).unwrap();
     }
 
+    /// Ignore sources are opened as git opens them: a UTF-8 byte order mark
+    /// at the start of `.gitignore` is dropped, so its first rule ignores
+    /// `bom`, which is taken, while the same mark before a later rule is
+    /// part of the pattern and `bom2` stays visible and refused. A
+    /// `core.excludesFile` naming a file that does not exist is no error and
+    /// ignores nothing, so a directory only it was meant to cover is refused
+    /// too. `.git/info/exclude`, unlike a `.gitignore`, is read through a
+    /// symlink, so a directory named only in the file it leads to is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_ignore_sources_as_git_opens_them() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "\u{feff}/bom/\n\u{feff}/bom2/\n").unwrap();
+        let missing = outside.path().join("missing");
+        git_str(
+            root,
+            &["config", "core.excludesFile", missing.to_str().unwrap()],
+        );
+        let rules = outside.path().join("exclude");
+        std::fs::write(&rules, "/linked/\n").unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        let exclude = root.join(".git/info/exclude");
+        let _ = std::fs::remove_file(&exclude);
+        std::os::unix::fs::symlink(&rules, &exclude).unwrap();
+        let bom = root.join("bom");
+        let bom2 = root.join("bom2");
+        let lost = root.join("missing");
+        let linked = root.join("linked");
+        for dir in [&bom, &bom2, &lost, &linked] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [bom2.clone(), lost.clone(), bom.clone()]);
+        assert_eq!(tmp.path().parent(), Some(bom.as_path()));
+        let tmp_linked = tempdir_in_first(root, [lost.clone(), linked.clone()]);
+        assert_eq!(tmp_linked.path().parent(), Some(linked.as_path()));
+        assert!(!missing.exists());
+        for dir in [&bom2, &lost] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_linked.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(bom2.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(lost.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "bom2/a.rs", "missing/b.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
+    /// A rule is anchored as `.gitignore` syntax places it: `loose`, with
+    /// no slash, ignores a directory of that name at any depth, so
+    /// `a/b/loose` is taken; `mid/dle`, with a slash before its end, is
+    /// anchored to the `.gitignore` holding it, so `x/mid/dle` stays visible
+    /// and is refused, while `**/far/off` reaches any depth and `x/y/far/off`
+    /// is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_where_their_rules_are_anchored() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "loose\nmid/dle\n**/far/off\n").unwrap();
+        let loose = root.join("a/b/loose");
+        let unanchored = root.join("x/mid/dle");
+        let far = root.join("x/y/far/off");
+        for dir in [&loose, &unanchored, &far] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [unanchored.clone(), loose.clone()]);
+        assert_eq!(tmp.path().parent(), Some(loose.as_path()));
+        let tmp_far = tempdir_in_first(root, [unanchored.clone(), far.clone()]);
+        assert_eq!(tmp_far.path().parent(), Some(far.as_path()));
+        assert_eq!(std::fs::read_dir(&unanchored).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_far.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(unanchored.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), [".gitignore", "x/mid/dle/a.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
