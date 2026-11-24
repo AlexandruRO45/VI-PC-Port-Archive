@@ -2083,6 +2083,88 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Ignore sources are weighed as git weighs them, not merely added up:
+    /// a `.gitignore` beats `.git/info/exclude`, so `!/reopened/` there
+    /// makes a directory excluded only in `info/exclude` visible, and it is
+    /// refused; a deeper `.gitignore` beats a shallower one, so
+    /// `sub/.gitignore`'s `!/scratch/` re-includes `sub/scratch` though the
+    /// top level ignores it, and that is refused too. The excluded
+    /// directory nothing re-includes is taken.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_ignore_precedence() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "/reopened/\n/excluded/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "!/reopened/\n/sub/scratch/\n").unwrap();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "!/scratch/\n").unwrap();
+        let reopened = root.join("reopened");
+        let scratch = root.join("sub/scratch");
+        let excluded = root.join("excluded");
+        for dir in [&reopened, &scratch, &excluded] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [reopened.clone(), scratch.clone(), excluded.clone()]);
+        assert_eq!(tmp.path().parent(), Some(excluded.as_path()));
+        for dir in [&reopened, &scratch] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(reopened.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(scratch.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [
+                ".gitignore",
+                "reopened/a.rs",
+                "sub/.gitignore",
+                "sub/scratch/b.rs"
+            ]
+        );
+        super::run(root, false).unwrap();
+    }
+
+    /// A TMPDIR is judged by where it leads, from inside the checkout as
+    /// well as from outside: a symlink in the checkout to a directory
+    /// elsewhere is taken, since git lists the link and never what it
+    /// leads to. A file tracked with `add -f` under an ignored directory
+    /// does not make the directory visible: a TMPDIR there is still taken,
+    /// and only the tracked file is listed.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_follow_links_out_and_ignore_tracked_siblings() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/ignored/\n").unwrap();
+        let ignored = root.join("ignored");
+        std::fs::create_dir(&ignored).unwrap();
+        std::fs::write(ignored.join("kept.rs"), b"fn kept() {}\n").unwrap();
+        git_str(root, &["add", "-f", "--", "ignored/kept.rs"]);
+        let link = root.join("out.txt");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let tmp = tempdir_in_first(root, [link.clone()]);
+        assert!(
+            tmp.path()
+                .starts_with(outside.path().canonicalize().unwrap())
+        );
+        let tmp_ignored = tempdir_in_first(root, [ignored.clone()]);
+        assert_eq!(tmp_ignored.path().parent(), Some(ignored.as_path()));
+        for dir in [tmp.path(), tmp_ignored.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "ignored/kept.rs", "out.txt"]
+        );
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
