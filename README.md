@@ -81,6 +81,9 @@ A **gamepad is recommended**: console games are made for one, and their menus an
   E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
   the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
   used together.
+- **Keyboard and mouse prompt icons** (work in progress, the newer retail game only): a script swaps the
+  game's Xbox button icons for keycaps and mouse icons through XCL's overlay. See
+  [`docs/kbm-icons`](docs/kbm-icons/README.md).
 
 ## Building and usage
 
