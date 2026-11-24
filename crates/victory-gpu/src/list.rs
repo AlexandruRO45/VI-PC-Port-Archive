@@ -2049,8 +2049,12 @@ mod tests {
             for x in 0..4usize {
                 let in_center = (1..3).contains(&x) && (1..3).contains(&y);
                 // SAFETY: readback buffers hold 4 rows at 256-byte pitch.
-                let got_u = unsafe { ptr_u32.add(y * 256 + x * 4).cast::<u32>().read() };
-                let got_f = unsafe { ptr_f32.add(y * 256 + x * 4).cast::<f32>().read() };
+                let (got_u, got_f) = unsafe {
+                    (
+                        ptr_u32.add(y * 256 + x * 4).cast::<u32>().read(),
+                        ptr_f32.add(y * 256 + x * 4).cast::<f32>().read(),
+                    )
+                };
                 assert_eq!(got_u, if in_center { 99 } else { 7 }, "u32 ({x},{y})");
                 assert_eq!(got_f, if in_center { 3.25 } else { 1.5 }, "f32 ({x},{y})");
             }
@@ -2293,8 +2297,12 @@ mod tests {
             for x in 0..4usize {
                 let idx = (y * 4 + x) as u32;
                 // SAFETY: 4 rows at 256-byte row pitch.
-                let got_a = unsafe { ptr_a.add(y * 256 + x * 4).cast::<u32>().read() };
-                let got_u = unsafe { ptr_u.add(y * 256 + x * 4).cast::<u32>().read() };
+                let (got_a, got_u) = unsafe {
+                    (
+                        ptr_a.add(y * 256 + x * 4).cast::<u32>().read(),
+                        ptr_u.add(y * 256 + x * 4).cast::<u32>().read(),
+                    )
+                };
                 assert_eq!(got_a, 0x1111_0000 + idx, "aligned ({x},{y})");
                 assert_eq!(got_u, 0x2222_0000 + idx, "unaligned 516 ({x},{y})");
             }

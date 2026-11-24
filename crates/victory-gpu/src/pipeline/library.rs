@@ -139,12 +139,12 @@ pub(crate) fn pipeline(
     let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a live pipeline; skip `StorePipeline` if another worker already
-    // stored the same name while we compiled outside the lock.
-    if l.stored.insert(name.to_owned())
-        && unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok()
-    {
-        l.added += 1;
+    if l.stored.insert(name.to_owned()) {
+        // SAFETY: a live pipeline; skip `StorePipeline` if another worker
+        // already stored the same name while we compiled outside the lock.
+        if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            l.added += 1;
+        }
     }
     Ok(pso)
 }

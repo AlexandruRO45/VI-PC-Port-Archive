@@ -3204,6 +3204,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // SAFETY: balanced VirtualAlloc / VirtualFree of our private test block.
         let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE) };
         assert!(!base.is_null());
+        // SAFETY: committing and initializing the first and third chunks of our reserved block.
         unsafe {
             let a = VirtualAlloc(base, CHUNK, MEM_COMMIT, PAGE_READWRITE);
             let b = VirtualAlloc(base.cast::<u8>().add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE);
@@ -3223,6 +3224,7 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         let mut src = vec![0x33u8; TOTAL];
         src[2 * CHUNK..].fill(0xCC);
         super::write_mapped(base.cast::<u8>(), src.as_ptr(), TOTAL);
+        // SAFETY: reading back the two committed chunks before freeing the reservation.
         unsafe {
             assert!(std::slice::from_raw_parts(base.cast::<u8>(), CHUNK)
                 .iter()
