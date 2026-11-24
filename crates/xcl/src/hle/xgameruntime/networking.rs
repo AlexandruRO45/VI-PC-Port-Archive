@@ -430,7 +430,7 @@ unsafe fn check_thumbprints(security_info: *const XNetworkingSecurityInformation
         let expected = std::slice::from_raw_parts(tp.thumbprint_buffer, SHA1_LEN);
         let matched = match tp.thumbprint_type {
             0 => chain_sha1s.first().is_some_and(|c| c.as_slice() == expected),
-            1 => chain_sha1s.get(1..).is_some_and(|ca_certs| ca_certs.iter().any(|c| c.as_slice() == expected)),
+            1 => chain_sha1s.iter().skip(1).take(chain_sha1s.len().saturating_sub(2)).any(|c| c.as_slice() == expected),
             2 => chain_sha1s.last().is_some_and(|c| c.as_slice() == expected),
             _ => return PinCheck::InvalidMetadata,
         };
@@ -922,7 +922,7 @@ mod tests {
             assert_eq!(check_thumbprints(&info_sub2, &chain), PinCheck::Matched);
             assert!(verify_thumbprints(&info_sub2, &chain));
 
-            // Issuer pin (type 1) matching root in an issuer position
+            // A root must only match a root pin, not an issuer pin
             let pin_root_as_issuer = XNetworkingThumbprint {
                 thumbprint_type: 1,
                 thumbprint_buffer_byte_count: root.len(),
@@ -933,8 +933,11 @@ mod tests {
                 thumbprint_count: 1,
                 thumbprints: &pin_root_as_issuer,
             };
-            assert_eq!(check_thumbprints(&info_root_as_issuer, &chain), PinCheck::Matched);
-            assert!(verify_thumbprints(&info_root_as_issuer, &chain));
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &chain), PinCheck::Mismatch);
+            assert!(!verify_thumbprints(&info_root_as_issuer, &chain));
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[leaf.clone(), root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[root.clone()]), PinCheck::Mismatch);
+            assert_eq!(check_thumbprints(&info_root_as_issuer, &[]), PinCheck::Mismatch);
 
             // Issuer pin (type 1) matching unrelated cert must reject with Mismatch
             let pin_unrelated = XNetworkingThumbprint {
