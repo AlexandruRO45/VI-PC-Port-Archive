@@ -8,7 +8,7 @@ qui les nomme, ce qui mesure ce qui reste à traduire.
 """
 import struct
 
-from emu import rdna2, rdna2_exec_ext, rdna2_exec_graphics, rdna2_exec_image, rdna2_exec_memory, rdna2_exec_vop3
+from emu import rdna2, rdna2_exec_ext, rdna2_exec_f16, rdna2_exec_graphics, rdna2_exec_image, rdna2_exec_memory, rdna2_exec_vop3
 from emu.rdna2_exec_ops import SCALAR, VECTOR, VECTOR_COMPARE, BRANCHES, float_bits
 
 LANES = 32
@@ -129,6 +129,8 @@ def step(wave, data):
             next_pc = wave.pc + rdna2.DWORD + _signed16(fields["simm16"]) * rdna2.DWORD
     elif name in SCALAR:
         SCALAR[name](wave, fields, literal)
+    elif name in rdna2_exec_f16.OPERATIONS:     # avant is_ext : les formes SDWA/DPP du f16 sont refusées par rdna2_exec_f16
+        rdna2_exec_f16.execute(wave, name, fields, literal)
     elif rdna2_exec_ext.is_ext(family, fields.get("src0")):
         rdna2_exec_ext.execute(wave, family, name, fields, literal or 0)
     elif name in VECTOR:
@@ -172,7 +174,7 @@ def run(data, wave=None, max_steps=MAX_STEPS):
     raise RuntimeError(f"programme interrompu après {max_steps} instructions (boucle infinie ?)")
 
 
-EXECUTABLE = frozenset({"s_endpgm", *SCALAR, *VECTOR, *VECTOR_COMPARE, *BRANCHES})
+EXECUTABLE = frozenset({"s_endpgm", *SCALAR, *VECTOR, *VECTOR_COMPARE, *BRANCHES, *rdna2_exec_f16.OPERATIONS})
 
 
 def executable(family, name):
