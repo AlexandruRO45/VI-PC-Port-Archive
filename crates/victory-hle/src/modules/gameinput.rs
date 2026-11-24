@@ -212,7 +212,7 @@ pub struct Object {
 
 #[repr(C)]
 pub struct Device {
-    vtable: &'static Table<21>,
+    vtable: &'static Table<22>,
     hub: *const Hub,
     index: usize,
     info: DeviceInfo,
@@ -1089,9 +1089,15 @@ static DISPATCHER: Table<5> = Table([
     open_wait_handle as *const (), // 0x20
 ]);
 
-/// Aggregate device: no title of ours asks for it.
-extern "system" fn create_aggregate(_: This, _kind: u32, out: Out) -> HRESULT {
-    tracing::warn!("aggregate input device not implemented");
+/// Aggregate devices: E_NOTIMPL is what this API version (v0, the one whose
+/// table this is) answers; the GDK documents CreateAggregateDevice as
+/// "introduced but unimplemented" in v0, removed in v1 and implemented,
+/// with another signature, only from v3.
+extern "system" fn create_aggregate(_: This, kind: u32, out: Out) -> HRESULT {
+    tracing::debug!(
+        kind = format_args!("{kind:#x}"),
+        "aggregate input device: not in API v0"
+    );
     fail(out, E_NOTIMPL)
 }
 extern "system" fn find_by_id(this: This, id: *const [u8; 32], out: Out) -> HRESULT {
@@ -1182,36 +1188,112 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
     lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
 }
-extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
-    tracing::warn!(
-        slot = format_args!("{SLOT:#x}"),
-        "input device method not implemented"
-    );
+/// `GameInputBatteryState`: rates and capacities, then a status.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BatteryState {
+    charge_rate: f32,
+    max_charge_rate: f32,
+    remaining_capacity: f32,
+    full_charge_capacity: f32,
+    status: i32,
+}
+const BATTERY_UNKNOWN: i32 = -1;
+
+/// What the methods below answer is that of a device with no battery
+/// report, no force feedback or haptic motors (the info says none), no
+/// input synchronization and no raw reports: what our devices are.
+// shortcut: the battery is unknown, XInput's coarse levels have no
+// capacities to give; API v0 documents its battery state as unimplemented.
+extern "system" fn battery_state(_: *const Device, out: *mut BatteryState) {
+    if !out.is_null() {
+        // SAFETY: checked non-null; the title passes room for the state.
+        unsafe {
+            out.write(BatteryState {
+                charge_rate: 0.0,
+                max_charge_rate: 0.0,
+                remaining_capacity: 0.0,
+                full_charge_capacity: 0.0,
+                status: BATTERY_UNKNOWN,
+            });
+        }
+    }
+}
+/// No such motor: force feedback effects and haptic states.
+extern "system" fn no_motor(
+    _: *const Device,
+    _motor: u32,
+    _params: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_INVALIDARG)
+}
+extern "system" fn no_haptics(_: *const Device, _motor: u32, _params: *const c_void) -> HRESULT {
+    E_INVALIDARG
+}
+/// Power state of a force feedback motor; exclusive raw access: no.
+extern "system" fn no(_: *const Device, _: u64) -> bool {
+    false
+}
+/// Motor gain, input synchronization, power off, releasing raw access.
+// shortcut: PowerOff leaves the host pad on; that is the user's to do.
+extern "system" fn ignore(_: *const Device, _: u64, _: u32) {}
+/// Raw reports: creating one, reading a feature, sending with a response.
+extern "system" fn no_report(_: *const Device, _id: u32, _kind: u32, out: Out) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_feature(_: *const Device, _id: u32, out: Out) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_report_sent(_: *const Device, _report: *const c_void) -> HRESULT {
+    E_NOTIMPL
+}
+extern "system" fn no_report_response(
+    _: *const Device,
+    _report: *const c_void,
+    out: Out,
+) -> HRESULT {
+    fail(out, E_NOTIMPL)
+}
+extern "system" fn no_io_control(
+    _: *const Device,
+    _code: u32,
+    _in_size: usize,
+    _in: *const c_void,
+    _out_size: usize,
+    _out: *mut c_void,
+    out_written: *mut usize,
+) -> HRESULT {
+    if !out_written.is_null() {
+        // SAFETY: checked non-null; zero on failure, as documented.
+        unsafe { out_written.write(0) };
+    }
     E_NOTIMPL
 }
 
-static DEVICE: Table<21> = Table([
-    query_device as *const (),        // 0x00
-    add_ref::<Device> as *const (),   // 0x08 AddRef
-    add_ref::<Device> as *const (),   // 0x10 Release
-    device_info as *const (),         // 0x18
-    device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
-    unsupported::<0x30> as *const (), // force feedback
-    unsupported::<0x38> as *const (), //
-    unsupported::<0x40> as *const (), //
-    unsupported::<0x48> as *const (), // haptics
-    set_rumble as *const (),          // 0x50
-    unsupported::<0x58> as *const (), // input synchronization
-    unsupported::<0x60> as *const (), //
-    unsupported::<0x68> as *const (), // power off
-    unsupported::<0x70> as *const (), // raw device access
-    unsupported::<0x78> as *const (), //
-    unsupported::<0x80> as *const (), //
-    unsupported::<0x88> as *const (), //
-    unsupported::<0x90> as *const (), //
-    unsupported::<0x98> as *const (), //
-    unsupported::<0xa0> as *const (), //
+static DEVICE: Table<22> = Table([
+    query_device as *const (),       // 0x00
+    add_ref::<Device> as *const (),  // 0x08 AddRef
+    add_ref::<Device> as *const (),  // 0x10 Release
+    device_info as *const (),        // 0x18
+    device_status as *const (),      // 0x20
+    battery_state as *const (),      // 0x28
+    no_motor as *const (),           // 0x30 CreateForceFeedbackEffect
+    no as *const (),                 // 0x38 IsForceFeedbackMotorPoweredOn
+    ignore as *const (),             // 0x40 SetForceFeedbackMotorGain
+    no_haptics as *const (),         // 0x48 SetHapticMotorState
+    set_rumble as *const (),         // 0x50
+    ignore as *const (),             // 0x58 SetInputSynchronizationState
+    ignore as *const (),             // 0x60 SendInputSynchronizationHint
+    ignore as *const (),             // 0x68 PowerOff
+    no_report as *const (),          // 0x70 CreateRawDeviceReport
+    no_feature as *const (),         // 0x78 GetRawDeviceFeature
+    no_report_sent as *const (),     // 0x80 SetRawDeviceFeature
+    no_report_sent as *const (),     // 0x88 SendRawDeviceOutput
+    no_report_response as *const (), // 0x90 SendRawDeviceOutputWithResponse
+    no_io_control as *const (),      // 0x98 ExecuteRawDeviceIoControl
+    no as *const (),                 // 0xa0 AcquireExclusiveRawDeviceAccess
+    ignore as *const (),             // 0xa8 ReleaseExclusiveRawDeviceAccess
 ]);
 
 fn reading<'a>(this: *const Reading) -> &'a Reading {
@@ -1823,6 +1905,108 @@ mod tests {
             assert_eq!(WaitForSingleObject(b, 0), WAIT_TIMEOUT);
             CloseHandle(b);
         }
+    }
+
+    #[test]
+    fn devices_answer_as_devices_without_battery_motors_or_raw_reports() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        for device in [&raw const hub.devices[0], &raw const hub.devices[KEYBOARD]] {
+            let mut battery = BatteryState {
+                charge_rate: 9.0,
+                max_charge_rate: 9.0,
+                remaining_capacity: 9.0,
+                full_charge_capacity: 9.0,
+                status: 7,
+            };
+            slot::<extern "system" fn(*const Device, *mut BatteryState), _>(device, 0x28)(
+                device,
+                &mut battery,
+            );
+            let unknown = BatteryState {
+                charge_rate: 0.0,
+                max_charge_rate: 0.0,
+                remaining_capacity: 0.0,
+                full_charge_capacity: 0.0,
+                status: -1, // GameInputBatteryUnknown
+            };
+            assert_eq!(battery, unknown);
+
+            type Motor = extern "system" fn(*const Device, u32, *const c_void, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            let effect =
+                slot::<Motor, _>(device, 0x30)(device, 0, &1_u64 as *const u64 as _, &mut out);
+            assert_eq!((effect, out), (E_INVALIDARG, std::ptr::null()));
+            type Haptic = extern "system" fn(*const Device, u32, *const c_void) -> HRESULT;
+            let haptic = slot::<Haptic, _>(device, 0x48)(device, 0, std::ptr::null());
+            assert_eq!(haptic, E_INVALIDARG);
+            // Booleans are false: E_NOTIMPL's low byte would read as true.
+            for offset in [0x38, 0xa0] {
+                let ask = slot::<extern "system" fn(*const Device, u32) -> bool, _>(device, offset);
+                assert!(!ask(device, 0), "slot {offset:#x}");
+            }
+            // Gain, synchronization, power off, releasing access: no effect.
+            for offset in [0x40, 0x58, 0x60, 0x68, 0xa8] {
+                slot::<extern "system" fn(*const Device, u32, u32), _>(device, offset)(
+                    device, 0, 1,
+                );
+            }
+
+            type Create = extern "system" fn(*const Device, u32, u32, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            assert_eq!(
+                slot::<Create, _>(device, 0x70)(device, 1, 1, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+            type Feature = extern "system" fn(*const Device, u32, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            assert_eq!(
+                slot::<Feature, _>(device, 0x78)(device, 1, &mut out),
+                E_NOTIMPL
+            );
+            assert!(out.is_null());
+            type Send = extern "system" fn(*const Device, *const c_void) -> HRESULT;
+            for offset in [0x80, 0x88] {
+                assert_eq!(
+                    slot::<Send, _>(device, offset)(device, std::ptr::null()),
+                    E_NOTIMPL
+                );
+            }
+            type Response = extern "system" fn(*const Device, *const c_void, Out) -> HRESULT;
+            let mut out = std::ptr::dangling::<c_void>();
+            let hr = slot::<Response, _>(device, 0x90)(device, std::ptr::null(), &mut out);
+            assert_eq!((hr, out), (E_NOTIMPL, std::ptr::null()));
+            type Control = extern "system" fn(
+                *const Device,
+                u32,
+                usize,
+                *const c_void,
+                usize,
+                *mut c_void,
+                *mut usize,
+            ) -> HRESULT;
+            let mut written = 5;
+            let control = slot::<Control, _>(device, 0x98);
+            let hr = control(
+                device,
+                1,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                &mut written,
+            );
+            assert_eq!((hr, written), (E_NOTIMPL, 0));
+        }
+        assert!(host.lock().unwrap().rumble.is_empty());
+
+        // Aggregate devices are not in API v0.
+        type Aggregate = extern "system" fn(This, u32, Out) -> HRESULT;
+        let mut out = std::ptr::dangling::<c_void>();
+        let hr = slot::<Aggregate, _>(&hub.object, 0x78)(&hub.object, GAMEPAD_KIND, &mut out);
+        assert_eq!((hr, out), (E_NOTIMPL, std::ptr::null()));
     }
 
     #[test]
