@@ -1154,6 +1154,32 @@ mod tests {
         assert_eq!(names(root, false), [".gitignore"]);
     }
 
+    /// A TMPDIR inside the checkout's `.git` directory is used as it is:
+    /// nothing under it is ever listed, though no ignore rule covers it.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_live_in_the_git_directory() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let visible = root.join("visible");
+        let scratch = root.join(".git/scratch");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::create_dir(&scratch).unwrap();
+
+        let tmp = tempdir_in_first(root, [visible.clone(), scratch.clone()]);
+        assert_eq!(tmp.path().parent(), Some(scratch.as_path()));
+        assert_eq!(std::fs::read_dir(visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("fixture.rs"), b"fixture\n").unwrap();
+        assert!(names(root, false).is_empty());
+        // Git itself does not call it ignored; only the shortcut lets it be.
+        let status = super::git_command(root)
+            .args(["check-ignore", "-q", "--", ".git/scratch"])
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
@@ -1163,11 +1189,20 @@ mod tests {
     }
 
     /// Whether nothing under `dir` is listed by the full check of `checkout`:
-    /// it is elsewhere, or ignored there.
+    /// it is elsewhere, inside a `.git` directory, or ignored there.
+    ///
+    /// Git never lists what is under `.git`, and the walk skips it too, but
+    /// `check-ignore` calls such a path not ignored: a TMPDIR kept in the
+    /// checkout's `.git` (to stay on its filesystem, or out of `/tmp`) was
+    /// passed over for beside the test binary, and when that was not
+    /// writable every test panicked asking for the TMPDIR it already had.
     fn unseen_by_full_check(checkout: &std::path::Path, dir: &std::path::Path) -> bool {
         let Ok(relative) = dir.strip_prefix(checkout) else {
             return true;
         };
+        if relative.components().any(|c| c.as_os_str() == ".git") {
+            return true;
+        }
         let status = super::git_command(checkout)
             .args(["check-ignore", "-q", "--"])
             .arg(relative)
