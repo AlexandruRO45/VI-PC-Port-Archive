@@ -89,16 +89,21 @@ fn scan_sources(
     let mut scan = vec![0; (chunk as u64 + 3).min(len) as usize];
     let mut batch = Vec::new();
     let mut bytes = 0;
+    // Flush full batches immediately. In particular, don't retain a large
+    // singleton while reading the next candidate from the archive.
     let mut push = |source: Source| {
-        if !batch.is_empty()
-            && (source.len() > BATCH_BYTES.saturating_sub(bytes) || batch.len() == BATCH_COUNT)
-        {
+        if !batch.is_empty() && source.len() > BATCH_BYTES - bytes {
             visit(&batch);
             batch.clear();
             bytes = 0;
         }
         bytes += source.len();
         batch.push(source);
+        if bytes >= BATCH_BYTES || batch.len() == BATCH_COUNT {
+            visit(&batch);
+            batch.clear();
+            bytes = 0;
+        }
     };
     let mut sgd = false;
     let mut end = 0;
@@ -331,5 +336,46 @@ mod tests {
                 (format!("@{raw_at:#x}"), None, container().to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn visits_an_oversized_source_before_reading_the_next_candidate() {
+        struct HeaderReadFailure {
+            data: Cursor<Vec<u8>>,
+            offset: u64,
+        }
+
+        impl Read for HeaderReadFailure {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.data.position() == self.offset && buf.len() == 32 {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                self.data.read(buf)
+            }
+        }
+
+        impl Seek for HeaderReadFailure {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.data.seek(position)
+            }
+        }
+
+        let size = BATCH_BYTES + 1;
+        let mut data = container().to_vec();
+        data[24..28].copy_from_slice(&(size as u32).to_le_bytes());
+        data.resize(size, 0);
+        data.extend_from_slice(&container());
+        let len = data.len() as u64;
+        let mut file = HeaderReadFailure {
+            data: Cursor::new(data),
+            offset: size as u64,
+        };
+        let mut visited = Vec::new();
+        let error = scan_sources(&mut file, len, CHUNK, |batch| {
+            visited.extend(batch.iter().map(Source::len));
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(visited, [size]);
     }
 }
