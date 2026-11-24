@@ -272,34 +272,6 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn warp_adapter_accepts_only_software() {
-        // This probes DXGI without creating a D3D12 device or running a title.
-        // SAFETY: plain DXGI adapter queries.
-        let raw = unsafe {
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                return;
-            };
-            factory.EnumWarpAdapter::<IDXGIAdapter>()
-        };
-        let Ok(raw) = raw else { return };
-        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
-        eprintln!(
-            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
-            desc.VendorId, desc.Flags
-        );
-        assert_eq!(
-            warp_adapter().is_ok(),
-            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
-        );
-    }
-}
-
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -2058,6 +2030,29 @@ fn pick_hardware_adapter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warp_adapter_accepts_only_software() {
+        // This probes DXGI without creating a D3D12 device or running a title.
+        // SAFETY: plain DXGI adapter queries.
+        let raw = unsafe {
+            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            else {
+                return;
+            };
+            factory.EnumWarpAdapter::<IDXGIAdapter>()
+        };
+        let Ok(raw) = raw else { return };
+        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
+        eprintln!(
+            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
+            desc.VendorId, desc.Flags
+        );
+        assert_eq!(
+            warp_adapter().is_ok(),
+            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+        );
+    }
 
     #[test]
     fn adapter_name_stops_at_nul() {
