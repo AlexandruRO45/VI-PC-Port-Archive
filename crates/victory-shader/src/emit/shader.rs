@@ -15,7 +15,7 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
-    pub const DOUBLE: u64 = 1 << 0;
+    pub const DOUBLE: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
