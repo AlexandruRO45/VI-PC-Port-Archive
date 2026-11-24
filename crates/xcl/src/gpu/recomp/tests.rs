@@ -73,21 +73,31 @@ fn kernel_wave(code: &[u8], wave64: bool) -> (Vec<u8>, Vec<u32>) {
 /// `XCL_DIRECT_DXIL=1`: the direct DXIL translator's kernel for a kernel-mode program with
 /// one memory window (else `hlsl`, the HLSL path's container).
 fn direct_or(code: &[u8], opt: &Options, hlsl: Vec<u8>) -> Vec<u8> {
-    use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
-    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
-    if !runner::direct_dxil() || !windows {
+    if !runner::direct_dxil() {
         return hlsl;
     }
+    direct_of(code, opt).unwrap_or(hlsl)
+}
+
+/// The direct DXIL translator's container for `opt` (`XCL_DIRECT_DXIL` or not); None for what
+/// the tests leave to the HLSL path.
+fn direct_of(code: &[u8], opt: &Options) -> Option<Vec<u8>> {
+    use crate::gpu::dxil::kernel::{translate, translate_compute, KernelOptions};
+    let windows = opt.mem_windows <= 4 && (opt.hw_wave == 0 || (opt.hw_wave == 32 && !opt.wave64));
+    if !windows {
+        return None;
+    }
     let split = opt.wave64 && (opt.split_wave64 || runner::split_wave64());
-    let o = KernelOptions { wave64: opt.wave64, split, mem_windows: opt.mem_windows, sampler_base: opt.static_sampler_base };
-    match &opt.mode {
+    let mem_windows = opt.mem_windows | if opt.heap_windows { super::HEAP_WINDOWS } else { 0 };
+    let o = KernelOptions { wave64: opt.wave64, split, mem_windows, sampler_base: opt.static_sampler_base };
+    Some(match &opt.mode {
         Mode::Kernel => translate(code, o).unwrap_or_else(|e| panic!("direct DXIL: {e}")),
         Mode::Compute(cs) => translate_compute(code, o, cs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Mesh(ms) => crate::gpu::dxil::kernel::translate_mesh(code, o, ms).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Vertex(vs) => crate::gpu::dxil::kernel::translate_vertex(code, o, vs).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
         Mode::Pixel(ps) => crate::gpu::dxil::kernel::translate_pixel(code, o, ps).unwrap_or_else(|e| panic!("direct DXIL: {e}")).dxil,
-        _ => hlsl,
-    }
+        _ => return None,
+    })
 }
 
 /// `XCL_DIRECT_DXIL=1`: a kernel-mode program the HLSL path only compiles must also go
@@ -3227,17 +3237,26 @@ fn gpu_mesh_mode_reads_memory_windows() {
 /// accesses in window 0.
 #[test]
 fn gpu_memory_windows_above_4_gib() {
-    memory_windows_above_4_gib(false);
+    memory_windows_above_4_gib(false, false);
 }
 
 /// The same program with the windows taken from the descriptor heap (`Options::heap_windows`):
 /// same results, and no `switch` over windows in the HLSL.
 #[test]
 fn gpu_memory_windows_from_the_heap() {
-    memory_windows_above_4_gib(true);
+    memory_windows_above_4_gib(true, false);
 }
 
-fn memory_windows_above_4_gib(heap: bool) {
+/// The direct DXIL translator's forms of that program (`XCL_DIRECT_DXIL` or not): the switch
+/// over root UAVs, and the windows from the descriptor heap (one access with the window's
+/// index, smaller than the switch).
+#[test]
+fn gpu_direct_memory_windows_from_the_heap() {
+    memory_windows_above_4_gib(false, true);
+    memory_windows_above_4_gib(true, true);
+}
+
+fn memory_windows_above_4_gib(heap: bool, direct: bool) {
     if !gpu_ready() {
         return;
     }
@@ -3268,13 +3287,22 @@ fn memory_windows_above_4_gib(heap: bool) {
     let p = prog(&refs);
     let one = translate(&p, &Options::default()).unwrap();
     assert!(!one.hlsl.contains("mem1") && !one.hlsl.contains("xcl_w =") && !one.hlsl.contains("xcl_m"), "one window: the single-window HLSL");
-    let t = translate(&p, &on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() })).unwrap();
+    let opt = on_gpu(Options { mem_windows: 2, heap_windows: heap, ..Default::default() });
+    let t = translate(&p, &opt).unwrap();
     assert!(t.hlsl.contains("RWByteAddressBuffer mem1 : register(u3)"));
     assert_eq!(t.hlsl.contains("switch (xcl_w)"), !heap, "heap windows: no switch over windows");
     assert_eq!(t.hlsl.contains("ResourceDescriptorHeap[NonUniformResourceIndex(0u + xcl_w)]"), heap);
     let hlsl_dxil = || super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).map_err(|e| format!("{e}\n{}", t.hlsl)).unwrap();
-    // the direct translator binds windows as root UAVs only (no heap windows yet)
-    let dxil = if heap { hlsl_dxil() } else { direct_or(&p, &on_gpu(Options { mem_windows: 2, ..Default::default() }), hlsl_dxil()) };
+    let dxil = if direct {
+        let Some(d) = direct_of(&p, &opt) else { return runner::skip_test("the direct translator does not take this adapter's wave form") };
+        if heap {
+            let switch = direct_of(&p, &Options { heap_windows: false, ..opt.clone() }).unwrap();
+            assert!(d.len() < switch.len(), "heap windows: {} B of DXIL, the switch {} B", d.len(), switch.len());
+        }
+        d
+    } else {
+        direct_or(&p, &opt, hlsl_dxil())
+    };
     let hi = |a: u64| (a >> 32) as u32;
     let mut st = KernelState::default();
     st.sgpr[2..4].copy_from_slice(&[(w1 + 0x1000) as u32, hi(w1)]);

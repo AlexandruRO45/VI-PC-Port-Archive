@@ -293,7 +293,7 @@ impl Lw {
             let off_lo = self.shlc(nlo, 3);
             let a = self.add(base_lo, off_lo);
             // the window: bits 32.. of the 64-bit address
-            if self.mems.len() > 1 {
+            if self.multi_window() {
                 let d1lo = self.andc(d1, 0xFF);
                 let b64 = self.pack64(d0, d1lo);
                 let k8 = self.c64(8);

@@ -143,8 +143,11 @@ pub struct Lw {
     pub upper: Value,
     /// lane >> 5
     pub half: Value,
-    /// the memory windows `mem`, `mem1`.. (u2..)
+    /// the memory windows `mem`, `mem1`.. (u2..); empty with `heap_mems`
     pub mems: Vec<RawUav>,
+    /// the memory windows from the descriptor heap (`recomp::HEAP_WINDOWS`): (how many,
+    /// `globallycoherent`); window k is descriptor `recomp::MEM_HEAP_BASE + k`
+    pub heap_mems: Option<(u32, bool)>,
     pub res: Option<RawUav>,
     /// the buffer format table (`FMT_INFO`), created on first use
     pub fmt_table: Option<Value>,

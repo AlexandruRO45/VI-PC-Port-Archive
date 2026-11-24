@@ -100,11 +100,6 @@ pub fn translate_compute(code: &[u8], o: KernelOptions, cs: &CsInterface) -> Res
 }
 
 fn translate_entry(code: &[u8], o: KernelOptions, entry: Entry) -> Result<Kernel, String> {
-    // memory windows through the descriptor heap (`recomp::HEAP_WINDOWS` in the count,
-    // `XCL_HEAP_WINDOWS=1`) are not translated yet: the caller falls back to HLSL
-    if o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0 {
-        return Err("unsupported: heap memory windows (XCL_HEAP_WINDOWS)".into());
-    }
     // SSA construction recurses along the CFG (one level per guarded memory access between
     // a register's definition and its use): a thread with a large stack for big programs
     let code = code.to_vec();
@@ -144,7 +139,16 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
     let res = if kernel || ms.is_some() { Some(s.raw_uav(1, 0)) } else { None };
     // compute work across groups relies on coherent memory (as the HLSL compute mode's
     // `globallycoherent` windows)
-    let mems: Vec<_> = (0..o.mem_windows.clamp(1, 4)).map(|k| if cs.is_some() { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect();
+    // memory windows through the descriptor heap (`recomp::HEAP_WINDOWS` in the count,
+    // `XCL_HEAP_WINDOWS=1`): one access with the window's index instead of a switch over
+    // root UAVs, as the HLSL path's heap form
+    let windows = (o.mem_windows & !crate::gpu::recomp::HEAP_WINDOWS).clamp(1, 4);
+    let heap_mems = (o.mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0 && windows > 1).then_some((windows, cs.is_some()));
+    let mems: Vec<_> = if heap_mems.is_some() {
+        Vec::new()
+    } else {
+        (0..windows).map(|k| if cs.is_some() { s.raw_uav_coherent(2 + k, 0) } else { s.raw_uav(2 + k, 0) }).collect()
+    };
     let i32 = s.m.i32();
     let z = s.m.i32c(0);
     let mut lw = Lw {
@@ -158,6 +162,7 @@ fn translate_on_this_thread(code: &[u8], o: KernelOptions, entry: Entry) -> Resu
         upper: z,
         half: z,
         mems,
+        heap_mems,
         res,
         fmt_table: None,
         ntmp: 0,

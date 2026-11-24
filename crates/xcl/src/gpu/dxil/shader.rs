@@ -292,6 +292,13 @@ impl Shader {
         RawUav { handle, binding: None }
     }
 
+    /// `RWByteAddressBuffer` (`globallycoherent` if `coherent`) from `ResourceDescriptorHeap[index]`.
+    pub fn heap_raw_uav(&mut self, index: Value, coherent: bool, nonuniform: bool) -> RawUav {
+        let h = self.handle_from_heap(index, false, nonuniform);
+        let handle = self.annotate(h, kind::RAW_BUFFER | 0x1000 | if coherent { 0x4000 } else { 0 }, 0);
+        RawUav { handle, binding: None }
+    }
+
     pub(super) fn res_ret(&mut self, t: Ty) -> Ty {
         let name = format!("dx.types.ResRet.{}", self.type_suffix(t));
         let i32 = self.m.i32();

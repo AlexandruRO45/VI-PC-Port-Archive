@@ -118,6 +118,19 @@ impl Lw {
     /// a switch over the windows when the program may address several, as the HLSL kernel's
     /// `xcl_m*` accessors; returns `f`'s value (i32 or i64).
     fn with_mem(&mut self, f: &mut dyn FnMut(&mut Lw, RawUav) -> Option<Value>) -> Option<Value> {
+        if let Some((n, coherent)) = self.heap_mems {
+            // window 0 for any other value, as the switch below (`xcl_w` is `hi & 3`)
+            let w = self.rd(super::lower::VAR_WIN);
+            let w = if n < 4 {
+                let outside = self.cmpc(Pred::UGe, w, n);
+                self.selc(outside, 0, w)
+            } else {
+                w
+            };
+            let i = self.addc(w, crate::gpu::recomp::MEM_HEAP_BASE);
+            let m = self.s.heap_raw_uav(i, coherent, true);
+            return f(self, m);
+        }
         if self.mems.len() <= 1 {
             let m = self.mems[0];
             return f(self, m);
@@ -166,9 +179,13 @@ impl Lw {
             }
         }
     }
+    /// The program may address several memory windows (root UAVs or the descriptor heap).
+    pub fn multi_window(&self) -> bool {
+        self.mems.len() > 1 || self.heap_mems.is_some()
+    }
     /// `xcl_w = hi & 3` (several memory windows only).
     pub fn window(&mut self, hi: Value) {
-        if self.mems.len() > 1 {
+        if self.multi_window() {
             let v = self.andc(hi, 3);
             self.wr(super::lower::VAR_WIN, v);
         }
@@ -1278,7 +1295,7 @@ impl Lw {
 
     /// `flat_window`: the window of a FLAT / global address (SADDR pair or the 64-bit VGPR address).
     fn flat_window(&mut self, d: &Decoded) {
-        if self.mems.len() > 1 {
+        if self.multi_window() {
             let global = d.enc.name == "ENC_FLAT_GLBL";
             let saddr = Self::fv(d, "SADDR");
             let hi = if global && saddr != 0x7D && saddr != 0x7F { self.sreg(saddr + 1) } else { self.vreg(Self::fv(d, "ADDR") + 1) };
