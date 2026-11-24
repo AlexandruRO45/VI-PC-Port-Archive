@@ -658,6 +658,22 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        let dst_sub = if let Some(hd) = crate::resource::host_copy(dst) {
+            let Some(mapped) = hd.host_subresource(dst_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            dst_sub
+        };
+        let src_sub = if let Some(hs) = crate::resource::host_copy(src) {
+            let Some(mapped) = hs.host_subresource(src_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            src_sub
+        };
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -675,7 +691,15 @@ extern "system" fn resolve(
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let dst_mips = u32::from(a.MipLevels).max(1);
+            let src_mips = u32::from(b.MipLevels).max(1);
+            let dst_mip = dst_sub % dst_mips;
+            let src_mip = src_sub % src_mips;
+            let dst_w = (a.Width >> dst_mip).max(1);
+            let dst_h = (u64::from(a.Height) >> dst_mip).max(1);
+            let src_w = (b.Width >> src_mip).max(1);
+            let src_h = (u64::from(b.Height) >> src_mip).max(1);
+            if (dst_w, dst_h) == (src_w, src_h) {
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
@@ -683,8 +707,8 @@ extern "system" fn resolve(
                 let rect = RECT {
                     left: 0,
                     top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
+                    right: dst_w.min(src_w) as i32,
+                    bottom: dst_h.min(src_h) as i32,
                 };
                 list1.ResolveSubresourceRegion(
                     to,
