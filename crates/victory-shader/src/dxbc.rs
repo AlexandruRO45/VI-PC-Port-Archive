@@ -567,6 +567,42 @@ mod tests {
     }
 
     #[test]
+    fn overlap_is_checked_against_every_earlier_part() {
+        // The third part pointed back into the first's data: the second
+        // part, between them in the table, does not hide the overlap.
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[(own, &[0; 16]), (own, &[0; 4]), (own, &[0; 4])]);
+        let first = HEADER_SIZE as u32 + 12;
+        // On its header, at the start of its data, and with the third's
+        // header ending exactly where the second part begins.
+        for offset in [first, first + 8, first + 8 + 16 - 8] {
+            let mut bad = bytes.clone();
+            bad[0x28..0x2C].copy_from_slice(&offset.to_le_bytes());
+            // A zero size keeps the third part's range inside the first.
+            let at = offset as usize;
+            bad[at + 4..at + 8].copy_from_slice(&0u32.to_le_bytes());
+            assert_eq!(malformed(&bad), "two parts overlap", "offset {offset:#x}");
+        }
+        assert_eq!(Container::parse(&bytes).unwrap().parts.len(), 3);
+    }
+
+    #[test]
+    fn a_known_part_listed_twice_at_one_offset_is_a_repeat() {
+        // Two table entries naming the same DXIL part read the same bytes
+        // twice; the repeat is named before the overlap it also is.
+        let bytes = build(&[(FourCC::DXIL, &[0; 4]), (FourCC::SFI0, &[0; 4])]);
+        let mut bad = bytes.clone();
+        bad[0x24..0x28].copy_from_slice(&(HEADER_SIZE as u32 + 8).to_le_bytes());
+        assert_eq!(malformed(&bad), "a part listed twice");
+        // A title's own part listed twice at one offset is no repeat, but
+        // still an overlap.
+        let own = FourCC(*b"PRIV");
+        let mut own_bad = build(&[(own, &[0; 4]), (own, &[0; 4])]);
+        own_bad[0x24..0x28].copy_from_slice(&(HEADER_SIZE as u32 + 8).to_le_bytes());
+        assert_eq!(malformed(&own_bad), "two parts overlap");
+    }
+
+    #[test]
     fn fourcc_display_masks_unprintable_bytes() {
         assert_eq!(FourCC::DXIL.to_string(), "DXIL");
         assert_eq!(FourCC(*b"A\0 \xFF").to_string(), "A...");
