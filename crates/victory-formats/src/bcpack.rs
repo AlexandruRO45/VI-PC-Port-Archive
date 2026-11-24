@@ -1745,6 +1745,142 @@ mod tests {
         assert_eq!(out, want.to_le_bytes());
     }
 
+    /// The plain formats' element widths, which bytes of a record each
+    /// residual reads its endpoints and indices from, how BC3 and BC5 stack
+    /// their halves, and `plain` summing residuals onto the dictionary and
+    /// then onto earlier blocks, wrapping at each element's width.
+    #[test]
+    fn plain_widths_residuals_and_stacked_packs() {
+        let ix_of = |w: &Widths| w.ix;
+        let mut want = [0u8; 32];
+        want[..16].fill(2);
+        assert_eq!(
+            (BC1.ep, ix_of(&BC1), BC1.paired),
+            ([5, 6, 5, 5, 6, 5, 0, 0], want, false)
+        );
+        want[..16].fill(3);
+        want[16..].fill(2);
+        assert_eq!(
+            (BC3.ep, ix_of(&BC3), BC3.paired),
+            ([5, 6, 5, 5, 6, 5, 8, 8], want, true)
+        );
+        want[16..].fill(0);
+        assert_eq!(
+            (BC4.ep, ix_of(&BC4), BC4.paired),
+            ([8, 8, 0, 0, 0, 0, 0, 0], want, false)
+        );
+        want.fill(3);
+        assert_eq!(
+            (BC5.ep, ix_of(&BC5), BC5.paired),
+            ([8, 8, 8, 8, 0, 0, 0, 0], want, true)
+        );
+
+        let mut t = Tables::parse(&tables()).unwrap();
+        for (i, r) in t.rank1.iter_mut().enumerate() {
+            *r = i as u8;
+        }
+        for (i, r) in t.rank3c.iter_mut().enumerate() {
+            *r = i as u8;
+        }
+        for (i, r) in t.rank4.iter_mut().enumerate() {
+            *r = i as u8;
+        }
+
+        // BC1: six zigzag endpoints from byte 2, quads from byte 8.
+        let mut s = [0u8; 12];
+        s[2..8].copy_from_slice(&[1, 1, 1, 2, 2, 2]);
+        s[8] = 0b1110_0100;
+        let v = bc1_residual(&t, &s);
+        assert_eq!(v.ep, [31, 63, 31, 1, 1, 1, 0, 0]);
+        assert_eq!(
+            [v.ix[0], v.ix[1], v.ix[4], v.ix[5], v.ix[2]],
+            [0, 1, 2, 3, 0]
+        );
+
+        // BC3: alpha endpoints in bytes 4-5, colour lanes in 14-19 carry each
+        // channel's two endpoints together, alpha pairs from 6, colour quads
+        // from 20.
+        let mut s = [0u8; 24];
+        for (at, k) in [
+            (14, 1),
+            (15, 2),
+            (16, 3),
+            (17, 4),
+            (18, 5),
+            (19, 6),
+            (4, 7),
+            (5, 8),
+        ] {
+            s[at] = 2 * k;
+        }
+        s[6] = 0x21;
+        s[20] = 0b1110_0100;
+        let v = bc3_residual(&t, &s);
+        assert_eq!(v.ep, [1, 3, 5, 2, 4, 6, 7, 8]);
+        assert_eq!(&v.ix[..3], &[1, 2, 0]);
+        assert_eq!([v.ix[16], v.ix[17], v.ix[20], v.ix[21]], [0, 1, 2, 3]);
+
+        // BC4: endpoints in bytes 2-3, pairs from 4.
+        let mut s = [0u8; 12];
+        s[2..5].copy_from_slice(&[3, 4, 0x35]);
+        let v = bc4_residual(&t, &s);
+        assert_eq!(&v.ep[..3], &[0xfe, 2, 0]);
+        assert_eq!(&v.ix[..3], &[5, 3, 0]);
+
+        // BC5: four endpoints from byte 4, sixteen pairs from 8.
+        let mut s = [0u8; 24];
+        s[4..8].copy_from_slice(&[0, 1, 2, 3]);
+        s[8] = 0x17;
+        s[23] = 0x30;
+        let v = bc5_residual(&t, &s);
+        assert_eq!(&v.ep[..5], &[0, 0xff, 1, 0xfe, 0]);
+        assert_eq!((&v.ix[..2], &v.ix[30..]), (&[7, 1][..], &[0, 3][..]));
+
+        // BC3 is a BC4 alpha half (endpoints 6-7, indices 0-15) then a BC1
+        // colour half (indices 16-31); BC5 is two BC4 halves.
+        let mut v = Plain::default();
+        for (k, e) in v.ep.iter_mut().enumerate() {
+            *e = 3 * k as u8 + 1;
+        }
+        for (k, x) in v.ix.iter_mut().enumerate() {
+            *x = (k * 5 % 8) as u8;
+        }
+        let (mut got, mut want) = ([0u8; 16], [0u8; 16]);
+        bc3_pack(&v, &mut got);
+        bc4_alpha(v.ep[6], v.ep[7], &v.ix[..16], &mut want[..8]);
+        bc1_color(&v.ep, &v.ix[16..], &mut want[8..]);
+        assert_eq!(got, want);
+        bc5_pack(&v, &mut got);
+        bc4_alpha(v.ep[0], v.ep[1], &v.ix[..16], &mut want[..8]);
+        bc4_alpha(v.ep[2], v.ep[3], &v.ix[16..], &mut want[8..]);
+        assert_eq!(got, want);
+
+        // Two BC1 records, each referring one back: the first lands on the
+        // dictionary and wraps every endpoint to 0, the second on the first.
+        let dictionary = [Plain {
+            ep: [31, 63, 31, 0, 0, 0, 0, 0],
+            ix: [1; 32],
+        }];
+        let mut records = [[0u8; 12]; 2];
+        records[0][1] = 1;
+        records[0][2..5].copy_from_slice(&[2, 2, 2]);
+        records[1][1] = 1;
+        records[1][2] = 1;
+        records[1][8] = 1;
+        let mut out = [[0u8; 8]; 2];
+        plain(
+            records.iter().map(|r| &r[..]),
+            out.iter_mut().map(|o| &mut o[..]),
+            &dictionary,
+            &BC1,
+            |s| bc1_residual(&t, s),
+            bc1_pack,
+        )
+        .unwrap();
+        assert_eq!(out[0], [0, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa]);
+        assert_eq!(out[1], [0x00, 0xf8, 0, 0, 0xab, 0xaa, 0xaa, 0xaa]);
+    }
+
     /// `quads` writes each 2-bit residual symbol to one 2x2 quad of the 4x4
     /// block, low bits first in the order top-left, top-right, bottom-left,
     /// bottom-right; `pairs` writes a 3-bit residual to each of two raster
