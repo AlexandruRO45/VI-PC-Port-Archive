@@ -50,6 +50,7 @@ ApplicationWindow {
                             radius: 9
                             color: "#282026"
                             border.color: "#4b3039"
+                            border.width: 1
                             Text {
                                 anchors.centerIn: parent
                                 text: "VI"
@@ -124,6 +125,7 @@ ApplicationWindow {
                         radius: 15
                         color: "#191b1e"
                         border.color: "#34373b"
+                        border.width: 1
                         RowLayout {
                             anchors.centerIn: parent
                             spacing: 7
@@ -148,6 +150,7 @@ ApplicationWindow {
                         radius: 17
                         color: "#25272b"
                         border.color: "#45484c"
+                        border.width: 1
                         Text {
                             anchors.centerIn: parent
                             text: "V"
@@ -215,9 +218,10 @@ ApplicationWindow {
                                 id: featureCard
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 374
-                                radius: 14
+                                radius: 12
                                 color: "#17191d"
                                 border.color: "#33363a"
+                                border.width: 1
                                 clip: true
 
                                 RowLayout {
@@ -257,6 +261,7 @@ ApplicationWindow {
                                             radius: 15
                                             color: "#bb101215"
                                             border.color: "#6e74777a"
+                                            border.width: 1
                                             RowLayout {
                                                 anchors.centerIn: parent
                                                 spacing: 7
@@ -313,6 +318,7 @@ ApplicationWindow {
                                                     radius: 13
                                                     color: launcher.gameExists ? "#1c3025" : "#332521"
                                                     border.color: launcher.gameExists ? "#365846" : "#614137"
+                                                    border.width: 1
                                                     Text {
                                                         anchors.centerIn: parent
                                                         text: launcher.gameExists ? "READY" : "SETUP"
@@ -429,9 +435,10 @@ ApplicationWindow {
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    radius: 11
+                                    radius: 12
                                     color: window.surface
                                     border.color: window.edge
+                                    border.width: 1
                                     ColumnLayout {
                                         anchors.fill: parent
                                         anchors.margins: 15
@@ -466,6 +473,7 @@ ApplicationWindow {
                                             radius: 6
                                             color: installMouse.containsMouse ? "#282b30" : "#202328"
                                             border.color: "#373b40"
+                                            border.width: 1
                                             Text {
                                                 anchors.centerIn: parent
                                                 text: launcher.hasGame ? "CHANGE LOCATION" : "SELECT FILES"
@@ -488,9 +496,10 @@ ApplicationWindow {
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    radius: 11
+                                    radius: 12
                                     color: window.surface
                                     border.color: window.edge
+                                    border.width: 1
                                     ColumnLayout {
                                         anchors.fill: parent
                                         anchors.margins: 15
@@ -521,6 +530,7 @@ ApplicationWindow {
                                                     radius: 6
                                                     color: launcher.consoleModel === modelData ? "#3c2730" : "#1d2024"
                                                     border.color: launcher.consoleModel === modelData ? "#81505c" : "#363a3f"
+                                                    border.width: 1
                                                     Text {
                                                         anchors.centerIn: parent
                                                         text: modelData
@@ -541,9 +551,10 @@ ApplicationWindow {
                                 Rectangle {
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
-                                    radius: 11
+                                    radius: 12
                                     color: window.surface
                                     border.color: window.edge
+                                    border.width: 1
                                     ColumnLayout {
                                         anchors.fill: parent
                                         anchors.margins: 15
@@ -571,6 +582,7 @@ ApplicationWindow {
                                             radius: 6
                                             color: activityMouse.containsMouse ? "#282b30" : "#202328"
                                             border.color: "#373b40"
+                                            border.width: 1
                                             Text {
                                                 anchors.centerIn: parent
                                                 text: "VIEW ACTIVITY"
@@ -624,6 +636,7 @@ ApplicationWindow {
                                 radius: 7
                                 color: clearMouse.containsMouse ? "#25282d" : "#191b1f"
                                 border.color: "#383c41"
+                                border.width: 1
                                 Text {
                                     anchors.centerIn: parent
                                     text: "CLEAR HISTORY"
@@ -652,6 +665,7 @@ ApplicationWindow {
                             radius: 12
                             color: window.surface
                             border.color: window.edge
+                            border.width: 1
                             ListView {
                                 id: activityList
                                 anchors.fill: parent
@@ -737,9 +751,10 @@ ApplicationWindow {
                             Rectangle {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 104
-                                radius: 11
+                                radius: 12
                                 color: window.surface
                                 border.color: window.edge
+                                border.width: 1
                                 RowLayout {
                                     anchors.fill: parent
                                     anchors.margins: 18
@@ -770,6 +785,7 @@ ApplicationWindow {
                                             radius: 7
                                             color: launcher.consoleModel === modelData ? "#3c2730" : "#1d2024"
                                             border.color: launcher.consoleModel === modelData ? "#81505c" : "#363a3f"
+                                            border.width: 1
                                             Text {
                                                 anchors.centerIn: parent
                                                 text: modelData
@@ -788,9 +804,10 @@ ApplicationWindow {
                             Rectangle {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 142
-                                radius: 11
+                                radius: 12
                                 color: window.surface
                                 border.color: window.edge
+                                border.width: 1
                                 ColumnLayout {
                                     anchors.fill: parent
                                     anchors.margins: 18
@@ -817,6 +834,7 @@ ApplicationWindow {
                                         radius: 7
                                         color: browseSettingsMouse.containsMouse ? "#282b30" : "#202328"
                                         border.color: "#373b40"
+                                        border.width: 1
                                         Text {
                                             anchors.centerIn: parent
                                             text: launcher.hasGame ? "CHANGE LOCATION" : "LOCATE GTA VI"
@@ -838,9 +856,10 @@ ApplicationWindow {
                             Rectangle {
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: 115
-                                radius: 11
+                                radius: 12
                                 color: window.surface
                                 border.color: window.edge
+                                border.width: 1
                                 ColumnLayout {
                                     anchors.fill: parent
                                     anchors.margins: 18
