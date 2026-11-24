@@ -33,7 +33,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
 
@@ -340,7 +340,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             };
                             // The first half's result is this one's old dst.
                             let interp = halves
-                                .pair(attr, inst.read(Reg::V(d)), inst.read(Reg::V(reg)))
+                                .pair(attr, inst.read(Reg::V(d)), inst.read(Reg::V(reg)), inst)
                                 .map_err(|what| unsupported(at, what))?;
                             io.interps.push((site, interp.with(attribute)));
                         }
@@ -356,7 +356,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1))
+                            .pair(&v.src[0], read(2), read(1), inst)
                             .map_err(|what| unsupported(at, what))?;
                         io.interps.push((site, interp.with(attribute)));
                     }
@@ -481,16 +481,31 @@ struct Halves<'a> {
 }
 
 impl Halves<'_> {
+    /// Copy tracing is limited to the entry EXEC mask. Equal SSA names for
+    /// a loop's EXEC phi need not mean equal masks in different iterations.
+    /// Keeping the entry mask also ensures inactive lanes cannot rejoin
+    /// with the destination's old value after a partial copy.
+    fn entry_exec(&self, inst: &Inst) -> bool {
+        (0..1 + u8::from(self.p.wave64)).all(|half| {
+            let reg = Reg::S(EXEC + half);
+            self.p
+                .inputs
+                .iter()
+                .find(|input| input.0 == reg)
+                .is_some_and(|input| inst.read(reg) == Some(input.1))
+        })
+    }
+
     fn input_of(&self, v: Value) -> Option<Input> {
         self.inputs.iter().find(|i| i.0 == v).map(|i| i.1)
     }
 
     /// A VGPR value's barycentric kind and index, following plain `v_mov_b32`
     /// copies and phis whose incoming values agree.
-    fn barycentric(&self, v: Option<Value>) -> Option<(Barycentric, u8)> {
+    fn barycentric(&self, v: Option<Value>, copied: &mut bool) -> Option<(Barycentric, u8)> {
         let mut seen = Vec::new();
         let mut found = None;
-        self.barycentric_from(v?, &mut seen, &mut found)
+        self.barycentric_from(v?, &mut seen, &mut found, copied)
             .then_some(found)
             .flatten()
     }
@@ -500,6 +515,7 @@ impl Halves<'_> {
         v: Value,
         seen: &mut Vec<Value>,
         found: &mut Option<(Barycentric, u8)>,
+        copied: &mut bool,
     ) -> bool {
         if seen.contains(&v) {
             return true;
@@ -514,11 +530,16 @@ impl Halves<'_> {
             };
         }
         if let Some(&site) = self.defs.get(&v) {
-            let Some(src) = vgpr_copy(&self.p.blocks[site.0].insts[site.1]) else {
+            let inst = &self.p.blocks[site.0].insts[site.1];
+            let Some(src) = vgpr_copy(inst) else {
                 return false;
             };
+            if !self.entry_exec(inst) {
+                return false;
+            }
+            *copied = true;
             seen.push(v);
-            return self.barycentric_from(src, seen, found);
+            return self.barycentric_from(src, seen, found, copied);
         }
         let Some(&(b, i)) = self.phis.get(&v) else {
             return false;
@@ -527,7 +548,7 @@ impl Halves<'_> {
         self.p.blocks[b].phis[i]
             .args
             .iter()
-            .all(|&a| self.barycentric_from(a, seen, found))
+            .all(|&a| self.barycentric_from(a, seen, found, copied))
     }
 
     /// The interpolation whose second half reads the first half's result
@@ -538,17 +559,20 @@ impl Halves<'_> {
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
+        second: &Inst,
     ) -> Result<Pair, &'static str> {
         let mut first = Vec::new();
+        let mut copied = false;
         self.sites(
             acc.ok_or("an interpolation without its first half")?,
             &mut Vec::new(),
             &mut first,
+            &mut copied,
         )?;
         if first.is_empty() {
             return Err("an interpolation without its first half");
         }
-        let Some((kind, 1)) = self.barycentric(j) else {
+        let Some((kind, 1)) = self.barycentric(j, &mut copied) else {
             return Err("an interpolation with computed barycentrics");
         };
         for &(b, i) in &first {
@@ -560,7 +584,7 @@ impl Halves<'_> {
                     ..
                 } if inst.name() == "v_interp_p1_f32" => (*attr, inst.read(Reg::V(*reg))),
                 Fields::Valu(v) if inst.name() == "v_interp_p1ll_f16" => match v.src.get(1) {
-                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(*reg))),
+                    Some(&Operand::Vector { reg, .. }) => (v.src[0], inst.read(Reg::V(reg))),
                     _ => return Err("an interpolation without its first half"),
                 },
                 _ => return Err("an interpolation without its first half"),
@@ -568,9 +592,19 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if self.barycentric(i) != Some((kind, 0)) {
+            if self.barycentric(i, &mut copied) != Some((kind, 0)) {
                 return Err("an interpolation with computed barycentrics");
             }
+        }
+        // A full-mask copy can still carry a partially computed p1 result.
+        // Require both interpolation halves to use the same entry mask too.
+        if copied
+            && (!self.entry_exec(second)
+                || first
+                    .iter()
+                    .any(|&(b, i)| !self.entry_exec(&self.p.blocks[b].insts[i])))
+        {
+            return Err("an interpolation copy with a changed execution mask");
         }
         Ok(Pair {
             barycentric: kind,
@@ -585,14 +619,20 @@ impl Halves<'_> {
         v: Value,
         seen: &mut Vec<Value>,
         out: &mut Vec<Site>,
+        copied: &mut bool,
     ) -> Result<(), &'static str> {
         if seen.contains(&v) {
             return Ok(());
         }
         if let Some(&site) = self.defs.get(&v) {
-            if let Some(src) = vgpr_copy(&self.p.blocks[site.0].insts[site.1]) {
+            let inst = &self.p.blocks[site.0].insts[site.1];
+            if let Some(src) = vgpr_copy(inst) {
+                if !self.entry_exec(inst) {
+                    return Err("an interpolation copy with a changed execution mask");
+                }
+                *copied = true;
                 seen.push(v);
-                return self.sites(src, seen, out);
+                return self.sites(src, seen, out, copied);
             }
             if !out.contains(&site) {
                 out.push(site);
@@ -605,7 +645,7 @@ impl Halves<'_> {
             .ok_or("an interpolation without its first half")?;
         seen.push(v);
         for &a in &self.p.blocks[b].phis[i].args {
-            self.sites(a, seen, out)?;
+            self.sites(a, seen, out, copied)?;
         }
         Ok(())
     }
@@ -829,6 +869,82 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn interpolation_copies_require_the_entry_execution_mask() {
+        for fp16 in [false, true] {
+            let first = if fp16 {
+                vec![0xD742_0002, 0x104 << 9] // v_interp_p1ll_f16 v2, attr0.x, v4
+            } else {
+                vec![0xC808_0004] // v_interp_p1_f32 v2, v4, attr0.x
+            };
+            let second = if fp16 {
+                vec![0xD75A_0003, (0x105 << 9) | (0x103 << 18)] // p2 v3, attr0.x, v5, v3
+            } else {
+                vec![0xC80D_0005] // v_interp_p2_f32 v3, v5, attr0.x
+            };
+            let instructions = [
+                vec![0x7E08_0300], // v_mov_b32 v4, v0 (i)
+                vec![0x7E0A_0301], // v_mov_b32 v5, v1 (j)
+                first,
+                vec![0x7E06_0302], // v_mov_b32 v3, v2 (acc)
+                second,
+                vec![S_ENDPGM],
+            ];
+            for wave64 in [false, true] {
+                let mut native = pixel(vec![PsInput { fp16, ..TEXCOORD }], 2);
+                native.wave64 = wave64;
+                let build = |words: &[u32]| {
+                    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    crate::ir::build(&code, wave64, 256).unwrap()
+                };
+                let words: Vec<u32> = instructions.iter().flatten().copied().collect();
+                assert_eq!(raise(&build(&words), &native).unwrap().interps.len(), 1);
+
+                // Independently mask i, j, p1, acc, or p2. Inactive lanes
+                // retain old values; restoring EXEC must not hide that.
+                for half in 0..=u32::from(wave64) {
+                    let narrow = 0xBEFE_0380 | (half << 16); // s_mov_b32 exec_{lo,hi}, 0
+                    let restore = 0xBEFE_03C1 | (half << 16); // s_mov_b32 exec_{lo,hi}, -1
+                    for masked in 0..5 {
+                        let mut changed = Vec::new();
+                        for (i, words) in instructions.iter().enumerate() {
+                            if i == masked {
+                                changed.push(narrow);
+                            }
+                            changed.extend(words);
+                            if i == masked {
+                                changed.push(restore);
+                            }
+                        }
+                        assert!(
+                            matches!(
+                                raise(&build(&changed), &native),
+                                Err(ShaderError::Unsupported { .. })
+                            ),
+                            "fp16={fp16}, wave64={wave64}, half={half}, masked={masked}"
+                        );
+                    }
+                }
+
+                // Even matching mask SSA names are not enough if they are
+                // not the entry mask (a loop phi can vary per iteration).
+                let mut changed = vec![0xBEFE_0381]; // s_mov_b32 exec_lo, 1
+                changed.extend(&words);
+                assert!(matches!(
+                    raise(&build(&changed), &native),
+                    Err(ShaderError::Unsupported { .. })
+                ));
+
+                if !wave64 {
+                    // EXEC_HI does not control any lane in a wave32 program.
+                    let mut changed = vec![0xBEFF_0380];
+                    changed.extend(&words);
+                    assert_eq!(raise(&build(&changed), &native).unwrap().interps.len(), 1);
+                }
+            }
+        }
     }
 
     #[test]
