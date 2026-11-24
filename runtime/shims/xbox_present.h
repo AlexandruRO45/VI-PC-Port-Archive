@@ -12,18 +12,20 @@
 //   - XCL (GPL-2.0-only, facts only) measured the frame calls on device slots 78-81 and PresentX on queue slot 30
 //     (older runtime layout: XDefiant, Minecraft, Fortnite) or 32 (newer: Unicorn Overlord).
 // WHAT IS OURS: the constant values, the HRESULT choices and the ScaleFilter/plane-flag values; the real enum
-// values are still unmeasured. The SuspendX/ResumeX slots are not in any public source.
+// values are still unmeasured. The SuspendX/ResumeX slots are not in public documentation; they were measured
+// locally on the retail 1.0.2.1 executable via Capstone disassembly of ID3D12Device/ID3D12CommandQueue call sites
+// (e.g. SetFrameIntervalX +0x270 at RVA 0x1ea6e7, SuspendX +0x0b8 at 0x31b17, ResumeX +0x0c0 at 0x3299b,
+// PresentX +0x100 at 0x28751).
 //
-// Slots (0-based, QueryInterface = 0) before the proxy can forward:
+// Measured 0-based slots (QueryInterface = 0) on retail 1.0.2.1:
 //   ID3D12Device (Xbox):        SetFrameIntervalX   (output, interval, latency, flags)                    78 (0x270)
 //                               ScheduleFrameEventX (event, offset, reserved pointer, flags)              79 (0x278)
 //                               WaitFrameEventX     (event, timeout ms, reserved pointer, flags, &token)   80 (0x280)
 //                               GetFrameStatisticsX (token, type mask, &count, array)                     81 (0x288)
 //   ID3D12CommandQueue (Xbox):  SuspendX (flags)                                                        23 (0x0b8)
 //                               ResumeX ()                                                              24 (0x0c0)
-//                               PresentX (plane count, planes, params)                                    30 (older) / 32 (newer; measured 32 at 0x100)
-// The public numbers are measurements of other titles' runtimes, not of this game. The runtime version moves
-// PresentX, so neither value may be assumed; trace the game's slots.
+//                               PresentX (plane count, planes, params)                                    32 (0x100; older GDKX runtimes used 30)
+// Note: other GDKX runtime versions may place PresentX at slot 30 instead of 32, so the proxy allows env overrides.
 // The queue-side calls do not look at the queue: the Vulkan device has one VkQueue behind every D3D12 queue, and
 // the present is submitted after the work already executed on it.
 

@@ -405,9 +405,8 @@ blocks the import-driven work:
   measured: the FSR DLL's calls confirm device slots 14, 15, 16, 18, 19, 27, 38, 62 and 76, slot 67 is a
   console-only pipeline call, and the rest is open (`docs/d3d12_vulkan.md`, question 2).
 - The command-queue and fence extensions: the proxies forward the public slots, and the console's own methods past
-  them (`PresentX`, `SuspendX`, `ResumeX`) have unknown slots, so they are refused with a log.
-  `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`) but
-  nothing reaches them yet: their queue and device slots are unmeasured.
+  them are measured on retail 1.0.2.1 (`SuspendX` slot 23, `ResumeX` slot 24, `PresentX` slot 32; device frame-event
+  slots 78–81). `PresentX` and the frame events themselves are implemented (`shims/xbox_present.*`, `xbox_present_test`).
 - Most of the `xgameruntime` surface: an offline shim covers `XGameRuntimeInitialize`, device/console queries,
   `XTaskQueue` and `XAsync`, and `QueryApiImpl` serves `XThreadingImpl`, `XErrorImpl`, `XNetworkingImpl`,
   `XPersistentLocalStorageImpl` and `XSystemImpl` (see `xgameruntime_test`); any other class is refused with a log.

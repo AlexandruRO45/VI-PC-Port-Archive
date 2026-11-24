@@ -675,8 +675,8 @@ extensions. The parts relevant to this page:
 | `PresentX` is an `ID3D12CommandQueue` method | **Prior art** | Class-attributed by a UMD validation message and by 367 call sites in the console SDK samples ([`d3d12-xs-wrapper.md:69-97`](https://github.com/p-portela/SCARAB/blob/d304fa2/docs/d3d12-xs-wrapper.md)). |
 | `PresentX` carries at most 2 planes and 8 views per plane | **Prior art** | `D3D12CONS_PRESENT_PLANES_MAX = 2`, `D3D12CONS_PRESENT_VIEWS_MAX = 8`; the UMD message names `pPlaneParameters[%d].ResourceCount <= 2`. |
 | Present flags `NONE`, `IMMEDIATE`, `PERSIST`, `UNIQUE_VIEW_RESOURCES` exist | **Prior art** | Names are recovered; the numeric values are **not** measured. `console_extensions.h` assigns `0x1/0x2/0x4` while `present_adapter.h` says the values are unknown and uses zero; the two contradict each other ([`d3d12_xs_surface.md §7`](d3d12_xs_surface.md)). |
-| `PresentX` signature and slot | **Open** | No signature, slot or call sequence is recovered. |
-| `SuspendX` / `ResumeX` are queue methods | **Prior art** | 122 sample call sites each; no signature or slot. |
+| `PresentX` signature and slot | **Measured (1.0.2.1)** | Queue slot `32` (`+0x100`, e.g. RVA `0x28751`); plane/params layouts match public GDKX structs (`0x48` / `0x20` bytes). |
+| `SuspendX` / `ResumeX` are queue methods | **Measured (1.0.2.1)** | 122 sample call sites each; measured on retail 1.0.2.1 at queue slots `23` (`+0x0b8`, e.g. `0x31b17`) and `24` (`+0x0c0`, e.g. `0x3299b`). |
 | `CreateCommandQueueX` is a device method | **Prior art** | UMD message ties it to `ID3D12Device`; the inferred shape is `(pDesc, pShaderQueueParams, riid, out)`; the UMD says a shader-based queue supports only `D3D12_COMMAND_LIST_TYPE_COMPUTE`; SCARAB returns `E_NOTIMPL`. Slot and parameter layout are **Open**. |
 | `ID3D12ConsDmaCommandList` IID `30bc77b9-8379-4b25-95de-b8588c42275d` | **Prior art** | Exported at ordinal 100; the DMA list rule is quoted from the UMD. `D3D12CONS_COMMAND_LIST_TYPE_DMA = 6` is **Derived** by appending to the PC enum, not measured. |
 | Command-list extension order | **Assumed** | SCARAB's own header says the order within the appended block is not recovered; every appended slot logs its name and raw arguments ([`console_extensions.h:13-31`](https://github.com/p-portela/SCARAB/blob/d304fa2/components/extension-wrapper/console_extensions.h)). Do not copy it. |
@@ -829,9 +829,9 @@ command object.
 
 | Item | Why it is blocked |
 |---|---|
-| `PresentX` | No slot, signature, plane struct or swapchain/plane parameters. Prior art gives only names, the 2-plane/8-view limits and four flag names. |
+| `PresentX` | Slot `32` (`+0x100`) measured on 1.0.2.1; enum values (`ScaleFilter`, plane `Flags`) remain unmeasured. |
 | `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. |
-| `SuspendX` / `ResumeX` | No slot or signature. |
+| `SuspendX` / `ResumeX` | Slots `23` (`+0x0b8`) and `24` (`+0x0c0`) measured on 1.0.2.1; exact `SuspendX` flags remain unmeasured. |
 | Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
 | Builder's list field `+0x350` | Read once (`0x1d877`) and not explained by the inline buffer of section 3.5a, which covers `+0x18`, `+0x28`, `+0x30`, `+0x140`, `+0x141`, `+0x344` and `+0x544`. |
 | DMA list use/value | The IID is prior art; type 6 is derived; no shipped module uses it, and no module can name any GUID at a call site beyond its known ten or holds a static queue description with a non-PC type (§3.2a). |
