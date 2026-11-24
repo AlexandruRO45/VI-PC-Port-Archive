@@ -5,7 +5,7 @@
 //! in the cache, or it is made lazily); a pipeline's first build is marked as used, which the
 //! tool compiles first. `XCL_PSO_JOURNAL=0`: off.
 //!
-//! Append-only frames, little-endian: tag u8, memory windows u8, 0 u16, payload length u32,
+//! Append-only frames, little-endian: tag u8, memory windows u8 (`windows_byte`), 0 u16, payload length u32,
 //! hash u64, payload. Tags: `S` a shader (its bytes; hash = fnv64 of them), `G` a graphics
 //! pipeline, `C` a compute one, `U` (no payload) pipeline `hash` was built. A pipeline's
 //! payload names its shaders by hash; each shader is written once, before the first pipeline
@@ -213,9 +213,21 @@ fn put_shader(j: &mut Journal, out: &mut Vec<u8>, sh: Option<&[u8]>) -> std::io:
     Ok(())
 }
 
+/// `pso::mem_windows` in a frame's byte: the count in the low 7 bits, `HEAP_WINDOWS` in the top
+/// bit (the shaders take the windows from the descriptor heap: other HLSL than the switch form).
+pub fn windows_byte(mem_windows: u32) -> u8 {
+    (mem_windows & 0x7F) as u8 | if mem_windows & crate::gpu::recomp::HEAP_WINDOWS != 0 { 0x80 } else { 0 }
+}
+
+/// A frame's memory windows as `pso::mem_windows` had them (`windows_byte`).
+pub fn mem_windows_of(byte: u8) -> u32 {
+    (byte & 0x7F) as u32 | if byte & 0x80 != 0 { crate::gpu::recomp::HEAP_WINDOWS } else { 0 }
+}
+
 fn finish(j: &mut Journal, tag: u8, mut payload: Vec<u8>) -> std::io::Result<u64> {
-    // the memory windows are part of what the pipeline is (its HLSL differs with them)
-    let windows = crate::gpu::recomp::pso::mem_windows() as u8;
+    // the memory windows are part of what the pipeline is (its HLSL differs with them, and with
+    // heap windows)
+    let windows = windows_byte(crate::gpu::recomp::pso::mem_windows());
     payload.push(windows);
     let hash = crate::gpu::shader::fnv64(&payload);
     payload.pop();
@@ -387,6 +399,15 @@ pub fn replay(f: &Frame, shader: impl Fn(u64) -> Option<Vec<u8>>) -> Option<Repl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_heap_windows_flag_is_kept() {
+        let heap = crate::gpu::recomp::HEAP_WINDOWS;
+        for w in [1, 4, 4 | heap, 16 | heap] {
+            assert_eq!(mem_windows_of(windows_byte(w)), w);
+        }
+        assert_ne!(windows_byte(4), windows_byte(4 | heap));
+    }
 
     #[test]
     fn graphics_round_trip() {
