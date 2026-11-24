@@ -3650,46 +3650,79 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
-    let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
-    copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    copy.CS = bytecode(&dxil);
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    let flags = d.Flags.0;
+    let rs_raw = rs as usize;
+    let run_pso = |cached_blob: Option<&[u8]>| -> HRESULT {
+        let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
+        copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        copy.CS = bytecode(&dxil);
+        copy.CachedPSO = match cached_blob {
+            Some(b) => D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() },
+            None => D3D12_CACHED_PIPELINE_STATE::default(),
+        };
+        finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
+    };
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
-    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
-    let mut cached = compute_blob(key);
+    let key = compute_blob_key(&dxil, rs_raw, flags);
     // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
-    let disk = driver_cache::path(&dxil, copy.Flags.0);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
-    if let Some(b) = &cached {
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
-    }
-    // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
-    let _slot = (big && cached.is_none() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")))
-        .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, super::pso_async::build_is_wanted));
-    let started = std::time::Instant::now();
-    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    if hr < 0 && cached.is_some() {
-        // a blob the driver does not take (another root signature at the same address…): compiled
-        forget_compute_blob(key);
-        if from_disk {
-            driver_cache::note(false, disk.as_deref());
+    let disk = driver_cache::path(&dxil, flags);
+    let lookup = || -> Option<(std::sync::Arc<Vec<u8>>, bool)> {
+        if let Some(b) = compute_blob(key) {
+            return Some((b, false));
         }
-        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
-    }
-    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
-    if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, started.elapsed());
-        }
-    } else if reused && from_disk {
-        driver_cache::note(true, None);
-    }
+        disk.as_deref().and_then(driver_cache::load).map(|b| (std::sync::Arc::new(b), true))
+    };
+    let is_bg_pso_worker = std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let caller_wanted = super::pso_async::build_is_wanted() || !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-"));
+    let Ok((hr, took, reused)) = coalesce_compute_build(
+        compute_flights(),
+        key,
+        caller_wanted,
+        lookup,
+        |flight| -> Result<(HRESULT, std::time::Duration, bool), ()> {
+            // in the background, one at a time and within the commit left (each ~1.5 GB in the driver)
+            let _slot = (big && is_bg_pso_worker)
+                .then(|| big_compile_turn(&BIG_COMPILES, big_compile_commit_free, || super::pso_async::build_is_wanted() || flight.is_wanted()));
+            let started = std::time::Instant::now();
+            let hr = run_pso(None);
+            let took = started.elapsed();
+            if hr >= 0 {
+                keep_compute_blob(key, *ppv, dxil.len(), took);
+                if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+                    driver_cache::keep(p, &b, took);
+                }
+            }
+            Ok((hr, took, false))
+        },
+        |(b, from_disk)| -> Result<(HRESULT, std::time::Duration, bool), ()> {
+            let started = std::time::Instant::now();
+            let mut hr = run_pso(Some(&b));
+            if hr < 0 {
+                // a blob the driver does not take (another root signature at the same address…): compiled
+                forget_compute_blob(key);
+                if from_disk {
+                    driver_cache::note(false, disk.as_deref());
+                }
+                let retry_started = std::time::Instant::now();
+                hr = run_pso(None);
+                let took = retry_started.elapsed();
+                if hr >= 0 {
+                    keep_compute_blob(key, *ppv, dxil.len(), took);
+                    if let (Some(p), Some(blob)) = (disk.as_deref(), compute_blob(key)) {
+                        driver_cache::keep(p, &blob, took);
+                    }
+                }
+                return Ok((hr, took, false));
+            }
+            if from_disk {
+                driver_cache::note(true, None);
+            }
+            Ok((hr, started.elapsed(), true))
+        },
+    ) else {
+        return Some(Err(()));
+    };
     if hr < 0 {
         note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
         return Some(Err(()));
@@ -3703,7 +3736,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
         dxil.len(),
-        started.elapsed().as_millis(),
+        took.as_millis(),
         if reused { ", the driver's blob of an earlier build" } else { "" }
     );
     Some(Ok(hr))
@@ -3724,7 +3757,7 @@ pub(crate) mod driver_cache {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
-    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    pub(super) const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
@@ -3888,8 +3921,73 @@ pub(crate) mod driver_cache {
 /// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
 static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
 const COMPUTE_BLOBS_MAX: usize = 512 << 20;
-/// smaller programs compile in milliseconds: not kept
+/// smaller programs compile in milliseconds: not kept unless the build itself was slow (`driver_cache::KEEP`)
 const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
+
+/// Per-key in-flight state for cold driver compute PSO compilation so duplicate keys wait on
+/// the leader's driver blob instead of compiling concurrently, while distinct keys run in parallel.
+#[derive(Default)]
+struct ComputeFlight {
+    mu: Mutex<()>,
+    wanted: AtomicUsize,
+}
+
+impl ComputeFlight {
+    fn is_wanted(&self) -> bool {
+        self.wanted.load(Ordering::Acquire) > 0
+    }
+}
+
+struct FlightWantedGuard<'a>(&'a ComputeFlight);
+
+impl Drop for FlightWantedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.wanted.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn compute_flights() -> &'static Mutex<HashMap<(u64, usize, i32), std::sync::Weak<ComputeFlight>>> {
+    static FLIGHTS: OnceLock<Mutex<HashMap<(u64, usize, i32), std::sync::Weak<ComputeFlight>>>> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn compute_pso_flight(
+    flights: &Mutex<HashMap<(u64, usize, i32), std::sync::Weak<ComputeFlight>>>,
+    key: (u64, usize, i32),
+) -> std::sync::Arc<ComputeFlight> {
+    let mut g = flights.lock().unwrap();
+    g.retain(|_, v| v.strong_count() != 0);
+    if let Some(flight) = g.get(&key).and_then(std::sync::Weak::upgrade) {
+        return flight;
+    }
+    let flight = std::sync::Arc::new(ComputeFlight::default());
+    g.insert(key, std::sync::Arc::downgrade(&flight));
+    flight
+}
+
+fn coalesce_compute_build<B, R, E>(
+    flights: &Mutex<HashMap<(u64, usize, i32), std::sync::Weak<ComputeFlight>>>,
+    key: (u64, usize, i32),
+    caller_wanted: bool,
+    mut lookup: impl FnMut() -> Option<B>,
+    build_cold: impl FnOnce(&ComputeFlight) -> Result<R, E>,
+    build_cached: impl FnOnce(B) -> Result<R, E>,
+) -> Result<R, E> {
+    if let Some(b) = lookup() {
+        return build_cached(b);
+    }
+    let flight = compute_pso_flight(flights, key);
+    let _wanted_guard = caller_wanted.then(|| {
+        flight.wanted.fetch_add(1, Ordering::AcqRel);
+        FlightWantedGuard(&flight)
+    });
+    let guard = flight.mu.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = lookup() {
+        drop(guard);
+        return build_cached(b);
+    }
+    build_cold(&flight)
+}
 
 fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
     use std::hash::{Hash, Hasher};
@@ -3934,11 +4032,140 @@ mod compute_blob_tests {
         assert!(super::compute_blob(key).is_none());
         assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
     }
+
+    #[test]
+    fn concurrent_cold_compute_builds_coalesce_same_key_and_parallelize_different_keys() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Barrier, Mutex};
+        use std::time::Duration;
+
+        let flights = Mutex::new(HashMap::new());
+        let blobs: Mutex<HashMap<(u64, usize, i32), Vec<u8>>> = Mutex::new(HashMap::new());
+        let cold_calls = AtomicUsize::new(0);
+        let cached_calls = AtomicUsize::new(0);
+        let same_key = (0x1111u64, 0x2000usize, 0i32);
+
+        // Four concurrent callers for the same cold key: only one cold compile runs;
+        // the remaining three pick up the leader's cached blob.
+        let start_same = Barrier::new(4);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    start_same.wait();
+                    let res = super::coalesce_compute_build(
+                        &flights,
+                        same_key,
+                        false,
+                        || blobs.lock().unwrap().get(&same_key).cloned(),
+                        |_| -> Result<u32, ()> {
+                            cold_calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            blobs.lock().unwrap().insert(same_key, vec![9, 9, 9]);
+                            Ok(1)
+                        },
+                        |b| -> Result<u32, ()> {
+                            assert_eq!(b, vec![9, 9, 9]);
+                            cached_calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(2)
+                        },
+                    );
+                    assert!(res.is_ok());
+                });
+            }
+        });
+        assert_eq!(cold_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cached_calls.load(Ordering::SeqCst), 3);
+
+        // Two distinct cold keys must proceed in parallel (rendezvous barrier would deadlock otherwise).
+        let parallel = Barrier::new(2);
+        let k1 = (0xAAAAu64, 0x2000usize, 0i32);
+        let k2 = (0xBBBBu64, 0x2000usize, 0i32);
+        std::thread::scope(|s| {
+            let t1 = s.spawn(|| {
+                super::coalesce_compute_build(
+                    &flights,
+                    k1,
+                    false,
+                    || Option::<Vec<u8>>::None,
+                    |_| -> Result<u32, ()> {
+                        parallel.wait();
+                        Ok(11)
+                    },
+                    |_| Ok(0),
+                )
+            });
+            let t2 = s.spawn(|| {
+                super::coalesce_compute_build(
+                    &flights,
+                    k2,
+                    false,
+                    || Option::<Vec<u8>>::None,
+                    |_| -> Result<u32, ()> {
+                        parallel.wait();
+                        Ok(22)
+                    },
+                    |_| Ok(0),
+                )
+            });
+            assert_eq!(t1.join().unwrap(), Ok(11));
+            assert_eq!(t2.join().unwrap(), Ok(22));
+        });
+    }
+
+    #[test]
+    fn compute_flight_propagates_wanted_to_leader() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let flights = Mutex::new(HashMap::new());
+        let key = (0xCCCCu64, 0x3000usize, 0i32);
+        let (started_tx, started_rx) = mpsc::channel();
+        let leader_done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let leader = s.spawn(|| {
+                super::coalesce_compute_build(
+                    &flights,
+                    key,
+                    false,
+                    || Option::<Vec<u8>>::None,
+                    |flight| -> Result<bool, ()> {
+                        assert!(!flight.is_wanted());
+                        started_tx.send(()).unwrap();
+                        let t0 = Instant::now();
+                        while !flight.is_wanted() && t0.elapsed() < Duration::from_secs(5) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        let saw_wanted = flight.is_wanted();
+                        leader_done.store(true, Ordering::Release);
+                        Ok(saw_wanted)
+                    },
+                    |_| Ok(false),
+                )
+            });
+            started_rx.recv().unwrap();
+            let follower = s.spawn(|| {
+                super::coalesce_compute_build(
+                    &flights,
+                    key,
+                    true,
+                    || leader_done.load(Ordering::Acquire).then(|| vec![1]),
+                    |_| -> Result<bool, ()> { Ok(false) },
+                    |_| Ok(true),
+                )
+            });
+            assert_eq!(leader.join().unwrap(), Ok(true));
+            assert_eq!(follower.join().unwrap(), Ok(true));
+        });
+    }
 }
 
 /// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize, took: std::time::Duration) {
+    if (dxil_len < COMPUTE_BLOB_MIN_DXIL && took < driver_cache::KEEP) || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
         return;
     }
     type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
