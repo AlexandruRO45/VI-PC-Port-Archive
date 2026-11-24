@@ -456,4 +456,83 @@ mod tests {
             &LLVM_BITCODE_MAGIC
         );
     }
+
+    /// A part too short for the version or the size word is truncated, not
+    /// misread as a size: the header is read before anything is checked.
+    #[test]
+    fn a_part_shorter_than_the_first_two_words_is_truncated() {
+        for len in 0..8 {
+            assert_eq!(malformed(&vec![0x60; len]), "truncated", "{len} bytes");
+        }
+        // Eight bytes reach the size word, which 24 bytes cannot satisfy.
+        assert_eq!(malformed(&[0; 8]), "program size disagrees with part size");
+    }
+
+    /// With every field wrong at once, the checks report in header order:
+    /// size, shader model, magic, DXIL version, bitcode bounds, LLVM magic,
+    /// bitcode length, then the offset floor. Fixing each in turn exposes
+    /// the next.
+    #[test]
+    fn header_checks_report_in_field_order() {
+        let bitcode = fake_bitcode();
+        let good = build_standard(0, (6, 0), 0x100, &bitcode);
+        let mut bytes = good.clone();
+        set_u32(&mut bytes, 4, 1); // size
+        set_u32(&mut bytes, 0, 0x50); // shader model 5.0
+        bytes[8..12].copy_from_slice(b"DXBC");
+        set_u32(&mut bytes, 12, 0x0FF); // DXIL 0.255
+        set_u32(&mut bytes, 16, 0x1000); // bitcode past the program
+
+        assert_eq!(malformed(&bytes), "program size disagrees with part size");
+        bytes[4..8].copy_from_slice(&good[4..8]);
+        assert_eq!(malformed(&bytes), "DXIL program below shader model 6");
+        bytes[0..4].copy_from_slice(&good[0..4]);
+        assert_eq!(malformed(&bytes), "missing DXIL magic");
+        bytes[8..12].copy_from_slice(b"DXIL");
+        assert_eq!(malformed(&bytes), "DXIL version below 1.0");
+        bytes[12..16].copy_from_slice(&good[12..16]);
+        assert_eq!(malformed(&bytes), "bitcode out of bounds");
+
+        // Back in bounds, but on zeroed bytes and with a ragged length:
+        // the magic is checked before the length.
+        set_u32(&mut bytes, 16, 16);
+        set_u32(&mut bytes, 20, bitcode.len() as u32 - 1);
+        bytes[24..28].fill(0);
+        assert_eq!(malformed(&bytes), "bitcode lacks LLVM magic");
+        bytes[24..28].copy_from_slice(&LLVM_BITCODE_MAGIC);
+        assert_eq!(malformed(&bytes), "bitcode size not a multiple of 4");
+        set_u32(&mut bytes, 20, bitcode.len() as u32);
+        assert_eq!(bytes, good);
+        assert!(DxilProgram::parse(&bytes).is_ok());
+    }
+
+    /// The bitcode is a window into the program, not a copy, and the
+    /// prefix, bitcode and trailer tile the program after its header.
+    #[test]
+    fn prefix_bitcode_and_trailer_tile_the_program() {
+        let bytes = around(b"XDAT\x01\0\0\0", b"\0\0\0\0xbop\0\0\0\0");
+        let p = DxilProgram::parse(&bytes).unwrap();
+        let tiled = [p.prefix, p.bitcode, p.trailer].concat();
+        assert_eq!(tiled, &bytes[24..]);
+        assert!(std::ptr::eq(p.bitcode.as_ptr(), bytes[32..].as_ptr()));
+        assert_eq!(p.bitcode.len(), 16);
+    }
+
+    /// `xbop` split across the bitcode's end and the trailer's start is in
+    /// neither, so it is not found: only the trailer is searched.
+    #[test]
+    fn xbop_straddling_the_bitcode_end_is_not_found() {
+        let mut bitcode = LLVM_BITCODE_MAGIC.to_vec();
+        bitcode.extend_from_slice(b"\0\0xb");
+        let trailer = b"op\0\0";
+        let size = 24 + bitcode.len() + trailer.len();
+        let mut bytes = build_standard(5, (6, 5), 0x105, &bitcode);
+        bytes.extend_from_slice(trailer);
+        set_u32(&mut bytes, 4, (size / 4) as u32);
+        let p = DxilProgram::parse(&bytes).unwrap();
+        assert_eq!(p.trailer, trailer);
+        assert!(bytes.windows(4).any(|w| w == b"xbop"));
+        assert_eq!(p.xbox_extras(), XboxExtras::default());
+        assert!(!p.is_standard_layout());
+    }
 }
