@@ -47,7 +47,7 @@ fn copies_back_what_changed_in_declared_ranges() {
     const LEN: usize = 8 * PAGE;
     let mut title = vec![0x11u8; LEN + PAGE];
     let start = (title.as_mut_ptr() as usize).next_multiple_of(PAGE);
-    let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(LEN as u64)) else {
+    let Some((buffer, data)) = crate::host::test_gpu().and_then(|h| h.shared_buffer(LEN as u64)) else {
         return; // no host GPU here
     };
     // SAFETY: a live buffer.
@@ -86,7 +86,8 @@ fn copies_back_what_changed_in_declared_ranges() {
 
 /// Two pages of title memory and a copy of it.
 fn copy_of(title: &[u8]) -> Option<Shadow> {
-    let (buffer, data) = host()?.shared_buffer(title.len() as u64)?;
+    // Says so when there is no device, so a skip is not mistaken for a pass.
+    let (buffer, data) = crate::host::test_gpu()?.shared_buffer(title.len() as u64)?;
     Some(Shadow::new(
         buffer,
         data,
