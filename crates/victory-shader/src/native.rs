@@ -2126,6 +2126,94 @@ mod tests {
     }
 
     #[test]
+    fn an_index_without_its_exact_magic_is_the_pc_layout() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let good = part(&[(KIND_NATIVE, &native)]);
+        assert_eq!(native_programs(&good).unwrap().len(), 1);
+        // Any other four bytes where the magic belongs, even the same letters
+        // in another case, mean the part holds no native programs.
+        for magic in [b"xdat", b"XDAX", b"TADX"] {
+            let mut data = good.clone();
+            data[XDAT_OFFSET..][..4].copy_from_slice(magic);
+            assert!(native_programs(&data).unwrap().is_empty(), "{magic:?}");
+        }
+        // A part ending before or inside the magic has none either.
+        for len in [0, XDAT_OFFSET, XDAT_OFFSET + 3] {
+            assert!(native_programs(&good[..len]).unwrap().is_empty(), "{len}");
+        }
+        // The magic alone, with no count after it, is cut short.
+        assert_eq!(refused(&good[..XDAT_OFFSET + 4]), "truncated");
+    }
+
+    #[test]
+    fn a_native_entry_is_read_exactly_within_its_bounds() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        // The entry's offset and size fields.
+        let offset_at = XDAT_OFFSET + 12 + 4;
+        let size_at = offset_at + 4;
+        let entry = |data: &mut Vec<u8>, offset: u32, size: u32| {
+            data[offset_at..][..4].copy_from_slice(&offset.to_le_bytes());
+            data[size_at..][..4].copy_from_slice(&size.to_le_bytes());
+        };
+
+        // A blob ending the part exactly is read; bytes after it are ignored.
+        let data = part(&[(KIND_NATIVE, &native)]);
+        assert_eq!(native_programs(&data).unwrap().len(), 1);
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0xAB; 7]);
+        assert_eq!(native_programs(&padded).unwrap().len(), 1);
+
+        // One byte past the part, by size or by offset, is out of bounds.
+        let start = (data.len() - native.len()) as u32;
+        let mut over = data.clone();
+        entry(&mut over, start, native.len() as u32 + 1);
+        assert_eq!(refused(&over), "XDAT entry out of bounds");
+        let mut over = data.clone();
+        entry(&mut over, start + 1, native.len() as u32);
+        assert_eq!(refused(&over), "XDAT entry out of bounds");
+        // Both fields at their largest do not wrap round into the part.
+        let mut over = data.clone();
+        entry(&mut over, u32::MAX, u32::MAX);
+        assert_eq!(refused(&over), "XDAT entry out of bounds");
+
+        // A blob one byte short is read as far as it goes, and refused there.
+        let mut short = data.clone();
+        entry(&mut short, start, native.len() as u32 - 1);
+        assert_eq!(refused(&short), "XBCH stream out of bounds");
+        // An empty native entry, wherever it points, has no XBCH magic.
+        for offset in [0, start, data.len() as u32] {
+            let mut empty = data.clone();
+            entry(&mut empty, offset, 0);
+            assert_eq!(refused(&empty), "native blob lacks XBCH magic", "{offset}");
+        }
+        // One pointing at the index itself is read as a blob like any other.
+        let mut index = data.clone();
+        entry(&mut index, XDAT_OFFSET as u32, 16);
+        assert_eq!(refused(&index), "native blob lacks XBCH magic");
+    }
+
+    #[test]
+    fn a_native_entry_cut_inside_the_index_is_truncated() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        let data = part(&[(KIND_NATIVE, &native)]);
+        // Cut inside the entry's kind, offset or size field.
+        for cut in [2, 6, 10] {
+            assert_eq!(
+                refused(&data[..XDAT_OFFSET + 12 + cut]),
+                "truncated",
+                "{cut}"
+            );
+        }
+        // The third index word is not read: any value leaves the entries as
+        // they were.
+        for word in [0, 0x0c, u32::MAX] {
+            let mut data = data.clone();
+            data[XDAT_OFFSET + 8..][..4].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(native_programs(&data).unwrap().len(), 1, "{word:#x}");
+        }
+    }
+
+    #[test]
     fn names_each_xbch_refusal() {
         let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
         let with = |at: usize, value: &[u8]| {
