@@ -104,8 +104,14 @@ pub fn open(at: usize, len: usize) {
         return;
     };
     let end = (at.saturating_add(len)).div_ceil(BLOCK).min(WORDS * 64);
-    for block in at / BLOCK..end {
+    let mut block = at / BLOCK;
+    while block < end {
+        if block.is_multiple_of(64) && bits[block / 64].load(Ordering::Relaxed) == 0 {
+            block += 64; // nothing guarded in this word (releases of big reservations)
+            continue;
+        }
         open_block(bits, block);
+        block += 1;
     }
 }
 

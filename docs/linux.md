@@ -103,8 +103,19 @@ translator stay shared.
   (DXIL through dxil-spirv), mesh shaders, directly indexed heaps,
   pipeline libraries. Fences need no event: `SetEventOnCompletion` with
   none waits.
-- **Not yet:** write watching (every copy of title memory is whole), the
-  DXIL validator and the indirect argument clamp's compiler by default
+- **Write watching** (only what the title wrote since a copy is copied
+  again; Windows: `GetWriteWatch` and a guard on views): the region table
+  guards every 64 KiB block a copy took with `mprotect`
+  (`victory-loader/src/linux/vm.rs` `guard`, `watch.rs`), and the
+  signal handler takes the first write to one, from title code or ours,
+  before anything else sees it. `VirtualQuery` and `VirtualProtect` never
+  see the guard; a physical page shown at several addresses is guarded at
+  all of them. The kernel does not fault into the handler (`read(2)` into
+  a guarded block is `EFAULT`): code that lets it write title memory calls
+  `victory_gpu::kernel_will_write` first (the file layer and UCRT reads,
+  DirectStorage), and writes into the physical pool outside the views call
+  `vm::pool_written`.
+- **Not yet:** the DXIL validator and the indirect argument clamp's compiler by default
   (below), fence events until the handle table registers its `SetEvent`
   (`victory_gpu::fence::on_set_event`), the debug layer and WARP.
 
@@ -153,7 +164,7 @@ to a window.
 | kernel32: handles, waits, sync objects and locks, threads, TLS/FLS, thread pool, time, system, process | done (`victory-hle/src/linux/handles.rs`, `kernel32_*.rs`; SuspendThread uses `SIGRTMIN+6`) |
 | Region table (`vm.rs`), kernel32 memory, heap, files at host level, text, locale | done: `kernel32_{memory,heap,file,io,path,text,locale}.rs`; overlapped I/O completes inside the call |
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
-| GPU, window, input | device, pipelines, window, pads and keyboard on vkd3d-proton and SDL3; every vertex, pixel and mesh program of the title makes a pipeline; no write watching yet |
+| GPU, window, input | device, pipelines, window, pads and keyboard on vkd3d-proton and SDL3; every vertex, pixel and mesh program of the title makes a pipeline; write watching |
 | Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
 | xmem, virtual drives (`files`), persistent local storage | done: xmem on the region table (reservations inside the console's address limits, the physical pool, `alias` for the GPU's page mappings, `MEM_DECOMMIT` to unmap; no placeholders of ours, while the title's own take pages); `G:`/`T:`/storage drives rewritten to Linux folders, names found whatever their case; the title's own `msvcp140` reaches them through its imports |
 | `victory-hle` modules lifecycle, xsystem, apu, dstorage | done: suspend on SIGINT/SIGTERM/SIGHUP (the window's owner raises SIGTERM when the user closes it), relaunch waits on a pidfd, the device type over the empty registry; dstorage reads through the Linux file layer and writes into physical pages |
