@@ -718,19 +718,22 @@ fn allows(resource: &ID3D12Resource, flag: D3D12_RESOURCE_FLAGS) -> bool {
     unsafe { resource.GetDesc() }.Flags.0 & flag.0 != 0
 }
 
-/// Says once which kind of view was made null for lack of permission.
-fn once_render(resource: &ID3D12Resource, kind: &str) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// Says once for each kind which view was made null for lack of permission.
+fn once_render(resource: &ID3D12Resource, kind: &'static str) {
+    static ONCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        std::sync::OnceLock::new();
+    let said = ONCE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let first = said.lock().map(|mut s| s.insert(kind)).unwrap_or(false);
+    if first {
         // SAFETY: a plain query on a live resource.
         let desc = unsafe { resource.GetDesc() };
         tracing::warn!(
             kind,
             flags = desc.Flags.0,
             format = desc.Format.0,
-            "a view of a resource without the permission for it is null: its draws write nothing"
+            "a view of a resource without the permission for it is null: what it draws is lost"
         );
-    });
+    }
 }
 
 impl Host {

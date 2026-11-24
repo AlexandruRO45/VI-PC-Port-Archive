@@ -512,7 +512,9 @@ impl State {
                     // title set.
                     let address = match reg.checked_sub(256) {
                         Some(at) => {
-                            let (slot, dword) = ((reg & 0xFF) as u8, ((at >> 8) as u32) + 1);
+                            // Subtracting 256 removed the encoder's + 1, so
+                            // the high half already is the dword.
+                            let (slot, dword) = ((reg & 0xFF) as u8, (at >> 8) as u32);
                             let lo = self.user_value(compute, slot, RootType::Constants, dword);
                             let hi =
                                 self.user_value(compute, slot, RootType::Constants, dword + 1);
