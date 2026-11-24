@@ -1238,6 +1238,82 @@ mod tests {
         }
     }
 
+    /// What `Decoder::new`, `reset` and `flush` promise, checked on noise
+    /// frames: the channel count is clamped to 1 or 2, sample rates are
+    /// rounded up to one of the four the format has, `reset` gives the
+    /// output of a new decoder, and `flush` gives half a frame per channel
+    /// and then leaves only silence to flush.
+    #[test]
+    fn reset_flush_and_construction() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|_| (0..64 + next() % 512).map(|_| next() as u8).collect())
+            .collect();
+        let decode_all = |decoder: &mut Decoder| {
+            let mut out = Vec::new();
+            for frame in &frames {
+                let _ = decoder.decode(frame, frame.len() * 8, &mut out);
+            }
+            decoder.flush(&mut out);
+            out
+        };
+
+        assert_eq!(Decoder::new(0, 48_000).channels(), 1);
+        assert_eq!(Decoder::new(1, 48_000).channels(), 1);
+        assert_eq!(Decoder::new(2, 48_000).channels(), 2);
+        assert_eq!(Decoder::new(6, 48_000).channels(), 2);
+
+        // Rates in one bucket decode alike.
+        for bucket in [
+            &[0, 8_000, 24_000][..],
+            &[24_001, 32_000],
+            &[32_001, 44_100],
+            &[44_101, 48_000, 96_000, u32::MAX],
+        ] {
+            for channels in [1, 2] {
+                let expected = decode_all(&mut Decoder::new(channels, bucket[0]));
+                assert_eq!(
+                    expected.len(),
+                    (frames.len() + 1) * FRAME_SAMPLES * channels - FRAME_SAMPLES / 2 * channels
+                );
+                for &rate in &bucket[1..] {
+                    assert_eq!(
+                        decode_all(&mut Decoder::new(channels, rate)),
+                        expected,
+                        "{rate} Hz"
+                    );
+                }
+            }
+        }
+
+        for channels in [1, 2] {
+            let fresh = Decoder::new(channels, 44_100);
+            let expected = decode_all(&mut fresh.clone());
+            // Some noise frames decode, so the comparisons below see sound.
+            assert!(expected.iter().any(|&s| s != 0));
+            // `reset` after other frames gives a new decoder's output.
+            let mut used = fresh.clone();
+            let mut scratch = Vec::new();
+            for frame in frames.iter().rev() {
+                let _ = used.decode(frame, frame.len() * 8, &mut scratch);
+            }
+            used.reset();
+            assert_eq!(decode_all(&mut used), expected);
+            // `flush` resets too, so the same decoder can run again, and a
+            // second flush has nothing left to give.
+            assert_eq!(decode_all(&mut used), expected);
+            let mut silence = Vec::new();
+            used.flush(&mut silence);
+            assert_eq!(silence, vec![0; FRAME_SAMPLES / 2 * channels]);
+        }
+    }
+
     /// Walks and decodes saved input buffers (`VICTORY_XMA_STREAMS=<dir>` of
     /// `*.xma` files with their `*.ctx` context words, made outside the
     /// repository): the frames walked from the first packet must be the
