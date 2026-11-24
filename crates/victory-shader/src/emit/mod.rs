@@ -188,6 +188,8 @@ mod sampler;
 mod semantics_tests;
 mod shader;
 #[cfg(all(test, windows))]
+mod split_tests;
+#[cfg(all(test, windows))]
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
@@ -1599,7 +1601,7 @@ mod tests {
     }
 
     /// A compute program of 64 threads in one group: `words` as GFX10 code.
-    fn compute(words: &[u32], wave64: bool) -> crate::NativeProgram {
+    pub(super) fn compute(words: &[u32], wave64: bool) -> crate::NativeProgram {
         crate::NativeProgram {
             stage: crate::HwStage::Cs,
             wave64,
@@ -1614,7 +1616,7 @@ mod tests {
         }
     }
 
-    fn emit_for(
+    pub(super) fn emit_for(
         native: &crate::NativeProgram,
         target: Target,
     ) -> Result<super::HostShader, crate::ShaderError> {
