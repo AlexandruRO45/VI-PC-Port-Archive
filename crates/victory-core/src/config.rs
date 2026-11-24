@@ -576,6 +576,21 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
             }
             anyhow::bail!("{what}, which does not exist");
         }
+        // A link whose target is a file written with a trailing slash or
+        // `/.` (`ln -s real.toml/ victory.toml`, or a tab-completed folder
+        // that was later swapped for a file): the OS reads the target as a
+        // folder and says only "Not a directory", which does not say that
+        // the slash in the link is what to drop.
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
+            if let Some((shown, file)) = slashed_link_to_file(&plain) {
+                anyhow::bail!(
+                    "{what}, {shown}, a file named with a trailing slash or `/.` in the link, \
+                     which makes it a folder; drop it from the link: {}",
+                    file.display()
+                );
+            }
+            return Err(err).context(checking);
+        }
         Err(err) => {
             return Err(err).context(checking);
         }
@@ -594,6 +609,28 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
         anyhow::bail!("{what}, which is a folder, not a config file{hint}");
     }
     anyhow::bail!("{what}, which is not a regular file");
+}
+
+/// For a chain of links from `path` with a hop written as a folder (a
+/// trailing slash or `/.`) that leads to a file: the hops up to and with
+/// that one, as [`config_file_or`] names them, and the file it means.
+/// `None` when no hop is spelled that way or the one spelled that way is
+/// not a file once the slash is dropped (a file below a file stays the OS
+/// error).
+fn slashed_link_to_file(path: &Path) -> Option<(String, PathBuf)> {
+    let mut at = path.to_path_buf();
+    let mut shown = Vec::new();
+    for target in link_hops(path) {
+        at = at.parent().unwrap_or(Path::new("")).join(&target);
+        shown.push(format!("a link to {}", target.display()));
+        let bytes = target.as_os_str().as_encoded_bytes();
+        let as_folder = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
+        let plain: PathBuf = at.components().collect();
+        if as_folder && std::fs::metadata(&plain).is_ok_and(|m| m.is_file()) {
+            return Some((shown.join(", "), plain));
+        }
+    }
+    None
 }
 
 /// The targets of the chain of links starting at `path`, each as written
@@ -2977,6 +3014,95 @@ mod tests {
         // A path without the slash is read as before.
         assert_eq!(config_file(Some(file.clone())).unwrap(), Some(file));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_link_to_a_file_written_with_a_trailing_slash_names_the_slash() {
+        // `victory.toml -> real.toml/`: the OS reads the target as a folder
+        // and says only "Not a directory". Scratch folder under the system
+        // temp folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("victory.toml");
+
+        for target in ["real.toml/", "real.toml/."] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let err = config_file_or(None, &link).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "the config file {}, a link to {target}, a file named with a trailing \
+                     slash or `/.` in the link, which makes it a folder; drop it from the \
+                     link: {}",
+                    link.display(),
+                    real.display()
+                )
+            );
+            let err = config_file(Some(link.clone())).unwrap_err().to_string();
+            assert!(err.starts_with("VICTORY_CONFIG points at"), "{err}");
+            assert!(!err.contains("os error"), "{err}");
+            std::fs::remove_file(&link).unwrap();
+        }
+
+        // The slash on a middle hop: `victory.toml -> current.toml/` with
+        // `current.toml -> real.toml`. The chain is named up to the hop
+        // spelled as a folder, and the file is where it leads.
+        let current = dir.path().join("current.toml");
+        std::os::unix::fs::symlink("real.toml", &current).unwrap();
+        std::os::unix::fs::symlink("current.toml/", &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!(
+                "the config file {}, a link to current.toml/, a file named",
+                link.display()
+            )),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(&format!("drop it from the link: {}", current.display())),
+            "{err}"
+        );
+        std::fs::remove_file(&link).unwrap();
+
+        // A slashed target that is a folder is still a folder, with the
+        // hint; one that is gone still names the missing end.
+        let folder = dir.path().join("profile");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("victory.toml"), "").unwrap();
+        std::os::unix::fs::symlink("profile/", &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(err.contains("is a folder, not a config file"), "{err}");
+        assert!(err.contains("did you mean"), "{err}");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("gone.toml/", &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, a link to gone.toml/, which does not exist",
+                link.display()
+            )
+        );
+        std::fs::remove_file(&link).unwrap();
+
+        // A slashed target below a file is the OS error, as before: the
+        // slash is not what is wrong there.
+        std::os::unix::fs::symlink("real.toml/inner.toml/", &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("checking the config file {}", link.display())
+        );
+        // Without the slash, read as before.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("real.toml", &link).unwrap();
+        assert_eq!(config_file_or(None, &link).unwrap(), Some(link.clone()));
     }
 
     #[cfg(unix)]
