@@ -578,3 +578,113 @@ fn a_title_dll_stays_a_dll_with_its_other_flags() {
         0x0022 | file_flags::DLL
     );
 }
+
+#[test]
+fn directory_slots_past_number_of_rva_and_sizes_are_not_written() {
+    // A shorter optional header with 10 directories (through TLS): the
+    // section table follows directly, so the slot where the bound-import
+    // directory would be (index 11) holds the section's virtual size and
+    // RVA. Writing it would unmap the section the title runs from.
+    const COUNT: usize = 10;
+    let opt_size = layout::OPT_DATA_DIRECTORY + COUNT * layout::DATA_DIRECTORY_SIZE;
+    let mut original = image();
+    put16(&mut original, FILE_HEADER + 16, opt_size as u16);
+    put32(
+        &mut original,
+        OPT + layout::OPT_NUMBER_OF_RVA_AND_SIZES,
+        COUNT as u32,
+    );
+    let section = original[SECTIONS..SECTIONS + 40].to_vec();
+    put(&mut original, SECTIONS, &[0; 40]);
+    put(&mut original, OPT + opt_size, &section);
+    assert!((OPT + opt_size..OPT + opt_size + 40).contains(&dir_offset(dir::BOUND_IMPORT)));
+
+    let info = ImageInfo::parse(&original).unwrap();
+    assert_eq!(info.sections[0].rva, SECTION_RVA);
+    let prepared = prepare(&original).unwrap();
+    let section_table = OPT + opt_size..OPT + opt_size + 40;
+    assert_eq!(
+        &prepared.bytes[section_table.clone()],
+        &original[section_table]
+    );
+    let patched = ImageInfo::parse(&prepared.bytes).unwrap();
+    assert!(patched.is_dll());
+    assert!(patched.imports.is_empty());
+    assert_eq!(patched.sections[0].rva, SECTION_RVA);
+    assert_eq!(patched.sections[0].virtual_size, SECTION_SIZE as u32);
+    // The rest of the patch still happened.
+    assert_eq!(patched.tls.as_ref().unwrap().callbacks_va, 0);
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+}
+
+#[test]
+fn every_relocation_of_the_callback_pointer_becomes_a_no_op() {
+    // A linker that merges relocation tables can leave two DIR64 entries for
+    // one field. Either one alone would turn the cleared pointer into
+    // `delta` on a rebase, so both are neutralised.
+    let mut original = image();
+    let second = file(RELOCS) + 16;
+    put32(&mut original, second, SECTION_RVA);
+    put32(&mut original, second + 4, 12);
+    put16(&mut original, second + 8, dir64(callbacks_field()));
+    put16(&mut original, second + 10, 0); // ABSOLUTE padding
+    set_dir(&mut original, dir::BASERELOC, RELOCS, 28);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    assert_eq!(&prepared.bytes[second + 8..][..2], &[0, 0]);
+    let mut mapped = prepared.bytes;
+    let delta = 0x2_0000_0000;
+    rebase(&mut mapped, delta);
+    assert_eq!(layout::read_u64(&mapped, file(callbacks_field())), Some(0));
+    assert_eq!(
+        layout::read_u64(&mapped, file(TLS) + 16),
+        Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta)
+    );
+}
+
+#[test]
+fn an_import_directory_of_only_a_terminator_points_at_it() {
+    // A title that imports nothing through the ordinary table but keeps an
+    // import directory (its delay imports or IAT are elsewhere): the empty
+    // table is the directory itself, given the size of one descriptor
+    // whatever size the linker recorded.
+    let mut original = image();
+    put(&mut original, file(IMPORTS), &[0; 20]);
+    set_dir(&mut original, dir::IMPORT, IMPORTS, 2 * 20);
+    let prepared = prepare(&original).unwrap();
+    assert!(prepared.info.imports.is_empty());
+    let import = dir_offset(dir::IMPORT);
+    assert_eq!(layout::read_u32(&prepared.bytes, import), Some(IMPORTS));
+    assert_eq!(layout::read_u32(&prepared.bytes, import + 4), Some(20));
+    assert!(
+        ImageInfo::parse(&prepared.bytes)
+            .unwrap()
+            .imports
+            .is_empty()
+    );
+}
+
+#[test]
+fn damaged_images_return_a_result_without_panicking() {
+    // Every truncation, and every byte of the headers, directories and
+    // tables set to 0x00 and to 0xFF in turn. A patched copy, when there is
+    // one, keeps the original's length: `prepare` only overwrites fields.
+    let original = image();
+    let check = |bytes: &[u8], what: &str| {
+        if let Ok(prepared) = prepare(bytes) {
+            assert_eq!(prepared.bytes.len(), bytes.len(), "{what}");
+            assert_eq!(prepared.original_hash, blake3::hash(bytes), "{what}");
+        }
+    };
+    for len in 0..original.len() {
+        check(&original[..len], &format!("truncated to {len:#x}"));
+    }
+    for at in 0..original.len() {
+        for value in [0x00, 0xFF] {
+            let mut damaged = original.clone();
+            damaged[at] = value;
+            check(&damaged, &format!("byte {at:#x} set to {value:#04x}"));
+        }
+    }
+}
