@@ -262,24 +262,24 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
 fn lanes_query_size_in_a_separate_waterfall_loop() {
     use crate::resource::tests::WATERFALL_SIZE_AND_SAMPLE_WAVE32;
     let shader = build_expecting(WATERFALL_SIZE_AND_SAMPLE_WAVE32, false, 2);
-    let first = [[1.0f32, 0.0, 0.0, 1.0]];
-    let second = [
-        [2.0f32, 0.0, 0.0, 1.0],
-        [2.0f32, 0.0, 0.0, 1.0],
-        [2.0f32, 0.0, 0.0, 1.0],
-    ];
+    let first = [[1.0f32, 0.0, 0.0, 1.0]; 5];
+    let second = [[2.0f32, 0.0, 0.0, 1.0]; 3];
     let views = [
-        View::Texture(1, 1, &first),
+        View::Texture(1, 5, &first),
         View::Texture(1, 3, &second),
         View::RawUav(32),
     ];
     let results = run(&shader, &views);
     assert!(!results.is_empty());
+    let mut errs = Vec::new();
     for (label, words) in results {
         let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
-        // Even lanes: 1x1 red=1.0 -> 1.0 + (1 - 1) = 1.0.
+        // Even lanes: 1x5 red=1.0 -> 1.0 + (5 - 1) = 5.0.
         // Odd lanes:  1x3 red=2.0 -> 2.0 + (3 - 1) = 4.0.
-        let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 1.0 } else { 4.0 }).collect();
-        assert_eq!(got, want, "{label}");
+        let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 5.0 } else { 4.0 }).collect();
+        if got != want {
+            errs.push(format!("{label}: got[0..4]={:?} want[0..4]={:?}", &got[..4], &want[..4]));
+        }
     }
+    assert!(errs.is_empty(), "waterfall size mismatch: {}", errs.join(" | "));
 }
