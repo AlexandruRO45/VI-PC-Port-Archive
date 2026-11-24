@@ -120,21 +120,6 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     }
 }
 
-/// Removes `.` and resolves `..` lexically (only used on the non-existing tail).
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
