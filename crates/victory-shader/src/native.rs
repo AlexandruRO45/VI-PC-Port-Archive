@@ -748,6 +748,20 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     if !distinct(outputs.iter().map(|o| o.param & 0x7F)) {
         return Err(Malformed("vertex outputs share a parameter"));
     }
+    // Raising turns each `exp param<n>` into a write of its output's
+    // signature row, and lowering keys 16-bit outputs by that row
+    // (`half_outputs`): two outputs naming one row would write the same
+    // element, the later export silently replacing the earlier. Per-vertex
+    // rows (`OSG1`) and per-primitive rows (`PSG1`) are separate signatures.
+    let rows = |primitive: bool| {
+        outputs
+            .iter()
+            .filter(move |o| (o.param & 0x80 != 0) == primitive)
+            .map(|o| o.row)
+    };
+    if !distinct(rows(false)) || !distinct(rows(true)) {
+        return Err(Malformed("vertex outputs share a row"));
+    }
     Ok(StageIo::Vs { inputs, outputs })
 }
 
@@ -1643,6 +1657,41 @@ mod tests {
         assert!(matches!(
             inputs(0),
             Err(Malformed("pixel inputs share an attribute"))
+        ));
+    }
+
+    #[test]
+    fn refuses_outputs_sharing_a_row() {
+        // Two outputs: param0 in row 0, param1 (or per-primitive param1) in
+        // `row`.
+        for stage in [HwStage::Vs, HwStage::Ms] {
+            let base = fssm(&[(stage, &VS_CODE)]);
+            let e = stage_data_at(&base, stage);
+            let outputs = |param: u8, row: u8| {
+                let mut blob = base.clone();
+                blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+                blob[e + VS_OUTPUTS..][..12]
+                    .copy_from_slice(&[6, 0, 0, 0, 0, 0, 6, row, param, row, 0, 0]);
+                native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+            };
+            assert!(outputs(1, 1).is_ok(), "{stage:?}");
+            // A per-primitive output's row is in the primitive signature, so
+            // row 0 there is not the vertex output's row 0.
+            assert!(outputs(0x81, 0).is_ok(), "{stage:?}");
+            assert!(
+                matches!(outputs(1, 0), Err(Malformed("vertex outputs share a row"))),
+                "{stage:?}"
+            );
+        }
+        // Two per-primitive outputs in one row clash too.
+        let base = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&base, HwStage::Ms);
+        let mut blob = base.clone();
+        blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+        blob[e + VS_OUTPUTS..][..12].copy_from_slice(&[6, 2, 0x80, 2, 0, 0, 6, 2, 0x81, 2, 0, 0]);
+        assert!(matches!(
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])),
+            Err(Malformed("vertex outputs share a row"))
         ));
     }
 
