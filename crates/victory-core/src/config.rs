@@ -3,7 +3,9 @@
 //! Resolution order for each value: environment variable, then the config
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! A variable that is set but empty counts as unset. Relative paths in the
-//! config file are relative to the file, not to the working directory. A
+//! config file are relative to the file, not to the working directory;
+//! relative paths in variables are relative to the working directory. Both
+//! are made absolute when loaded. A
 //! leading `~` in a path (from the file or a variable) is the home directory,
 //! and an error when there is none.
 //! See `victory.example.toml` at the repository root.
@@ -159,14 +161,39 @@ impl Config {
             }
             None => (None, FilePaths::default()),
         };
-        Self::resolve(parsed, source, env)
+        let cwd = std::env::current_dir().context("reading the working directory")?;
+        Self::resolve_in(parsed, source, env, Some(&cwd))
     }
 
+    /// [`Config::resolve_in`] with relative paths kept as written.
+    #[cfg(test)]
     fn resolve(
         file: FilePaths,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
+        Self::resolve_in(file, source, env, None)
+    }
+
+    /// Resolves every value. A path still relative at the end (from a
+    /// variable such as `VICTORY_DATA_DIR=data`, or from `./victory.toml`,
+    /// whose folder is the empty path) is relative to the working directory,
+    /// so it is joined to `cwd` when one is given. Kept relative, it would
+    /// slip past the folder checks below, which compare paths as written:
+    /// `VICTORY_CACHE_DIR=/home/me/victory` with `VICTORY_DATA_DIR=data`
+    /// started from `/home/me/victory` puts the saves inside the cache, and
+    /// `victory config` would show `data` rather than the folder used. It
+    /// would also move if the working directory later changed.
+    fn resolve_in(
+        file: FilePaths,
+        source: Option<PathBuf>,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+        cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let absolute = |p: PathBuf| match cwd {
+            Some(cwd) if p.is_relative() => cwd.join(p),
+            _ => p,
+        };
         // A quoted `VICTORY_GAME_DIR="~/games"` reaches us unexpanded.
         let home = home_dir(&env);
         let expand = |k: &str, p: PathBuf| expand_home(k, p, home.as_deref());
@@ -206,11 +233,13 @@ impl Config {
                 None if file.test_titles.is_empty() => (file.test_titles, Origin::Default),
                 None => (file.test_titles, Origin::File),
             };
+        let test_titles: Vec<PathBuf> = test_titles.into_iter().map(absolute).collect();
         let (game_dir, game_origin) = pick("VICTORY_GAME_DIR", file.game_dir)?;
+        let game_dir = game_dir.map(absolute);
         let (cache_dir, cache_origin) = pick("VICTORY_CACHE_DIR", file.cache_dir)?;
-        let cache_dir = cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?;
+        let cache_dir = absolute(cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?);
         let (data_dir, data_origin) = pick("VICTORY_DATA_DIR", file.data_dir)?;
-        let data_dir = data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
+        let data_dir = absolute(data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?);
         let origins = Origins {
             game_dir: game_origin,
             cache_dir: cache_origin,
@@ -1642,6 +1671,40 @@ mod tests {
             _ => None,
         };
         assert!(Config::resolve(FilePaths::default(), None, cache_in_data).is_ok());
+    }
+
+    #[test]
+    fn relative_paths_are_joined_to_the_working_directory() {
+        let cwd = PathBuf::from(abs("v"));
+        // Started from the cache folder, `VICTORY_DATA_DIR=data` is inside it.
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("v")),
+            "VICTORY_DATA_DIR" => Some(OsString::from("data")),
+            _ => None,
+        };
+        let err = Config::resolve_in(FilePaths::default(), None, env, Some(&cwd))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the cache folder"), "{err}");
+
+        // Elsewhere, every relative value (variable or `./victory.toml`) is
+        // reported as the folder it names.
+        let file = FilePaths {
+            game_dir: Some("game".into()),
+            test_titles: vec!["t".into()],
+            ..Default::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(OsString::from("cache")),
+            "VICTORY_DATA_DIR" => Some(OsString::from("data")),
+            _ => None,
+        };
+        let cfg = Config::resolve_in(file, None, env, Some(&cwd)).unwrap();
+        assert_eq!(cfg.game_dir.unwrap(), cwd.join("game"));
+        assert_eq!(cfg.cache_dir, cwd.join("cache"));
+        assert_eq!(cfg.data_dir, cwd.join("data"));
+        assert_eq!(cfg.test_titles, vec![cwd.join("t")]);
+        assert_eq!(cfg.origins.cache_dir, Origin::Env("VICTORY_CACHE_DIR"));
     }
 
     #[test]
