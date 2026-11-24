@@ -625,4 +625,35 @@ mod tests {
         bytes[0x18..0x1C].copy_from_slice(&len.to_le_bytes());
         assert_eq!(malformed(&bytes), "implausible part count");
     }
+    #[test]
+    fn a_part_out_of_bounds_is_named_before_a_repeat() {
+        // The second DXIL's data runs past the container: its bounds are
+        // checked before its FourCC is compared with the earlier parts.
+        let mut bytes = build(&[(FourCC::DXIL, &[0; 4]), (FourCC::DXIL, &[0; 4])]);
+        let second = bytes.len() - 12;
+        bytes[second + 4..second + 8].copy_from_slice(&5u32.to_le_bytes());
+        assert_eq!(malformed(&bytes), "part data out of bounds");
+        // An empty first copy is still a copy.
+        let empty = build(&[(FourCC::ISG1, &[]), (FourCC::ISG1, &[0; 4])]);
+        assert_eq!(malformed(&empty), "a part listed twice");
+    }
+
+    #[test]
+    fn part_data_borrows_the_input_bytes() {
+        // Each part's data is a view of the buffer just past its header, at
+        // the offset the table gives, not a copy.
+        let bytes = build(&[(FourCC::SFI0, &[1, 2, 3]), (FourCC::HASH, &[4; 5])]);
+        let c = Container::parse(&bytes).unwrap();
+        for p in &c.parts {
+            assert_eq!(&bytes[p.offset..p.offset + 4], &p.fourcc.0);
+            assert!(std::ptr::eq(
+                p.data.as_ptr(),
+                bytes[p.offset + 8..].as_ptr()
+            ));
+        }
+        // An odd-sized part leaves the next one unaligned; DXC pads, but the
+        // table's offsets are taken as written.
+        assert_eq!(c.parts[1].offset % 4, 3);
+        assert_eq!(c.part(FourCC::HASH).unwrap().data, &[4; 5]);
+    }
 }
