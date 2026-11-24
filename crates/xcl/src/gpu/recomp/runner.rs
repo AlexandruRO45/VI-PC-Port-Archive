@@ -192,7 +192,7 @@ unsafe fn bind_resources(dev: &ID3D12Device, list: &ID3D12GraphicsCommandList, t
             AddressU: sm.address,
             AddressV: sm.address,
             AddressW: sm.address,
-            MaxAnisotropy: 1,
+            MaxAnisotropy: if sm.filter == D3D12_FILTER_ANISOTROPIC { 16 } else { 1 },
             ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
             MaxLOD: f32::MAX,
             ..Default::default()
