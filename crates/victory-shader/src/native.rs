@@ -4422,6 +4422,37 @@ mod tests {
     }
 
     #[test]
+    fn entry_padding_is_never_read_but_a_layout_kind_is_its_whole_dword() {
+        // A table in s4 (slot 2) and an SRV read from it.
+        let build = |pad: u8, layout_kind: u32| {
+            let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
+            set_stage_reads(&mut blob, HwStage::Ps, &[(3, 1, 4, 2)], &[(0, 3, 0, 4, 2)]);
+            let used = blob.len() - ENTRY_SIZE as usize;
+            let layout = used - ENTRY_SIZE as usize;
+            blob[layout..][..4].copy_from_slice(&layout_kind.to_le_bytes());
+            // A root entry's last two bytes, and a read's bytes 2-3 and 19.
+            blob[layout + 18..][..2].fill(pad);
+            blob[used + 2..][..2].fill(pad);
+            blob[used + 19] = pad;
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let clean = build(0, 3).unwrap();
+        let padded = build(0xFF, 3).unwrap();
+        assert_eq!(clean[0].layout, padded[0].layout);
+        assert_eq!(clean[0].used, padded[0].used);
+        assert_eq!(padded[0].used[0].root, RootType::Table);
+        // A read states its kinds in one byte each, but a root entry's kind
+        // is all four: a table's byte with any higher bit set is no table.
+        for kind in [0x103, 0x1_0003, 0x0100_0003, 0x8000_0003] {
+            assert_eq!(
+                why_refused(build(0, kind)),
+                "root parameter of unknown kind",
+                "{kind:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_a_table_read_past_any_heap() {
         let (srv, cbv, sampler) = (0u8, 2u8, 1u8);
         let (descriptor, table) = (1u8, 3u8);
