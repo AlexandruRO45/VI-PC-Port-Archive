@@ -843,6 +843,16 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
     used
 }
 
+/// Whether a replay asked for only the names in `VICTORY_ASKED_NAMES`, and this
+/// is not one of them: true means skip it rather than spend a driver compile on a
+/// pipeline no session asked for.
+pub(crate) fn only_asked(key: &str) -> bool {
+    match crate::pipeline::precompile::asked() {
+        Some(set) => !set.contains(key),
+        None => false,
+    }
+}
+
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))

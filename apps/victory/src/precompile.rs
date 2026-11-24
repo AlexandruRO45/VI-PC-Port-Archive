@@ -83,6 +83,13 @@ pub fn run(
     // boot still has to compile.
     let early = std::fs::read_to_string(cache.join("early-pipelines.txt")).unwrap_or_default();
     let early = early.lines().filter(|line| !line.trim().is_empty()).count();
+    if report.asked_hit + report.asked_made > 0 {
+        println!(
+            "asked set     {} held of {} replayed",
+            report.asked_hit,
+            report.asked_hit + report.asked_made
+        );
+    }
     if early > 0 {
         let held = report.early_loaded;
         println!(

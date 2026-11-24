@@ -535,6 +535,10 @@ pub(crate) struct HostPipeline {
     pub(crate) rects: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// The library's key for it (`library::name`): what a load asks the
+    /// library for, and therefore the only thing a caller can compare against
+    /// a list of wanted pipelines.
+    pub(crate) key: String,
     /// Its depth, stencil, cull and blend state in short, for the frame
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
@@ -754,6 +758,12 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            // `VICTORY_ASKED_NAMES`: only the pipelines a real session asked for
+            // are worth a driver compile. The name is known before the create, and
+            // a pipeline nobody asked for costs the same seconds of driver time.
+            if super::library::only_asked(&name) {
+                return None;
+            }
             // A fault inside the driver leaves no line of its own, so what the
             // create was given has to be in the log before it is given
             // (`VICTORY_PIPELINE_ARGS=1`, diagnostics builds). A description
@@ -820,6 +830,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                key: name.clone(),
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -858,6 +869,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                key: name.clone(),
                 slots: 0,
                 inputs: Vec::new(),
                 rects: false,
@@ -935,14 +947,21 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_ref()));
+        // The key the successful create stored under: a rectangle pipeline that
+        // falls back to no geometry stage is stored under that name instead.
+        let mut key_used = name(rect_gs.as_ref());
+        if super::library::only_asked(&key_used) {
+            return None;
+        }
+        let mut made = make(&desc, &key_used);
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(?shaders, "host pipeline refused with the rectangle geometry stage");
             host.log_messages();
             desc.GS = D3D12_SHADER_BYTECODE::default();
             rect_gs = None;
-            made = make(&desc, &name(None));
+            key_used = name(None);
+            made = make(&desc, &key_used);
         }
         let pso = match made {
             Ok(pso) => pso,
@@ -990,6 +1009,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            key: key_used,
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
