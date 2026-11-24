@@ -4,7 +4,8 @@
 //! file (`VICTORY_CONFIG`, else `./victory.toml`), then the default.
 //! A variable that is set but empty counts as unset. Relative paths in the
 //! config file are relative to the file, not to the working directory. A
-//! leading `~` in a path (from the file or a variable) is the home directory.
+//! leading `~` in a path (from the file or a variable) is the home directory,
+//! and an error when there is none.
 //! See `victory.example.toml` at the repository root.
 
 use std::path::{Component, Path, PathBuf};
@@ -100,7 +101,7 @@ impl FileConfig {
     fn anchored_at(self, dir: &Path, home: Option<&Path>) -> Result<FilePaths> {
         let anchor = |key: &str, p: PathBuf| -> Result<PathBuf> {
             check_setting(&format!("[paths].{key}"), &p)?;
-            let p = expand_home(p, home);
+            let p = expand_home(&format!("[paths].{key}"), p, home)?;
             Ok(if p.is_relative() { dir.join(p) } else { p })
         };
         let set = |p: &PathBuf| !p.as_os_str().is_empty();
@@ -166,14 +167,14 @@ impl Config {
     ) -> Result<Self> {
         // A quoted `VICTORY_GAME_DIR="~/games"` reaches us unexpanded.
         let home = home_dir(&env);
-        let expand = |p: PathBuf| expand_home(p, home.as_deref());
+        let expand = |k: &str, p: PathBuf| expand_home(k, p, home.as_deref());
         // The variable, else the file, with where the value came from.
         let pick = |k: &'static str, from_file: Option<PathBuf>| -> Result<_> {
             Ok(match env(k).filter(|v| !v.is_empty()) {
                 Some(v) => {
                     let p = PathBuf::from(v);
                     check_setting(k, &p)?;
-                    (Some(expand(p)), Origin::Env(k))
+                    (Some(expand(k, p)?), Origin::Env(k))
                 }
                 None if from_file.is_some() => (from_file, Origin::File),
                 None => (None, Origin::Default),
@@ -193,7 +194,10 @@ impl Config {
                         ensure_trimmed("VICTORY_TEST_TITLES", title)?;
                     }
                     (
-                        titles.into_iter().map(expand).collect(),
+                        titles
+                            .into_iter()
+                            .map(|p| expand("VICTORY_TEST_TITLES", p))
+                            .collect::<Result<_>>()?,
                         Origin::Env("VICTORY_TEST_TITLES"),
                     )
                 }
@@ -315,7 +319,7 @@ fn explicit_config(
         .map(|v| {
             let p = PathBuf::from(v);
             check_setting("VICTORY_CONFIG", &p)?;
-            Ok(expand_home(p, home))
+            expand_home("VICTORY_CONFIG", p, home)
         })
         .transpose()
 }
@@ -732,21 +736,33 @@ fn home_dir(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf>
 
 /// `~` and `~/rest` (`~\rest` on Windows) under `home`. Neither TOML nor a
 /// quoted shell value expands `~`, so without this `game_dir = "~/games"`
-/// would name a folder called `~`. `~user` is left alone, and so is
-/// everything when there is no home directory.
-fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
-    let Some(home) = home else { return path };
+/// would name a folder called `~`. `~user` is left alone.
+///
+/// With no home directory (`HOME` and `USERPROFILE` unset or relative, as
+/// under `env -i`, a bare systemd service or some containers) a leading `~`
+/// is refused rather than kept: kept, it is a relative folder named `~`
+/// under the config file's folder or the working directory (often the
+/// repository), created on first use and easy to delete by mistake with a
+/// `rm -rf ~`. `what` names the setting for the error.
+fn expand_home(what: &str, path: PathBuf, home: Option<&Path>) -> Result<PathBuf> {
     let mut parts = path.components();
     match parts.next() {
         Some(Component::Normal(first)) if first == "~" => {
+            let Some(home) = home else {
+                anyhow::bail!(
+                    "{what} is {}, but there is no home directory to put in place of `~` \
+                     (HOME is unset or not absolute); set HOME or write the full path",
+                    path.display()
+                );
+            };
             let rest = parts.as_path();
-            if rest.as_os_str().is_empty() {
+            Ok(if rest.as_os_str().is_empty() {
                 home.to_path_buf()
             } else {
                 home.join(rest)
-            }
+            })
         }
-        _ => path,
+        _ => Ok(path),
     }
 }
 
@@ -977,13 +993,52 @@ mod tests {
     fn a_leading_tilde_is_the_home_directory() {
         let home = PathBuf::from(abs("home"));
         let h = Some(home.as_path());
-        assert_eq!(expand_home("~".into(), h), home);
-        assert_eq!(expand_home("~/games/gta".into(), h), home.join("games/gta"));
+        let ex = |p: &str, h| expand_home("VICTORY_GAME_DIR", p.into(), h).unwrap();
+        assert_eq!(ex("~", h), home);
+        assert_eq!(ex("~/games/gta", h), home.join("games/gta"));
         // Only a whole leading `~` component counts.
-        assert_eq!(expand_home("~user/x".into(), h), PathBuf::from("~user/x"));
-        assert_eq!(expand_home("a/~/b".into(), h), PathBuf::from("a/~/b"));
-        // Without a home directory nothing changes.
-        assert_eq!(expand_home("~/x".into(), None), PathBuf::from("~/x"));
+        assert_eq!(ex("~user/x", h), PathBuf::from("~user/x"));
+        assert_eq!(ex("a/~/b", h), PathBuf::from("a/~/b"));
+        // Without a home directory, paths without a leading `~` are kept.
+        assert_eq!(ex("/x/~", None), PathBuf::from("/x/~"));
+        assert_eq!(ex("~user/x", None), PathBuf::from("~user/x"));
+    }
+
+    #[test]
+    fn a_leading_tilde_without_a_home_is_refused() {
+        // `env -i`, a bare systemd unit: no HOME, so `~` cannot be expanded
+        // and would otherwise be a folder named `~` under the working
+        // directory.
+        for p in ["~", "~/games/gta"] {
+            let err = expand_home("VICTORY_GAME_DIR", p.into(), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+            assert!(err.contains("no home directory"), "{err}");
+        }
+        let no_home = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(OsString::from("~/cache")),
+            "HOME" => Some(OsString::from("relative")),
+            "XDG_DATA_HOME" => Some(abs("data")),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, no_home).unwrap_err();
+        assert!(err.to_string().contains("VICTORY_CACHE_DIR"), "{err}");
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let titles = format!("{}{sep}~/t", abs("one").to_string_lossy());
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(OsString::from(&titles)),
+            "XDG_CACHE_HOME" => Some(abs("cache")),
+            "XDG_DATA_HOME" => Some(abs("data")),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env).unwrap_err();
+        assert!(err.to_string().contains("VICTORY_TEST_TITLES"), "{err}");
+        let parsed: FileConfig = toml::from_str("[paths]\ndata_dir = '~/d'\n").unwrap();
+        let err = parsed
+            .anchored_at(&PathBuf::from(abs("configs")), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("[paths].data_dir"), "{err}");
     }
 
     #[test]
@@ -1037,11 +1092,9 @@ mod tests {
         );
         assert_eq!(explicit_config(with(""), Some(&home)).unwrap(), None);
         assert_eq!(explicit_config(|_: &str| None, Some(&home)).unwrap(), None);
-        // Without a home directory the value is taken as written.
-        assert_eq!(
-            explicit_config(with("~/victory.toml"), None).unwrap(),
-            Some(PathBuf::from("~/victory.toml"))
-        );
+        // Without a home directory a leading `~` cannot be expanded.
+        let err = explicit_config(with("~/victory.toml"), None).unwrap_err();
+        assert!(err.to_string().contains("VICTORY_CONFIG"), "{err}");
     }
 
     #[test]
