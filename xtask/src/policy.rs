@@ -257,6 +257,7 @@ pub(crate) fn git_command(root: &Path) -> Command {
     // whose tree already has a staged file drops it from `diff --cached`.
     // The check reads the objects as they will be committed.
     command.current_dir(root).arg("--no-replace-objects");
+    unredirect_output(&mut command, std::env::vars_os().map(|(key, _)| key));
     #[cfg(test)]
     {
         for var in REPOSITORY_ENV.iter().chain(PATHSPEC_ENV) {
@@ -289,6 +290,31 @@ pub(crate) fn git_command(root: &Path) -> Command {
         }
     }
     command
+}
+
+/// Keeps git's stdout to what the command prints, since the check parses it.
+///
+/// `GIT_TRACE=/dev/stdout` (or `GIT_TRACE_SETUP`, `GIT_TRACE2_EVENT`, any
+/// of the trace variables pointed at stdout) puts trace lines in front of
+/// the first NUL-separated field. In the full check that field is the first
+/// file listed: its name no longer exists, so it is never read, and that
+/// file passes whatever it holds. `--staged` stops at a record it cannot
+/// parse, and every test that reads git's output failed. Git for Windows'
+/// `GIT_REDIRECT_STDOUT` sends the output to a file instead, and the check
+/// sees an empty repository. Trace2 can also be turned on from global or
+/// system configuration, which its variables override, so those are set
+/// off rather than only dropped.
+fn unredirect_output(command: &mut Command, keys: impl IntoIterator<Item = std::ffi::OsString>) {
+    for key in keys {
+        // Variable names are case-insensitive on Windows.
+        let upper = key.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("GIT_TRACE") || upper.starts_with("GIT_REDIRECT_") {
+            command.env_remove(key);
+        }
+    }
+    for var in ["GIT_TRACE2", "GIT_TRACE2_EVENT", "GIT_TRACE2_PERF"] {
+        command.env(var, "0");
+    }
 }
 
 /// A configuration directory that never exists, so git finds no `git/ignore`
@@ -1051,7 +1077,9 @@ mod tests {
             assert!(removed.iter().any(|r| r == var), "{var} is inherited");
         }
         // The list is git's own; a git that adds a variable fails here.
-        let Some(out) = std::process::Command::new("git")
+        let mut git = std::process::Command::new("git");
+        super::unredirect_output(&mut git, std::env::vars_os().map(|(key, _)| key));
+        let Some(out) = git
             .args(["rev-parse", "--local-env-vars"])
             .output()
             .ok()
@@ -1127,6 +1155,7 @@ mod tests {
         // under that HOME apply.
         let mut plain = std::process::Command::new("git");
         plain.current_dir(root).env_remove("XDG_CONFIG_HOME");
+        super::unredirect_output(&mut plain, std::env::vars_os().map(|(key, _)| key));
         for var in super::REPOSITORY_ENV.iter().chain(super::PATHSPEC_ENV) {
             plain.env_remove(var);
         }
@@ -1326,6 +1355,52 @@ mod tests {
                 .all(|(key, _)| key != "GIT_QUARANTINE_PATH")
         );
         assert!(checkout.get_args().all(|arg| arg != "safe.directory=*"));
+    }
+
+    /// Trace output pointed at stdout used to be parsed as git's output: the
+    /// first file listed was taken for a name that does not exist and went
+    /// unread, and `--staged` failed on the record. The variables are
+    /// dropped (trace2's set off) for every git the check runs.
+    #[cfg(unix)]
+    #[test]
+    fn trace_output_is_not_read_as_git_output() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.bin"), b"MZ\x90\0").unwrap();
+        git_str(root, &["add", "a.bin"]);
+        const TRACES: [&str; 4] = [
+            "GIT_TRACE",
+            "GIT_TRACE_SETUP",
+            "GIT_TRACE_PERFORMANCE",
+            "GIT_TRACE2_EVENT",
+        ];
+        let ls_files = |unredirect: bool| {
+            let mut command = super::git_command(root);
+            for var in TRACES {
+                command.env(var, "/dev/stdout");
+            }
+            command.env("GIT_TRACE2", "/dev/stdout");
+            if unredirect {
+                let keys = TRACES.iter().chain(&["GIT_TRACE2", "GIT_REDIRECT_STDOUT"]);
+                super::unredirect_output(&mut command, keys.map(std::ffi::OsString::from));
+            }
+            command.args(["ls-files", "-z"]).output().unwrap()
+        };
+
+        // As git was run before: trace lines lead the first name.
+        let traced = ls_files(false);
+        assert!(traced.status.success());
+        assert_ne!(traced.stdout, b"a.bin\0", "git wrote no trace to stdout");
+        // As it is run now: only the names.
+        let plain = ls_files(true);
+        assert!(plain.status.success());
+        assert_eq!(plain.stdout, b"a.bin\0");
+
+        // And whatever this process inherited, the check reads the file.
+        assert_eq!(names(root, false), ["a.bin"]);
+        assert!(super::run(root, false).is_err());
+        assert!(super::run(root, true).is_err());
     }
 
     /// A temporary directory that is not a repository is walked. Made beside
