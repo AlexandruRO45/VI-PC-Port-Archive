@@ -132,8 +132,8 @@ Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
 [docs/debugging-notes-from-a-gta-v-port.md](docs/debugging-notes-from-a-gta-v-port.md)
-collects what found dark scenes, GPU hangs and load stalls in another RAGE
-port.
+collects what got another RAGE port from "the world loads" to "the game
+runs": what the title waited for, and how each wait was found.
 
 ## License
 

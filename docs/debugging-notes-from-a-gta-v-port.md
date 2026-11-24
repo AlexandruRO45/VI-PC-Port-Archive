@@ -1,113 +1,148 @@
 # Debugging notes from a GTA V port
 
 Lessons from bringing GTA V (RAGE, D3D11 path) up natively on an Android
-phone (ARM64, D3D11 over DXVK and Vulkan on an Adreno 740). That port hit
-the stages VIctory is at now: the title loads the world, then the scene is
-dark, frames are slow and the GPU can hang. What found the causes there is
-written down here as things to try. None of it has been checked against
-GTA VI.
+phone (ARM64, D3D11 over DXVK and Vulkan on an Adreno 740). That port went
+through the stage VIctory is at now: the title loads the world and then
+does not move on into the game. What got it past that is written down here
+as things to try. None of it has been checked against GTA VI.
 
 Nothing from either game is in this note: no code, names from it or data.
 
+## The world loads, but the game does not start
+
+In the port, the title got through boot, menus and the loading screen,
+loaded the map, and then sat there: the loading screen (or a dark frame)
+stayed up, memory stopped growing, nothing crashed. It was never one cause.
+Each fix moved it a little further, to the next wait. The order below is
+the order they turned up in.
+
+### First, find out what it is waiting for
+
+A hang with no crash only shows itself through state. These dumps, taken
+while it sat there, are what named each cause:
+
+* **Every script thread with its state and program counter.** Taken
+  every few seconds during loading. A script that never leaves its first
+  instructions, or one that has faulted, stops the game flow even though
+  the engine keeps rendering.
+* **The streaming queue.** When the head request stops moving: its file,
+  its state, whether the read completed, whether it was placed in memory,
+  and how many requests are pending against the loader's limit (30 in that
+  engine; past it, nothing new is issued).
+* **All threads' stacks** (`VICTORY_STACKS`), to see who waits on what: a
+  sleeping thread waiting for a service that never answers looks idle, not
+  stuck.
+* **Any warning or prompt the title opens**, with its text, logged from the
+  title's own call. See the next section on why.
+
+### The title is waiting for something the platform should give it
+
+These were the actual causes, each with what it looked like.
+
+**A prompt nobody can see or answer.** Twice the game was not stuck but
+waiting for input. Once a "sign in" warning came up during autoload, and
+the screen showed no text because fonts were not drawing yet. Once it was
+the first-boot brightness calibration, which waits for a button press, and
+input was not wired up. With a dark scene, the title may be showing a
+dialog. Logging every warning or prompt with its text (and the button it
+waits for) answers that in one run.
+
+**The signed-in user.** The save system asked whether a user was signed
+in, and the replacement for the online platform answered no. Autoload then
+stopped at the sign-in warning above. Answering "signed in" as a local
+offline user fixed it; with no saves, autoload then starts a new game. In
+VIctory that is the runtime-services layer: every user, licence and
+package query the title makes while loading should get a definite "yes,
+offline" answer.
+
+**A background service that never answers.** One thread slept forever
+waiting for the online platform's entitlement check. That one was harmless,
+but it is the same shape as a real stall: a title thread blocked on a
+platform callback, event or async result that is never signalled. Check
+that every async operation the HLE layer accepts completes, including the
+ones that fail.
+
+**Data it waits on without reporting a missing file.** The loading screen
+waited for sound banks that were not there yet: no error, just a wait.
+After the banks were added, it moved on.
+
+**Data in a form it did not expect.** Script files were still encrypted
+(they used the container's key, unlike the other resources). The script
+system loaded them and failed silently. Every converted file should be
+verified by a read in the title's own format, not by size.
+
+**The startup script faulting.** The first script faulted with "call
+through a null function pointer" in its first instructions, and the game
+never left the loading flow. The script VM was not translating the older
+bytecode it was given. Natives were not the problem, although they looked
+like it. If the title runs scripts, a VM fault log (script, program counter,
+reason) is worth having before anything else.
+
+**Budgets and pools from the platform config.** The world's streaming
+stalled because a memory budget was 0 MB: it was inherited from another
+platform's config and cut down by a heap size that did not match. Later,
+crossing from the first area to the main city aborted because a pool of
+loaded objects was sized for a smaller data set. In VIctory the title reads
+its config for the Xbox. If a memory figure the title asks the platform for
+comes back smaller or 0, the title sizes its budgets from it and stalls
+when they fill up.
+
+**A platform function returning garbage.** A "how many worker threads"
+query had no branch for the new platform and returned garbage. It was used
+as an index, and the physics crashed on the first frame of gameplay. In
+VIctory the equivalents are system queries with an out of range answer
+(processor count, core masks, memory sizes, GPU properties) that the title
+uses to size arrays.
+
+**The render thread deadlocking with the main thread.** One fix took the
+graphics context for a whole list of commands. The main thread then waited
+for the context while the render thread held it waiting for the next list,
+and the picture froze. Look at both threads' stacks when the frame freezes
+and the process does not crash.
+
+**Streaming reads that never complete.** Sometimes one read request never
+finished. The streamer was idle, the loader's queue filled up behind it,
+and loading stopped. It was intermittent. In VIctory this is file I/O and
+async completion in the HLE layer: a read, or a completion port or event,
+that never gets signalled. It looks exactly like this.
+
+### Slow frames make "running" look like "stuck"
+
+Game flow in these engines advances per frame. At 0.5 to 1.8 s per frame, a
+cutscene or scripted transition that takes 300 frames needs several minutes.
+Before treating the game as stuck, check the script program counters and
+the streaming queue over time: if they move, it is running, just slowly.
+
 ## A dark scene after loading
 
-**Find the pass where the image goes empty before guessing.** In the port
-the world was black and characters were flat grey shapes. Lighting was the
-obvious suspect and it was wrong: a dump of every bound render target and
-depth buffer before each change of targets (141 passes in one frame) showed
-the G-buffer and lighting were correct, and the frame went black in the
-copy that feeds post-processing. Min, max and mean per channel for each
-dump is enough to spot the pass at a glance. `VICTORY_DUMP_TARGETS` already
-saves targets; dumping at every target change, not only at the end of a
-frame, is what pinned it.
+**Find the pass where the image goes empty.** In the port the world was
+black and characters were flat grey shapes. A dump of every bound render
+target before each change of targets (141 passes in one frame) showed that
+the G-buffer and lighting were correct. The frame went black in the copy
+that feeds post-processing: the title took a branch that skips that copy
+on some platforms. More generally, anything the console does implicitly
+(render-target metadata, fast clears, resolves) has to be done by the host
+layer, or a later pass reads an empty target.
 
-**The title expects something the console does for it.** The black world
-came from a step the title only takes on some platforms: the platform being
-ported to took the branch that skips a back-buffer copy, and the
-post-process read a stale copy. The general form for VIctory: anything the
-console GPU or runtime does implicitly (compression metadata on render
-targets, fast clears, decompression or resolve on transition, memory that
-CPU and GPU see without copies) has to be done by the host layer, or a
-later pass reads an empty or cleared target. The README lists
-render-target metadata planes as missing; a target whose contents only
-exist in that metadata would read as its clear colour.
+**Auto-exposure turns one bad value into a dark frame.** A luminance
+reduction that yields 0 or NaN darkens the whole scene. A missing compute
+dispatch in that chain would look the same. Forcing a fixed exposure tells
+the two apart.
 
-**Auto-exposure turns one bad value into a dark frame.** If the luminance
-reduction produces 0 or NaN, the whole scene goes dark while the G-buffer
-is fine. It works both ways: in the port, fixing the exposure showed the
-scene was already black before it, so exposure was ruled out in one run. In
-VIctory, a dropped compute dispatch in the exposure chain would look exactly
-like a dark scene. Forcing a fixed exposure, or finding the adaptation
-buffer and checking its value, separates the two.
-
-**Dropped or wrong passes.** In an earlier PC build, shaders whose passes did
-not match what the code indexed gave "black world, HUD visible". Since VIctory
-drops draws whose shaders are not translated yet, it helps to log which
-passes lose draws or dispatches in a dark frame. Drawing those in a debug
-colour instead of skipping them shows what is missing on screen.
-
-**A constant that arrives as 0 makes a shader sample texel (0,0).** A skin
-pass in the port received its screen-size constant as 0, so every pixel read
-the top-left texel: characters came out one flat colour, exactly that
-pixel's. When a surface is a single flat colour, compare it with pixel (0,0)
-of the pass's inputs, then check the constant buffer for zeros (wrong
-offset, size or root-parameter mapping).
+**A constant that arrives as 0 makes a pass sample texel (0,0).** That gives
+one flat colour, exactly that pixel's. Check the constant buffer for zeros.
 
 ## GPU hangs
 
-**Separate the hang from the rendering first.** The "flat grey shapes" seen
-at one point in the port were a half-drawn frame left on screen by a GPU
-hang, not a shading bug. WARP, or full synchronisation, shows what the
-frame looks like when nothing hangs.
-
-**Experiments that narrowed it down:**
-
-* Waiting for the GPU to finish before each present: no hangs (7 clean runs
-  in a row). As a test, it shows the fault depends on how much CPU and GPU
-  work overlap, not on one shader.
-* One submission per draw: never hung in over 10 minutes, at 3 fps.
-* Ending the render pass at every shader change: moved the hang and once
-  showed corrupted texture blocks (overwritten BC data). That pointed to
-  memory reused while the GPU still read it.
-* Early fences: the title recycles memory when its fences say the GPU is
-  done; a fence signalled early lets it overwrite data in flight. Tested by
-  marking fences complete only when the whole command list had finished,
-  and logging any fence the driver reported earlier. That gave 0 cases, so
-  the hypothesis was dropped. In VIctory the title manages console fences
-  and memory itself, so the same check on the mapping of title fences to
-  host fences is worth one run.
-* The cause there turned out to be the phone vendor's driver with that
-  command pattern, fixed by switching to Mesa's Turnip driver. On a desktop
-  AMD GPU the answer may differ, but the steps above apply.
-
-**A hang at a fixed point is a gift.** It happened about 44 s in, at the same
-cinematic-to-gameplay switch every time. Recording what was drawn and what
-memory had just been freed or reused right before that point narrows it
-much faster than random runs.
-
-## Loads that stall
-
-Each stall in the port was one of these:
-
-* data the title waits on without reporting it (audio banks missing);
-* data still encrypted, or in a form the loader did not expect;
-* budgets and pool sizes from the platform's config (a streaming budget of
-  0 MB, a loaded-object pool too small for the data set): either a silent
-  wait or an abort that names the pool;
-* a function with no return value on the platform's branch, returning
-  garbage (a thread count used as an array index);
-* streaming reads that never complete, intermittently. A dump of the loader's
-  queue when its head stops moving shows which request is stuck.
-
-## Tooling that paid off
-
-* Switches that need no rebuild, like VIctory's environment variables.
-* A crash handler that names the function and walks the frame chain even
-  when the program counter is invalid.
-* All threads' stacks on demand for hangs with no crash
-  (`VICTORY_STACKS`).
-* Short, bounded logging: one line per frame was enough to cost frame rate.
-* The same frame-rate measurement every run, several samples per run.
+* A half-drawn frame left on screen by a GPU hang looked like a shading bug.
+  Separate the two first (WARP or full synchronisation).
+* Waiting for the GPU before each present stopped the hangs. So did one
+  submission per draw. Both showed the fault depended on CPU/GPU overlap.
+* Early fences (the title reusing memory because a fence said the GPU was
+  done) were tested and ruled out. In VIctory, title fences map onto host
+  fences, so the same check is worth one run.
+* The cause there was the phone vendor's driver; switching to Mesa's Turnip
+  fixed it.
 
 ## What does not carry over
 
