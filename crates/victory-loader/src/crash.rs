@@ -531,6 +531,7 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 
 /// Debugging aid: `VICTORY_TITLE_ASSERTS=<n>` continues past up to `n`
 /// `int3` asserts in title code, where the first one ends the process.
+/// Each skip is logged with its address and the title's last debug output.
 ///
 /// A title asserts where a check it believes it cannot recover from
 /// failed, so a run that gets past one is not a run to trust. It is how the
@@ -582,10 +583,13 @@ unsafe fn past_assert(info: *mut EXCEPTION_POINTERS) -> bool {
         // The next instruction: read before the exception, so an `int3`
         // that is the first byte of a debugger's patch is not skipped.
         context.Rip = at as u64 + 1;
-        eprintln!(
-            "VIctory: past a title assert at {} ({} left)",
+        // The title's last debug output with it: asserts in a bring-up
+        // build usually say what they were checking on the lines before.
+        eprint!(
+            "VIctory: past a title assert at {} ({} left)\n{}",
             locate(at),
-            asserts_left().load(std::sync::atomic::Ordering::Relaxed)
+            asserts_left().load(std::sync::atomic::Ordering::Relaxed),
+            title_output()
         );
     }
     true
@@ -596,11 +600,11 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
-    // SAFETY: as above.
     // SAFETY: the system passes valid exception pointers.
     if unsafe { past_assert(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
+    // SAFETY: the system passes valid exception pointers.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
     if FATAL.contains(&code) {
         let to_file =
