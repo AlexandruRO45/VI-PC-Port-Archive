@@ -66,6 +66,8 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+/// Pipelines this run made and then loaded back before drawing them.
+pub(crate) static RECYCLED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
@@ -571,7 +573,7 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -643,37 +645,67 @@ pub(crate) fn pipeline(
             began.elapsed().as_secs_f64() * 1e3
         )
     });
-    let _all = one_call();
-    let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
-    let _call = call("store", name);
-    #[cfg(feature = "diagnostics")]
-    let store_started = std::time::Instant::now();
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    let stored = unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) };
-    #[cfg(feature = "diagnostics")]
-    super::timing::add(super::timing::Part::Store, store_started.elapsed());
-    match stored {
-        Ok(()) => {
-            library.added.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(why) => {
-            // A store the host refuses leaves the entry out for every later
-            // run, so the same pipeline is compiled again each time and the
-            // library file stays small while thousands are made. Said once,
-            // with the count on the save line beside it.
-            STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
-            static SAID: AtomicBool = AtomicBool::new(false);
-            if !SAID.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    error = %why,
-                    pipeline = %name,
-                    "host pipeline: the library refused to store it"
-                );
+    {
+        let _all = one_call();
+        let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+        let _call = call("store", name);
+        #[cfg(feature = "diagnostics")]
+        let store_started = std::time::Instant::now();
+        // SAFETY: a live pipeline; a name already stored (a description that
+        // differs) is refused, which leaves the library as it was.
+        let stored = unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) };
+        #[cfg(feature = "diagnostics")]
+        super::timing::add(super::timing::Part::Store, store_started.elapsed());
+        match stored {
+            Ok(()) => {
+                library.added.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(why) => {
+                // A store the host refuses leaves the entry out for every later
+                // run, so the same pipeline is compiled again each time and the
+                // library file stays small while thousands are made. Said once,
+                // with the count on the save line beside it.
+                STORE_REFUSED.fetch_add(1, Ordering::Relaxed);
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        error = %why,
+                        pipeline = %name,
+                        "host pipeline: the library refused to store it"
+                    );
+                }
             }
         }
     }
-    Ok(pso)
+    // The draw gets the pipeline the library hands back, never the one the
+    // compiler just made: a made pipeline is handed to the title in the same
+    // frame it was made in, and a run in which every miss is made draws at
+    // frame 57 while a run in which every miss is refused (`VICTORY_NO_
+    // PIPELINE_FALLBACK=1`) runs 1539 frames with no fault. So the object
+    // the compiler returns is stored and given up; the object a load returns
+    // is the one that is drawn. A load that fails here is a missed draw this
+    // frame and a load the next one, because the library now holds the name.
+    let _all = one_call();
+    let _one = same_name(name);
+    let _call = call("load", name);
+    match load(&library.library, PCWSTR(wide.as_ptr())) {
+        Ok(pso) => {
+            RECYCLED.fetch_add(1, Ordering::Relaxed);
+            crate::host::trail(|| {
+                let label = LABEL.with(|l| l.borrow().clone());
+                format!("pipeline library: made {label}, drawn as loaded")
+            });
+            Ok(pso)
+        }
+        Err(e) => {
+            tracing::warn!(
+                pipeline = %name,
+                error = %e,
+                "host pipeline: made and stored, but the load of it refused: the draw waits"
+            );
+            Err(e)
+        }
+    }
 }
 
 /// Writes the library and the early list if pipelines were added since the
@@ -747,6 +779,7 @@ pub(crate) fn save(now: bool) {
             made = MADE.load(Ordering::Relaxed),
             store_refused = STORE_REFUSED.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
+            recycled = RECYCLED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),

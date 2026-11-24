@@ -241,7 +241,55 @@ pub struct HostShader {
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
 
+/// Which descriptor heaps a container's code indexes directly, from the
+/// features it declares (`SFI0`).
+///
+/// A root signature must declare exactly the heaps its shaders use: a shader
+/// that indexes a heap its signature does not declare is refused by
+/// shader-to-root-signature validation, and a device without the feature
+/// (tier 3 and `dx.op.createHandleFromHeap`) may refuse a signature that
+/// declares one the code never touches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Heaps {
+    pub views: bool,
+    pub samplers: bool,
+}
+
+impl Heaps {
+    pub fn any(self) -> bool {
+        self.views || self.samplers
+    }
+
+    /// What a root signature declares for a container it cannot read: what
+    /// every signature declared before the flags followed the code.
+    pub fn all() -> Self {
+        Self {
+            views: true,
+            samplers: true,
+        }
+    }
+
+    /// The heaps this container's code indexes.
+    pub fn of(container: &[u8]) -> Self {
+        let features = Container::parse(container)
+            .ok()
+            .and_then(|c| c.part(FourCC::SFI0).and_then(|p| crate::dxbc::u32_at(p.data, 0).ok()));
+        let Some(features) = features else {
+            return Self::all();
+        };
+        Self {
+            views: features & 0x200_0000 != 0,
+            samplers: features & 0x400_0000 != 0,
+        }
+    }
+}
+
 impl HostShader {
+    /// The heaps this stage's code indexes.
+    pub fn heaps(&self) -> Heaps {
+        Heaps::of(&self.dxil)
+    }
+
     /// Size of the user-data buffer the shader declares, in dwords (a
     /// multiple of 4; 0 when it reads none). Root constants must cover it.
     pub fn user_data_dwords(&self) -> u32 {
@@ -1885,5 +1933,31 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    /// The heap flags a root signature must declare come from the code's own
+    /// declared features, so a container that indexes no heap declares none:
+    /// that is what keeps a signature from demanding a device feature its
+    /// shader never uses.
+    #[test]
+    fn a_container_declares_the_heaps_its_code_indexes() {
+        let container = |features: u32| {
+            let mut sfi0 = [0u8; 8];
+            sfi0[..4].copy_from_slice(&features.to_le_bytes());
+            crate::dxbc::build(&[(FourCC::SFI0, &sfi0), (FourCC::HASH, &[0; 20])])
+        };
+        assert_eq!(Heaps::of(&container(0)), Heaps::default());
+        assert_eq!(
+            Heaps::of(&container(0x200_0000)),
+            Heaps { views: true, samplers: false }
+        );
+        assert_eq!(
+            Heaps::of(&container(0x400_0000)),
+            Heaps { views: false, samplers: true }
+        );
+        assert!(Heaps::of(&container(0x600_0000)).any());
+        // Not a container at all: declare both, as every signature did
+        // before the flags followed the code, and let the device decide.
+        assert_eq!(Heaps::of(&[0u8; 16]), Heaps::all());
     }
 }

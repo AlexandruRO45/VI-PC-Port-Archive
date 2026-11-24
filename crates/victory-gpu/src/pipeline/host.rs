@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{Heaps, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -602,8 +602,14 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        // The heaps the stages' code indexes: the signature declares those
+        // and no others.
+        let mut heaps = Heaps::default();
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
+            let stage_heaps = t.heaps();
+            heaps.views |= stage_heaps.views;
+            heaps.samplers |= stage_heaps.samplers;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -721,7 +727,7 @@ impl HostPipeline {
         }
         #[cfg(feature = "diagnostics")]
         let root_started = std::time::Instant::now();
-        let made = root_signature(&host.device, &params, &samplers, compute.is_some());
+        let made = root_signature(&host.device, &params, &samplers, compute.is_some(), heaps);
         #[cfg(feature = "diagnostics")]
         super::timing::add(super::timing::Part::RootSignature, root_started.elapsed());
         let (root, root_blob) = match made {
@@ -1094,17 +1100,38 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The signature's flags: what the stages need (input layout, heaps), and
+/// nothing more. Declared from the code, not from the parameters: a shader
+/// that indexes a heap needs its flag (the validator refuses it otherwise),
+/// and a device without the feature may refuse a flag whose heap no stage
+/// touches.
+fn heap_flags(
+    input: D3D12_ROOT_SIGNATURE_FLAGS,
+    heaps: Heaps,
+) -> D3D12_ROOT_SIGNATURE_FLAGS {
+    let mut flags = input;
+    if heaps.views {
+        flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+    }
+    if heaps.samplers {
+        flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+    }
+    flags
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
+    heaps: Heaps,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
+    let flags = heap_flags(input, heaps);
     let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
         Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
         Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -1113,9 +1140,7 @@ fn root_signature(
                 pParameters: params.as_ptr(),
                 NumStaticSamplers: samplers.len() as u32,
                 pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                Flags: flags,
             },
         },
     };
@@ -1268,7 +1293,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) =
+            root_signature(&host.device, &[], &[], false, Heaps::all()).unwrap();
         let mut g = GraphicsState::default();
         // This pipeline has only a color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
@@ -1292,7 +1318,7 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
-        let (root, _) = root_signature(&host.device, &[], &[], true).unwrap();
+        let (root, _) = root_signature(&host.device, &[], &[], true, Heaps::all()).unwrap();
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -1306,5 +1332,43 @@ mod tests {
             made.is_err(),
             "an empty CS must be refused, or cs_bytes = 0 on a refusal says nothing"
         );
+    }
+
+    /// A signature's heap flags follow its code, never its parameters: the
+    /// bounded one-view tables `bounded_root_srvs()` emits are tables in a
+    /// signature whose shaders index no heap, and such a signature must
+    /// declare no heap.
+    #[test]
+    fn heap_flags_follow_the_code() {
+        let table = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        assert_eq!(
+            heap_flags(D3D12_ROOT_SIGNATURE_FLAG_NONE, Heaps::default()).0,
+            0,
+            "a signature whose code indexes no heap declares none"
+        );
+        let views =
+            heap_flags(D3D12_ROOT_SIGNATURE_FLAG_NONE, Heaps { views: true, samplers: false });
+        assert_ne!(
+            views.0 & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED.0,
+            0,
+            "a shader that indexes the view heap needs its flag"
+        );
+        assert_eq!(
+            views.0 & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED.0,
+            0,
+            "and one that does not index the sampler heap does not declare it"
+        );
+        let both = heap_flags(
+            D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+            Heaps::all(),
+        );
+        assert_ne!(
+            both.0 & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT.0,
+            0,
+            "the layout flag the caller asked for survives"
+        );
+        // The table parameter kind is what the bounded root SRVs emit; it
+        // neither adds a heap flag nor removes one.
+        let _ = table;
     }
 }

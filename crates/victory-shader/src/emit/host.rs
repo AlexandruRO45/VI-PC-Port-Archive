@@ -206,6 +206,23 @@ impl Host {
                 });
             }
         }
+        // The heaps these stages' code indexes, and no others: a signature
+        // that declares a heap its code never touches needs a device
+        // feature it does not have to.
+        let heaps = stages.iter().fold(super::Heaps::default(), |h, (s, _)| {
+            let s = s.heaps();
+            super::Heaps {
+                views: h.views || s.views,
+                samplers: h.samplers || s.samplers,
+            }
+        });
+        let mut flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        if heaps.views {
+            flags |= D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        }
+        if heaps.samplers {
+            flags |= D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
+        }
         let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
             Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
             Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
@@ -214,9 +231,7 @@ impl Host {
                     pParameters: params.as_ptr(),
                     NumStaticSamplers: samplers.len() as u32,
                     pStaticSamplers: samplers.as_ptr(),
-                    Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
-                        | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                        | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
+                    Flags: flags,
                 },
             },
         };
