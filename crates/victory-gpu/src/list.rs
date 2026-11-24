@@ -1406,7 +1406,7 @@ extern "system" fn set_predication(this: This, buffer: This, offset: u64, operat
         }
         let addr = data as u64 + offset;
         let op = D3D12_PREDICATION_OP(operation as i32);
-        if let Some(shadow) = list.latest_gpu_write_shadow(addr, 8) {
+        if let Some(shadow) = list.latest_gpu_write_shadow(addr as usize, 8) {
             let off = shadow.offset(addr);
             if !off.is_multiple_of(8) {
                 return;
@@ -2754,20 +2754,28 @@ mod tests {
         };
         let rtv_handle = heap_start(rtv_heap);
 
-        let heap_props = crate::resource::HeapProps {
-            kind: 1,
-            cpu_page: 0,
-            pool: 0,
-            creation: 0,
-            visible: 0,
-        };
-        let tex_desc = crate::resource::ResourceDesc {
+        #[repr(C)]
+        struct RawDesc {
+            dimension: u32,
+            alignment: u64,
+            width: u64,
+            height: u32,
+            depth_or_array_size: u16,
+            mip_levels: u16,
+            format: u32,
+            sample_count: u32,
+            sample_quality: u32,
+            layout: u32,
+            flags: u32,
+        }
+        let hp: [u32; 5] = [1, 0, 0, 1, 1];
+        let tex_desc = RawDesc {
             dimension: 3, // TEXTURE2D
             alignment: 0,
             width: 4,
             height: 1,
-            depth_or_array: 1,
-            mips: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
             format: 28, // R8G8B8A8_UNORM
             sample_count: 1,
             sample_quality: 0,
@@ -2778,9 +2786,9 @@ mod tests {
         assert_eq!(
             crate::resource::create_committed(
                 null,
-                &heap_props,
+                (&raw const hp).cast(),
                 0,
-                &tex_desc,
+                (&raw const tex_desc).cast(),
                 0x4, // RENDER_TARGET
                 null.cast(),
                 &resource_iid,
@@ -2791,13 +2799,13 @@ mod tests {
         crate::descriptor::create_rtv(null, tex, null.cast(), rtv_handle);
 
         // Create a 64-byte predicate buffer with [0u64, 1u64].
-        let buf_desc = crate::resource::ResourceDesc {
+        let buf_desc = RawDesc {
             dimension: 1, // BUFFER
             alignment: 0,
             width: 64,
             height: 1,
-            depth_or_array: 1,
-            mips: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
             format: 0,
             sample_count: 1,
             sample_quality: 0,
@@ -2808,9 +2816,9 @@ mod tests {
         assert_eq!(
             crate::resource::create_committed(
                 null,
-                &heap_props,
+                (&raw const hp).cast(),
                 0,
-                &buf_desc,
+                (&raw const buf_desc).cast(),
                 0,
                 null.cast(),
                 &resource_iid,
