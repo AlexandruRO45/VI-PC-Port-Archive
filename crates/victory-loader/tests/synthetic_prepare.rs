@@ -1430,3 +1430,126 @@ fn builds_that_differ_only_in_their_checksum_prepare_to_the_same_bytes_under_dif
     assert_eq!(b.original_hash, blake3::hash(&second));
     assert_ne!(a.file_name(), b.file_name());
 }
+
+#[test]
+fn dll_characteristics_other_than_force_integrity_are_kept_as_written() {
+    // Every bit set, defined or reserved: only FORCE_INTEGRITY goes.
+    let mut original = image();
+    let at = OPT + layout::OPT_DLL_CHARACTERISTICS;
+    put16(&mut original, at, 0xFFFF);
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(prepared.info.dll_characteristics, 0xFFFF);
+    assert_eq!(
+        ImageInfo::parse(&prepared.bytes)
+            .unwrap()
+            .dll_characteristics,
+        !dll_flags::FORCE_INTEGRITY
+    );
+
+    // Without FORCE_INTEGRITY the word comes through bit for bit.
+    let flags = dll_flags::GUARD_CF | dll_flags::APPCONTAINER | dll_flags::NX_COMPAT;
+    put16(&mut original, at, flags);
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[at..at + 2], &flags.to_le_bytes());
+}
+
+#[test]
+fn data_after_the_last_section_is_carried_over_unchanged() {
+    // An overlay (installer payload, certificate table) past the raw data
+    // of the last section is not part of any mapping; the copy keeps it.
+    let mut original = image();
+    let overlay: Vec<u8> = (0..=255u8).cycle().take(0x300).collect();
+    original.extend_from_slice(&overlay);
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(prepared.bytes.len(), original.len());
+    assert_eq!(&prepared.bytes[SECTION_FILE + SECTION_SIZE..], &overlay[..]);
+    assert_eq!(prepared.original_hash, blake3::hash(&original));
+    assert_ne!(
+        prepared.file_name(),
+        prepare(&image()).unwrap().file_name(),
+        "the overlay is part of the build that names the copy"
+    );
+    // Apart from the overlay, the same bytes change as without it.
+    let expected = expected_changes();
+    let unexpected: Vec<usize> = (0..original.len())
+        .filter(|&i| original[i] != prepared.bytes[i])
+        .filter(|i| !expected.iter().any(|r| r.contains(i)))
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected bytes changed: {unexpected:#x?}"
+    );
+}
+
+#[test]
+fn the_callback_relocation_is_cleared_even_when_relocations_are_marked_stripped() {
+    // The parser reports no relocations for a stripped image, but the
+    // table is still in the file; its entry for the callback field is made
+    // a no-op all the same, so nothing can re-arm the pointer.
+    let mut original = image();
+    let flags = FILE_HEADER + layout::FILE_HEADER_CHARACTERISTICS;
+    put16(&mut original, flags, 0x0022 | file_flags::RELOCS_STRIPPED);
+    let prepared = prepare(&original).unwrap();
+    assert!(!prepared.info.has_relocations);
+    assert_eq!(
+        layout::read_u64(&prepared.bytes, file(callbacks_field())),
+        Some(0)
+    );
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    // The other two entries (index slot, callback array) are untouched.
+    assert_eq!(
+        &prepared.bytes[file(RELOCS) + 8..][..2],
+        &original[file(RELOCS) + 8..][..2]
+    );
+    assert_eq!(
+        &prepared.bytes[file(RELOCS) + 12..][..2],
+        &original[file(RELOCS) + 12..][..2]
+    );
+    assert_eq!(
+        ImageInfo::parse(&prepared.bytes).unwrap().characteristics,
+        0x0022 | file_flags::RELOCS_STRIPPED | file_flags::DLL
+    );
+}
+
+#[test]
+fn a_callback_pointer_to_an_empty_array_is_still_cleared() {
+    // The array can gain entries at run time (a callback may add the next
+    // one), so a non-zero pointer is cleared whatever it points at now.
+    let mut original = image();
+    put64(&mut original, file(CALLBACKS), 0);
+    let info = ImageInfo::parse(&original).unwrap();
+    let tls = info.tls.as_ref().unwrap();
+    assert_eq!(tls.callbacks_va, IMAGE_BASE + u64::from(CALLBACKS));
+    assert!(tls.callback_rvas.is_empty());
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(
+        layout::read_u64(&prepared.bytes, file(callbacks_field())),
+        Some(0)
+    );
+    assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    assert_eq!(
+        ImageInfo::parse(&prepared.bytes)
+            .unwrap()
+            .tls
+            .unwrap()
+            .callbacks_va,
+        0
+    );
+}
+
+#[test]
+fn errors_say_whether_parsing_or_patching_failed() {
+    use victory_loader::PrepareError;
+    // What does not parse is the parser's error, passed through as is.
+    let err = prepare(b"MZ").unwrap_err();
+    assert!(matches!(err, PrepareError::Pe(_)), "{err:?}");
+    let pe = victory_pe::ImageInfo::parse(b"MZ").unwrap_err();
+    assert_eq!(err.to_string(), pe.to_string());
+    // A patch that cannot be made says so, with its reason.
+    let err = PrepareError::Patch("TLS directory is not file-backed");
+    assert_eq!(
+        err.to_string(),
+        "cannot patch image: TLS directory is not file-backed"
+    );
+}
