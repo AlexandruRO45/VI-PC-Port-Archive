@@ -93,6 +93,15 @@ const MIN_DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        Self::with_capacity(sampler, count, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_capped(count: u32, dynamic: u32) -> Option<Self> {
+        Self::with_capacity(false, count, Some(dynamic))
+    }
+
+    fn with_capacity(sampler: bool, count: u32, test_dynamic: Option<u32>) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -123,7 +132,9 @@ impl HostHeap {
         // Translated shaders clamp their indices below `HEAP_VIEWS` or
         // `HEAP_SAMPLERS`: slots up to there exist and stay null.
         let (views, samplers) = (victory_shader::emit::HEAP_VIEWS, victory_shader::emit::HEAP_SAMPLERS);
-        let (heap, count, extra) = if sampler {
+        let (heap, count, extra) = if let Some(extra) = test_dynamic {
+            (make(count + extra).ok()?, count, extra)
+        } else if sampler {
             match make(count.max(samplers)) {
                 Ok(heap) => (heap, count, 0),
                 Err(e) => {
@@ -274,10 +285,14 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    pub(crate) fn can_allocate_table(&self, n: u32) -> bool {
+        !self.sampler && (1..=self.dynamic).contains(&n)
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+        if !self.can_allocate_table(n) {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -950,8 +965,8 @@ fn buffer_uav(
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+fn fits(texture: &ID3D12Resource, castable: &[u32], format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+    use crate::resource::DEPTH_FORMATS;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
     let allowed = if unordered {
@@ -969,36 +984,63 @@ fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI
         );
         return false;
     }
-    // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
-    if let Some(format) = format.as_deref_mut()
-        && unordered
-        && let Some(&(_, linear)) = crate::resource::SRGB
-            .iter()
-            .find(|&&(s, _)| s == format.0 as u32)
+    let view = format.as_ref().map(|f| f.0 as u32);
+    match (typed_view(own, castable, view, unordered, typed_store), format) {
+        (Ok(Some(chosen)), Some(format)) => {
+            format.0 = chosen as i32;
+            true
+        }
+        (Ok(None), _) => true,
+        (Ok(Some(_)), None) => false,
+        (Err(reason), _) => {
+            once!(?view, own, reason, "view the host cannot make");
+            false
+        }
+    }
+}
+
+/// Resolve the effective typed format before checking casts and UAV support.
+/// An absent descriptor is different from an explicit DXGI_FORMAT_UNKNOWN.
+fn typed_view(
+    own: u32,
+    castable: &[u32],
+    view: Option<u32>,
+    unordered: bool,
+    stores: impl FnOnce(u32) -> bool,
+) -> Result<Option<u32>, &'static str> {
+    use crate::resource::{family, is_typeless, typed_view_format};
+    let own_typeless = is_typeless(own);
+    let Some(view) = view else {
+        return if own_typeless {
+            Err("typeless texture without a view description")
+        } else {
+            Ok(None)
+        };
+    };
+    if view == 0 && !own_typeless {
+        return Ok(None); // preserve the original typed-resource default
+    }
+    let requested = if view == 0 { own } else { view };
+    let mut typed = if is_typeless(requested) {
+        typed_view_format(requested).ok_or("no typed member")?
+    } else {
+        requested
+    };
+    if unordered
+        && let Some(&(_, linear)) = crate::resource::SRGB.iter().find(|&&(f, _)| f == typed)
     {
-        format.0 = linear as i32;
+        typed = linear;
     }
-    let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return !typeless;
+    let same = family(typed) == family(own);
+    let cast = castable.contains(&typed);
+    if !same && !cast {
+        return Err("format not in family or castable list");
     }
-    let cast = castable.contains(&view);
-    if family(view) != family(own) && !cast {
-        once!(view, own, "view format of another family");
-        return false;
+    let chosen = if own_typeless || cast { typed } else { own };
+    if unordered && (chosen != own || own_typeless) && !stores(chosen) {
+        return Err("format does not support typed UAVs");
     }
-    if cast && family(view) != family(own) && unordered && !typed_store(view) {
-        once!(view, own, "an unordered view in a format the host cannot store");
-        return false;
-    }
-    if let Some(format) = format
-        && !typeless
-        && !cast
-    {
-        *format = d.Format;
-    }
-    true
+    Ok(Some(chosen))
 }
 
 /// Whether a view without a description of `resource` (a title texture)
@@ -1416,6 +1458,32 @@ mod tests {
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
+    #[test]
+    fn typeless_views_preserve_upstream_casts_and_validate_uavs() {
+        let srv = |own, casts: &[u32], view| typed_view(own, casts, view, false, |_| unreachable!());
+        assert_eq!(srv(9, &[], Some(9)), Ok(Some(10)));
+        assert_eq!(srv(27, &[], Some(0)), Ok(Some(28)));
+        assert_eq!(srv(44, &[], Some(44)), Ok(Some(46)));
+        assert_eq!(srv(9, &[], Some(11)), Ok(Some(11)));
+        assert_eq!(srv(10, &[], Some(9)), Ok(Some(10)));
+        assert!(srv(9, &[], None).is_err());
+        assert!(srv(42, &[], Some(67)).is_err());
+        assert_eq!(srv(42, &[67], Some(67)), Ok(Some(67)));
+        assert_eq!(srv(28, &[29], Some(29)), Ok(Some(29)));
+        assert!(typed_view(42, &[67], Some(67), true, |_| false).is_err());
+        assert_eq!(typed_view(27, &[28, 29], Some(29), true, |f| f == 28), Ok(Some(28)));
+        use crate::resource::{family, is_typeless, typed_view_format};
+        for format in 1..=120 {
+            if is_typeless(format) {
+                let typed = typed_view_format(format).expect("typeless family needs a default");
+                assert_eq!(family(typed), format);
+                assert!(!is_typeless(typed));
+            } else {
+                assert_eq!(typed_view_format(format), None);
+            }
+        }
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {

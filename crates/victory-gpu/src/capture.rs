@@ -224,6 +224,138 @@ pub(crate) fn save_read_back(
     }
 }
 
+pub(crate) mod blit;
+
+type TargetShape = (u64, u32, i32);
+type Target = std::sync::Arc<crate::resource::HostTexture>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShowSpec {
+    List,
+    Target(TargetShape),
+}
+
+fn parse_show(value: &str) -> Option<ShowSpec> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("list") {
+        return Some(ShowSpec::List);
+    }
+    let (size, format) = value.split_once("-f")?;
+    let (width, height) = size.split_once('x')?;
+    let (w, h, f) = (width.parse().ok()?, height.parse().ok()?, format.parse().ok()?);
+    (w > 0 && h > 0 && f > 0).then_some(ShowSpec::Target((w, h, f)))
+}
+
+fn show_spec() -> Option<ShowSpec> {
+    static SPEC: std::sync::OnceLock<Option<ShowSpec>> = std::sync::OnceLock::new();
+    *SPEC.get_or_init(|| {
+        let value = std::env::var("VICTORY_SHOW_TARGET").ok()?;
+        let spec = parse_show(&value);
+        if spec.is_none() {
+            tracing::warn!(%value, "invalid VICTORY_SHOW_TARGET; expected list or <w>x<h>-f<format>");
+        }
+        spec
+    })
+}
+
+pub(crate) fn requested_target_format() -> Option<DXGI_FORMAT> {
+    match show_spec()? {
+        ShowSpec::Target((_, _, f)) => Some(DXGI_FORMAT(f)),
+        ShowSpec::List => None,
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ShowNotes {
+    shapes: std::collections::BTreeSet<TargetShape>,
+    selected: Option<Target>,
+}
+
+static SHOW_FRAME: std::sync::Mutex<Option<ShowNotes>> = std::sync::Mutex::new(None);
+
+impl ShowNotes {
+    fn add(&mut self, spec: ShowSpec, copy: Target) {
+        // SAFETY: the Arc keeps the texture live.
+        let d = unsafe { copy.texture.GetDesc() };
+        let shape = (d.Width, d.Height, d.Format.0);
+        match spec {
+            ShowSpec::List => {
+                self.shapes.insert(shape);
+            }
+            ShowSpec::Target(wanted) if wanted == shape => self.selected = Some(copy),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn record(&mut self, resource: crate::object::This) {
+        if let Some(spec) = show_spec()
+            && let Some(copy) = crate::resource::host_copy(resource)
+        {
+            self.add(spec, copy);
+        }
+    }
+
+    fn merge_into(&self, frame: &mut Self) {
+        frame.shapes.extend(self.shapes.iter().copied());
+        if let Some(copy) = &self.selected {
+            frame.selected = Some(copy.clone());
+        }
+    }
+
+    pub(crate) fn submitted(&self) {
+        if self.selected.is_none() && self.shapes.is_empty() {
+            return;
+        }
+        let mut frame = SHOW_FRAME.lock().unwrap_or_else(|e| e.into_inner());
+        self.merge_into(frame.get_or_insert_with(Default::default));
+    }
+}
+
+pub(crate) fn show_enabled() -> bool {
+    show_spec().is_some()
+}
+
+/// Only the last matching **submitted** target since the previous present.
+/// Keep recording ahead of the GPU from selecting an unwritten texture.
+pub(crate) fn take_show_target(frame: u64) -> Option<Target> {
+    let spec = show_spec()?;
+    let notes = SHOW_FRAME.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if spec == ShowSpec::List {
+        let shapes: Vec<_> = notes.shapes.into_iter().map(|(w, h, f)| format!("{w}x{h}-f{f}")).collect();
+        tracing::info!(frame, ?shapes, "show target inventory");
+    }
+    notes.selected
+}
+
+#[cfg(test)]
+mod show_tests {
+    use super::*;
+
+    #[test]
+    fn submitted_inventories_merge_without_repeating_shapes() {
+        let mut frame = ShowNotes::default();
+        let a = (2560, 1440, 10);
+        let b = (1920, 1080, 28);
+        let mut first = ShowNotes::default();
+        first.shapes.insert(a);
+        let mut second = ShowNotes::default();
+        second.shapes.extend([a, b]);
+        first.merge_into(&mut frame);
+        second.merge_into(&mut frame);
+        assert_eq!(std::mem::take(&mut frame).shapes.into_iter().collect::<Vec<_>>(), [b, a]);
+        assert!(frame.shapes.is_empty());
+    }
+
+    #[test]
+    fn show_parser_accepts_inventory_and_positive_shape() {
+        assert_eq!(parse_show(" LIST "), Some(ShowSpec::List));
+        assert_eq!(parse_show(" 2560x1440-f10 "), Some(ShowSpec::Target((2560, 1440, 10))));
+        for bad in ["", "2560x1440", "2560-f28", "ax1440-f28", "0x1440-f28", "1x1-f-1"] {
+            assert_eq!(parse_show(bad), None);
+        }
+    }
+}
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
@@ -270,7 +402,13 @@ static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mut
 /// command of `list`, whose submission dumps it again when the frame is
 /// listed).
 pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
-    if resource.is_null() || !dump_on() {
+    if resource.is_null() {
+        return;
+    }
+    if show_enabled() {
+        list.note_show_target(resource);
+    }
+    if !dump_on() {
         return;
     }
     let by = WRITER.with(|w| w.borrow().clone());
