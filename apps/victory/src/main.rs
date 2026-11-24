@@ -181,6 +181,7 @@ fn show_config() -> Result<()> {
     );
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
+    println!("data_dir    : {}", cfg.data_dir.display());
     match agility::runtime_dir().map(|d| d.join("D3D12Core.dll")) {
         Some(dll) if dll.exists() => println!(
             "d3d12 sdk   : {} (version {})",
@@ -198,7 +199,7 @@ fn show_config() -> Result<()> {
         .game_dir
         .iter()
         .chain(&cfg.test_titles)
-        .chain([&cfg.cache_dir])
+        .chain([&cfg.cache_dir, &cfg.data_dir])
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
