@@ -5298,7 +5298,7 @@ impl<'a> Lower<'a> {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4, 0) | (6, 0 | 1 | 2) => keep = false,
+                (4, 0) | (6, 0..=2) => keep = false,
                 (4, 1) => {
                     keep = false;
                     sext = true;
