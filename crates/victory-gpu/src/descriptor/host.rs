@@ -111,6 +111,12 @@ struct Bindless {
     /// texture (held, so its address names it alone), the frame last uploaded,
     /// and whether it is a placed texture.
     uploaded: HashMap<usize, (ID3D12Resource, u64, bool)>,
+    /// Uploads recorded on lists none of which was submitted yet, by
+    /// resource object: the host texture, the frame, and how to reach it.
+    /// Until one is, every list recorded carries the upload too (the first
+    /// may be dropped, or submitted after another that reads the texture);
+    /// the submission of one makes the texture uploaded.
+    unsubmitted: HashMap<usize, (ID3D12Resource, u64, RecheckTarget)>,
     /// Uploaded textures by frame, oldest first, to look at again.
     recheck: VecDeque<(u64, RecheckTarget)>,
     /// A frame and the uploads of known textures done in it.
@@ -125,7 +131,7 @@ struct Bindless {
 }
 
 /// A bindless texture queued for periodic CPU-memory recheck.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RecheckTarget {
     Placed(usize),
     /// `(slot_index, view_index, generation, resource_address)`.
@@ -1191,7 +1197,9 @@ impl HostHeap {
     /// the upload of the textures they newly reach and of a few known ones
     /// due a look ([`RECHECK_FRAMES`]), each moved to the shader resource
     /// state. Buffer and constant-buffer views are materialized and refreshed
-    /// at submission from [`HostHeap::bindless_plan`].
+    /// at submission from [`HostHeap::bindless_plan`]. An upload counts as
+    /// done once a list carrying it is submitted; until then each list
+    /// recorded carries it too.
     ///
     /// shortcut: a texture is moved to the shader resource state in the list
     /// that uploads it and keeps that state after; one another list moves
@@ -1226,7 +1234,7 @@ impl HostHeap {
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let live = evictions.then(crate::resource::placed_live);
-        let (todo, due) = {
+        let (todo, due, unsubmitted) = {
             // The submission may hold the heap's lock for a while: the work
             // waits for a later draw rather than this one waiting.
             let mut b = match self.bindless.try_lock() {
@@ -1238,6 +1246,9 @@ impl HostHeap {
             if let Some(live) = &live {
                 b.uploaded
                     .retain(|t, (_, _, placed)| !*placed || live.contains(t));
+                b.unsubmitted.retain(|t, (_, _, target)| {
+                    !matches!(target, RecheckTarget::Placed(_)) || live.contains(t)
+                });
                 for (&slot, &(_, t)) in &b.recorded {
                     if !live.contains(&t) {
                         b.record_pending.insert(slot);
@@ -1274,10 +1285,24 @@ impl HostHeap {
                     .map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
                 Ordering::Release,
             );
-            self.record_hint
-                .store(!b.record_pending.is_empty(), Ordering::Release);
-            (todo, due)
+            // Uploads no submitted list carried yet: this list carries them
+            // too (checked like known ones, without their per-frame limit).
+            let unsubmitted: Vec<_> = b
+                .unsubmitted
+                .values()
+                .map(|&(_, f, target)| (f, target))
+                .collect();
+            self.record_hint.store(
+                !b.record_pending.is_empty() || !unsubmitted.is_empty(),
+                Ordering::Release,
+            );
+            (todo, due, unsubmitted)
         };
+        // Less those this list carries already (a draw before this one).
+        let mut due = due;
+        due.extend(unsubmitted.into_iter().filter(|&(_, target)| match target {
+            RecheckTarget::Placed(t) | RecheckTarget::Ordinary(.., t) => !list.carries(t),
+        }));
         if todo.is_empty() && due.is_empty() {
             return;
         }
@@ -1317,26 +1342,34 @@ impl HostHeap {
             }
         }
         over.extend(todo.map(|(i, _)| i));
+        // Targets no longer reached: not carried by later lists either.
+        let mut gone = Vec::new();
         for (recheck_frame, target) in due {
             match target {
                 RecheckTarget::Placed(t) => {
                     if let Some(held) = crate::resource::hold_placed(t as crate::object::This) {
                         reached.push(held);
+                    } else {
+                        gone.push(target);
                     }
                 }
                 RecheckTarget::Ordinary(slot, vi, generation, tex_addr) => {
                     match self.resolve_ordinary_texture(slot, vi, generation) {
                         Ok(Some(tex)) => reached_ordinary.push((slot, vi, generation, tex)),
-                        Ok(None) => {}
+                        Ok(None) => gone.push(target),
                         Err(()) => {
                             stale.push(slot);
                             stale_ordinary.push((tex_addr, recheck_frame));
+                            gone.push(target);
                         }
                     }
                 }
             }
         }
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        // Uploads the texture module declines (a texture the host wrote):
+        // no list will carry them, so they count as done.
+        let mut declined = Vec::new();
         for held in reached {
             let texture = held.as_this();
             let Some(host_tex) = crate::resource::host_resource(texture) else {
@@ -1351,6 +1384,9 @@ impl HostHeap {
                 )
             {
                 crate::texture::upload(list, texture, host_tex);
+                if !list.carries(texture as usize) {
+                    declined.push(texture as usize);
+                }
             }
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
@@ -1367,6 +1403,9 @@ impl HostHeap {
                 )
             {
                 crate::texture::upload(list, texture, host_tex);
+                if !list.carries(texture as usize) {
+                    declined.push(texture as usize);
+                }
             }
             crate::list::ensure_state(list, texture, SHADER_RESOURCE);
         }
@@ -1384,9 +1423,20 @@ impl HostHeap {
                     b.uploaded.remove(&tex_addr);
                 }
             }
+            for target in gone {
+                let (RecheckTarget::Placed(t) | RecheckTarget::Ordinary(.., t)) = target;
+                if b.unsubmitted.get(&t).is_some_and(|e| e.2 == target) {
+                    b.unsubmitted.remove(&t);
+                }
+            }
             b.record_pending.extend(over);
-            self.record_hint
-                .store(!b.record_pending.is_empty(), Ordering::Release);
+            self.record_hint.store(
+                !b.record_pending.is_empty() || !b.unsubmitted.is_empty(),
+                Ordering::Release,
+            );
+        }
+        if !declined.is_empty() {
+            self.bindless_submitted(|t| declined.contains(&t));
         }
         let us = started.elapsed().as_micros() as u64;
         self.budget_spend(1, us);
@@ -1459,7 +1509,8 @@ impl HostHeap {
 
     /// Whether to upload bindless texture `texture` (reached through a slot)
     /// in a list recorded in `frame`: the first time, then as
-    /// [`RECHECK_FRAMES`] allows.
+    /// [`RECHECK_FRAMES`] allows, and while no list carrying the upload was
+    /// submitted ([`HostHeap::bindless_submitted`]).
     fn upload_due(
         &self,
         texture: crate::object::This,
@@ -1468,9 +1519,14 @@ impl HostHeap {
         target: RecheckTarget,
     ) -> bool {
         use windows::core::Interface;
-        let is_placed = matches!(target, RecheckTarget::Placed(_));
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
         let b = &mut *b;
+        if b.unsubmitted
+            .get(&(texture as usize))
+            .is_some_and(|(h, ..)| h.as_raw() == host.as_raw())
+        {
+            return true;
+        }
         let due = match b.uploaded.get(&(texture as usize)) {
             None => true,
             // Another texture at the object's address.
@@ -1485,17 +1541,52 @@ impl HostHeap {
             Some(_) => false,
         };
         if due {
-            b.uploaded
-                .insert(texture as usize, (host.clone(), frame, is_placed));
-            b.recheck.push_back((frame, target));
-            self.recheck_at.store(
-                b.recheck
-                    .front()
-                    .map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
-                Ordering::Release,
-            );
+            b.unsubmitted
+                .insert(texture as usize, (host.clone(), frame, target));
+            self.record_hint.store(true, Ordering::Release);
         }
         due
+    }
+
+    /// At the submission of a list that carries the uploads of the textures
+    /// `carried` says (by resource object): they are uploaded as of the
+    /// frame they were recorded in, and looked at again from then on. Lists
+    /// recorded after no longer carry them.
+    pub(crate) fn bindless_submitted(&self, carried: impl Fn(usize) -> bool) {
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        let b = &mut *b;
+        if b.unsubmitted.is_empty() {
+            return;
+        }
+        let done: Vec<usize> = b
+            .unsubmitted
+            .keys()
+            .copied()
+            .filter(|&t| carried(t))
+            .collect();
+        if done.is_empty() {
+            return;
+        }
+        for t in done {
+            let Some((host, frame, target)) = b.unsubmitted.remove(&t) else {
+                continue;
+            };
+            let placed = matches!(target, RecheckTarget::Placed(_));
+            b.uploaded.insert(t, (host, frame, placed));
+            // Recorded in order, not always submitted in order.
+            let at = b.recheck.partition_point(|&(f, _)| f <= frame);
+            b.recheck.insert(at, (frame, target));
+        }
+        self.recheck_at.store(
+            b.recheck
+                .front()
+                .map_or(u64::MAX, |&(f, _)| f + RECHECK_FRAMES),
+            Ordering::Release,
+        );
+        self.record_hint.store(
+            !b.record_pending.is_empty() || !b.unsubmitted.is_empty(),
+            Ordering::Release,
+        );
     }
 
     /// At submission: what the heap's bindless slots need. Only slots
@@ -2834,16 +2925,23 @@ void main() {
         let (b, _) = host.shared_buffer(1 << 16).unwrap();
         let tex = 0x1000 as crate::object::This;
         let target = |t: crate::object::This| RecheckTarget::Placed(t as usize);
+        let submit = || heap.bindless_submitted(|_| true);
         assert!(
             heap.upload_due(tex, &a, 10, target(tex)),
             "first reach uploads"
         );
+        assert!(
+            heap.upload_due(tex, &a, 10, target(tex)),
+            "every list carries the upload until one is submitted"
+        );
+        submit();
         assert!(!heap.upload_due(tex, &a, 10, target(tex)));
         assert!(!heap.upload_due(tex, &a, 10 + RECHECK_FRAMES - 1, target(tex)));
         assert!(
             heap.upload_due(tex, &b, 11, target(tex)),
             "a new texture at the address"
         );
+        submit();
         assert!(
             heap.upload_due(tex, &b, 11 + RECHECK_FRAMES, target(tex)),
             "looked at again"
@@ -2854,6 +2952,7 @@ void main() {
             .map(|i| {
                 let t = (0x2000 + i) as crate::object::This;
                 assert!(heap.upload_due(t, &a, 0, target(t)));
+                submit();
                 t
             })
             .collect();
@@ -3112,7 +3211,8 @@ void main() {
 
     /// An ordinary resource-backed CPU texture SRV reached only through a
     /// shader-visible bindless heap schedules its initial upload during
-    /// `prepare_bindless_record` and re-uploads after `RECHECK_FRAMES`.
+    /// `prepare_bindless_record` (again on a later list when the first is
+    /// dropped unsubmitted) and re-uploads after `RECHECK_FRAMES`.
     #[test]
     fn ordinary_bindless_texture_srv_uploads_and_refreshes_on_gpu() {
         const TEX_PROBE_HLSL: &str = r#"
@@ -3289,11 +3389,24 @@ void main() {
             list.reset();
         };
 
-        // First draw must upload the ordinary CPU-backed texture and sample it.
+        // A first recording that schedules the upload is dropped unsubmitted:
+        // the upload stays pending for the next list that reads the texture.
+        let dropped = host.new_list().unwrap();
+        host_heap.prepare_bindless_record(&dropped);
+        assert!(!dropped.first_use(tex_res as usize));
+        dropped.close();
+        dropped.reset();
+
+        // The next draw must upload the ordinary CPU-backed texture and sample it.
         run_probe(&list, true);
         // SAFETY: GPU finished and copied UAV output back to `uav_addr`.
         let first = unsafe { (uav_addr as *const u32).read_volatile() };
         assert_eq!(first, 0x7856_3412);
+        // Submitted once, it is not uploaded again before its recheck.
+        host_heap.prepare_bindless_record(&list);
+        assert!(list.first_use(tex_res as usize));
+        list.close();
+        list.reset();
 
         // Modify CPU bytes and advance past the normal recheck interval.
         // SAFETY: inside `mem`.

@@ -1161,6 +1161,11 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the list brings `key` (a texture) up to date already.
+    pub(crate) fn carries(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -1214,6 +1219,9 @@ impl HostList {
         let deferred = self.deferred();
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
+            // The bindless texture uploads recorded on the list are done
+            // now, not when recorded (a list may be dropped unsubmitted).
+            heap.bindless_submitted(|t| deferred.textures.contains(&t));
         }
         for step in &deferred.copies {
             let started = std::time::Instant::now();
