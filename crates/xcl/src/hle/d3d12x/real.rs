@@ -4532,6 +4532,10 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     graphics_pso(this, desc, riid, ppv, false)
 }
 
+pub(super) unsafe extern "system" fn dev_create_graphics_pso_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    graphics_pso(this, desc, riid, ppv, true)
+}
+
 /// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
 unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
@@ -5206,7 +5210,7 @@ pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void
         return hr;
     }
     match stream_pipeline(desc) {
-        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Graphics(d) => return super::device_x::create_graphics_pso_tracked(this, &*d as *const _ as *const c_void, riid, ppv, true),
         StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
         StreamPipeline::Unknown => {}
     }

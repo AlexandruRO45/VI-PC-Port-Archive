@@ -144,7 +144,7 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 /// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
 /// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    create_graphics_pso_tracked(this, desc, riid, ppv, false)
 }
 
 /// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
@@ -187,8 +187,13 @@ pub(super) unsafe fn dynamic_depth_bias_supported(dev: *mut c_void) -> bool {
 
 /// Create a graphics PSO, enabling `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when the
 /// device supports it (retrying without the flag if creation fails), and record it as a base.
-unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+pub(super) unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     let mut used_dynamic = false;
+    let create = |desc| if stream {
+        real::dev_create_graphics_pso_stream(this, desc, riid, ppv)
+    } else {
+        real::dev_create_graphics_pso(this, desc, riid, ppv)
+    };
     let hr = if !desc.is_null() && crate::gpu::shader::readable(desc as usize, GFX_DESC) {
         let orig = GfxDesc((desc as *const [u8; GFX_DESC]).read_unaligned());
         let already_dynamic = rd32(&orig.0, PSO_FLAGS) & FLAG_DYNAMIC_DEPTH_BIAS != 0;
@@ -196,19 +201,19 @@ unsafe fn create_graphics_pso_tracked(this: *mut c_void, desc: *const c_void, ri
         if want_dynamic {
             let mut dyn_desc = orig;
             enable_dynamic_depth_bias(&mut dyn_desc.0);
-            let hr = real::dev_create_graphics_pso(this, dyn_desc.0.as_ptr() as *const c_void, riid, ppv);
+            let hr = create(dyn_desc.0.as_ptr() as *const c_void);
             if hr >= 0 {
                 used_dynamic = true;
                 hr
             } else {
-                real::dev_create_graphics_pso(this, desc, riid, ppv)
+                create(desc)
             }
         } else {
             used_dynamic = already_dynamic;
-            real::dev_create_graphics_pso(this, desc, riid, ppv)
+            create(desc)
         }
     } else {
-        real::dev_create_graphics_pso(this, desc, riid, ppv)
+        create(desc)
     };
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         note_base(*ppv, desc, used_dynamic);
@@ -561,7 +566,7 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
         }
     }
     let desc = d.0.as_ptr() as *const c_void;
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    create_graphics_pso_tracked(this, desc, riid, ppv, false)
 }
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
@@ -1259,5 +1264,35 @@ mod tests {
         assert_eq!(allocation_of([(K64, K64), (u64::MAX, 0), (M4, M4)], |_, _, _, _| placed += 1), (u64::MAX, K64));
         assert_eq!(placed, 1);
         assert_eq!(allocation_of(std::iter::empty(), |_, _, _, _| {}), (0, 0));
+    }
+
+    #[test]
+    fn stream_graphics_pso_is_tracked_as_base() {
+        let dummy_pso = 0x1234_5678 as *mut c_void;
+        let mut desc = [0u8; GFX_DESC];
+        // Set sample rasterizer depth bias fields
+        desc[RASTERIZER_DEPTH_BIAS..RASTERIZER_DEPTH_BIAS + 4].copy_from_slice(&(-100i32).to_le_bytes());
+        desc[RASTERIZER_DEPTH_BIAS_CLAMP..RASTERIZER_DEPTH_BIAS_CLAMP + 4].copy_from_slice(&0.1f32.to_le_bytes());
+        desc[RASTERIZER_SLOPE_SCALED_DEPTH_BIAS..RASTERIZER_SLOPE_SCALED_DEPTH_BIAS + 4].copy_from_slice(&2.0f32.to_le_bytes());
+
+        // Dummy shader bytes for stage_hashes (VS at STAGES[0])
+        let vs_bytes = [0u8; 16];
+        desc[STAGES[0]..STAGES[0] + 8].copy_from_slice(&(vs_bytes.as_ptr() as u64).to_le_bytes());
+        desc[STAGES[0] + 8..STAGES[0] + 16].copy_from_slice(&(vs_bytes.len() as u64).to_le_bytes());
+
+        unsafe {
+            note_base(dummy_pso, desc.as_ptr() as *const c_void, true);
+        }
+
+        let info = base_depth_bias_info(dummy_pso as usize);
+        assert!(info.is_some());
+        let (dynamic, bias) = info.unwrap();
+        assert!(dynamic);
+        assert_eq!(bias.depth_bias(), -100.0);
+        assert_eq!(bias.depth_bias_clamp(), 0.1);
+        assert_eq!(bias.slope_scaled_depth_bias(), 2.0);
+
+        forget_base(dummy_pso as usize);
+        assert!(base_depth_bias_info(dummy_pso as usize).is_none());
     }
 }
