@@ -107,6 +107,19 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
             }
         }
+        // The parser reads the directory through `object`, which skips a
+        // section with no virtual size; `rva_to_file_offset` maps that
+        // section by its raw size. A damaged section table can make the two
+        // disagree, and then the write above lands somewhere else while the
+        // callbacks stay armed. The copy must never run them on its own.
+        if ImageInfo::parse(&bytes)?
+            .tls
+            .is_some_and(|tls| tls.callbacks_va != 0)
+        {
+            return Err(PrepareError::Patch(
+                "TLS callback pointer is not where the image was parsed from",
+            ));
+        }
     }
 
     Ok(PreparedImage {

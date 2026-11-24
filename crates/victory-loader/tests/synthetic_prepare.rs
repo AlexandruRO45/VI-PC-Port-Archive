@@ -787,3 +787,30 @@ fn an_import_directory_without_an_rva_is_left_as_it_is() {
         &[0; 8]
     );
 }
+
+#[test]
+fn a_section_table_that_hides_the_tls_directory_is_an_error() {
+    // A first section with no virtual size but raw data at the headers,
+    // over the same RVAs as `.data`. The parser skips it and reads the TLS
+    // directory from `.data`; the RVA-to-file mapping, which treats a zero
+    // virtual size as the raw size, lands in the headers. Clearing the
+    // pointer there would leave the real callbacks armed, so `prepare`
+    // must fail instead of handing out a copy the OS would run.
+    let mut original = image();
+    let data = original[SECTIONS..SECTIONS + 40].to_vec();
+    put(&mut original, SECTIONS + 40, &data);
+    put16(&mut original, FILE_HEADER + 2, 2); // sections
+    put(&mut original, SECTIONS, b".ghost\0\0");
+    put32(&mut original, SECTIONS + 8, 0); // virtual size
+    put32(&mut original, SECTIONS + 20, 0); // raw data at the headers
+
+    let info = ImageInfo::parse(&original).unwrap();
+    let tls = info.tls.as_ref().unwrap();
+    assert_eq!(tls.callbacks_va, IMAGE_BASE + u64::from(CALLBACKS));
+    assert_eq!(info.rva_to_file_offset(TLS), Some(TLS - SECTION_RVA));
+
+    assert!(matches!(
+        prepare(&original),
+        Err(victory_loader::PrepareError::Patch(_))
+    ));
+}
