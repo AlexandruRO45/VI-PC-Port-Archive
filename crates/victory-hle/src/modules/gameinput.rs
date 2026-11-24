@@ -387,6 +387,10 @@ impl Hub {
         let hub = Hub::new(source);
         hub.poll();
         std::thread::spawn(move || {
+            // Device callbacks are title code: this thread needs a TEB of
+            // its own, not the one inherited with its creator's GS base.
+            #[cfg(target_os = "linux")]
+            victory_loader::linux::thread::attach_current();
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();
