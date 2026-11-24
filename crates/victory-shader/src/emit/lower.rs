@@ -3753,6 +3753,22 @@ impl<'a> Lower<'a> {
         {
             return self.boolean(m, self.cur);
         }
+        // An inline constant mask: no lane, every lane, or (with console
+        // lanes) the lane's own bit of the sign-extended constant.
+        if let Some(&Operand::Const(k)) = mask {
+            let x = crate::resource::inline(k).ok_or(UNTRACKED_SELECT)?;
+            return if x == 0 {
+                Ok(self.s.m.bool(false))
+            } else if x == u32::MAX {
+                Ok(self.s.m.bool(true))
+            } else if self.console_lanes {
+                let lo = self.s.m.i32(x);
+                let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                Ok(self.lane_bit(self.cur, lo, Some(hi)))
+            } else {
+                Err("a constant lane mask")
+            };
+        }
         let Some(&Operand::Scalar { code, .. }) = mask else {
             return Err(UNTRACKED_SELECT);
         };
@@ -3760,6 +3776,15 @@ impl<'a> Lower<'a> {
             return Ok(self.s.m.bool(false));
         }
         if !self.numeric_selects || !self.console_lanes {
+            // A mask derived from neither EXEC nor a VALU result (a uniform
+            // select, a constant, an opaque value). Failing here leaves a
+            // compute program its retry with numeric selects.
+            if let Some(&m) = inst
+                .read(Reg::S(code))
+                .and_then(|m| self.x.st.others.get(&m))
+            {
+                return self.boolean(m, self.cur).map_err(|_| UNTRACKED_SELECT);
+            }
             return Err(UNTRACKED_SELECT);
         }
         // A scalar operation can define either dword independently. The SSA
@@ -13465,6 +13490,24 @@ mod tests {
         for words in [add, sub] {
             lowers_rsrc2(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn v_cndmask_accepts_uniform_and_constant_masks() {
+        // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+        // (resolved in `Structured::others` or directly as constants).
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0001,
+            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0xD501_0002,
+            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0xD834_0000,
+            0x0000_0200,    // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lowers_rsrc2(&words, 0x8001).unwrap();
     }
 
     /// A dword load by index through a descriptor built around the root
