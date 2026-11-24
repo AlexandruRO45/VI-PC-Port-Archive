@@ -27,6 +27,8 @@ const WSAHOST_NOT_FOUND: i32 = 11001;
 
 #[link(name = "ws2_32", kind = "raw-dylib")]
 extern "system" {
+    #[link_name = "bind"]
+    fn real_bind(s: usize, name: *const u8, len: i32) -> i32;
     #[link_name = "connect"]
     fn real_connect(s: usize, name: *const u8, len: i32) -> i32;
     #[link_name = "sendto"]
@@ -63,6 +65,7 @@ pub fn enabled() -> bool {
 fn table() -> Vec<(&'static str, usize, u16)> {
     vec![
         ("WinHttpSendRequest", send_request as *const () as usize, 0),
+        ("bind", bind as *const () as usize, 2),
         ("connect", connect as *const () as usize, 4),
         ("sendto", sendto as *const () as usize, 20),
         ("gethostbyname", gethostbyname as *const () as usize, 52),
@@ -112,12 +115,20 @@ unsafe fn unreachable_net(what: &str) -> i32 {
 
 /// the originals of the system functions hooked (`install_system_hooks`; 0: not hooked – the
 /// linked import is the original)
+static O_BIND: AtomicUsize = AtomicUsize::new(0);
 static O_CONNECT: AtomicUsize = AtomicUsize::new(0);
 static O_SENDTO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO: AtomicUsize = AtomicUsize::new(0);
 static O_GETADDRINFO_W: AtomicUsize = AtomicUsize::new(0);
 /// trampolines of hooks whose original is never called
 static O_UNUSED: [AtomicUsize; 16] = [const { AtomicUsize::new(0) }; 16];
+
+unsafe fn orig_bind(s: usize, name: *const u8, len: i32) -> i32 {
+    match O_BIND.load(Ordering::Acquire) {
+        0 => real_bind(s, name, len),
+        f => std::mem::transmute::<usize, unsafe extern "system" fn(usize, *const u8, i32) -> i32>(f)(s, name, len),
+    }
+}
 
 unsafe fn orig_connect(s: usize, name: *const u8, len: i32) -> i32 {
     match O_CONNECT.load(Ordering::Acquire) {
@@ -154,7 +165,7 @@ pub fn install_system_hooks() {
     ONCE.call_once(|| unsafe {
         let mut unused = O_UNUSED.iter();
         let mut spare = || unused.next().expect("enough spare trampolines");
-        let hooks: [(&str, &str, usize, &AtomicUsize); 18] = [
+        let hooks: [(&str, &str, usize, &AtomicUsize); 19] = [
             ("winhttp.dll", "WinHttpSendRequest", send_request as usize, spare()),
             ("winhttp.dll", "WinHttpConnect", null_handle_winhttp as usize, spare()),
             ("wininet.dll", "InternetConnectA", null_handle_inet8 as usize, spare()),
@@ -165,6 +176,7 @@ pub fn install_system_hooks() {
             ("wininet.dll", "HttpSendRequestW", false_inet5 as usize, spare()),
             ("wininet.dll", "HttpSendRequestExA", false_inet5 as usize, spare()),
             ("wininet.dll", "HttpSendRequestExW", false_inet5 as usize, spare()),
+            ("ws2_32.dll", "bind", bind as usize, &O_BIND),
             ("ws2_32.dll", "connect", connect as usize, &O_CONNECT),
             ("ws2_32.dll", "WSAConnect", wsa_connect as usize, spare()),
             ("ws2_32.dll", "sendto", sendto as usize, &O_SENDTO),
@@ -220,6 +232,42 @@ unsafe extern "system" fn send_request(_req: *mut c_void, _headers: *const u16, 
     note("WinHttpSendRequest");
     SetLastError(ERROR_WINHTTP_NAME_NOT_RESOLVED);
     0
+}
+
+/// Rewrite a non-loopback `AF_INET` / `AF_INET6` sockaddr to loopback (`127.0.0.1` / `::1`)
+/// preserving family and port so `bind` succeeds locally without exposing a LAN socket or
+/// triggering Windows Firewall (#568).
+unsafe fn rewrite_bind_to_loopback(name: *const u8, len: i32) -> Option<([u8; 28], i32)> {
+    if name.is_null() || len < 16 || loopback(name, len) {
+        return None;
+    }
+    let mut buf = [0u8; 28];
+    match (name as *const u16).read_unaligned() {
+        2 => {
+            std::ptr::copy_nonoverlapping(name, buf.as_mut_ptr(), 16);
+            buf[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            Some((buf, 16))
+        }
+        23 if len >= 28 => {
+            std::ptr::copy_nonoverlapping(name, buf.as_mut_ptr(), 28);
+            buf[8..24].fill(0);
+            buf[23] = 1;
+            buf[24..28].fill(0);
+            Some((buf, 28))
+        }
+        _ => None,
+    }
+}
+
+unsafe extern "system" fn bind(s: usize, name: *const u8, len: i32) -> i32 {
+    if let Some((lb, lb_len)) = rewrite_bind_to_loopback(name, len) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+            crate::xlog_info!("XCL_NETWORK=0: bind rewritten to loopback (no network)");
+        }
+        return orig_bind(s, lb.as_ptr(), lb_len);
+    }
+    orig_bind(s, name, len)
 }
 
 unsafe extern "system" fn connect(s: usize, name: *const u8, len: i32) -> i32 {
@@ -305,6 +353,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn non_loopback_bind_rewrites_to_loopback() {
+        let mut v4_any = [2, 0, 0x0C, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]; // 0.0.0.0:3074
+        let v4_lan = [2, 0, 0x0C, 0x02, 192, 168, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0];
+        let v4_lb = [2, 0, 0x0C, 0x02, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut v6_any = [0u8; 28];
+        v6_any[0] = 23;
+        v6_any[2..4].copy_from_slice(&[0x0C, 0x02]);
+        v6_any[24] = 9; // non-zero scope_id cleared for ::1
+        let mut v6_lb = [0u8; 28];
+        v6_lb[0] = 23;
+        v6_lb[2..4].copy_from_slice(&[0x0C, 0x02]);
+        v6_lb[23] = 1;
+
+        unsafe {
+            assert_eq!(rewrite_bind_to_loopback(std::ptr::null(), 16), None);
+            assert_eq!(rewrite_bind_to_loopback(v4_any.as_ptr(), 15), None);
+            assert_eq!(rewrite_bind_to_loopback(v4_lb.as_ptr(), 16), None);
+            assert_eq!(rewrite_bind_to_loopback(v6_lb.as_ptr(), 28), None);
+            assert_eq!(rewrite_bind_to_loopback(v6_any.as_ptr(), 27), None);
+
+            let (buf, len) = rewrite_bind_to_loopback(v4_any.as_ptr(), 16).unwrap();
+            assert_eq!(len, 16);
+            assert_eq!(&buf[..16], &v4_lb);
+
+            let (buf, len) = rewrite_bind_to_loopback(v4_lan.as_ptr(), 16).unwrap();
+            assert_eq!(len, 16);
+            assert_eq!(&buf[..16], &v4_lb);
+
+            let (buf, len) = rewrite_bind_to_loopback(v6_any.as_ptr(), 28).unwrap();
+            assert_eq!(len, 28);
+            assert_eq!(&buf, &v6_lb);
+
+            v4_any[0] = 1; // AF_UNIX
+            assert_eq!(rewrite_bind_to_loopback(v4_any.as_ptr(), 16), None);
+        }
+    }
+
     /// With the system hooks, the system's own functions refuse – found the way a crash
     /// reporter can find them, through GetProcAddress, not the title's imports (#305) – and
     /// what may go through still reaches the original.
@@ -312,6 +398,14 @@ mod tests {
     fn the_systems_own_network_functions_refuse() {
         use windows_sys::Win32::Foundation::GetLastError;
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        #[link(name = "ws2_32", kind = "raw-dylib")]
+        extern "system" {
+            fn WSAStartup(ver: u16, data: *mut u8) -> i32;
+            fn WSACleanup() -> i32;
+            fn socket(af: i32, ty: i32, proto: i32) -> usize;
+            fn getsockname(s: usize, name: *mut u8, len: *mut i32) -> i32;
+            fn closesocket(s: usize) -> i32;
+        }
         install_system_hooks();
         unsafe {
             let f = |dll: &str, name: &[u8]| GetProcAddress(LoadLibraryW(crate::util::wide(dll).as_ptr()), name.as_ptr()).expect("export") as usize;
@@ -328,6 +422,35 @@ mod tests {
             assert_eq!(gai(b"example.com\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
             assert!(out.is_null());
             assert_ne!(gai(b"localhost\0".as_ptr(), std::ptr::null(), std::ptr::null(), &mut out), WSAHOST_NOT_FOUND);
+
+            // Real Winsock bind to 0.0.0.0:0 / [::]:0 is rewritten to loopback (#568).
+            let mut wsa = [0u8; 512];
+            assert_eq!(WSAStartup(0x0202, wsa.as_mut_ptr()), 0);
+            let ws_bind: unsafe extern "system" fn(usize, *const u8, i32) -> i32 = std::mem::transmute(f("ws2_32.dll", b"bind\0"));
+            let s4 = socket(2, 2, 17); // AF_INET, SOCK_DGRAM, IPPROTO_UDP
+            assert_ne!(s4, usize::MAX);
+            let any4 = [2u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            assert_eq!(ws_bind(s4, any4.as_ptr(), 16), 0);
+            let mut got4 = [0u8; 16];
+            let mut got4_len = 16i32;
+            assert_eq!(getsockname(s4, got4.as_mut_ptr(), &mut got4_len), 0);
+            assert_eq!(&got4[4..8], &[127, 0, 0, 1]);
+            assert_ne!(&got4[2..4], &[0, 0]);
+            closesocket(s4);
+
+            let s6 = socket(23, 2, 17);
+            if s6 != usize::MAX {
+                let mut any6 = [0u8; 28];
+                any6[0] = 23;
+                assert_eq!(ws_bind(s6, any6.as_ptr(), 28), 0);
+                let mut got6 = [0u8; 28];
+                let mut got6_len = 28i32;
+                assert_eq!(getsockname(s6, got6.as_mut_ptr(), &mut got6_len), 0);
+                assert!(got6[8..23].iter().all(|&b| b == 0) && got6[23] == 1);
+                assert_ne!(&got6[2..4], &[0, 0]);
+                closesocket(s6);
+            }
+            WSACleanup();
         }
     }
 }
