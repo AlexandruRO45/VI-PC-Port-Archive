@@ -7027,11 +7027,13 @@ impl<'a> Lower<'a> {
                 // A number joined with a lane mask (a traversal keeps lane
                 // masks as numbers on its stack): in compute the mask as a
                 // number is its ballot, bit for bit.
+                // shortcut: elsewhere it is the host wave's ballot. There the
+                // join is a register the compiler reused on a path that does
+                // not read it; a program that did would read the host's lanes.
                 let val = match self.vals.get(&arg).copied() {
                     Some(Val::I32(x)) => Some(Val::I32(x)),
                     other
                         if !bit
-                            && self.mask_data == MaskData::Console
                             && self.read_phis.contains(&phi.value)
                             && (self.x.st.masks.contains_key(&arg)
                                 || self.x.st.highs.contains_key(&arg)) =>
