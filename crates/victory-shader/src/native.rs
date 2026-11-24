@@ -524,7 +524,10 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             return Err(Malformed("root parameter of unknown kind"));
         }
         // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
-        // root descriptor are computed from these bytes ([`sgpr_span`]).
+        // root descriptor are computed from these bytes ([`sgpr_span`]). A
+        // fixed sampler taking none may name the end of them, but no
+        // further: resource tracking still adds the stage's system SGPRs to
+        // its byte, which would overflow from dword 248 of a merged stage.
         if layout.iter().any(|p| {
             let (first, span) = sgpr_span(stage, p);
             u64::from(first) + u64::from(span) > u64::from(SGPRS)
@@ -706,11 +709,15 @@ fn compute_io(data: &[u8], layout: &[RootParam], vgprs: u16) -> Result<ComputeIo
 
 /// The first SGPR of a root parameter and how many it takes. Resource
 /// tracking reads a root descriptor's high half from the SGPR after its
-/// first whatever the stated count, so a descriptor spans at least two.
+/// first whatever the stated count, so a descriptor spans at least two. A
+/// fixed sampler is part of the root signature, not of the user data: one
+/// stating no SGPRs takes none (`resource::param_of` never maps an SGPR to
+/// it), so its user-data byte only has to keep `user_sgpr` in range.
 fn sgpr_span(stage: HwStage, p: &RootParam) -> (u32, u32) {
     let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
     let span = match p.root {
         RootType::Descriptor => p.sgprs.max(2),
+        RootType::ImmediateSampler => p.sgprs,
         _ => p.sgprs.max(1),
     };
     (first, span)
@@ -1516,28 +1523,36 @@ mod tests {
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
     }
 
+    /// A compute program with this `COMPUTE_PGM_RSRC2` and one (root type,
+    /// SGPRs, user data) parameter.
+    fn compute_program(
+        rsrc2: u32,
+        root: u32,
+        sgprs: u32,
+        user_data: u8,
+    ) -> Result<Vec<NativeProgram>, ShaderError> {
+        let mut blob = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
+        let e = record + RECORD_SIZE as usize;
+        blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        for v in [root, 0, sgprs, 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&[user_data, 0, 0, 0]);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+        blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
     #[test]
     fn compute_root_params_stay_off_system_sgprs() {
         // 4 user SGPRs, then group id x in s4, y in s5 and the group info
         // in s6.
         let rsrc2: u32 = 4 << 1 | 1 << 7 | 1 << 8 | 1 << 10;
-        let program = |rsrc2: u32, root: u32, sgprs: u32, user_data: u8| {
-            let mut blob = fssm(&[(HwStage::Cs, &VS_CODE)]);
-            let record =
-                FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
-            let e = record + RECORD_SIZE as usize;
-            blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
-            let table = (blob.len() - FSSM_HEADER) as u64;
-            for v in [root, 0, sgprs, 0] {
-                blob.extend_from_slice(&v.to_le_bytes());
-            }
-            blob.extend_from_slice(&[user_data, 0, 0, 0]);
-            let payload = (blob.len() - FSSM_HEADER) as u64;
-            blob[8..16].copy_from_slice(&payload.to_le_bytes());
-            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
-            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
-            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
-        };
+        let program = compute_program;
         let (constants, descriptor, table) = (0, 1, 3);
         // s0-s3 are the user SGPRs; a table in s3 takes one of them.
         let p = program(rsrc2, constants, 4, 0).unwrap();
@@ -1579,6 +1594,92 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    #[test]
+    fn compute_system_sgprs_skip_disabled_components() {
+        // Only group id z: it takes the first SGPR after the user data, not
+        // the third.
+        let cs = |rsrc2: u32| ComputeIo {
+            rsrc2,
+            threads: [1, 1, 1],
+        };
+        assert_eq!(
+            cs(3 << 1 | 1 << 9).system_sgprs(),
+            ([None, None, Some(3)], None)
+        );
+        // Group id x and z with the info: y's SGPR is not left free.
+        assert_eq!(
+            cs(2 << 1 | 1 << 7 | 1 << 9 | 1 << 10).system_sgprs(),
+            ([Some(2), None, Some(3)], Some(4))
+        );
+        // The info alone, after no user SGPRs.
+        assert_eq!(cs(1 << 10).system_sgprs(), ([None; 3], Some(0)));
+        // The 5-bit user SGPR field at its most: the ids follow s30.
+        let full = cs(0x1F << 1 | 0xF << 7);
+        assert_eq!(full.user_sgprs(), 31);
+        assert_eq!(
+            full.system_sgprs(),
+            ([Some(31), Some(32), Some(33)], Some(34))
+        );
+        // Bit 6 (trap present) and the LDS field sit between and after the
+        // fields read here and move none of them.
+        assert_eq!(
+            cs(1 << 1 | 1 << 6 | 1 << 8 | 0x1FF << 15).system_sgprs(),
+            ([None, Some(1), None], None)
+        );
+    }
+
+    #[test]
+    fn compute_root_params_over_a_disabled_component_are_free() {
+        // Group id z alone lands in s2, right after two user SGPRs; s3 and
+        // up are free though x and y would have taken them.
+        let rsrc2: u32 = 2 << 1 | 1 << 9;
+        let constants = 0;
+        assert_eq!(
+            why_refused(compute_program(rsrc2, constants, 1, 2)),
+            "root parameter over a system SGPR"
+        );
+        for user_data in [0, 1, 3, 4] {
+            assert!(
+                compute_program(rsrc2, constants, 1, user_data).is_ok(),
+                "dword {user_data}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixed_sampler_takes_no_sgpr() {
+        let (constants, sampler) = (0, 4);
+        // No user SGPRs and group id x in s0: a fixed sampler whose byte
+        // names dword 0 holds no SGPR, so it can't collide with the id.
+        let rsrc2: u32 = 1 << 7 | 1 << 10;
+        assert!(compute_program(rsrc2, sampler, 0, 0).is_ok());
+        assert!(compute_program(rsrc2, sampler, 0, 1).is_ok());
+        // Constants there still do, and so would a sampler stating an SGPR.
+        for root in [constants, sampler] {
+            assert_eq!(
+                why_refused(compute_program(rsrc2, root, 1, 0)),
+                "root parameter over a system SGPR",
+                "{root}"
+            );
+        }
+        // Past the user data, up to the end of the SGPRs (s106, just after
+        // s105), it is still fine, since it takes none; further on its byte
+        // could overflow `user_sgpr` in a merged stage, so that is refused.
+        assert!(compute_program(0, sampler, 0, 106).is_ok());
+        assert_eq!(
+            why_refused(compute_program(0, sampler, 0, 107)),
+            "root parameter outside the SGPRs"
+        );
+        assert_eq!(
+            why_refused(compute_program(0, sampler, 0, 0xFF)),
+            "root parameter outside the SGPRs"
+        );
+        // In a pixel program, a fixed sampler beside a root descriptor's
+        // high half, and at the user data's end, is fine too.
+        assert!(program(&[(1, 2, 0, 0), (sampler, 0, 1, 1)]).is_ok());
+        assert!(program(&[(sampler, 0, 106, 1)]).is_ok());
     }
 
     #[test]
