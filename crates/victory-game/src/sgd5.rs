@@ -11,6 +11,17 @@ pub const MAGIC: &[u8; 4] = b"SGD5";
 const MARKER: [u8; 4] = 0x000D_DCE7_u32.to_le_bytes();
 /// Containers are at most a few MiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: usize = 64 << 20;
+/// Bytes a record's packed stream may hold beyond what deflate needs (see
+/// [`max_packed`]): the stream's end is not checked, so allow some padding.
+const PACKED_SLACK: usize = 4096;
+
+/// The most packed bytes a container of `unpacked` bytes can take. Deflate
+/// never spends more than 9 bits a byte (fixed codes), and stored blocks only
+/// 5 bytes per 65535, so a size beyond this is not a record's: it is bytes
+/// that look like a marker (in a container stored between records, say).
+fn max_packed(unpacked: usize) -> usize {
+    unpacked + unpacked / 8 + PACKED_SLACK
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
@@ -63,6 +74,8 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// of the next record's header or name, which must follow them. A record
 /// whose packed bytes run past the end of the file (a truncated file) is not
 /// yielded, and ends the search: every byte after its marker is its own.
+/// Sizes that no deflate stream of the stated unpacked size could have do
+/// not form a record, so such bytes neither end the search nor hide records.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
     // Where the next record may start: after the magic, then after each
@@ -111,7 +124,7 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
     else {
         return Found::Nothing;
     };
-    if n2 != n || n < 12 || unpacked_size > MAX_UNPACKED {
+    if n2 != n || n < 12 || unpacked_size > MAX_UNPACKED || n - 12 > max_packed(unpacked_size) {
         return Found::Nothing;
     }
     let Some(packed) = at.checked_add(n).and_then(|end| file.get(at + 12..end)) else {
@@ -327,6 +340,43 @@ mod tests {
         // Before: [PS_first, PS_inner].
         let names: Vec<_> = records(&file[..inner_end]).map(|r| r.name).collect();
         assert_eq!(names, [Some("PS_first")]);
+    }
+
+    #[test]
+    fn marker_with_impossible_sizes_does_not_end_the_search() {
+        // Bytes between records that read as a marker whose packed size runs
+        // past the end of the file, but is far more than a deflate stream of
+        // 16 bytes could take.
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"DXBC");
+        for v in [u32::MAX, 0x000D_DCE7, u32::MAX, 16] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        // Before: [] (the phantom was a truncated record and ended the search).
+        let names: Vec<_> = records(&file).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_after")]);
+    }
+
+    #[test]
+    fn packed_size_bound_holds_for_every_level() {
+        // Incompressible bytes, at every level miniz writes: the bound is
+        // never reached, so no real record is refused.
+        let mut x = 0x1234_5678_u32;
+        let noise: Vec<u8> = (0..200_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        for len in [0, 1, 100, 65_535, 65_536, noise.len()] {
+            for level in 0..=10 {
+                let packed = miniz_oxide::deflate::compress_to_vec(&noise[..len], level);
+                assert!(packed.len() <= max_packed(len), "len {len} level {level}");
+            }
+        }
     }
 
     #[test]
