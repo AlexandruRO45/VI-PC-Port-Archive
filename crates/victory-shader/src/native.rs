@@ -1723,6 +1723,92 @@ mod tests {
     }
 
     #[test]
+    fn the_vgpr_count_is_the_low_ten_bits() {
+        let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
+        let record = FSSM_HEADER + u64_at(&cs, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
+        let program = |regs: u32| {
+            let mut blob = cs.clone();
+            blob[record + RECORD_REGS..][..4].copy_from_slice(&regs.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Bits above the 10-bit count belong to other fields and change
+        // nothing: the program still has the low bits' VGPRs.
+        for (regs, vgprs) in [
+            (0xFFFF_FC00 | VGPRS, VGPRS as u16),
+            (1 << 10 | 1, 1),
+            (0xFFFF_FC00 | 256, 256),
+        ] {
+            assert_eq!(program(regs).unwrap()[0].vgprs, vgprs, "{regs:#x}");
+        }
+        // So a count of 0x400 is no VGPRs at all, and the thread id in v0
+        // has nowhere to arrive, while 0x3FF is past any program.
+        assert_eq!(
+            why_refused(program(1 << 10)),
+            "thread ids outside the VGPRs"
+        );
+        assert_eq!(why_refused(program(0x3FF)), "implausible VGPR count");
+        assert_eq!(why_refused(program(0x7FF)), "implausible VGPR count");
+    }
+
+    #[test]
+    fn a_root_descriptor_stating_no_sgprs_still_takes_two() {
+        let (constants, descriptor) = (0, 1);
+        // Its high half is read from the SGPR after its first anyway, so
+        // in compute's 16 dwords it may start at dword 14, not 15.
+        assert!(compute_program(0, descriptor, 0, 14).is_ok());
+        assert_eq!(
+            why_refused(compute_program(0, descriptor, 0, 15)),
+            "root parameter past the user data"
+        );
+        // The same high half collides with constants after it, and with a
+        // group id right after the user SGPRs.
+        assert_eq!(
+            why_refused(program(&[(descriptor, 0, 0, 0), (constants, 1, 1, 1)])),
+            "root parameters share an SGPR"
+        );
+        assert!(program(&[(descriptor, 0, 0, 0), (constants, 1, 2, 1)]).is_ok());
+        let id_in_s1: u32 = 1 << 1 | 1 << 7;
+        assert_eq!(
+            why_refused(compute_program(id_in_s1, descriptor, 0, 0)),
+            "root parameter over a system SGPR"
+        );
+        // In a pixel program, s104-s105 exist but are past the user data;
+        // from dword 105 its high half would be s106, which no program has.
+        assert_eq!(
+            why_refused(program(&[(descriptor, 0, 104, 0)])),
+            "root parameter past the user data"
+        );
+        assert_eq!(
+            why_refused(program(&[(descriptor, 0, 105, 0)])),
+            "root parameter outside the SGPRs"
+        );
+    }
+
+    #[test]
+    fn compute_user_data_is_refused_before_system_sgprs() {
+        // Sixteen user SGPRs (all of compute's user data) put group id x in
+        // s16. Constants at dword 16 would cover it too, but are first a
+        // parameter past the user data: the layout is checked before the
+        // stage data, so it is named for that.
+        let rsrc2: u32 = 16 << 1 | 1 << 7;
+        let constants = 0;
+        assert!(compute_program(rsrc2, constants, 16, 0).is_ok());
+        assert_eq!(
+            why_refused(compute_program(rsrc2, constants, 1, 16)),
+            "root parameter past the user data"
+        );
+        // With the 5-bit field at 31, the ids sit past the user data
+        // altogether, so no parameter that fits it can reach them.
+        let full: u32 = 0x1F << 1 | 0xF << 7;
+        for user_data in [0, 8, 15] {
+            assert!(
+                compute_program(full, constants, 1, user_data).is_ok(),
+                "dword {user_data}"
+            );
+        }
+    }
+
+    #[test]
     fn reads_every_native_blob() {
         let es = xbch(&fssm(&[(HwStage::Es, &VS_CODE)]));
         let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
