@@ -3040,4 +3040,77 @@ mod tests {
         // With nothing stored before it, even one byte back is too far.
         assert!(!starts_stream(&stored_then_copy(b"", 1), 3));
     }
+
+    /// A non-final stored block of `before`, then one final fixed-code
+    /// block: a copy of 3 bytes coded by distance code `code` (4 to 29) and
+    /// `extra`, the value of its extra bits, then the end of the block.
+    fn stored_then_far_copy(before: &[u8], code: u32, extra: u32) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(1, 2); // fixed codes
+        bits.code(1, 7); // length code 257: 3 bytes, no extra bits
+        bits.code(code, 5);
+        bits.put(extra, code / 2 - 1); // codes 4 and up: (code / 2 - 1) extra bits
+        bits.code(0, 7); // end of block (256)
+        [stored_block(before), bits.out].concat()
+    }
+
+    /// The distance distance code `code` (4 to 29) and the value `extra` of
+    /// its extra bits state, as deflate defines them.
+    fn far_distance(code: u32, extra: u32) -> u32 {
+        let bits = code / 2 - 1;
+        ((2 + (code & 1)) << bits) + 1 + extra
+    }
+
+    #[test]
+    fn copy_reaching_back_by_its_extra_bits_is_told_by_the_whole_distance() {
+        // Distance codes from 4 on state a range of distances, the extra
+        // bits after the code picking one: code 7 is 13 to 16 bytes back.
+        // Whether a copy reaches before the container's start depends on
+        // the whole distance, not on the code alone: after 14 stored bytes,
+        // code 7 with extra bits 0 or 1 (13, 14 back) is a stream and with
+        // 2 or 3 (15, 16 back) breaks it. Such a broken record covers no
+        // other, so it is yielded and does not unpack, and the record after
+        // it is found either way.
+        assert_eq!(far_distance(4, 0), 5);
+        assert_eq!(far_distance(6, 3), 12);
+        assert_eq!(far_distance(7, 3), 16);
+        assert_eq!(far_distance(29, 8191), 32_768);
+        let before = b"DXBC fourteen.";
+        assert_eq!(before.len(), 14);
+        for code in 4..=8 {
+            for extra in 0..1 << (code / 2 - 1) {
+                let distance = far_distance(code, extra) as usize;
+                let what = format!("code {code}, extra {extra}: {distance} back");
+                let packed = stored_then_far_copy(before, code, extra);
+                let valid = distance <= before.len();
+                let want = valid.then(|| {
+                    let mut out = before.to_vec();
+                    for _ in 0..3 {
+                        out.push(out[out.len() - distance]);
+                    }
+                    out
+                });
+                assert_eq!(
+                    miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                    want,
+                    "{what}"
+                );
+                assert_eq!(starts_stream(&packed, before.len() + 3), valid, "{what}");
+
+                let (file, marker) = outer_then_after(&packed, before.len() + 3);
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+                assert_eq!(
+                    found[0].span(),
+                    marker..marker + 12 + packed.len(),
+                    "{what}"
+                );
+                assert_eq!(found[0].unpack(), want, "{what}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+                assert_eq!(found[1].span().end, file.len(), "{what}");
+            }
+        }
+    }
 }
