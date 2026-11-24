@@ -62,13 +62,18 @@ const HISTORY: usize = 32;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+/// Keeps every documented binding plus PC aliases (Space=A, Left Ctrl=B, R=X,
+/// Left Shift=L3). Sticks: W/A/S/D left, I/J/K/L (or mouse look) right;
+/// triggers Z/C or mouse RMB/LMB.
+const FALLBACK_BUTTONS: [(u8, u32); 18] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
+    (0xA2, B),    // Left Ctrl
     (b'X', X),
+    (b'R', X),
     (b'Y', Y),
     (0x26, UP), // arrows
     (0x28, DOWN),
@@ -77,6 +82,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'Q', LEFT_SHOULDER),
     (b'E', RIGHT_SHOULDER),
     (b'F', LEFT_STICK),
+    (0xA0, LEFT_STICK), // Left Shift
     (b'H', RIGHT_STICK),
 ];
 
@@ -142,8 +148,25 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// Optional mouse contribution (triggers + camera look) blended into the
+    /// fallback gamepad when no physical pad is connected.
+    fn mouse_pad(&mut self) -> PadState {
+        PadState::default()
+    }
     /// Motor intensities: low/high frequency plus left/right impulse triggers.
     fn rumble(&mut self, slot: usize, rumble: Rumble);
+}
+
+fn merge_pad(a: PadState, b: PadState) -> PadState {
+    PadState {
+        buttons: a.buttons | b.buttons,
+        left_trigger: a.left_trigger.max(b.left_trigger),
+        right_trigger: a.right_trigger.max(b.right_trigger),
+        left_x: (a.left_x + b.left_x).clamp(-1.0, 1.0),
+        left_y: (a.left_y + b.left_y).clamp(-1.0, 1.0),
+        right_x: (a.right_x + b.right_x).clamp(-1.0, 1.0),
+        right_y: (a.right_y + b.right_y).clamp(-1.0, 1.0),
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -262,6 +285,7 @@ pub struct Reading {
     refs: AtomicU32,
     device: *const Device,
     sequence: u64,
+    order: u64,
     timestamp: u64,
     value: Value,
 }
@@ -351,6 +375,10 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    /// Global strictly-increasing reading counter across all devices so
+    /// null-device `previous_reading`/`next_reading` walks all devices in
+    /// exact chronological order (#361).
+    next_order: u64,
     /// Whether each host pad slot has reported non-rest input since it began
     /// answering, filtering out wireless receivers answering for switched-off pads.
     seen_input: [bool; PADS],
@@ -400,6 +428,7 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
+                next_order: 0,
                 seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
@@ -436,12 +465,14 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, mouse) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            (pads, source.keys())
+            let keys = source.keys();
+            let mouse = source.mouse_pad();
+            (pads, keys, mouse)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = self.state().poll(&self.devices, pads, keys, mouse);
         self.deliver(events);
     }
 
@@ -500,6 +531,7 @@ impl State {
         devices: &[Device; DEVICES],
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
+        mouse: PadState,
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
@@ -523,7 +555,7 @@ impl State {
         for (slot, pad) in active.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        let fallback = (!any_pad).then(|| Value::Pad(merge_pad(fallback(&keys), mouse)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -546,6 +578,8 @@ impl State {
             && (!was || slot.history.back().is_none_or(|r| r.value != value))
         {
             slot.sequence += 1;
+            self.next_order += 1;
+            let order = self.next_order;
             if slot.history.len() == HISTORY {
                 slot.history.pop_front();
             }
@@ -554,6 +588,7 @@ impl State {
                 refs: AtomicU32::new(1),
                 device: &devices[index],
                 sequence: slot.sequence,
+                order,
                 timestamp: now,
                 value,
             }));
@@ -686,7 +721,8 @@ extern "system" fn current_reading(
     hand(out, found)
 }
 
-/// The reading after (`forward`) or before `reference` on its device.
+/// The reading after (`forward`) or before `reference` on `device`, or across
+/// all devices in chronological order when `device` is null (#361).
 fn relative(
     this: This,
     reference: *const Reading,
@@ -701,35 +737,52 @@ fn relative(
     let hub = hub(this);
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
-    // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
-    // only keyboard readings (one device) and the current pad's previous one.
-    let Some(index) = hub.index(reference.device) else {
+    let Some(ref_index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
     };
-    if !device.is_null() && !std::ptr::eq(device, reference.device) {
-        return fail(out, E_INVALIDARG);
-    }
     let state = hub.state();
-    let history = &state.slots[index].history;
-    if history
+    let ref_history = &state.slots[ref_index].history;
+    if ref_history
         .front()
         .is_none_or(|oldest| reference.sequence < oldest.sequence)
     {
         return fail(out, REFERENCE_TOO_OLD);
     }
     let wanted = |r: &&Ref| r.kind() & kind != 0;
+    if !device.is_null() {
+        if !std::ptr::eq(device, reference.device) {
+            return fail(out, E_INVALIDARG);
+        }
+        let found = if forward {
+            ref_history
+                .iter()
+                .filter(|r| r.sequence > reference.sequence)
+                .find(wanted)
+        } else {
+            ref_history
+                .iter()
+                .rev()
+                .filter(|r| r.sequence < reference.sequence)
+                .find(wanted)
+        };
+        return hand(out, found);
+    }
+    // Null device: walk readings across all devices ordered by `(timestamp, order)`.
+    let ref_key = (reference.timestamp, reference.order);
     let found = if forward {
-        history
+        state
+            .slots
             .iter()
-            .filter(|r| r.sequence > reference.sequence)
-            .find(wanted)
+            .flat_map(|s| s.history.iter())
+            .filter(|r| wanted(r) && (r.timestamp, r.order) > ref_key)
+            .min_by_key(|r| (r.timestamp, r.order))
     } else {
-        history
+        state
+            .slots
             .iter()
-            .rev()
-            .filter(|r| r.sequence < reference.sequence)
-            .find(wanted)
+            .flat_map(|s| s.history.iter())
+            .filter(|r| wanted(r) && (r.timestamp, r.order) < ref_key)
+            .max_by_key(|r| (r.timestamp, r.order))
     };
     hand(out, found)
 }
@@ -1173,6 +1226,7 @@ fn order_held_keys(pressed: &mut Vec<u8>, current: &[u8]) {
 mod host {
     use std::time::{Duration, Instant};
 
+    use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
@@ -1186,7 +1240,7 @@ mod host {
         XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
     };
 
     use super::*;
@@ -1232,6 +1286,9 @@ mod host {
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
         pressed: Vec<u8>,
+        last_cursor: Option<(i32, i32)>,
+        mouse_look: bool,
+        f9_down: bool,
     }
 
     impl Source for Host {
@@ -1281,6 +1338,58 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn mouse_pad(&mut self) -> PadState {
+            if !focused() {
+                self.last_cursor = None;
+                return PadState::default();
+            }
+            const VK_LBUTTON: i32 = 0x01;
+            const VK_RBUTTON: i32 = 0x02;
+            const VK_MBUTTON: i32 = 0x04;
+            const VK_F9: i32 = 0x78;
+            // SAFETY: plain key-state queries.
+            let (lmb, rmb, mmb, f9) = unsafe {
+                (
+                    GetAsyncKeyState(VK_LBUTTON) < 0,
+                    GetAsyncKeyState(VK_RBUTTON) < 0,
+                    GetAsyncKeyState(VK_MBUTTON) < 0,
+                    GetAsyncKeyState(VK_F9) < 0,
+                )
+            };
+            if f9 && !self.f9_down {
+                self.mouse_look = !self.mouse_look;
+            }
+            self.f9_down = f9;
+
+            let mut pt = POINT::default();
+            // SAFETY: valid out pointer.
+            let got_pt = unsafe { GetCursorPos(&mut pt) != 0 };
+            let (right_x, right_y) = if got_pt {
+                let prev = self.last_cursor.replace((pt.x, pt.y));
+                if (rmb || self.mouse_look)
+                    && let Some((px, py)) = prev
+                {
+                    let dx = (pt.x - px) as f32 / 14.0;
+                    let dy = (py - pt.y) as f32 / 14.0;
+                    (dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0))
+                } else {
+                    (0.0, 0.0)
+                }
+            } else {
+                self.last_cursor = None;
+                (0.0, 0.0)
+            };
+
+            PadState {
+                buttons: if mmb { RIGHT_STICK } else { 0 },
+                left_trigger: if rmb { 1.0 } else { 0.0 },
+                right_trigger: if lmb { 1.0 } else { 0.0 },
+                right_x,
+                right_y,
+                ..Default::default()
+            }
         }
 
         fn rumble(&mut self, slot: usize, rumble: Rumble) {
@@ -2114,5 +2223,51 @@ mod tests {
         // Release all.
         order_held_keys(&mut pressed, &[]);
         assert!(pressed.is_empty());
+    }
+
+    #[test]
+    fn null_device_walks_readings_across_devices() {
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+        let walk_any = |hub: &Hub, offset: usize, from: *const Reading| {
+            let mut out = std::ptr::null();
+            let hr = slot::<Walk, _>(&hub.object, offset)(
+                &hub.object,
+                from,
+                GAMEPAD_KIND,
+                std::ptr::null(),
+                &mut out,
+            );
+            result(hr, out)
+        };
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        let r0 = current(hub, GAMEPAD_KIND, 0).expect("pad 0 reading");
+
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        let r1 = current(hub, GAMEPAD_KIND, 1).expect("pad 1 reading");
+
+        // Null device walks chronologically from pad 0's reading to pad 1's reading (#361).
+        let next = walk_any(hub, 0x28, r0).expect("cross-device next");
+        assert_eq!(pad(next).buttons, B);
+        let prev = walk_any(hub, 0x30, r1).expect("cross-device prev");
+        assert_eq!(pad(prev).buttons, A);
+        release(next);
+        release(prev);
+        release(r1);
+        release(r0);
+    }
+
+    #[test]
+    fn fallback_supports_pc_gaming_aliases() {
+        let p = fallback(&[key(0x20), key(0xA0), key(b'R'), key(0xA2)]);
+        assert_eq!(p.buttons, A | LEFT_STICK | X | B);
     }
 }

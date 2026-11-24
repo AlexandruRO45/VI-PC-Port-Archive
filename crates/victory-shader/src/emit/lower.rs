@@ -5037,6 +5037,131 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                if v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_cvt_pk_i16_i32";
+                let sat = |l: &mut Self, x: V| {
+                    if signed {
+                        let lo = l.s.m.i32((-32768i32) as u32);
+                        let hi = l.s.m.i32(32767);
+                        let too_lo = l.s.m.cmp(c, pred::SLT, x, lo);
+                        let x = l.s.m.select(c, too_lo, lo, x);
+                        let too_hi = l.s.m.cmp(c, pred::SGT, x, hi);
+                        l.s.m.select(c, too_hi, hi, x)
+                    } else {
+                        let hi = l.s.m.i32(0xFFFF);
+                        let too_hi = l.s.m.cmp(c, pred::IUGT, x, hi);
+                        l.s.m.select(c, too_hi, hi, x)
+                    }
+                };
+                let mask = self.s.m.i32(0xFFFF);
+                let lo = sat(self, a);
+                let lo = self.s.m.bin(c, Bin::And, lo, mask);
+                let hi = sat(self, bb);
+                let sh = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi, sh);
+                let r = self.s.m.bin(c, Bin::Or, lo, hi);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a packed result outside a VGPR");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
+            "v_mad_u32_u16" | "v_mad_i32_i16" => {
+                if v.clamp || v.omod != 0 || v.opsel & !3 != 0 {
+                    return Err("integer output modifiers");
+                }
+                let (a, bb, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let signed = name == "v_mad_i32_i16";
+                let k16 = self.s.m.i32(16);
+                let ext = |l: &mut Self, x: V, hi_sel: bool| {
+                    let x = if hi_sel {
+                        l.s.m.bin(c, Bin::LShr, x, k16)
+                    } else {
+                        x
+                    };
+                    let x = l.s.m.bin(c, Bin::Shl, x, k16);
+                    l.s.m
+                        .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, k16)
+                };
+                let a = ext(self, a, v.opsel & 1 != 0);
+                let bb = ext(self, bb, v.opsel & 2 != 0);
+                let prod = self.s.m.bin(c, Bin::Mul, a, bb);
+                let r = self.s.m.bin(c, Bin::Add, prod, d);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a result outside a VGPR");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" | "v_dot2_i32_i16" | "v_dot2_u32_u16" => {
+                if v.neg != 0 || v.neg_hi != 0 || v.omod != 0 {
+                    return Err("dot-product operand modifiers");
+                }
+                let (a, bb, acc) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let signed = matches!(name, "v_dot4_i32_i8" | "v_dot2_i32_i16");
+                let lanes = if name.starts_with("v_dot4_") { 4u32 } else { 2u32 };
+                let bits = 32 / lanes;
+                let shift_ext = self.s.m.i32(32 - bits);
+                let shr_op = if signed { Bin::AShr } else { Bin::LShr };
+                let r = if v.clamp {
+                    self.s.flags |= flags::INT64;
+                    let i64t = self.s.m.int(64);
+                    let ext_cast = if signed { Cast::SExt } else { Cast::ZExt };
+                    let mut sum64 = self.s.m.cast(c, ext_cast, acc, i64t);
+                    for lane in 0..lanes {
+                        let sh = self.s.m.i32(lane * bits);
+                        let la = self.s.m.bin(c, Bin::LShr, a, sh);
+                        let la = self.s.m.bin(c, Bin::Shl, la, shift_ext);
+                        let la = self.s.m.bin(c, shr_op, la, shift_ext);
+                        let lb = self.s.m.bin(c, Bin::LShr, bb, sh);
+                        let lb = self.s.m.bin(c, Bin::Shl, lb, shift_ext);
+                        let lb = self.s.m.bin(c, shr_op, lb, shift_ext);
+                        let la64 = self.s.m.cast(c, ext_cast, la, i64t);
+                        let lb64 = self.s.m.cast(c, ext_cast, lb, i64t);
+                        let prod = self.s.m.bin(c, Bin::Mul, la64, lb64);
+                        sum64 = self.s.m.bin(c, Bin::Add, sum64, prod);
+                    }
+                    let clamped = if signed {
+                        let min32 = self.s.m.i32(i32::MIN as u32);
+                        let max32 = self.s.m.i32(i32::MAX as u32);
+                        let min64 = self.s.m.cast(c, Cast::SExt, min32, i64t);
+                        let max64 = self.s.m.cast(c, Cast::SExt, max32, i64t);
+                        let lt = self.s.m.cmp(c, pred::SLT, sum64, min64);
+                        let t = self.s.m.select(c, lt, min64, sum64);
+                        let gt = self.s.m.cmp(c, pred::SGT, t, max64);
+                        self.s.m.select(c, gt, max64, t)
+                    } else {
+                        let max32 = self.s.m.i32(u32::MAX);
+                        let max64 = self.s.m.cast(c, Cast::ZExt, max32, i64t);
+                        let gt = self.s.m.cmp(c, pred::IUGT, sum64, max64);
+                        self.s.m.select(c, gt, max64, sum64)
+                    };
+                    self.s.m.cast(c, Cast::Trunc, clamped, self.s.t.i32)
+                } else {
+                    let mut sum32 = acc;
+                    for lane in 0..lanes {
+                        let sh = self.s.m.i32(lane * bits);
+                        let la = self.s.m.bin(c, Bin::LShr, a, sh);
+                        let la = self.s.m.bin(c, Bin::Shl, la, shift_ext);
+                        let la = self.s.m.bin(c, shr_op, la, shift_ext);
+                        let lb = self.s.m.bin(c, Bin::LShr, bb, sh);
+                        let lb = self.s.m.bin(c, Bin::Shl, lb, shift_ext);
+                        let lb = self.s.m.bin(c, shr_op, lb, shift_ext);
+                        let prod = self.s.m.bin(c, Bin::Mul, la, lb);
+                        sum32 = self.s.m.bin(c, Bin::Add, sum32, prod);
+                    }
+                    sum32
+                };
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a dot-product result outside a VGPR");
+                };
+                self.write(inst, Reg::V(reg), r, guard);
+                Ok(())
+            }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
@@ -5983,6 +6108,65 @@ impl<'a> Lower<'a> {
                 let b = self.s.m.bin(c, Bin::Shl, b, sh);
                 let b = self.s.m.bin(c, op, b, sh);
                 self.s.m.bin(c, Bin::Mul, a, b)
+            }
+            "v_mul_hi_u32_u24" | "v_mul_hi_i32_i24" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_mul_hi_i32_i24";
+                let (sh, op) = (k(self, 8), if signed { Bin::AShr } else { Bin::LShr });
+                let a = self.s.m.bin(c, Bin::Shl, a, sh);
+                let a = self.s.m.bin(c, op, a, sh);
+                let b = self.s.m.bin(c, Bin::Shl, b, sh);
+                let b = self.s.m.bin(c, op, b, sh);
+                self.mul_hi(a, b, signed)
+            }
+            "v_lerp_u8" => {
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let ff = k(self, 0xFF);
+                let one = k(self, 1);
+                let mut out = k(self, 0);
+                for byte in 0..4u32 {
+                    let sh = k(self, byte * 8);
+                    let ba = self.s.m.bin(c, Bin::LShr, a, sh);
+                    let ba = self.s.m.bin(c, Bin::And, ba, ff);
+                    let bb = self.s.m.bin(c, Bin::LShr, b, sh);
+                    let bb = self.s.m.bin(c, Bin::And, bb, ff);
+                    let bd = self.s.m.bin(c, Bin::LShr, d, sh);
+                    let bd = self.s.m.bin(c, Bin::And, bd, one);
+                    let sum = self.s.m.bin(c, Bin::Add, ba, bb);
+                    let sum = self.s.m.bin(c, Bin::Add, sum, bd);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let placed = self.s.m.bin(c, Bin::Shl, avg, sh);
+                    out = self.s.m.bin(c, Bin::Or, out, placed);
+                }
+                out
+            }
+            "v_sad_u8" | "v_sad_u16" | "v_sad_u32" => {
+                let (a, b, mut acc) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (lanes, bits, mask) = match name {
+                    "v_sad_u8" => (4u32, 8u32, 0xFFu32),
+                    "v_sad_u16" => (2u32, 16u32, 0xFFFFu32),
+                    _ => (1u32, 32u32, u32::MAX),
+                };
+                let m = k(self, mask);
+                for lane in 0..lanes {
+                    let (la, lb) = if lanes == 1 {
+                        (a, b)
+                    } else {
+                        let sh = k(self, lane * bits);
+                        let ta = self.s.m.bin(c, Bin::LShr, a, sh);
+                        let tb = self.s.m.bin(c, Bin::LShr, b, sh);
+                        (
+                            self.s.m.bin(c, Bin::And, ta, m),
+                            self.s.m.bin(c, Bin::And, tb, m),
+                        )
+                    };
+                    let gt = self.s.m.cmp(c, pred::IUGT, la, lb);
+                    let hi = self.s.m.select(c, gt, la, lb);
+                    let lo = self.s.m.select(c, gt, lb, la);
+                    let diff = self.s.m.bin(c, Bin::Sub, hi, lo);
+                    acc = self.s.m.bin(c, Bin::Add, acc, diff);
+                }
+                acc
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -9452,6 +9636,75 @@ mod tests {
             max_wave_size: 64,
         })
         .expect("v_mul_legacy_f32, v_cmp_lg_f32, f16 omod, and v_cvt_u16_f16 must lower");
+    }
+
+    #[test]
+    fn wave9_rdna2_valu_mul_hi_24_pack_dot_sad_lerp_lower() {
+        let words = [
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x1404_0300, // v_mul_hi_i32_i24 v2, v0, v1
+            0x1806_0300, // v_mul_hi_u32_u24 v3, v0, v1
+            0xD54D_0004,
+            0x040A_0300, // v_lerp_u8 v4, v0, v1, v2
+            0xD55A_0005,
+            0x040A_0300, // v_sad_u8 v5, v0, v1, v2
+            0xD76A_8006,
+            0x0002_0300, // v_cvt_pk_u16_u32 v6, v0, v1 clamp
+            0xD76B_0007,
+            0x0002_0300, // v_cvt_pk_i16_i32 v7, v0, v1
+            0xD773_0008,
+            0x040A_0300, // v_mad_u32_u16 v8, v0, v1, v2
+            0xD775_0009,
+            0x040A_0300, // v_mad_i32_i16 v9, v0, v1, v2
+            0xCC14_800A,
+            0x1C0A_0300, // v_dot2_i32_i16 v10, v0, v1, v2 clamp
+            0xCC15_000B,
+            0x1C0A_0300, // v_dot2_u32_u16 v11, v0, v1, v2
+            0xCC16_800C,
+            0x1C0A_0300, // v_dot4_i32_i8 v12, v0, v1, v2 clamp
+            0xCC17_000D,
+            0x1C0A_0300, // v_dot4_u32_u8 v13, v0, v1, v2
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            max_wave_size: 64,
+        })
+        .expect("Wave 9 RDNA2 VALU instructions must lower cleanly");
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone())
+                .expect("Wave 9 RDNA2 VALU DXIL must validate");
+        }
+        let _ = out;
     }
 
     #[test]

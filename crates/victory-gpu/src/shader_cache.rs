@@ -10,8 +10,8 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{ConstRootView, HostShader, StaticSampler, UserData};
@@ -95,10 +95,12 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. `ran` tells a miss from a hit; `produced` holds
+/// the translated shader so a cache-write failure still delivers it (#358).
 struct Translate<F> {
     translate: F,
     ran: AtomicBool,
+    produced: Mutex<Option<HostShader>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -112,7 +114,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
         let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let encoded = encode(&shader);
+        *self.produced.lock().unwrap_or_else(|e| e.into_inner()) = Some(shader);
+        Ok(encoded)
     }
 }
 
@@ -126,11 +130,27 @@ fn cached(
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
+        produced: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                // If translation itself succeeded and only persisting the entry
+                // to disk failed, still return the translated shader (#358).
+                if let Some(shader) = converter
+                    .produced
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    MISSES.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(error = %format!("{e:#}"), "shader cache write failed; using in-memory translation");
+                    return Ok(shader);
+                }
+                return Err(format!("{e:#}"));
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
@@ -145,6 +165,14 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
+    if let Some(shader) = converter
+        .produced
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        return Ok(shader);
+    }
     (converter.translate)(container)
 }
 

@@ -284,6 +284,37 @@ fn log2(v: usize) -> u32 {
 
 // The inverse transform.
 
+/// Cached pre- and post-rotation `(sin, cos)` tables for an `n`-point half-IMDCT (#172).
+struct ImdctTables {
+    pre: Vec<(f64, f64)>,
+    post: Vec<(f64, f64)>,
+}
+
+impl ImdctTables {
+    fn build(n: usize) -> Self {
+        let m = n / 2;
+        let pre = (0..m)
+            .map(|k| (-std::f64::consts::PI * k as f64 / n as f64).sin_cos())
+            .collect();
+        let post = (0..m)
+            .map(|k| (-std::f64::consts::PI * (4 * k + 1) as f64 / (4 * n) as f64).sin_cos())
+            .collect();
+        Self { pre, post }
+    }
+}
+
+fn imdct_tables(n: usize) -> Option<&'static ImdctTables> {
+    use std::sync::OnceLock;
+    // XMA subframe sizes are powers of two in 64..=2048 (6 slots).
+    static CACHE: [OnceLock<ImdctTables>; 6] = [const { OnceLock::new() }; 6];
+    if n.is_power_of_two() && (64..=2048).contains(&n) {
+        let idx = (n.trailing_zeros() - 6) as usize;
+        Some(CACHE[idx].get_or_init(|| ImdctTables::build(n)))
+    } else {
+        None
+    }
+}
+
 /// Half-length inverse MDCT as FFmpeg defines it (`av_tx` MDCT, inverse):
 /// `n` coefficients to the middle `n` samples of the 2n-sample window,
 /// negated and scaled by `scale`. Computed as a DCT-IV through an
@@ -293,6 +324,21 @@ fn imdct_half(input: &[f32], out: &mut [f32], scale: f32) {
     let m = n / 2;
     let mut re = vec![0f64; m];
     let mut im = vec![0f64; m];
+    if let Some(tables) = imdct_tables(n) {
+        for k in 0..m {
+            let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
+            let (s, c) = tables.pre[k];
+            (re[k], im[k]) = (a * c - b * s, a * s + b * c);
+        }
+        fft(&mut re, &mut im);
+        for k in 0..m {
+            let (s, c) = tables.post[k];
+            let (wr, wi) = (re[k] * c - im[k] * s, re[k] * s + im[k] * c);
+            out[n - 1 - 2 * k] = (wr as f32) * scale;
+            out[2 * k] = -(wi as f32) * scale;
+        }
+        return;
+    }
     for k in 0..m {
         let (a, b) = (input[2 * k] as f64, input[n - 1 - 2 * k] as f64);
         let (s, c) = (-std::f64::consts::PI * k as f64 / n as f64).sin_cos();

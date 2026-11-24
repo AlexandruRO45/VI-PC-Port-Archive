@@ -33,23 +33,76 @@ pub struct AdapterReport {
     pub resource_binding_tier: u32,
 }
 
-/// Probes the default D3D12 adapter (or WARP when `VICTORY_WARP=1`) and
+/// Selects a D3D12 adapter and creates a device: WARP when `warp` is true,
+/// `VICTORY_ADAPTER` (index or name substring) when set, otherwise the
+/// high-performance GPU via `IDXGIFactory6` (avoiding picking an iGPU on
+/// hybrid Windows laptops, #208 / #1132), falling back to the default adapter.
+unsafe fn create_device(factory: &IDXGIFactory4, warp: bool) -> Result<ID3D12Device, String> {
+    let mut device: Option<ID3D12Device> = None;
+    // SAFETY: caller upholds DXGI/D3D12 safety; all out pointers are valid.
+    unsafe {
+        if warp {
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            return device.ok_or_else(|| "no Direct3D 12 device".to_owned());
+        }
+        if let Ok(sel) = std::env::var("VICTORY_ADAPTER") {
+            let sel = sel.trim();
+            if !sel.is_empty() {
+                if let Ok(idx) = sel.parse::<u32>() {
+                    if let Ok(adapter) = factory.EnumAdapters1(idx)
+                        && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                        && let Some(d) = device.take()
+                    {
+                        return Ok(d);
+                    }
+                } else {
+                    let needle = sel.to_ascii_lowercase();
+                    let mut i = 0u32;
+                    while let Ok(adapter) = factory.EnumAdapters1(i) {
+                        i += 1;
+                        if let Ok(desc) = adapter.GetDesc1() {
+                            let end = desc
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.Description.len());
+                            let name = String::from_utf16_lossy(&desc.Description[..end]);
+                            if name.to_ascii_lowercase().contains(&needle)
+                                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                                    .is_ok()
+                                && let Some(d) = device.take()
+                            {
+                                return Ok(d);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(f6) = factory.cast::<IDXGIFactory6>()
+            && let Ok(adapter) =
+                f6.EnumAdapterByGpuPreference::<IDXGIAdapter>(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+            && let Some(d) = device.take()
+        {
+            return Ok(d);
+        }
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+        device.ok_or_else(|| "no Direct3D 12 device".to_owned())
+    }
+}
+
+/// Probes the preferred D3D12 adapter (or WARP when `VICTORY_WARP=1`) and
 /// returns its GPU/shader capability report without failing if SM 6.6 is
 /// absent (#910).
 pub fn probe_host() -> Result<AdapterReport, String> {
     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     // SAFETY: plain D3D12/DXGI calls with valid out pointers.
     unsafe {
-        let mut device: Option<ID3D12Device> = None;
         let factory: IDXGIFactory4 =
             CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-        if warp {
-            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-        }
-        let device = device.ok_or("no Direct3D 12 device")?;
+        let device = create_device(&factory, warp)?;
         let desc = factory
             .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
             .and_then(|a| a.GetDesc1())
@@ -179,21 +232,15 @@ fn err(e: windows::core::Error) -> String {
 }
 
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// The preferred high-performance adapter (or `VICTORY_ADAPTER`), or WARP
+    /// with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
-            let mut device: Option<ID3D12Device> = None;
             let factory: IDXGIFactory4 =
                 CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-            if warp {
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
-                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            }
-            let device = device.ok_or("no device")?;
+            let device = create_device(&factory, warp)?;
             let software = warp
                 || factory
                     .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())

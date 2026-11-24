@@ -64,6 +64,10 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// D3D12's architectural cap for shader-visible sampler heaps across all
+/// hardware tiers (`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`, #100).
+const PORTABLE_SAMPLERS: u32 = 2_048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run), reclaimed under heap
@@ -108,6 +112,21 @@ impl HostHeap {
         let (heap, count, extra) = if sampler {
             match make(count) {
                 Ok(heap) => (heap, count, 0),
+                Err(e) if count > PORTABLE_SAMPLERS => match make(PORTABLE_SAMPLERS) {
+                    Ok(heap) => {
+                        tracing::warn!(
+                            error = %e,
+                            count,
+                            cap = PORTABLE_SAMPLERS,
+                            "host sampler heap capped at {PORTABLE_SAMPLERS}"
+                        );
+                        (heap, PORTABLE_SAMPLERS, 0)
+                    }
+                    Err(e2) => {
+                        tracing::warn!(error = %e2, count, sampler, "no host descriptor heap");
+                        return None;
+                    }
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;

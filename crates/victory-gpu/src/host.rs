@@ -12,6 +12,9 @@ use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -288,6 +291,22 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some((adapter, desc)) = preferred_adapter() {
+            match D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) {
+                Ok(()) => {
+                    let end = desc
+                        .Description
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    let gpu = String::from_utf16_lossy(&desc.Description[..end]);
+                    let vram_mb = (desc.DedicatedVideoMemory as u64) >> 20;
+                    tracing::info!(gpu = %gpu, vram_mb, "host GPU selected");
+                }
+                Err(_) => {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            }
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -364,6 +383,56 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+/// Picks the preferred hardware D3D12 adapter: `VICTORY_ADAPTER` (index or
+/// case-insensitive name substring) when set, otherwise `IDXGIFactory6`'s
+/// `HIGH_PERFORMANCE` adapter so hybrid laptops pick their discrete GPU
+/// instead of an iGPU (#208 / #1132).
+fn preferred_adapter() -> Option<(IDXGIAdapter, DXGI_ADAPTER_DESC1)> {
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        if let Ok(sel) = std::env::var("VICTORY_ADAPTER") {
+            let sel = sel.trim();
+            if !sel.is_empty() {
+                if let Ok(idx) = sel.parse::<u32>() {
+                    if let Ok(a1) = factory.EnumAdapters1(idx)
+                        && let Ok(desc) = a1.GetDesc1()
+                        && let Ok(adapter) = a1.cast::<IDXGIAdapter>()
+                    {
+                        return Some((adapter, desc));
+                    }
+                } else {
+                    let needle = sel.to_ascii_lowercase();
+                    let mut i = 0u32;
+                    while let Ok(a1) = factory.EnumAdapters1(i) {
+                        i += 1;
+                        if let Ok(desc) = a1.GetDesc1() {
+                            let end = desc
+                                .Description
+                                .iter()
+                                .position(|&c| c == 0)
+                                .unwrap_or(desc.Description.len());
+                            let name = String::from_utf16_lossy(&desc.Description[..end]);
+                            if name.to_ascii_lowercase().contains(&needle)
+                                && let Ok(adapter) = a1.cast::<IDXGIAdapter>()
+                            {
+                                return Some((adapter, desc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let f6: IDXGIFactory6 = factory.cast().ok()?;
+        let a1: IDXGIAdapter1 = f6
+            .EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            .ok()?;
+        let desc = a1.GetDesc1().ok()?;
+        let adapter: IDXGIAdapter = a1.cast().ok()?;
+        Some((adapter, desc))
     }
 }
 
@@ -3115,12 +3184,81 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     Ok(HWND(hwnd as *mut _))
 }
 
+/// Saved windowed placement while our fallback presentation window is in
+/// borderless fullscreen (F11 / Alt+Enter).
+static FULLSCREEN_RESTORE: Mutex<Option<(i32, RECT)>> = Mutex::new(None);
+
+fn toggle_fullscreen(hwnd: HWND) {
+    let mut saved = FULLSCREEN_RESTORE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: valid top-level window handle on its owning message thread.
+    unsafe {
+        if let Some((style, rect)) = saved.take() {
+            SetWindowLongW(hwnd, GWL_STYLE, style);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                rect.left,
+                rect.top,
+                (rect.right - rect.left).max(1),
+                (rect.bottom - rect.top).max(1),
+                SWP_FRAMECHANGED | SWP_NOOWNERZORDER,
+            );
+            return;
+        }
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let mr = info.rcMonitor;
+        *saved = Some((style, rect));
+        let borderless = style & !(WS_OVERLAPPEDWINDOW.0 as i32);
+        SetWindowLongW(hwnd, GWL_STYLE, borderless);
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            mr.left,
+            mr.top,
+            (mr.right - mr.left).max(1),
+            (mr.bottom - mr.top).max(1),
+            SWP_FRAMECHANGED | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
 extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const VK_F11: usize = 0x7A;
+    const VK_RETURN: usize = 0x0D;
+    let repeat = (lparam.0 & (1 << 30)) != 0;
+    let alt = (lparam.0 & (1 << 29)) != 0;
+    if !repeat
+        && ((message == WM_KEYDOWN && wparam.0 == VK_F11)
+            || (message == WM_SYSKEYDOWN && wparam.0 == VK_RETURN && alt))
+    {
+        toggle_fullscreen(hwnd);
+        return LRESULT(0);
+    }
+    if message == WM_CLOSE {
+        // SAFETY: valid window handle on its owning message thread.
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            PostQuitMessage(0);
+        }
+        return LRESULT(0);
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }

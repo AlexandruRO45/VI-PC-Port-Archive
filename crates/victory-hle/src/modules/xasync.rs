@@ -230,10 +230,14 @@ pub struct Queue {
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     waiters: Mutex<Vec<Waiter>>,
     terminated: AtomicBool,
+    terminate_lock: Mutex<bool>,
+    terminate_wake: Condvar,
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
+        *self.terminate_lock.get_mut().unwrap_or_else(|e| e.into_inner()) = true;
+        self.terminate_wake.notify_all();
         for waiter in self.waiters.get_mut().unwrap_or_else(|e| e.into_inner()).drain(..) {
             waiter.stop();
         }
@@ -247,6 +251,8 @@ impl Queue {
             monitors: Mutex::default(),
             waiters: Mutex::default(),
             terminated: AtomicBool::new(false),
+            terminate_lock: Mutex::new(false),
+            terminate_wake: Condvar::new(),
         })
     }
 
@@ -262,8 +268,23 @@ impl Queue {
         } else {
             let queue = self.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
+                let guard = lock(&queue.terminate_lock);
+                let (guard, _) = queue
+                    .terminate_wake
+                    .wait_timeout_while(
+                        guard,
+                        Duration::from_millis(delay_ms.into()),
+                        |&mut terminated| !terminated,
+                    )
+                    .unwrap_or_else(|e| e.into_inner());
+                let canceled = *guard || queue.terminated.load(Ordering::Acquire);
+                drop(guard);
+                if canceled {
+                    // Terminating a queue cancels its delayed callbacks (#132).
+                    task.run(true);
+                } else {
+                    queue.deliver(port, task);
+                }
             });
         }
         S_OK
@@ -424,6 +445,8 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    *lock(&queue.terminate_lock) = true;
+    queue.terminate_wake.notify_all();
     let waiters: Vec<Waiter> = lock(&queue.waiters).drain(..).collect();
     for waiter in waiters {
         waiter.stop();
@@ -1552,6 +1575,35 @@ mod tests {
             CloseHandle(ev);
         }
         assert!(!XTaskQueueDispatch(q, WORK, 25));
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn terminating_queue_cancels_delayed_callbacks() {
+        static CANCELED: AtomicUsize = AtomicUsize::new(0);
+        extern "system" fn on_delayed(_: *mut c_void, canceled: bool) {
+            if canceled {
+                CANCELED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        assert_eq!(
+            XTaskQueueSubmitDelayedCallback(q, WORK, 30_000, std::ptr::null_mut(), Some(on_delayed)),
+            S_OK
+        );
+        assert_eq!(XTaskQueueTerminate(q, false, std::ptr::null_mut(), None), S_OK);
+        let start = std::time::Instant::now();
+        while CANCELED.load(Ordering::SeqCst) == 0
+            && start.elapsed() < Duration::from_secs(2)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            CANCELED.load(Ordering::SeqCst),
+            1,
+            "delayed callback must be canceled promptly on terminate"
+        );
         XTaskQueueCloseHandle(q);
     }
 }

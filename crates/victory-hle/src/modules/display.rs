@@ -118,10 +118,16 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
     NOT_SUPPORTED
 }
 
+/// Sentinel handle handed out when the host OS rejects `PowerSetRequest`
+/// with `ERROR_NOT_SUPPORTED` (RDP, headless runners, restricted power plans).
+#[cfg(windows)]
+const NOOP_DEFERRAL: *mut c_void = 1usize as *mut c_void;
+
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.
 #[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NOT_SUPPORTED, GetLastError};
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -144,10 +150,15 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     }
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
-        let hr = last_error();
+        // SAFETY: no preconditions.
+        let code = unsafe { GetLastError() };
         // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+        unsafe { CloseHandle(request) };
+        if code == ERROR_NOT_SUPPORTED {
+            tracing::debug!("PowerSetRequest returned ERROR_NOT_SUPPORTED; using no-op deferral");
+            return put(out, NOOP_DEFERRAL);
+        }
+        return (0x8007_0000 | (code & 0xffff)) as i32;
     }
     put(out, request)
 }
@@ -156,7 +167,7 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() {
+    if !handle.is_null() && handle != NOOP_DEFERRAL {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
