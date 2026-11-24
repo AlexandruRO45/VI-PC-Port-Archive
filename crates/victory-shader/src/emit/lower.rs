@@ -2297,7 +2297,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    /// LDS (thread-group shared memory) and `ds_swizzle`.
+    /// LDS (thread-group shared memory) and DS lane operations.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
             dst,
@@ -2321,6 +2321,51 @@ impl<'a> Lower<'a> {
             Some(Operand::Vector { reg, .. }) => Some(*reg),
             _ => None,
         };
+        if name == "ds_bpermute_b32" {
+            self.cross_lane(false)?;
+            let index = self.vgprs(inst, addr.as_ref().ok_or("a permute index")?, 1)?[0];
+            let value = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let reg = dst_reg.ok_or("a permute result")?;
+            let lane = self.lane_index();
+            let bias = self.s.m.i32(u32::from(*offset0));
+            let two = self.s.m.i32(2);
+            let low_mask = self.s.m.i32(31);
+            let byte = self.s.m.bin(c, Bin::Add, index, bias);
+            let dword = self.s.m.bin(c, Bin::LShr, byte, two);
+            let src_low = self.s.m.bin(c, Bin::And, dword, low_mask);
+
+            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+            let lo = self.s.m.extract(c, ballot, 0);
+            // RDNA2 permutes within a 32-lane half, even in Wave64.
+            let (src, mask) = if self.wave() == 64 {
+                let bit = self.s.m.i32(32);
+                let zero = self.s.m.i32(0);
+                let half = self.s.m.bin(c, Bin::And, lane, bit);
+                let high = self.s.m.cmp(c, pred::NE, half, zero);
+                let hi = self.s.m.extract(c, ballot, 1);
+                (
+                    self.s.m.bin(c, Bin::Or, half, src_low),
+                    self.s.m.select(c, high, hi, lo),
+                )
+            } else {
+                (src_low, lo)
+            };
+            let bits = self.s.m.bin(c, Bin::LShr, mask, src_low);
+            let one = self.s.m.i32(1);
+            let zero = self.s.m.i32(0);
+            let bit = self.s.m.bin(c, Bin::And, bits, one);
+            let active = self.s.m.cmp(c, pred::NE, bit, zero);
+            // Inactive sources return zero. Read our active host lane as
+            // a fallback so WaveReadLaneAt never reads an inactive lane.
+            let safe_src = self.s.m.select(c, active, src, lane);
+            let read = self.read_lane(value, safe_src);
+            let result = self.s.m.select(c, active, read, zero);
+            self.write(inst, Reg::V(reg), result, guard);
+            return Ok(());
+        }
         if name == "ds_swizzle_b32" {
             // Bit 15 set: each lane of a quad picks a lane of it; else lanes
             // of each group of 32 combine their index with and/or/xor masks.
