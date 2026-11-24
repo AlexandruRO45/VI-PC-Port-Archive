@@ -577,18 +577,20 @@ impl Host {
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // passes declare the same big ranges dozens of times). Deduplicated
+        // by identity in a set, not by scanning what is already there: a
+        // submission declares thousands of ranges.
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
+        let mut seen = std::collections::HashSet::new();
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+                    if seen.insert(key) {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }

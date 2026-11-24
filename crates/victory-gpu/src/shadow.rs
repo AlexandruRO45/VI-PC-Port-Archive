@@ -201,7 +201,10 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            // From the pool: this runs once per range and submission, and a
+            // fresh 64 KiB buffer per call was an allocation and a memset of
+            // it for bytes `read_into` overwrites anyway.
+            let mut piece = pooled(PIECE);
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -210,7 +213,7 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
+                let title = &mut piece[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
@@ -231,6 +234,7 @@ impl Shadow {
                 }
                 at += n;
             }
+            give_back(piece);
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
