@@ -418,11 +418,12 @@ fn displayable(d: &D3D12_RESOURCE_DESC) -> bool {
 }
 
 /// The index of the displayable target bound most often (the last of
-/// equals), given each target's description and binds.
+/// equals), given each target's description and binds; one never bound
+/// (only listed, see [`note_unwritten`]) is never picked.
 fn busiest(seen: &[(D3D12_RESOURCE_DESC, u32)]) -> Option<usize> {
     seen.iter()
         .enumerate()
-        .filter(|(_, (d, _))| displayable(d))
+        .filter(|(_, (d, n))| *n > 0 && displayable(d))
         .max_by_key(|(_, (_, n))| *n)
         .map(|(i, _)| i)
 }
@@ -437,6 +438,18 @@ fn presentable(d: &D3D12_RESOURCE_DESC) -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    note(resource, true);
+}
+
+/// Notes a title texture dropped work would have written: listed (so an
+/// index or a dump can reach it) but not counted as a bind, since nothing
+/// wrote it, so it cannot win show mode `busiest` on its own.
+pub(crate) fn note_unwritten(resource: crate::object::This) {
+    note(resource, false);
+}
+
+/// Lists `resource` for this frame, counting a bind if `bind`.
+fn note(resource: crate::object::This, bind: bool) {
     if resource.is_null() {
         return;
     }
@@ -444,7 +457,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
     if !dumping && show_index().is_none() {
         return;
     }
-    if show_index().is_some() {
+    if bind && show_index().is_some() {
         let mut hits = HITS.lock().unwrap_or_else(|e| e.into_inner());
         hit(hits.get_or_insert_with(std::collections::HashMap::new), resource as usize);
     }
@@ -788,6 +801,17 @@ mod tests {
             SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_target_only_dropped_work_writes_is_listed_but_never_busiest() {
+        // A displayable layer only dropped work would have written (listed,
+        // no binds) loses to any bound one, and alone is not picked.
+        let unwritten = (screen(2560, 1440, 28), 0);
+        let bound = (screen(2560, 1440, 28), 1);
+        assert_eq!(super::busiest(&[unwritten]), None);
+        assert_eq!(super::busiest(&[unwritten, bound]), Some(1));
+        assert_eq!(super::busiest(&[bound, unwritten]), Some(0));
     }
 
     #[test]
