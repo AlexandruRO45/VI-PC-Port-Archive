@@ -5371,6 +5371,96 @@ mod tests {
     /// instead of hanging the test run.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
+    fn folder_settings_that_are_not_utf8_are_kept_byte_for_byte() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        // Scratch folder under the system temp folder, removed when dropped.
+        let scratch = tempfile::tempdir().unwrap();
+        if ensure_outside_repo(scratch.path()).is_err() {
+            // `TMPDIR` is inside the checkout; every subfolder is refused,
+            // which `subfolders_are_created_nested_and_again_without_error`
+            // already checks.
+            return;
+        }
+        // A Latin-1 `é` (0xE9) is a valid name on Linux but not UTF-8: it
+        // must reach the file system as written, not as U+FFFD.
+        let odd = |name: &[u8]| scratch.path().join(OsString::from_vec(name.to_vec()));
+        let cache = odd(b"cach\xE9");
+        let data = odd(b"donn\xE9es");
+        let game = odd(b"jeu\xE9");
+        std::fs::create_dir_all(&game).unwrap();
+        let env = |game: PathBuf| {
+            let (cache, data) = (cache.clone(), data.clone());
+            move |k: &str| match k {
+                "VICTORY_GAME_DIR" => Some(game.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+
+        let cfg = Config::resolve(FilePaths::default(), None, env(game.clone())).unwrap();
+        assert_eq!(cfg.game_dir.as_deref(), Some(&*game));
+        assert_eq!(cfg.cache_dir, cache);
+        assert_eq!(cfg.data_dir, data);
+        assert_eq!(cfg.origins.cache_dir, Origin::Env("VICTORY_CACHE_DIR"));
+
+        // The subfolders are made under the exact bytes, nested and again.
+        let made = cfg.cache_subdir("shaders/x").unwrap();
+        assert_eq!(made, cache.join("shaders").join("x"));
+        assert!(made.is_dir());
+        assert_eq!(cfg.cache_subdir("shaders/x").unwrap(), made);
+        assert!(cfg.data_subdir("saves").unwrap().is_dir());
+        let names: Vec<Vec<u8>> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().as_bytes().to_vec())
+            .collect();
+        assert!(names.contains(&b"cach\xE9".to_vec()), "{names:?}");
+        assert!(names.contains(&b"donn\xE9es".to_vec()), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|n| std::str::from_utf8(n).is_ok_and(|n| n.contains('\u{FFFD}'))),
+            "a name was written with the replacement character: {names:?}"
+        );
+
+        // A file in place of the game folder is still refused by kind, the
+        // error spelling the odd byte the lossy way and pointing at the
+        // folder holding it.
+        let exe = game.join(OsString::from_vec(b"default\xFF.xex".to_vec()));
+        std::fs::write(&exe, b"").unwrap();
+        let err = Config::resolve(FilePaths::default(), None, env(exe.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "the game folder {} (from VICTORY_GAME_DIR) is a file",
+                exe.display()
+            )),
+            "{err}"
+        );
+        assert!(err.contains(&game.display().to_string()), "{err}");
+        assert!(err.contains('\u{FFFD}'), "{err}");
+        // Refused without being touched.
+        assert!(exe.is_file());
+
+        // A link that leads nowhere under an odd name is named, target too.
+        let dangling = odd(b"lien\xE9");
+        std::os::unix::fs::symlink(odd(b"parti\xE9"), &dangling).unwrap();
+        let err = Config::resolve(FilePaths::default(), None, env(dangling.clone()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!(
+                "the game folder {} (from VICTORY_GAME_DIR) is a link to {} that leads nowhere",
+                dangling.display(),
+                odd(b"parti\xE9").display()
+            )),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn a_subfolder_taken_by_a_named_pipe_or_a_socket_is_an_error_without_blocking() {
         // Scratch folder under the system temp folder, removed when dropped.
         let scratch = tempfile::tempdir().unwrap();
