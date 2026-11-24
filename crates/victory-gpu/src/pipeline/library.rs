@@ -228,8 +228,8 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
-/// Writes changed shards and the early list when due. Saves are serialized
-/// so an older snapshot cannot overwrite a newer one.
+/// Writes changed shards and the early list when due. Within this process,
+/// saves are serialized so an older snapshot cannot overwrite a newer one.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
