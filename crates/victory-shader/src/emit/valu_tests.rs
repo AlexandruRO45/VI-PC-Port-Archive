@@ -990,19 +990,19 @@ fn build_and_validate_cs(native: &NativeProgram) -> Result<HostShader, crate::Sh
 }
 
 #[test]
-fn s_buffer_load_and_multi_descriptor_data_execute() {
+fn multi_descriptor_data_execute() {
     use super::host::Stride;
 
     // One `s_load_dwordx16 s[8:23], s[0:1], 0` loads two 32-byte heap slots at once:
     // - s[8:11]  (first=0, heap[0]): StructuredBuffer (stride=16, 3 records = 12 dwords)
     // - s[16:19] (first=8, heap[1]): RawUav (5 dwords = 20 bytes)
-    // Reads s10 (num_records=3), s9>>16 (stride=16), s_buffer_load_dwordx2 from
-    // record 2 (offset 0x20), and s18 (UAV byte size = 20).
+    // Reads s10 (num_records=3), s9>>16 (stride=16), and s18 (UAV byte size =
+    // 20). (Byte-offset loads of a descriptor no `buffer_*` access indexes
+    // stay raw: `s_buffer_load_with_table_stride_reads_raw_view`.)
     let mut words = vec![s_mov_b32(1, 0x80)];
     words.extend_from_slice(&smem_load(0x04, 8, 0, 125, 0)); // s_load_dwordx16 s[8:23], s[0:1], 0
     words.push(sop2(0x20, 24, 9, 0x90)); // s_lshr_b32 s24, s9, 16 (stride)
-    words.extend_from_slice(&smem_load(0x09, 26, 8, 125, 0x20)); // s_buffer_load_dwordx2 s[26:27], s[8:11], 0x20
-    for (k, sreg) in [10u8, 24, 26, 27, 18].into_iter().enumerate() {
+    for (k, sreg) in [10u8, 24, 18].into_iter().enumerate() {
         words.push(vop1(0x001, k as u8, sgpr(sreg)));
         words.extend_from_slice(&buffer_store_dword(k as u8, 16, (k * 4) as u16));
     }
@@ -1049,7 +1049,7 @@ fn s_buffer_load_and_multi_descriptor_data_execute() {
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
 
-    let shader = build_and_validate_cs(&native).expect("lower structured s_buffer_load + x8 data");
+    let shader = build_and_validate_cs(&native).expect("lower x16 descriptor data");
     let sb_data: [u32; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 0xCAFE_1234, 0xBEEF_5678, 11, 12];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
@@ -1076,9 +1076,94 @@ fn s_buffer_load_and_multi_descriptor_data_execute() {
             )
             .expect(label);
         assert_eq!(
+            out[0][..3],
+            [3, 16, 20],
+            "{label}: unexpected structured descriptor data output"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+#[test]
+fn s_buffer_load_with_table_stride_reads_raw_view() {
+    use super::host::Stride;
+
+    // A descriptor read only by `s_buffer_load_dwordx2 s[26:27], s[8:11], 0x44`
+    // whose resource table records a stride (64) over the title's raw view:
+    // the load stays raw, so it reads dwords 17 and 18.
+    let mut words = vec![s_mov_b32(1, 0x80)];
+    words.extend_from_slice(&smem_load(0x04, 8, 0, 125, 0)); // s_load_dwordx16 s[8:23], s[0:1], 0
+    words.extend_from_slice(&smem_load(0x09, 26, 8, 125, 0x44)); // s_buffer_load_dwordx2 s[26:27], s[8:11], 0x44
+    for (k, sreg) in [26u8, 27].into_iter().enumerate() {
+        words.push(vop1(0x001, k as u8, sgpr(sreg)));
+        words.extend_from_slice(&buffer_store_dword(k as u8, 16, (k * 4) as u16));
+    }
+    words.push(S_ENDPGM);
+
+    let table = |kind, table_offset_dwords, stride| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![
+            table(ResourceType::Srv, 0, 64),
+            table(ResourceType::Uav, 8, 0),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+
+    let shader = build_and_validate_cs(&native).expect("lower s_buffer_load over a raw view");
+    let data: Vec<u32> = (0..32).map(|k| 0x1000 + k).collect();
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).expect(label);
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(2),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect(label);
+        assert_eq!(
             out[0],
-            vec![3, 16, 0xCAFE_1234, 0xBEEF_5678, 20],
-            "{label}: unexpected structured descriptor/s_buffer_load output"
+            vec![0x1011, 0x1012],
+            "{label}: s_buffer_load over a raw view"
         );
         ran += 1;
     }

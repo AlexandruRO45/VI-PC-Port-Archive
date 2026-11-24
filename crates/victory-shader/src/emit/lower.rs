@@ -2873,7 +2873,7 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        if let Some((props, _)) = self.buffer_srv_uav_props(src, kind) {
+        if let Some((props, _)) = self.buffer_srv_uav_props(src, kind, true) {
             let h = self.handle(site, src, false, props)?;
             let view_kind = props.0 & 0xFF;
             for k in 0..count {
@@ -3065,10 +3065,18 @@ impl<'a> Lower<'a> {
     /// DXIL `(props0, props1)` and `V#` stride for an SRV or UAV buffer `src`
     /// (`None` when `src` is a constant buffer). Keeps `s_buffer_load_dword*`,
     /// `buffer_*`, and `descriptor_data` on the same heap view kind.
+    ///
+    /// `loads`: the view reads data (`s_buffer_load_dword*`), not only its
+    /// size. Then it is structured only when a `buffer_*` access of the same
+    /// descriptor indexes records: the resource table's stride alone does
+    /// not show the title's view is structured, and a structured annotation
+    /// over its raw view reads zeros (the byte-offset raw load the console
+    /// makes is right for either).
     fn buffer_srv_uav_props(
         &self,
         src: &Source,
         used: Option<&UsedResource>,
+        loads: bool,
     ) -> Option<((u32, u32), u32)> {
         let leaves = src.leaves();
         let shares_source = |d_src: &Source| match src {
@@ -3128,7 +3136,10 @@ impl<'a> Lower<'a> {
         });
         if any_typed {
             Some(((10 | u, 0x409), raw_stride))
-        } else if any_raw_buf || matches!(src, Source::Built { .. }) {
+        } else if any_raw_buf
+            || (loads && buf_sites.is_empty())
+            || matches!(src, Source::Built { .. })
+        {
             Some(((11 | u, 0), 0))
         } else if raw_stride >= 4 && raw_stride.is_multiple_of(4) {
             Some(((12 | u, raw_stride), raw_stride))
@@ -3453,7 +3464,7 @@ impl<'a> Lower<'a> {
                 }))
             }
             Fields::Buffer { .. } | Fields::Smem { .. } => {
-                match self.buffer_srv_uav_props(&src, used) {
+                match self.buffer_srv_uav_props(&src, used, false) {
                     Some((props, stride)) => Ok(Some(DescSlice::Buffer { props, stride })),
                     None => Ok(Some(DescSlice::Cbv)),
                 }
