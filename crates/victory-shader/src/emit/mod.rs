@@ -382,6 +382,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 "signature name outside 1 to 64 characters",
             ));
         }
+        // HLSL semantics are identifiers. The name is raw bytes of the
+        // title's part, and a byte outside printable ASCII went through a
+        // lossy UTF-8 conversion: each invalid byte became U+FFFD, three
+        // bytes, so a name that passed the length check above reached the
+        // validator past 64 characters, and two different names became one
+        // semantic (one refused as listed twice, or a link to the wrong row).
+        if !name.iter().all(u8::is_ascii_graphic) {
+            return Err(ShaderError::Malformed(
+                "signature name outside printable ASCII",
+            ));
+        }
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
@@ -494,7 +505,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         // one element. The next stage links by it, and D3D12 refuses a
         // signature that lists one twice, so the pipeline was lost; a second
         // element in another register passed every check above.
-        let name = String::from_utf8_lossy(name).into_owned();
+        let name = String::from_utf8(name.to_vec()).expect("checked ASCII above");
         let index = u32_at(part, at + 8)?;
         if out
             .iter()
@@ -962,6 +973,41 @@ mod tests {
                 ShaderError::Malformed("signature name outside 1 to 64 characters").to_string(),
                 "name of {} characters",
                 name.len()
+            );
+        }
+    }
+
+    /// A semantic name with a byte outside printable ASCII is refused. A
+    /// lossy UTF-8 conversion used to turn each invalid byte into three, so
+    /// 64 bytes of `0xFF` became a 192-byte name the validator refuses, and
+    /// `0xFE` and `0xFF` became the same semantic.
+    #[test]
+    fn a_signature_name_outside_printable_ascii_is_refused() {
+        let part = |name: &[u8]| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, 0, 3, 1, 0x3, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(name);
+            p.push(0);
+            p
+        };
+        for name in [&b"TEXCOORD"[..], b"SV_Position", b"_a1~!"] {
+            assert_eq!(signature(&part(name)).unwrap()[0].name.as_bytes(), name);
+        }
+        for name in [
+            &[0xFF; 64][..],
+            &[0xFE][..],
+            b"TEX\x80COORD",
+            "T\u{E9}XCOORD".as_bytes(),
+            b"TEX COORD",
+            b"TEX\tCOORD",
+            b"\x7F",
+        ] {
+            assert_eq!(
+                signature(&part(name)).unwrap_err().to_string(),
+                ShaderError::Malformed("signature name outside printable ASCII").to_string(),
+                "name {name:?}"
             );
         }
     }
