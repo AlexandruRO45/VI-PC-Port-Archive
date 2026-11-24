@@ -713,6 +713,10 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Vs { inputs, outputs })
 }
 
+/// The VGPRs a vertex program receives its vertex, primitive and instance
+/// id in.
+const VS_SYSTEM_VGPRS: [u32; 3] = [0, 2, 3];
+
 /// Raising loads a vertex input's channel `c` from `v[vgpr + c]`, an 8-bit
 /// register number: every enabled channel must land on a VGPR.
 fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
@@ -724,6 +728,18 @@ fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
         })
     {
         return Err(Malformed("vertex input outside the VGPRs"));
+    }
+    // Raising also labels v0, v2 and v3 as the vertex, primitive and
+    // instance id (`io::raise`) and takes the first label a register has, so
+    // a channel loaded into one of them would silently read as that id.
+    if let StageIo::Vs { inputs, .. } = &io
+        && inputs.iter().any(|i| {
+            (0..4)
+                .filter(|c| i.mask >> c & 1 != 0)
+                .any(|c| VS_SYSTEM_VGPRS.contains(&(u32::from(i.vgpr) + c)))
+        })
+    {
+        return Err(Malformed("vertex input over a system VGPR"));
     }
     Ok(io)
 }
@@ -1373,6 +1389,20 @@ mod tests {
                 matches!(
                     input(vgpr, mask),
                     Err(Malformed("vertex input outside the VGPRs"))
+                ),
+                "v{vgpr} mask {mask:#x}"
+            );
+        }
+        // v1 and v4 up hold no id: x in v1 and x-w from v4 load. Any channel
+        // on v0, v2 or v3 is refused, including y and z of an input in v1.
+        assert!(input(1, 0x1).is_ok());
+        assert!(input(4, 0xf).is_ok());
+        assert!(input(0, 0).is_ok(), "no channel is loaded");
+        for (vgpr, mask) in [(0, 0x1), (1, 0x2), (2, 0x1), (3, 0x1), (1, 0x4)] {
+            assert!(
+                matches!(
+                    input(vgpr, mask),
+                    Err(Malformed("vertex input over a system VGPR"))
                 ),
                 "v{vgpr} mask {mask:#x}"
             );
