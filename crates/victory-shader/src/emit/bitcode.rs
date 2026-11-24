@@ -168,7 +168,7 @@ struct Block {
     term: Option<Term>,
 }
 
-/// Function attributes of a `dx.op` declaration.
+/// Function attributes of a `dx.op` declaration or of the entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Attr {
     ReadNone = 1,
@@ -176,6 +176,7 @@ pub(crate) enum Attr {
     ReadOnly = 3,
     /// Barriers.
     NoDuplicate = 4,
+    WaveOpsIncludeHelperLanes = 5,
 }
 
 struct Func {
@@ -326,6 +327,13 @@ impl Module {
         });
         self.func_ids.insert(name.into(), i);
         V::Func(i)
+    }
+
+    pub fn set_function_attr(&mut self, function: V, attr: Attr) {
+        let V::Func(index) = function else {
+            unreachable!("function attribute outside a function");
+        };
+        self.funcs[index as usize].attr = Some(attr);
     }
 
     /// An external global of type `ty` in address space `space` (DXIL
@@ -524,7 +532,11 @@ impl Module {
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
 
-        // Attribute groups 1-4 and one list per group.
+        let wave_helpers = self
+            .funcs
+            .iter()
+            .any(|f| f.attr == Some(Attr::WaveOpsIncludeHelperLanes));
+        // Attribute groups and one list per group.
         w.enter(PARAMATTR_GROUP_BLOCK, 3);
         for (id, kinds) in [
             (1, &[18u64, 20][..]),
@@ -538,9 +550,16 @@ impl Module {
             }
             w.record(3, &r);
         }
+        if wave_helpers {
+            let mut r = vec![Attr::WaveOpsIncludeHelperLanes as u64, 0xFFFF_FFFF, 3];
+            // A valueless string attribute, terminated by NUL.
+            r.extend(chars("waveops-include-helper-lanes"));
+            r.push(0);
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=4 + u64::from(wave_helpers) {
             w.record(2, &[id]);
         }
         w.exit();

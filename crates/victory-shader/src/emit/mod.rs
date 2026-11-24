@@ -1,5 +1,6 @@
 //! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
-//! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
+//! or mesh shader as a PC DXIL container that host D3D12 accepts (SM 6.6,
+//! or SM 6.7 for pixel shaders that use wave intrinsics on helper lanes).
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
@@ -522,6 +523,67 @@ mod tests {
         let c = Container::parse(&container).unwrap();
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
             assert!(e.to_string().contains("its own value"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_pixel_loop_elects_from_helper_lanes() {
+        // A lane retries until it is in the elected key's group. A helper
+        // also has to be able to elect itself once the covered lanes leave.
+        let words = [
+            0x7E02_0300u32, // v_mov_b32 v1, v0 (position.x)
+            0x7E00_0501,    // v_readfirstlane_b32 s0, v1
+            0xD4C2_006A,
+            0x0002_0200, // v_cmp_eq_u32 vcc_lo, s0, v1
+            0xBF86_FFFC, // s_cbranch_vccz to the lane read
+            0xF800_180F,
+            0x0101_0101, // exp mrt0 v1, v1, v1, v1 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 8,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, kind| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        };
+        let isg = container::signature(&[element("SV_Position", 3)], true);
+        let osg = container::signature(&[element("SV_Target", 16)], false);
+        let c = crate::dxbc::build(&[(FourCC::ISG1, &isg), (FourCC::OSG1, &osg)]);
+        let c = Container::parse(&c).unwrap();
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let dxil = Container::parse(&out.dxil).unwrap().part(FourCC::DXIL).unwrap().data;
+        let dxil = crate::DxilProgram::parse(dxil).unwrap();
+        assert_eq!(dxil.shader_model, (6, 7));
+        assert_eq!(dxil.dxil_version, 0x107);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
         }
     }
 
