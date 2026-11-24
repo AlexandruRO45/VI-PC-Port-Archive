@@ -1,4 +1,5 @@
 #include "dxr_fixture.h"
+#include "dxr_placed_build.h"
 #include "era_title_va.h"
 #include "ray_candidates.h"
 #include "ray_candidates_pipeline.h"
@@ -160,7 +161,7 @@ constexpr UINT64 asOffset = 2 * D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALI
 static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const std::vector<Vertex>& vertices,
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> instances, const std::vector<Ray>& rays,
     Backend backend, const SceneUpdate* update, const std::vector<D3D12_RAYTRACING_GEOMETRY_FLAGS>* triangleGeometries,
-    const AddressScene* addressScene) {
+    const AddressScene* addressScene, PlacedBuildScene* placedScene = nullptr) {
     const bool usePipeline = backend == Backend::pipeline;
     if (usePipeline) {
         if (triangleGeometries && (triangleGeometries->empty() || triangleGeometries->size() > 4))
@@ -231,14 +232,19 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     constexpr auto as_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
     const UINT64 prefix = addressScene ? asOffset : 0;
     const UINT64 blasBytes = prefix + bottom_size.ResultDataMaxSizeInBytes;
-    auto blas = make_buffer(device, blasBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
-    auto tlas = make_buffer(device, prefix + top_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
-    auto scratch = make_buffer(device, (std::max)({bottom_size.ScratchDataSizeInBytes, top_size.ScratchDataSizeInBytes,
-                               bottom_size.UpdateScratchDataSizeInBytes, top_size.UpdateScratchDataSizeInBytes}),
-                               D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
-    bottom.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
-    top.DestAccelerationStructureData = tlas->GetGPUVirtualAddress() + prefix;
-    bottom.ScratchAccelerationStructureData = top.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    ComPtr<ID3D12Resource> blas, tlas, scratch;
+    if (placedScene) {
+        placedScene->prepare(device, bottom_size, top_size, bottom, top);
+    } else {
+        blas = make_buffer(device, blasBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
+        tlas = make_buffer(device, prefix + top_size.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT, as_state, writable);
+        scratch = make_buffer(device, (std::max)({bottom_size.ScratchDataSizeInBytes, top_size.ScratchDataSizeInBytes,
+                              bottom_size.UpdateScratchDataSizeInBytes, top_size.UpdateScratchDataSizeInBytes}),
+                              D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, writable);
+        bottom.DestAccelerationStructureData = blas->GetGPUVirtualAddress();
+        top.DestAccelerationStructureData = tlas->GetGPUVirtualAddress() + prefix;
+        bottom.ScratchAccelerationStructureData = top.ScratchAccelerationStructureData = scratch->GetGPUVirtualAddress();
+    }
     ComPtr<ID3D12Resource> otherBlas, otherVertices;
     auto otherGeometry = geometries.front();
     auto otherBuild = bottom;
@@ -299,7 +305,7 @@ static std::vector<bvh_fixture::Word> trace_scene(ID3D12Device* device, const st
     transition(list.Get(), results.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(results.Get(), 0, initial.Get(), 0, result_bytes);
     transition(list.Get(), results.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(list.Get(), scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (scratch) transition(list.Get(), scratch.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     D3D12_RESOURCE_BARRIER order{};
     order.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     // Order both the BLAS write and the reused scratch storage before building the TLAS.
@@ -384,6 +390,20 @@ bool check_dxr_address_ranges(ID3D12Device* device) {
     }
     std::puts("DXR address ranges: interior offset=512 full=[hit7@1,miss,miss,hit11@2] "
               "truncated=[hit7@1,miss,hit11@1,miss]");
+    return true;
+}
+
+bool check_dxr_placed_build(ID3D12Device* device) {
+    using namespace dxr_fixture;
+    if (!supported(device, Backend::pipeline)) return false;
+    PlacedBuildScene placement;
+    const std::vector<Vertex> vertices{{-1,-1,1}, {1,-1,1}, {0,1,1}};
+    const std::vector<Ray> rays{{0,0,0,.01f,0,0,1,4,1}, {4,0,0,.01f,0,0,1,4,1}, {0,0,0,.01f,0,0,1,4,2}};
+    const auto output = trace_scene(device, vertices, {instance(7,1)}, rays, Backend::pipeline,
+        nullptr, nullptr, nullptr, &placement);
+    const std::vector<bvh_fixture::Word> expected{1,7,0,0x3f800000, 0,0,0,0, 0,0,0,0};
+    if (output != expected) throw std::runtime_error("Placed BLAS/TLAS ray output differs from hit7@1, miss, masked miss");
+    std::puts("Slot 133 placed BLAS/TLAS: hit7@1, miss, masked miss; 12/12 words matched");
     return true;
 }
 

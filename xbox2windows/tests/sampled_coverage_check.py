@@ -95,8 +95,11 @@ MIXED_PROGRAMS = {
     for index, relation in enumerate(RELATIONS)
     for forms in (("e32", "e64"), ("e64", "e32"))
 }
+# The explicit-level zero sample has the same operands as the implicit one.
+LZ_PROGRAM = [line.replace("image_sample ", "image_sample_lz ") for line in PROGRAM]
 PROGRAMS = [
     PROGRAM,
+    LZ_PROGRAM,
     *OP_PROGRAMS.values(),
     *E64_PROGRAMS.values(),
     *MIXED_PROGRAMS.values(),
@@ -217,6 +220,7 @@ def controls():
             distinguishing_case(0, relation, legacy, relation, not legacy, E64_CASES)
 
     spelling_controls()
+    sample_lz_controls()
 
     wrong_quad_source = source.replace(
         "s_wqm_b64 s[54:55], s[48:49]", "s_wqm_b64 s[54:55], s[52:53]"
@@ -329,35 +333,123 @@ def spelling_controls():
         )
 
 
+SAMPLE_LINE = "image_sample v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D"
+# Rewrites of the sample line that the pattern must refuse for both opcodes. The
+# format is a template for the opcode. Every row assembles with LLVM 19 except
+# the last two, which only the translator-level check uses.
+SAMPLE_REFUSED = (
+    "{op} v[10:11], v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D tfe",
+    "{op} v10, v8, s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D a16",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D lwe",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D d16",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D r128",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D unorm",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D glc",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D slc",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D dlc",
+    "{op} v[10:11], v[8:9], s[64:71], s[60:63] dmask:0x3 dim:SQ_RSRC_IMG_2D",
+    "{op} v10, v[8:10], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_3D",
+    "{op}_o v10, v[8:10], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D",
+    "image_sample_l v10, v[8:10], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D da",
+    "{op} v10, v[8:9], s[64:71], s[60:63] dmask:0x8 dim:SQ_RSRC_IMG_2D_ARRAY",
+)
+
+
+def sample_refusals(assembled_only=False):
+    # (opcode, program, expected message) for each refused rewrite.
+    rows = []
+    for op in ("image_sample", "image_sample_lz"):
+        base = "\n".join(PROGRAM if op == "image_sample" else LZ_PROGRAM)
+        line = SAMPLE_LINE.replace("image_sample", op, 1)
+        for template in SAMPLE_REFUSED[: -2 if assembled_only else None]:
+            text = template.format(op=op)
+            message = (
+                "Unsupported sample"
+                if text.split(" ")[0] == op
+                else "Unsupported coverage instruction"
+            )
+            rows.append((text, base.replace(line, text).splitlines(), message))
+    return rows
+
+
+def lowers_as_level(source):
+    return "SampleLevel(samp,uv,0)" in source and ".Sample(" not in source
+
+
+def sample_lz_controls():
+    # The zero-level form lowers to the same program with only the sampling call
+    # replaced, for both textures and for the red channel.
+    red_lz = [line.replace("image_sample ", "image_sample_lz ") for line in RED_PROGRAM]
+    for slot in range(2):
+        implicit = lower(decoded(PROGRAM), bindings(slot))
+        explicit = lower(decoded(LZ_PROGRAM), bindings(slot))
+        assert lowers_as_level(explicit) and not lowers_as_level(implicit)
+        assert explicit == implicit.replace(".Sample(samp,uv)", ".SampleLevel(samp,uv,0)")
+        assert f"tex{slot}.SampleLevel(samp,uv,0).a" in explicit
+        implicit = lower(decoded(RED_PROGRAM), red_bindings(slot))
+        explicit = lower(decoded(red_lz), red_bindings(slot))
+        assert explicit == implicit.replace(".Sample(samp,uv)", ".SampleLevel(samp,uv,0)")
+        assert f"tex{slot}.SampleLevel(samp,uv,0).r" in explicit
+    # Every modifier, dmask, dimension and opcode the lowering does not model is
+    # refused for the zero-level form exactly as for the implicit one.
+    for _, lines, message in sample_refusals():
+        reject_with(lines, message)
+    # One sampled value per program, in either order and either spelling.
+    for first, second in (
+        ("image_sample", "image_sample_lz"),
+        ("image_sample_lz", "image_sample"),
+        ("image_sample_lz", "image_sample_lz"),
+    ):
+        lines = "\n".join(PROGRAM).replace(
+            SAMPLE_LINE,
+            SAMPLE_LINE.replace("image_sample", first, 1)
+            + "\n"
+            + SAMPLE_LINE.replace("image_sample", second, 1).replace("v10", "v12", 1),
+        )
+        reject_with(lines.splitlines(), "Unsupported sample")
+
+
 def binary(tmp, *tools):
     for program in PROGRAMS:
         binary_program(tmp, program, *tools)
     binary_modifiers(tmp, *tools)
+    binary_samples(tmp, *tools)
+
+
+def binary_samples(tmp, assembler, objcopy, library):
+    # The refused sample rewrites, assembled and disassembled by the real LLVM.
+    for text, lines, _ in sample_refusals(assembled_only=True):
+        refused(tmp, lines, text, assembler, objcopy, library)
 
 
 def binary_modifiers(tmp, assembler, objcopy, library):
     # The same mutations, assembled by the real LLVM and disassembled again, so
     # the refusal does not depend on this file's guess of how LLVM prints them.
-    tool = Path(__file__).resolve().parents[1] / "tools/sampled_coverage_aot.py"
     for _, line, text, _ in modifier_mutations():
         mutated = mutation_source(line).replace(line, text).splitlines()
-        container = assemble(tmp, mutated, assembler, objcopy)
-        manifest = tmp / "bindings.json"
-        manifest.write_text(json.dumps(bindings(0)))
-        out = tmp / "refused.hlsl"
-        out.unlink(missing_ok=True)
-        result = subprocess.run(
-            [sys.executable, "-B", tool, container, "--bindings", manifest,
-             "--llvm", library, "--output", out],
-            capture_output=True,
-            text=True,
-        )
-        assert result.returncode == 2 and "Unsupported coverage input" in result.stderr, (
-            text,
-            result.returncode,
-            result.stderr,
-        )
-        assert not out.exists(), text
+        refused(tmp, mutated, text, assembler, objcopy, library)
+
+
+def refused(tmp, lines, text, assembler, objcopy, library):
+    tool = Path(__file__).resolve().parents[1] / "tools/sampled_coverage_aot.py"
+    container = assemble(tmp, lines, assembler, objcopy)
+    manifest = tmp / "bindings.json"
+    manifest.write_text(json.dumps(bindings(0)))
+    out = tmp / "refused.hlsl"
+    out.unlink(missing_ok=True)
+    result = subprocess.run(
+        [sys.executable, "-B", tool, container, "--bindings", manifest,
+         "--llvm", library, "--output", out],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2 and "Unsupported coverage input" in result.stderr, (
+        text,
+        result.returncode,
+        result.stderr,
+    )
+    assert not out.exists(), text
 
 
 def assemble(tmp, program, assembler, objcopy):
@@ -578,6 +670,13 @@ if __name__ == "__main__":
                     3,
                     10,
                     red=True,
+                )
+                or draw(
+                    tmp,
+                    *sys.argv[1:],
+                    [lower(decoded(LZ_PROGRAM), bindings(0))],
+                    1,
+                    6,
                 )
                 or draw_ops(tmp, *sys.argv[1:])
             )

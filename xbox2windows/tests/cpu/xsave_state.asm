@@ -1,6 +1,6 @@
 ; coverage: source cpu_aot_xsave_state
-; Source-built MASM fixture exercising 6 XSAVE state forms from docs/coverage/x64_zen2.tsv
-; group XSAVE: xsave, xsave64, xsavec, xsavec64, xrstor, and xrstor64, along with transport/ABI glue
+; Source-built MASM fixture exercising 8 XSAVE state forms from docs/coverage/x64_zen2.tsv
+; group XSAVE: xsave, xsave64, xsavec, xsavec64, xsaveopt, xsaveopt64, xrstor, and xrstor64, along with transport/ABI glue
 ; (vmovdqu, vzeroupper, paddd, movq, emms).
 ; Every export uses the Windows x64 leaf ABI:
 ;   RCX = const void* input_a (64-byte aligned; 960+ bytes)
@@ -172,6 +172,80 @@ op_xsavec64_dynmask PROC FRAME
     xsavec64 [r8]
     ret
 op_xsavec64_dynmask ENDP
+
+; --- XSAVEOPT / XSAVEOPT64 (standard format, init optimization) after a full XRSTOR64 ---
+; The restore reads input_a and the save targets output, so the modified optimization never applies.
+
+op_xrstor64_xsaveopt PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    xsaveopt [r8]
+    ret
+op_xrstor64_xsaveopt ENDP
+
+op_xrstor64_xsaveopt64 PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+IFDEF ALTER_OP
+    xsave64 [r8]
+ELSE
+    xsaveopt64 [r8]
+ENDIF
+    ret
+op_xrstor64_xsaveopt64 ENDP
+
+op_xrstor64_xsaveopt64_sse PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+IFDEF ALTER_OP
+    mov eax, 7
+ELSE
+    mov eax, 2
+ENDIF
+    xsaveopt64 [r8]
+    ret
+op_xrstor64_xsaveopt64_sse ENDP
+
+; RFBM = x87|AVX skips SSE: MXCSR is still stored because RFBM[2] is set.
+op_xrstor64_xsaveopt64_x87_avx PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    mov eax, 5
+    xsaveopt64 [r8]
+    ret
+op_xrstor64_xsaveopt64_x87_avx ENDP
+
+; RFBM = AVX alone: MXCSR and MXCSR_MASK are stored, x87 and XMM are not.
+op_xrstor64_xsaveopt64_avx PROC FRAME
+    .endprolog
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    mov eax, 4
+    xsaveopt64 [r8]
+    ret
+op_xrstor64_xsaveopt64_avx ENDP
+
+; The request mask comes from input_b (RAX = [rdx], RDX = [rdx+8]).
+op_xsaveopt64_dynmask PROC FRAME
+    .endprolog
+    mov r9, rdx
+    mov eax, 7
+    xor edx, edx
+    xrstor64 [rcx]
+    mov rax, QWORD PTR [r9]
+    mov rdx, QWORD PTR [r9+8]
+    xsaveopt64 [r8]
+    ret
+op_xsaveopt64_dynmask ENDP
 
 ; --- Chained AVX + SSE + MMX + XSAVE64 pipeline and dead-read fault ordering ---
 

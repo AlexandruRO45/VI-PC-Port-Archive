@@ -16,3 +16,9 @@ EXPORTS
     op_xrstor64_xsavec64_sse
     op_xrstor64_xsavec64_x87_avx
     op_xsavec64_dynmask
+    op_xrstor64_xsaveopt
+    op_xrstor64_xsaveopt64
+    op_xrstor64_xsaveopt64_sse
+    op_xrstor64_xsaveopt64_x87_avx
+    op_xrstor64_xsaveopt64_avx
+    op_xsaveopt64_dynmask

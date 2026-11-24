@@ -21,6 +21,20 @@ BINARY_F32 = {
 }
 
 
+# One-source binary32 e32 forms with a VGPR, constant or scalar word source. round is round-half-even, like
+# v_rndne_f32. The result of rcp, rsq and sqrt is whatever the host computes: a caller may only rely on inputs
+# whose exact result is an integer, and a zero or negative operand is not claimed. Source modifiers, clamp,
+# output modifiers, a second source and the e64 encodings stay rejected.
+UNARY_F32 = {
+    "v_rcp_f32_e32": "(1.0f / {x})",
+    "v_rsq_f32_e32": "rsqrt({x})",
+    "v_sqrt_f32_e32": "sqrt({x})",
+    "v_floor_f32_e32": "floor({x})",
+    "v_trunc_f32_e32": "trunc({x})",
+    "v_rndne_f32_e32": "round({x})",
+}
+
+
 # Ordered binary32 compares that write EXEC with the lanes where the compare holds.
 # A lane for which src0 OP vsrc1 holds is discarded. Only the four ordered forms are
 # claimed: a NaN operand makes every one of them false, as the HLSL operators do. The
@@ -166,6 +180,8 @@ def lower(decoded, tables):
                 expr = BINARY_F32[op](x, y)
             elif op == "v_fmac_f32_e32" and len(args) == 3:
                 expr = f"mad({fp(args[1])}, {fp(args[2])}, {vector[dest]})"
+            elif op in UNARY_F32 and len(args) == 2:
+                expr = UNARY_F32[op].format(x=fp(args[1]))
             elif op == "v_fract_f32_e32" and len(args) == 2:
                 # D3D min returns the other operand for a NaN, so a min cap would turn a NaN input
                 # into the finite cap; a comparison fails for NaN and passes it through.

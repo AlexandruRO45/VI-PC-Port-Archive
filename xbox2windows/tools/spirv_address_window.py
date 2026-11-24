@@ -21,6 +21,9 @@ SIGNED_ARRAY_DECLARATIONS = ("%int = OpTypeInt 32 1", "%rt_int = OpTypeRuntimeAr
 SIGNED_MEMORY_OPERANDS = ([], ["Aligned", "4"])
 CONSTANT = re.compile(rf"({ID}) = OpConstant %uint (\d+)")
 SIGNED_ATOMICS = {"OpAtomicSMin": "OpSLessThan", "OpAtomicSMax": "OpSGreaterThan"}
+# Atomics with no signedness, by operand count after the result type; their operands are bit-cast to unsigned.
+SIGNED_WORD_ATOMICS = {"OpAtomicIAdd": 4, "OpAtomicExchange": 4, "OpAtomicAnd": 4, "OpAtomicOr": 4, "OpAtomicXor": 4,
+                       "OpAtomicCompareExchange": 6}
 WIDE_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_ulong ({ID}) ({ID})")
 WIDE_POINTER_TYPE = "%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong"
 WIDE_ARRAY_POINTER_TYPE = "%_ptr_PSB_arr64 = OpTypePointer PhysicalStorageBuffer %rt_ulong"
@@ -138,6 +141,18 @@ def failure_semantics(name, value):
     return f"%x2w_failure_{failure}", [f"%x2w_failure_{failure} = OpConstant %uint {failure}"]
 
 
+def signed_word_atomic(fields, ptr, stem):
+    """Lower a signed add, exchange, and, or, xor or compare-exchange on an in-window word.
+
+    The atomic runs on the unsigned word with its scope and semantics unchanged; value and comparator are bit-cast
+    and the old value is cast back by the caller."""
+    values = fields[-2:] if fields[2] == "OpAtomicCompareExchange" else fields[-1:]
+    names = [f"{stem}_value", f"{stem}_cmp"][:len(values)]
+    lines = [f"{name} = OpBitcast %uint {value}" for name, value in zip(names, values)]
+    lines.append(" ".join([f"{stem}_old = {fields[2]} %uint {ptr}", *fields[5:len(fields) - len(values)], *names]))
+    return lines
+
+
 def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     """Lower a signed DWORD load, store, SMin or SMax into a branch taken only for a valid address.
 
@@ -148,11 +163,14 @@ def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     store = fields[0] == "OpStore"
     pointer = fields[1] if store else fields[4]
     atomic = not store and fields[2] in SIGNED_ATOMICS
+    word_atomic = not store and fields[2] in SIGNED_WORD_ATOMICS
     operands = fields[3:] if store else fields[5:]
     if store:
         shape = len(fields) >= 3 and operands in SIGNED_MEMORY_OPERANDS
     elif atomic:
         shape = len(fields) == 8 and fields[1] == "=" and fields[3] == "%int"
+    elif word_atomic:
+        shape = len(fields) == 4 + SIGNED_WORD_ATOMICS[fields[2]] and fields[1] == "=" and fields[3] == "%int"
     else:
         shape = fields[1:4] == ["=", "OpLoad", "%int"] and fields[4:5] and operands in SIGNED_MEMORY_OPERANDS
     if not shape or pointer not in pointers or len(pointers) != 1:
@@ -163,6 +181,12 @@ def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     if store:
         lines.extend([f"{stem}_value = OpBitcast %uint {fields[2]}", " ".join(["OpStore", ptr, f"{stem}_value", *operands]),
                       f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel"])
+        return lines, stem + "_merge"
+    if word_atomic:
+        lines.extend(signed_word_atomic(fields, ptr, stem))
+        lines.extend([f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel",
+                      f"{stem}_result = OpPhi %uint {stem}_old {stem}_issue %c0 {label}",
+                      f"{fields[0]} = OpBitcast %int {stem}_result"])
         return lines, stem + "_merge"
     if atomic:
         scope, semantics, value = fields[5:8]

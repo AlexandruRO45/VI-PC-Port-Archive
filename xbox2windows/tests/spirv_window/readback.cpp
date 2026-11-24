@@ -41,25 +41,28 @@ constexpr WindowCase atomic_cases[] = {
 constexpr UINT arena_fill = 0xcba98765u;
 
 // A signed case: base low, operand bits, destination byte address, base high. The shader runs SMin on the DWORD at
-// base + 4, SMax at base + 8 and a plain load at base + 12, then stores the three old values at the destination
-// address and the two DWORDs after it.
+// base + 4, SMax at base + 8 and a plain load at base + 12, then a sequence on the DWORD at base + 16: add and
+// exchange of the operand, and with 0xffff0000, or with 0x0f0f, xor with 0x0ff00ff0, a compare-exchange that misses
+// (comparator off in the sign bit only) and one that hits (new value 0xfffe1dc0). It stores the ten old values at
+// the destination address and the nine DWORDs after it.
 struct SignedCase {
     const char* name;
     std::array<UINT, 4> parameters;
 };
 
 constexpr SignedCase signed_cases[] = {
-    {"signed positive operand", {8, 2, 44, 0}},
-    {"signed negative operand", {8, 0xfffffff6u, 44, 0}},
-    {"signed minimum operand", {8, 0x80000000u, 44, 0}},
-    {"signed maximum operand", {8, 0x7fffffffu, 44, 0}},
-    {"signed misaligned base", {9, 2, 44, 0}},
-    {"signed window end", {0xfffffff4u, 2, 44, 0}},
-    {"signed index addition wraps", {0xfffffffcu, 2, 44, 0xffffffffu}},
-    {"signed misaligned write", {8, 2, 45, 0}},
-    {"signed write beyond descriptor", {8, 2, 64, 0}},
-    {"signed write above the window", {8, 2, 0xfffffffcu, 0}},
-    {"signed write straddling the end of the descriptor", {8, 2, 60, 0}},
+    {"signed positive operand", {4, 2, 24, 0}},
+    {"signed negative operand", {4, 0xfffffff6u, 24, 0}},
+    {"signed minimum operand", {4, 0x80000000u, 24, 0}},
+    {"signed maximum operand", {4, 0x7fffffffu, 24, 0}},
+    {"signed add crosses zero", {4, 9, 24, 0}},
+    {"signed misaligned base", {5, 2, 24, 0}},
+    {"signed window end", {0xfffffff4u, 2, 24, 0}},
+    {"signed index addition wraps", {0xfffffffcu, 2, 24, 0xffffffffu}},
+    {"signed misaligned write", {4, 2, 25, 0}},
+    {"signed write beyond descriptor", {4, 2, 64, 0}},
+    {"signed write above the window", {4, 2, 0xfffffffcu, 0}},
+    {"signed write straddling the end of the descriptor", {4, 2, 52, 0}},
 };
 
 // A QWORD case: base low, source QWORD index, destination byte address, base high. The shader adds the index
@@ -120,29 +123,55 @@ void apply_dword_case(const WindowCase& test, std::array<UINT, 16>& expected)
 void init_signed_arena(std::array<UINT, 16>& words)
 {
     words.fill(arena_fill);
-    words[3] = static_cast<UINT>(-3);
-    words[4] = static_cast<UINT>(-7);
-    words[5] = 0x80000000u;
+    words[2] = static_cast<UINT>(-3);
+    words[3] = static_cast<UINT>(-7);
+    words[4] = 0x80000000u;
+    words[5] = static_cast<UINT>(-5);
 }
 
 // Independent CPU model of the signed accesses. An address is used only when it is a multiple of four, below the
 // window end, and the base plus the offset does not wrap. The 64-byte view then returns zero for a read past it and
-// discards a write past it. Every old value is stored, as zero when its address was not used.
+// discards a write past it. Every old value is stored, as zero when its address was not used. The fifth address runs
+// the sequence, each step reading what the previous one left.
 void apply_signed_case(const SignedCase& test, std::array<UINT, 16>& words)
 {
     const uint64_t base = (static_cast<uint64_t>(test.parameters[3]) << 32) | test.parameters[0];
-    const int32_t operand = static_cast<int32_t>(test.parameters[1]);
-    UINT old[3]{};
+    const UINT bits = test.parameters[1];
+    const int32_t operand = static_cast<int32_t>(bits);
+    const UINT expected = ((bits & 0xffff0000u) | 0x0f0fu) ^ 0x0ff00ff0u;
+    UINT old[10]{};
+    // The DWORD at base + 4 * index, or null when the address is not used.
+    auto target = [&](uint64_t index) -> UINT* {
+        const uint64_t address = base + 4 * index;
+        if (address < base || address % 4 != 0 || address >= 0xfffffffcull || address + 4 > sizeof(words)) return nullptr;
+        return &words[address / 4];
+    };
     for (uint64_t k = 0; k < 3; ++k) {
-        const uint64_t address = base + 4 * (k + 1);
-        if (address < base || address % 4 != 0 || address >= 0xfffffffcull || address + 4 > sizeof(words)) continue;
-        UINT& word = words[address / 4];
-        old[k] = word;
-        const int32_t value = static_cast<int32_t>(word);
-        if (k == 0) word = static_cast<UINT>(operand < value ? operand : value);
-        if (k == 1) word = static_cast<UINT>(operand > value ? operand : value);
+        UINT* word = target(k + 1);
+        if (!word) continue;
+        old[k] = *word;
+        const int32_t value = static_cast<int32_t>(*word);
+        if (k == 0) *word = static_cast<UINT>(operand < value ? operand : value);
+        if (k == 1) *word = static_cast<UINT>(operand > value ? operand : value);
     }
-    for (uint64_t k = 0; k < 3; ++k) {
+    if (UINT* word = target(4)) {
+        // Each step stores its old value and leaves the next step's input.
+        old[3] = *word;
+        *word += bits;
+        old[4] = *word;
+        *word = bits;
+        old[5] = *word;
+        *word &= 0xffff0000u;
+        old[6] = *word;
+        *word |= 0x0f0fu;
+        old[7] = *word;
+        *word ^= 0x0ff00ff0u;
+        old[8] = *word;
+        if (*word == (expected ^ 0x80000000u)) *word = 0x12345678u;
+        old[9] = *word;
+        if (*word == expected) *word = 0xfffe1dc0u;
+    }
+    for (uint64_t k = 0; k < 10; ++k) {
         const uint64_t address = static_cast<uint64_t>(test.parameters[2]) + 4 * k;
         if (address % 4 == 0 && address < 0xfffffffcull && address + 4 <= sizeof(words)) words[address / 4] = old[k];
     }

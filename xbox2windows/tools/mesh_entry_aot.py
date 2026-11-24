@@ -24,6 +24,22 @@ def span(token):
     return range(int(m[1]), int(m[2]) + 1)
 
 
+# One-source binary32 forms and their HLSL lowering. round is round-half-even, like v_rndne_f32. The result of
+# rcp, rsq and sqrt is whatever the host computes; callers must only rely on inputs whose result is exact.
+UNARY_F32_EXPR = {
+    "v_rcp_f32": "(1.0f / {x})",
+    "v_rsq_f32": "rsqrt({x})",
+    "v_sqrt_f32": "sqrt({x})",
+    "v_floor_f32": "floor({x})",
+    "v_trunc_f32": "trunc({x})",
+    "v_rndne_f32": "round({x})",
+    # v_fract_f32 is x - floor(x) clamped to 0x3f7fffff: a tiny negative input must not round up to 1.0. The cap is a
+    # comparison, not min: D3D min returns its other operand for a NaN, and a NaN input must stay NaN.
+    "v_fract_f32": "(frac({x}) >= 1.0f ? asfloat(0x3f7fffffu) : frac({x}))",
+}
+UNARY_F32 = {f"{name}_e{width}": expr for name, expr in UNARY_F32_EXPR.items() for width in (32, 64)}
+
+
 # Inline raw descriptor constructed from the two bound entry SGPRs, a byte
 # stride, identity component selects, and the observed raw-buffer flags.
 VERTEX_DESCRIPTOR = [0x20000, 0x10000, U32, 0x11014FAC]
@@ -274,7 +290,10 @@ class Wave:
             "v_min_f32_e64",
             "v_max_f32_e32",
             "v_max_f32_e64",
+            *UNARY_F32,
         }
+        if op in UNARY_F32 and len(src) != 1:
+            raise ValueError(f"{op} takes one source")
         for lane in live:
             vals = [self.lane_value(t, lane) for t in src]
             if (
@@ -349,6 +368,8 @@ class Wave:
                     expr = f"float({word})" if "_u32_" in op else f"float(asint({word}))"
                 elif op.startswith(("v_min_f32_", "v_max_f32_")):
                     expr = f"{op[2:5]}({x}, {y})"
+                elif op in UNARY_F32:
+                    expr = UNARY_F32[op].format(x=x)
                 else:
                     expr = f"({x} + {y})"
                 if expr not in expressions:

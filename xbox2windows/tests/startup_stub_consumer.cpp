@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <array>
+#include <fstream>
 #include <cstring>
 #include <vector>
 
@@ -1149,6 +1151,65 @@ bool dstorage_checks() {
     return true;
 }
 
+// The Python fixture supplies absolute ranges from each synthetic file's RDS5
+// directory. Keep one real queue and one open file object per input for all batches.
+bool dstorage_directory_batches()
+{
+    struct Request { unsigned batch, file; unsigned long long offset; unsigned length; };
+    std::vector<Request> requests;
+    Request r{};
+    while (std::scanf("%u%u%llu%u", &r.batch, &r.file, &r.offset, &r.length) == 4) {
+        if (r.file >= 2 || !r.length || requests.size() >= 32) return false;
+        requests.push_back(r);
+    }
+    if (requests.empty() || !std::feof(stdin)) return false;
+    HMODULE library = LoadLibraryW(L"XCRDAPI.dll");
+    if (!library) return false;
+    auto factory_export = reinterpret_cast<DStorageGetFactoryFn>(GetProcAddress(library, "DStorageGetFactory"));
+    void* object = nullptr;
+    if (!factory_export || factory_export(nullptr, &object) || !object) return false;
+    auto* factory = static_cast<Object*>(object);
+    void* files[2]{};
+    const wchar_t* names[]{L"small.ttpf", L"large.ttpf"};
+    for (unsigned i = 0; i < 2; ++i)
+        if (reinterpret_cast<OpenFileFn>(factory->vtable[4])(factory, names[i], nullptr, &files[i])) return false;
+    if (reinterpret_cast<CreateQueueFn>(factory->vtable[10])(factory, nullptr, nullptr, &object)) return false;
+    auto* queue = static_cast<Object*>(object);
+    const unsigned count = static_cast<unsigned>(requests.size());
+    if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, count, "directory", nullptr, &object)) return false;
+    auto* status = static_cast<Object*>(object);
+
+    constexpr unsigned page = 4096, guard = 16;
+    std::vector<std::array<unsigned char, page + 2 * guard>> output(count);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& request = requests[i];
+        output[i].fill(0xa5);
+        alignas(8) unsigned char record[0x48]{};
+        const u64 fields[]{1, reinterpret_cast<u64>(output[i].data() + guard), 0, page,
+                           reinterpret_cast<u64>(files[request.file]), request.offset, request.length};
+        std::memcpy(record, fields, sizeof(fields));
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, record);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, status, i);
+        if (i + 1 == count || requests[i + 1].batch != request.batch)
+            reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+    }
+    const auto deadline = GetTickCount64() + 5000;
+    while (!reinterpret_cast<IsCompleteFn>(status->vtable[3])(status, count - 1)) {
+        if (GetTickCount64() >= deadline) return false;
+        Sleep(1);
+    }
+    std::ofstream readback("readback.bin", std::ios::binary);
+    for (unsigned i = 0; i < count; ++i) {
+        const long hr = reinterpret_cast<GetHResultFn>(status->vtable[4])(status, i);
+        std::printf("%08lx\n", static_cast<unsigned long>(hr));
+        readback.write(reinterpret_cast<const char*>(output[i].data()), output[i].size());
+    }
+    for (void* file : files)
+        reinterpret_cast<CloseFileFn>(static_cast<Object*>(file)->vtable[3])(file);
+    readback.close();
+    return readback.good();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1169,6 +1230,7 @@ int main(int argc, char** argv)
         std::puts("physical ok");
         return 0;
     }
+    if (!std::strcmp(which, "dstorage-directory")) return dstorage_directory_batches() ? 0 : 8;
     if (!std::strcmp(which, "dstorage")) {
         if (!dstorage_checks()) return 7;
         std::puts("dstorage ok");

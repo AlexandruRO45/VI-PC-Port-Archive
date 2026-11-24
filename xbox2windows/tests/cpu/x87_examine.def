@@ -3,3 +3,4 @@ EXPORTS
     ficom_m16
     ficom_m32
     fnop_fclex
+    legacy_controls

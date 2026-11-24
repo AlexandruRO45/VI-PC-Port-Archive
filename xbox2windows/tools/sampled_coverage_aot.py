@@ -24,6 +24,15 @@ COVERAGE_COMPARES = tuple(
 )
 
 
+# The explicit-level zero form takes the same operands as the implicit one, so
+# the same pattern accepts it. It reads mip 0 without a derivative, hence
+# SampleLevel with a literal zero rather than Sample.
+SAMPLE_CALLS = {
+    "image_sample": "Sample(samp,uv)",
+    "image_sample_lz": "SampleLevel(samp,uv,0)",
+}
+
+
 def plain(bank, *tokens):
     # One unmodified register of the bank, so a modifier suffix or prefix, a
     # special register or an inline constant is rejected rather than ignored.
@@ -225,7 +234,7 @@ def lower(decoded, bindings):
                 vector[dst] = "uv." + attr[-1]
             else:
                 raise ValueError("Unmatched interpolation pair")
-        elif op == "image_sample":
+        elif op in SAMPLE_CALLS:
             match = re.fullmatch(
                 r"(v\d+), (v\[\d+:\d+\]), (s\[\d+:\d+\]), (s\[\d+:\d+\]) dmask:0x([1248]) dim:SQ_RSRC_IMG_2D",
                 operands,
@@ -247,7 +256,7 @@ def lower(decoded, bindings):
             channel = int(match[5]).bit_length() - 1
             vector[match[1]] = (
                 "sample",
-                f"tex{descriptor[1]}.Sample(samp,uv).{'rgba'[channel]}",
+                f"tex{descriptor[1]}.{SAMPLE_CALLS[op]}.{'rgba'[channel]}",
             )
             pending_sample.add(match[1])
             samples += 1

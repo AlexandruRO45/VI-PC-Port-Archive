@@ -38,6 +38,23 @@ requested view. This applies only to Texture2D views with no resource or counter
 `ctest --test-dir out/bin --no-tests=error -R "^startup_null_views_" -V` against your build
 directory to exercise both slots on hardware and WARP.
 
+## Null bindings in translated draws
+
+The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
+`(entry, buffer, token, wrapper, dimension)`. Each null binding falls in exactly one cause, so
+the five parts add up to N:
+
+- entry: the descriptor table entry is null, empty or unreadable.
+- buffer: the buffer address or size is missing or unreadable, or the frame copy failed.
+- token: the descriptor memory names a view id the wrapper never issued.
+- wrapper: the texture's resource is missing or is not a resource wrapper.
+- dimension: the view dimension does not match the shader, so a null texture is bound.
+
+The classification lives in `src/startup_stubs/null_binding_cause.h`. The source-built
+`startup_null_views_check` fixture checks every cause, that the parts sum to the total, and that
+valid bindings add nothing. It does not draw, so the counters in the totals line itself are checked
+by reading a render log.
+
 ## What is measured
 
 With the switches below, an x64 console executable on an AMD RDNA4 GPU (Windows 11, release
@@ -163,7 +180,11 @@ These are measured on one executable; treat them as hypotheses for others.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
-  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers.
+  `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
+  pixel stage checks all four manifest words, rejects a mask width from a root constant, and
+  decodes the folded words with the stand-in's static sampler path. The clamp sampler reads
+  column 1 at x=1.25, while the wrap control reads column 0. Run
+  `ctest --preset release --no-tests=error -R "^startup_inline_sampler_"`.
 - **3D images.** `image_sample` with `dim:SQ_RSRC_IMG_3D` becomes a `Texture3D<float4>` sampled with
   a `float3` of the three address registers in order; 1D images are refused. A source-built pixel
   stage draws one texel of a 2x2x2 texture on WARP and hardware with DXC and FXC
@@ -182,6 +203,12 @@ These are measured on one executable; treat them as hypotheses for others.
 - **DirectStorage file ranges.** A nonempty file request checks its byte offset and length against
   the current file size before allocating the staging buffer. A range ending at EOF is valid.
   An overrun or short read fails the queue request and preserves the destination.
+  The `startup_storage_directory_batch` fixture submits ten requests across two synthetic RDS5/ETPF
+  files on one queue. In each file, moving the first absolute source offset by 896 KiB selects a
+  different valid 28-byte zlib stream. Both return success and produce 4096 bytes. Comparing the
+  entire page detects the wrong stream. Moving the second request by the same distance reaches
+  EOF and leaves the destination untouched. A subsequent request using its directory offset succeeds.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_directory_batch$' -V`.
 
 ## Shortcuts that are known to be wrong
 

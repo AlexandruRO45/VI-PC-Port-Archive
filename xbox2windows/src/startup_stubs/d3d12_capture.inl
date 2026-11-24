@@ -32,9 +32,18 @@ struct HeapInfo {
     u64 title_sampler_cpu;
     std::uint32_t* shadow;           // per descriptor: view id + 1 (0: nothing known)
 };
+enum class Placement { none, aliased_buffer, copied_buffer };
+struct PlacedVertexView {
+    const Wrapper* owner{};
+    ID3D12Resource* alias{};
+    bool reject{};
+};
 struct ResourceInfo {
     D3D12_RESOURCE_DESC console;     // the description as the title passed it
     u64 bytes;                       // allocation size when known, else 0
+    Placement placement{};
+    const Wrapper* placement_device{};
+    D3D12_RESOURCE_STATES initial_state{};
 };
 
 SRWLOCK note_lock = SRWLOCK_INIT;
@@ -118,12 +127,72 @@ void note_root_blob(Wrapper* w, const void* blob, std::size_t bytes)
     root_blobs()[w].assign(static_cast<const unsigned char*>(blob), static_cast<const unsigned char*>(blob) + bytes);
     ReleaseSRWLockExclusive(&note_lock);
 }
+// This index only lists active slot-133 wrappers. The existing resource record
+// owns the extent and backing. Large resources must not widen the search
+// window for thousands of small vertex buffers.
+struct PlacementIndex {
+    std::multimap<u64, const Wrapper*> by_start;
+    u64 max_width{};
+};
+std::array<PlacementIndex, 2> placement_index;
+PlacementIndex& placement_group(u64 width)
+{
+    return placement_index[width > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT];
+}
+
 void note_resource(Wrapper* w, const D3D12_RESOURCE_DESC* console, u64 bytes)
 {
     if (!w || !console) return;
-    AcquireSRWLockExclusive(&note_lock);
+    x2w_startup::ExclusiveNoteLock guard(note_lock);
     resource_infos()[w] = ResourceInfo{*console, bytes};
+}
+void retire_placement(Wrapper* w)
+{
+    // Keep immutable capture data available to resource_info() readers.
+    AcquireSRWLockExclusive(&note_lock);
+    const auto found = resource_infos().find(w);
+    if (found != resource_infos().end() && found->second.placement != Placement::none) {
+        auto& group = placement_group(found->second.bytes);
+        const auto [first, last] = group.by_start.equal_range(reinterpret_cast<u64>(w->own().title_memory));
+        for (auto it = first; it != last; ++it) {
+            if (it->second == w) {
+                group.by_start.erase(it);
+                break;
+            }
+        }
+        found->second.placement = Placement::none;
+    }
     ReleaseSRWLockExclusive(&note_lock);
+}
+
+PlacedVertexView placed_buffer_range(const Wrapper* device, u64 start, u64 bytes)
+{
+    PlacedVertexView result{};
+    if (!start || !bytes) return result;
+    if (bytes > ~u64{} - start) return {nullptr, nullptr, true};
+    AcquireSRWLockShared(&note_lock);
+    const u64 end = start + bytes;
+    for (const auto& group : placement_index) {
+        if (group.by_start.empty()) continue;
+        const u64 earliest = start >= group.max_width ? start - group.max_width + 1 : 0;
+        for (auto it = group.by_start.lower_bound(earliest); it != group.by_start.end() && it->first < end; ++it) {
+            const auto* owner = it->second;
+            const auto& info = resource_infos().at(owner);
+            if (info.placement_device != device) continue;
+            const u64 base = it->first;
+            if (base <= start && start - base >= info.bytes) continue;
+            if (result.owner || start < base || bytes > info.bytes - (start - base)) {
+                result = {nullptr, nullptr, true}; // Ambiguous or crossing an allocation.
+                break;
+            }
+            result.owner = owner;
+            if (info.placement == Placement::aliased_buffer)
+                result.alias = static_cast<ID3D12Resource*>(owner->own().real);
+        }
+        if (result.reject) break;
+    }
+    ReleaseSRWLockShared(&note_lock);
+    return result;
 }
 const ResourceInfo* resource_info(const Wrapper* w)
 {

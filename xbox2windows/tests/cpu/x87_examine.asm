@@ -1,6 +1,7 @@
 ; coverage: source cpu_aot_x87_examine
-; Source-owned differential fixture for FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX and FCLEX in the x87
-; leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
+; Source-owned differential fixture for FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX and FCLEX, and the
+; 8087/287 controls FENI, FNENI, FDISI, FNDISI and FSETPM (ML64 has no FNSETPM spelling and assembles
+; FSETPM without a WAIT), in the x87 leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
 ; +16 and an m32 integer at +24), records C0, C2 and C3 after each status-word writer as bytes of the
 ; output block at RDX, and returns with the x87 stack empty.
 .code
@@ -156,5 +157,20 @@ fnop_fclex PROC FRAME
     mov eax, 0
     ret
 fnop_fclex ENDP
+
+; The 287 and later execute these as FNOP: the stored value, the control word and the empty stack on
+; return must match a plain load and store.
+legacy_controls PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx]
+    feni
+    fneni
+    fdisi
+    fndisi
+    fsetpm
+    fstp tbyte ptr [rdx+16]
+    mov eax, 0
+    ret
+legacy_controls ENDP
 
 END

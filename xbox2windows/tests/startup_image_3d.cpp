@@ -6,9 +6,11 @@
 // reads the colour back.
 //
 // The texture is 2x2x2 R32G32B32A32_FLOAT. Texel (x, y, z) holds ((1 + x + 2y + 4z) / 8, x, y, z),
-// so the readback names the texel the coordinate selected. The sampler is a static point sampler
-// with wrap addressing, which is what the fixture's all-zero inline sampler words decode to.
+// so the readback names the texel the coordinate selected. By default it uses the all-zero inline
+// sampler (point wrap). The inline sampler fixture passes its own manifest line for the same draw.
 #include "desktop_gpu.h"
+
+#include "startup_stubs/translated_sampler_bindings.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -34,46 +36,24 @@ std::vector<char> read_blob(const char* path)
     return bytes;
 }
 
-ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device)
+ComPtr<ID3D12RootSignature> create_root(ID3D12Device* device, const char* sampler_line)
 {
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-    D3D12_ROOT_PARAMETER params[2]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants = {0, 0, entry_constants};
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable = {1, &srv};
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC sampler{};
-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    sampler.MaxAnisotropy = 1;
-    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
-    sampler.ShaderRegister = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_ROOT_SIGNATURE_DESC desc{};
-    desc.NumParameters = _countof(params);
-    desc.pParameters = params;
-    desc.NumStaticSamplers = 1;
-    desc.pStaticSamplers = &sampler;
-    ComPtr<ID3DBlob> signature, errors;
-    if (FAILED(D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &signature, &errors)))
-        throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer())
-                                        : "Serialize image 3D root signature");
+    x2w_startup::TranslatedSamplers samplers;
+    if (!samplers.read_manifest_line(sampler_line) || samplers.statics.size() != 1)
+        throw std::runtime_error("Expected one inline sampler in the image 3D draw");
     ComPtr<ID3D12RootSignature> root;
-    check(device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&root)),
-          "Create image 3D root signature");
+    check(x2w_startup::create_translated_root(device, entry_constants, 1, samplers, &root),
+          "Create translated image 3D root signature");
     return root;
 }
 }  // namespace
 
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4])
+                            float color[4], const char* sampler_line)
 {
     const auto vs = read_blob(vertex_path);
     const auto ps = read_blob(pixel_path);
-    const auto root = create_root(device);
+    const auto root = create_root(device, sampler_line);
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = root.Get();

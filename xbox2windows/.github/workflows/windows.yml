@@ -50,6 +50,7 @@ jobs:
           python3 -B tests/startup_image_sample_l_check.py binary llvm-mc-15
           python3 -B tests/startup_image_3d_check.py binary llvm-mc-15
           python3 -B tests/startup_flat_param_check.py binary llvm-mc-15
+          python3 -B tests/startup_inline_sampler_check.py binary llvm-mc-15
           LLVM_LIB=libLLVM-15.so.1 LLVM_MC=llvm-mc-15 LLVM_OBJCOPY=llvm-objcopy-15 python3 -B tests/rdna2_tools_check.py
   python-linux:
     name: Run platform-independent Python checks on Linux
@@ -106,6 +107,7 @@ jobs:
           python -B tests/startup_image_3d_check.py
           python -B tests/startup_translator_check.py
           python -B tests/startup_flat_param_check.py
+          python -B tests/startup_inline_sampler_check.py
   build-and-test:
     name: Build and test on Windows
     runs-on: windows-2025

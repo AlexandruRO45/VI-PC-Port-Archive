@@ -22,12 +22,11 @@ static_assert(constants_offset % alignment == 0);
 constexpr UINT sentinel = 0xc5c5c5c5u;
 constexpr std::array<UINT, 16> constants{count, 73, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 19, 23, 29};
 constexpr UINT uavs = 13, srvs = 21;
-// The image-load case binds one R32G32B32A32_UINT source texture at t0. The case file carries the
-// texture words, so the same runner checks dmask variants without a second content generator.
+// The image-load case binds one UINT source texture at t0. Bit 24 of the dispatch word selects
+// RGBA8 instead of RGBA32. The case file carries the raw texels for either format.
+constexpr UINT texture_rgba8_flag = 1u << 24;
 constexpr UINT texture_width = 32, texture_height = 8, texture_channels = 4;
-constexpr UINT texture_words = texture_width * texture_height * texture_channels;
 constexpr UINT texture_mip_levels = 3;
-constexpr UINT texture_mip_words = texture_words + texture_words / 4 + texture_words / 16;
 }
 
 static UINT input_word(UINT i) { return 0x8b02a7f1u + i * 0x413b1u; }
@@ -53,16 +52,18 @@ static void fill_upload(ID3D12Resource* upload)
 // buffer alive until the command list has executed.
 static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12GraphicsCommandList* list,
                                              const std::vector<UINT>& texels,
-                                             ComPtr<ID3D12Resource>& staging)
+                                             DXGI_FORMAT format, ComPtr<ID3D12Resource>& staging)
 {
-    const UINT mips = texels.size() == texture_words ? 1 : texture_mip_levels;
+    const UINT words_per_texel = format == DXGI_FORMAT_R8G8B8A8_UINT ? 1 : texture_channels;
+    const UINT base_words = texture_width * texture_height * words_per_texel;
+    const UINT mips = texels.size() == base_words ? 1 : texture_mip_levels;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = texture_width;
     desc.Height = texture_height;
     desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
     desc.MipLevels = static_cast<UINT16>(mips);
-    desc.Format = DXGI_FORMAT_R32G32B32A32_UINT;
+    desc.Format = format;
     auto texture = resource(device, desc, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
     std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, texture_mip_levels> layouts{};
     UINT64 upload_bytes = 0;
@@ -75,7 +76,7 @@ static ComPtr<ID3D12Resource> upload_texture(ID3D12Device* device, ID3D12Graphic
     std::size_t word = 0;
     for (UINT level = 0; level < mips; ++level) {
         const auto& layout = layouts[level];
-        const UINT row_words = (texture_width >> level) * texture_channels;
+        const UINT row_words = (texture_width >> level) * words_per_texel;
         for (UINT y = 0; y < (texture_height >> level); ++y) {
             auto* row = static_cast<unsigned char*>(mapped) + layout.Offset + y * layout.Footprint.RowPitch;
             std::memcpy(row, texels.data() + word, row_words * sizeof(UINT));
@@ -155,7 +156,8 @@ struct StoreCase {
 
 static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE shader,
                         D3D12_SHADER_BYTECODE rootBytes, bool conversion_pair = false,
-                        const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr)
+                        const StoreCase* store = nullptr, const std::vector<UINT>* texels = nullptr,
+                        DXGI_FORMAT texture_format = DXGI_FORMAT_UNKNOWN)
 {
     if (texels && !tables) throw std::runtime_error("An image load needs the descriptor-table signature");
     ComPtr<ID3D12RootSignature> signature;
@@ -175,7 +177,7 @@ static void run_compute(ID3D12Device* device, bool tables, D3D12_SHADER_BYTECODE
     ComputeCommands commands(device, pipeline.Get());
     auto& list = commands.list;
     ComPtr<ID3D12Resource> texture_upload, texture;
-    if (texels) texture = upload_texture(device, list.Get(), *texels, texture_upload);
+    if (texels) texture = upload_texture(device, list.Get(), *texels, texture_format, texture_upload);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(output.Get(), 0, input.Get(), bytes, bytes);
     transition(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -277,22 +279,26 @@ void check_compute_texture_file(ID3D12Device* device, const char* path, const ch
         throw std::runtime_error(std::string("Could not read compute shader: ") + path);
     const D3D12_SHADER_BYTECODE shader{bytes.data(), bytes.size()};
     StoreCase store{};
-    std::vector<UINT> texels(texture_words);
     std::ifstream source(reference, std::ios::binary);
     if (!source) throw std::runtime_error(std::string("Could not open compute reference: ") + reference);
     source.read(reinterpret_cast<char*>(&store.groups), sizeof(store.groups));
     source.read(reinterpret_cast<char*>(store.expected.data()), sizeof(store.expected));
+    const bool rgba8 = (store.groups & texture_rgba8_flag) != 0;
+    store.groups &= ~texture_rgba8_flag;
+    const UINT base_words = texture_width * texture_height * (rgba8 ? 1 : texture_channels);
+    std::vector<UINT> texels(base_words);
     source.read(reinterpret_cast<char*>(texels.data()), static_cast<std::streamsize>(texels.size() * sizeof(UINT)));
     // Older cases stop after the base image. A mip case appends levels one and two.
     if (source && source.peek() != std::char_traits<char>::eof()) {
-        texels.resize(texture_mip_words);
-        source.read(reinterpret_cast<char*>(texels.data() + texture_words),
-                    (texture_mip_words - texture_words) * sizeof(UINT));
+        const UINT extra_words = base_words / 4 + base_words / 16;
+        texels.resize(base_words + extra_words);
+        source.read(reinterpret_cast<char*>(texels.data() + base_words), extra_words * sizeof(UINT));
     }
     if (!source || source.peek() != std::char_traits<char>::eof() || store.groups >> 24 || !store.axis(0) ||
         store.axis(0) > 5 || store.axis(1) > 5 || store.axis(2) > 5)
         throw std::runtime_error("Invalid compute image load reference");
-    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels);
+    const auto format = rgba8 ? DXGI_FORMAT_R8G8B8A8_UINT : DXGI_FORMAT_R32G32B32A32_UINT;
+    run_compute(device, true, shader, {compute_tables, sizeof(compute_tables)}, false, &store, &texels, format);
 }
 
 void check_bvh_root_roundtrip(ID3D12Device* device)

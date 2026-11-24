@@ -12,7 +12,10 @@ Entry-state contract (`--entry-state`):
     state; every xsave/xsave64 must only save components previously initialized
     by a supported xrstor/xrstor64 (or vzeroupper for AVX). Entry-only xsave*
     and partially initialized restore/save paths that observe uninitialized
-    components from entry are rejected.
+    components from entry are rejected. MXCSR is tracked apart from the
+    components: only an xrstor whose RFBM selects SSE or AVX defines it, so
+    vzeroupper alone does not, and a save that stores MXCSR (xsaveopt with SSE
+    or AVX selected, xsave/xsavec with SSE selected) is rejected without it.
   - canonical (opt-in): permits xsave/xsave64 before full component definition
     assuming the native caller establishes canonical architectural XSAVE state
     on entry (FCW=0x037F, FSW=0, FTW=0, FOP=0, FIP=0, FCS=0, FDP=0, FDS=0,
@@ -36,6 +39,13 @@ group XSAVE):
                        the reserved header bytes [528..575] left untouched.
                        MXCSR and MXCSR_MASK are stored with selected live SSE state.
                        Alignment and mask checks run before the first store.
+  - xsaveopt / xsaveopt64: same alignment and mask contract as xsave, standard format, init optimization
+                       only: a component with XINUSE clear is not written and its XSTATE_BV bit is
+                       cleared; XSTATE_BV = (old & ~rfbm) | (XINUSE & rfbm). SSE counts as in use
+                       while MXCSR differs from 0x1F80. MXCSR and MXCSR_MASK are stored whenever
+                       RFBM selects SSE or AVX, and the header bytes [520..575] stay untouched. The
+                       modified optimization (XMODIFIED after a prior XRSTOR to the same address) is
+                       not modeled: the lifted code writes every component that is in use.
   - xrstor / xrstor64: require 64-byte-aligned [base + disp] and bounded mask
                        (edx == 0 && (eax & ~7) == 0); validate XCOMP_BV == 0,
                        header [528..535] == 0, (XSTATE_BV & ~7) == 0, and
@@ -47,7 +57,7 @@ Transport/ABI glue: vmovdqa/vmovdqu (XMM0..5, YMM0..5), vzeroupper,
 movdqa/movdqu (XMM0..5), paddd (XMM0..5), movq (MM0..7 <-> m64 / volatile
 scratch r64), emms, 32/64-bit volatile GPR mov/xor, and terminal ret.
 
-XSAVEOPT/XSAVES/XRSTORS, compacted XRSTOR, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
+XSAVES/XRSTORS, compacted XRSTOR, FXSAVE/FXRSTOR, EVEX encodings, nonvolatile
 registers (XMM6..15, YMM6..15, ZMM0..15, RBX/RBP/RSI/RDI/R12..R15/RSP),
 non-argument memory bases, stores outside r8, RIP-relative/indexed addressing,
 prefixes, branches, unclosed MMX state before ret, and trailing bytes reject.
@@ -107,12 +117,14 @@ XSAVEC_CODES = {
     Code.XSAVEC_MEM: False,
     Code.XSAVEC64_MEM: True,
 }
+XSAVEOPT_CODES = {
+    Code.XSAVEOPT_MEM: False,
+    Code.XSAVEOPT64_MEM: True,
+}
 ENTRY_STATES = ("defined", "canonical")
 XCOMP_NAMES = ((1, "x87"), (2, "sse"), (4, "avx"))
 
 REJECT_XSAVE_FAMILY_CODES = {
-    Code.XSAVEOPT_MEM,
-    Code.XSAVEOPT64_MEM,
     Code.XSAVES_MEM,
     Code.XSAVES64_MEM,
     Code.XRSTORS_MEM,
@@ -166,6 +178,7 @@ ALLOWED_CODES = {
     Code.XOR_RM32_R32,
     *XSAVE_CODES,
     *XSAVEC_CODES,
+    *XSAVEOPT_CODES,
     *XRSTOR_CODES,
     *VEX_LOAD_CODES,
     *VEX_STORE_CODES,
@@ -199,6 +212,16 @@ extern "C" __declspec(dllexport) std::uint32_t host_has_xsavec() {
     int sub[4]{};
     __cpuidex(sub, 0xD, 1);
     return (sub[0] & 2) != 0 ? 1u : 0u;  // CPUID.(0DH,1):EAX[1] = XSAVEC
+}
+
+extern "C" __declspec(dllexport) std::uint32_t host_has_xsaveopt() {
+    if (host_has_xsave() == 0u) return 0u;
+    int info0[4]{};
+    __cpuid(info0, 0);
+    if (info0[0] < 0xD) return 0u;
+    int sub[4]{};
+    __cpuidex(sub, 0xD, 1);
+    return (sub[0] & 1) != 0 ? 1u : 0u;  // CPUID.(0DH,1):EAX[0] = XSAVEOPT
 }
 
 extern "C" __declspec(dllexport) std::uint64_t host_xcr0() {
@@ -613,6 +636,24 @@ static inline void op_xsavec(const XState& state, word address, word rax_val, wo
     dst[65] = (1ull << 63) | rfbm;
     std::atomic_signal_fence(std::memory_order_seq_cst);
 }
+
+static inline void op_xsaveopt(const XState& state, word address, word rax_val, word rdx_val, bool is64) {
+    // Every fault check precedes the first store, so a rejected call leaves memory intact.
+    if ((address & 63ull) != 0ull) raise_gp();
+    if (static_cast<std::uint32_t>(rdx_val) != 0u || (static_cast<std::uint32_t>(rax_val) & ~7u) != 0u) raise_gp();
+    const std::uint64_t rfbm = static_cast<std::uint64_t>(rax_val) & 7ull;
+    // Init optimization only: SSE is in use while MXCSR is not at its reset value (SDM vol.1 13.6).
+    const std::uint64_t sse_live = state.mxcsr != 0x1F80u ? 2ull : 0ull;
+    const std::uint64_t inuse = state.xinuse | sse_live;
+    op_xsave(state, address, rfbm & inuse, 0ull, is64);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    auto* dst = reinterpret_cast<volatile std::uint64_t*>(address);
+    if ((rfbm & 6ull) != 0ull) {
+        dst[3] = static_cast<std::uint64_t>(state.mxcsr) | (static_cast<std::uint64_t>(state.mxcsr_mask) << 32);
+    }
+    dst[64] = (dst[64] & ~rfbm) | (inuse & rfbm);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+}
 """
 
 
@@ -696,6 +737,8 @@ def lift_code(name, start, raw, *, entry_state="defined"):
     ptr_origins = {"rcx": R.RCX, "rdx": R.RDX, "r8": R.R8}
     const_gpr = {"rcx": None, "rdx": None, "r8": None, "rax": None, "r9": None, "r10": None, "r11": None}
     defined_xcomp = 0
+    # MXCSR is tracked apart from the SSE/AVX components: vzeroupper defines AVX state but never MXCSR.
+    defined_mxcsr = False
     used_canonical_entry = False
     mmx_active = False
     statements = []
@@ -790,9 +833,9 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             statements.append("return;")
             returned = True
 
-        elif ins.code in XSAVE_CODES or ins.code in XSAVEC_CODES:
-            is64 = {**XSAVE_CODES, **XSAVEC_CODES}[ins.code]
-            op_name = "op_xsavec" if ins.code in XSAVEC_CODES else "op_xsave"
+        elif ins.code in XSAVE_CODES or ins.code in XSAVEC_CODES or ins.code in XSAVEOPT_CODES:
+            is64 = {**XSAVE_CODES, **XSAVEC_CODES, **XSAVEOPT_CODES}[ins.code]
+            op_name = "op_xsavec" if ins.code in XSAVEC_CODES else "op_xsaveopt" if ins.code in XSAVEOPT_CODES else "op_xsave"
             require_xsave_masks(ins)
             addr = flat_address(ins, ptr_origins, write=True)
             rax_val = const_gpr.get("rax")
@@ -802,11 +845,20 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             else:
                 needed_xcomp = 7
             missing = needed_xcomp & ~defined_xcomp
+            # xsave/xsavec store MXCSR with SSE; xsaveopt also stores it when only AVX is selected.
+            mxcsr_stored = bool(needed_xcomp & (6 if ins.code in XSAVEOPT_CODES else 2))
             if missing != 0:
                 if entry_state != "canonical":
                     missing_names = ", ".join(lbl for bit, lbl in XCOMP_NAMES if missing & bit)
                     raise ValueError(
                         f"xsave observes uninitialized XSAVE component(s) ({missing_names}) before definition; "
+                        f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
+                    )
+                used_canonical_entry = True
+            if mxcsr_stored and not defined_mxcsr:
+                if entry_state != "canonical":
+                    raise ValueError(
+                        f"xsave stores MXCSR before any restore defined it; "
                         f"requires explicit --entry-state canonical at RVA {ins.ip:#x}: {ins}"
                     )
                 used_canonical_entry = True
@@ -821,6 +873,9 @@ def lift_code(name, start, raw, *, entry_state="defined"):
             rdx_val = const_gpr.get("rdx")
             if rdx_val == 0 and rax_val is not None and (rax_val & ~7) == 0:
                 defined_xcomp |= rax_val & 7
+                # xrstor loads MXCSR whenever RFBM selects SSE or AVX.
+                if rax_val & 6:
+                    defined_mxcsr = True
             defined_xmm.update(range(6))
             defined_ymm.update(range(6))
             defined_mm.update(range(8))

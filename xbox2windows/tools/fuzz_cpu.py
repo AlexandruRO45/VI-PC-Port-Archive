@@ -582,11 +582,162 @@ def generate_chains(seed, count):
     return [*pool, *functions]
 
 
+# Switch shapes: a jump table behind an unsigned bound check, in the layouts cpu_switch_aot accepts (see
+# tests/cpu/switch.asm and tests/cpu/switch_inverted.asm). Each export is fn(selector, y, out): the
+# selector in RCX picks an arm that rewrites RDX, every arm writes a marker word of its own, and the common
+# tail stores RDX at the start of the output and returns the selector plus RDX. Every combination of table
+# layout, bound branch and index source appears once in 48 exports.
+SWITCH_COUNTS = (2, 3, 4, 5, 6, 8, 9, 12, 16, 24)
+SWITCH_LAYOUTS = ("rva", "rel")
+# JA and JAE branch to the default; JBE and JB branch to the dispatch block, which a JMP to the default precedes.
+SWITCH_BOUNDS = ("ja", "jae", "jbe", "jb")
+SWITCH_SOURCES = ("plain", "wide", "mask", "byte", "word", "floor")
+SWITCH_MARKERS = 8
+# Selectors 0 to 39 reach every arm, and the default, of the largest table.
+SWITCH_SELECTORS = 40
+# Negative controls: the shape that the translator must refuse, and the reason it must give.
+SWITCH_CONTROLS = {
+    "unbounded": "unbounded jump-table index",
+    "signed": "jump-table bound is not an unsigned upper limit",
+    "unextended": "is not the bounded value",
+    "base": "is not a RIP-relative address",
+}
+
+
+def arm_operations(rng, wide, count):
+    """Operations on RDX that read only RDX and the selector in RAX, so that no arm depends on the
+    registers that the dispatch sequence overwrites."""
+    d, a = ("rdx", "rax") if wide else ("edx", "eax")
+    imm = lambda: rng.choice((1, 3, 7, 17, 127, 23130))
+    shifts = ("shl", "shr", "sar", "rol")
+    choices = (lambda: f"add {d}, {imm()}", lambda: f"sub {d}, {imm()}", lambda: f"xor {d}, {imm()}",
+               lambda: f"imul {d}, {d}, {rng.choice((3, 5, 7, 11))}",
+               lambda: f"{rng.choice(shifts)} {d}, {rng.choice((1, 3, 5))}", lambda: f"neg {d}", lambda: f"not {d}",
+               lambda: f"lea {d}, [rdx+rdx*{rng.choice((2, 4, 8))}]",
+               lambda: f"lea {d}, [rdx+rax*{rng.choice((2, 4))}+{imm()}]",
+               lambda: f"{rng.choice(('add', 'xor', 'sub'))} {d}, {a}")
+    return [rng.choice(choices)() for _ in range(count)]
+
+
+def switch_entries(rng, count):
+    """The arm of each table entry and the order the arms are laid out in: every entry its own arm in
+    order, runs of entries that share an arm in order, or shared arms with entries and arms shuffled."""
+    kind = rng.choice(("distinct", "grouped", "shuffled") if count > 2 else ("distinct", "shuffled"))
+    if kind == "distinct":
+        return list(range(count)), list(range(count))
+    arms = rng.randint(max(2, count // 2), count - 1 if kind == "grouped" else count)
+    entries = list(range(arms)) + [rng.randrange(arms) for _ in range(count - arms)]
+    layout = list(range(arms))
+    if kind == "grouped":
+        return sorted(entries), layout
+    rng.shuffle(entries)
+    rng.shuffle(layout)
+    return entries, layout
+
+
+def switch_function(name, rng, layout, bound, source):
+    count = rng.choice(SWITCH_COUNTS)
+    wide = rng.random() < 0.3
+    d, a, ptr = ("rdx", "rax", "QWORD PTR") if wide else ("edx", "eax", "DWORD PTR")
+    entries, order = switch_entries(rng, count)
+    arms = max(entries) + 1
+    # JA and JBE admit selectors up to the compared limit, JAE and JB stop one short of it.
+    limit = count - 1 if bound in ("ja", "jbe") else count
+    default, store, table = f"{name}_default", f"{name}_store", f"{name}_table"
+    epilogue = [f"mov {ptr} [r8], {d}", f"add {a}, {d}", "ret"]
+
+    def block(label, slot, tail):
+        lines = [f"{label}:", f"mov DWORD PTR [r8+{SWITCH_MARKERS + 4 * slot}], {0x100 + slot}",
+                 *arm_operations(rng, wide, rng.choice((1, 2)))]
+        return lines + {"jump": [f"jmp {store}"], "fall": [], "ret": epilogue, "const": [f"mov {a}, -1", "ret"]}[tail]
+
+    # What the selector becomes before the bound check, the register that is compared, and which
+    # 32-bit register the dispatch block copies the index from.
+    mask = (1 << count.bit_length()) - 1
+    prepare, compared = {
+        "plain": (["mov eax, ecx"], "ecx"), "wide": (["mov eax, ecx"], "rcx"),
+        "mask": (["mov eax, ecx", f"and eax, {mask}"], "eax"), "byte": (["movzx eax, cl"], "eax"),
+        "word": (["movzx eax, cx"], "eax"),
+        "floor": (["mov eax, ecx", "xor r11d, r11d", "test eax, eax", "cmovs eax, r11d"], "eax"),
+    }[source]
+    hoisted = []
+    if layout == "rva":
+        # MSVC: image-relative entries, loaded through a register that holds the image base.
+        index = rng.choice((f"movsxd r9, {'ecx' if source in ('plain', 'wide') else 'eax'}",
+                            f"mov r9d, {'ecx' if source in ('plain', 'wide') else 'eax'}"))
+        if rng.random() < 0.25:
+            hoisted, dispatch = ["lea r10, __ImageBase"], [index]
+        else:
+            dispatch = rng.sample([index, "lea r10, __ImageBase"], 2)
+        dispatch += [f"mov r9d, DWORD PTR [(IMAGEREL {table}) + r10 + r9*4]", "add r9, r10", "jmp r9"]
+        table_lines = [f"{table} LABEL DWORD", *(f"DD IMAGEREL {name}_arm{arm}" for arm in entries)]
+    else:
+        # LLVM: signed offsets from the table, whose address is added back. A 64-bit compare of RCX
+        # needs no copy; a 32-bit one zero-extends the compared value into RCX first.
+        base = rng.choice(("r9", "r10"))
+        dispatch = [*([] if source == "wide" else ["mov ecx, eax"]), f"lea {base}, {table}"]
+        rng.shuffle(dispatch)
+        dispatch += [f"movsxd rcx, DWORD PTR [{base}+rcx*4]", f"add rcx, {base}", "jmp rcx"]
+        table_lines = [f"{table}:", *(f"DD {name}_arm{arm} - {table}" for arm in entries)]
+    check = [f"cmp {compared}, {limit}"]
+    if bound in ("jbe", "jb"):
+        check += [f"{bound} {name}_in_range", f"jmp {default}", f"{name}_in_range:"]
+    else:
+        check.append(f"{bound} {default}")
+
+    guard = rng.random() < 0.25
+    default_tail = rng.choice(("jump", "jump", "ret", "const"))
+    default_lines = block(default, arms, default_tail)
+    lines = [*hoisted]
+    if guard:
+        # The default in front of the check: the bound branch goes backward.
+        lines += [f"jmp {name}_guard", *default_lines, f"{name}_guard:"]
+    lines += [*prepare, *check, *dispatch]
+    for position, arm in enumerate(order):
+        last = position == len(order) - 1
+        tail = "fall" if not last and rng.random() < 0.25 else rng.choice(("jump",) * 4 + ("ret",))
+        arm_lines = block(f"{name}_arm{arm}", arm, tail)
+        if guard and last and tail == "jump":
+            arm_lines.pop()  # falls into the common tail
+        lines += arm_lines
+    if not guard:
+        # The default after the arms; as the last block it falls into the common tail.
+        lines += default_lines[:-1] if default_tail == "jump" else default_lines
+    return Function(name, [*lines, f"{store}:", *epilogue, "ALIGN 4", *table_lines])
+
+
+def switch_control(name, kind):
+    """A negative control: a two-entry LLVM-layout switch that breaks one rule the translator checks."""
+    check = {"unbounded": [], "signed": ["cmp ecx, 1", f"jg {name}_default"]}.get(kind, ["cmp ecx, 1", f"ja {name}_default"])
+    copy = [] if kind in ("unbounded", "unextended") else ["mov ecx, eax"]
+    base = "mov r9, rdx" if kind == "base" else f"lea r9, {name}_table"
+    lines = ["mov eax, ecx", *check, *copy, base, "movsxd rcx, DWORD PTR [r9+rcx*4]", "add rcx, r9", "jmp rcx",
+             f"{name}_arm0:", "add edx, 1", f"jmp {name}_store", f"{name}_arm1:", "xor edx, 5", f"jmp {name}_store",
+             f"{name}_default:", "not edx", f"{name}_store:", "mov DWORD PTR [r8], edx", "add eax, edx", "ret",
+             "ALIGN 4", f"{name}_table:", f"DD {name}_arm0 - {name}_table", f"DD {name}_arm1 - {name}_table"]
+    return Function(name, lines, refused=SWITCH_CONTROLS[kind])
+
+
+def generate_switches(seed, count):
+    """Exports that switch on the selector in RCX through a jump table, then four refused controls.
+
+    The first 48 exports take the 48 combinations of layout, bound branch and index source in a
+    seeded order; later ones repeat them with other tables.
+    """
+    rng = random.Random(seed)
+    shapes = [(layout, bound, source) for layout in SWITCH_LAYOUTS for bound in SWITCH_BOUNDS
+              for source in SWITCH_SOURCES]
+    rng.shuffle(shapes)
+    functions = [switch_function(f"fuzz_switch_{index}", rng, *shapes[index % len(shapes)]) for index in range(count)]
+    return [*functions, *(switch_control(f"fuzz_switch_refused_{kind}", kind) for kind in SWITCH_CONTROLS)]
+
+
 AREAS = {"leaf": (generate, "cpu_fuzz"), "frames": (generate_frames, "cpu_fuzz_frames"),
-         "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains")}
+         "calls": (generate_calls, "cpu_fuzz_calls"), "chains": (generate_chains, "cpu_fuzz_chains"),
+         "switches": (generate_switches, "cpu_fuzz_switches")}
 
 
-def inputs_for(seed):
+def inputs_for(seed, area="leaf"):
     boundary = [
         0, 1, 2, 3, 7, 0x0F, 0x10, 0x1F, 0x20, 0x3F, 0x40, 0x7F, 0x80, 0x81, 0xFF, 0x100,
         0x7FFF, 0x8000, 0xFFFF, 0x10000, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x100000000,
@@ -597,6 +748,13 @@ def inputs_for(seed):
     rng = random.Random(seed ^ 0x5EED)
     while len(values) < 313:
         values.append((rng.getrandbits(64), rng.getrandbits(64)))
+    if area == "switches":
+        # Selectors that reach every arm and the default, then the same selectors with upper bits set: a
+        # 32-bit compare ignores them, a 64-bit compare does not, and a signed clamp sees bit 31.
+        rng = random.Random(seed ^ 0x5E1EC7)
+        values = ([(selector, rng.getrandbits(64)) for selector in range(SWITCH_SELECTORS)]
+                  + [(upper | selector, rng.getrandbits(64)) for selector in range(4)
+                     for upper in (1 << 32, 0x80000000, 0xFFFFFFFF00000000)] + values)
     return values[:313]
 
 
@@ -622,7 +780,7 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
     functions = AREAS[area][0](seed, count)
     controls = [function for function in functions if function.refused]
     functions = [function for function in functions if not function.refused and function.export]
-    inputs = inputs_for(seed)
+    inputs = inputs_for(seed, area)
     libraries = [(native, ""), (lifted, "lifted_"), (o2, "lifted_")]
     if mutant is not None:
         libraries.append((mutant, "lifted_"))
@@ -721,7 +879,8 @@ def run_check(seed, count, native, lifted, o2, only=None, input_index=None, area
 def emit(seed, count, asm_path, def_path, area="leaf"):
     generator, library = AREAS[area]
     functions = generator(seed, count)
-    asm = ".code\n\n" + "\n\n".join(function.asm() for function in functions) + "\n\nEND\n"
+    body = "\n\n".join(function.asm() for function in functions)
+    asm = ("EXTERN __ImageBase:BYTE\n" if "__ImageBase" in body else "") + ".code\n\n" + body + "\n\nEND\n"
     definition = (f"LIBRARY {library}\nEXPORTS\n"
                   + "".join(f"    {function.name}\n" for function in functions if function.export))
     Path(asm_path).write_text(asm, encoding="utf-8")
@@ -795,8 +954,26 @@ def plant_swapped_arguments(cpu_switch_aot, image, functions):
     cpu_switch_aot.translate = translate
 
 
+def plant_table_rotate(cpu_switch_aot, image, functions):
+    """Read every jump-table entry one slot late, so each selector reaches the arm of the next entry.
+
+    This is a planted translator fault for the negative control: the bound check and the control flow
+    are unchanged, but a selector runs another arm, which the markers, RDX and the return value show.
+    """
+    original = cpu_switch_aot.Function.dispatch
+
+    def dispatch(self, ip):
+        found = original(self, ip)
+        index, targets, *rest = self.dispatches[ip]
+        self.dispatches[ip] = (index, targets[1:] + targets[:1], *rest)
+        return found
+
+    cpu_switch_aot.Function.dispatch = dispatch
+
+
 MUTANTS = {"frames": ("reload_shift", plant_reload_shift), "calls": ("call_retarget", plant_call_retarget),
-           "chains": ("swapped_arguments", plant_swapped_arguments)}
+           "chains": ("swapped_arguments", plant_swapped_arguments),
+           "switches": ("table_rotate", plant_table_rotate)}
 
 
 def translate(seed, count, image, output, area="leaf", mutant=False):

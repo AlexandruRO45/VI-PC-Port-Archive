@@ -22,10 +22,13 @@
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/derived_blend.h"
+#include "startup_stubs/placement_publish.h"
+#include "startup_stubs/placed_build.h"
 
 #include "startup_stubs/slice_footprints.h"
 
 #include <d3d12.h>
+#include "null_binding_cause.h"
 #include "null_texture_view.h"
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
@@ -67,6 +70,7 @@ const char* const kind_names[kind_count] = {
 // The title also writes into those fields (seen: a command list at +0x544), so the wrapper's own
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
+struct Wrapper;
 struct WrapperOwn {
     IUnknown* real;
     LONG refs;
@@ -80,7 +84,7 @@ struct WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     void* pass;       // CommandList (render mode): recording state (Pass)
-    std::uint64_t pad;  // keeps the size a multiple of 16: the title uses aligned loads on objects
+    Wrapper* list_device;    // CommandList: wrapper that created this list.
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
 struct Wrapper {
@@ -674,7 +678,9 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
     Kind kind = other_kind;
     if (SUCCEEDED(static_cast<HRESULT>(result)) && iid && out && *out) {
         kind = kind_for(*iid);
-        *out = wrap(static_cast<IUnknown*>(*out), kind);
+        Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if (K == device_kind && kind == list_kind) child->own().list_device = self;
+        *out = child;
     }
     static LONG calls;
     if (first_calls(calls, 4)) {
@@ -730,7 +736,13 @@ HRESULT __stdcall query_interface(Wrapper* self, const GUID* iid, void** out)
 }
 ULONG __stdcall add_ref(Wrapper* self) { return static_cast<ULONG>(InterlockedIncrement(&self->own().refs)); }
 // The wrappers and their desktop objects stay alive for the process (experiment scope).
-ULONG __stdcall release(Wrapper* self) { return static_cast<ULONG>(InterlockedDecrement(&self->own().refs)); }
+void retire_placement(Wrapper* w);
+ULONG __stdcall release(Wrapper* self)
+{
+    const auto refs = InterlockedDecrement(&self->own().refs);
+    if (!refs && self->own().kind == resource_kind && self->own().title_memory) retire_placement(self);
+    return static_cast<ULONG>(refs);
+}
 
 // Slot 7 of every device child, desktop ID3D12DeviceChild::GetDevice(riid, ppv).
 HRESULT __stdcall child_get_device(Wrapper* self, const GUID* iid, void** out)
@@ -1425,6 +1437,7 @@ struct Pass {
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
+    PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
     DXGI_FORMAT target_formats[8] = {};
     UINT target_count = 0;
@@ -2076,7 +2089,9 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
         log("x2w-d3d12 Device::slot73(CreateCommandList?) desc=[%s] allocator=%p pso=%p riid=%s -> 0x%08lx", bytes,
             allocator, pso, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
-    *out = wrap(list, list_kind);
+    Wrapper* child = wrap(list, list_kind);
+    child->own().list_device = self;
+    *out = child;
     return S_OK;
 }
 
@@ -2161,6 +2176,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         return E_INVALIDARG;
     }
     void* base = info.AllocationBase;
+    const auto initial_state = state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
+        state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
+    if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return E_INVALIDARG;
     const UINT64 offset = static_cast<char*>(address) - static_cast<char*>(base);
     ID3D12Heap* heap = nullptr;
     HRESULT hr = S_OK;
@@ -2173,7 +2192,8 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
          VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
          cursor += region.RegionSize)
         allocation_bytes += region.RegionSize;
-    if ((offset & 0xFFFF) || offset + desc->Width > allocation_bytes || info.Type != MEM_PRIVATE) hr = E_INVALIDARG;
+    if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || info.Type != MEM_PRIVATE ||
+        initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
         for (auto& [known, h] : existing_heaps)
@@ -2193,15 +2213,16 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
                                                    D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER);
     ID3D12Resource* resource = nullptr;
     if (SUCCEEDED(hr))
-        hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        hr = device_of(self)->CreatePlacedResource(heap, offset, &copy, initial_state, nullptr,
                                                    IID_PPV_ARGS(&resource));
     // A buffer that spans several allocations (adjacent placeholder pieces) cannot be placed on one
     // existing heap. Fallback: a committed default-heap buffer, not aliased with the title memory.
+    const bool aliased = SUCCEEDED(hr);
     const char* placement = "aliased";
     if (FAILED(hr)) {
         const D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
         copy.Flags = static_cast<D3D12_RESOURCE_FLAGS>(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &copy, D3D12_RESOURCE_STATE_COMMON,
+        hr = device_of(self)->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &copy, initial_state,
                                                       nullptr, IID_PPV_ARGS(&resource));
         placement = "not aliased";
     }
@@ -2211,7 +2232,19 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     if (FAILED(hr)) return hr;
     Wrapper* w = wrap(resource, resource_kind);
     w->own().title_memory = address;
-    note_resource(w, desc, desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc->Width : 0);
+    const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
+    auto& group = placement_group(desc->Width);
+    hr = x2w_startup::publish_placement(note_lock, resource_infos, group.by_start, group.max_width,
+        static_cast<const Wrapper*>(w), reinterpret_cast<u64>(address), record);
+    if (FAILED(hr)) {
+        // The caller has never received this wrapper; release its desktop resource and storage.
+        AcquireSRWLockExclusive(&registry_lock);
+        registry().erase(w);
+        ReleaseSRWLockExclusive(&registry_lock);
+        resource->Release();
+        _aligned_free(&w->own());
+        return hr;
+    }
     *out = w;
     return S_OK;
 }
@@ -2668,12 +2701,21 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     } else if (frame % 10 == 1 || (render_mode() && frame % 6 == 0)) {
         draw_overlay(frame, (now - started) / 1000.0);
     }
+    // The null-binding total and its causes change together under draw_lock (draw_translated holds it), so they are copied there.
+    LONG null_total = 0, null_causes[x2w_local::null_cause_count] = {};
+    if (render_mode() && frame % 300 == 0) {
+        AcquireSRWLockExclusive(&draw_lock);
+        null_total = null_bindings;
+        for (int c = 0; c < x2w_local::null_cause_count; ++c) null_causes[c] = null_by_cause[c];
+        ReleaseSRWLockExclusive(&draw_lock);
+    }
     if (render_mode() && frame % 300 == 0)
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, executes %ld, draws %ld (skipped %ld), "
-            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld, textures uploaded %ld "
-            "(%ld KiB, unreadable %ld)", render_resets,
+            "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
+            "textures uploaded %ld (%ld KiB, unreadable %ld)", render_resets,
             render_reset_failures, render_closes, render_clears, render_executes, render_draws, render_draws_skipped,
-            translated_draws, untranslated_draws, translation_ready, translation_missing, null_bindings, textures_uploaded,
+            translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
+            null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
             texture_bytes_uploaded, textures_unreadable);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
@@ -2867,6 +2909,43 @@ void note_texture_write(void* base, UINT bc7_width, UINT bc7_height)
 }
 }  // namespace
 
+void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
+{
+    static const bool ready = (build_tables(), true);
+    (void)ready;
+    removal_device = device;
+    the_device = wrap(device, device_kind);
+    *wrapped = the_device;
+}
+
+HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& sizes,
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& build)
+{
+    if (build.SourceAccelerationStructureData ||
+        (build.Inputs.Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE))
+        return E_INVALIDARG;
+    constexpr UINT64 alignment = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT;
+    const auto translate = [&](UINT64 address, UINT64 bytes, D3D12_RESOURCE_STATES state) -> UINT64 {
+        if (address % alignment) return 0;
+        const auto found = placed_buffer_range(static_cast<const Wrapper*>(guest_device), address, bytes);
+        if (!found.owner || found.reject) return 0;
+        const auto* info = resource_info(found.owner);
+        if (!info || info->initial_state != state) return 0;
+        const auto base = reinterpret_cast<UINT64>(found.owner->own().title_memory);
+        const auto gpu = static_cast<ID3D12Resource*>(found.owner->own().real)->GetGPUVirtualAddress();
+        const auto offset = address - base;
+        if (!gpu || offset > UINT64_MAX - gpu || (gpu + offset) % alignment) return 0;
+        return gpu + offset;
+    };
+    const auto out = translate(dest, sizes.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE);
+    const auto temp = translate(scratch, sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!out || !temp) return E_INVALIDARG;
+    build.DestAccelerationStructureData = out;
+    build.ScratchAccelerationStructureData = temp;
+    return S_OK;
+}
+
 // Called by the XG stand-in after it filled texture memory at a title address.
 extern "C" __declspec(dllexport) void x2w_d3d12_texture_written(void* base, unsigned long long bytes)
 {
@@ -2887,8 +2966,6 @@ bool x2w_d3d12_permissive()
 
 HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parameters, REFIID iid, void** out)
 {
-    static const bool ready = (build_tables(), true);
-    (void)ready;
     char text[48];
     guid_text(&iid, text, sizeof(text));
     char block[3 * 0x40 + 1];
@@ -2914,9 +2991,7 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx", static_cast<void*>(adapter), block,
         text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
-    removal_device = device;
     if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
-    the_device = wrap(device, device_kind);
-    *out = the_device;
+    x2w_startup::attach_device(device, out);
     return S_OK;
 }

@@ -506,32 +506,38 @@ def uncompressed_export(body, mask=0xF):
     return program
 
 
-def masked_region_body():
+# The two closes of an s_and_saveexec_b64 region on s[60:61]. LLVM emits the s_or_b64 form; the precompiled pixel
+# programs measured in issue #1315 close every such region with the s_mov_b64 copy of the saved pair.
+MASKED_OR_RESTORE = "s_or_b64 exec, exec, s[60:61]"
+MASKED_MOV_RESTORE = "s_mov_b64 exec, s[60:61]"
+
+
+def masked_region_body(restore=MASKED_OR_RESTORE):
     return [
         "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
         "s_and_saveexec_b64 s[60:61], vcc",
         "v_mov_b32_e32 v13, s45",
         "v_mov_b32_e32 v14, s46",
-        "s_or_b64 exec, exec, s[60:61]",
+        restore,
     ]
 
 
-def masked_region():
+def masked_region(restore=MASKED_OR_RESTORE):
     """A single forward masked-if: while sample.x is below s44, overwrite v13 and v14."""
-    return uncompressed_export(masked_region_body())
+    return uncompressed_export(masked_region_body(restore))
 
 
-def masked_complementary():
+def masked_complementary(restore=MASKED_OR_RESTORE):
     """Two adjacent regions on complementary predicates, so exactly one writes v13 per lane."""
     return uncompressed_export([
         "v_cmp_lt_f32_e64 vcc_lo, v12, s44",
         "s_and_saveexec_b64 s[60:61], vcc",
         "v_mov_b32_e32 v13, s45",
-        "s_or_b64 exec, exec, s[60:61]",
+        restore,
         "v_cmp_nlt_f32_e64 vcc_lo, v12, s44",
         "s_and_saveexec_b64 s[58:59], vcc",
         "v_mov_b32_e32 v13, s46",
-        "s_or_b64 exec, exec, s[58:59]",
+        restore.replace("s[60:61]", "s[58:59]"),
     ])
 
 
@@ -545,18 +551,18 @@ def offset_pairs(program):
     return pairs
 
 
-def masked_skip():
+def masked_skip(restore=MASKED_OR_RESTORE):
     """The masked region with its whole-wave empty-mask skip, as (offset, text) pairs."""
-    program = masked_region()
+    program = masked_region(restore)
     program.insert(program.index("s_and_saveexec_b64 s[60:61], vcc") + 1, "s_cbranch_execz 2")
     return offset_pairs(program)
 
 
-def masked_skip_asm():
+def masked_skip_asm(restore=MASKED_OR_RESTORE):
     """The skip program as assembler text: the branch names its restore label instead."""
-    program = [line for _, line in masked_skip()]
+    program = [line for _, line in masked_skip(restore)]
     program[program.index("s_cbranch_execz 2")] = "s_cbranch_execz .Lmask_restore"
-    program.insert(program.index("s_or_b64 exec, exec, s[60:61]"), ".Lmask_restore:")
+    program.insert(program.index(restore), ".Lmask_restore:")
     return program
 
 
@@ -583,7 +589,11 @@ def check_masked_draw(directory, compiler, renderer, backend):
     constants = bytearray(256)
     for label, program, complementary in (
             ("region", masked_region(), False), ("skip", masked_skip(), False),
-            ("complementary", masked_complementary(), True)):
+            ("complementary", masked_complementary(), True),
+            # Issue #1315: the same regions closed by the s_mov_b64 copy of the saved pair.
+            ("region-mov", masked_region(MASKED_MOV_RESTORE), False),
+            ("skip-mov", masked_skip(MASKED_MOV_RESTORE), False),
+            ("complementary-mov", masked_complementary(MASKED_MOV_RESTORE), True)):
         source.write_text(translate(program), encoding="ascii")
         compile_shader(compiler, source, shader)
         cases = []
@@ -595,11 +605,14 @@ def check_masked_draw(directory, compiler, renderer, backend):
         run_pixel_batch(renderer, backend, shader, cases)
     struct.pack_into("<4f", constants, 12, 0.5, 0.25, 0.75, 0.0)
     expected = masked_pixels(0.5, (0.25, 0.75), False)
-    unmasked = [line for line in masked_region()
-                if line not in ("s_and_saveexec_b64 s[60:61], vcc", "s_or_b64 exec, exec, s[60:61]")]
-    for mutant in (("reversed", [line.replace("v_cmp_lt_f32_e64", "v_cmp_ge_f32_e64")
-                                 for line in masked_region()]),
-                   ("unmasked", unmasked)):
+    mutants = []
+    for suffix, restore in (("", MASKED_OR_RESTORE), ("-mov", MASKED_MOV_RESTORE)):
+        unmasked = [line for line in masked_region(restore)
+                    if line not in ("s_and_saveexec_b64 s[60:61], vcc", restore)]
+        mutants += [("reversed" + suffix, [line.replace("v_cmp_lt_f32_e64", "v_cmp_ge_f32_e64")
+                                           for line in masked_region(restore)]),
+                    ("unmasked" + suffix, unmasked)]
+    for mutant in mutants:
         source.write_text(translate(mutant[1]), encoding="ascii")
         compile_shader(compiler, source, shader)
         case = directory / f"masked-{mutant[0]}.case"
@@ -8799,6 +8812,128 @@ CARRY_OUT_WRONG = {
         (2, 1, lambda a, b, c, d: c, "borrow dropped"),
     ),
 }
+# v_mad_u64_u32 and v_mad_i64_i32: D = S0 * S1 + S2 modulo 2^64 with two 32-bit factors and a 64-bit S2 (AMD RDNA 2
+# ISA reference, VOP3B opcodes 374 and 375; LLVM 15 VOP3Instructions.td, VOP3b_I64_I1_I32_I32_I64, which gives the
+# unsigned form a 64-bit result and a one-bit lane-mask carry-out). The unsigned carry-out is the carry of the
+# 64-bit add. The signed carry-out is not established, so the signed form is only accepted with the discarding
+# `null` destination. Bodies for uncompressed_export(): A = s44, B = s45 and S2 = {C, D} = s46, s47 from the
+# constants, v18 = B, v20 = C and v21 = D. Each program is one body; _CARRY_SELECT-style selects turn a carry into
+# 0.5 (clear) or 1.0 (set). u64_pair: v[12:13] = A * B + v[20:21] with its carry in vcc_lo, and the carry of
+# B * A + (-1) in s60 (an inline constant S2 is sign-extended, so this carries when the product is not zero).
+# u64_mixed: v[12:13] = B * A + s[46:47] with its carry in s60, and the low word of 3 * B + v[20:21] written to the
+# unaligned pair v[15:16]. i64_pair: v[12:13] = A * B + v[20:21] and v[14:15] = B * A + (-1). i64_mixed:
+# v[12:13] = B * A + s[46:47] and v[14:15] = -3 * B + v[20:21].
+MAD64_PREFIX = ["v_mov_b32_e32 v18, s45", "v_mov_b32_e32 v20, s46", "v_mov_b32_e32 v21, s47"]
+MAD64_BODIES = {
+    "u64_pair": ["v_mad_u64_u32 v[12:13], vcc_lo, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo",
+                 "v_mad_u64_u32 v[16:17], s60, v18, s44, -1", "v_cndmask_b32_e64 v15, 0.5, 1.0, s60"],
+    "u64_mixed": ["v_mad_u64_u32 v[12:13], s60, v18, s44, s[46:47]", "v_cndmask_b32_e64 v14, 0.5, 1.0, s60",
+                  "v_mad_u64_u32 v[15:16], vcc_lo, 3, v18, v[20:21]"],
+    "i64_pair": ["v_mad_i64_i32 v[12:13], null, s44, v18, v[20:21]", "v_mad_i64_i32 v[14:15], null, v18, s44, -1"],
+    "i64_mixed": ["v_mad_i64_i32 v[12:13], null, v18, s44, s[46:47]", "v_mad_i64_i32 v[14:15], null, -3, v18, v[20:21]"],
+}
+MAD64_OPS = ("v_mad_u64_u32", "v_mad_i64_i32")
+_MASK64 = (1 << 64) - 1
+_MAD64_CLEAR, _MAD64_SET = 0x3F000000, 0x3F800000
+
+
+def mad64_group(group):
+    return [*MAD64_PREFIX, *MAD64_BODIES[group]]
+
+
+def _sext32(word):
+    return word - (1 << 32) if word >> 31 else word
+
+
+def _mad64(signed, a, b, s2):
+    """The 64-bit result and the carry of the 64-bit add, from unbounded integers."""
+    product = (_sext32(a) * _sext32(b) if signed else a * b) & _MASK64
+    wide = product + s2
+    return wide & _MASK64, int(wide >> 64)
+
+
+def _words64(value):
+    return value & 0xffffffff, value >> 32
+
+
+def _select(carry):
+    return _MAD64_SET if carry else _MAD64_CLEAR
+
+
+def mad64_words(group, a, b, c, d):
+    s2 = c | (d << 32)
+    if group.startswith("u64"):
+        first, carry = _mad64(False, a, b, s2)
+        if group == "u64_pair":
+            return (*_words64(first), _select(carry), _select(_mad64(False, a, b, _MASK64)[1]))
+        return (*_words64(first), _select(carry), _words64(_mad64(False, 3, b, s2)[0])[0])
+    first = _words64(_mad64(True, a, b, s2)[0])
+    if group == "i64_pair":
+        return (*first, *_words64(_mad64(True, a, b, _MASK64)[0]))
+    return (*first, *_words64(_mad64(True, 0xFFFFFFFD, b, s2)[0]))
+
+
+# (A, B, C, D) as binary32 words; the inputs and every exported word are normal numbers or zero (asserted at the
+# draw). Unsigned rows: 0 carries out of the high word with both factors above 2^31, so a signed multiply differs;
+# 1 carries from the low into the high word and not out of it; 2 wraps to exactly zero and carries; 3 has S2 zero,
+# so only the inline -1 carries; 4 has a zero factor, so the inline -1 does not carry. Signed rows: 0 negative
+# times positive, 1 negative times negative with a negative S2, 2 positive times positive with a negative S2.
+MAD64_ROWS = {
+    "u64": ((0xBF800000, 0xFE000001, 0x1A61DBE2, 0xC1700000), (0x40D10000, 0xD5FEFAE9, 0xFF7FFFFF, 0x40000000),
+            (0x7F7FFFFF, 0x7F7FFFFF, 0xFEFFFFFF, 0xC07FC000), (0x3F7FFFFF, 0xC1700000, 0, 0),
+            (0, 0x40D10000, 0x3F800000, 0x40000000)),
+    "i64": ((0xEA329951, 0x1AEB866D, 0x40000000, 0x01000000), (0x80800000, 0xDA1DDB3E, 0xFE000001, 0xC7A3D81A),
+            (0x3F7FFFFF, 0x7F7FFFFF, 0x3F7FFFFF, 0xFF7FFFFF)),
+}
+MAD64_ROWS["u64_pair"] = MAD64_ROWS["u64_mixed"] = MAD64_ROWS["u64"]
+MAD64_ROWS["i64_pair"] = MAD64_ROWS["i64_mixed"] = MAD64_ROWS["i64"]
+
+
+def _wrong_signed_hi(signed, extra=0):
+    """High word of the product with the other signedness (and, for the inline cases, another S2)."""
+    return lambda a, b, c, d: _words64(_mad64(signed, a, b, c | (d << 32))[0])[1]
+
+
+def _wrong_hi_without_low_carry(a, b, c, d):
+    return (_words64(_mad64(False, a, b, c | (d << 32))[0])[1] - 1) & 0xffffffff
+
+
+# Negative controls by group: (row, channel, word a wrong lowering would give, what went wrong). Each must report
+# a mismatch.
+MAD64_WRONG = {
+    "u64_pair": (
+        (0, 1, _wrong_signed_hi(True), "signed product for unsigned"),
+        (0, 0, lambda a, b, c, d: (a * b) & 0xffffffff, "S2 dropped"),
+        (0, 2, lambda a, b, c, d: _MAD64_CLEAR, "carry dropped"),
+        (1, 2, lambda a, b, c, d: _MAD64_SET, "carry on a carry from the low into the high word only"),
+        (1, 1, _wrong_hi_without_low_carry, "carry of the low word dropped"),
+        (2, 2, lambda a, b, c, d: _MAD64_CLEAR, "carry dropped when the sum wraps to zero"),
+        (3, 3, lambda a, b, c, d: _MAD64_CLEAR, "carry of the inline -1 dropped"),
+        (4, 3, lambda a, b, c, d: _MAD64_SET, "carry of the inline -1 on a zero product"),
+    ),
+    "u64_mixed": (
+        (0, 1, _wrong_signed_hi(True), "signed product for unsigned"),
+        (0, 2, lambda a, b, c, d: _MAD64_CLEAR, "carry dropped"),
+        (1, 2, lambda a, b, c, d: _MAD64_SET, "carry on a carry from the low into the high word only"),
+        (2, 2, lambda a, b, c, d: _MAD64_CLEAR, "carry dropped when the sum wraps to zero"),
+        (0, 3, lambda a, b, c, d: _words64(_mad64(False, 1, b, c | (d << 32))[0])[0], "inline 3 read as 1"),
+        (1, 1, _wrong_hi_without_low_carry, "carry of the low word dropped"),
+    ),
+    "i64_pair": (
+        (0, 1, _wrong_signed_hi(False), "unsigned product for signed"),
+        (1, 1, _wrong_signed_hi(False), "unsigned product for signed, both factors negative"),
+        (0, 0, lambda a, b, c, d: (_sext32(a) * _sext32(b)) & 0xffffffff, "S2 dropped"),
+        (0, 3, lambda a, b, c, d: _words64(_mad64(True, a, b, 0xffffffff)[0])[1], "inline -1 zero-extended"),
+        (2, 1, lambda a, b, c, d: _words64(_mad64(True, a, b, c)[0])[1], "S2 high word dropped"),
+    ),
+    "i64_mixed": (
+        (0, 1, _wrong_signed_hi(False), "unsigned product for signed"),
+        (1, 1, _wrong_signed_hi(False), "unsigned product for signed, both factors negative"),
+        (1, 3, lambda a, b, c, d: _words64((0xFFFFFFFD * _sext32(b) + (c | (d << 32))) & _MASK64)[1],
+         "inline -3 zero-extended"),
+        (0, 2, lambda a, b, c, d: _words64(_mad64(True, 3, b, c | (d << 32))[0])[0], "inline -3 read as 3"),
+    ),
+}
 # v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32: the carry-out add and subtracts above, plus the carry or
 # borrow of each lane read from a lane mask. Bodies for uncompressed_export(): A, B, C and D are the constants in
 # s44 to s47, v18 = B and v19 = D. The carry-out form of the same operation leaves the carry of op(A, B) in vcc_lo
@@ -9598,6 +9733,89 @@ def check_carry_out_lowering():
     assert len(set(sources.values())) == 3
 
 
+def check_mad64_lowering():
+    """Static checks for v_mad_u64_u32 and v_mad_i64_i32 as written by mad64_group()."""
+    # v18, v20 and v21 are written by the movs at 20 to 22; the operations and selects follow from 23.
+    assert set(MAD64_BODIES) == set(MAD64_WRONG) == {"u64_pair", "u64_mixed", "i64_pair", "i64_mixed"}
+    for group in MAD64_BODIES:
+        program = uncompressed_export(mad64_group(group))
+        assert program.index("v_mov_b32_e32 v18, s45") == 20, group
+        source = translate_int(program).splitlines()
+        signed = group.startswith("i64")
+        for index in (23, 24, 25):
+            if f"    uint m{index}pl = m{index}a * m{index}b;" not in source:
+                continue
+            high = "mul_hi_i32" if signed else "mul_hi_u32"
+            for statement in (f"    uint m{index}ph = {high}(m{index}a, m{index}b);",
+                              f"    uint m{index}lo = m{index}pl + m{index}cl;",
+                              f"    uint m{index}h1 = m{index}ph + m{index}ch;",
+                              f"    uint m{index}hi = m{index}h1 + (m{index}lo < m{index}pl ? 1u : 0u);"):
+                assert statement in source, (group, statement)
+            carry = f"    bool cmp{index} = m{index}h1 < m{index}ph || m{index}hi < m{index}h1;"
+            assert (carry in source) != signed, (group, index)
+    assert any(line.startswith("    precise float alu24 = cmp23 ?") for line in
+               translate_int(uncompressed_export(mad64_group("u64_pair"))).splitlines())
+    assert set(MAD64_OPS) <= ACCEPTED, set(MAD64_OPS) - ACCEPTED
+    sources = {g: translate_int(uncompressed_export(mad64_group(g))) for g in MAD64_BODIES}
+    assert len(set(sources.values())) == 4
+
+    def program(line):
+        return uncompressed_export([*MAD64_PREFIX, line])
+
+    # Unsigned: a lane mask as the carry-out (vcc, vcc_lo, one SGPR or an SGPR pair), a register, an inline
+    # constant or a literal for each factor, a VGPR or SGPR pair or an inline -16 to 64 for S2, and an
+    # unaligned destination or S2 pair (LLVM 15 assembles them; hardware legality is assumed, not measured).
+    for good in ("v_mad_u64_u32 v[12:13], vcc, s44, v18, v[20:21]", "v_mad_u64_u32 v[12:13], vcc_lo, v18, s44, s[46:47]",
+                 "v_mad_u64_u32 v[12:13], s60, v18, v18, v[20:21]", "v_mad_u64_u32 v[12:13], s[60:61], 64, -16, 64",
+                 "v_mad_u64_u32 v[15:16], vcc_lo, 0x12345678, v18, -16", "v_mad_u64_u32 v[254:255], vcc_lo, s44, v18, 0",
+                 "v_mad_u64_u32 v[12:13], vcc_lo, s44, v18, v[13:14]",
+                 "v_mad_u64_u32 v[20:21], vcc_lo, s44, v18, v[20:21]"):
+        translate_int(program(good))
+    # Signed: only with the discarding null destination.
+    for good in ("v_mad_i64_i32 v[12:13], null, s44, v18, v[20:21]", "v_mad_i64_i32 v[15:16], null, 0x12345678, v18, s[46:47]",
+                 "v_mad_i64_i32 v[12:13], null, -16, 64, -16", "v_mad_i64_i32 v[20:21], null, s44, v18, v[20:21]"):
+        translate_int(program(good))
+    for op, mask in (("u64_u32", "vcc_lo"), ("i64_i32", "null")):
+        for bad in (f"v_mad_{op} v[12:13], {mask}, s44, v18, v[20:21] clamp",
+                    f"v_mad_{op}_e64 v[12:13], {mask}, s44, v18, v[20:21]",
+                    f"v_mad_{op} v[12:13], {mask}, -s44, v18, v[20:21]", f"v_mad_{op} v[12:13], {mask}, s44, |v18|, v[20:21]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, -v[20:21]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, v[20:21] mul:2",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, 0x12345678", f"v_mad_{op} v[12:13], {mask}, s44, v18, 65",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, -17", f"v_mad_{op} v[12:13], {mask}, s44, v18, 1.0",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, v20", f"v_mad_{op} v[12:13], {mask}, s44, v18, s46",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, v[20:22]", f"v_mad_{op} v[12:13], {mask}, s44, v18, v[21:20]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, s[47:48]", f"v_mad_{op} v[12:13], {mask}, s44, v18, v[98:99]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v99, v[20:21]", f"v_mad_{op} v[12:13], {mask}, s44, v106, v[20:21]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18", f"v_mad_{op} v[12:13], {mask}, s44, v18, v[20:21], v[20:21]",
+                    f"v_mad_{op} v12, {mask}, s44, v18, v[20:21]", f"v_mad_{op} v[12:12], {mask}, s44, v18, v[20:21]",
+                    f"v_mad_{op} v[12:14], {mask}, s44, v18, v[20:21]", f"v_mad_{op} v[13:12], {mask}, s44, v18, v[20:21]",
+                    f"v_mad_{op} v[255:256], {mask}, s44, v18, v[20:21]", f"v_mad_{op} s[12:13], {mask}, s44, v18, v[20:21]",
+                    f"v_mad_{op} v[12:13], s44, v18, v[20:21]",
+                    f"v_mad_{op} v[12:13], {mask}, s44, v18, v[20:21] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"):
+            must_reject(translate_int, program(bad))
+    # The carry-out names a lane mask for the unsigned form and nothing else is accepted: no null, exec, VGPR,
+    # width error or unaligned pair. The signed form takes null only, never a mask.
+    for bad in ("null", "exec", "exec_lo", "v13", "s[60:62]", "s[60:60]", "s[61:62]", "s[62:61]", "s107", "s[106:107]"):
+        must_reject(translate_int, program(f"v_mad_u64_u32 v[12:13], {bad}, s44, v18, v[20:21]"))
+    for bad in ("vcc", "vcc_lo", "s60", "s[60:61]", "exec", "v13"):
+        must_reject(translate_int, program(f"v_mad_i64_i32 v[12:13], {bad}, s44, v18, v[20:21]"))
+    # The unsigned carry is the mask a select reads and a later write to the register replaces it. The signed
+    # form writes no mask, so a select on an unwritten register is refused and an earlier carry is kept.
+    replaced = translate_int(uncompressed_export([
+        *MAD64_PREFIX, "v_mad_u64_u32 v[12:13], vcc_lo, s44, v18, v[20:21]",
+        "v_cmp_lt_u32_e64 vcc_lo, s44, v18", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"])).splitlines()
+    assert any(line.startswith("    precise float alu25 = cmp24 ?") for line in replaced), replaced
+    kept = translate_int(uncompressed_export([
+        *MAD64_PREFIX, "v_mad_u64_u32 v[12:13], vcc_lo, s44, v18, v[20:21]",
+        "v_mad_i64_i32 v[14:15], null, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"])).splitlines()
+    assert any(line.startswith("    precise float alu25 = cmp23 ?") for line in kept), kept
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_mad_i64_i32 v[12:13], null, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"]))
+    must_reject(translate_int, uncompressed_export([
+        *MAD64_PREFIX, "v_mad_u64_u32 v[12:13], s60, s44, v18, v[20:21]", "v_cndmask_b32_e64 v14, 0.5, 1.0, vcc_lo"]))
+
+
 def check_carry_in_lowering():
     """Static checks for v_add_co_ci_u32, v_sub_co_ci_u32 and v_subrev_co_ci_u32 as written by carry_in_group()."""
     # v18 and v19 are written by the movs at 20 and 21, the carry-out forms at 22 (vcc_lo) and 23 (s60) write the
@@ -9769,6 +9987,40 @@ def check_nc_integer_lowering():
     ):
         translate_int(uncompressed_export(["v_mov_b32_e32 v18, s45", good]))
         must_reject(translate_int, uncompressed_export(["v_mov_b32_e32 v18, s45", bad]))
+
+
+def check_masked_mov_close_controls():
+    """Issue #1315: an s_and_saveexec_b64 region may close with the s_mov_b64 copy of its exact saved pair."""
+    # EXEC inside the region is a subset of the saved entry mask, so both closes restore the same mask and lower
+    # to the same HLSL, with and without the skip and for two regions on different pairs.
+    for build in (masked_region, masked_skip, masked_complementary):
+        assert translate(build(MASKED_MOV_RESTORE)) == translate(build(MASKED_OR_RESTORE)), build.__name__
+    region = masked_region(MASKED_MOV_RESTORE)
+    # The copy must name the saved pair; one without an open region, or a second close, is not a restore.
+    expect_value_error(translate, [line.replace(MASKED_MOV_RESTORE, "s_mov_b64 exec, s[58:59]") for line in region],
+                       "Unexpected execution mask restore")
+    expect_value_error(translate, uncompressed_export([MASKED_MOV_RESTORE]), "Unsupported execution mask")
+    expect_value_error(translate, uncompressed_export([*masked_region_body(MASKED_MOV_RESTORE), MASKED_MOV_RESTORE]),
+                       "Unsupported execution mask")
+    # The skip keeps its target: the close of the same pair, not a copy of another pair.
+    expect_value_error(translate, [(offset, "s_mov_b64 exec, s[58:59]" if line == MASKED_MOV_RESTORE else line)
+                                   for offset, line in masked_skip(MASKED_MOV_RESTORE)],
+                       "Execution skip does not target the matching restore")
+    # The else transition and a wave32 copy stay outside this stage.
+    for extra in ("s_andn2_b64 exec, s[60:61], exec", "s_mov_b32 exec_lo, s60"):
+        changed = list(region)
+        changed.insert(changed.index(MASKED_MOV_RESTORE), extra)
+        expect_value_error(translate, changed, f"Instruction cannot run in a masked region: {extra}")
+    # s_mov_b64 leaves SCC, but s_and_saveexec_b64 already wrote it from the new EXEC, which is untracked, so an SCC
+    # reader after the MOV close rejects exactly as after the s_or_b64 close. (cmpx_observables draws the v_cmpx
+    # case, where SCC is tracked through the region and survives the MOV close.)
+    for restore in (MASKED_MOV_RESTORE, MASKED_OR_RESTORE):
+        expect_value_error(translate, uncompressed_export([
+            "s_cmp_eq_u32 s44, s45", *masked_region_body(restore)[:2], restore, "s_cmov_b64 s[44:45], s[46:47]"]),
+            "Conditional move requires a tracked SCC")
+    # An SCC written after the close is tracked again.
+    translate(uncompressed_export([*masked_region_body(MASKED_MOV_RESTORE), "s_cmp_eq_u32 s44, s45",
+                                   "s_cmov_b64 s[44:45], s[46:47]"]))
 
 
 def check_masked_controls():
@@ -10005,9 +10257,12 @@ def check_cmpx_controls():
                   "v_cmp_eq_f32_e64 vcc_lo, v12, v13", "v_readfirstlane_b32 s62, v12",
                   "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13", "s_andn2_b64 exec, s[60:61], exec"):
         must_reject(translate, region[:inside + 1] + [extra] + region[inside + 1:])
-    # The s_mov_b64 restore closes only a v_cmpx region; the s_and_saveexec_b64 region keeps its s_or_b64 close.
-    must_reject(translate, [CMPX_MOV_RESTORE if line == "s_or_b64 exec, exec, s[60:61]" else line
-                            for line in masked_region()])
+    # Since issue #1315 the s_mov_b64 restore also closes an s_and_saveexec_b64 region on the same pair, lowering as
+    # the s_or_b64 close does (check_masked_mov_close_controls); a copy of a different pair still does not close it.
+    assert translate([CMPX_MOV_RESTORE if line == "s_or_b64 exec, exec, s[60:61]" else line
+                      for line in masked_region()]) == translate(masked_region())
+    expect_value_error(translate, [CMPX_MOV_RESTORE.replace("60:61", "58:59") if line == "s_or_b64 exec, exec, s[60:61]"
+                                   else line for line in masked_region()], "Unexpected execution mask restore")
     must_reject(translate, [line for line in region if line != CMPX_MOV_RESTORE])
     # Out of scope for this stage: e64, SDWA, other widths and kinds, VSRC1 not a VGPR, and source modifiers.
     for compare in ("v_cmpx_gt_f32_e64 s44, v12", "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
@@ -12324,6 +12579,7 @@ def check_controls(directory):
     check_dpp_f16_contract_controls()
     check_smem_pointer_controls()
     check_masked_controls()
+    check_masked_mov_close_controls()
     check_cmpx_controls()
     check_shift64_controls()
     check_region_body_controls()
@@ -12526,6 +12782,7 @@ def check_controls(directory):
     check_e64_integer_lowering()
     check_carry_out_lowering()
     check_carry_in_lowering()
+    check_mad64_lowering()
     check_sdwa_integer_lowering()
     check_pack_int16_lowering()
     check_sat_pack_u8_lowering()
@@ -14442,6 +14699,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(e64_integer_group(group)), translate_int) for group in E64_INT_BODIES)
     fixtures.extend((uncompressed_export(carry_out_group(op)), translate_int) for op in CARRY_OUT_OPS)
     fixtures.extend((uncompressed_export(carry_in_group(op)), translate_int) for op in CARRY_IN_OPS)
+    fixtures.extend((uncompressed_export(mad64_group(group)), translate_int) for group in MAD64_BODIES)
     fixtures.extend((uncompressed_export(sdwa_integer_group(group)), translate_int) for group in SDWA_INT_BODIES)
     fixtures.extend((uncompressed_export(pack_group(group)), translate_int) for group in PACK_BODIES)
     fixtures.append((sat_pack_u8_program(), translate_int))
@@ -14450,9 +14708,10 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((uncompressed_export(sad_group(group)), translate_int) for group in SAD_BODIES)
     fixtures.extend((compressed_export(mask), translate_masked) for mask in (0x3, 0xC, 0xF))
     fixtures.extend((uncompressed_export([], mask), translate_masked) for mask in (0x1, 0x8, 0x5, 0xA))
-    fixtures.append((masked_region(), translate))
-    fixtures.append((masked_complementary(), translate))
-    fixtures.append((masked_skip_asm(), translate, "gfx1013", "", masked_skip()))
+    for restore in (MASKED_OR_RESTORE, MASKED_MOV_RESTORE):
+        fixtures.append((masked_region(restore), translate))
+        fixtures.append((masked_complementary(restore), translate))
+        fixtures.append((masked_skip_asm(restore), translate, "gfx1013", "", masked_skip(restore)))
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
@@ -15224,6 +15483,56 @@ def check_carry_out_draws(directory, compiler, renderer, backend):
             wrong_words = list(right[index])
             wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
             assert wrong_words[channel] != right[index][channel], (op, reason)
+            add_case(cases, rows[index], wrong_words, "mismatch")
+        try:
+            run_pixel_batch(renderer, backend, shader, cases)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == 77:
+                return 77
+            raise
+    return 0
+
+
+def check_mad64_draws(directory, compiler, renderer, backend):
+    """Draw v_mad_u64_u32 and v_mad_i64_i32 through the integer readback target, bit for bit.
+
+    Each program of mad64_group() is compiled once and drawn in one renderer batch: every row of MAD64_ROWS with
+    the right words, then one draw per MAD64_WRONG entry with one channel of its row replaced by the word a wrong
+    lowering would give, which must report a mismatch. The unsigned carry is observed through v_cndmask_b32. On a
+    desktop GPU the draws establish that the translated shader computes the stated operation, not what the
+    console does.
+    """
+    source = directory / "mad64.hlsl"
+    shader = directory / "mad64.cso"
+
+    def add_case(cases, row, words, status):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *row)
+        case = directory / f"mad64-{len(cases)}.case"
+        case.write_bytes(bytes(constants) + struct.pack("<4I", *words) * 64 + b"")
+        cases.append((case, status))
+
+    for group in MAD64_BODIES:
+        source.write_text(translate_int(uncompressed_export(mad64_group(group))), encoding="ascii")
+        compile_shader(compiler, source, shader)
+        rows = MAD64_ROWS[group]
+        right = [mad64_words(group, *row) for row in rows]
+        cases = []
+        for row, words in zip(rows, right):
+            # Integer export carries any pattern, but normal rows keep the draw independent of NaN and denormal handling.
+            assert all(binary32_normal_or_zero(word) for word in (*row, *words)), (group, [hex(w) for w in (*row, *words)])
+            add_case(cases, row, words, "pass")
+        if group.startswith("u64"):
+            # Each carry state is drawn on each mask, so a constant mask cannot pass.
+            for channel in (2, 3) if group == "u64_pair" else (2,):
+                assert {words[channel] for words in right} == {_MAD64_CLEAR, _MAD64_SET}, (group, channel)
+        # The signed and unsigned products differ on a drawn row, so the two forms cannot be swapped unseen.
+        assert any(_mad64(False, row[0], row[1], row[2] | (row[3] << 32))[0]
+                   != _mad64(True, row[0], row[1], row[2] | (row[3] << 32))[0] for row in rows), group
+        for index, channel, wrong, reason in MAD64_WRONG[group]:
+            wrong_words = list(right[index])
+            wrong_words[channel] = wrong(*rows[index]) & 0xffffffff
+            assert wrong_words[channel] != right[index][channel], (group, reason)
             add_case(cases, rows[index], wrong_words, "mismatch")
         try:
             run_pixel_batch(renderer, backend, shader, cases)
@@ -19431,7 +19740,7 @@ def main():
         if mode in ("draw-blend-scalar", "draw-predicate-rounding", "draw-integer-nc",
                     "draw-e64-integer", "draw-bfm", "draw-brev", "draw-align",
                     "draw-sdwa-integer", "draw-plain-bitscan", "draw-vop3-ternary-int", "draw-swap",
-                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-pack-int16", "draw-pack-b32",
+                    "draw-mac-legacy", "draw-carry-out", "draw-carry-in", "draw-mad64", "draw-pack-int16", "draw-pack-b32",
                     "draw-sad",
                     "draw-int16-vop3", "draw-int16-ternary", "draw-compressed-export", "draw-uncompressed-export",
                     "draw-uncompressed-integer-export",
@@ -19450,6 +19759,7 @@ def main():
                         "draw-e64-integer": check_e64_integer_draws,
                         "draw-carry-out": check_carry_out_draws,
                         "draw-carry-in": check_carry_in_draws,
+                        "draw-mad64": check_mad64_draws,
                         "draw-sdwa-integer": check_sdwa_integer_draws,
                         "draw-bfm": check_bfm_draw,
                         "draw-brev": check_brev_draw,

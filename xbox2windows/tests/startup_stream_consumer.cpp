@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "startup_stream_draw.h"
+#include "startup_stream_setup.h"
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
@@ -49,20 +50,6 @@ static bool derive(void* device, void*& pipeline, bool child)
     return true;
 }
 
-struct alignas(8) Stage {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
-    D3D12_SHADER_BYTECODE shader;
-};
-struct alignas(8) Root {
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE tag;
-    ID3D12RootSignature* signature;
-};
-struct Stream {
-    Stage ps;
-    Root root;
-    Stage vs;
-};
-
 int main(int argc, char** argv)
 {
     if (argc != 4 && (argc < 6 || argc > 8) && argc != 10) return 2;
@@ -75,74 +62,13 @@ int main(int argc, char** argv)
         if ((bc7.width != 64 || bc7.height != 64) && (bc7.width != 81 || bc7.height != 69)) return 2;
         if (!bc7.tiled && std::strcmp(argv[9], "linear") != 0) return 2;
     }
-    std::ifstream vs_file(argv[1], std::ios::binary), ps_file(argv[2], std::ios::binary);
-    std::vector<char> vs{std::istreambuf_iterator<char>(vs_file), {}};
-    std::vector<char> ps{std::istreambuf_iterator<char>(ps_file), {}};
-    if (vs.empty() || ps.empty()) return 3;
-
-    ComPtr<IDXGIFactory4> factory;
     ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return 4;
-    if (draw && std::strcmp(argv[4], "hardware") == 0) {
-        ComPtr<IDXGIFactory6> factory6;
-        if (FAILED(factory.As(&factory6))) return 77;
-        for (UINT n = 0;; ++n) {
-            ComPtr<IDXGIAdapter1> candidate;
-            HRESULT hr = factory6->EnumAdapterByGpuPreference(n, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
-            if (hr == DXGI_ERROR_NOT_FOUND) return 77;
-            if (FAILED(hr)) return 4;
-            DXGI_ADAPTER_DESC1 desc{};
-            if (FAILED(candidate->GetDesc1(&desc))) return 4;
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                SUCCEEDED(D3D12CreateDevice(candidate.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) {
-                adapter = candidate;
-                break;
-            }
-        }
-    } else if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) return 4;
-    DXGI_ADAPTER_DESC desc{};
-    LARGE_INTEGER driver{};
-    if (FAILED(adapter->GetDesc(&desc))) return 4;
-    adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver);
-    std::printf("adapter=%ls driver=%u.%u.%u.%u\n", desc.Description,
-        HIWORD(driver.HighPart), LOWORD(driver.HighPart), HIWORD(driver.LowPart), LOWORD(driver.LowPart));
-    std::array<unsigned char, 64> parameters{};
     void* device = nullptr;
-    if (FAILED(D3D12XboxCreateDevice(adapter.Get(), parameters.data(), __uuidof(ID3D12Device), &device))) return 5;
-
-    D3D12_ROOT_SIGNATURE_DESC root_desc{};
-    const D3D12_DESCRIPTOR_RANGE srv{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
-    D3D12_ROOT_PARAMETER table{};
-    if (bc7.blocks) {
-        table.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        table.DescriptorTable = {1, &srv};
-        table.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        root_desc.NumParameters = 1;
-        root_desc.pParameters = &table;
-    }
-    ComPtr<ID3DBlob> blob;
-    if (FAILED(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr))) return 6;
-    std::ofstream(argv[3], std::ios::binary).write(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
-    using CreateRoot = HRESULT (WINAPI*)(void*, UINT, const void*, SIZE_T, REFIID, void**);
-    using CreateStream = HRESULT (WINAPI*)(void*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
-    auto** slots = *static_cast<void***>(device);
-    ID3D12RootSignature* root = nullptr;
-    if (FAILED(reinterpret_cast<CreateRoot>(slots[16])(device, 0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                                        __uuidof(ID3D12RootSignature), reinterpret_cast<void**>(&root)))) return 7;
-
-    Stream stream{{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, {ps.data(), ps.size()}},
-                  {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root},
-                  {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, {vs.data(), vs.size()}}};
     void* pso = nullptr;
-    auto submit = [&](SIZE_T bytes) {
-        D3D12_PIPELINE_STATE_STREAM_DESC desc{bytes, &stream};
-        const auto hr = reinterpret_cast<CreateStream>(slots[86])(device, &desc, __uuidof(ID3D12PipelineState), &pso);
-        return SUCCEEDED(hr) && pso;
-    };
-    // A truncated last shader must not publish a partial request, even with readable backing memory.
-    if (!submit(sizeof(stream) - 8)) return 8;
+    const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
+    if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, bc7.blocks != nullptr,
+                                                adapter, device, pso)) return rc;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;
-    if (!submit(sizeof(stream))) return 9;
     if (argc == 4) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
@@ -157,6 +83,16 @@ int main(int argc, char** argv)
         if (format != DXGI_FORMAT_R32_UINT && format != DXGI_FORMAT_R32_SINT &&
             format != DXGI_FORMAT_R32G32B32A32_FLOAT) return 2;
         if (argc == 8) export_word = static_cast<UINT>(std::strtoul(argv[7], nullptr, 0));
+    }
+    if (GetEnvironmentVariableW(L"X2W_TEST_PLACED_VERTEX", nullptr, 0)) {
+        extern void release_placed_vertices(bool);
+        const std::string first = std::string(argv[5]) + ".first";
+        if (const int rc = check_stream_draw(adapter.Get(), device, pso, first.c_str(), nullptr, format)) return rc;
+        // GPU fence and readback are complete before the high range is released.
+        release_placed_vertices(false);
+        const int rc = check_stream_draw(adapter.Get(), device, pso, argv[5], nullptr, format);
+        release_placed_vertices(true);
+        return rc;
     }
     return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word);
 }

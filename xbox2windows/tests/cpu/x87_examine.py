@@ -1,9 +1,10 @@
-"""Compare native and translated FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX and FCLEX in the x87 profile.
+"""Compare native and translated FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX, FCLEX and the 8087/287 controls
+FENI, FNENI, FDISI, FNDISI and FSETPM in the x87 profile.
 
 Each export runs through the native harness (control word 0x027F, empty stack) and writes C0, C2 and C3
 after each status-word writer, and any stored m80 value, to its output block. An independent model gives
 the expected block: comparisons use exact rationals, and FXAM classifies the 80-bit encoding (unsupported,
-NaN, normal, infinity, zero, empty, denormal). Three mutated translations must each mismatch, and
+NaN, normal, infinity, zero, empty, denormal). Four mutated translations must each mismatch, and
 translation must reject the sequences in check_rejections.
 """
 from fractions import Fraction
@@ -15,7 +16,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import x87_add as base  # noqa: E402  (tests/cpu is the script directory)
 
-EXPORTS = ("ftst_fxam", "ficom_m16", "ficom_m32", "fnop_fclex")
+EXPORTS = ("ftst_fxam", "ficom_m16", "ficom_m32", "fnop_fclex", "legacy_controls")
 INPUT, OUTPUT = base.INPUT, base.OUTPUT
 J = 1 << 63
 # Mutations of the lifted source that the check requires to mismatch: (pattern, replacement).
@@ -24,6 +25,8 @@ CONTROLS = {
     "unsigned": (re.compile(r"static_cast<int(16|32)_t>\(load_always<uint\1_t>"), r"static_cast<uint\1_t>(load_always<uint\1_t>"),
     "positive": (re.compile(re.escape("x87_compare(x87_slot[0], X87Value{0, 0})")),
                  "x87_compare(x87_slot[0], X87Value{0x8000000000000000ull, 0x3fff})"),
+    # A legacy control that changed ST(0) instead of acting as FNOP.
+    "legacy": (re.compile(re.escape(";  // fnsetpm")), "x87_slot[0].se ^= 0x8000;  // fnsetpm"),
 }
 
 
@@ -125,7 +128,7 @@ INTEGERS32 = (*INTEGERS, 2147483647, -2147483648, 1 << 30)
 def cases():
     for sig, se in values():
         m80 = struct.pack("<QH", sig, se)
-        for name in ("ftst_fxam", "fnop_fclex"):
+        for name in ("ftst_fxam", "fnop_fclex", "legacy_controls"):
             yield name, (m80 + b"\0" * 6 + struct.pack("<h", 7) + b"\0" * 6 + struct.pack("<i", 9)).ljust(INPUT, b"\0")
         for n in INTEGERS:
             yield "ficom_m16", (m80 + b"\0" * 6 + struct.pack("<h", n)).ljust(INPUT, b"\0")
@@ -134,7 +137,7 @@ def cases():
 
 
 def check_rejections():
-    """Translation must reject an underflowing FTST or FICOMP and a reader of C0 after FNOP or FNCLEX."""
+    """Translation must reject an underflowing FTST or FICOMP and a reader of C0 after FNOP, FNCLEX, FNENI or FNSETPM."""
     from iced_x86 import Decoder
     from ffx_version_query import lower
 
@@ -148,6 +151,8 @@ def check_rejections():
         "ficomp on an empty stack": ("de19c3", "underflow"),
         "fnop then a reader of C0": (sequence("d9d0"), "not known"),
         "fnclex then a reader of C0": (sequence("dbe2"), "not known"),
+        "fneni then a reader of C0": (sequence("dbe0"), "not known"),
+        "fnsetpm then a reader of C0": (sequence("dbe4"), "not known"),
     }
     for label, code in accepted.items():
         lower(list(Decoder(64, bytes.fromhex(code))), [], {}, {}, {}, x87=True)

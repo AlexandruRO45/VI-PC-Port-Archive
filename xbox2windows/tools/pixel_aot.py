@@ -2805,9 +2805,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             ds_needs_wait = False
         rstate = None
         if region is not None:
-            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]", line):
-                pass
-            elif region["opener"] == "cmpx" and re.fullmatch(r"s_mov_b64 exec, s\[\d+:\d+\]", line):
+            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["start"] + 1 and region["skip"] is None):
@@ -3014,9 +3012,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             wqm_width = None
             scc = None
         elif region is not None and (m := match(r"s_mov_b64 exec, (s\[\d+:\d+\])")):
-            # The v_cmpx region closes with an exact copy of the saved mask. Unlike s_or_b64 it leaves SCC.
-            if region["opener"] != "cmpx":
-                raise ValueError("Unexpected execution mask restore")
+            # Either opener may close with an exact copy of the saved pair (issue #1315 for s_and_saveexec_b64).
+            # EXEC inside the region is a subset of the saved entry mask, so this restores the same mask as
+            # s_or_b64 exec, exec, s[a:b]. Unlike s_or_b64 it leaves SCC; after s_and_saveexec_b64, which wrote
+            # SCC from the new EXEC, SCC is already untracked, so no reader can follow either close.
             close_region(i, sgpr_pair(m[1]))
             region = None
         elif m := match(r"s_mov_b64 (?:exec|exec_lo), (s\[\d+:\d+\])"):
@@ -3107,7 +3106,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
             rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
-            if rm is None and region["opener"] == "cmpx":
+            if rm is None:
                 rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
             if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
                 raise ValueError("Execution skip does not target the matching restore")
@@ -4123,6 +4122,49 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
             vector[dst] = f"alu{i}"
+        elif m := match(r"v_mad_(u64_u32|i64_i32) v\[(\d+):(\d+)\], ([^,\s]+), ([^,\s]+), ([^,\s]+), ([^,\s]+)"):
+            # 64-bit multiply-add of two 32-bit factors: D = S0 * S1 + S2 modulo 2^64, with S2 a 64-bit pair.
+            # The unsigned form zero-extends the factors and writes the carry-out of the 64-bit add (the wrapped
+            # sum is below S2) to the lane mask. The signed form sign-extends the factors; its carry-out is not
+            # established here, so it is accepted only with the discarding `null` destination and never leaves
+            # a lane mask behind. Every operand is read before the destination is written. gfx10 encodes both as
+            # VOP3 only; a trailing clamp or modifier is left to the fall-through, a literal S2 is refused.
+            kind, first, last, carry, src0, src1, src2 = m.groups()
+            signed = kind == "i64_i32"
+            first, last = int(first), int(last)
+            if signed != (carry == "null"):
+                raise ValueError("64-bit multiply-add carry-out must be null for the signed form and a lane mask otherwise")
+            regs = []
+            if not signed:
+                if not re.fullmatch(LANE_MASK, carry):
+                    raise ValueError("Invalid 64-bit multiply-add carry-out")
+                regs = lane_mask(carry)
+                if re.fullmatch(r"s\d+", carry):
+                    sgpr_name(carry)
+            names = (f"v{first}", f"v{last}")
+            if (mask != "entry" or last != first + 1 or last > 255 or pending.intersection(regs)
+                    or any(name in sample_dest for name in names)):
+                raise ValueError("Invalid 64-bit multiply-add")
+            a = int_operand(src0, scalar, vector, pending, sample_dest, signed=False)
+            b = int_operand(src1, scalar, vector, pending, sample_dest, signed=False)
+            c_lo, c_hi = int64_operand(src2, scalar, vector, pending, sample_dest, signed=False,
+                                       encoding="e64", position=2)
+            helpers.add("scalar_mul_hi")
+            high = "mul_hi_i32" if signed else "mul_hi_u32"
+            for word, value in (("a", a), ("b", b), ("cl", c_lo), ("ch", c_hi)):
+                lines.append(f"    uint m{i}{word} = {value};")
+            lines.append(f"    uint m{i}pl = m{i}a * m{i}b;")
+            lines.append(f"    uint m{i}ph = {high}(m{i}a, m{i}b);")
+            lines.append(f"    uint m{i}lo = m{i}pl + m{i}cl;")
+            lines.append(f"    uint m{i}h1 = m{i}ph + m{i}ch;")
+            lines.append(f"    uint m{i}hi = m{i}h1 + (m{i}lo < m{i}pl ? 1u : 0u);")
+            if not signed:
+                lines.append(f"    bool cmp{i} = m{i}h1 < m{i}ph || m{i}hi < m{i}h1;")
+                for j, reg in enumerate(regs):
+                    scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
+            lines.append(f"    precise float alu{i}l = asfloat(m{i}lo);")
+            lines.append(f"    precise float alu{i}h = asfloat(m{i}hi);")
+            vector[names[0]], vector[names[1]] = f"alu{i}l", f"alu{i}h"
         elif m := match(rf"v_(add|sub|subrev)_co_ci_u32_(e32|e64) (v\d+), {LANE_MASK}, ([^,\s]+), ([^,\s]+), {LANE_MASK}"):
             # The carry-out add and subtracts above with a carry or borrow of each lane read from a lane mask.
             # LLVM 15 prints both encodings with their suffix. The VOP2 (e32) encoding reads and writes VCC and

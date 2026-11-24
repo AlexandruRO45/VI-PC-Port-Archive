@@ -19,7 +19,7 @@ void check_dynamic_sampler_index(ID3D12Device* device);
 float check_startup_sampler_heap(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                  std::uint32_t byte_offset, const char* manifest, const char* binding_case);
 void check_startup_image_3d(ID3D12Device* device, const char* vertex_path, const char* pixel_path, float z,
-                            float color[4]);
+                            float color[4], const char* sampler_line);
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t words[4]);
 void dump_raw_uav(ID3D12Device* device, const char* shader_path, const char* groups,
@@ -90,6 +90,7 @@ bool check_wave_shuffle(ID3D12Device* device);
 void check_wave64_emulate(ID3D12Device* device);
 bool check_shader_wave(ID3D12Device* device, unsigned forced);
 bool check_dxr_address_ranges(ID3D12Device* device);
+bool check_dxr_placed_build(ID3D12Device* device);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);
