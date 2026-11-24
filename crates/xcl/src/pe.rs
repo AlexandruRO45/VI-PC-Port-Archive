@@ -606,8 +606,12 @@ impl OwnedExports {
         let mut out = OwnedExports::default();
         if let Some(ex) = pe.exports()? {
             for (i, &rva) in ex.functions.iter().enumerate() {
+                let ordinal = match ex.ordinal_base.checked_add(i as u32) {
+                    Some(o) => o,
+                    None => continue,
+                };
                 if let Some(t) = pe.export_target(&ex, rva) {
-                    out.by_ordinal.insert(ex.ordinal_base + i as u32, t);
+                    out.by_ordinal.insert(ordinal, t);
                 }
             }
             for (name, idx) in &ex.names {
