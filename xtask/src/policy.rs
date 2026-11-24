@@ -2642,6 +2642,67 @@ mod tests {
         super::run(&linked, false).unwrap();
     }
 
+    /// A `core.excludesFile` in a linked worktree's own `config.worktree`
+    /// holds there only once `extensions.worktreeConfig` is set: before,
+    /// git skips that file, `own` stays visible in the worktree and is
+    /// refused, left empty, and `shared` (ignored by `info/exclude`) is
+    /// taken. Once set, `own` is taken in the linked worktree, while the
+    /// main checkout, which never reads that file, still refuses its `own`.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_a_worktrees_own_config() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let main = repo.path().join("main");
+        let linked = repo.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        git_str(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.rs"), b"fn a() {}\n").unwrap();
+        git_str(&main, &["add", "--", "a.rs"]);
+        git_str(&main, &["commit", "-q", "-m", "a"]);
+        git_str(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        std::fs::create_dir_all(main.join(".git/info")).unwrap();
+        std::fs::write(main.join(".git/info/exclude"), "/shared/\n").unwrap();
+        let rules = outside.path().join("own.rules");
+        std::fs::write(&rules, "/own/\n").unwrap();
+        let worktree_config = main.join(".git/worktrees/linked/config.worktree");
+        std::fs::write(
+            &worktree_config,
+            format!("[core]\n\texcludesFile = {}\n", rules.to_str().unwrap()),
+        )
+        .unwrap();
+        for top in [&main, &linked] {
+            std::fs::create_dir(top.join("own")).unwrap();
+            std::fs::create_dir(top.join("shared")).unwrap();
+        }
+        let taken = |top: &std::path::Path, first: &[&str], last: &str| {
+            let candidates = first.iter().chain([&last]).map(|name| top.join(name));
+            let tmp = tempdir_in_first(top, candidates);
+            assert_eq!(tmp.path().parent(), Some(top.join(last).as_path()));
+            for name in first {
+                assert_eq!(std::fs::read_dir(top.join(name)).unwrap().count(), 0);
+            }
+            tmp
+        };
+
+        // Without the extension, `config.worktree` is not read.
+        drop(taken(&linked, &["own"], "shared"));
+        std::fs::write(linked.join("own/b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(&linked, false), ["a.rs", "own/b.rs"]);
+        std::fs::remove_file(linked.join("own/b.rs")).unwrap();
+
+        git_str(&main, &["config", "extensions.worktreeConfig", "true"]);
+        let tmp = taken(&linked, &[], "own");
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(&linked, false), ["a.rs"]);
+        super::run(&linked, false).unwrap();
+
+        // The main checkout has no `config.worktree` of its own.
+        drop(taken(&main, &["own"], "shared"));
+        std::fs::write(main.join("own/c.rs"), b"fn c() {}\n").unwrap();
+        assert_eq!(names(&main, false), ["a.rs", "own/c.rs"]);
+    }
+
     /// Ignore sources are opened as git opens them: a UTF-8 byte order mark
     /// at the start of `.gitignore` is dropped, so its first rule ignores
     /// `bom`, which is taken, while the same mark before a later rule is
