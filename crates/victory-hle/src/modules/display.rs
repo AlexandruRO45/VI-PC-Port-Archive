@@ -121,7 +121,7 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
 /// Sentinel handle handed out when the host OS rejects `PowerSetRequest`
 /// with `ERROR_NOT_SUPPORTED` (RDP, headless runners, restricted power plans).
 #[cfg(windows)]
-const NOOP_DEFERRAL: *mut c_void = 1usize as *mut c_void;
+const NOOP_DEFERRAL: *mut c_void = std::ptr::dangling_mut();
 
 /// A deferral keeps the host display on, as on the console, through a
 /// power request; the handle is that request.

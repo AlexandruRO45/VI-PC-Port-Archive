@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
 
 jobs:
   check:
@@ -25,9 +25,36 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee /tmp/clippy.log
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            grep -E "^(error|warning|  --> )" /tmp/clippy.log | head -n 10 | while IFS= read -r line; do echo "::error::$line"; done
+            exit $rc
+          fi
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings 2>&1 | tee /tmp/clippy_diag.log
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            grep -E "^(error|warning|  --> )" /tmp/clippy_diag.log | head -n 10 | while IFS= read -r line; do echo "::error::$line"; done
+            exit $rc
+          fi
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee /tmp/test.log
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            awk '/^failures:/{flag=1} flag && NF{print "::error::" $0}' /tmp/test.log | head -n 10
+            exit $rc
+          fi
