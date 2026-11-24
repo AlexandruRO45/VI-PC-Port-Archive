@@ -1095,6 +1095,104 @@ mod tests {
         assert_eq!(r.scalar, [((0, 4), at(1, 0x20))]);
     }
 
+    /// A spill may carry a constant as well as an SGPR: the high half of a
+    /// table's address restored from lane 4, which was written an inline
+    /// zero, is the zero a table needs.
+    #[test]
+    fn a_spilled_constant_is_restored_as_that_constant() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD761_0000,
+                0x0001_0880, // v_writelane_b32 v0, 0, 4
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xD760_0003,
+                0x0001_0900, // v_readlane_b32 s3, v0, 4
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 4), at(0, 0x20))]);
+    }
+
+    /// The read's lane select wraps as the write's does: in a wave32 a read
+    /// of lane 35 is a read of lane 3, so it restores the SGPR spilled there.
+    #[test]
+    fn a_read_lane_past_the_wave_wraps_as_the_hardware_does() {
+        let r = track_words(
+            &[
+                0xD761_0000,
+                0x0001_0609, // v_writelane_b32 v0, s9, 3
+                0xD760_0002,
+                0x0001_4700, // v_readlane_b32 s2, v0, 35 (lane 3)
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    /// A read of a lane no spill wrote reaches the VGPR's incoming value,
+    /// which is no spilled SGPR: the address is refused, not taken for the
+    /// SGPR spilled to the lane beside it.
+    #[test]
+    fn a_read_of_a_lane_no_spill_wrote_is_not_traced() {
+        let err = track_err(
+            &[
+                0xD761_0000,
+                0x0001_0809, // v_writelane_b32 v0, s9, 4
+                0xD760_0002,
+                0x0001_0700, // v_readlane_b32 s2, v0, 3
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        assert_eq!(err, unsupported(20, "an address not from a root parameter"));
+    }
+
+    /// A root descriptor's high dword may have its bits set by
+    /// `s_bitset1_b32` rather than `s_or_b32`; the bit index keeps its low
+    /// 5 bits, so bit 52 is bit 20.
+    #[test]
+    fn root_descriptor_bits_set_one_at_a_time() {
+        let r = track_words(
+            &[
+                0xBE8B_1DB4, // s_bitset1_b32 s11, 52 (bit 20)
+                0xBE81_030B, // s_mov_b32 s1, s11
+                0xBE80_030A, // s_mov_b32 s0, s10
+                0xBE82_03C1, // s_mov_b32 s2, -1
+                0xBE83_03FF,
+                0x1101_4FAC, // s_mov_b32 s3, 0x11014fac
+                0xF430_0000,
+                0xFA00_0000, // s_buffer_load_dwordx16 s[0:15], s[0:3], null
+                S_ENDPGM,
+            ],
+            &[param(Descriptor, 10, 2)],
+            HwStage::Vs,
+        );
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC]
+            }
+        );
+    }
+
     #[test]
     fn descriptors_joined_by_control_flow_are_traced_per_edge() {
         let r = track_words(
