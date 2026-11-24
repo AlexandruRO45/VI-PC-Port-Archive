@@ -122,8 +122,14 @@ fn uav_barrier(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
     }
 }
 
+/// Upper bound on geometries accepted in a single BLAS build/prebuild query.
+/// Rejects corrupt `NumDescs` values before allocating host staging buffers.
+const MAX_GEOMETRY_DESCS: usize = 1 << 20;
+
 /// Reads the `NumDescs` geometry descriptions from `inputs` (supporting both
-/// contiguous arrays and arrays of pointers).
+/// contiguous arrays and arrays of pointers), validating `NumDescs`, address
+/// overflow, and committed/readable backing memory via `ReadProcessMemory`
+/// before allocating or dereferencing caller pointers.
 fn read_geometries(
     inputs: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
 ) -> Option<Vec<D3D12_RAYTRACING_GEOMETRY_DESC>> {
@@ -131,31 +137,64 @@ fn read_geometries(
     if count == 0 {
         return Some(Vec::new());
     }
+    if count > MAX_GEOMETRY_DESCS {
+        return None;
+    }
+    const GEOM_BYTES: usize = size_of::<D3D12_RAYTRACING_GEOMETRY_DESC>();
     match inputs.DescsLayout {
         D3D12_ELEMENTS_LAYOUT_ARRAY => {
             // SAFETY: union member selected by `DescsLayout == ARRAY`.
             let ptr = unsafe { inputs.Anonymous.pGeometryDescs };
-            if ptr.is_null() {
+            let addr = ptr as usize;
+            let bytes = count.checked_mul(GEOM_BYTES)?;
+            if ptr.is_null()
+                || addr.checked_add(bytes).is_none()
+                || !crate::texture::committed(ptr.cast::<u8>(), bytes)
+            {
                 return None;
             }
-            // SAFETY: caller passes `NumDescs` geometry descriptions.
-            Some(unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec())
+            let mut out = vec![D3D12_RAYTRACING_GEOMETRY_DESC::default(); count];
+            // SAFETY: `out` is a contiguous writable buffer of `bytes` bytes.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), bytes) };
+            crate::host::read_into(ptr.cast::<u8>(), dst).then_some(out)
         }
         D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS => {
             // SAFETY: union member selected by `DescsLayout == ARRAY_OF_POINTERS`.
             let ptrs = unsafe { inputs.Anonymous.ppGeometryDescs };
-            if ptrs.is_null() {
+            let ptrs_addr = ptrs as usize;
+            let ptr_bytes = count.checked_mul(size_of::<usize>())?;
+            if ptrs.is_null()
+                || ptrs_addr.checked_add(ptr_bytes).is_none()
+                || !crate::texture::committed(ptrs.cast::<u8>(), ptr_bytes)
+            {
                 return None;
             }
-            // SAFETY: caller passes `NumDescs` pointers to geometry descriptions.
-            let slice = unsafe { std::slice::from_raw_parts(ptrs, count) };
+            let mut raw_ptrs = vec![0usize; count];
+            // SAFETY: `raw_ptrs` is a contiguous writable buffer of `ptr_bytes` bytes.
+            let ptr_dst = unsafe {
+                std::slice::from_raw_parts_mut(raw_ptrs.as_mut_ptr().cast::<u8>(), ptr_bytes)
+            };
+            if !crate::host::read_into(ptrs.cast::<u8>(), ptr_dst) {
+                return None;
+            }
             let mut out = Vec::with_capacity(count);
-            for &p in slice {
-                if p.is_null() {
+            for p in raw_ptrs {
+                if p == 0 || p.checked_add(GEOM_BYTES).is_none() {
                     return None;
                 }
-                // SAFETY: checked non-null geometry descriptor pointer.
-                out.push(unsafe { p.read() });
+                let mut desc = D3D12_RAYTRACING_GEOMETRY_DESC::default();
+                // SAFETY: `desc` is a writable `GEOM_BYTES`-byte local buffer.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        std::ptr::from_mut(&mut desc).cast::<u8>(),
+                        GEOM_BYTES,
+                    )
+                };
+                if !crate::host::read_into(p as *const u8, dst) {
+                    return None;
+                }
+                out.push(desc);
             }
             Some(out)
         }
@@ -740,5 +779,170 @@ mod tests {
         crate::watch::title_memory_remapped(base as usize, 256 << 10);
         assert!(host_acceleration_structure_va(clone_title_va).is_none());
         assert!(host_acceleration_structure_va(tlas_title_va).is_none());
+    }
+
+    #[test]
+    fn read_geometries_rejects_null_oversized_and_uncommitted_inputs() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+
+        struct Guard(*mut std::ffi::c_void);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: `self.0` was returned by `VirtualAlloc(..., MEM_RESERVE, ...)`.
+                    unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+                }
+            }
+        }
+
+        let make_inputs =
+            |layout, count, anon| D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE,
+                NumDescs: count,
+                DescsLayout: layout,
+                Anonymous: anon,
+            };
+
+        let geom = triangle_geometry(0x1000, 0x2000);
+        let geom_ptr = &raw const geom;
+
+        // Oversized counts must fail before allocating or reading memory.
+        for bad_count in [MAX_GEOMETRY_DESCS as u32 + 1, u32::MAX] {
+            assert!(
+                read_geometries(&make_inputs(
+                    D3D12_ELEMENTS_LAYOUT_ARRAY,
+                    bad_count,
+                    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        pGeometryDescs: &geom,
+                    },
+                ))
+                .is_none()
+            );
+            assert!(
+                read_geometries(&make_inputs(
+                    D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+                    bad_count,
+                    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                        ppGeometryDescs: &geom_ptr,
+                    },
+                ))
+                .is_none()
+            );
+        }
+
+        // Null pointers with non-zero count must fail.
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY,
+                1,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: std::ptr::null(),
+                },
+            ))
+            .is_none()
+        );
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+                1,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    ppGeometryDescs: std::ptr::null(),
+                },
+            ))
+            .is_none()
+        );
+
+        // Reserve 2 pages (8 KiB) uncommitted, commit only the first 4 KiB page.
+        // SAFETY: reserving an anonymous 8 KiB address range.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 8192, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        let _guard = Guard(base);
+        // SAFETY: committing the first 4 KiB page inside our reservation.
+        let committed = unsafe { VirtualAlloc(base, 4096, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(committed, base);
+        let uncommitted = (base as usize + 4096) as *const D3D12_RAYTRACING_GEOMETRY_DESC;
+
+        // Uncommitted ARRAY and ARRAY_OF_POINTERS bases must fail.
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY,
+                1,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: uncommitted,
+                },
+            ))
+            .is_none()
+        );
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+                1,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    ppGeometryDescs: uncommitted.cast(),
+                },
+            ))
+            .is_none()
+        );
+
+        // Committed ARRAY straddling into the uncommitted second page must fail.
+        let straddle_count = (4096 / size_of::<D3D12_RAYTRACING_GEOMETRY_DESC>() + 2) as u32;
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY,
+                straddle_count,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    pGeometryDescs: base.cast(),
+                },
+            ))
+            .is_none()
+        );
+
+        // Committed pointer array holding a null or uncommitted element must fail.
+        let null_elem: [*const D3D12_RAYTRACING_GEOMETRY_DESC; 2] = [&geom, std::ptr::null()];
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+                2,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    ppGeometryDescs: null_elem.as_ptr(),
+                },
+            ))
+            .is_none()
+        );
+        let bad_elem: [*const D3D12_RAYTRACING_GEOMETRY_DESC; 2] = [&geom, uncommitted];
+        assert!(
+            read_geometries(&make_inputs(
+                D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+                2,
+                D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    ppGeometryDescs: bad_elem.as_ptr(),
+                },
+            ))
+            .is_none()
+        );
+
+        // Valid ARRAY and ARRAY_OF_POINTERS inputs still decode cleanly.
+        let valid_arr = read_geometries(&make_inputs(
+            D3D12_ELEMENTS_LAYOUT_ARRAY,
+            1,
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                pGeometryDescs: &geom,
+            },
+        ))
+        .expect("valid ARRAY");
+        assert_eq!(valid_arr.len(), 1);
+        let valid_ptrs = read_geometries(&make_inputs(
+            D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS,
+            1,
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                ppGeometryDescs: &geom_ptr,
+            },
+        ))
+        .expect("valid ARRAY_OF_POINTERS");
+        assert_eq!(valid_ptrs.len(), 1);
     }
 }
