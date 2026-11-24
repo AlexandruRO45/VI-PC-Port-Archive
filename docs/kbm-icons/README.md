@@ -47,6 +47,29 @@ These are the keys XCL presses each pad button with (`crates/xcl/src/hle/kbm.rs`
 Q, E and WASD are read by key position, so on AZERTY they are A, E and Z Q S D. One library per layout
 would be needed for those.
 
+## Evidence: the Xbox build has no keyboard/mouse icons
+
+Checked so far with `python scripts/kbm_icons/survey.py D:\Game\data.rpf D:\Game\packs.rpf`, which reads only
+and finds entries by content:
+
+| Archive | Scaleform movies | Icon libraries | Symbols | Platform prefixes |
+|---|---|---|---|---|
+| `data.rpf` (481 MB) | 87 | 1: `input_icons` (28,148 bytes) | 38, `Main_Button_4…39, 58, 59`, all Xbox pad buttons | `platform_xbsx` only |
+| `packs.rpf` (4.8 GB) | 0 | 0 | – | – |
+
+- The three movies that show prompts (`generic_movie`, `hud`, `map_scripted_movie`) all load that one library.
+- Every symbol is an Xbox control: A B X Y, the bumpers and triggers, Menu, View, the d-pad and the sticks.
+- The icon class `InputIconV2` has a list of device prefixes (`DEVICE_PREFIXES`). This build starts it with a
+  single empty entry, so there is one icon set and no second device.
+- No identifier names a keyboard icon. The "mouse" names are the UI framework's cursor functions, present in
+  every movie (`getMouseTopMostEntity`, `get/setMouseCursorType`), plus mouse-input functions in one movie.
+  "kbm" occurs only by chance inside binary shape data, and "_key_" is a car dashboard light (`light_key_on`).
+- In the game, with a keyboard reported to it through GameInput, the title reads the keyboard but keeps
+  showing Xbox icons.
+
+Not searched yet: the other archives (`anim`, `audio`, `levels`, `movies`, `navmeshes`, `common`, `script`,
+`shaders`, `textures`, about 130 GB).
+
 ## How it was made
 
 1. **Find the icon library.** The title has no keyboard or mouse icons of its own. Its only button icons are
@@ -119,6 +142,7 @@ sits 20 px away).
 | `scripts/kbm_icons/keycaps.py` | the icon designs; writes the master file and the Icon library preview |
 | `scripts/kbm_icons/build_library.py` | builds the library into a copy of `data.rpf` |
 | `scripts/kbm_icons/motion.py` | the Prompt motion preview, from the title's tables |
+| `scripts/kbm_icons/survey.py` | lists the UI movies and icon libraries in an archive (the evidence above) |
 
 The previews open in a browser. They load Barlow Condensed and Figtree from Google Fonts, which stand in
 for the title's own label face.
