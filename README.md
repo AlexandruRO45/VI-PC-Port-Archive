@@ -403,6 +403,7 @@ it is read; its README is the index for those.
 
 | Variable | Effect |
 |---|---|
+| `VICTORY_PASS_COST=1` | charges each submission's wall time to the pipelines its lists bound and logs the worst six once a second of accounted time, with each one's share of the accounted total. It also logs the wall clock between submissions and the percentage those passes account for — when that remainder is large it is the finding, not the ranking |
 | `VICTORY_LOG_FLUSH=1` | Flushes after every event, so a log cut short by a kill or a device loss ends at its real last event instead of at a buffer boundary — which is where the operations just before a removal used to disappear. Costs a write per line. No wrapper in this crew's run harness sets it, so set it yourself on any run whose log matters |
 | `VICTORY_LOG=<target>=<level>,…` | Log filter, e.g. `VICTORY_LOG=victory_loader=trace,info`; falls back to `RUST_LOG`. A release build cannot log below info whatever the filter asks |
 | `VICTORY_STACKS=<s>,<s>` | Every thread's unwound stack as `module+rva`, that many seconds after start, to see what a title waits on |

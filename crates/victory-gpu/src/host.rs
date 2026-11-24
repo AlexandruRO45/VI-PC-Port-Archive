@@ -1265,6 +1265,94 @@ pub(crate) fn no_args_refresh() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_NO_ARGS_REFRESH").is_some())
 }
 
+/// What a frame's time is spent on, by pipeline (`VICTORY_PASS_COST=1`).
+///
+/// Each submission's wall time is charged to the pipelines its lists bound, once
+/// per distinct set, and the worst six are logged **since the run started** with
+/// the share of the wall clock they account for: "1–3 fps" becomes "these passes
+/// are most of the frame", a number that names what to fix rather than a total
+/// that names nothing. It is a running average, not a per-second window.
+#[cfg(feature = "diagnostics")]
+fn pass_cost(runs: &[&HostList], gpu: std::time::Duration) {
+    use std::sync::Mutex;
+    static ON: OnceLock<bool> = OnceLock::new();
+    static COST: Mutex<Option<std::collections::HashMap<String, (u64, u64)>>> = Mutex::new(None);
+    // The wall clock between submissions, so the log can say how much of the
+    // frame is not in any submission at all: a ranked list that covers only
+    // submissions could sum to a tenth of the frame and look like the answer.
+    static SPAN: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PASS_COST").is_some()) {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut span = SPAN.lock().unwrap_or_else(|e| e.into_inner());
+    let frame_us = match span.as_mut() {
+        Some((last, total)) => {
+            *total += now.duration_since(*last).as_micros() as u64;
+            *last = now;
+            *total
+        }
+        None => {
+            *span = Some((now, 0));
+            0
+        }
+    };
+    drop(span);
+    let mut cost = COST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cost.get_or_insert_with(std::collections::HashMap::new);
+    // A submission is many lists, so its time is charged once per **distinct**
+    // pipeline set and split between them: charging every list would enter one
+    // submission's time once per list, and the ranking would then measure how
+    // many lists a set appears in rather than what it cost.
+    let mut sets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for list in runs {
+        let names = list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !names.is_empty() {
+            sets.insert(names.into_iter().collect::<Vec<String>>().join(", "));
+        }
+    }
+    if !sets.is_empty() {
+        let each = gpu.as_micros() as u64 / sets.len() as u64;
+        for key in sets {
+            let entry = map.entry(key).or_insert((0, 0));
+            entry.0 += each;
+            entry.1 += 1;
+        }
+    }
+    let mut worst: Vec<(&String, &(u64, u64))> = map.iter().collect();
+    worst.sort_by_key(|(_, (us, _))| std::cmp::Reverse(*us));
+    // Logged once a second of accounted time, which is often enough to watch
+    // and rare enough to read.
+    let total: u64 = worst.iter().map(|(_, (us, _))| us).sum();
+    if total < 1_000_000 {
+        return;
+    }
+    let accounted = if frame_us == 0 {
+        100.0 * total as f64 / (total as f64 + 1.0)
+    } else {
+        100.0 * total as f64 / frame_us as f64
+    };
+    tracing::warn!(
+        frame_ms = frame_us / 1000,
+        accounted = format!("{accounted:.0}%"),
+        passes = worst.len(),
+        "pass cost since start: what these passes do not account for is the pipeline queue, copies and waits"
+    );
+    for (name, (us, count)) in worst.iter().take(6) {
+        tracing::warn!(
+            ms = *us / 1000,
+            share = format!("{:.0}%", 100.0 * *us as f64 / total as f64),
+            submissions = count,
+            pipelines = %name,
+            "pass cost"
+        );
+    }
+    map.clear();
+    if let Some((_, counted)) = SPAN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        *counted = 0;
+    }
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -4134,6 +4222,8 @@ impl Host {
             let text = format!("{} lists, pipelines {pipelines:?}", runs.len());
             text.chars().take(1200).collect()
         });
+        #[cfg(feature = "diagnostics")]
+        pass_cost(runs, gpu);
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
