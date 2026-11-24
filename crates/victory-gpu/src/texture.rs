@@ -48,13 +48,18 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
+}
+
+thread_local! {
+    /// Room to read a watched texture's memory into. Kept per thread, not
+    /// per texture: a texture needs it only while it is detiled, and every
+    /// texture ever sampled stays in [`STAGING`].
+    static READ: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -191,12 +196,22 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
-            last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut read = READ.take();
+            read.clear();
+            if read.try_reserve_exact(size).is_err() {
+                // The texture stays as it was (and still asks to be
+                // detiled): a failed allocation must not end the process.
+                once!(size, "no room to read a texture's memory; not uploaded");
+                READ.set(read);
+                return 0;
+            }
+            last.asked = now;
+            read.resize(size, 0);
+            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read);
+            READ.set(read);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
