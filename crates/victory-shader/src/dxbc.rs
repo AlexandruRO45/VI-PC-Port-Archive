@@ -656,4 +656,37 @@ mod tests {
         assert_eq!(c.parts[1].offset % 4, 3);
         assert_eq!(c.part(FourCC::HASH).unwrap().data, &[4; 5]);
     }
+
+    #[test]
+    fn a_later_part_reaching_up_into_an_earlier_one_overlaps() {
+        // The table lists the higher part first, so the second entry starts
+        // below the first and only its end can reach it.
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[(own, &[0; 16]), (own, &[0; 4])]);
+        let low = HEADER_SIZE + 8;
+        let high = low + 8 + 16;
+        let mut swapped = bytes.clone();
+        swapped[0x20..0x24].copy_from_slice(&(high as u32).to_le_bytes());
+        swapped[0x24..0x28].copy_from_slice(&(low as u32).to_le_bytes());
+        // Ending exactly where the higher part's header starts is adjacent.
+        let c = Container::parse(&swapped).unwrap();
+        assert_eq!((c.parts[0].offset, c.parts[1].offset), (high, low));
+        // One byte into the higher header, or over all of it and its data
+        // to the container end, is an overlap.
+        for size in [17u32, 16 + 12] {
+            let mut bad = swapped.clone();
+            bad[low + 4..low + 8].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(malformed(&bad), "two parts overlap", "size {size}");
+        }
+        // The enclosing size alone is in bounds: listed first, the enclosed
+        // part is refused against it, and with the table cut to that one
+        // entry it parses, the other header now just bytes of its data.
+        let mut first = bytes.clone();
+        first[low + 4..low + 8].copy_from_slice(&28u32.to_le_bytes());
+        assert_eq!(malformed(&first), "two parts overlap");
+        first[0x1C..0x20].copy_from_slice(&1u32.to_le_bytes());
+        let c = Container::parse(&first).unwrap();
+        assert_eq!(c.parts.len(), 1);
+        assert_eq!(&c.parts[0].data[16..20], b"PRIV");
+    }
 }
