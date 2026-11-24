@@ -14,6 +14,10 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+// D3D12 from the Agility SDK beside the executable (`cargo xtask agility`):
+// Windows 10's own runtime stops at shader model 6.5. See build.rs.
+victory_shader::agility_exports!();
+
 #[derive(Parser)]
 #[command(
     name = "victory",

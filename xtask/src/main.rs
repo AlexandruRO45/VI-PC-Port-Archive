@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod agility;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,17 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Fetch the D3D12 Agility SDK runtime into the cache folder and put it
+    /// in `D3D12\` beside the build outputs (needed on Windows 10, whose own
+    /// D3D12 stops at shader model 6.5). Run again after `cargo clean`.
+    Agility,
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Agility => agility::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

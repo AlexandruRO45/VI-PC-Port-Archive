@@ -495,6 +495,40 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Logs which D3D12 runtime the process took (the Agility SDK's beside the
+/// executable, or the system's) and the shader model it reports, and warns
+/// when that is below 6.6, the model of every translated shader: then the
+/// pipelines are refused, which on Windows 10 means the SDK is missing.
+fn log_runtime(device: &ID3D12Device) {
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: the query writes the structure of the given size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+            .is_ok()
+    };
+    let runtime = victory_shader::agility::loaded_runtime();
+    tracing::info!(
+        runtime = %runtime.as_deref().map_or("?".into(), |p| p.display().to_string()),
+        agility_sdk = victory_shader::agility::sdk_runtime_loaded(),
+        shader_model = format_args!("{:#x}", model.HighestShaderModel.0),
+        "host D3D12 runtime"
+    );
+    if !ok || model.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+        tracing::warn!(
+            "the host D3D12 runtime is below shader model 6.6, so translated pipelines \
+             will be refused; on Windows 10 run `cargo xtask agility` to put the Agility \
+             SDK's runtime beside the executable"
+        );
+    }
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
@@ -548,6 +582,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        log_runtime(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.

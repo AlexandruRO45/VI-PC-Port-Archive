@@ -56,6 +56,11 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+// The unit-test harness creates host devices: it loads the Agility SDK's
+// D3D12 runtime as the `victory` binary does (see build.rs).
+#[cfg(all(windows, test))]
+victory_shader::agility_exports!();
+
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

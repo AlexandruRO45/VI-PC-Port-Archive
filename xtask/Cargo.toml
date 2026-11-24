@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Repository maintenance: asset-policy enforcement and git hooks."
+description = "Repository maintenance: asset-policy enforcement, git hooks, the D3D12 Agility SDK."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,10 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
 clap.workspace = true
+victory-core.workspace = true
+victory-shader.workspace = true
 walkdir.workspace = true
 
 [lints]

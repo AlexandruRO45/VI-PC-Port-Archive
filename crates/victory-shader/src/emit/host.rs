@@ -115,8 +115,11 @@ impl Host {
                 .map_err(err)?;
             if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
                 return Err(format!(
-                    "the device supports SM {:#x} only",
-                    sm.HighestShaderModel.0
+                    "the device supports SM {:#x} only (runtime {}; on Windows 10 run \
+                     `cargo xtask agility` for the Agility SDK's runtime)",
+                    sm.HighestShaderModel.0,
+                    crate::agility::loaded_runtime()
+                        .map_or("?".into(), |p| p.display().to_string()),
                 ));
             }
             Ok(Host { device })
