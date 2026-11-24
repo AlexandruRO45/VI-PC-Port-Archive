@@ -1006,25 +1006,29 @@ impl State {
             return false;
         }
         // Rectangles: the draws of their expanded vertices, from records of
-        // our own (the title's go back to unordered access at once).
+        // our own; the title's stay as they are (and hold the count, if the
+        // title keeps it beside them).
         let rects = kind == DRAW && self.topology == RECTANGLES;
-        let mut read = (args.buffer.clone(), args.offset(arguments), signature);
+        let (mut from, mut at, mut signature) =
+            (args.buffer.clone(), args.offset(arguments), signature);
         let mut expanded = 0;
         if rects {
-            crate::indirect::done(list, &args.buffer);
-            let made = self.rectangle_vertices().and_then(|vertices| {
-                expanded = vertices;
-                let records = (stride, max, vertices);
-                let (buffer, at) = crate::indirect::rectangles(list, args.gpu(arguments), records)?;
-                Some((buffer, at, host_signature(DRAW, 16)?))
-            });
-            match made {
-                Some(made) => read = made,
-                None => {
-                    why("rectangles not expanded");
-                    return false;
-                }
-            }
+            let made = self
+                .rectangle_vertices()
+                .zip(host_signature(DRAW, 16))
+                .and_then(|(vertices, triangles)| {
+                    let records = (stride, max, vertices);
+                    let gpu = args.gpu(arguments);
+                    let (buffer, offset) =
+                        crate::indirect::rectangles(list, &args.buffer, gpu, records)?;
+                    Some((buffer, offset, triangles, vertices))
+                });
+            let Some(made) = made else {
+                crate::indirect::done(list, &args.buffer);
+                why("rectangles not expanded");
+                return false;
+            };
+            (from, at, signature, expanded) = made;
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
@@ -1042,7 +1046,10 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &read.0);
+            crate::indirect::done(list, &from);
+            if rects {
+                crate::indirect::done(list, &args.buffer);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1058,15 +1065,18 @@ impl State {
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &read.2,
+                &signature,
                 max,
-                &read.0,
-                read.1,
+                &from,
+                at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &read.0);
+        crate::indirect::done(list, &from);
+        if rects {
+            crate::indirect::done(list, &args.buffer);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

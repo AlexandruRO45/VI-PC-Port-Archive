@@ -74,6 +74,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// the first vertex of the bound buffers on) into records of our own, so
 /// the title's records stay as they are. A record must start on a
 /// rectangle and stay within the `vertices` expanded; others draw nothing.
+/// The clamp's bound of 2^24 vertices holds for the triangles too.
+/// shortcut: the budget is charged the title's count, half the vertices
+/// the triangles run.
 const RECTANGLES: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) { uint stride; uint records; uint vertices; uint unused; };
@@ -85,7 +88,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
     // Vertex count, instances, first vertex, first instance.
     uint4 a = args.Load4(id.x * stride);
-    uint rects = a.x / 3;
+    uint rects = min(a.x / 3, (1u << 24) / 6);
     bool whole = a.z % 3 == 0 && a.z <= vertices && rects * 3 <= vertices - a.z;
     triangles.Store4(id.x * 16, whole ? uint4(rects * 6, a.y, a.z / 3 * 6, a.w) : uint4(0, 0, 0, 0));
 }
@@ -105,7 +108,7 @@ unsafe impl Sync for Pass {}
 
 fn rectangle_pass() -> Option<&'static Pass> {
     static PASS: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
-    PASS.get_or_init(|| match make(RECTANGLES) {
+    PASS.get_or_init(|| match make(RECTANGLES, "rectangle pass") {
         Ok(c) => Some(c),
         Err(e) => {
             tracing::warn!(error = %e, "no rectangle pass: indirect rectangles dropped");
@@ -118,7 +121,7 @@ fn rectangle_pass() -> Option<&'static Pass> {
 fn clamp() -> Option<&'static Pass> {
     static CLAMP: std::sync::OnceLock<Option<Pass>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make(SOURCE) {
+        .get_or_init(|| match make(SOURCE, "argument clamp") {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -128,7 +131,7 @@ fn clamp() -> Option<&'static Pass> {
         .as_ref()
 }
 
-fn make(source: &str) -> windows::core::Result<Pass> {
+fn make(source: &str, what: &str) -> windows::core::Result<Pass> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
@@ -154,7 +157,7 @@ fn make(source: &str) -> windows::core::Result<Pass> {
             let text = unsafe {
                 std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize())
             };
-            tracing::warn!("our compute pass: {}", String::from_utf8_lossy(text));
+            tracing::warn!("{what}: {}", String::from_utf8_lossy(text));
         }
         return Err(e);
     }
@@ -218,14 +221,18 @@ pub(crate) fn bound(
 }
 
 /// Records, in `list`, the rewrite of `records` rectangle-list draw records
-/// `stride` bytes apart at host address `gpu` (in unordered access, as
-/// [`done`] leaves them) into triangle-list records over the first
+/// `stride` bytes apart at host address `gpu` in `buffer` (bounded: read as
+/// arguments, and left so) into triangle-list records over the first
 /// `vertices` vertices expanded (see [`RECTANGLES`]): 16-byte records in
-/// the list's argument memory, left ready to be read as arguments ([`done`]
-/// after the execution). Replaces the list's compute root signature and
-/// pipeline. None if the pass or the memory is not available.
+/// the list's argument memory, ready to be read as arguments ([`done`] for
+/// both buffers after the execution). Replaces the list's compute root
+/// signature and pipeline. None, with nothing recorded, if the pass or the
+/// memory is not available.
+/// shortcut: at most 4,096 records (the list's argument memory comes in
+/// 64 KiB pieces); more are dropped.
 pub(crate) fn rectangles(
     list: &HostList,
+    buffer: &ID3D12Resource,
     gpu: u64,
     (stride, records, vertices): (u32, u32, u32),
 ) -> Option<(ID3D12Resource, u64)> {
@@ -234,13 +241,15 @@ pub(crate) fn rectangles(
         return None;
     }
     let (out, offset) = list.argument_space(u64::from(records) * 16)?;
+    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    const WRITE: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let l = &list.list;
     let constants = [stride, records, vertices, 0];
     // SAFETY: an open list; our root signature, pipeline, the caller's live
     // buffer and the list's own argument memory.
     unsafe {
         let to = out.GetGPUVirtualAddress() + offset;
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.ResourceBarrier(&[transition(buffer, READ, WRITE)]);
         l.SetComputeRootSignature(&p.root);
         l.SetPipelineState(&p.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
@@ -249,11 +258,8 @@ pub(crate) fn rectangles(
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[
             uav_barrier(),
-            transition(
-                &out,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            ),
+            transition(buffer, WRITE, READ),
+            transition(&out, WRITE, READ),
         ]);
     }
     Some((out, offset))
@@ -315,7 +321,10 @@ mod tests {
         let list = host.new_list().unwrap();
         // SAFETY: a live buffer.
         let gpu = unsafe { input.GetGPUVirtualAddress() };
-        let (out, offset) = super::rectangles(&list, gpu, (20, 4, 9)).unwrap();
+        assert!(super::bound(&list, &input, gpu, (0, 20, 4)));
+        let (out, offset) = super::rectangles(&list, &input, gpu, (20, 4, 9)).unwrap();
+        super::done(&list, &out);
+        super::done(&list, &input);
         list.close();
         host.execute(&[&list]);
         let read = |buffer: &super::ID3D12Resource, at: u64| {
