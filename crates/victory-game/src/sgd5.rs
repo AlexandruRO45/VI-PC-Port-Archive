@@ -2147,4 +2147,67 @@ mod tests {
         assert_eq!(found[0].unpack(), Some(container));
         assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
     }
+
+    #[test]
+    fn stream_broken_after_a_valid_block_is_noise() {
+        // Packed bytes that start a valid stored block and then break (a
+        // stored block whose NLEN is not LEN's complement, or a block of
+        // the reserved type 3) are no deflate stream: alone, such a record
+        // covers no other, so it is yielded and does not unpack; laid over
+        // a real record stored in its first block, the real one wins. The
+        // record after it is found either way.
+        fn stored(data: &[u8]) -> Vec<u8> {
+            let len = data.len() as u16;
+            let mut out = vec![0]; // BFINAL 0, stored
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(data);
+            out
+        }
+        let bad_nlen = [1, 4, 0, 4, 0, b'x', b'y', b'z', b'w'];
+        let reserved = [0b111, 0, 0, 0];
+        let inner = record_bytes("PS_inner", 0x41, b"stored inside");
+        for (what, tail) in [
+            ("bad NLEN", &bad_nlen[..]),
+            ("reserved type", &reserved[..]),
+        ] {
+            for (covering, first) in [(false, &b"DXBC head"[..]), (true, &inner[..])] {
+                let mut packed = stored(first);
+                packed.extend_from_slice(tail);
+                let stated = first.len() + 4;
+                assert!(!starts_stream(&packed, stated), "{what}");
+                assert!(
+                    starts_stream(&packed[..1 + 4 + first.len()], stated),
+                    "{what}"
+                );
+
+                let n = (packed.len() + 12) as u32;
+                let mut file = MAGIC.to_vec();
+                file.extend_from_slice(b"\x0aPS_broken\0\x32");
+                let marker = file.len() + 4;
+                for v in [n, 0x000D_DCE7, n, stated as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&packed);
+                let after = file.len();
+                file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                if covering {
+                    assert_eq!(names, [Some("PS_inner"), Some("PS_after")], "{what}");
+                    let at = marker + 12 + 5 + 4 + 15;
+                    assert_eq!(found[0].offset, at, "{what}");
+                    assert_eq!(found[0].kind, 0x41, "{what}");
+                    assert_eq!(found[0].unpack().as_deref(), Some(&b"stored inside"[..]));
+                    assert!(!in_record(&found, marker), "{what}");
+                } else {
+                    assert_eq!(names, [Some("PS_broken"), Some("PS_after")], "{what}");
+                    assert_eq!(found[0].span(), marker..after, "{what}");
+                    assert_eq!(found[0].unpack(), None, "{what}");
+                }
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            }
+        }
+    }
 }
