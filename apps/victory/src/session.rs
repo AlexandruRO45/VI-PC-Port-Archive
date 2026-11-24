@@ -61,22 +61,23 @@ impl Drop for Session {
     }
 }
 
-/// The refusal a second session prints, naming who holds it. Pure, so the
-/// wording is testable without a second process.
+/// The refusal a second session prints, with the live sessions to act on: the
+/// object itself names no process. Pure, so the wording is testable without a
+/// second process.
 fn refusal(others: &[(u32, String)]) -> String {
     let who = if others.is_empty() {
-        "another victory holds it, and its pid is not visible to this user".to_owned()
+        String::new()
     } else {
         let list: Vec<String> = others
             .iter()
             .map(|(pid, name)| format!("{name} (pid {pid})"))
             .collect();
-        format!("{} holds it", list.join(", "))
+        format!(" Live title processes: {}.", list.join(", "))
     };
     format!(
-        "another title session is running: {who}. Two sessions share one GPU, one save folder and \
-         one shader cache, so this one stops here without touching the GPU. Wait for it to end, or \
-         end it and try again."
+        "another title session is running, so this one stops here without touching the GPU: two \
+         sessions share one GPU, one save folder and one shader cache. Wait for it to end, or end \
+         it and try again.{who}"
     )
 }
 
@@ -174,7 +175,9 @@ mod imp {
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            if entry.th32ProcessID != me && name.to_ascii_lowercase().contains("victory") {
+            // Our own image only: a session may start renamed children (the
+            // shader workers) that are not sessions themselves.
+            if entry.th32ProcessID != me && name.eq_ignore_ascii_case("victory.exe") {
                 found.push((entry.th32ProcessID, name));
             }
             // SAFETY: as above.
@@ -200,13 +203,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_refusal_names_who_holds_the_session() {
+    fn the_refusal_names_the_live_sessions() {
         let text = refusal(&[(4312, "victory.exe".to_owned())]);
         assert!(text.contains("victory.exe (pid 4312)"), "{text}");
         assert!(text.contains("without touching the GPU"), "{text}");
         // Without a visible holder it still says the session is taken.
         let text = refusal(&[]);
         assert!(text.contains("another title session is running"), "{text}");
+        assert!(!text.contains("Live title processes"), "{text}");
     }
 
     #[test]
