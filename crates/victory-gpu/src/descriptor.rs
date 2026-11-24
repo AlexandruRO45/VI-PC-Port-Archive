@@ -316,7 +316,7 @@ struct ViewEntry {
     generation: u32,
     /// Read when the title creates the view and still owns its resource.
     #[cfg(windows)]
-    image_words: [u32; 2],
+    image_words: [u32; 4],
 }
 
 /// Every distinct view in use; a descriptor holds a tag, an index into it
@@ -368,7 +368,7 @@ fn record(handle: u64, view: View) {
                 view: view.clone(),
                 generation,
                 #[cfg(windows)]
-                image_words: host::image_words(&view).unwrap_or([0; 2]),
+                image_words: host::descriptor_words(&view),
             };
             let i = match views.free.pop() {
                 Some(i) => {
