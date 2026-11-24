@@ -3361,6 +3361,39 @@ mod tests {
     }
 
     #[test]
+    fn joined_title_check_needs_a_title_on_both_sides() {
+        // A separator at the very start, at the end, before only spaces or
+        // before a relative name does not split off another absolute title.
+        for (p, on_windows) in [
+            (";/t/one", false),
+            (",~/t/one", false),
+            ("/t/one;", false),
+            ("/t/one,  ", false),
+            ("/t/one;two", false),
+            ("/t/one,./two", false),
+            (":C:\\t", true),
+            ("C:\\t\\one:", true),
+            ("C:\\t\\one,two", true),
+        ] {
+            assert!(ensure_one_title(Path::new(p), on_windows).is_ok(), "{p}");
+        }
+        // A bare drive after the separator is still another title.
+        assert!(ensure_one_title(Path::new("C:\\t\\one,D:"), true).is_err());
+        // Names that are not ASCII before the separator are walked by
+        // character, not byte, and the error quotes the whole entry.
+        let err = ensure_one_title(Path::new("/t/caf\u{e9};/t/\u{fc}ber"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/t/caf\u{e9};/t/\u{fc}ber"), "{err}");
+        assert!(err.contains("';'"), "{err}");
+        // Only the first wrong separator that starts a title is reported.
+        let err = ensure_one_title(Path::new("/t/a,b;/t/c"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("joined with ';'"), "{err}");
+    }
+
+    #[test]
     fn windows_network_paths_are_refused_off_windows() {
         for p in [
             "\\\\nas\\games\\gta",
