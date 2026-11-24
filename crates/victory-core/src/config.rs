@@ -74,20 +74,13 @@ impl Config {
         let explicit = std::env::var_os("VICTORY_CONFIG")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
-        let path = explicit
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("victory.toml"));
-        let file = if path.is_file() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            Some((path, text))
-        } else if let Some(p) = explicit {
-            anyhow::bail!(
-                "VICTORY_CONFIG points at {}, which does not exist",
-                p.display()
-            );
-        } else {
-            None
+        let file = match config_file(explicit)? {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                Some((path, text))
+            }
+            None => None,
         };
         let (source, parsed) = match file {
             Some((path, text)) => {
@@ -155,6 +148,35 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// The config file to read: `explicit` (`VICTORY_CONFIG`), which must be a
+/// file, else `./victory.toml` when that is a file.
+fn config_file(explicit: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = explicit else {
+        let default = PathBuf::from("victory.toml");
+        return Ok(default.is_file().then_some(default));
+    };
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+    if path.is_dir() {
+        // An easy slip: the folder holding victory.toml instead of the file.
+        let inside = path.join("victory.toml");
+        let hint = if inside.is_file() {
+            format!("; did you mean {}?", inside.display())
+        } else {
+            String::new()
+        };
+        anyhow::bail!(
+            "VICTORY_CONFIG points at {}, which is a folder, not a config file{hint}",
+            path.display()
+        );
+    }
+    anyhow::bail!(
+        "VICTORY_CONFIG points at {}, which does not exist",
+        path.display()
+    );
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -435,6 +457,29 @@ mod tests {
         };
         assert_eq!(home_dir(env), Some(PathBuf::from(abs("profile"))));
         assert_eq!(home_dir(|_: &str| None), None);
+    }
+
+    #[test]
+    fn victory_config_must_name_a_file() {
+        let dir = std::env::temp_dir().join(format!("victory-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("victory.toml");
+        let _ = std::fs::remove_file(&file);
+
+        let err = config_file(Some(dir.clone())).unwrap_err().to_string();
+        assert!(err.contains("is a folder"), "{err}");
+        assert!(!err.contains("did you mean"), "{err}");
+
+        std::fs::write(&file, "").unwrap();
+        let err = config_file(Some(dir.clone())).unwrap_err().to_string();
+        assert!(err.contains("did you mean"), "{err}");
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert_eq!(config_file(Some(file.clone())).unwrap(), Some(file.clone()));
+
+        let missing = dir.join("missing.toml");
+        let err = config_file(Some(missing)).unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

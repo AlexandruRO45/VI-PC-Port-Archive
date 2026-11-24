@@ -21,14 +21,15 @@ const CAP: LevelFilter = if cfg!(feature = "diagnostics") {
 };
 
 pub fn init(default_level: &str) {
-    let (filter, warning) = choose_filter(
-        std::env::var("VICTORY_LOG").ok(),
-        std::env::var("RUST_LOG").ok(),
-        default_level,
-    );
+    let (victory_log, bad_victory_log) = read_var("VICTORY_LOG", std::env::var("VICTORY_LOG"));
+    let (rust_log, bad_rust_log) = read_var("RUST_LOG", std::env::var("RUST_LOG"));
+    let (filter, warning) = choose_filter(victory_log, rust_log, default_level);
     let capped = capped_warning(&filter, CAP);
     // The subscriber is not installed yet, so these cannot go through it.
-    for warning in warning.into_iter().chain(capped) {
+    for warning in [bad_victory_log, bad_rust_log, warning, capped]
+        .into_iter()
+        .flatten()
+    {
         eprintln!("victory: {warning}");
     }
     let _ = tracing_subscriber::registry()
@@ -40,6 +41,23 @@ pub fn init(default_level: &str) {
                 .with_writer(std::io::stderr),
         )
         .try_init();
+}
+
+/// A log variable's value. One that is not valid UTF-8 cannot be a filter;
+/// it is treated as unset and the second value says so, instead of being
+/// dropped without a word.
+fn read_var(
+    name: &str,
+    value: Result<String, std::env::VarError>,
+) -> (Option<String>, Option<String>) {
+    match value {
+        Ok(v) => (Some(v), None),
+        Err(std::env::VarError::NotPresent) => (None, None),
+        Err(std::env::VarError::NotUnicode(v)) => (
+            None,
+            Some(format!("ignoring {name}={v:?}: it is not valid UTF-8")),
+        ),
+    }
 }
 
 /// The filter from `VICTORY_LOG`, else `RUST_LOG`, else `default_level`.
@@ -86,7 +104,7 @@ fn capped_warning(filter: &EnvFilter, cap: LevelFilter) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EnvFilter, LevelFilter, capped_warning, choose_filter};
+    use super::{EnvFilter, LevelFilter, capped_warning, choose_filter, read_var};
 
     fn s(v: &str) -> Option<String> {
         Some(v.to_owned())
@@ -153,5 +171,28 @@ mod tests {
             capped_warning(&EnvFilter::new("info"), LevelFilter::INFO),
             None
         );
+    }
+
+    #[test]
+    fn a_non_utf8_variable_is_reported_and_unset() {
+        use std::env::VarError;
+        assert_eq!(
+            read_var("VICTORY_LOG", Ok("warn".into())),
+            (s("warn"), None)
+        );
+        assert_eq!(
+            read_var("VICTORY_LOG", Err(VarError::NotPresent)),
+            (None, None)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = std::ffi::OsString::from_vec(vec![b'w', 0xff]);
+            let (value, warning) = read_var("RUST_LOG", Err(VarError::NotUnicode(bad)));
+            assert_eq!(value, None);
+            let warning = warning.expect("a warning");
+            assert!(warning.contains("RUST_LOG"), "{warning}");
+            assert!(warning.contains("UTF-8"), "{warning}");
+        }
     }
 }
