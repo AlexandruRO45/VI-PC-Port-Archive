@@ -2943,7 +2943,10 @@ impl<'a> Lower<'a> {
             Some("x16") => 16,
             _ => return Err("a scalar memory read as data"),
         };
-        // How the program uses the descriptor tells the view's kind.
+        // How the program uses the descriptor tells the view's kind. Prefer any
+        // non-BVH resource use first; if only `image_bvh*` uses it, zero the
+        // loaded words directly without declaring a host buffer handle.
+        let mut bvh_use = None;
         let use_at = self
             .x
             .res
@@ -2951,11 +2954,21 @@ impl<'a> Lower<'a> {
             .iter()
             .filter(|d| d.role == Role::Resource)
             .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
+                let first = d.source.leaves().into_iter().find_map(|l| match *l {
+                    Source::Loaded { load, first } if load == site => Some(first),
                     _ => None,
-                })
-            });
+                })?;
+                if self.x.p.blocks[d.site.0].insts[d.site.1]
+                    .name()
+                    .starts_with("image_bvh")
+                {
+                    bvh_use.get_or_insert((d.site, first));
+                    None
+                } else {
+                    Some((d.site, first))
+                }
+            })
+            .or(bvh_use);
         let Some((at, first)) = use_at else {
             return Err("a descriptor read only as data");
         };
@@ -2963,6 +2976,13 @@ impl<'a> Lower<'a> {
         let used = self.used_kind(&src);
         let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
         let un = ui.name();
+        if un.starts_with("image_bvh") {
+            let zero = self.s.m.i32(0);
+            for k in 0..count {
+                self.write(inst, Reg::S(code + k as u8), zero, None);
+            }
+            return Ok(());
+        }
         let uav = un.contains("store")
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
@@ -5597,10 +5617,13 @@ impl<'a> Lower<'a> {
         if *a16 && name.starts_with("image_sample_b") {
             return Err("a biased image sample with 16-bit coordinates");
         }
-        // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        if name.starts_with("image_bvh") {
+            return self.bvh_miss(inst, b, i, data, addr);
+        }
         let site = (b, i);
         let guard = self.guard(b, i)?;
+        // A load or sample with no channel enabled returns the first.
+        let dmask = if *dmask == 0 { &1 } else { dmask };
         let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
@@ -6107,6 +6130,57 @@ impl<'a> Lower<'a> {
         }
         for (k, x) in xs.into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+        }
+        Ok(())
+    }
+
+    /// Emulates `image_bvh_intersect_ray` / `image_bvh64_intersect_ray` as an
+    /// unconditional miss without reading a host acceleration structure.
+    ///
+    /// Node pointer bits 0-2 in the first address VGPR identify the node kind:
+    /// leaves (0..=3) return `[+inf, 1.0, 0, 0]` (`t_num / t_den = +inf`), while
+    /// box/internal nodes (4..=7) return `[0xFFFF_FFFF; 4]` (`INVALID_NODE`) so
+    /// traversal pushes no children and exits cleanly.
+    fn bvh_miss(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        data: &Operand,
+        addr: &[Operand],
+    ) -> Result<(), Why> {
+        let Operand::Vector { reg, dwords } = *data else {
+            return Err("an image result");
+        };
+        let guard = self.guard(b, i)?;
+        let r0 = addr
+            .iter()
+            .find_map(|a| match *a {
+                Operand::Vector { reg, dwords } if dwords > 0 => Some(reg),
+                _ => None,
+            })
+            .ok_or("a ray intersection address")?;
+        let node_lo = match inst.read(Reg::V(r0)) {
+            Some(v) => self.i32_of(v)?,
+            None => self.s.m.i32(4),
+        };
+        let c = self.cur;
+        let seven = self.s.m.i32(7);
+        let three = self.s.m.i32(3);
+        let kind = self.s.m.bin(c, Bin::And, node_lo, seven);
+        let is_leaf = self.s.m.cmp(c, pred::IULE, kind, three);
+        let invalid = self.s.m.i32(u32::MAX);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let one = self.s.m.i32(0x3F80_0000);
+        let zero = self.s.m.i32(0);
+        let miss = [
+            self.s.m.select(c, is_leaf, inf, invalid),
+            self.s.m.select(c, is_leaf, one, invalid),
+            self.s.m.select(c, is_leaf, zero, invalid),
+            self.s.m.select(c, is_leaf, zero, invalid),
+        ];
+        for (k, &val) in miss.iter().take(usize::from(dwords.max(4))).enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), val, guard);
         }
         Ok(())
     }
@@ -7417,5 +7491,104 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    #[test]
+    fn image_bvh_intersect_ray_lowers_as_miss() {
+        let words = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBE82_0380, // s_mov_b32 s2, 0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF198_8F01, // image_bvh_intersect_ray v[1:4], v0, s[0:3] (r128=1, dmask=0xF)
+            0x0000_0100, // vdata=v1, vaddr=v0, srsrc=s0
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD834_0004,
+            0x0000_0200, // ds_write_b32 v0, v2 offset:4
+            0xD834_0008,
+            0x0000_0300, // ds_write_b32 v0, v3 offset:8
+            0xD834_000C,
+            0x0000_0400, // ds_write_b32 v0, v4 offset:12
+            S_ENDPGM,
+        ];
+        let mut emitted = lower_with(&words, Vec::new(), Vec::new()).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut emitted.dxil)
+                .expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn image_bvh64_intersect_ray_with_synthesized_descriptor_lowers_as_miss() {
+        // Synthesized BVH descriptor via `s_or_b32` around a root constant `s0`,
+        // plus `a16=1`, verifying resource tracking tolerates loop-built BVH
+        // descriptors and the lowered DXIL passes dxil.dll validation.
+        let words = [
+            0x8804_8100, // s_or_b32 s4, s0, 1
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE86_03FF, // s_mov_b32 s6, -1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF19C_8F01, // image_bvh64_intersect_ray v[1:4], v0, s[4:7] dmask:0xf a16
+            0x4001_0100, // vdata=v1, vaddr=v0, srsrc=s4, a16=1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            0xD834_000C,
+            0x0000_0400, // ds_write_b32 v0, v4 offset:12
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Constants, 0, 0)];
+        let mut emitted = lower_with(&words, layout, Vec::new()).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut emitted.dxil)
+                .expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn image_bvh_loaded_descriptor_words_read_as_zero_without_handle() {
+        // Loaded TLAS/BVH descriptor whose dword 0 is read as a number to form
+        // `node_lo` must resolve to zero cleanly without requiring a host SRV.
+        let words = [
+            0xBE80_0300, // s_mov_b32 s0, s0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], null
+            0x4A02_0004, // v_add_nc_u32 v1, s4, v0
+            0xF198_8F01, // image_bvh_intersect_ray v[2:5], v1, s[4:7]
+            0x0001_0201, // vdata=v2, vaddr=v1, srsrc=s4
+            0xD834_0000,
+            0x0000_0200, // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0)];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let mut emitted = lower_with(&words, layout, used).unwrap();
+        assert_eq!(
+            emitted.nonuniform_handles, 0,
+            "BVH descriptor read as data must not allocate host handles"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut emitted.dxil)
+                .expect("DXIL validation failed");
+        }
     }
 }

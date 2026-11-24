@@ -340,12 +340,13 @@ impl Instruction {
                     bit(w1, 31),
                 );
                 let (r128, tfe, lwe) = (bit(w0, 15), bit(w0, 16), bit(w0, 17));
-                let mut data = if name.starts_with("image_gather4") {
+                let mut data = if name.starts_with("image_gather4") || name.starts_with("image_bvh")
+                {
                     4
                 } else {
                     dmask.count_ones().max(1) as u8
                 };
-                if d16 {
+                if d16 && !name.starts_with("image_bvh") {
                     data = data.div_ceil(2);
                 }
                 let count = image_addr_dwords(name, dim, a16);

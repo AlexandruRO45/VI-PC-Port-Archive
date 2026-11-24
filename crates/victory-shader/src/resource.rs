@@ -178,6 +178,22 @@ pub fn track(
             };
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
+            if let Fields::Image { rsrc, .. } = &inst.fields
+                && inst.name().starts_with("image_bvh")
+            {
+                // Emulated as a miss in lowering without a host view; keep a
+                // tracked source if available so `descriptor_data` still sees
+                // loaded TLAS descriptors, but tolerate loop-built ones and
+                // omit waterfall tracking.
+                if let Ok(source) = t.descriptor(inst, rsrc, b) {
+                    out.descriptors.push(Descriptor {
+                        site,
+                        role: Role::Resource,
+                        source,
+                    });
+                }
+                continue;
+            }
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
