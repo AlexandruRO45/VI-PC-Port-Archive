@@ -870,4 +870,379 @@ mod tests {
         ];
         let _ = offsets(&inputs);
     }
+
+    fn read_subobject<T>(
+        state: &mut GraphicsState,
+        kind: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
+        data: T,
+    ) {
+        #[repr(C, align(8))]
+        struct Subobject<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+        let subobject = Subobject(kind, data);
+        // SAFETY: the test supplies the payload type for the given kind and
+        // keeps any data it references alive for the call.
+        unsafe { state.read(kind.0 as u32, (&raw const subobject).cast()) };
+    }
+
+    fn read_layout(state: &mut GraphicsState, elements: &[D3D12_INPUT_ELEMENT_DESC]) {
+        read_subobject(
+            state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
+            D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: elements.as_ptr(),
+                NumElements: elements.len() as u32,
+            },
+        );
+    }
+
+    fn input(slot: u32, format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"SYNTHETIC".as_ptr().cast()),
+            Format: format,
+            InputSlot: slot,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn input_layout_owns_semantic_names_and_describes_their_values() {
+        let mut state = GraphicsState::default();
+        let element = D3D12_INPUT_ELEMENT_DESC {
+            SemanticIndex: 7,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+            InstanceDataStepRate: 3,
+            ..input(2, DXGI_FORMAT(119), 12)
+        };
+        {
+            let name = CString::new("SYNTHETIC").unwrap();
+            let source = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..element
+            };
+            read_layout(&mut state, &[source]);
+            assert_ne!(
+                state.inputs[0].SemanticName,
+                source.SemanticName,
+            );
+        }
+        let stored = state.inputs[0];
+        // SAFETY: the state still owns the copied string.
+        let copied_name = unsafe { CStr::from_ptr(stored.SemanticName.0.cast()) };
+        assert_eq!(copied_name, c"SYNTHETIC");
+        assert_eq!(
+            stored,
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: stored.SemanticName,
+                Format: DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+                ..element
+            },
+        );
+
+        let mut other = GraphicsState::default();
+        read_layout(&mut other, &[element]);
+        assert_eq!(state.describe(), other.describe());
+        read_layout(
+            &mut other,
+            &[D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(c"OTHER".as_ptr().cast()),
+                ..element
+            }],
+        );
+        assert_ne!(state.describe(), other.describe());
+    }
+
+    #[test]
+    fn appended_inputs_respect_format_alignment_per_slot() {
+        let mut state = GraphicsState::default();
+        let append = D3D12_APPEND_ALIGNED_ELEMENT;
+        let mut instance = input(31, DXGI_FORMAT_R16_UINT, append);
+        instance.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
+        instance.InstanceDataStepRate = 2;
+        let mut instance_next = instance;
+        instance_next.Format = DXGI_FORMAT_R32_FLOAT;
+        read_layout(
+            &mut state,
+            &[
+                input(0, DXGI_FORMAT_R8_UINT, 0),
+                instance,
+                input(0, DXGI_FORMAT_R16_UINT, append),
+                instance_next,
+                input(0, DXGI_FORMAT_R32G32B32_FLOAT, append),
+                input(0, DXGI_FORMAT_R8_UINT, append),
+                input(0, DXGI_FORMAT_R32_FLOAT, 24),
+                input(0, DXGI_FORMAT_R32_FLOAT, append),
+            ],
+        );
+
+        assert_eq!(state.slots(), 1 | (1 << 31));
+        let elements = state.elements();
+        let locations: Vec<_> = elements
+            .iter()
+            .map(|e| (e.slot, e.offset, e.format, e.per_instance))
+            .collect();
+        assert_eq!(
+            locations,
+            [
+                (0, 0, 62, false),
+                (31, 0, 57, true),
+                (0, 2, 57, false),
+                (31, 4, 41, true),
+                (0, 4, 6, false),
+                (0, 16, 62, false),
+                (0, 24, 41, false),
+                (0, 28, 41, false),
+            ],
+        );
+    }
+
+    #[test]
+    fn omitted_subobjects_use_d3d12_defaults() {
+        let state = GraphicsState::default();
+        assert!(!state.blend.AlphaToCoverageEnable.as_bool());
+        assert!(!state.blend.IndependentBlendEnable.as_bool());
+        for target in state.blend.RenderTarget {
+            assert!(!target.BlendEnable.as_bool());
+            assert!(!target.LogicOpEnable.as_bool());
+            assert_eq!(target.SrcBlend, D3D12_BLEND_ONE);
+            assert_eq!(target.DestBlend, D3D12_BLEND_ZERO);
+            assert_eq!(target.BlendOp, D3D12_BLEND_OP_ADD);
+            assert_eq!(target.SrcBlendAlpha, D3D12_BLEND_ONE);
+            assert_eq!(target.DestBlendAlpha, D3D12_BLEND_ZERO);
+            assert_eq!(target.BlendOpAlpha, D3D12_BLEND_OP_ADD);
+            assert_eq!(target.LogicOp, D3D12_LOGIC_OP_NOOP);
+            assert_eq!(target.RenderTargetWriteMask, 0xf);
+        }
+        assert_eq!(state.sample_mask, u32::MAX);
+        assert_eq!(state.rasterizer.FillMode, D3D12_FILL_MODE_SOLID);
+        assert_eq!(state.rasterizer.CullMode, D3D12_CULL_MODE_BACK);
+        assert!(!state.rasterizer.FrontCounterClockwise.as_bool());
+        assert!(state.rasterizer.DepthClipEnable.as_bool());
+        assert_eq!(state.rasterizer.DepthBias, 0);
+        assert!(state.depth.DepthEnable.as_bool());
+        assert_eq!(state.depth.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ALL);
+        assert_eq!(state.depth.DepthFunc, D3D12_COMPARISON_FUNC_LESS);
+        assert!(!state.depth.StencilEnable.as_bool());
+        assert_eq!(state.depth.StencilReadMask, 0xff);
+        assert_eq!(state.depth.StencilWriteMask, 0xff);
+        for face in [state.depth.FrontFace, state.depth.BackFace] {
+            assert_eq!(face.StencilFailOp, D3D12_STENCIL_OP_KEEP);
+            assert_eq!(face.StencilDepthFailOp, D3D12_STENCIL_OP_KEEP);
+            assert_eq!(face.StencilPassOp, D3D12_STENCIL_OP_KEEP);
+            assert_eq!(face.StencilFunc, D3D12_COMPARISON_FUNC_ALWAYS);
+        }
+        assert_eq!(state.strip_cut, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED);
+        assert_eq!(state.topology, D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED);
+        assert_eq!(state.targets.NumRenderTargets, 0);
+        assert_eq!(state.targets.RTFormats, [DXGI_FORMAT_UNKNOWN; 8]);
+        assert_eq!(state.depth_format, DXGI_FORMAT_UNKNOWN);
+        assert_eq!(
+            state.samples,
+            DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0
+            }
+        );
+    }
+
+    #[test]
+    fn reads_blend_and_rasterizer_state() {
+        let mut state = GraphicsState::default();
+        let mut blend = D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: true.into(),
+            IndependentBlendEnable: true.into(),
+            RenderTarget: state.blend.RenderTarget,
+        };
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_REV_SUBTRACT,
+            SrcBlendAlpha: D3D12_BLEND_DEST_ALPHA,
+            DestBlendAlpha: D3D12_BLEND_INV_DEST_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_MAX,
+            RenderTargetWriteMask: 0x5,
+            ..blend.RenderTarget[0]
+        };
+        blend.RenderTarget[7].LogicOpEnable = true.into();
+        blend.RenderTarget[7].LogicOp = D3D12_LOGIC_OP_XOR;
+        let raster = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE_WIREFRAME,
+            CullMode: D3D12_CULL_MODE_FRONT,
+            FrontCounterClockwise: true.into(),
+            DepthBias: -7,
+            DepthBiasClamp: 0.5,
+            SlopeScaledDepthBias: -1.25,
+            DepthClipEnable: false.into(),
+            MultisampleEnable: true.into(),
+            AntialiasedLineEnable: true.into(),
+            ForcedSampleCount: 4,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON,
+        };
+        read_subobject(&mut state, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend);
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+            raster,
+        );
+        assert_eq!(state.blend, blend);
+        assert_eq!(state.rasterizer, raster);
+    }
+
+    #[test]
+    fn reads_both_depth_stencil_subobjects() {
+        let mut state = GraphicsState::default();
+        let depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: false.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
+            DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
+            StencilEnable: true.into(),
+            StencilReadMask: 0x31,
+            StencilWriteMask: 0xe7,
+            FrontFace: D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: D3D12_STENCIL_OP_ZERO,
+                StencilDepthFailOp: D3D12_STENCIL_OP_REPLACE,
+                StencilPassOp: D3D12_STENCIL_OP_INCR_SAT,
+                StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
+            },
+            BackFace: D3D12_DEPTH_STENCILOP_DESC {
+                StencilFailOp: D3D12_STENCIL_OP_INVERT,
+                StencilDepthFailOp: D3D12_STENCIL_OP_DECR,
+                StencilPassOp: D3D12_STENCIL_OP_INCR,
+                StencilFunc: D3D12_COMPARISON_FUNC_NOT_EQUAL,
+            },
+        };
+        let depth1 = D3D12_DEPTH_STENCIL_DESC1 {
+            DepthEnable: true.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+            DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+            StencilEnable: false.into(),
+            StencilReadMask: 0x52,
+            StencilWriteMask: 0xa5,
+            FrontFace: depth.BackFace,
+            BackFace: depth.FrontFace,
+            DepthBoundsTestEnable: true.into(),
+        };
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+            depth,
+        );
+        assert_eq!(state.depth, depth);
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+            depth1,
+        );
+        assert_eq!(
+            state.depth,
+            D3D12_DEPTH_STENCIL_DESC {
+                DepthEnable: true.into(),
+                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+                DepthFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                StencilEnable: false.into(),
+                StencilReadMask: 0x52,
+                StencilWriteMask: 0xa5,
+                FrontFace: depth.BackFace,
+                BackFace: depth.FrontFace,
+            },
+        );
+    }
+
+    #[test]
+    fn translates_render_target_and_depth_formats() {
+        let mut state = GraphicsState::default();
+        let mut formats = [DXGI_FORMAT_R8G8B8A8_UNORM; 8];
+        formats[6] = DXGI_FORMAT(119);
+        formats[7] = DXGI_FORMAT(120);
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
+            D3D12_RT_FORMAT_ARRAY {
+                RTFormats: formats,
+                NumRenderTargets: 8,
+            },
+        );
+        formats[6] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        formats[7] = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        assert_eq!(state.targets.NumRenderTargets, 8);
+        assert_eq!(state.targets.RTFormats, formats);
+
+        for (title, native) in [
+            (118, DXGI_FORMAT_D24_UNORM_S8_UINT),
+            (40, DXGI_FORMAT_D32_FLOAT),
+            (0, DXGI_FORMAT_UNKNOWN),
+        ] {
+            read_subobject(
+                &mut state,
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
+                DXGI_FORMAT(title),
+            );
+            assert_eq!(state.depth_format, native);
+        }
+    }
+
+    #[test]
+    fn reads_scalar_and_sample_state_and_ignores_unknown_subobjects() {
+        let mut state = GraphicsState::default();
+        let mut storage = [0u64; 2];
+        let kind = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK.0 as u32;
+        let at = storage.as_mut_ptr().cast::<u8>().wrapping_add(1);
+        let mask = 0xfe01_1234u32;
+        // SAFETY: both u32 writes are inside the storage at the stream's
+        // type/data offsets. The read is of that whole subobject.
+        unsafe {
+            at.cast::<u32>().write_unaligned(kind);
+            at.add(4).cast::<u32>().write_unaligned(mask);
+            state.read(kind, at);
+        }
+        assert_eq!(state.sample_mask, mask);
+
+        let strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+        let topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        let samples = DXGI_SAMPLE_DESC {
+            Count: 4,
+            Quality: 3,
+        };
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
+            strip_cut,
+        );
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+            topology,
+        );
+        read_subobject(
+            &mut state,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+            samples,
+        );
+        assert_eq!(state.strip_cut, strip_cut);
+        assert_eq!(state.topology, topology);
+        assert_eq!(state.samples, samples);
+
+        let before = state.describe();
+        read_subobject(&mut state, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(99), 0u32);
+        assert_eq!(state.describe(), before);
+    }
+
+    #[test]
+    fn shader_bytecode_is_copied_by_length() {
+        assert!(code_bytes(&D3D12_SHADER_BYTECODE::default()).is_empty());
+        let copy = {
+            let bytes = [8u8, 0, 32, 91];
+            let mut desc = D3D12_SHADER_BYTECODE {
+                pShaderBytecode: bytes.as_ptr().cast(),
+                BytecodeLength: 0,
+            };
+            assert!(code_bytes(&desc).is_empty());
+            desc.BytecodeLength = 3;
+            code_bytes(&desc)
+        };
+        assert_eq!(copy, [8, 0, 32]);
+    }
 }
