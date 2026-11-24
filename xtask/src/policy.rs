@@ -493,6 +493,57 @@ mod tests {
         git(root, &args)
     }
 
+    /// A temporary directory the checkout's own full check cannot see.
+    ///
+    /// Under a TMPDIR inside the checkout, a test's temporary repository is
+    /// an untracked directory there, and `repository_passes_policy`, running
+    /// at the same time, fails on it and on the files the test stages. The
+    /// directory is then made beside the test binary instead, which is
+    /// ignored as build output; if that is not ignored either, the test says
+    /// so rather than flaking.
+    fn tempdir() -> tempfile::TempDir {
+        let checkout = crate::workspace_root();
+        let checkout = checkout.canonicalize().unwrap_or(checkout);
+        let candidates = [
+            Some(std::env::temp_dir()),
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
+        ];
+        for dir in candidates.into_iter().flatten() {
+            let Ok(dir) = dir.canonicalize() else {
+                continue;
+            };
+            if unseen_by_full_check(&checkout, &dir) {
+                return tempfile::tempdir_in(dir).unwrap();
+            }
+        }
+        panic!(
+            "no temporary directory outside {} or ignored by it: set TMPDIR outside the checkout",
+            checkout.display()
+        );
+    }
+
+    /// Whether nothing under `dir` is listed by the full check of `checkout`:
+    /// it is elsewhere, or ignored there.
+    fn unseen_by_full_check(checkout: &std::path::Path, dir: &std::path::Path) -> bool {
+        let Ok(relative) = dir.strip_prefix(checkout) else {
+            return true;
+        };
+        let status = super::git_command(checkout)
+            .args(["check-ignore", "-q", "--"])
+            .arg(relative.join("probe"))
+            .status();
+        match status.ok().and_then(|s| s.code()) {
+            Some(0) => true,
+            Some(1) => false,
+            // Not a git checkout: the walk skips only `target` and `.git`.
+            _ => relative
+                .components()
+                .any(|c| matches!(c.as_os_str().to_str(), Some("target" | ".git"))),
+        }
+    }
+
     #[cfg(unix)]
     fn names(root: &std::path::Path, staged: bool) -> Vec<String> {
         super::list_files(root, staged)
@@ -507,7 +558,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_check_reads_type_changes() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         std::os::unix::fs::symlink("elsewhere.rs", root.join("data.rs")).unwrap();
@@ -528,14 +579,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinks_are_checked_as_git_stores_them() {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempdir();
         let binary = outside.path().join("game.bin");
         std::fs::write(&binary, b"MZ\x90\0binary").unwrap();
         let fifo = outside.path().join("fifo");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         assert!(made.unwrap().success(), "mkfifo");
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         std::os::unix::fs::symlink(&binary, root.join("binary.rs")).unwrap();
@@ -577,7 +628,7 @@ mod tests {
     #[test]
     fn exempted_paths_refuse_other_content() {
         let (path, ..) = super::EXCEPTIONS[0];
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let file = root.join(path);
@@ -600,7 +651,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_check_reads_renames() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
@@ -619,7 +670,7 @@ mod tests {
         use std::io::Write;
         use std::os::unix::ffi::OsStrExt;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let mut hash = super::git_command(root)
@@ -661,7 +712,7 @@ mod tests {
     fn non_utf8_names_on_disk_are_read() {
         use std::os::unix::ffi::OsStrExt;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let name = std::ffi::OsStr::from_bytes(b"data\xff.rs");
@@ -682,7 +733,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn submodules_are_violations() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let oid = "0123456789abcdef0123456789abcdef01234567";
@@ -708,7 +759,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staged_submodules_are_seen_whatever_git_ignores() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let oid = "0123456789abcdef0123456789abcdef01234567";
@@ -770,7 +821,7 @@ mod tests {
     /// configuration may reach those tests; the checkout keeps the rest.
     #[test]
     fn temporary_repositories_read_only_their_own_config() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         let out = super::git_command(root).args(["init", "-q"]).output();
         let Some(_) = out.ok().filter(|o| o.status.success()) else {
@@ -820,10 +871,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn lfs_tracked_files_are_violations() {
-        let outside = tempfile::tempdir().unwrap();
+        let outside = tempdir();
         let pointer = outside.path().join("pointer");
         std::fs::write(&pointer, LFS_POINTER).unwrap();
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
         let clean = format!("cat '{}'", pointer.display());
