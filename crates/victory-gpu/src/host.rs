@@ -589,6 +589,28 @@ void main() {
         // SAFETY: destination remains mapped and contains a four-byte result.
         let result = unsafe { destination.data.cast::<u32>().read_volatile() };
         assert_eq!(result, INPUT ^ MASK);
+        assert_eq!(
+            source.state.actual.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+            "the submitted list must publish the arena's final resource state"
+        );
+
+        // A later command list must transition the same arena resource from
+        // the previous submission's UAV state, not from COMMON or a
+        // suballocation-local state.
+        let settle = host.new_list().expect("create arena state handoff list");
+        assert!(
+            settle
+                .transition_unified(&destination, D3D12_RESOURCE_STATE_COMMON.0 as u32)
+                .is_none()
+        );
+        settle.close();
+        host.execute(&[&settle]);
+        assert_eq!(
+            source.state.actual.load(Ordering::Relaxed),
+            D3D12_RESOURCE_STATE_COMMON.0 as u32,
+            "the next list's prelude must publish the COMMON state"
+        );
 
         // The 174 MiB allocation leaves less than 82 MiB after the two
         // alignment slots, so exhaustion must preserve the caller's fallback.
