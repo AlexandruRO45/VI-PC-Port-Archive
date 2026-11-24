@@ -27,7 +27,7 @@ use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, ir, resource, structure};
+use crate::{io, ir, range, resource};
 use std::fmt::Write as _;
 
 const S_ENDPGM: u32 = 0xBF81_0000;
@@ -100,7 +100,7 @@ fn name_of(op: u16) -> Option<&'static str> {
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
-    let p = ir::build(&code, false, 8).ok()?;
+    let p = ir::build(&code, false, 16).ok()?;
     let name = p.blocks.first()?.insts.first()?.name();
     (!name.is_empty()).then_some(name)
 }
@@ -160,7 +160,7 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs: 16,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -195,8 +195,9 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         }),
         code,
     };
-    let p = ir::build(&native.code, false, 8).map_err(|e| format!("ir: {e:?}"))?;
-    let st = structure::structure(&p).map_err(|e| format!("structure: {e:?}"))?;
+    let (p, st) = range::build(&native.code, native.wave64, native.vgprs)
+        .map_err(|e| format!("ir: {e:?}"))?;
+    let st = st.map_err(|e| format!("structure: {e:?}"))?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))
         .map_err(|e| format!("resource: {e:?}"))?;
     let io = io::raise(&p, &native).map_err(|e| format!("io: {e:?}"))?;
@@ -220,6 +221,12 @@ fn build(words: &[u32]) -> Result<HostShader, String> {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
