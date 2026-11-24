@@ -5940,4 +5940,98 @@ mod tests {
             [(0, 4, 4), (u32::MAX, 0, 8), (7, 16, 0), (0, 0, 0xFF)]
         );
     }
+
+    #[test]
+    fn a_record_breaking_several_rules_is_named_for_the_first_checked() {
+        // A record's checks, in the order they are made: its code, its VGPR
+        // count, its layout table and the layout's rules, its read table and
+        // the reads' rules, then its stage data. The read table is not even
+        // found until the layout has passed. Record `from` breaks every rule
+        // from that one on.
+        const RULES: [&str; 7] = [
+            "native code out of bounds",
+            "implausible VGPR count",
+            "FSSM root table out of bounds",
+            "root parameter of unknown kind",
+            "FSSM root table out of bounds",
+            "used descriptor of unknown kind",
+            "implausible semantic count",
+        ];
+        let (constants, unknown_root, srv, unknown_kind) = (0, 2, 0, 9);
+        let blob = |from: usize| {
+            let breaks = |k: usize| k >= from;
+            let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+            let root = if breaks(3) { unknown_root } else { constants };
+            let kind = if breaks(5) { unknown_kind } else { srv };
+            // A constants read keeps none of the table or descriptor rules.
+            set_stage_reads(
+                &mut blob,
+                HwStage::Vs,
+                &[(root, 1, 0, 0)],
+                &[(kind, constants as u8, 0, 0, 0)],
+            );
+            let e = stage_data_at(&blob, HwStage::Vs);
+            let record = e - RECORD_SIZE as usize;
+            if breaks(0) {
+                blob[record + 8..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            if breaks(1) {
+                blob[record + RECORD_REGS..][..4].copy_from_slice(&257u32.to_le_bytes());
+            }
+            if breaks(2) {
+                blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            if breaks(4) {
+                blob[record + RECORD_USED..][..8].copy_from_slice(&u64::MAX.to_le_bytes());
+            }
+            if breaks(6) {
+                blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&(MAX_SEMANTICS + 1).to_le_bytes());
+            }
+            xbch(&blob)
+        };
+        for (from, why) in RULES.into_iter().enumerate() {
+            assert_eq!(refused_blob(&blob(from)), why, "breaking rules {from}..");
+        }
+        let p = native_programs(&part(&[(KIND_NATIVE, &blob(RULES.len()))])).unwrap();
+        assert_eq!((p[0].layout.len(), p[0].used.len()), (1, 1));
+    }
+
+    #[test]
+    fn of_several_bad_records_the_first_slot_is_named_whatever_the_record_order() {
+        // Pixel laid out before vertex, then compute, each able to break a
+        // rule of its own. Slots are read in order (VS, PS, then CS), so the
+        // first bad slot names the refusal wherever its record sits, and a
+        // bad later slot refuses the programs already read before it.
+        let blob = |bad: &[HwStage]| {
+            let mut blob = fssm(&[
+                (HwStage::Ps, &PS_CODE),
+                (HwStage::Vs, &VS_CODE),
+                (HwStage::Cs, &VS_CODE),
+            ]);
+            for &stage in bad {
+                let e = stage_data_at(&blob, stage);
+                let record = e - RECORD_SIZE as usize;
+                match stage {
+                    HwStage::Vs => {
+                        blob[record + RECORD_REGS..][..4].copy_from_slice(&257u32.to_le_bytes())
+                    }
+                    HwStage::Ps => blob[record + 8..][..8].copy_from_slice(&u64::MAX.to_le_bytes()),
+                    _ => blob[e + CS_THREADS..][..4].copy_from_slice(&0u32.to_le_bytes()),
+                }
+            }
+            xbch(&blob)
+        };
+        let (vs, ps, cs) = (HwStage::Vs, HwStage::Ps, HwStage::Cs);
+        for (bad, why) in [
+            (&[cs, ps, vs][..], "implausible VGPR count"),
+            (&[cs, vs], "implausible VGPR count"),
+            (&[cs, ps], "native code out of bounds"),
+            (&[ps], "native code out of bounds"),
+            (&[cs], "implausible thread-group size"),
+        ] {
+            assert_eq!(refused_blob(&blob(bad)), why, "{bad:?}");
+        }
+        let p = native_programs(&part(&[(KIND_NATIVE, &blob(&[]))])).unwrap();
+        assert_eq!(p.iter().map(|p| p.stage).collect::<Vec<_>>(), [vs, ps, cs]);
+    }
 }
