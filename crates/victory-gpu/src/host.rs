@@ -346,12 +346,25 @@ pub(crate) fn host() -> Option<&'static Host> {
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
-        // The debug layer only in builds with diagnostics.
-        let debug =
-            cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some();
+        // The debug layer only in builds with diagnostics. `VICTORY_D3D12_AGILITY=<dir>`
+        // (a directory with the Agility SDK's D3D12Core.dll and d3d12SDKLayers.dll)
+        // supplies the layer without the Graphics Tools feature, and implies it.
+        let factory = if cfg!(feature = "diagnostics") {
+            agility_factory()
+        } else {
+            None
+        };
+        let debug = cfg!(feature = "diagnostics")
+            && (factory.is_some() || std::env::var_os("VICTORY_D3D12_DEBUG").is_some());
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
-            match D3D12GetDebugInterface(&mut layer) {
+            let got = match &factory {
+                Some(f) => f
+                    .GetConfigurationInterface::<ID3D12Debug>(&CLSID_D3D12Debug)
+                    .map(|l| layer = Some(l)),
+                None => D3D12GetDebugInterface(&mut layer),
+            };
+            match got {
                 Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
                 Err(e) => tracing::warn!(error = %e, "no D3D12 debug layer"),
             }
@@ -377,7 +390,15 @@ fn create() -> windows::core::Result<Host> {
         // faulting address), read when the device is removed.
         if dred_on() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
-            if D3D12GetDebugInterface(&mut dred).is_ok()
+            let got = match &factory {
+                Some(f) => f
+                    .GetConfigurationInterface::<ID3D12DeviceRemovedExtendedDataSettings>(
+                        &CLSID_D3D12DeviceRemovedExtendedData,
+                    )
+                    .map(|d| dred = Some(d)),
+                None => D3D12GetDebugInterface(&mut dred),
+            };
+            if got.is_ok()
                 && let Some(dred) = dred
             {
                 dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
@@ -388,12 +409,19 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        let warp = cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some();
+        let adapter: Option<windows::core::IUnknown> =
+            if warp { Some(warp_adapter()?.cast()?) } else { None };
+        match &factory {
+            Some(f) => f.CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            None => D3D12CreateDevice(adapter.as_ref(), D3D_FEATURE_LEVEL_12_0, &mut device)?,
+        }
+        if warp {
             tracing::info!("host device on the software adapter (WARP)");
-        } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+        }
+        if let Some(f) = factory {
+            // The factory must outlive the device.
+            std::mem::forget(f);
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -438,6 +466,44 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// The Agility SDK version of the package in `VICTORY_D3D12_AGILITY`
+/// (Microsoft.Direct3D.D3D12 1.615.x).
+const AGILITY_SDK_VERSION: u32 = 615;
+
+/// A device factory over the Agility SDK in `VICTORY_D3D12_AGILITY=<dir>`
+/// (D3D12Core.dll and d3d12SDKLayers.dll), which gives the debug layer
+/// without admin rights. `None` when unset or unusable.
+fn agility_factory() -> Option<ID3D12DeviceFactory> {
+    let dir = std::env::var("VICTORY_D3D12_AGILITY").ok()?;
+    let version = std::env::var("VICTORY_D3D12_AGILITY_VERSION")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(AGILITY_SDK_VERSION);
+    let dir = std::fs::canonicalize(&dir)
+        .map(|p| p.to_string_lossy().trim_start_matches(r"\?\").to_owned())
+        .unwrap_or(dir);
+    let path = std::ffi::CString::new(dir.clone()).ok()?;
+    // SAFETY: plain D3D12 SDK configuration calls with a NUL-terminated path.
+    let made = unsafe {
+        let mut config: Option<ID3D12SDKConfiguration1> = None;
+        D3D12GetInterface(&CLSID_D3D12SDKConfiguration, &mut config).ok()?;
+        config?.CreateDeviceFactory::<_, ID3D12DeviceFactory>(
+            version,
+            windows::core::PCSTR(path.as_ptr().cast()),
+        )
+    };
+    match made {
+        Ok(f) => {
+            tracing::info!(%dir, version, "D3D12 Agility SDK device factory");
+            Some(f)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, %dir, version, "Agility SDK device factory failed");
+            None
+        }
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -463,6 +529,23 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agility_factory_creates_a_device() {
+        let Some(dir) = std::env::var_os("VICTORY_TEST_AGILITY_DIR") else { return }; let dir = std::path::Path::new(&dir);
+        if !dir.join("D3D12Core.dll").exists() {
+            return;
+        }
+        // SAFETY: the variable is read only by this test.
+        unsafe { std::env::set_var("VICTORY_D3D12_AGILITY", dir) };
+        let Some(f) = agility_factory() else { return };
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation; no GPU is a skip.
+        let r = unsafe { f.CreateDevice(None::<&windows::core::IUnknown>, D3D_FEATURE_LEVEL_12_0, &mut device) };
+        if r.is_ok() {
+            assert!(device.is_some());
+        }
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
