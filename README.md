@@ -81,6 +81,43 @@ Three statements this fork can stand behind today:
 - **The frame rate belongs to a tree and a machine, and on the adopted base it
   belongs to one lock** — [What a frame costs](#what-a-frame-costs).
 
+### The stages a run can reach, and what proves one
+
+The goal this fork is now pointed at is not "the cutscene renders" but "the
+cutscene finishes and the world is controllable", so a frame count on its own
+says nothing. Every window is reported as one line — frames, the furthest stage
+reached, the adapter, and the feature set the binary was built with:
+
+```
+frames=2,240 stage=cutscene adapter=card features=diagnostics
+```
+
+The stages, in the order the title reaches them:
+
+```
+boot screens → menus → profile (the account/picker button) → boot movie → cutscene → loading → world
+```
+
+Two things are true of that vocabulary today and both matter to whoever reads a
+number next:
+
+- **The layer emits no stage line.** `victory-hle`, `victory-gpu` and the app
+  contain no code that reports which screen the title is on (a grep for one
+  finds nothing), so a stage claim currently rests on a capture that has content
+  at that point, plus the frame log around it. A run that sat in the menus for
+  two thousand frames and a run that reached the cutscene produce the same kind
+  of log; only the captures tell them apart.
+- **One screen needs input to pass**: the profile picker, which pad A
+  (`Enter`) answers, and which can ask twice. After it the title has advanced on
+  its own in every window we have run — but no window has yet been long enough
+  to tell a slow advance from a stall. The 180 s card window was still in the
+  cutscene when its bound fired, and its log cannot say whether the title was
+  working or waiting. `VICTORY_KEYS` schedules presses before the run starts;
+  there is no live input channel in the tree yet, so a window that must press at
+  a particular moment presses on a fixed schedule and hopes the prompt is late,
+  which is why the schedule covers five minutes at three-to-five-second spacing
+  rather than a few early presses.
+
 ### What this file did not check itself
 
 Kept deliberately, because a claim you cannot reproduce is worth less than the
