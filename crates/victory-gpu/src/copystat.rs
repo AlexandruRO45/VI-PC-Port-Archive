@@ -127,6 +127,14 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    let (loose_count, loose_bytes) = crate::shadow::cache_stats();
+    let (placed_count, placed_bytes) = crate::resource::placed_texture_cache_stats();
+    let kept_slots = crate::descriptor::host::kept_slots();
+    tracing::info!(
+        "retained GPU mirrors: {loose_count} loose shadows ({:.1} MiB),          {placed_count} placed textures ({:.1} MiB estimated), {kept_slots} descriptor slots holding resources",
+        loose_bytes as f64 / (1 << 20) as f64,
+        placed_bytes as f64 / (1 << 20) as f64,
+    );
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
