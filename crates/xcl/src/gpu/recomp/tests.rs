@@ -5657,6 +5657,75 @@ fn far_jumps_are_direct_branches() {
     }
 }
 
+/// A branch (direct or resolved far jump) entering a far-jump sequence after `s_getpc_b64`
+/// bypasses its PC initialization, so the `s_setpc_b64` must stay indirect (`far_target == None`).
+/// Branching to the `s_getpc_b64` entry itself still runs the full sequence and stays direct.
+#[test]
+fn far_jumps_stay_indirect_when_branched_into() {
+    let decode_and_resolve = |code: &[u8]| {
+        let mut v = Vec::new();
+        let mut off = 0;
+        while off + 4 <= code.len() {
+            let d = crate::gpu::rdna2::decode(&code[off..], off as u64).unwrap();
+            off += d.len;
+            v.push(d);
+        }
+        crate::gpu::rdna2::resolve_far_jumps(&mut v);
+        v
+    };
+
+    // Layout: [0] S_CBRANCH_SCC1 simm16 (4 B, pc=0)
+    //         [1] S_GETPC_B64 s[4:5]   (4 B, pc=4)
+    //         [2] S_ADD/SUB_U32 s4,s4,lit (8 B, pc=8)
+    //         [3] S_ADDC/SUBB_U32 s5,s5,0 (4 B, pc=16)
+    //         [4] S_SETPC_B64 s[4:5]   (4 B, pc=20)
+    //         [5] S_NOP 0              (4 B, pc=24)
+    for sub in [false, true] {
+        let (lo, hi) = if sub { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
+        let offset = if sub { 4u32 } else { 16u32 };
+        let expected_target = if sub { 4u64 } else { 24u64 };
+
+        // Branch target PC = 4 + simm16 * 4:
+        //   simm16 = 0 -> pc=4  (S_GETPC_B64, valid entry -> stays direct)
+        //   simm16 = 1 -> pc=8  (lo add/sub, interior -> must stay indirect)
+        //   simm16 = 3 -> pc=16 (hi addc/subb, interior -> must stay indirect)
+        //   simm16 = 4 -> pc=20 (S_SETPC_B64, interior -> must stay indirect)
+        for (simm16, expect_direct) in [(0u64, true), (1, false), (3, false), (4, false)] {
+            let code = prog(&[
+                ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", simm16)], None),
+                ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+                (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(offset)),
+                (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+                ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+                ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+            ]);
+            let insts = decode_and_resolve(&code);
+            let want = expect_direct.then_some(expected_target);
+            assert_eq!(insts[4].far_target, want, "sub={sub} simm16={simm16}");
+        }
+    }
+
+    // Far-to-far edge: sequence A (pc=0..20) resolves to pc=24, which is the `lo` instruction
+    // inside sequence B (pc=20..40). Sequence A remains direct; sequence B must stay indirect.
+    //   A: [0] GETPC (pc=0, base=4), [1] ADD +20 (pc=4, 8B), [2] ADDC 0 (pc=12), [3] SETPC (pc=16) -> target 24
+    //   B: [4] GETPC (pc=20, base=24), [5] ADD +16 (pc=24, 8B), [6] ADDC 0 (pc=32), [7] SETPC (pc=36) -> target 40
+    //      [8] S_NOP (pc=40)
+    let far_to_far = prog(&[
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 255)], Some(20)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)], None),
+        ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 6)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 6), ("SSRC0", 6), ("SSRC1", 255)], Some(16)),
+        ("S_ADDC_U32", "ENC_SOP2", &[("SDST", 7), ("SSRC0", 7), ("SSRC1", 128)], None),
+        ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)], None),
+        ("S_NOP", "ENC_SOPP", &[("SIMM16", 0)], None),
+    ]);
+    let insts = decode_and_resolve(&far_to_far);
+    assert_eq!(insts[3].far_target, Some(24), "first far jump A stays direct");
+    assert_eq!(insts[7].far_target, None, "second far jump B targeted inside its interior stays indirect");
+}
+
 /// Mesh mode for a GPU with 32-lane waves only: the console's two wave64s per group as four
 /// hardware wave32s exchanging masks and lane reads (counter-paired: two console waves),
 /// programs with cross-half operations included; native wave64 and wave32 programs unchanged.
