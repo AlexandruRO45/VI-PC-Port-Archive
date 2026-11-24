@@ -19,7 +19,8 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::locate;
+use crate::unwind::{MAX_FRAMES, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
