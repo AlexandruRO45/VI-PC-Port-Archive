@@ -70,7 +70,9 @@ user's dump), `test_titles`, and `cache_dir` for everything derived
    the exempted content: any other content at that path is refused, so a
    new version needs the entry updated.
 3. At runtime, everything that writes derived data calls
-   `victory_core::ensure_outside_repo`.
+   `victory_core::ensure_outside_repo`. It resolves the destination as a
+   write to it would, symlinks included, even past a directory that does
+   not exist yet (`missing/../link/out`).
 4. Tests that need real files take their paths from environment variables
    and skip when unset. They assert on properties, never on snapshots.
 
