@@ -52,3 +52,24 @@ fn a_title_dll_in_a_case_sensitive_folder_is_found_by_any_spelling() {
         assert_eq!(names, ["late.dll"], "loading {name}");
     }
 }
+
+#[test]
+fn a_folder_spelled_like_a_title_dll_does_not_hide_it() {
+    let Some(title) = case_sensitive_dir() else {
+        eprintln!("no case-sensitive folders on this machine; skipped");
+        return;
+    };
+    // The folder is listed before the file; neither is the spelling asked for.
+    std::fs::create_dir(title.path().join("LATE.DLL")).unwrap();
+    std::fs::copy(
+        r"C:\Windows\System32\version.dll",
+        title.path().join("late.dll"),
+    )
+    .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let wanted = |_: &str| true;
+    let dlls =
+        victory_loader::load_title_dll("LATE.dll", title.path(), cache.path(), &wanted).unwrap();
+    let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["late.dll"]);
+}
