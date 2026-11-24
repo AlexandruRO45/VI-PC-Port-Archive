@@ -112,7 +112,7 @@ impl Shader {
                 static DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
                 let deny = DENY.get_or_init(|| {
                     std::env::var("VICTORY_SHADER_DENY")
-                        .unwrap_or_else(|_| "b37565055f2f7d3b".into())
+                        .unwrap_or_else(|_| "b37565055f2f7d3b,04b9be3756e8f41c".into())
                         .split(',')
                         .map(|h| h.trim().to_ascii_lowercase())
                         .filter(|h| !h.is_empty())
