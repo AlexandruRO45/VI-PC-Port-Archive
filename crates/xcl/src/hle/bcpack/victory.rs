@@ -1010,3 +1010,51 @@ fn bc6<'a>(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod block_packing_tests {
+    use super::{bc1_pack, bc3_pack, bc4_pack, bc5_pack, Plain};
+
+    #[test]
+    fn bc1_packs_rgb565_and_raster_indices() {
+        let mut block = Plain::default();
+        block.ep[..6].copy_from_slice(&[31, 0, 0, 0, 63, 0]);
+        for (pixel, index) in block.ix[..16].iter_mut().enumerate() {
+            *index = (pixel % 4) as u8;
+        }
+        let mut out = [0; 8];
+        bc1_pack(&block, &mut out);
+        assert_eq!(out, [0x00, 0xf8, 0xe0, 0x07, 0x78, 0x78, 0x78, 0x78]);
+    }
+
+    #[test]
+    fn bc4_packs_biased_endpoints_and_three_bit_indices() {
+        let mut block = Plain::default();
+        block.ep[..2].copy_from_slice(&[0, 127]);
+        block.ix[..16].fill(1);
+        let mut out = [0; 8];
+        bc4_pack(&block, &mut out);
+        assert_eq!(out, [0x80, 0xff, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49]);
+    }
+
+    #[test]
+    fn bc3_and_bc5_keep_channels_in_separate_halves() {
+        let mut block = Plain::default();
+        block.ep.copy_from_slice(&[31, 0, 0, 0, 63, 0, 0, 127]);
+        block.ix[..16].fill(1);
+        for (pixel, index) in block.ix[16..].iter_mut().enumerate() {
+            *index = (pixel % 4) as u8;
+        }
+        let mut bc3 = [0; 16];
+        bc3_pack(&block, &mut bc3);
+        assert_eq!(bc3, [0x80, 0xff, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49,
+                         0x00, 0xf8, 0xe0, 0x07, 0x78, 0x78, 0x78, 0x78]);
+
+        block.ep[..4].copy_from_slice(&[0, 127, 128, 255]);
+        block.ix[16..].fill(7);
+        let mut bc5 = [0; 16];
+        bc5_pack(&block, &mut bc5);
+        assert_eq!(bc5, [0x80, 0xff, 0x92, 0x24, 0x49, 0x92, 0x24, 0x49,
+                         0x00, 0x7f, 0x49, 0x92, 0x24, 0x49, 0x92, 0x24]);
+    }
+}
