@@ -46,6 +46,13 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        // `VICTORY_PIPELINE_DUMP`: the pipeline as a line `victory precompile`
+        // rebuilds, written before the make so a run that faults here still
+        // leaves the description that faulted.
+        super::dump::record(
+            &shaders.iter().map(|s| (s.stage.to_owned(), s.hash.clone())).collect::<Vec<_>>(),
+            graphics.as_deref(),
+        );
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());

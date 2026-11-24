@@ -89,6 +89,66 @@ impl Default for GraphicsState {
     }
 }
 
+/// A state's fields, written as text: numbers separated by a space, input
+/// element names escaped so a name never splits the field.
+#[derive(Default)]
+struct Fields(String);
+
+impl Fields {
+    fn n(&mut self, v: i64) {
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        self.0.push_str(&v.to_string());
+    }
+
+    fn name(&mut self, name: &str) {
+        self.0.push(' ');
+        for b in name.bytes() {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.0.push(b as char);
+            } else {
+                self.0.push_str(&format!("%{b:02x}"));
+            }
+        }
+    }
+}
+
+/// The bytes an escaped name stood for, or  for an escape this does not
+/// know.
+fn unescape(name: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(name.len());
+    let mut it = name.bytes();
+    while let Some(b) = it.next() {
+        if b != b'%' {
+            bytes.push(b);
+        } else {
+            let hex = [it.next()?, it.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        }
+    }
+    Some(bytes)
+}
+
+/// Reads a state's fields back.
+struct Read<'a> {
+    it: std::str::Split<'a, char>,
+}
+
+impl<'a> Read<'a> {
+    fn n(&mut self) -> Option<i64> {
+        self.it.next()?.parse::<i64>().ok()
+    }
+
+    fn word(&mut self) -> Option<&'a str> {
+        self.it.next()
+    }
+
+    fn done(&mut self) -> bool {
+        self.it.next().is_none()
+    }
+}
+
 impl GraphicsState {
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
@@ -206,6 +266,177 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         )
+    }
+
+    /// The state's fields as integers, in `describe()`'s order, so a state can
+    /// be written to a pipeline dump and read back exactly.
+    ///
+    /// `describe()` of the state [`GraphicsState::from_fields`] rebuilds is
+    /// byte-identical to this one's, which is what makes a precompiled
+    /// library's entry names the names the title asks for: a name is
+    /// `library::name(kind, root, code, describe())`, so any field this codec
+    /// loses or reorders is an entry nothing will ever find.
+    pub(crate) fn fields(&self) -> String {
+        let mut out = Fields::default();
+        // Fields version: bumped if this order or these meanings change, so an
+        // old dump is refused instead of read as a different state.
+        out.n(1);
+        out.n(self.blend.AlphaToCoverageEnable.0 as i64);
+        out.n(self.blend.IndependentBlendEnable.0 as i64);
+        for rt in &self.blend.RenderTarget {
+            for v in [
+                rt.BlendEnable.0,
+                rt.LogicOpEnable.0,
+                rt.SrcBlend.0,
+                rt.DestBlend.0,
+                rt.BlendOp.0,
+                rt.SrcBlendAlpha.0,
+                rt.DestBlendAlpha.0,
+                rt.BlendOpAlpha.0,
+                rt.LogicOp.0,
+                i32::from(rt.RenderTargetWriteMask),
+            ] {
+                out.n(v as i64);
+            }
+        }
+        out.n(self.sample_mask as i64);
+        let r = &self.rasterizer;
+        for v in [
+            r.FillMode.0,
+            r.CullMode.0,
+            r.FrontCounterClockwise.0,
+            r.DepthBias,
+            r.DepthBiasClamp.to_bits() as i32,
+            r.SlopeScaledDepthBias.to_bits() as i32,
+            r.DepthClipEnable.0,
+            r.MultisampleEnable.0,
+            r.AntialiasedLineEnable.0,
+            r.ForcedSampleCount as i32,
+            r.ConservativeRaster.0,
+        ] {
+            out.n(v as i64);
+        }
+        let d = &self.depth;
+        for v in [d.DepthEnable.0, d.DepthWriteMask.0, d.DepthFunc.0, d.StencilEnable.0] {
+            out.n(v as i64);
+        }
+        out.n(i32::from(d.StencilReadMask) as i64);
+        out.n(i32::from(d.StencilWriteMask) as i64);
+        for face in [&d.FrontFace, &d.BackFace] {
+            for v in [
+                face.StencilFailOp.0,
+                face.StencilDepthFailOp.0,
+                face.StencilPassOp.0,
+                face.StencilFunc.0,
+            ] {
+                out.n(v as i64);
+            }
+        }
+        out.n(self.inputs.len() as i64);
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            // A name is a semantic ("POSITION", "TEXCOORD") and holds no space,
+            // but an escape keeps a title's odd name from splitting the field.
+            out.name(&name.to_string_lossy());
+            for v in [
+                e.SemanticIndex as i64,
+                e.Format.0 as i64,
+                e.InputSlot as i64,
+                e.AlignedByteOffset as i64,
+                e.InputSlotClass.0 as i64,
+                e.InstanceDataStepRate as i64,
+            ] {
+                out.n(v);
+            }
+        }
+        out.n(self.strip_cut.0 as i64);
+        out.n(self.topology.0 as i64);
+        for f in &self.targets.RTFormats {
+            out.n(f.0 as i64);
+        }
+        out.n(self.targets.NumRenderTargets as i64);
+        out.n(self.depth_format.0 as i64);
+        out.n(self.samples.Count as i64);
+        out.n(self.samples.Quality as i64);
+        out.0
+    }
+
+    /// The state [`GraphicsState::fields`] wrote, or `None` if the text is not
+    /// exactly one such state (another fields version, a line cut short, an
+    /// escape this does not know).
+    pub(crate) fn from_fields(text: &str) -> Option<GraphicsState> {
+        let mut read = Read { it: text.split(' ') };
+        if read.word()? != "1" {
+            return None;
+        }
+        let b = |v: Option<i64>| -> Option<bool> { Some(v? != 0) };
+        let i = |v: Option<i64>| -> Option<i32> { i32::try_from(v?).ok() };
+        let u = |v: Option<i64>| -> Option<u32> { u32::try_from(v?).ok() };
+        let mut state = GraphicsState::default();
+        state.blend.AlphaToCoverageEnable = b(read.n())?.into();
+        state.blend.IndependentBlendEnable = b(read.n())?.into();
+        for rt in &mut state.blend.RenderTarget {
+            rt.BlendEnable = b(read.n())?.into();
+            rt.LogicOpEnable = b(read.n())?.into();
+            rt.SrcBlend = D3D12_BLEND(i(read.n())?);
+            rt.DestBlend = D3D12_BLEND(i(read.n())?);
+            rt.BlendOp = D3D12_BLEND_OP(i(read.n())?);
+            rt.SrcBlendAlpha = D3D12_BLEND(i(read.n())?);
+            rt.DestBlendAlpha = D3D12_BLEND(i(read.n())?);
+            rt.BlendOpAlpha = D3D12_BLEND_OP(i(read.n())?);
+            rt.LogicOp = D3D12_LOGIC_OP(i(read.n())?);
+            rt.RenderTargetWriteMask = u8::try_from(read.n()?).ok()?;
+        }
+        state.sample_mask = u(read.n())?;
+        let r = &mut state.rasterizer;
+        r.FillMode = D3D12_FILL_MODE(i(read.n())?);
+        r.CullMode = D3D12_CULL_MODE(i(read.n())?);
+        r.FrontCounterClockwise = b(read.n())?.into();
+        r.DepthBias = i(read.n())?;
+        r.DepthBiasClamp = f32::from_bits(u(read.n())?);
+        r.SlopeScaledDepthBias = f32::from_bits(u(read.n())?);
+        r.DepthClipEnable = b(read.n())?.into();
+        r.MultisampleEnable = b(read.n())?.into();
+        r.AntialiasedLineEnable = b(read.n())?.into();
+        r.ForcedSampleCount = u(read.n())?;
+        r.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE(i(read.n())?);
+        let d = &mut state.depth;
+        d.DepthEnable = b(read.n())?.into();
+        d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK(i(read.n())?);
+        d.DepthFunc = D3D12_COMPARISON_FUNC(i(read.n())?);
+        d.StencilEnable = b(read.n())?.into();
+        d.StencilReadMask = u8::try_from(read.n()?).ok()?;
+        d.StencilWriteMask = u8::try_from(read.n()?).ok()?;
+        for face in [&mut d.FrontFace, &mut d.BackFace] {
+            face.StencilFailOp = D3D12_STENCIL_OP(i(read.n())?);
+            face.StencilDepthFailOp = D3D12_STENCIL_OP(i(read.n())?);
+            face.StencilPassOp = D3D12_STENCIL_OP(i(read.n())?);
+            face.StencilFunc = D3D12_COMPARISON_FUNC(i(read.n())?);
+        }
+        for _ in 0..usize::try_from(read.n()?).ok()? {
+            let name = unescape(read.word()?)?;
+            state.names.push(CString::new(name).ok()?);
+            state.inputs.push(D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(std::ptr::null()),
+                SemanticIndex: u(read.n())?,
+                Format: DXGI_FORMAT(i(read.n())?),
+                InputSlot: u(read.n())?,
+                AlignedByteOffset: u(read.n())?,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(i(read.n())?),
+                InstanceDataStepRate: u(read.n())?,
+            });
+        }
+        for (e, name) in state.inputs.iter_mut().zip(&state.names) {
+            e.SemanticName = PCSTR(name.as_ptr().cast());
+        }
+        state.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(i(read.n())?);
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(i(read.n())?);
+        for f in &mut state.targets.RTFormats {
+            f.0 = i(read.n())?;
+        }
+        state.targets.NumRenderTargets = u(read.n())?;
+        state.depth_format = DXGI_FORMAT(i(read.n())?);
+        state.samples = DXGI_SAMPLE_DESC { Count: u(read.n())?, Quality: u(read.n())? };
+        read.done().then_some(state)
     }
 
     /// The vertex buffer slots the input layout reads.
@@ -894,7 +1125,64 @@ mod tests {
 
     use super::*;
 
-    /// A triangle mesh shader of our own and a pixel shader for it.
+    /// A state written to a dump and read back describes the same pipeline, and
+    /// the description is what a library entry is named by: an entry whose name
+    /// differs by one field is an entry the title never finds.
+    #[test]
+    fn a_state_survives_its_fields() {
+        let names = ["POSITION", "TEXCOORD", "odd name%with spaces"];
+        let mut state = GraphicsState::default();
+        state.names = names.iter().map(|n| CString::new(*n).unwrap()).collect();
+        state.inputs = names
+            .iter()
+            .zip(&state.names)
+            .enumerate()
+            .map(|(i, (_, name))| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: i as u32,
+                Format: DXGI_FORMAT(6 + i as i32),
+                InputSlot: i as u32,
+                AlignedByteOffset: D3D12_APPEND_ALIGNED_ELEMENT,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                InstanceDataStepRate: i as u32 + 1,
+            })
+            .collect();
+        state.blend.RenderTarget[2].BlendEnable = true.into();
+        state.blend.RenderTarget[2].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        state.blend.IndependentBlendEnable = true.into();
+        state.rasterizer.DepthBias = -7;
+        state.rasterizer.DepthBiasClamp = 0.125;
+        state.rasterizer.SlopeScaledDepthBias = 3.5;
+        state.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+        state.depth.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        state.depth.StencilReadMask = 0x3f;
+        state.sample_mask = 0x80;
+        state.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        state.targets.NumRenderTargets = 3;
+        state.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        state.targets.RTFormats[2] = DXGI_FORMAT_R11G11B10_FLOAT;
+        state.depth_format = DXGI_FORMAT_D32_FLOAT;
+        state.samples = DXGI_SAMPLE_DESC { Count: 4, Quality: 1 };
+        let fields = state.fields();
+        let back = GraphicsState::from_fields(&fields).expect("the state it wrote, read back");
+        assert_eq!(back.describe(), state.describe(), "fields: {fields}");
+        // And what it wrote is what it wrote: the text does not drift.
+        assert_eq!(back.fields(), fields);
+    }
+
+    /// A line that is not exactly one state is refused rather than read as a
+    /// state with defaulted fields: a silently defaulted field is a wrong name.
+    #[test]
+    fn a_cut_or_foreign_dump_line_is_refused() {
+        let fields = GraphicsState::default().fields();
+        assert!(GraphicsState::from_fields(&fields).is_some());
+        assert!(GraphicsState::from_fields(&fields[..fields.len() - 3]).is_none());
+        assert!(GraphicsState::from_fields(&format!("{fields} 0")).is_none());
+        assert!(GraphicsState::from_fields(&format!("2{}", &fields[1..])).is_none());
+        assert!(GraphicsState::from_fields("").is_none());
+    }
+
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
         void main(out vertices V v[3], out indices uint3 t[1]) {
