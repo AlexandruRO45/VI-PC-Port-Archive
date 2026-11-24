@@ -80,7 +80,7 @@ const PROJECTS = {
   victory: { name: "VIctory", branch: "victory" },
   xbox2windows: { name: "Xbox2Windows", branch: "xbox2windows" },
   tuxbox: { name: "TuxBox", branch: "tuxbox" },
-  "victory-gta6": { name: "victory-fork", branch: "victory-gta6" },
+  "victory-fork": { name: "victory-fork", branch: "victory-fork" },
 };
 const PAGE = 150;
 const cache = {}, commentCache = {};
@@ -160,6 +160,7 @@ async function renderDetail(n) {
 
 function route() {
   if (/^#leonida(\/|$)/.test(location.hash)) { location.replace(location.hash.replace("#leonida", "#leonida-old")); return; } // old links
+  if (/^#victory-gta6(\/|$)/.test(location.hash)) { location.replace(location.hash.replace("#victory-gta6", "#victory-fork")); return; } // renamed 24 Nov 2026
   const [p, n] = location.hash.slice(1).split("/");
   if (PROJECTS[p] && p !== project) { project = p; shown = PAGE; current = null; tabs(); renderList(); }
   if (n && /^\d+$/.test(n)) renderDetail(+n);

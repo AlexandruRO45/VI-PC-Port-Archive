@@ -16,7 +16,7 @@ ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HE
 | [`victory/`](victory) | VIctory: an attempt at running GTA VI on PC | `Marvisak/VIctory` | GPL-3.0 |
 | [`xbox2windows/`](xbox2windows) | Xbox2Windows: static recompilation of Xbox Series software for x64 Windows | `R0Y00/Xbox2Windows` | MIT |
 | [`tuxbox/`](tuxbox) | TuxBox: Xbox Series compatibility layer for Linux and Windows | `brcly/TuxBox` | Apache-2.0 |
-| [`victory-gta6/`](victory-gta6) | victory-fork: a fork of VIctory aimed at getting the world to render and run | `fxceless/victory-fork` (was `victory-gta6`) | GPL-3.0 |
+| [`victory-fork/`](victory-fork) | victory-fork: a fork of VIctory aimed at getting the world to render and run | `fxceless/victory-fork` (was `victory-gta6`) | GPL-3.0 |
 | [`github-export/`](github-export) | each project's issues, pull requests and comments | | |
 
 Each project folder keeps its own license file. Leonida's (old and new) `third_party/rpf9-explorer` submodule
@@ -37,7 +37,7 @@ hashes and file paths, is on its own branches:
 | VIctory | `victory/main` | `victory/pr/<number>` (612) | `victory/github-export` |
 | Xbox2Windows | `xbox2windows/main`, other branches as `xbox2windows/branch/<name>` (155), tag `xbox2windows/<tag>` | `xbox2windows/pr/<number>` (1,130) | `xbox2windows/github-export` |
 | TuxBox | `tuxbox/main`, other branches as `tuxbox/branch/<name>` (2) | `tuxbox/pr/<number>` (68) | `tuxbox/github-export` |
-| victory-fork | `victory-gta6/main` | `victory-gta6/pr/<number>` (15) | `victory-gta6/github-export` |
+| victory-fork | `victory-fork/main` | `victory-fork/pr/<number>` (43) | `victory-fork/github-export` |
 
 Get one project on its own:
 

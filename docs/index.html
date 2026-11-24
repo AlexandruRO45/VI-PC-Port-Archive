@@ -8,8 +8,8 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-gta6)(\/\d+)?$/.test(location.hash))
-    location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old"));
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-fork|victory-gta6)(\/\d+)?$/.test(location.hash))
+    location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old").replace(/^#victory-gta6/, "#victory-fork"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -194,7 +194,7 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
-  "victory-gta6": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", lic: "GPL-3.0", branch: "victory-gta6", up: "https://github.com/fxceless/victory-fork",
+  "victory-fork": { repo: "fxceless/victory-fork", saved: "24 Nov 2026", name: "victory-fork", lic: "GPL-3.0", branch: "victory-fork", up: "https://github.com/fxceless/victory-fork",
     desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
     note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-fork#status-of-this-fork-2026-11-25" },
 };

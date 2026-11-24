@@ -17,8 +17,7 @@ PROJECTS = {
     "victory": ("Marvisak/VIctory", r"## Status"),
     "xbox2windows": ("R0Y00/Xbox2Windows", r"> \*\*Current status\.\*\*"),
     "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
-    "victory-gta6": ("fxceless/victory-fork",  # renamed from victory-gta6; folder and branches keep the old name
-                     r"## Status of this fork"),
+    "victory-fork": ("fxceless/victory-fork", r"## Status of this fork"),
 }
 PUSH_BUDGET = 300  # seconds of branch pushing per project per run; the rest waits for the next run
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
