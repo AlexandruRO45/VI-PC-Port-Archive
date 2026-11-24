@@ -607,6 +607,22 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
         // which names neither link. Say where each leads and which one it
         // loops back to, keeping the OS error underneath.
         Err(err) => {
+            // A folder on the way without search permission for this user
+            // (`chmod 0` on the profile folder, or a link into another
+            // user's home): the OS says only "Permission denied", which
+            // does not say which folder to fix, and it may be several
+            // levels up or at the end of a link. Name it, keeping the OS
+            // error underneath, as for a cache or data folder.
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                && let Some(locked) = unsearchable_on_the_way(&plain)
+            {
+                return Err(err).context(format!(
+                    "{checking}: {} has no search permission for this user, so whether the \
+                     config file is there cannot be told; give it search permission, or set \
+                     VICTORY_CONFIG to a config file elsewhere",
+                    locked.display()
+                ));
+            }
             if let Some((hops, back)) = link_cycle(&plain) {
                 let hops: Vec<String> = hops
                     .iter()
@@ -701,6 +717,29 @@ fn not_a_folder_on_the_way(path: &Path) -> Option<(PathBuf, &'static str)> {
             }
         };
         return Some((at, kind));
+    }
+    None
+}
+
+/// For a `path` the OS refused with "Permission denied": the folder on
+/// the way to where it leads (through its chain of links, as [`link_hops`]
+/// follows them) that this user cannot search, as it is written from that
+/// chain: the parent of the first name that cannot even be looked at.
+/// `None` when every name can be looked at (the file itself is what is
+/// refused, or the folder changed meanwhile).
+fn unsearchable_on_the_way(path: &Path) -> Option<PathBuf> {
+    let mut end = path.to_path_buf();
+    for target in link_hops(path) {
+        end = end.parent().unwrap_or(Path::new("")).join(&target);
+    }
+    let mut at = PathBuf::new();
+    for part in end.components() {
+        at.push(part);
+        if std::fs::symlink_metadata(&at)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return at.parent().map(Path::to_path_buf);
+        }
     }
     None
 }
@@ -3780,7 +3819,13 @@ mod tests {
             let text = err.to_string();
             assert_eq!(
                 text,
-                format!("checking the config file {}", default.display())
+                format!(
+                    "checking the config file {}: {} has no search permission for this user, \
+                     so whether the config file is there cannot be told; give it search \
+                     permission, or set VICTORY_CONFIG to a config file elsewhere",
+                    default.display(),
+                    locked.display()
+                )
             );
 
             // The same through VICTORY_CONFIG, naming the variable.
@@ -3789,10 +3834,61 @@ mod tests {
                 err.downcast_ref::<std::io::Error>().unwrap().kind(),
                 std::io::ErrorKind::PermissionDenied
             );
-            assert_eq!(
-                err.to_string(),
-                format!("checking VICTORY_CONFIG at {}", default.display())
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "checking VICTORY_CONFIG at {}: {} has no search permission",
+                    default.display(),
+                    locked.display()
+                )),
+                "{err:#}"
             );
+
+            // Several levels below the locked folder: the folder named is
+            // the one without search permission, not the file's own.
+            let deep = locked.join("profiles").join("main").join("victory.toml");
+            let err = config_file(Some(deep.clone())).unwrap_err();
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "checking VICTORY_CONFIG at {}: {} has no search permission",
+                    deep.display(),
+                    locked.display()
+                )),
+                "{err:#}"
+            );
+
+            // A link that is itself readable but leads into the locked
+            // folder: the folder named is the one at the end of the link,
+            // as the link writes it, not the link's own folder.
+            let link = dir.join("link.toml");
+            std::os::unix::fs::symlink(&default, &link).unwrap();
+            for config in [link.clone(), PathBuf::from(format!("{}/", link.display()))] {
+                let err = config_file(Some(config.clone())).unwrap_err();
+                assert_eq!(
+                    err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+                assert!(
+                    err.to_string().starts_with(&format!(
+                        "checking VICTORY_CONFIG at {}: {} has no search permission",
+                        config.display(),
+                        locked.display()
+                    )),
+                    "{err:#}"
+                );
+            }
+            // A relative link target is followed from the link's folder.
+            std::fs::remove_file(&link).unwrap();
+            std::os::unix::fs::symlink("locked/victory.toml", &link).unwrap();
+            let err = config_file(Some(link.clone())).unwrap_err();
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "checking VICTORY_CONFIG at {}: {} has no search permission",
+                    link.display(),
+                    dir.join("locked").display()
+                )),
+                "{err:#}"
+            );
+            std::fs::remove_file(&link).unwrap();
 
             // A trailing slash changes nothing: still unreadable, never
             // taken for a file named with a slash.
