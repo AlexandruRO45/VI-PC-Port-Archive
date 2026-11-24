@@ -9,6 +9,7 @@
 
 # Build output
 /target/
+/apps/victory/ui/node_modules/
 /tests/fixtures/*/target/
 
 # Local configuration (contains paths to YOUR files)

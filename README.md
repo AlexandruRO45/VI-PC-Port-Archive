@@ -72,6 +72,18 @@ target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf 
 target\release\victory.exe run <game dir>\<the title's exe> --execute
 ```
 
+The Windows desktop launcher uses Python 3.13, PySide6, and Qt Quick/QML.
+For development, create its Python environment outside the repository and
+install the requirements in apps/victory/launcher/requirements.txt as described
+in the [launcher README](apps/victory/launcher/README.md). Then run:
+
+    cargo run -p victory -- gui
+
+A portable Windows build can include the packaged Python and Qt runtime beside
+victory.exe. Choose the title executable in its existing game directory;
+VIctory records that selection and the launch log under
+%LOCALAPPDATA%\victory\launcher. The desktop app starts the same run --execute
+path as the command-line tool.
 The `translate --cache` step (minutes; again after a change of the shader
 translator) translates every shader the title can ask for into the cache
 (about 1.3 GB), so a run does not translate them while it plays; without it
@@ -119,6 +131,7 @@ victory translate [paths...] --cache [--pipelines] [--jobs N]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
+victory gui
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
