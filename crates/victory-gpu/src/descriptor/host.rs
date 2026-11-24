@@ -583,7 +583,17 @@ impl HostHeap {
                     View::Shader(..) => "host view not made: shader resource",
                     View::Unordered(..) => "host view not made: unordered access",
                     View::Placed(true, r, _) if r[0] != 1 => "host view not made: placed UAV texture (not mirrored)",
-                    View::Placed(..) => "host view not made: placed resource",
+                    View::Placed(true, _, _) => "host view not made: placed UAV buffer",
+                    View::Placed(false, r, _) if r[0] == 1 => "host view not made: placed buffer",
+                    View::Placed(false, r, desc) => {
+                        #[cfg(feature = "diagnostics")]
+                        placed_detail(r, desc);
+                        if placed_texture(&view).is_none() {
+                            "host view not made: placed texture (no host texture at its address)"
+                        } else {
+                            "host view not made: placed texture (view refused)"
+                        }
+                    }
                     View::Sampler(..) | View::ConsoleSampler(..) => "host view not made: sampler",
                 });
             }
@@ -1405,6 +1415,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 
 /// A shader view of a texture the title placed in memory itself, as a view
 /// of the resource made for that memory (on first use).
+/// Local build (diagnostics): the first distinct (dimension, format, layout, size) of placed
+/// textures whose host view could not be made.
+#[cfg(feature = "diagnostics")]
+fn placed_detail(resource: &[u32; 14], desc: &[u32; 16]) {
+    static SEEN: std::sync::Mutex<Vec<(u32, u32, u32, u32, u32)>> = std::sync::Mutex::new(Vec::new());
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { resource.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+    let key = (d.dimension, d.format, d.layout, d.width as u32, d.height);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 40 && !seen.contains(&key) {
+        seen.push(key);
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        tracing::info!(dimension = d.dimension, format = d.format, layout = format_args!("{:#x}", d.layout), width = d.width, height = d.height, mips = d.mip_levels, address = format_args!("{address:#x}"), has_texture = crate::resource::texture_at(address, resource).is_some(), "placed texture view not made");
+    }
+}
+
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {

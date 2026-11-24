@@ -85,16 +85,16 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
+    pub(crate) dimension: u32,
     alignment: u64,
-    width: u64,
-    height: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
     depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
     sample_count: u32,
     sample_quality: u32,
-    layout: u32,
+    pub(crate) layout: u32,
     flags: u32,
 }
 
