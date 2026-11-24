@@ -40,3 +40,12 @@ class D3D12RegressionTests(unittest.TestCase):
         record="TuxBox d3d12_xs: buffer backing path=strict_rejected count=1 source=place_virtual bytes=65536"
         self.assertTrue(validate("buffer-import-reject","10de:2704",0,negative+"\n"+record)[0])
         self.assertFalse(validate("buffer-import-reject","10de:2704",0,negative)[0])
+
+    def test_alias_budget_requires_timing_and_late_publication(self):
+        line="d3d12-alias-budget PASS pci=10de:2704 overlaps=2 old=verified refreshed=verified shared_budget=1"
+        timeout="TuxBox d3d12_xs: placed texture layout alias before GPU write publication timed out"
+        log="\n".join([line,timeout,timeout,"alias budget observed ms=1999"])
+        self.assertTrue(validate("alias-budget","10de:2704",0,log)[0])
+        self.assertFalse(validate("alias-budget","10de:2704",0,log.replace("1999","4000"))[0])
+        self.assertFalse(validate("alias-budget","10de:2704",0,log+"\nFailed to signal event")[0])
+        self.assertFalse(validate("alias-budget","10de:2704",0,line)[0])

@@ -1,6 +1,7 @@
 //! Keep CPU-backed tiled Xbox textures coherent with their desktop images.
 mod descriptors;
 mod publication;
+mod publication_budget;
 mod upload;
 mod writeback;
 pub(crate) use descriptors::{DescriptorMap, DescriptorRange, HeapViews, PlacedView, Views};
@@ -533,21 +534,18 @@ const PUBLICATION_WAIT_MS: u32 = 2000;
 
 /// Wait on the CPU for `value`. False if the device was lost, the wait failed
 /// or it timed out; the caller then falls back without failing the queue.
-fn wait_for_publication(fence: &ID3D12Fence, value: u64) -> bool {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    let reached = |fence: &ID3D12Fence| {
+fn wait_for_publication(fence: &ID3D12Fence, value: u64, budget: &mut publication_budget::Budget) -> bool {
+    // D3D12 has no cancellation for SetEventOnCompletion. Closing a
+    // timed-out event leaves a pending registration in the driver, which
+    // may signal an invalid/reused handle when publication finally arrives.
+    // Poll only the incomplete fences, within the shared batch budget.
+    loop {
         let done = unsafe { fence.GetCompletedValue() };
-        done != u64::MAX && done >= value
-    };
-    if reached(fence) {
-        return true;
+        if done == u64::MAX { return false; }
+        if done >= value { return true; }
+        let Some(remaining) = budget.remaining_ms(std::time::Instant::now()) else { return false; };
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(remaining.min(2))));
     }
-    let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else { return false };
-    let signalled = unsafe { fence.SetEventOnCompletion(value, event) }.is_ok()
-        && unsafe { WaitForSingleObject(event, PUBLICATION_WAIT_MS) } == WAIT_OBJECT_0;
-    let _ = unsafe { CloseHandle(event) };
-    signalled && reached(fence)
 }
 
 /// Report an aliasing case that is handled by degrading, a bounded number of times.
@@ -625,6 +623,10 @@ pub(crate) unsafe fn submit(
     refresh
         .try_reserve(textures.len())
         .map_err(|_| E_OUTOFMEMORY)?;
+    // One wall-clock budget for all distinct-image overlaps in this batch.
+    // A dense descriptor heap must not multiply a two-second driver stall
+    // by the number of overlapping views or pending writes.
+    let mut budget = publication_budget::Budget::new(PUBLICATION_WAIT_MS);
     for texture in textures.iter() {
         let mut pending = false;
         for write in submission
@@ -636,7 +638,7 @@ pub(crate) unsafe fn submit(
                 // Another image wrote this memory and has not published it yet.
                 // Wait for the publication so the refresh below reads the
                 // written bytes. If it does not arrive, keep the current image.
-                if wait_for_publication(&write.published, write.tick) {
+                if wait_for_publication(&write.published, write.tick, &mut budget) {
                     continue;
                 }
                 report_alias("placed texture layout alias before GPU write publication timed out");
