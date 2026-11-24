@@ -7132,7 +7132,7 @@ mod tests {
             0xBE86_0380, // s_mov_b32 s6, 0
             S_ENDPGM,
         ];
-        lowers(&words).unwrap();
+        lowers(&words, 0).unwrap();
     }
 
     #[test]
