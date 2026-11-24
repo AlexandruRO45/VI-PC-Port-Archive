@@ -3035,6 +3035,19 @@ mod tests {
     /// A pixel program with a table in s4 (slot 2), a root descriptor in
     /// s6-s7 (slot 3), and these (kind, root type, table offset) reads.
     fn reading(reads: &[(u8, u8, u32)]) -> Result<Vec<NativeProgram>, ShaderError> {
+        let named = reads
+            .iter()
+            .map(|&(kind, root, offset)| {
+                let (user_data, slot) = if root == 3 { (4, 2) } else { (6, 3) };
+                (kind, root, offset, user_data, slot)
+            })
+            .collect::<Vec<_>>();
+        reading_named(&named)
+    }
+
+    /// As [`reading`], with each read's (kind, root type, table offset,
+    /// user data, slot) stated in full.
+    fn reading_named(reads: &[(u8, u8, u32, u8, u8)]) -> Result<Vec<NativeProgram>, ShaderError> {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
         let tables = (blob.len() - FSSM_HEADER) as u64;
@@ -3044,8 +3057,7 @@ mod tests {
             }
             blob.extend_from_slice(&[user_data, slot, 0, 0]);
         }
-        for &(kind, root, offset) in reads {
-            let (user_data, slot) = if root == 3 { (4, 2) } else { (6, 3) };
+        for &(kind, root, offset, user_data, slot) in reads {
             blob.extend_from_slice(&[kind, root, 0, 0]);
             for v in [offset, 0, 0] {
                 blob.extend_from_slice(&v.to_le_bytes());
@@ -3183,6 +3195,67 @@ mod tests {
                 "{what}"
             );
         }
+    }
+
+    #[test]
+    fn reads_breaking_several_rules_are_named_for_the_first_checked() {
+        let (srv, sampler, cbv, uav) = (0u8, 1u8, 2u8, 3u8);
+        let (descriptor, table, unknown) = (1u8, 3u8, 2u8);
+        // The reads breaking each rule, in the order the rules are checked.
+        // Each row below holds the reads breaking its rule and every later
+        // one, the first-checked rule's read listed last.
+        let rules: [(&[(u8, u8, u32, u8, u8)], &str); 7] = [
+            (&[(4, table, 0, 4, 2)], "used descriptor of unknown kind"),
+            (
+                &[(srv, unknown, 0, 4, 2)],
+                "used descriptor of unknown root kind",
+            ),
+            (
+                &[(srv, table, 0, 5, 2)],
+                "used descriptor names no root table",
+            ),
+            (
+                &[(cbv, descriptor, 0, 8, 3)],
+                "used descriptor names no root descriptor",
+            ),
+            (
+                &[(cbv, table, MAX_TABLE_DWORDS, 4, 2)],
+                "used descriptor past any heap",
+            ),
+            (
+                &[(srv, table, 16, 4, 2), (uav, table, 16, 4, 2)],
+                "used descriptors read one descriptor two ways",
+            ),
+            (
+                &[(sampler, table, 0, 4, 2), (srv, table, 8, 4, 2)],
+                "root table mixes samplers and views",
+            ),
+        ];
+        for (k, &(_, why)) in rules.iter().enumerate() {
+            let reads = rules[k..]
+                .iter()
+                .rev()
+                .flat_map(|(reads, _)| reads.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(why_refused(reading_named(&reads)), why, "{reads:?}");
+            // Listed first, too.
+            let first = rules[k..]
+                .iter()
+                .flat_map(|(reads, _)| reads.iter().copied())
+                .collect::<Vec<_>>();
+            assert_eq!(why_refused(reading_named(&first)), why, "{first:?}");
+        }
+        // Each rule's reads named in full, without the others, are well
+        // formed once the breaking byte is put right.
+        assert!(
+            reading_named(&[
+                (srv, table, 0, 4, 2),
+                (cbv, descriptor, 0, 6, 3),
+                (cbv, table, MAX_TABLE_DWORDS - 8, 4, 2),
+                (uav, table, 16, 4, 2),
+            ])
+            .is_ok()
+        );
     }
 
     fn why_refused(r: Result<Vec<NativeProgram>, ShaderError>) -> &'static str {
