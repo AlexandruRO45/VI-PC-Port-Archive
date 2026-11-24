@@ -1328,9 +1328,11 @@ fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
 #[test]
 fn fspx_programs_run_with_the_hardwares_dot_products() {
     let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    // Add tid.x (0 in [1,1,1]) so drivers without native dot4 (RDNA1) keep
+    // the operands as runtime values instead of constant-folding bytes unsigned.
     let mut load = Vec::new();
     for (v, x) in [(1, a), (2, b), (3, acc)] {
-        load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
+        load.extend([0x25 << 25 | (v as u32) << 17 | 0xFF, x]); // v_add_nc_u32 vN, literal, v0
     }
     let cases: [(Vec<u32>, u32); 4] = [
         (
@@ -1356,7 +1358,7 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
         ),
     ];
     for (body, want) in cases {
-        let mut words = load.clone();
+        let mut words = load.to_vec();
         words.extend(&body);
         let shader = fspx_cs(&words);
         run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
