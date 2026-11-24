@@ -694,6 +694,12 @@ struct Request {
     name: *const c_char,
 }
 
+impl Request {
+    fn has_supported_options(&self) -> bool {
+        self.options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) == 0
+    }
+}
+
 // Request options.
 /// Inflate zlib (RFC 1950) data.
 const ZLIB: u64 = 1;
@@ -850,7 +856,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
         );
         hr
     };
-    if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
+    if !request.has_supported_options() {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
     if request.source.is_null() || request.destination.is_null() {
@@ -1368,15 +1374,23 @@ mod tests {
 
         // A later failure starts a fresh record. Retrieve while the event
         // is still signaled, before a wait can consume the signal.
-        enqueue(queue, &first);
+        // Use a live file object so an accidental lookup returns its filename.
+        let unsupported = Request {
+            options: 1 << 23, // Physical-page source.
+            ..first
+        };
+        enqueue(queue, &unsupported);
         enqueue_status(queue, array, 0);
         void(queue, 0x30);
-        assert_eq!(wait(array, 0), END_OF_FILE);
+        assert_eq!(wait(array, 0), E_NOTIMPL);
         retrieve(queue, &mut out.record);
         assert_eq!(
             (out.record.failure_count, out.record.first.result),
-            (1, END_OF_FILE),
+            (1, E_NOTIMPL),
         );
+        assert_eq!(out.record.first.options, unsupported.options);
+        assert_eq!(out.record.first.file_offset, 0);
+        assert_eq!(out.record.first.filename[0], 0);
         assert_eq!(poll_event(&event), WAIT_TIMEOUT);
 
         for object in [queue, idle_queue, array, file] {

@@ -90,9 +90,9 @@ impl ReadFailure {
         };
         if request.options & MEMORY_SOURCE != 0 {
             record.source = request.source as usize;
-        } else {
+        } else if request.has_supported_options() {
             record.file_offset = request.offset;
-            // SAFETY: a file request names a live file object, or null.
+            // SAFETY: supported file requests name a live file object or null.
             if let Some(file) = unsafe { request.source.cast::<Instance<File>>().as_ref() } {
                 let filename = &file.state.filename;
                 let length = filename.len().min(record.filename.len() - 1);
