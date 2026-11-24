@@ -4646,7 +4646,8 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_div_scale_f32" => {
-                let (a, num, den) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                // RDNA2 ISA: src0 = value to scale, src1 = denominator, src2 = numerator.
+                let (a, den, num) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
                 let (ai, ni, di) = (self.as_int(a), self.as_int(num), self.as_int(den));
                 let (k23, k255, kabs) = (
                     self.s.m.i32(23),
@@ -4666,20 +4667,21 @@ impl<'a> Lower<'a> {
                 let (e1, e2) = (exp_of(self, ni), exp_of(self, di));
                 let n_abs = self.s.m.bin(c, Bin::And, ni, kabs);
                 let d_abs = self.s.m.bin(c, Bin::And, di, kabs);
+                let z1 = self.s.m.cmp(c, pred::EQ, n_abs, zero);
+                let z2 = self.s.m.cmp(c, pred::EQ, d_abs, zero);
+                let any_zero = self.s.m.bin(c, Bin::Or, z1, z2);
                 let special = {
                     let s1 = self.s.m.cmp(c, pred::EQ, e1, k255);
                     let s2 = self.s.m.cmp(c, pred::EQ, e2, k255);
-                    let z1 = self.s.m.cmp(c, pred::EQ, n_abs, zero);
-                    let z2 = self.s.m.cmp(c, pred::EQ, d_abs, zero);
                     let a12 = self.s.m.bin(c, Bin::Or, s1, s2);
-                    let z12 = self.s.m.bin(c, Bin::Or, z1, z2);
-                    self.s.m.bin(c, Bin::Or, a12, z12)
+                    self.s.m.bin(c, Bin::Or, a12, any_zero)
                 };
                 let is_den = self.s.m.cmp(c, pred::EQ, ai, di);
                 let diff = self.s.m.bin(c, Bin::Sub, e2, e1);
                 let den_tiny = self.s.m.cmp(c, pred::IULE, e2, k23_exp);
                 let den_huge = self.s.m.cmp(c, pred::IUGE, e2, k232_exp);
                 let num_tiny_exp = self.s.m.cmp(c, pred::IULE, e1, k23_exp);
+                let num_huge = self.s.m.cmp(c, pred::IUGE, e1, k232_exp);
                 let num_gap = self.s.m.cmp(c, pred::SGE, diff, k96);
                 let not_den_huge = {
                     let t = self.s.m.bool(true);
@@ -4688,8 +4690,7 @@ impl<'a> Lower<'a> {
                 let num_gap = self.s.m.bin(c, Bin::And, num_gap, not_den_huge);
                 let num_tiny = self.s.m.bin(c, Bin::Or, num_tiny_exp, num_gap);
                 let up_raw = self.s.m.select(c, is_den, den_tiny, num_tiny);
-                let f_false = self.s.m.bool(false);
-                let dn_raw = self.s.m.select(c, is_den, den_huge, f_false);
+                let dn_raw = self.s.m.select(c, is_den, den_huge, num_huge);
                 let not_special = {
                     let t = self.s.m.bool(true);
                     self.s.m.bin(c, Bin::Xor, special, t)
@@ -4697,8 +4698,9 @@ impl<'a> Lower<'a> {
                 let up = self.s.m.bin(c, Bin::And, up_raw, not_special);
                 let dn = self.s.m.bin(c, Bin::And, dn_raw, not_special);
                 let uncancelled = {
-                    let x = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
-                    self.s.m.bin(c, Bin::Or, x, den_huge)
+                    let x_tiny = self.s.m.bin(c, Bin::Xor, den_tiny, num_tiny);
+                    let x_huge = self.s.m.bin(c, Bin::Xor, den_huge, num_huge);
+                    self.s.m.bin(c, Bin::Or, x_tiny, x_huge)
                 };
                 let flag_raw = self.s.m.select(c, is_den, uncancelled, up_raw);
                 let flag = self.s.m.bin(c, Bin::And, flag_raw, not_special);
@@ -4708,6 +4710,8 @@ impl<'a> Lower<'a> {
                 let a_dn = self.s.m.bin(c, Bin::Mul, a, k_dn);
                 let r = self.s.m.select(c, dn, a_dn, a);
                 let r = self.s.m.select(c, up, a_up, r);
+                let qnan = self.s.m.f32(0x7FC0_0000);
+                let r = self.s.m.select(c, any_zero, qnan, r);
                 float(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))

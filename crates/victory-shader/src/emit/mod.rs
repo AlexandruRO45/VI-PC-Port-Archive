@@ -819,17 +819,17 @@ mod tests {
             0xE034_1000,
             0x8002_0107, // buffer_load_dwordx2 v[1:2], v7, s[8:11], 0 offen
             0xD56D_6A03,
-            0x040A_0302, // v_div_scale_f32 v3, vcc_lo, v2, v1, v2
-            0xD56D_1001,
-            0x040A_0301, // v_div_scale_f32 v1, s16, v1, v1, v2
+            0x0406_0502, // v_div_scale_f32 v3, vcc_lo, v2, v2, v1
+            0xD56D_1008,
+            0x0406_0501, // v_div_scale_f32 v8, s16, v1, v2, v1
             0x7E08_5503, // v_rcp_f32 v4, v3
             0xD54B_0005,
             0x23CA_0903, // v_fma_f32 v5, -v3, v4, 1.0
             0xD54B_0004,
             0x0412_0905, // v_fma_f32 v4, v5, v4, v4
-            0x100A_0901, // v_mul_f32 v5, v1, v4
+            0x100A_0908, // v_mul_f32 v5, v8, v4
             0xD54B_0006,
-            0x2406_0B03, // v_fma_f32 v6, -v3, v5, v1
+            0x2422_0B03, // v_fma_f32 v6, -v3, v5, v8
             0xD56F_0004,
             0x0416_0906, // v_div_fmas_f32 v4, v6, v4, v5
             0xD55F_0001,
@@ -842,7 +842,7 @@ mod tests {
         let native = super::NativeProgram {
             stage: super::HwStage::Cs,
             wave64: false,
-            vgprs: 8,
+            vgprs: 9,
             layout: vec![
                 crate::RootParam {
                     root: crate::RootType::Constants,
@@ -885,7 +885,7 @@ mod tests {
             ],
             io: crate::native::StageIo::Cs(crate::native::ComputeIo {
                 rsrc2: 5 << 1,
-                threads: [6, 1, 1],
+                threads: [7, 1, 1],
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -926,7 +926,7 @@ mod tests {
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
-                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0,
+                7.0f32, 3.0, -1.0, 1e-40, 1.0, 1e35, 1e-35, 1e-36, 0.0, 0.0, -1.0, 0.0, -1e35, 1e35,
             ]
             .into_iter()
             .map(f32::to_bits)
@@ -949,7 +949,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let got: Vec<f32> = out[0][..6].iter().copied().map(f32::from_bits).collect();
+            let got: Vec<f32> = out[0][..7].iter().copied().map(f32::from_bits).collect();
             assert!((got[0] - (7.0f32 / 3.0)).abs() < 1e-6, "got {:?}", got);
             assert_eq!(out[0][1], (-1.0f32 / 1e-40).to_bits());
             assert!(
@@ -966,6 +966,12 @@ mod tests {
             );
             assert_eq!(out[0][4], 0xFFC0_0000);
             assert_eq!(out[0][5], (-1.0f32 / 0.0).to_bits());
+            assert!(
+                (got[6] - (-1.0)).abs() < 1e-6,
+                "lane 6 got {:?} ({:#x})",
+                got[6],
+                out[0][6]
+            );
         }
     }
 }
