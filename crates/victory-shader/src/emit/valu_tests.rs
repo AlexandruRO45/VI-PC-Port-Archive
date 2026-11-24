@@ -118,7 +118,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
 /// Lowers a synthetic RDNA2 compute shader of `threads` threads in one row
 /// (thread id in `v0`): 4 dwords of root constants in `s0..s3`, the
 /// descriptor table address in `s4`, a raw UAV at heap index 0.
-fn build_cs(words: &[u32], threads: u32) -> HostShader {
+fn build_cs(words: &[u32], threads: u32) -> Result<HostShader, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -2274,6 +2274,7 @@ fn relative_moves_reach_only_what_their_clamped_index_can() {
         "{:?}",
         refused.err()
     );
+}
 
 /// One wave of 32 lanes holding 1..=32 (the input of the ISA's examples)
 /// through `ds_swizzle_b32` with `offset`: what each lane reads.
@@ -2285,7 +2286,7 @@ fn swizzle_32(offset: u16) -> Vec<Vec<u32>> {
     words.push(vop2(0x1A, 3, 130, 0)); // v_lshlrev_b32 v3, 2, v0
     words.extend_from_slice(&buffer_store_dword_offen(2, 3, 8));
     words.push(S_ENDPGM);
-    let shader = build_cs(&words, 32);
+    let shader = build_cs(&words, 32).expect("build");
 
     let mut out = Vec::new();
     for (label, warp) in [("hardware", false), ("warp", true)] {
