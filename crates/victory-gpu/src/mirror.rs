@@ -130,6 +130,32 @@ fn make_views(device: &ID3D12Device) -> Vec<ID3D12Resource> {
     views
 }
 
+/// The host GPU address of title address 0 in the mirror, a page no title copy maps (title
+/// memory starts past the first 64 KiB): a null root view, where reads give zeros and writes
+/// go nowhere. `None` without the mirror or without tiled resources tier 2 (which defines
+/// unmapped tiles that way).
+pub(crate) fn null_va() -> Option<u64> {
+    static TIER2: OnceLock<bool> = OnceLock::new();
+    let mirror = get()?;
+    let tier2 = *TIER2.get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: the query writes this feature's structure.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+        supported.is_ok() && options.TiledResourcesTier.0 >= D3D12_TILED_RESOURCES_TIER_2.0
+    });
+    let unmapped = !mirror.pages.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&0);
+    (tier2 && unmapped).then_some(mirror.va)
+}
+
 /// The mirror, made on first use; `None` if it is off or the host refuses it.
 pub(crate) fn get() -> Option<&'static Mirror> {
     static MIRROR: OnceLock<Option<Mirror>> = OnceLock::new();
