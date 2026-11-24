@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HostList, crumbs};
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
 
@@ -294,6 +294,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        crumbs::record(crumbs::TARGETS, rtvs.len() as u64, u32::from(dsv.is_some()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -629,6 +630,7 @@ impl State {
             s.gpu_writes(list, *a, len);
         }
         let handle = host.gpu_handle(index);
+        crumbs::record(crumbs::VIEW, u64::from(index), param);
         unsafe {
             if compute {
                 list.list.SetComputeRootDescriptorTable(param, handle);
@@ -667,6 +669,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        crumbs::record(crumbs::DISPATCH, u64::from(x), y);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -717,15 +720,26 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        // A group count past the host's limit is an invalid command, and
+        // the title's count reaches it from a pass the host may have
+        // dropped: the clamp holds indirect arguments to the same bound.
+        let groups = crate::indirect::mesh_groups(x);
+        if groups != x {
+            once!(
+                groups = format_args!("{x}"),
+                "a mesh dispatch of {x} groups, past the host's {groups}-group limit, runs {groups}"
+            );
+        }
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        self.trace("mesh", groups, 0);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.note_op(|| self.op_text(format!("mesh {groups}"), false));
+                    crumbs::record(crumbs::MESH, u64::from(groups), 0);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { l6.DispatchMesh(groups, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -983,6 +997,7 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            crumbs::record(crumbs::DRAW, u64::from(count), instances);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1070,6 +1085,7 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            crumbs::record(crumbs::DRAW_INDEXED, u64::from(indices), instances);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1174,6 +1190,7 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        crumbs::record(crumbs::INDIRECT, arguments, kind);
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {

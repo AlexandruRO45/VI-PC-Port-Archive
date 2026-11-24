@@ -82,6 +82,146 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// The host operations recorded since the host GPU was made, for a removal
+/// no layer explains: this host keeps neither the debug layer's messages nor
+/// device-removed breadcrumbs, so the last calls the host recorded are the
+/// only account of the call that was invalid. Recording is a few relaxed
+/// stores per command; [`record`] never allocates or formats, [`dump`] does
+/// both once, when the GPU has already failed.
+pub(crate) mod crumbs {
+    use std::fmt::Write;
+    use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+
+    /// What [`record`] was called for; [`op_name`] names them in a dump.
+    pub(crate) const DRAW: u16 = 1;
+    pub(crate) const DRAW_INDEXED: u16 = 2;
+    pub(crate) const DISPATCH: u16 = 3;
+    pub(crate) const MESH: u16 = 4;
+    pub(crate) const INDIRECT: u16 = 5;
+    pub(crate) const COPY: u16 = 6;
+    pub(crate) const COPY_RESOURCE: u16 = 7;
+    pub(crate) const CLEAR_RTV: u16 = 8;
+    pub(crate) const CLEAR_DSV: u16 = 9;
+    pub(crate) const BARRIER: u16 = 10;
+    pub(crate) const TRANSITION: u16 = 11;
+    pub(crate) const TARGETS: u16 = 12;
+    pub(crate) const VIEW: u16 = 13;
+    pub(crate) const EXECUTE: u16 = 14;
+    pub(crate) const RESET: u16 = 15;
+    pub(crate) const CLOSE: u16 = 16;
+    pub(crate) const RESOURCE_CREATE: u16 = 17;
+    pub(crate) const RESOURCE_DESTROY: u16 = 18;
+    pub(crate) const RESOLVE: u16 = 19;
+    pub(crate) const PRESENT: u16 = 20;
+
+    /// How many of the newest operations a failure reports.
+    pub(crate) const SHOWN: usize = 64;
+
+    fn op_name(op: u16) -> &'static str {
+        match op {
+            DRAW => "draw",
+            DRAW_INDEXED => "draw_indexed",
+            DISPATCH => "dispatch",
+            MESH => "mesh",
+            INDIRECT => "indirect",
+            COPY => "copy",
+            COPY_RESOURCE => "copy_resource",
+            CLEAR_RTV => "clear_rtv",
+            CLEAR_DSV => "clear_dsv",
+            BARRIER => "barrier",
+            TRANSITION => "transition",
+            TARGETS => "targets",
+            VIEW => "view",
+            EXECUTE => "execute",
+            RESET => "reset",
+            CLOSE => "close",
+            RESOURCE_CREATE => "resource_create",
+            RESOURCE_DESTROY => "resource_destroy",
+            RESOLVE => "resolve",
+            PRESENT => "present",
+            _ => "unknown",
+        }
+    }
+
+    /// Entries in the ring: a submission or two of commands.
+    pub(crate) const ENTRIES: u64 = 256;
+
+    /// One recorded operation: what it was, and the two values it named (an
+    /// address, count, index or state, per opcode).
+    struct Entry {
+        op: AtomicU16,
+        a: AtomicU64,
+        b: AtomicU32,
+    }
+
+    /// The operations recorded so far, most recent last, in a ring of
+    /// [`ENTRIES`].
+    pub(crate) struct Ring {
+        entries: [Entry; ENTRIES as usize],
+        recorded: AtomicU64,
+    }
+
+    impl Ring {
+        pub(crate) const fn new() -> Ring {
+            Ring {
+                entries: [const {
+                    Entry {
+                        op: AtomicU16::new(0),
+                        a: AtomicU64::new(0),
+                        b: AtomicU32::new(0),
+                    }
+                }; ENTRIES as usize],
+                recorded: AtomicU64::new(0),
+            }
+        }
+
+        /// Records one operation as the host records the command it
+        /// describes. `a` and `b` are that call's address, count, index or
+        /// state: a create or destroy names the title address it gives or
+        /// frees.
+        pub(crate) fn record(&self, op: u16, a: u64, b: u32) {
+            let at = self.recorded.fetch_add(1, Ordering::Relaxed) % ENTRIES;
+            let entry = &self.entries[at as usize];
+            entry.a.store(a, Ordering::Relaxed);
+            entry.b.store(b, Ordering::Relaxed);
+            entry.op.store(op, Ordering::Relaxed);
+        }
+
+        /// The newest `newest` operations, oldest first, one per line as
+        /// `op=<name> a=<hex> b=<decimal>`: what the host last did.
+        pub(crate) fn dump(&self, newest: usize) -> String {
+            let recorded = self.recorded.load(Ordering::Relaxed);
+            let count = recorded.min(ENTRIES).min(newest as u64);
+            let mut text = String::new();
+            for (i, at) in (recorded - count..recorded).enumerate() {
+                let entry = &self.entries[(at % ENTRIES) as usize];
+                let op = entry.op.load(Ordering::Relaxed);
+                let (a, b) = (
+                    entry.a.load(Ordering::Relaxed),
+                    entry.b.load(Ordering::Relaxed),
+                );
+                if i > 0 {
+                    text.push('\n');
+                }
+                let _ = write!(text, "op={} a={a:#x} b={b}", op_name(op));
+            }
+            text
+        }
+    }
+
+    static RING: Ring = Ring::new();
+
+    /// Records one operation on the host's ring.
+    pub(crate) fn record(op: u16, a: u64, b: u32) {
+        RING.record(op, a, b);
+    }
+
+    /// The newest `newest` operations the host recorded, oldest first.
+    pub(crate) fn dump(newest: usize) -> String {
+        RING.dump(newest)
+    }
+}
+
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
 /// draws nothing at seconds per frame.
@@ -109,6 +249,7 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             ),
             None => {}
         }
+        text.push_str(&ops_text());
     }
     tracing::error!("{text}");
     match ON_FAILURE.get() {
@@ -251,6 +392,70 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ring_keeps_the_newest_operations_oldest_first() {
+        let ring = crumbs::Ring::new();
+        assert_eq!(ring.dump(crumbs::SHOWN), "");
+        let recorded = crumbs::SHOWN as u64 + 200;
+        for n in 0..recorded {
+            ring.record(crumbs::DRAW, n, n as u32);
+        }
+        let dump = ring.dump(crumbs::SHOWN);
+        let lines: Vec<&str> = dump.lines().collect();
+        assert_eq!(lines.len(), crumbs::SHOWN);
+        let oldest = recorded - crumbs::SHOWN as u64;
+        let newest = recorded - 1;
+        assert_eq!(lines[0], format!("op=draw a={oldest:#x} b={oldest}"));
+        assert_eq!(
+            lines[crumbs::SHOWN - 1],
+            format!("op=draw a={newest:#x} b={newest}")
+        );
+        // Wrapped: the ring holds the last entries only, the newest last.
+        let whole = ring.dump(crumbs::ENTRIES as usize);
+        let all: Vec<&str> = whole.lines().collect();
+        assert_eq!(all.len(), crumbs::ENTRIES as usize);
+        let first_kept = recorded - crumbs::ENTRIES;
+        assert_eq!(all[0], format!("op=draw a={first_kept:#x} b={first_kept}"));
+        assert_eq!(
+            ring.dump(1),
+            format!("op=draw a={newest:#x} b={newest}"),
+            "the single newest entry, on its own line"
+        );
+        // Each opcode dumps by name.
+        let opcodes = [
+            (crumbs::DRAW_INDEXED, "draw_indexed"),
+            (crumbs::DISPATCH, "dispatch"),
+            (crumbs::MESH, "mesh"),
+            (crumbs::INDIRECT, "indirect"),
+            (crumbs::COPY, "copy"),
+            (crumbs::COPY_RESOURCE, "copy_resource"),
+            (crumbs::CLEAR_RTV, "clear_rtv"),
+            (crumbs::CLEAR_DSV, "clear_dsv"),
+            (crumbs::BARRIER, "barrier"),
+            (crumbs::TRANSITION, "transition"),
+            (crumbs::TARGETS, "targets"),
+            (crumbs::VIEW, "view"),
+            (crumbs::EXECUTE, "execute"),
+            (crumbs::RESET, "reset"),
+            (crumbs::CLOSE, "close"),
+            (crumbs::RESOURCE_CREATE, "resource_create"),
+            (crumbs::RESOURCE_DESTROY, "resource_destroy"),
+            (crumbs::RESOLVE, "resolve"),
+            (crumbs::PRESENT, "present"),
+        ];
+        let ring = crumbs::Ring::new();
+        for &(op, _) in &opcodes {
+            ring.record(op, 0x1000, 3);
+        }
+        let dump = ring.dump(opcodes.len());
+        let lines: Vec<String> = dump.lines().map(str::to_owned).collect();
+        let expected: Vec<String> = opcodes
+            .iter()
+            .map(|&(_, name)| format!("op={name} a=0x1000 b=3"))
+            .collect();
+        assert_eq!(lines, expected);
+    }
 
     #[test]
     fn only_nonempty_submissions_advance_the_host_fence() {
@@ -553,6 +758,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                crumbs::record(crumbs::EXECUTE, group.len() as u64, *submitted as u32);
                 self.queue.ExecuteCommandLists(group);
                 let waited = self
                     .queue
@@ -637,7 +843,7 @@ impl Host {
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return ops_text();
         };
         let mut text = String::new();
         let mut fault_va = None;
@@ -680,6 +886,7 @@ impl Host {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
                     text.push_str(&format!("; no breadcrumbs ({e})"));
+                    text.push_str(&ops_text());
                     return text;
                 }
             };
@@ -893,6 +1100,7 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        crumbs::record(crumbs::CLOSE, 0, 0);
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
             fail(format_args!(
@@ -913,6 +1121,7 @@ impl HostList {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
+        crumbs::record(crumbs::RESET, 0, 0);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -971,6 +1180,7 @@ impl HostList {
             return None;
         }
         let (allocator, list) = &self.prelude;
+        crumbs::record(crumbs::RESET, barriers.len() as u64, 0);
         // SAFETY: the prelude is not executing (every submission is waited
         // for); the textures are live.
         let recorded = unsafe {
@@ -1653,6 +1863,7 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            crumbs::record(crumbs::PRESENT, u64::from(index), 0);
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -1837,6 +2048,16 @@ impl Host {
             }
         }
     }
+}
+
+/// The last host operations, one per line, oldest first, labelled: a
+/// removal that reports nothing else names what the host was doing just
+/// before it.
+fn ops_text() -> String {
+    format!(
+        "; last host operations, newest last:\n{}",
+        crumbs::dump(crumbs::SHOWN)
+    )
 }
 
 /// For adapters without device-removed data (the software one): the last
