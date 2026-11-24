@@ -5433,7 +5433,7 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l" | "image_gather4_l_o" => (73, true),
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -5568,7 +5568,7 @@ impl<'a> Lower<'a> {
             }
             if offset_word && offsets > 0 {
                 let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
+                for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
                     // Bits at..at+5 sign-extended: shift up, then down.
                     let left = self.s.m.i32(at);
                     let t = self.s.m.bin(c, Bin::Shl, w, left);
