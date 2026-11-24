@@ -104,6 +104,9 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 /// resource heap. The register is outside the title's possible root slots.
 pub const DESCRIPTOR_DATA_SLOT: u8 = u8::MAX;
 
+/// Local build: the loop limit without an override (see [`loop_limit`]).
+const LOCAL_LOOP_LIMIT: u32 = 8192;
+
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -118,12 +121,12 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 /// translation, so the shader cache must key on it (`victory-gpu`'s does).
 pub fn loop_limit() -> u32 {
     static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *LIMIT.get_or_init(|| {
-        if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
-        } else {
-            lower::LOOP_LIMIT
-        }
+    // Local build: 8192 unless `VICTORY_SHADER_LOOP_LIMIT` says otherwise, in every build: at
+    // 2^20 a loop that never ends by itself (bad data, waterfalls over helper lanes) ran past
+    // the host's 2 s GPU timeout and removed the device in Grand Theft Auto VI's world.
+    *LIMIT.get_or_init(|| match std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref() {
+        None => LOCAL_LOOP_LIMIT,
+        v => parse_loop_limit(v),
     })
 }
 
