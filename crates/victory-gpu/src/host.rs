@@ -1296,9 +1296,14 @@ fn refresh_direct_srvs(runs: &[&HostList]) -> Vec<(u64, crate::descriptor::host:
             if !live(*key) || range.address == range.end {
                 continue;
             }
+            // Ranges of one buffer that start in the page where the last one
+            // ends (or at its end) are one range: fewer ranges to bring up
+            // to date, and the world has close to a million per frame. The
+            // bytes between them are under a page; pending ranges are still
+            // left out when the range is brought up to date.
             if let Some((shadow, _, end)) = all.last_mut()
                 && Arc::ptr_eq(shadow, &range.shadow)
-                && range.address <= *end
+                && range.address <= (*end).next_multiple_of(crate::watch::PAGE)
             {
                 *end = (*end).max(range.end);
                 continue;
