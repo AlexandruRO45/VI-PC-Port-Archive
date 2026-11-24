@@ -338,8 +338,8 @@ mod tests {
         shadow.gpu_writes(&list, at, len);
         for (kind, row, records) in [(0, 1, 1), (2, 2, 2), (10, 4, 1), (1, 5, 1)] {
             let gpu = shadow.gpu(at + row * 32);
-            assert!(super::bound(&list, &shadow.buffer, gpu, (kind, 32, records)));
-            super::done(&list, &shadow.buffer);
+            assert!(super::bound(&list, &shadow, &shadow.buffer, gpu, (kind, 32, records)));
+            super::done(&list, &shadow, &shadow.buffer);
         }
         list.close();
         host.execute(&[&list]);
