@@ -41,12 +41,15 @@ pub fn is_sgd5(file: &[u8]) -> bool {
     memchr::memmem::find(file, MAGIC).is_some()
 }
 
-/// Every record in an SGD5 file, in file order. The search resumes after
-/// each record's packed bytes: a marker inside them (stored deflate blocks
-/// carry a container's bytes as they are) is part of that record.
+/// Every record in an SGD5 file, in file order. The search starts at the
+/// first magic: bytes before it (an archive's other files) belong to no SGD5
+/// file, whatever markers they happen to hold. It resumes after each
+/// record's packed bytes: a marker inside them (stored deflate blocks carry a
+/// container's bytes as they are) is part of that record.
 pub fn records(file: &[u8]) -> impl Iterator<Item = Record<'_>> {
     let finder = memchr::memmem::Finder::new(&MARKER);
-    let mut from = 0;
+    // No magic: start past the end, so nothing is found.
+    let mut from = memchr::memmem::find(file, MAGIC).map_or(file.len(), |m| m + MAGIC.len());
     std::iter::from_fn(move || {
         while let Some(found) = finder.find(&file[from..]) {
             let at = from + found;
@@ -163,9 +166,42 @@ mod tests {
     }
 
     #[test]
+    fn records_before_the_magic_are_not_read() {
+        // An archive whose other file happens to hold a well-formed record.
+        let mut archive = record_bytes("PS_elsewhere", 0x32, b"not ours");
+        assert_eq!(records(&archive).count(), 0, "no magic, no records");
+        archive.extend_from_slice(MAGIC);
+        archive.extend(record_bytes("PS_ours", 0x32, b"ours"));
+        let names: Vec<_> = records(&archive).map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_ours")]);
+    }
+
+    #[test]
+    fn truncated_file_yields_only_whole_records() {
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_a", 0x32, &[5; 200]));
+        let first_end = file.len();
+        file.extend(record_bytes("PS_b", 0x41, b"second"));
+        for cut in 0..=file.len() {
+            let part = &file[..cut];
+            let found: Vec<_> = records(part).collect();
+            let expected = usize::from(cut >= first_end) + usize::from(cut == file.len());
+            assert_eq!(found.len(), expected, "cut at {cut}");
+            for r in found {
+                assert!(
+                    r.unpack().is_some(),
+                    "cut at {cut}: {:?} does not unpack",
+                    r.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn corrupt_stream_does_not_unpack() {
-        let mut file = record_bytes("CS_x", 0x3c, &[1; 64]);
-        file[27] = 0xFF; // first packed byte: reserved block type
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("CS_x", 0x3c, &[1; 64]));
+        file[31] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
     }
