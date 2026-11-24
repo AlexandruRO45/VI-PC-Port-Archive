@@ -1029,7 +1029,7 @@ impl Pipelines {
     }
 
     /// The compute pipeline of `c` (made and released).
-    fn make(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::Compiled>) {
+    fn make(&self, name: &str, c: &recomp::pso::Compiled, retry_without_gvn: impl FnOnce() -> Option<recomp::pso::WithoutGvn>) {
         use crate::hle::d3d12x::real::driver_cache;
         use windows::Win32::Graphics::Direct3D12::*;
         let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
@@ -1091,12 +1091,20 @@ impl Pipelines {
             r
         };
         let mut r = try_create(&c.dxil);
-        if r.is_err() {
+        if let Err(first_err) = &r {
+            let reason = crate::hle::d3d12x::real::first_error_line(&first_err.to_string())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{:#x}", first_err.code().0));
             if let Some(nogvn) = retry_without_gvn() {
-                if nogvn.dxil != c.dxil {
-                    r = try_create(&nogvn.dxil);
+                if nogvn.compiled.dxil != c.dxil {
+                    r = try_create(&nogvn.compiled.dxil);
                     if r.is_ok() {
-                        eprintln!("  {name}: driver refused compute pipeline; built without GVN ({} B DXIL)", nogvn.dxil.len());
+                        eprintln!(
+                            "  {name}: driver refused compute pipeline ({reason}); built without GVN (dxil cache {:016x} -> {:016x}, {} B DXIL)",
+                            nogvn.rejected_key,
+                            nogvn.retry_key,
+                            nogvn.compiled.dxil.len()
+                        );
                     }
                 }
             }

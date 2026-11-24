@@ -124,6 +124,14 @@ pub struct Compiled {
     pub samplers: Vec<StaticSampler>,
 }
 
+/// Result of recompiling a shader without DXC's GVN pass, with both DXIL disk-cache keys
+/// (`rejected_key`: default GVN build; `retry_key`: `-opt-disable gvn` build).
+pub struct WithoutGvn {
+    pub compiled: Compiled,
+    pub rejected_key: u64,
+    pub retry_key: u64,
+}
+
 /// Translate a console shader for `stage` to signed DXIL (DXC, disk-cached); its static
 /// samplers take registers from `sampler_base` (space 1).
 /// Fails when the blob is not a console shader or the program is not fully translated.
@@ -141,13 +149,14 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
 
 /// Like `console_to_dxil_for`, disabling DXC's GVN pass for retrying driver-rejected shaders
 /// without overwriting the default `ShaderCache` / `translated` entries.
-pub fn console_to_dxil_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
+pub fn console_to_dxil_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<WithoutGvn, String> {
     console_to_dxil_in_without_gvn(blob, stage, sampler_base, split_wave64, mem_windows())
 }
 
 /// Like `console_to_dxil_in`, disabling DXC's GVN pass and using a distinct DXIL disk-cache key.
-pub fn console_to_dxil_in_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+pub fn console_to_dxil_in_without_gvn(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<WithoutGvn, String> {
     compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &["-opt-disable", "gvn"])
+        .map(|(compiled, rejected_key, retry_key)| WithoutGvn { compiled, rejected_key, retry_key })
 }
 
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
@@ -377,6 +386,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
         }
     }
     compile_console_shader_with_extra(blob, stage, sampler_base, windows, split_wave64, &[])
+        .map(|(c, _, _)| c)
 }
 
 fn compile_console_shader_with_extra(
@@ -386,7 +396,7 @@ fn compile_console_shader_with_extra(
     windows: u32,
     split_wave64: bool,
     extra: &[&str],
-) -> Result<Compiled, String> {
+) -> Result<(Compiled, u64, u64), String> {
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if !extra.is_empty() && extra.contains(&"-opt-disable") && t.hlsl.len() > 8 * 1024 * 1024 {
         return Err("already compiled at -O0 without GVN".into());
@@ -420,8 +430,10 @@ fn compile_console_shader_with_extra(
     }) {
         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
     }
+    let rejected_key = dxc::cache_key_with_extra(&t.hlsl, "main", profile, &[]);
+    let retry_key = dxc::cache_key_with_extra(&t.hlsl, "main", profile, extra);
     let dxil = dxc::compile_cached_with_extra(&t.hlsl, "main", profile, extra)?.0;
-    Ok(Compiled { dxil, samplers: t.static_samplers })
+    Ok((Compiled { dxil, samplers: t.static_samplers }, rejected_key, retry_key))
 }
 
 /// Every `X_T.Sample(args)` of generated HLSL as `X_T.SampleLevel(args, 0.0f)`.

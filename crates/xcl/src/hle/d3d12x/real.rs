@@ -548,6 +548,11 @@ pub fn init() -> Result<String, String> {
     }
 }
 
+thread_local! {
+    /// First line of the latest error-severity D3D12 debug layer message on this thread.
+    static LAST_D3D12_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
 /// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
 /// errors of a retail game, long before the message that came with its device removal.
@@ -556,6 +561,12 @@ unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, sever
     static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
     if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
         return;
+    }
+    if severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && !text.is_null() {
+        let msg = String::from_utf8_lossy(text.as_bytes());
+        if let Some(line) = first_error_line(&msg) {
+            LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = Some(line.to_string()));
+        }
     }
     {
         let mut g = PER_ID.lock().unwrap();
@@ -3890,17 +3901,30 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         }
         (hr, reused, in_driver, refusal_elapsed)
     };
+    LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = None);
     let (mut hr, mut reused, mut in_driver, _first_elapsed) = try_create(&mut copy, &dxil, "compute");
-    let mut retried_no_gvn = false;
+    let mut retried_no_gvn: Option<(u64, u64, String)> = None;
+    let mut failure_note: Option<String> = None;
     if hr < 0 && !HEAP_WINDOW_OOM.with(|o| o.get()) {
+        let first_hr = hr;
+        let first_msg = LAST_D3D12_ERROR.with(|e| e.borrow_mut().take());
+        let first_reason = format_driver_rejection(first_hr, first_msg.as_deref());
         let mut retry_reused = false;
         let mut retry_in_driver = std::time::Duration::ZERO;
         let mut retry_dxil = None;
+        let mut retry_keys = None;
+        let mut retry_attempted = false;
         let (retry_hr, retried) = retry_compute_pso_without_gvn(
-            hr,
+            first_hr,
             &dxil,
-            || console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this)).map(|c| c.dxil),
+            || {
+                let without = console_to_dxil_without_gvn(cs, Stage::Compute, 0, wave32_only(this))?;
+                retry_keys = Some((without.rejected_key, without.retry_key));
+                Ok(without.compiled.dxil)
+            },
             |new_dxil| {
+                LAST_D3D12_ERROR.with(|e| *e.borrow_mut() = None);
+                retry_attempted = true;
                 let (h, r, took, _) = try_create(&mut copy, new_dxil, "compute no-gvn");
                 retry_reused = r;
                 retry_in_driver = took;
@@ -3912,14 +3936,29 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         if retried {
             reused = retry_reused;
             in_driver = retry_in_driver;
-            retried_no_gvn = true;
+            retried_no_gvn = retry_keys.map(|(g, ng)| (g, ng, first_reason.clone()));
             if let Some(new_dxil) = retry_dxil {
                 dxil = new_dxil;
             }
+        } else {
+            failure_note = Some(if retry_attempted {
+                let retry_msg = LAST_D3D12_ERROR.with(|e| e.borrow_mut().take());
+                let retry_reason = format_driver_rejection(hr, retry_msg.as_deref());
+                if let Some((g, ng)) = retry_keys {
+                    format!("{first_reason}; retry without GVN {g:016x} -> {ng:016x} refused: {retry_reason}")
+                } else {
+                    retry_reason
+                }
+            } else {
+                first_reason
+            });
         }
     }
     if hr < 0 {
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        note_translation_error(format!(
+            "the driver rejected the compute PSO with the translated CS ({})",
+            failure_note.unwrap_or_else(|| format!("{hr:#x}"))
+        ));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
@@ -3928,12 +3967,15 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
     note_translated_compute(hr, ppv);
+    let retry_note = retried_no_gvn
+        .map(|(g, ng, reason)| format!(", retried without GVN (dxil cache {g:016x} -> {ng:016x}; driver refused: {reason})"))
+        .unwrap_or_default();
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{}{})",
         dxil.len(),
         in_driver.as_millis(),
         if reused { ", the driver's blob of an earlier build" } else { "" },
-        if retried_no_gvn { ", retried without GVN" } else { "" }
+        retry_note
     );
     Some(Ok(hr))
 }
@@ -5045,6 +5087,24 @@ fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs:
     create(copy)
 }
 
+/// First non-empty trimmed line of a driver or D3D12 error string.
+pub(crate) fn first_error_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|l| !l.is_empty())
+}
+
+/// Format a rejected `CreateComputePipelineState` reason for logs: `hr` plus the first line
+/// of any retained D3D12 error message, or Windows' formatted `HRESULT` text.
+fn format_driver_rejection(hr: HRESULT, retained_message: Option<&str>) -> String {
+    if let Some(line) = retained_message.and_then(first_error_line) {
+        return format!("{hr:#x}: {line}");
+    }
+    let msg = windows::core::Error::from_hresult(windows::core::HRESULT(hr)).to_string();
+    match first_error_line(&msg) {
+        Some(line) => line.to_string(),
+        None => format!("{hr:#x}"),
+    }
+}
+
 /// Retry a driver-rejected compute PSO once using DXIL recompiled without DXC's GVN pass
 /// (avoiding handle phis that some drivers refuse with `E_OUTOFMEMORY`, #756).
 fn retry_compute_pso_without_gvn(
@@ -6035,6 +6095,23 @@ mod compute_pso_retry_tests {
 
         let (hr2, retried2) = retry_compute_pso_without_gvn(REFUSED_OOM, b"orig-dxil", || Ok(b"no-gvn-dxil".to_vec()), |_| REFUSED_ARG);
         assert_eq!((hr2, retried2), (REFUSED_ARG, false));
+    }
+
+    #[test]
+    fn first_error_line_picks_first_non_empty_trimmed_line() {
+        assert_eq!(first_error_line("\n  \n  first useful detail \r\nsecond line\n"), Some("first useful detail"));
+        assert_eq!(first_error_line("  \r\n\t "), None);
+    }
+
+    #[test]
+    fn format_driver_rejection_prefers_retained_first_line_and_falls_back_to_hresult() {
+        assert_eq!(
+            format_driver_rejection(REFUSED_OOM, Some("\n  D3D12 ERROR: driver rejected phi handle  \nsecond line")),
+            "0x8007000e: D3D12 ERROR: driver rejected phi handle"
+        );
+        let fallback = format_driver_rejection(REFUSED_OOM, None);
+        assert!(!fallback.is_empty() && !fallback.contains('\n'));
+        assert!(fallback.to_ascii_lowercase().contains("8007000e"));
     }
 }
 
