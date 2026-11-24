@@ -176,7 +176,7 @@ fn footprint_len(
 ) -> u64 {
     let f = footprint.Footprint;
     let pitched = u64::from(f.RowPitch) * u64::from(rows) * u64::from(f.Depth);
-    pitched.min(buffer_size - footprint.Offset)
+    pitched.min(buffer_size.saturating_sub(footprint.Offset))
 }
 
 impl Staging {
@@ -329,6 +329,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
+    // Reject an out-of-buffer offset before detile forms a mapped pointer
+    // or a copy passes the footprint to D3D12.
+    if footprints.iter().any(|f| f.Offset >= total) {
+        once!(?desc, total, "texture upload footprint outside its staging buffer");
+        return None;
+    }
     let (buffer, data) = host.upload_buffer(total)?;
     crate::host::name(&buffer, || {
         format!(
@@ -372,5 +378,7 @@ mod tests {
         let total = 1536 + 2 * 256 + 20;
         assert_eq!(footprint_len(&mip(0, 10, 6), 6, total), 1536);
         assert_eq!(footprint_len(&mip(1536, 5, 3), 3, total), 532);
+        assert_eq!(footprint_len(&mip(total, 5, 3), 3, total), 0);
+        assert_eq!(footprint_len(&mip(total + 1, 5, 3), 3, total), 0);
     }
 }
