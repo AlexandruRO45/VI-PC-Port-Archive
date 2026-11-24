@@ -1590,6 +1590,67 @@ mod tests {
         assert_eq!(names(root, true), ["target"]);
     }
 
+    /// A build script may clone or `git init` a repository into its
+    /// `OUT_DIR`, inside the build directory. Git lists such a repository as
+    /// one untracked entry ending in `/`, which the full check refuses as a
+    /// nested repository; under the running build directory it is build
+    /// output like any other and is passed over, in a repository and outside
+    /// one. The same repository anywhere else in the checkout, or in a build
+    /// directory the check does not run from, is still refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_inside_the_build_directory_is_passed_over() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&root.join("build-out"));
+        let other = fake_build_dir(&root.join("build-other"));
+        for dir in [
+            "build-out/debug/build/x-0123/out/clone",
+            "build-other/debug/build/x-0123/out/clone",
+            "vendor/clone",
+        ] {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git_str(&dir, &["init", "-q"]);
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+
+        let listed = names_built_by(root, &exe);
+        assert!(
+            !listed.iter().any(|n| n.starts_with("build-out/")),
+            "{listed:?}"
+        );
+        assert!(listed.contains(&"vendor/clone/".to_owned()), "{listed:?}");
+        assert!(
+            listed.contains(&"build-other/debug/build/x-0123/out/clone/".to_owned()),
+            "{listed:?}"
+        );
+        let listed = names_built_by(root, &other);
+        assert!(
+            listed.contains(&"build-out/debug/build/x-0123/out/clone/".to_owned()),
+            "{listed:?}"
+        );
+        let files = super::list_files_built_by(root, false, Some(&exe)).unwrap();
+        let vendor = files.iter().find(|f| f.name == "vendor/clone/").unwrap();
+        let problem = super::read(root, vendor).unwrap_err();
+        assert!(problem.contains("nested"), "{problem}");
+
+        // Outside a repository the walk skips `.git` and the build directory
+        // alike, so neither the clone's history nor its files are read.
+        let outer = tempdir();
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::write(plain.join("a.rs"), b"fn a() {}\n").unwrap();
+        let exe = fake_build_dir(&plain.join("build-out"));
+        let clone = plain.join("build-out/debug/build/x-0123/out/clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        git_str(&clone, &["init", "-q"]);
+        std::fs::write(clone.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names_built_by(&plain, &exe), ["a.rs"]);
+    }
+
     /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
     /// `'` made the hook and filter commands built from it shell syntax
     /// errors, and the git commands running them failed.
