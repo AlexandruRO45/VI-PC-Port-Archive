@@ -627,6 +627,7 @@ impl Host {
         }
         batch.flush();
         let _direct_srvs = refresh_direct_srvs(&view_heaps, batch.sampled.as_ref());
+        let back = batch.snapshot_writes();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -696,22 +697,8 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
-                }
-            }
-        }
         let mut copied_back = 0u64;
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
+        for (shadow, address, len) in back {
             copied_back += shadow.copy_back(address, len) as u64;
         }
         let copyback_us = copying.elapsed().as_micros() as u64;
@@ -1344,9 +1331,7 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    batch.queue_write(shadow, *address, *len);
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1376,6 +1361,7 @@ pub(crate) fn test_submission_copy_bytes() -> u64 {
 }
 
 type ShadowReadRanges = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+type ShadowWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
 
 /// Refresh live mirrored SRVs after deferred title writes and before
 /// GPU work. Retain the resources until the submission has finished.
@@ -1595,14 +1581,15 @@ fn visit_direct_ranges<'a>(
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<ShadowReadRanges>,
+    writes: Vec<ShadowWrite>,
     sampled: Option<SampledRanges>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 /// Conventional reads prepared since the last deferred title-memory write.
-/// GPUs have yet to run, and their pending write exclusions only grow during
-/// preparation, so a direct read can reuse these already-sampled intervals.
+/// The submitted lists have yet to run, so a direct read can reuse these
+/// already-sampled intervals.
 #[derive(Default)]
 struct SampledRanges(std::collections::HashMap<usize, Vec<(usize, usize)>>);
 
@@ -1645,6 +1632,29 @@ impl SampledRanges {
 }
 
 impl Batch {
+    fn queue_write(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        self.flush();
+        if !self.writes.iter().any(|(other, at, size)| {
+            std::sync::Arc::ptr_eq(other, shadow) && (*at, *size) == (address, len)
+        }) {
+            self.writes.push((shadow.clone(), address, len));
+        }
+    }
+
+    /// All CPU refreshes are complete and the GPU has yet to run. Capture the
+    /// bytes these shaders start with, including title writes inside the UAVs.
+    fn snapshot_writes(self) -> Vec<ShadowWrite> {
+        for (shadow, address, len) in &self.writes {
+            shadow.writing(*address, *len);
+        }
+        self.writes
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         if len == 0 {
             return;
