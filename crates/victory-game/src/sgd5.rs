@@ -248,7 +248,13 @@ impl Streams {
 fn starts_stream(bytes: &[u8], unpacked: usize) -> bool {
     use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit};
     let limit = unpacked.min(PROBE);
-    match decompress_to_vec_with_limit(&bytes[..bytes.len().min(PROBE)], limit) {
+    let probe = &bytes[..bytes.len().min(PROBE)];
+    #[cfg(test)]
+    tests::WORK.with(|w| {
+        let (checks, read) = w.get();
+        w.set((checks + 1, read + probe.len()));
+    });
+    match decompress_to_vec_with_limit(probe, limit) {
         Ok(out) => out.len() == unpacked,
         Err(e) => {
             e.status == TINFLStatus::FailedCannotMakeProgress
@@ -276,6 +282,24 @@ fn name_before(file: &[u8], nul: usize) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Stream checks made, and packed bytes they read, on this thread
+        /// (each test runs on its own): the work [`records`] does, counted
+        /// rather than timed, so a slow or busy machine cannot fail a test
+        /// and a fast one cannot hide a regression.
+        pub(super) static WORK: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// The records in `file`, and the stream checks and packed bytes read
+    /// to find them.
+    fn records_counting(file: &[u8]) -> (Vec<Record<'_>>, usize, usize) {
+        WORK.with(|w| w.set((0, 0)));
+        let found = records(file).collect();
+        let (checks, read) = WORK.with(Cell::get);
+        (found, checks, read)
+    }
 
     fn record_bytes(name: &str, kind: u8, payload: &[u8]) -> Vec<u8> {
         let packed = miniz_oxide::deflate::compress_to_vec(payload, 6);
@@ -817,12 +841,13 @@ mod tests {
         }
         file.extend(&real);
         assert_eq!(file.len(), end);
-        let started = std::time::Instant::now();
-        let found: Vec<_> = records(&file).collect();
+        let (found, checks, _) = records_counting(&file);
         let names: Vec<_> = found.iter().map(|r| r.name).collect();
         assert_eq!(names, [Some("PS_real")]);
         assert_eq!(found[0].unpack().as_deref(), Some(&b"real"[..]));
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Each marker is checked for a stream at most twice (as a record,
+        // and as one another covers), not once for every marker before it.
+        assert!(checks <= 2 * (count + 1), "{checks} stream checks");
     }
 
     #[test]
@@ -869,10 +894,13 @@ mod tests {
         // than the probe reads, so the first marker is now taken for a
         // truncated record, as a cut-off file's last record would be.
         let real = record_bytes("PS_real", 0x32, b"real");
-        let file = chained_markers(32_000, |_| MAX_UNPACKED as u32, &real);
-        let started = std::time::Instant::now();
-        assert_eq!(records(&file).count(), 0);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let count = 32_000;
+        let file = chained_markers(count, |_| MAX_UNPACKED as u32, &real);
+        let (found, checks, read) = records_counting(&file);
+        assert!(found.is_empty());
+        // Each check reads a probe, not the rest of the chain.
+        assert!(checks <= 2 * count, "{checks} stream checks");
+        assert!(read <= checks * PROBE, "{read} bytes read");
     }
 
     #[test]
@@ -885,11 +913,11 @@ mod tests {
         let count = 32_000;
         let end = chained_markers(count, |_| 0, &[]).len();
         let file = chained_markers(count, |at| (end - at) as u32, &[]);
-        let started = std::time::Instant::now();
-        let found: Vec<_> = records(&file).collect();
+        let (found, checks, read) = records_counting(&file);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].span(), MAGIC.len() + 6..file.len());
         assert_eq!(found[0].unpack(), None);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(checks <= 2 * count, "{checks} stream checks");
+        assert!(read <= checks * PROBE, "{read} bytes read");
     }
 }
