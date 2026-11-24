@@ -4071,4 +4071,87 @@ mod tests {
             Err(Malformed("native code out of bounds"))
         ));
     }
+
+    #[test]
+    fn root_tables_are_read_exactly_within_the_payload() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let record = stage_data_at(&good, HwStage::Vs) - RECORD_SIZE as usize;
+        // One constants parameter in user-data dword 0 ending the payload.
+        let mut blob = good.clone();
+        let table = (blob.len() - FSSM_HEADER) as u64;
+        for v in [0u32, 0, 1, 0] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&[0; 4]);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        assert_eq!(table + ENTRY_SIZE, payload);
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        let read = |layout: (u64, u32), used: (u64, u32)| {
+            let mut blob = blob.clone();
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&layout.0.to_le_bytes());
+            blob[record + RECORD_USED..][..8].copy_from_slice(&used.0.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..4].copy_from_slice(&layout.1.to_le_bytes());
+            blob[record + RECORD_COUNTS + 4..][..4].copy_from_slice(&used.1.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // A table ending exactly at the payload's end is read whole.
+        let p = read((table, 1), (0, 0)).unwrap();
+        assert_eq!(
+            p[0].layout,
+            [RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0
+            }]
+        );
+        assert!(p[0].used.is_empty());
+        // An empty table's offset is never read, whatever it holds.
+        for offset in [0, payload, payload + 1, u64::MAX] {
+            let p = read((offset, 0), (offset, 0)).unwrap();
+            assert!(
+                p[0].layout.is_empty() && p[0].used.is_empty(),
+                "{offset:#x}"
+            );
+        }
+        // One entry more, or one byte later, is past the payload, for either
+        // table.
+        for bad in [(table, 2), (table + 1, 1), (payload, 1), (u64::MAX, 1)] {
+            assert!(
+                matches!(
+                    read(bad, (0, 0)),
+                    Err(Malformed("FSSM root table out of bounds"))
+                ),
+                "layout {bad:?}"
+            );
+            assert!(
+                matches!(
+                    read((0, 0), bad),
+                    Err(Malformed("FSSM root table out of bounds"))
+                ),
+                "used {bad:?}"
+            );
+        }
+        // The largest count does not wrap round into the payload.
+        for offset in [0, table] {
+            assert!(matches!(
+                read((offset, u32::MAX), (0, 0)),
+                Err(Malformed("FSSM root table out of bounds"))
+            ));
+            assert!(matches!(
+                read((0, 0), (offset, u32::MAX)),
+                Err(Malformed("FSSM root table out of bounds"))
+            ));
+        }
+        // Offsets count from the payload, not the FSSM header: a table read
+        // from offset 0 is the slot count (6, a sampler heap) over the
+        // absent LS slot (0xDEADBEEF SGPRs), not the FSSM magic, which would
+        // be a parameter of unknown kind.
+        assert!(matches!(
+            read((0, 1), (0, 0)),
+            Err(Malformed("root parameter outside the SGPRs"))
+        ));
+    }
 }
