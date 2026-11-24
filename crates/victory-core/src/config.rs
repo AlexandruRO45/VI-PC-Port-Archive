@@ -87,19 +87,29 @@ impl FileConfig {
     /// elsewhere, `cache_dir = "cache"` then means the folder next to that
     /// file, not one under whatever directory the tool was started from
     /// (often the repository, which the asset policy refuses). A path that
-    /// starts with `~` is under `home` instead, when there is one.
-    fn anchored_at(self, dir: &Path, home: Option<&Path>) -> FilePaths {
-        let anchor = |p: PathBuf| {
+    /// starts with `~` is under `home` instead, when there is one. A Windows
+    /// drive path on another host is refused (see [`ensure_native`]) rather
+    /// than anchored here as a relative path.
+    fn anchored_at(self, dir: &Path, home: Option<&Path>) -> Result<FilePaths> {
+        let anchor = |key: &str, p: PathBuf| -> Result<PathBuf> {
+            ensure_native(&format!("[paths].{key}"), &p, cfg!(windows))?;
             let p = expand_home(p, home);
-            if p.is_relative() { dir.join(p) } else { p }
+            Ok(if p.is_relative() { dir.join(p) } else { p })
         };
         let paths = self.paths;
-        FilePaths {
-            game_dir: paths.game_dir.map(anchor),
-            cache_dir: paths.cache_dir.map(anchor),
-            data_dir: paths.data_dir.map(anchor),
-            test_titles: paths.test_titles.into_iter().map(anchor).collect(),
-        }
+        Ok(FilePaths {
+            game_dir: paths.game_dir.map(|p| anchor("game_dir", p)).transpose()?,
+            cache_dir: paths
+                .cache_dir
+                .map(|p| anchor("cache_dir", p))
+                .transpose()?,
+            data_dir: paths.data_dir.map(|p| anchor("data_dir", p)).transpose()?,
+            test_titles: paths
+                .test_titles
+                .into_iter()
+                .map(|p| anchor("test_titles", p))
+                .collect::<Result<_>>()?,
+        })
     }
 }
 
@@ -121,7 +131,10 @@ impl Config {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
                 let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
-                (Some(path), parsed.anchored_at(&dir, home.as_deref()))
+                let paths = parsed
+                    .anchored_at(&dir, home.as_deref())
+                    .with_context(|| format!("in {}", path.display()))?;
+                (Some(path), paths)
             }
             None => (None, FilePaths::default()),
         };
@@ -137,28 +150,38 @@ impl Config {
         let home = home_dir(&env);
         let expand = |p: PathBuf| expand_home(p, home.as_deref());
         // The variable, else the file, with where the value came from.
-        let pick =
-            |k: &'static str, from_file: Option<PathBuf>| match env(k).filter(|v| !v.is_empty()) {
-                Some(v) => (Some(expand(PathBuf::from(v))), Origin::Env(k)),
+        let pick = |k: &'static str, from_file: Option<PathBuf>| -> Result<_> {
+            Ok(match env(k).filter(|v| !v.is_empty()) {
+                Some(v) => {
+                    let p = PathBuf::from(v);
+                    ensure_native(k, &p, cfg!(windows))?;
+                    (Some(expand(p)), Origin::Env(k))
+                }
                 None if from_file.is_some() => (from_file, Origin::File),
                 None => (None, Origin::Default),
-            };
+            })
+        };
         let (test_titles, test_titles_origin) =
             match env("VICTORY_TEST_TITLES").filter(|v| !v.is_empty()) {
-                Some(v) => (
-                    std::env::split_paths(&v)
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .map(expand)
-                        .collect(),
-                    Origin::Env("VICTORY_TEST_TITLES"),
-                ),
+                Some(v) => {
+                    // Checked before splitting: on this host `:` would cut
+                    // `D:\a` in two.
+                    ensure_native("VICTORY_TEST_TITLES", Path::new(&v), cfg!(windows))?;
+                    (
+                        std::env::split_paths(&v)
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(expand)
+                            .collect(),
+                        Origin::Env("VICTORY_TEST_TITLES"),
+                    )
+                }
                 None if file.test_titles.is_empty() => (file.test_titles, Origin::Default),
                 None => (file.test_titles, Origin::File),
             };
-        let (game_dir, game_origin) = pick("VICTORY_GAME_DIR", file.game_dir);
-        let (cache_dir, cache_origin) = pick("VICTORY_CACHE_DIR", file.cache_dir);
+        let (game_dir, game_origin) = pick("VICTORY_GAME_DIR", file.game_dir)?;
+        let (cache_dir, cache_origin) = pick("VICTORY_CACHE_DIR", file.cache_dir)?;
         let cache_dir = cache_dir.map_or_else(|| default_dir(Kind::Cache, &env), Ok)?;
-        let (data_dir, data_origin) = pick("VICTORY_DATA_DIR", file.data_dir);
+        let (data_dir, data_origin) = pick("VICTORY_DATA_DIR", file.data_dir)?;
         let data_dir = data_dir.map_or_else(|| default_dir(Kind::Data, &env), Ok)?;
         let origins = Origins {
             game_dir: game_origin,
@@ -257,6 +280,34 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
         );
     }
     Ok(())
+}
+
+/// Refuses a Windows drive path (`D:\games`, `D:/games`, `D:`) when the
+/// host is not Windows (`on_windows` is `cfg!(windows)`, a parameter so the
+/// check can be tested anywhere). There it is not absolute, so it would be
+/// taken as a relative path: under the config file's folder, or the working
+/// directory for a variable, which is often the repository. The example
+/// config ships such a path, so copying it unedited on Linux is an easy way
+/// to get here; the error names the setting instead of a confusing
+/// "inside the repository" or "does not exist" later on.
+fn ensure_native(what: &str, path: &Path, on_windows: bool) -> Result<()> {
+    if on_windows || !is_drive_path(path) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{what} is {}, a Windows path, but this host is not Windows; set it to a \
+         path on this machine",
+        path.display()
+    );
+}
+
+/// `X:` followed by nothing, `\` or `/`.
+fn is_drive_path(path: &Path) -> bool {
+    match path.as_os_str().as_encoded_bytes() {
+        [drive, b':'] => drive.is_ascii_alphabetic(),
+        [drive, b':', sep, ..] => drive.is_ascii_alphabetic() && matches!(sep, b'\\' | b'/'),
+        _ => false,
+    }
 }
 
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -471,7 +522,7 @@ mod tests {
         );
         let parsed: FileConfig = toml::from_str(&text).unwrap();
         let dir = PathBuf::from(abs("configs"));
-        let paths = parsed.anchored_at(&dir, None);
+        let paths = parsed.anchored_at(&dir, None).unwrap();
         assert_eq!(paths.game_dir.unwrap(), dir.join("game"));
         // Absolute paths are kept as written.
         assert_eq!(paths.cache_dir.unwrap(), PathBuf::from(abs("elsewhere")));
@@ -483,7 +534,7 @@ mod tests {
     fn the_default_config_file_keeps_paths_as_written() {
         // `./victory.toml` has an empty parent, so nothing changes.
         let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = 'game'\n").unwrap();
-        let paths = parsed.anchored_at(Path::new(""), None);
+        let paths = parsed.anchored_at(Path::new(""), None).unwrap();
         assert_eq!(paths.game_dir.unwrap(), PathBuf::from("game"));
     }
 
@@ -505,7 +556,9 @@ mod tests {
         let parsed: FileConfig =
             toml::from_str("[paths]\ngame_dir = '~/games/gta'\ntest_titles = ['~/t']\n").unwrap();
         let home = PathBuf::from(abs("home"));
-        let paths = parsed.anchored_at(&PathBuf::from(abs("configs")), Some(&home));
+        let paths = parsed
+            .anchored_at(&PathBuf::from(abs("configs")), Some(&home))
+            .unwrap();
         assert_eq!(paths.game_dir.unwrap(), home.join("games/gta"));
         assert_eq!(paths.test_titles, vec![home.join("t")]);
     }
@@ -675,6 +728,57 @@ mod tests {
         let err = Config::resolve(file, None, env).unwrap_err().to_string();
         assert!(err.contains("(from default)"), "{err}");
         assert!(err.contains("(from config file)"), "{err}");
+    }
+
+    #[test]
+    fn windows_drive_paths_are_refused_off_windows() {
+        for p in ["D:\\victory-data\\game", "d:/games", "D:"] {
+            assert!(is_drive_path(Path::new(p)), "{p}");
+            let err = ensure_native("[paths].game_dir", Path::new(p), false)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[paths].game_dir"), "{err}");
+            assert!(err.contains("Windows path"), "{err}");
+            assert!(ensure_native("[paths].game_dir", Path::new(p), true).is_ok());
+        }
+        for p in [
+            "/home/me/games",
+            "games",
+            "~/games",
+            "DD:/x",
+            "1:/x",
+            "D:x",
+            "",
+        ] {
+            assert!(!is_drive_path(Path::new(p)), "{p}");
+            assert!(ensure_native("x", Path::new(p), false).is_ok());
+        }
+        if cfg!(windows) {
+            return;
+        }
+        // Through the file and the variables, naming the setting.
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ntest_titles = ['ok', 'E:\\\\t']\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].test_titles"), "{err}");
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("D:\\victory")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+        }
     }
 
     #[test]

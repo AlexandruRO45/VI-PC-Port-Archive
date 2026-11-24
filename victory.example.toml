@@ -5,6 +5,8 @@
 # a leading ~ is your home folder).
 # Relative paths here are relative to this file; a leading ~ is your home folder.
 # An empty variable counts as unset.
+# The paths below are Windows examples; on Linux or macOS change them to paths
+# on that machine (a D:\ path there is refused, not read as relative).
 
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
