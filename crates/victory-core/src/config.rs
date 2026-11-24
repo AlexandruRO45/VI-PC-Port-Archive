@@ -5363,6 +5363,81 @@ mod tests {
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
+    /// The subfolder, or a folder above it, already taken by a named pipe, a
+    /// socket or a link to either (a dev server's socket or a `mkfifo` left
+    /// in the cache): an error naming the subfolder, returned promptly
+    /// rather than blocking on a peer, with the pipe, socket and links left
+    /// as they were. Each call runs on its own thread so a regression fails
+    /// instead of hanging the test run.
+    #[cfg(unix)]
+    #[test]
+    fn a_subfolder_taken_by_a_named_pipe_or_a_socket_is_an_error_without_blocking() {
+        // Scratch folder under the system temp folder, removed when dropped.
+        let scratch = tempfile::tempdir().unwrap();
+        if ensure_outside_repo(scratch.path()).is_err() {
+            // `TMPDIR` is inside the checkout; every subfolder is refused,
+            // which `subfolders_are_created_nested_and_again_without_error`
+            // already checks.
+            return;
+        }
+        let cache = scratch.path().join("c");
+        std::fs::create_dir_all(&cache).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(cache.join("sock")).unwrap();
+        std::os::unix::fs::symlink("sock", cache.join("to-sock")).unwrap();
+        let mut subs = vec!["sock", "sock/", "sock/inner", "to-sock", "to-sock/x/y"];
+        let made = std::process::Command::new("mkfifo")
+            .arg(cache.join("pipe"))
+            .status()
+            .is_ok_and(|s| s.success());
+        if made {
+            std::os::unix::fs::symlink("pipe", cache.join("to-pipe")).unwrap();
+            subs.extend(["pipe", "pipe/", "pipe/inner", "to-pipe", "to-pipe/x"]);
+        }
+        let cfg = Config {
+            cache_dir: cache.clone(),
+            data_dir: scratch.path().join("d"),
+            ..Default::default()
+        };
+
+        for sub in subs {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cfg = cfg.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(cfg.cache_subdir(sub).map_err(|e| format!("{e:#}")));
+            });
+            let err = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("{sub}: the subfolder check blocked"))
+                .unwrap_err();
+            assert!(err.contains("creating"), "{sub}: {err}");
+            assert!(
+                err.contains(&cache.join(sub.trim_end_matches('/')).display().to_string()),
+                "{sub}: {err}"
+            );
+        }
+
+        // Nothing was replaced or made: the socket and pipe keep their kind
+        // and the links still lead to them by name.
+        use std::os::unix::fs::FileTypeExt;
+        let kind = |name: &str| cache.join(name).symlink_metadata().unwrap().file_type();
+        assert!(kind("sock").is_socket());
+        assert_eq!(
+            std::fs::read_link(cache.join("to-sock")).unwrap(),
+            Path::new("sock")
+        );
+        if made {
+            assert!(kind("pipe").is_fifo());
+            assert_eq!(
+                std::fs::read_link(cache.join("to-pipe")).unwrap(),
+                Path::new("pipe")
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(&cache).unwrap().count(),
+            if made { 4 } else { 2 }
+        );
+    }
+
     #[test]
     fn subfolders_refuse_a_leading_dot_and_allow_a_trailing_slash() {
         // A leading `./` is a `.` component; a trailing slash or a doubled
