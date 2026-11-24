@@ -1633,10 +1633,16 @@ pub(crate) static GAME_LOADING: std::sync::atomic::AtomicBool = std::sync::atomi
 fn auto_a() -> bool {
     use std::sync::LazyLock;
     use std::time::Instant;
-    static START: LazyLock<Option<Instant>> =
-        LazyLock::new(|| std::env::var("VICTORY_AUTO_A").is_ok_and(|v| v.trim() == "1").then(Instant::now));
+    // "1": until the title loads the game; "2": also after (a fresh profile shows first-run
+    // screens - HUD tips, calibration - that wait for A once the game is loaded).
+    static MODE: LazyLock<u8> = LazyLock::new(|| match std::env::var("VICTORY_AUTO_A").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    });
+    static START: LazyLock<Option<Instant>> = LazyLock::new(|| (*MODE != 0).then(Instant::now));
     let Some(start) = *START else { return false };
-    if GAME_LOADING.load(std::sync::atomic::Ordering::Relaxed) {
+    if *MODE == 1 && GAME_LOADING.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
     let ms = start.elapsed().as_millis();
