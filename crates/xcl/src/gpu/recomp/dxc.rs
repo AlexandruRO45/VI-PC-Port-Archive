@@ -900,6 +900,48 @@ pub fn compile_cached(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>,
     compile_cached_in(&cache_dir(), src, entry, profile)
 }
 
+/// LLVM IR (text or bitcode) of a DXIL module to a signed DXIL container, without the HLSL
+/// front end and the optimiser: `dxcompiler.dll`'s assembler builds the container from the
+/// module's `dx.*` metadata and `dxil.dll`'s validator checks and signs it. A retail compute
+/// program's module (8.6 MB of IR, 1 MB of DXIL) takes 0.75 s this way, where its HLSL takes
+/// 25 s through `compile`: a backend that writes the IR itself saves that time.
+/// Give the module an `!llvm.ident`: without one, the container validates but the AMD driver
+/// (RX 7800 XT) faults in `CreateComputePipelineState`.
+pub fn assemble(ir: &str) -> Result<Vec<u8>, String> {
+    use windows::Win32::Graphics::Direct3D::Dxc::{
+        DxcValidatorFlags_InPlaceEdit, IDxcAssembler, IDxcOperationResult, IDxcUtils, IDxcValidator, CLSID_DxcAssembler, CLSID_DxcUtils, CLSID_DxcValidator,
+    };
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    fn errors(r: &IDxcOperationResult) -> String {
+        unsafe { r.GetErrorBuffer().map(|b| String::from_utf8_lossy(std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize())).into_owned()).unwrap_or_default() }
+    }
+    unsafe fn make<T: Interface>(create: CreateInstance, clsid: &GUID) -> Result<T, String> {
+        let mut p = std::ptr::null_mut();
+        create(clsid, &T::IID, &mut p).ok().map_err(|e| format!("DxcCreateInstance: {e}"))?;
+        Ok(T::from_raw(p))
+    }
+    let create = create_fn()?;
+    unsafe {
+        // (`load` loaded dxil.dll by its full path, before dxcompiler.dll)
+        let signer = GetModuleHandleW(crate::util::wide("dxil.dll").as_ptr());
+        let sign = (!signer.is_null()).then(|| GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr())).flatten().ok_or("assemble: no dxil.dll to sign with")?;
+        let utils: IDxcUtils = make(create, &CLSID_DxcUtils)?;
+        let blob = utils.CreateBlob(ir.as_ptr() as *const c_void, ir.len() as u32, DXC_CP_UTF8).map_err(|e| format!("assemble: {e}"))?;
+        let asm: IDxcAssembler = make(create, &CLSID_DxcAssembler)?;
+        let r = asm.AssembleToContainer(&blob).map_err(|e| format!("assemble: {e}"))?;
+        if r.GetStatus().map_err(|e| format!("assemble: {e}"))?.is_err() {
+            return Err(format!("assemble: {}", errors(&r)));
+        }
+        let container = r.GetResult().map_err(|e| format!("assemble: {e}"))?;
+        let v: IDxcValidator = make(std::mem::transmute::<usize, CreateInstance>(sign as usize), &CLSID_DxcValidator)?;
+        let r = v.Validate(&container, DxcValidatorFlags_InPlaceEdit).map_err(|e| format!("validate: {e}"))?;
+        if r.GetStatus().map_err(|e| format!("validate: {e}"))?.is_err() {
+            return Err(format!("validate: {}", errors(&r)));
+        }
+        Ok(std::slice::from_raw_parts(container.GetBufferPointer() as *const u8, container.GetBufferSize()).to_vec())
+    }
+}
+
 #[cfg(test)]
 mod cache_tests {
     use super::*;

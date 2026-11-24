@@ -7589,3 +7589,63 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// IR text written by hand (`dxc::assemble`, no HLSL): a CS of the ABI root signature that writes
+/// `mem[i] = 3 i + 1` runs on the GPU; a module the validator rejects is an error, not a container.
+#[test]
+fn ir_text_assembles_signs_and_runs() {
+    const IR: &str = r#"target datalayout = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+target triple = "dxil-ms-dx"
+%dx.types.Handle = type { i8* }
+%dx.types.ResBind = type { i32, i32, i32, i8 }
+%dx.types.ResourceProperties = type { i32, i32 }
+%struct.RWByteAddressBuffer = type { i32 }
+define void @main() {
+  %1 = call %dx.types.Handle @dx.op.createHandleFromBinding(i32 217, %dx.types.ResBind { i32 2, i32 2, i32 0, i8 1 }, i32 2, i1 false)
+  %2 = call i32 @dx.op.threadId.i32(i32 93, i32 0)
+  %3 = mul i32 %2, 3
+  %4 = add i32 %3, 1
+  %5 = shl i32 %2, 2
+  %6 = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %1, %dx.types.ResourceProperties { i32 4107, i32 0 })
+  call void @dx.op.rawBufferStore.i32(i32 140, %dx.types.Handle %6, i32 %5, i32 undef, i32 %4, i32 undef, i32 undef, i32 undef, i8 1, i32 4)
+  ret void
+}
+declare i32 @dx.op.threadId.i32(i32, i32) #0
+declare void @dx.op.rawBufferStore.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32, i32, i8, i32) #1
+declare %dx.types.Handle @dx.op.annotateHandle(i32, %dx.types.Handle, %dx.types.ResourceProperties) #0
+declare %dx.types.Handle @dx.op.createHandleFromBinding(i32, %dx.types.ResBind, i32, i1) #0
+attributes #0 = { nounwind readnone }
+attributes #1 = { nounwind }
+!llvm.ident = !{!0}
+!dx.version = !{!1}
+!dx.valver = !{!2}
+!dx.shaderModel = !{!3}
+!dx.resources = !{!4}
+!dx.entryPoints = !{!7}
+!0 = !{!"xcl"}
+!1 = !{i32 1, i32 6}
+!2 = !{i32 1, i32 9}
+!3 = !{!"cs", i32 6, i32 6}
+!4 = !{null, !5, null, null}
+!5 = !{!6}
+!6 = !{i32 0, %struct.RWByteAddressBuffer* undef, !"", i32 0, i32 2, i32 1, i32 11, i1 false, i1 false, i1 false, null}
+!7 = !{void ()* @main, !"main", null, !4, !8}
+!8 = !{i32 0, i64 16, i32 4, !9}
+!9 = !{i32 64, i32 1, i32 1}
+"#;
+    if super::dxc::location().is_err() {
+        runner::skip_test("no DXC");
+        return;
+    }
+    let dxil = super::dxc::assemble(IR).unwrap();
+    assert_eq!(&dxil[..4], b"DXBC");
+    // a value used before it is defined: refused by the assembler or the validator
+    assert!(super::dxc::assemble(&IR.replace("%3 = mul i32 %2, 3", "%3 = mul i32 %4, 3")).is_err());
+    if runner::adapter().is_err() {
+        runner::skip_test("no GPU");
+        return;
+    }
+    let out = runner::dispatch(&dxil, [1, 1, 1], &[], &[0u32; 64]).unwrap();
+    let want: Vec<u32> = (0..64).map(|i| 3 * i + 1).collect();
+    assert_eq!(&out[..64], &want[..]);
+}
