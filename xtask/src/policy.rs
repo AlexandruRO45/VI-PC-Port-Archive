@@ -422,7 +422,7 @@ pub(crate) fn git_command(root: &Path) -> Command {
         for var in REPOSITORY_ENV.iter().chain(PATHSPEC_ENV) {
             command.env_remove(var);
         }
-        if root != crate::workspace_root() {
+        if !is_checkout(root) {
             // Git for Windows opens "/dev/null" as NUL.
             command
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -449,6 +449,25 @@ pub(crate) fn git_command(root: &Path) -> Command {
         }
     }
     command
+}
+
+/// Whether `root` is the checkout itself, however it is spelled.
+///
+/// `tempdir` canonicalizes the checkout before asking `check-ignore` about
+/// a TMPDIR inside it. Reached through a symlink (`~/src` pointing at
+/// another disk), or with `..` in `CARGO_MANIFEST_DIR`, the canonical path
+/// differed from `workspace_root`, so the checkout was taken for a
+/// temporary repository and read without the developer's global excludes
+/// file: a TMPDIR ignored only there, which the full check never lists,
+/// was refused, and with no other candidate every test panicked.
+#[cfg(test)]
+fn is_checkout(root: &Path) -> bool {
+    let checkout = crate::workspace_root();
+    root == checkout
+        || matches!(
+            (root.canonicalize(), checkout.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Keeps git's stdout to what the command prints, since the check parses it.
@@ -2216,6 +2235,36 @@ mod tests {
             .unwrap();
         assert!(out.status.success());
         assert_eq!(out.stdout, tricky.as_os_str().as_encoded_bytes());
+    }
+
+    /// The checkout reached by another spelling (a symlink to it, or a
+    /// path through `..`) is still the checkout: git reads its global and
+    /// system configuration there, as the full check does, and only
+    /// temporary repositories are cut off from it.
+    #[cfg(unix)]
+    #[test]
+    fn the_checkout_keeps_its_configuration_however_it_is_reached() {
+        let isolated = |root: &std::path::Path| {
+            super::git_command(root)
+                .get_envs()
+                .any(|(key, _)| key == "GIT_CONFIG_GLOBAL")
+        };
+        let checkout = crate::workspace_root();
+        let links = tempdir();
+        let link = links.path().join("checkout");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+        let dotted = checkout.join("xtask").join("..");
+        for root in [
+            checkout.clone(),
+            checkout.canonicalize().unwrap(),
+            link,
+            dotted,
+        ] {
+            assert!(!isolated(&root), "{} was isolated", root.display());
+        }
+        // Not the checkout: a temporary repository, and one beside it.
+        assert!(isolated(links.path()));
+        assert!(isolated(&checkout.join("xtask")));
     }
 
     /// Under a TMPDIR whose path is not UTF-8, the tests that write hook
