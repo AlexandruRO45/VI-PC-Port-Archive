@@ -93,7 +93,7 @@ const KEPT: usize = 4;
 /// GPU time, the lists it ran, the commands it recorded and the pipelines
 /// it bound. Diagnostics builds keep the costliest of each window.
 #[cfg(feature = "diagnostics")]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Submission {
     pub ms: u64,
     pub lists: u32,
@@ -2353,6 +2353,45 @@ fn pump() {
 }
 
 #[cfg(test)]
+mod cost {   // the frame log's costliest-submission accounting (diagnostics builds)
+    #[cfg(feature = "diagnostics")]
+    use super::{KEPT, NOTABLE_MS, Submission, keep, take_submissions};
+
+    #[cfg(feature = "diagnostics")]
+    fn submission(ms: u64) -> Submission {
+        Submission {
+            ms,
+            lists: 1,
+            commands: 1,
+            draws: 1,
+            dispatches: 0,
+            pipelines: String::new(),
+        }
+    }
+
+    /// Only what a frame log would act on is kept, costliest first, and the
+    /// count of the window covers every submission.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn the_frame_log_keeps_the_costliest_submissions_of_a_window() {
+        let _ = take_submissions();
+        keep(submission(NOTABLE_MS - 1));
+        let (total, kept) = take_submissions();
+        assert_eq!(total, 1);
+        assert!(kept.is_empty(), "a cheap submission is not news");
+        for ms in [40, 900, 60, 1200, 100] {
+            keep(submission(ms));
+        }
+        let (total, kept) = take_submissions();
+        assert_eq!(total, 5);
+        let kept: Vec<u64> = kept.iter().map(|s| s.ms).collect();
+        assert_eq!(kept, [1200, 900, 100, 60], "costliest first, {KEPT} kept");
+        // A window starts empty.
+        let (total, kept) = take_submissions();
+        assert_eq!((total, kept.len()), (0, 0));
+    }
+}
+
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
