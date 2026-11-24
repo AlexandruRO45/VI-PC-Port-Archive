@@ -195,7 +195,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             },
             HwStage::Ps,
         ) => {
-            // A pixel shader exports no parameters; `[]` never reaches `Unread`.
+            // A pixel shader exports no parameters; `exp param` is refused below.
             let loaded = ps_vgprs(*input_addr)
                 .into_iter()
                 .map(|(r, i)| (Reg::V(r), i))
@@ -407,6 +407,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         9 => Target::Null,
                         t @ 12..=16 => Target::Position(t - 12),
                         20 => Target::Primitive,
+                        // Parameters feed the pixel shader; one has none to write.
+                        32..=63 if native.stage == HwStage::Ps => {
+                            return Err(ShaderError::Malformed(
+                                "a pixel shader exporting a parameter",
+                            ));
+                        }
                         32 if params.is_empty() => Target::Unread,
                         t @ 32..=63 => {
                             // Bit 7: a mesh program's per-primitive output.
@@ -1016,5 +1022,55 @@ mod tests {
         );
         // Only the last bit: fixed-point position alone, in v0.
         assert_eq!(ps_vgprs(1 << 15), [(0, Input::FixedPosition)]);
+    }
+
+    /// The six-bit export target: colours, depth, null, positions, the
+    /// primitive and parameters each name a target; the numbers between
+    /// them are refused, and a pixel shader has no parameter to export.
+    #[test]
+    fn export_targets_map_or_are_refused() {
+        // exp <t>, v0, off, off, off done
+        let export = |t: u32| program(&[0xF800_0801 | t << 4, 0x0000_0000, S_ENDPGM]);
+        let target =
+            |t, native: &NativeProgram| raise(&export(t), native).map(|io| io.exports[0].target);
+        let ps = pixel(vec![], 0);
+        for t in 0..=7u8 {
+            assert_eq!(target(t.into(), &ps), Ok(Target::Color(t)));
+        }
+        assert_eq!(target(8, &ps), Ok(Target::Depth));
+        assert_eq!(target(9, &ps), Ok(Target::Null));
+        let vs = vertex(vec![]);
+        for t in 12..=16u8 {
+            assert_eq!(target(t.into(), &vs), Ok(Target::Position(t - 12)));
+        }
+        assert_eq!(target(20, &vs), Ok(Target::Primitive));
+        // A vertex shader without outputs still exports param0.
+        assert_eq!(target(32, &vs), Ok(Target::Unread));
+        assert_eq!(
+            target(33, &vs),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a parameter export the stage data does not list"
+            })
+        );
+        for t in [10, 11, 17, 18, 19, 21, 31] {
+            assert_eq!(
+                target(t, &vs),
+                Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: "an export target"
+                }),
+                "target {t}"
+            );
+        }
+        for t in [32, 33, 63] {
+            assert_eq!(
+                target(t, &ps),
+                Err(ShaderError::Malformed(
+                    "a pixel shader exporting a parameter"
+                )),
+                "target {t}"
+            );
+        }
     }
 }
