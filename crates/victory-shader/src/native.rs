@@ -2586,6 +2586,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_fssm_header_or_slot_table_cut_anywhere_is_truncated() {
+        let good = fssm(&[]);
+        // `good[..len]` with its stated payload size made to agree, so only
+        // the cut itself can be refused.
+        let cut = |len: usize| {
+            let mut blob = good[..len].to_vec();
+            if len >= FSSM_HEADER {
+                let payload = (len - FSSM_HEADER) as u64;
+                blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            }
+            refused_blob(&xbch(&blob))
+        };
+        // Cut inside the magic, there is no magic to find.
+        for len in [0, 1, 3] {
+            assert_eq!(cut(len), "native blob lacks FSSM magic", "{len}");
+        }
+        // Cut inside the version or the payload size: each is read whole or
+        // not at all.
+        for len in [4, 7, 8, 12, 15] {
+            assert_eq!(cut(len), "truncated", "{len}");
+        }
+        // An empty payload has no slot count, and a slot table cut inside
+        // any slot is read no further than the cut.
+        for len in [0, 4, 7, 8, 12, 0x2f, 0x30, 0x47, 0x5f, 0x67] {
+            assert_eq!(cut(FSSM_HEADER + len), "truncated", "payload {len:#x}");
+        }
+        // The whole table, every slot absent, holds no programs.
+        let blob = xbch(&good);
+        assert!(native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap().is_empty());
+        assert_eq!(good.len(), FSSM_HEADER + slot(HwStage::Cs) + 8);
+    }
+
+    #[test]
+    fn a_record_must_fit_whole_in_the_payload() {
+        // A local-shader record (no stage data) of empty code ending exactly
+        // at the payload end is read; one byte less is refused as a record,
+        // not as a field read past the end.
+        let mut blob = fssm(&[(HwStage::Ls, &[])]);
+        let record = stage_data_at(&blob, HwStage::Ls) - RECORD_SIZE as usize;
+        blob[record..][..8].copy_from_slice(&0u64.to_le_bytes());
+        let with_len = |len: usize| {
+            let mut blob = blob[..len].to_vec();
+            let payload = (len - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let end = record + RECORD_SIZE as usize;
+        let programs = with_len(end).unwrap();
+        assert_eq!(programs.len(), 1);
+        assert_eq!(programs[0].stage, HwStage::Ls);
+        assert!(programs[0].code.is_empty());
+        for len in [end - 1, end - 4, record + 1, record] {
+            assert!(
+                matches!(with_len(len), Err(Malformed("FSSM record out of bounds"))),
+                "{len}"
+            );
+        }
+    }
+
     /// A one-program blob whose stage data is cut to `len` bytes: the code
     /// is moved to the payload start (empty) so the stage data ends the blob.
     fn cut_stage_data(stage: HwStage, len: usize) -> Result<Vec<NativeProgram>, ShaderError> {
