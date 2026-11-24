@@ -229,6 +229,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         // SGPRs after the user data.
         (StageIo::Cs(cs), HwStage::Cs) => {
             let (ids, info) = cs.system_sgprs();
+            // `TIDIG_COMP_CNT` is two bits of the title's stage data; 3 would
+            // name a fourth component (v3), which no thread id has.
+            if cs.thread_id_vgprs() > 3 {
+                return Err(ShaderError::Malformed("a thread id component past z"));
+            }
             let mut loaded: Vec<(Reg, Input)> = (0..cs.thread_id_vgprs())
                 .map(|c| (Reg::V(c), Input::ThreadIdInGroup(c)))
                 .collect();
@@ -704,6 +709,44 @@ mod tests {
                 raise(&p, &vertex(vec![input(vgpr, mask)])),
                 Err(ShaderError::Malformed("vertex attribute past v255")),
                 "v{vgpr} mask {mask:#x}"
+            );
+        }
+    }
+
+    /// `COMPUTE_PGM_RSRC2` enables one to three thread id VGPRs; the
+    /// field's fourth value would load a component past z into v3.
+    #[test]
+    fn compute_thread_ids_stop_at_z() {
+        let compute = |count: u32| NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: count << 11,
+                threads: [64, 1, 1],
+            }),
+            code: vec![],
+        };
+        let reads = |v: u32| program(&[0x7E08_0300 | v, S_ENDPGM]); // v_mov_b32 v4, v<v>
+        let id = |count, v| {
+            raise(&reads(v), &compute(count))
+                .unwrap()
+                .inputs
+                .iter()
+                .map(|i| i.1)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(id(0, 0), [Input::ThreadIdInGroup(0)]);
+        assert_eq!(id(2, 2), [Input::ThreadIdInGroup(2)]);
+        // v2 without a z component is not a thread id.
+        assert_eq!(id(1, 2), []);
+        for v in [0, 3] {
+            assert_eq!(
+                raise(&reads(v), &compute(3)),
+                Err(ShaderError::Malformed("a thread id component past z")),
+                "v{v}"
             );
         }
     }
