@@ -546,6 +546,11 @@ fn loose_extent(address: u64, end: u64) -> (u64, u64) {
         let start = address & !(SPAN - 1);
         (start, end.next_multiple_of(WINDOW).max(start + WINDOW) - start)
     };
+    static RUN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*RUN.get_or_init(|| std::env::var("VICTORY_LOOSE_RUN").is_ok_and(|v| v.trim() == "1")) {
+        let start = address & !(WINDOW - 1);
+        return (start, end.next_multiple_of(WINDOW) - start);
+    }
     let Some(here) = query(address) else { return fallback() };
     let (mut lo, mut hi) = (here.BaseAddress as u64, here.BaseAddress as u64 + here.RegionSize as u64);
     while address - lo < SPAN && lo > 0 {
