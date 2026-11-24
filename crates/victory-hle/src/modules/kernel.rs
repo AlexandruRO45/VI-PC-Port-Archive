@@ -617,6 +617,7 @@ mod tests {
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
     }
 
+    #[cfg(windows)]
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
     }

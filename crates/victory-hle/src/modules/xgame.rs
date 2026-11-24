@@ -91,6 +91,7 @@ extern "system" fn launch_new_game(
         tracing::error!(?command, "XLaunchNewGame: relaunch is Windows-only");
         std::process::exit(1);
     }
+    #[cfg(windows)]
     loop {
         std::thread::park();
     }
