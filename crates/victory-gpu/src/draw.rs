@@ -2511,7 +2511,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let desc = ExtendedHeapDesc {
             desc: D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
+                NumDescriptors: 1_245_184,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             },
@@ -2531,12 +2531,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         );
         let heap = crate::descriptor::heap(guest);
         let host = heap.host().unwrap();
+        let release_guest = || {
+            let release = slot::<extern "system" fn(This) -> u32>(guest, 0x10);
+            assert_eq!(release(guest), 0);
+        };
+        if host.count() >= desc.desc.NumDescriptors {
+            list.close();
+            release_guest();
+            return; // adapter accepted full request without capping
+        }
+        let table = heap.start + u64::from(host.count()) * 32;
         // SAFETY: the heap is live and GetDesc is a plain query.
         let capacity = unsafe { host.heap.GetDesc() }.NumDescriptors - host.count();
         let held = host.dynamic(capacity).unwrap();
         let mut state = State::default();
         state.set_heaps(&[guest]);
-        state.set_table(true, 0, heap.start);
+        state.set_table(true, 0, table);
         let used = [UsedResource {
             kind: ResourceType::Cbv,
             root: RootType::Table,
@@ -2555,12 +2565,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 
         let mut state = State::default();
         state.set_heaps(&[guest]);
-        state.set_table(true, 0, heap.start);
+        state.set_table(true, 0, table);
         let after_release = state.tables(&list, &used, true);
         drop(state);
         list.close();
-        let release = slot::<extern "system" fn(This) -> u32>(guest, 0x10);
-        assert_eq!(release(guest), 0);
+        release_guest();
 
         assert!(while_held.is_empty(), "reused a live range: {while_held:?}");
         assert!(declined);
