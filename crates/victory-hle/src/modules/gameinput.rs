@@ -1,5 +1,5 @@
-//! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! `gameinput.dll`: input devices from the host. Gamepads come from SDL3
+//! or XInput (host slots 0-3); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
@@ -93,6 +93,18 @@ struct PadState {
     right_y: f32,
 }
 
+/// A physical pad's state and its identity on the selected backend. SDL
+/// instance IDs follow the device when enumeration changes its slot.
+#[derive(Clone, Copy)]
+struct HostPad {
+    state: PadState,
+    id: u32,
+    profile: &'static str,
+}
+
+mod glyphs;
+use glyphs::Glyphs;
+
 /// One key held down: scan code (0xE0xx when extended), character, key.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -108,7 +120,7 @@ const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28
 /// Host input, or a fake in tests.
 trait Source: Send {
     /// The pad in host slot `slot`, `None` when the slot is empty.
-    fn pad(&mut self, slot: usize) -> Option<PadState>;
+    fn pad(&mut self, slot: usize) -> Option<HostPad>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
     /// Scripted diagnostic keys (`VICTORY_KEYS`), independent of focus.
@@ -354,6 +366,7 @@ struct State {
     slots: [Slot; DEVICES],
     /// Host slots that have reported non-rest input on their current connection.
     seen_input: [bool; PADS],
+    glyphs: Glyphs,
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -401,6 +414,7 @@ impl Hub {
             state: Mutex::new(State {
                 slots: Default::default(),
                 seen_input: [false; PADS],
+                glyphs: Glyphs::default(),
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -488,16 +502,17 @@ impl State {
     fn poll(
         &mut self,
         devices: &[Device; DEVICES],
-        pads: [Option<PadState>; PADS],
+        pads: [Option<HostPad>; PADS],
         keys: Vec<KeyState>,
         scripted: &[KeyState],
     ) -> Vec<Event> {
+        self.glyphs.poll(&pads);
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         // A wireless receiver answers for a switched-off pad with an all-zero
         // report; ignore a slot until its current connection reports input.
         let mut pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
-            let Some(pad) = pads[slot] else {
+            let Some(pad) = pads[slot].map(|p| p.state) else {
                 self.seen_input[slot] = false;
                 return None;
             };
@@ -582,7 +597,7 @@ fn host() -> Box<dyn Source> {
 fn host() -> Box<dyn Source> {
     struct Nothing;
     impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
+        fn pad(&mut self, _: usize) -> Option<HostPad> {
             None
         }
         fn keys(&mut self) -> Vec<KeyState> {
@@ -593,7 +608,14 @@ fn host() -> Box<dyn Source> {
     Box::new(Nothing)
 }
 
-static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
+static HUB: OnceLock<&'static Hub> = OnceLock::new();
+
+/// Pack directory of the most recently used physical controller. A file
+/// lookup before the title creates GameInput must not start input polling.
+#[cfg(windows)]
+pub(crate) fn active_glyph_profile() -> &'static str {
+    HUB.get().map_or("xbox", |hub| hub.state().glyphs.profile())
+}
 
 type This = *const Object;
 type Out = *mut *const c_void;
@@ -605,7 +627,7 @@ pub extern "system" fn GameInputCreate(out: *mut This) -> HRESULT {
         return E_INVALIDARG;
     }
     // SAFETY: checked non-null; the title passes room for a pointer.
-    unsafe { out.write(&HUB.object) };
+    unsafe { out.write(&HUB.get_or_init(|| Hub::start(host())).object) };
     S_OK
 }
 
@@ -1217,7 +1239,7 @@ mod host {
     }
 
     impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+        fn pad(&mut self, slot: usize) -> Option<HostPad> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 return None;
             }
@@ -1228,7 +1250,11 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            Some(HostPad {
+                state: convert(&state.Gamepad),
+                id: slot as u32,
+                profile: "xbox",
+            })
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1272,8 +1298,7 @@ mod host {
     }
 
     /// Gamepads from SDL3 (`SDL3.dll`), loaded at run time so the runtime
-    /// still starts without it. This is the controller path only; sensors and
-    /// glyph profiles build on it later.
+    /// still starts without it. The profile follows the controller type reported by SDL.
     mod sdl {
         use std::ffi::{CString, c_void};
         use std::time::{Duration, Instant};
@@ -1317,6 +1342,8 @@ mod host {
         type OpenGamepad = unsafe extern "C" fn(u32) -> *mut c_void;
         type CloseGamepad = unsafe extern "C" fn(*mut c_void);
         type UpdateGamepads = unsafe extern "C" fn();
+        type GamepadType = unsafe extern "C" fn(*mut c_void) -> i32;
+        type DeviceIdPart = unsafe extern "C" fn(*mut c_void) -> u16;
         type Button = unsafe extern "C" fn(*mut c_void, i32) -> bool;
         type Axis = unsafe extern "C" fn(*mut c_void, i32) -> i16;
         type Rumble = unsafe extern "C" fn(*mut c_void, u16, u16, u32) -> bool;
@@ -1330,6 +1357,9 @@ mod host {
             open: OpenGamepad,
             close_pad: CloseGamepad,
             update: UpdateGamepads,
+            gamepad_type: GamepadType,
+            vendor: DeviceIdPart,
+            product: DeviceIdPart,
             button: Button,
             axis: Axis,
             rumble: Rumble,
@@ -1364,6 +1394,9 @@ mod host {
                     open: get!(OpenGamepad, "SDL_OpenGamepad"),
                     close_pad: get!(CloseGamepad, "SDL_CloseGamepad"),
                     update: get!(UpdateGamepads, "SDL_UpdateGamepads"),
+                    gamepad_type: get!(GamepadType, "SDL_GetGamepadType"),
+                    vendor: get!(DeviceIdPart, "SDL_GetGamepadVendor"),
+                    product: get!(DeviceIdPart, "SDL_GetGamepadProduct"),
                     button: get!(Button, "SDL_GetGamepadButton"),
                     axis: get!(Axis, "SDL_GetGamepadAxis"),
                     rumble: get!(Rumble, "SDL_RumbleGamepad"),
@@ -1378,6 +1411,7 @@ mod host {
             api: Api,
             ids: [Option<u32>; PADS],
             pads: [Option<*mut c_void>; PADS],
+            profiles: [&'static str; PADS],
             scanned: Instant,
         }
 
@@ -1396,6 +1430,7 @@ mod host {
                     api,
                     ids: [None; PADS],
                     pads: [None; PADS],
+                    profiles: ["xbox"; PADS],
                     scanned: Instant::now(),
                 };
                 s.scan();
@@ -1435,6 +1470,14 @@ mod host {
                         let pad = unsafe { (self.api.open)(id) };
                         if !pad.is_null() {
                             self.pads[slot] = Some(pad);
+                            // SAFETY: the gamepad was just opened.
+                            self.profiles[slot] = unsafe {
+                                glyphs::sdl_profile(
+                                    (self.api.gamepad_type)(pad),
+                                    (self.api.vendor)(pad),
+                                    (self.api.product)(pad),
+                                )
+                            };
                         }
                     }
                 }
@@ -1452,8 +1495,8 @@ mod host {
         }
 
         impl Source for Sdl {
-            fn pad(&mut self, slot: usize) -> Option<PadState> {
-                if self.scanned.elapsed() >= SCAN {
+            fn pad(&mut self, slot: usize) -> Option<HostPad> {
+                if slot == 0 && self.scanned.elapsed() >= SCAN {
                     self.scan();
                 }
                 let pad = self.pads.get(slot).copied().flatten()?;
@@ -1492,7 +1535,7 @@ mod host {
                 // SDL's Y axis grows down; XInput's and the console's grows up.
                 let stick_up = |v: i16| (-f32::from(v) / 32767.0).clamp(-1.0, 1.0);
                 let trigger = |v: i16| (f32::from(v) / 32767.0).clamp(0.0, 1.0);
-                Some(PadState {
+                let state = PadState {
                     buttons,
                     left_trigger: trigger(axis(LEFT_TRIGGER)),
                     right_trigger: trigger(axis(RIGHT_TRIGGER)),
@@ -1500,6 +1543,11 @@ mod host {
                     left_y: stick_up(axis(LEFT_Y)),
                     right_x: stick(axis(RIGHT_X)),
                     right_y: stick_up(axis(RIGHT_Y)),
+                };
+                Some(HostPad {
+                    state,
+                    id: self.ids[slot]?,
+                    profile: self.profiles[slot],
                 })
             }
 
@@ -1644,6 +1692,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         pads: [Option<PadState>; PADS],
+        profiles: [Option<(u32, &'static str)>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
         rumble: Vec<(usize, [f32; 4])>,
@@ -1652,8 +1701,14 @@ mod tests {
     struct Fake(Arc<Mutex<FakeHost>>);
 
     impl Source for Fake {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
-            self.0.lock().unwrap().pads[slot]
+        fn pad(&mut self, slot: usize) -> Option<HostPad> {
+            let host = self.0.lock().unwrap();
+            let (id, profile) = host.profiles[slot].unwrap_or((slot as u32, "xbox"));
+            Some(HostPad {
+                state: host.pads[slot]?,
+                id,
+                profile,
+            })
         }
         fn keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().keys.clone()
@@ -1671,6 +1726,53 @@ mod tests {
         let hub = Hub::new(Box::new(Fake(Arc::clone(&host))));
         hub.poll();
         (hub, host)
+    }
+
+    #[test]
+    fn active_profile_follows_deliberate_input_across_slot_changes() {
+        let (hub, host) = fake();
+        let profile = || hub.state().glyphs.profile();
+        let sample = |slot: usize, pad| {
+            lock(&host).pads[slot] = pad;
+            hub.poll();
+        };
+        let idle = PadState::default();
+        let stick = |left_x| Some(PadState { left_x, ..idle });
+        {
+            let mut h = lock(&host);
+            h.profiles[0] = Some((41, "playstation"));
+            h.profiles[1] = Some((87, "nintendo"));
+            h.pads[0] = Some(idle);
+            h.pads[1] = Some(idle);
+        }
+        hub.poll();
+        assert_eq!(profile(), "playstation");
+        sample(1, stick(0.12));
+        assert_eq!(profile(), "playstation");
+        sample(1, stick(0.7));
+        assert_eq!(profile(), "nintendo");
+        // Scripted diagnostic input goes to slot 0, even when another pad is active.
+        lock(&host).scripted = vec![key(0x0D)];
+        hub.poll();
+        assert_eq!(profile(), "nintendo");
+        lock(&host).scripted.clear();
+        sample(0, Some(PadState { buttons: A, ..idle }));
+        sample(1, stick(0.49));
+        sample(1, stick(0.51));
+        assert_eq!(profile(), "playstation");
+        // SDL may move a still-connected pad to a different slot on a rescan.
+        {
+            let mut h = lock(&host);
+            h.profiles.swap(0, 1);
+            h.pads.swap(0, 1);
+        }
+        hub.poll();
+        assert_eq!(profile(), "playstation");
+        sample(1, None);
+        assert_eq!(profile(), "nintendo");
+        lock(&host).keys = vec![key(b'X')];
+        sample(0, None);
+        assert_eq!(profile(), "xbox");
     }
 
     fn key(virtual_key: u8) -> KeyState {
