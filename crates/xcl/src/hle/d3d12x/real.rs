@@ -633,7 +633,7 @@ fn module_of(addr: usize) -> usize {
 
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
-    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext((obj as *const usize).read_unaligned())
 }
 
 /// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
@@ -5471,6 +5471,17 @@ mod this_first_tests {
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
         }
+    }
+
+    /// #1130: a 4-byte-aligned struct-return buffer (e.g. `D3D12_HEAP_PROPERTIES`)
+    /// must not trap `is_adopted` with a misaligned 8-byte read; it is not adopted.
+    #[test]
+    fn four_byte_aligned_return_buffer_does_not_trap() {
+        let words = [0x1234_5678usize; 4];
+        let p = unsafe { (words.as_ptr() as *const u8).add(4) } as *mut c_void;
+        assert_eq!((p as usize) & 7, 4, "test needs a 4-byte-misaligned address");
+        assert!(crate::gpu::shader::readable(p as usize, 8), "stack buffer must be readable");
+        assert!(!unsafe { is_adopted(p) });
     }
 }
 
