@@ -2822,14 +2822,27 @@ mod tests {
     /// The header of a final dynamic-code block, as [`dynamic_block_of`]
     /// sends it, ready for the block's data.
     fn dynamic_header(hlit: u32, hdist: u32, clen: &[u32; 19], seq: &[(u32, u32)]) -> Bits {
+        dynamic_header_sending(19, hlit, hdist, clen, seq)
+    }
+
+    /// [`dynamic_header`] whose HCLEN sends only the first `hclen` (4 to
+    /// 19) code-length code lengths, in [`LENGTH_ORDER`]; `seq` is still
+    /// coded with the code of all of `clen`.
+    fn dynamic_header_sending(
+        hclen: usize,
+        hlit: u32,
+        hdist: u32,
+        clen: &[u32; 19],
+        seq: &[(u32, u32)],
+    ) -> Bits {
         let mut bits = Bits::default();
         bits.put(1, 1); // BFINAL
         bits.put(2, 2); // dynamic codes
         bits.put(hlit - 257, 5); // HLIT
         bits.put(hdist - 1, 5); // HDIST
-        bits.put(15, 4); // HCLEN: all 19 code-length code lengths
-        for sym in LENGTH_ORDER {
-            bits.put(clen[sym], 3);
+        bits.put(hclen as u32 - 4, 4); // HCLEN
+        for sym in &LENGTH_ORDER[..hclen] {
+            bits.put(clen[*sym], 3);
         }
         let clen_codes = canonical(clen);
         for &(sym, extra) in seq {
@@ -3283,6 +3296,62 @@ mod tests {
             ("copy with no distance code", 0, Some(0), false),
         ] {
             let packed = block(dist, copy);
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
+
+    #[test]
+    fn code_length_lengths_left_unsent_are_zeros() {
+        // HCLEN states how many of the 19 code-length code lengths a dynamic
+        // block sends, in their fixed order; the rest are 0. A header that
+        // stops once every nonzero one is sent is the same code in fewer
+        // bits, and a stream. One that stops before a length its sequence
+        // uses (here symbol 1, 18th in the order) leaves that symbol no
+        // code, and the stream breaks where it is first sent. Such a broken
+        // record covers no other, so it is yielded and does not unpack, and
+        // the record after it is found either way.
+        let a = u32::from(b'A');
+        // Code-length code: 18 in 1 bit, 0 and 1 in 2 (a complete code).
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[1]) = (1, 2, 2);
+        assert_eq!(LENGTH_ORDER.iter().position(|&s| s == 1), Some(17));
+        let mut lengths = vec![0; 258];
+        (lengths[a as usize], lengths[256]) = (1, 1);
+        let lit = &lengths[..257];
+        let lit_codes = canonical(lit);
+        let block = |hclen: usize| {
+            let mut bits = dynamic_header_sending(hclen, 257, 1, &clen, &length_symbols(&lengths));
+            for sym in [a, a, a, a, 256] {
+                bits.code(lit_codes[sym as usize], lit[sym as usize]);
+            }
+            bits.out
+        };
+        let want = b"AAAA".to_vec();
+        assert_eq!(
+            block(19),
+            dynamic_block(&clen, &length_symbols(&lengths), lit, &[a, a, a, a, 256])
+        );
+        for (hclen, valid) in [(19, true), (18, true), (17, false), (4, false)] {
+            let what = format!("{hclen} code-length code lengths sent");
+            let packed = block(hclen);
             assert_eq!(
                 miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
                 valid.then(|| want.clone()),
