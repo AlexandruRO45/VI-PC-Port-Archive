@@ -31,8 +31,8 @@ impl Retirement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     struct Payload(Vec<u8>, Arc<AtomicUsize>);
     impl Drop for Payload {

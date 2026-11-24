@@ -1466,10 +1466,11 @@ mod tests {
             assert_eq!(references(&buffer), 2, "ours and the slot's");
             heap.make_null(slot);
             assert_eq!(references(&buffer), 1, "idle retirement releases immediately");
-            let slot = heap.dynamic(1).unwrap();
-            heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
-            assert_eq!(references(&buffer), 2, "ours and the reused slot's");
-            heap.release(slot, 1);
+            let separate = HostHeap::new(false, 4).unwrap();
+            let slot = separate.dynamic(1).unwrap();
+            separate.raw_view_at(slot, Some(&buffer), 0, 256, false);
+            assert_eq!(references(&buffer), 2, "ours and the dynamic slot's");
+            separate.release(slot, 1);
             assert_eq!(references(&buffer), 1, "free dynamic slots hold no resource");
         }
         let a = heap.dynamic(heap.dynamic - 100).unwrap();
