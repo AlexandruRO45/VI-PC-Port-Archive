@@ -311,6 +311,12 @@ static TEXTURES: Mutex<Table> = Mutex::new(Table::new());
 static REFRESH: Mutex<()> = Mutex::new(());
 static TEXTURES_GEN: AtomicU64 = AtomicU64::new(0);
 static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TRACKED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn update_counts(t: &Table) {
+    TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+    TRACKED_COUNT.store(t.by_res.len() + t.shadowed.len(), Ordering::Release);
+}
 /// cached `watch_ranges` keyed by `(sparse::mapped_gen, TEXTURES_GEN, graphics_reservations_gen)`
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
@@ -386,7 +392,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         let mut t = TEXTURES.lock().unwrap();
         let (delta, unmap_ptrs) = t.insert(res as usize, e);
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_counts(&t);
         clone_resources(&unmap_ptrs)
     };
     for r in &to_unmap {
@@ -484,7 +490,7 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
         let mut t = TEXTURES.lock().unwrap();
         let (delta, retired, unmap_ptrs) = t.retire_range(va, va.saturating_add(len));
         adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        update_counts(&t);
         (retired, clone_resources(&unmap_ptrs))
     };
     for r in &to_unmap {
@@ -495,24 +501,80 @@ pub(super) unsafe fn retire_overlapping(va: usize, len: usize) {
     }
 }
 
-/// The PC texture was released for good.
-pub fn forget(res: usize) {
+unsafe fn finish_remove(res: usize, removed: bool, to_remap: Vec<ID3D12Resource>) {
     LAST_CONTENT.lock().unwrap().remove(&res);
-    let (removed, to_remap) = {
-        let mut t = TEXTURES.lock().unwrap();
-        let (removed, delta, remap_ptrs) = t.remove(res);
-        adjust_pending(delta);
-        TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
-        (removed, unsafe { clone_resources(&remap_ptrs) })
-    };
     for r in &to_remap {
-        unsafe {
-            super::vram::remap_if_unmapped(r);
-        }
+        super::vram::remap_if_unmapped(r);
     }
     if removed {
         TEXTURES_GEN.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Result of synchronizing a tracked resource's `Release` with `TEXTURES`.
+pub enum ReleaseOutcome {
+    /// Not tracked by `title_textures`; caller runs normal release path.
+    Untracked,
+    /// Tracked and still alive (refcount `n > 0`).
+    Alive(u32),
+    /// Tracked and already removed from `TEXTURES` before final destruction; caller holds the
+    /// final ref if `hold_ref` is true, or refcount already hit 0 if false.
+    Last { hold_ref: bool },
+}
+
+/// Synchronize `ID3D12Resource::Release` with `TEXTURES` so a tracked resource is removed before
+/// its refcount can drop to 0 and race with `clone_resources` / `refresh_once` calling `AddRef`.
+pub unsafe fn release_tracked(
+    res: usize,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+) -> ReleaseOutcome {
+    if TRACKED_COUNT.load(Ordering::Acquire) == 0 {
+        return ReleaseOutcome::Untracked;
+    }
+    let p = res as *mut c_void;
+    let mut t = TEXTURES.lock().unwrap();
+    if !t.by_res.contains_key(&res) && !t.shadowed.contains_key(&res) {
+        return ReleaseOutcome::Untracked;
+    }
+    // Keep `res` alive across concurrent drops while we inspect whether the caller holds the last ref.
+    let c = add_ref(p);
+    let (hold_ref, release_extra) = if c <= 2 {
+        (true, true)
+    } else {
+        let r1 = release(p);
+        if r1 <= 1 {
+            (r1 == 1, false)
+        } else {
+            let r2 = release(p);
+            if r2 > 0 {
+                return ReleaseOutcome::Alive(r2);
+            }
+            (false, false)
+        }
+    };
+    let (removed, delta, remap_ptrs) = t.remove(res);
+    adjust_pending(delta);
+    update_counts(&t);
+    let to_remap = clone_resources(&remap_ptrs);
+    drop(t);
+    finish_remove(res, removed, to_remap);
+    if release_extra {
+        release(p);
+    }
+    ReleaseOutcome::Last { hold_ref }
+}
+
+/// The PC texture was released for good.
+pub fn forget(res: usize) {
+    let (removed, to_remap) = {
+        let mut t = TEXTURES.lock().unwrap();
+        let (removed, delta, remap_ptrs) = t.remove(res);
+        adjust_pending(delta);
+        update_counts(&t);
+        (removed, unsafe { clone_resources(&remap_ptrs) })
+    };
+    unsafe { finish_remove(res, removed, to_remap) };
 }
 
 /// The title-memory address of a texture kept in step with it.
@@ -1994,5 +2056,139 @@ mod tests {
             mutator.join().unwrap();
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn tracked_release_removes_entry_before_final_drop_and_survives_refcount_2_race() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+        use std::sync::Barrier;
+
+        #[repr(C)]
+        struct MockCom {
+            refs: AtomicU32,
+            freed: AtomicBool,
+            uaf: AtomicBool,
+        }
+
+        unsafe extern "system" fn mock_add_ref(p: *mut c_void) -> u32 {
+            let m = &*(p as *const MockCom);
+            if m.freed.load(Ordering::Acquire) {
+                m.uaf.store(true, Ordering::SeqCst);
+                return 1;
+            }
+            let prev = m.refs.fetch_add(1, Ordering::AcqRel);
+            if prev == 0 || m.freed.load(Ordering::Acquire) {
+                m.uaf.store(true, Ordering::SeqCst);
+            }
+            prev + 1
+        }
+
+        unsafe extern "system" fn mock_release(p: *mut c_void) -> u32 {
+            let m = &*(p as *const MockCom);
+            let prev = m.refs.fetch_sub(1, Ordering::AcqRel);
+            if prev == 1 {
+                m.freed.store(true, Ordering::Release);
+            }
+            prev.saturating_sub(1)
+        }
+
+        let _guard = TEST_LOCK.lock().unwrap();
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let mk_entry = |va: usize| Entry {
+            device: 0,
+            va,
+            src: va,
+            in_gpu_view: false,
+            tex: Arc::clone(&tex),
+            states: vec![D3D12_RESOURCE_STATE_COMMON],
+            pending: false,
+            gpu_written: true,
+            placed: false,
+            unmapped: false,
+            seq: 0,
+        };
+
+        // Single-ref release (XCL_LATE_RELEASE=0 path): entry must be removed from TEXTURES before
+        // the caller's final Release drops refcount 1 -> 0.
+        let single = Box::new(MockCom {
+            refs: AtomicU32::new(1),
+            freed: AtomicBool::new(false),
+            uaf: AtomicBool::new(false),
+        });
+        let single_ptr = &*single as *const MockCom as usize;
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(single_ptr, mk_entry(0x7E57_1000_0000));
+            update_counts(&t);
+        }
+        let outcome = unsafe { release_tracked(single_ptr, mock_add_ref, mock_release) };
+        assert!(matches!(outcome, ReleaseOutcome::Last { hold_ref: true }));
+        assert!(!TEXTURES.lock().unwrap().by_res.contains_key(&single_ptr));
+        assert!(!single.freed.load(Ordering::Acquire), "must not free before removal from TEXTURES");
+        assert_eq!(unsafe { mock_release(single_ptr as *mut c_void) }, 0);
+        assert!(single.freed.load(Ordering::Acquire));
+        assert!(!single.uaf.load(Ordering::SeqCst));
+
+        // Concurrent refcount-2 race + reader cloning under TEXTURES lock (#1359).
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_r = Arc::clone(&stop);
+        let active = Arc::new(AtomicUsize::new(0));
+        let active_r = Arc::clone(&active);
+        let reader = std::thread::spawn(move || {
+            while !stop_r.load(Ordering::Relaxed) {
+                let held: Option<usize> = {
+                    let t = TEXTURES.lock().unwrap();
+                    let want = active_r.load(Ordering::Acquire);
+                    (want != 0 && t.by_res.contains_key(&want)).then(|| {
+                        unsafe { mock_add_ref(want as *mut c_void) };
+                        want
+                    })
+                };
+                if let Some(k) = held {
+                    if let ReleaseOutcome::Last { hold_ref: true } = unsafe { release_tracked(k, mock_add_ref, mock_release) } {
+                        unsafe { mock_release(k as *mut c_void) };
+                    }
+                }
+            }
+        });
+
+        for iter in 0..500usize {
+            let obj = Arc::new(MockCom {
+                refs: AtomicU32::new(2),
+                freed: AtomicBool::new(false),
+                uaf: AtomicBool::new(false),
+            });
+            let ptr = Arc::as_ptr(&obj) as usize;
+            active.store(ptr, Ordering::Release);
+            {
+                let mut t = TEXTURES.lock().unwrap();
+                t.insert(ptr, mk_entry(0x7E57_2000_0000 + iter * 0x10000));
+                update_counts(&t);
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let b2 = Arc::clone(&barrier);
+            let t2 = std::thread::spawn(move || {
+                b2.wait();
+                if let ReleaseOutcome::Last { hold_ref: true } = unsafe { release_tracked(ptr, mock_add_ref, mock_release) } {
+                    unsafe { mock_release(ptr as *mut c_void) };
+                }
+            });
+            barrier.wait();
+            if let ReleaseOutcome::Last { hold_ref: true } = unsafe { release_tracked(ptr, mock_add_ref, mock_release) } {
+                unsafe { mock_release(ptr as *mut c_void) };
+            }
+            t2.join().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !obj.freed.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            active.store(0, Ordering::Release);
+            assert!(!obj.uaf.load(Ordering::SeqCst), "UAF observed on iteration {iter}");
+            assert!(obj.freed.load(Ordering::Acquire), "object not freed on iteration {iter}");
+            assert!(!TEXTURES.lock().unwrap().by_res.contains_key(&ptr));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
     }
 }
