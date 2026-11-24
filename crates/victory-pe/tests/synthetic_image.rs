@@ -1830,3 +1830,64 @@ fn the_export_directory_dll_name_is_not_read() {
         assert_eq!(info.exports.len(), 3, "DLL name at {name:#x}");
     }
 }
+
+#[test]
+fn tls_callbacks_past_size_of_image_are_kept_as_written() {
+    // Only the 32-bit RVA range is checked: a callback below 4 GiB but past
+    // SizeOfImage is reported as written, for the caller to judge.
+    let mut d = image();
+    let past = SIZE_OF_IMAGE + 0x10;
+    put64(&mut d, at(TLS_CALLBACKS), IMAGE_BASE + u64::from(past));
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.callback_rvas, [past, 0x1020]);
+}
+
+#[test]
+fn header_values_are_not_checked_against_each_other() {
+    // An entry point past the image, a stack commit larger than its
+    // reserve and an image base that is not 64 KiB aligned are all taken
+    // as written; the loader decides what to make of them.
+    let mut d = image();
+    put32(&mut d, OPT + 16, SIZE_OF_IMAGE + 0x1000);
+    put64(&mut d, OPT + 24, IMAGE_BASE + 0x1000);
+    put64(&mut d, OPT + 72, 0x1000);
+    put64(&mut d, OPT + 80, 0x10_0000);
+    // Keep the TLS VAs relative to the new base.
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + 0x1000 + u64::from(TLS_CALLBACKS),
+    );
+    put64(&mut d, at(TLS_CALLBACKS), IMAGE_BASE + 0x1000 + 0x1010);
+    put64(&mut d, at(TLS_CALLBACKS) + 8, IMAGE_BASE + 0x1000 + 0x1020);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.entry_rva, SIZE_OF_IMAGE + 0x1000);
+    assert_eq!(info.image_base, IMAGE_BASE + 0x1000);
+    assert_eq!((info.stack_reserve, info.stack_commit), (0x1000, 0x10_0000));
+    assert_eq!(info.rva_to_file_offset(info.entry_rva), None);
+    assert_eq!(info.tls.unwrap().callback_rvas, [0x1010, 0x1020]);
+}
+
+#[test]
+fn data_appended_after_the_last_section_is_not_mapped() {
+    // An overlay (a signature, an installer payload) follows the raw data of
+    // the last section. It does not change the parse, and no RVA reaches it.
+    let plain = ImageInfo::parse(&image()).unwrap();
+    let mut d = image();
+    let overlay_offset = d.len() as u32;
+    d.extend_from_slice(&[0xCC; 0x300]);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(format!("{info:?}"), format!("{plain:?}"));
+    for rva in [
+        SECTION_RVA + SECTION_SIZE,
+        SECTION_RVA + SECTION_SIZE + 0x2FF,
+    ] {
+        assert_eq!(info.rva_to_file_offset(rva), None, "rva {rva:#x}");
+    }
+    assert!(
+        (0..SIZE_OF_IMAGE)
+            .step_by(0x10)
+            .filter_map(|rva| info.rva_to_file_offset(rva))
+            .all(|offset| offset < overlay_offset)
+    );
+}
