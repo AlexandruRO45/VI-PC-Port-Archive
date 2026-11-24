@@ -12,6 +12,7 @@ use crate::native::{
 };
 use crate::{io, ir, range, resource, structure};
 
+
 const S_ENDPGM: u32 = 0xBF81_0000;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
@@ -1621,7 +1622,11 @@ fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
 /// `v_dot4c` accumulates into its destination.
 #[test]
 fn fspx_programs_run_with_the_hardwares_dot_products() {
-    let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    // Constants with bytes below 0x80: RDNA1's driver folds a constant
+    // multiplicand with zero-extended bytes, which changes only bytes >=
+    // 0x80. The signed-byte case is covered separately with run-time
+    // operands below.
+    let (a, b, acc) = (0x0302_7B02u32, 0x7F7F_7F01u32, 0x7FFF_FFF0u32);
     let mut load = Vec::new();
     for (v, x) in [(1, a), (2, b), (3, acc)] {
         load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
@@ -1657,6 +1662,19 @@ fn fspx_programs_run_with_the_hardwares_dot_products() {
             assert_eq!(got, want, "{backend}: {body:08x?}");
         });
     }
+}
+
+/// The signed dot product with negative bytes in run-time operands: a
+/// constant multiplicand with such bytes is folded unsigned by the RDNA1
+/// driver, so this case must not use literals.
+#[test]
+fn dot4_signed_bytes_with_runtime_operands() {
+    let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    let [w0, w1] = dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7);
+    let shader = build_valu_cs(&[w0, w1]);
+    run_cases(&shader, &[[a, b, acc, 0]], |backend, _, _, got| {
+        assert_eq!(got, dot4_ref(a, b, acc), "{backend}");
+    });
 }
 
 /// `v_pk_fmac_f16` (VOP2): each half of the destination plus the product
