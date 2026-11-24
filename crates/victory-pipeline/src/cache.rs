@@ -143,8 +143,11 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn accepts_entry_published_concurrently_while_open() {
+        use std::os::windows::fs::OpenOptionsExt;
+
         struct RacingUpper {
             cache: Cache,
             held: std::sync::Mutex<Option<std::fs::File>>,
@@ -163,7 +166,20 @@ mod tests {
                 let path = self.cache.path_for(&key);
                 std::fs::create_dir_all(path.parent().unwrap())?;
                 std::fs::write(&path, &output)?;
-                *self.held.lock().unwrap() = Some(std::fs::File::open(&path)?);
+                // FILE_SHARE_READ permits readers but prevents replacement while held.
+                *self.held.lock().unwrap() = Some(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .share_mode(1)
+                        .open(&path)?,
+                );
+                let probe = tempfile_in(path.parent().unwrap());
+                std::fs::write(&probe, &output)?;
+                assert!(
+                    std::fs::rename(&probe, &path).is_err(),
+                    "the open reader must prevent replacing the published entry"
+                );
+                std::fs::remove_file(probe)?;
                 Ok(output)
             }
         }
