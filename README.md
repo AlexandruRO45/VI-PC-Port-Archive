@@ -91,6 +91,21 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
 
+The title can also be started from the launcher, a window that checks the
+game directory (executable, `MicrosoftGame.Config`, the RPF archives) and runs
+`victory.exe run ... --execute` with its output in a log tab (the
+`translate --cache` step above is still run from the command line):
+
+```powershell
+cargo build --release -p victory -p victory-launcher
+target\release\victory-launcher.exe
+```
+
+It keeps its settings in `%LOCALAPPDATA%\victory\launcher.toml`, writes the
+`victory.toml` it passes to `victory.exe` beside it, and saves each run's
+output to `last-run.log` there. Its diagnostics options use the build in
+`target\diag` (see [Debugging](#debugging)).
+
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
 data under the cache folder.
