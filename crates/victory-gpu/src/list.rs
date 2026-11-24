@@ -867,60 +867,6 @@ extern "system" fn resolve_queries(
     }
 }
 
-extern "system" fn set_predication(this: This, buffer: This, offset: u64, operation: u32) {
-    #[cfg(windows)]
-    {
-        use windows::Win32::Graphics::Direct3D12::*;
-
-        let Some(host) = host_list(this) else {
-            return;
-        };
-        if buffer.is_null() {
-            #[cfg(feature = "diagnostics")]
-            host.note_op(|| "disable predication".into());
-            // SAFETY: an open list; a null buffer disables predication.
-            unsafe {
-                host.list
-                    .SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO)
-            };
-            return;
-        }
-        let operation = match operation {
-            0 => D3D12_PREDICATION_OP_EQUAL_ZERO,
-            1 => D3D12_PREDICATION_OP_NOT_EQUAL_ZERO,
-            _ => {
-                tracing::debug!(operation, "invalid predication operation");
-                return;
-            }
-        };
-        if !offset.is_multiple_of(8) {
-            tracing::debug!(offset, "unaligned predication offset");
-            return;
-        }
-        let Some(data) = buffer_range(buffer, offset, 8) else {
-            return;
-        };
-        #[cfg(feature = "diagnostics")]
-        host.note_op(|| format!("set predication {buffer:?}+{offset:#x} {operation:?}"));
-        if let Some(resource) = crate::resource::host_resource(buffer) {
-            ensure_state(host, buffer, D3D12_RESOURCE_STATE_PREDICATION.0 as u32);
-            // SAFETY: an open list and a live buffer with an aligned predicate.
-            unsafe { host.list.SetPredication(Some(resource), offset, operation) };
-        } else if let Some(device) = crate::host::host()
-            && let Some((upload, mapped)) = host.upload(device, 8)
-        {
-            // Title buffers live in CPU memory. Take each predicate at its place
-            // among deferred title writes. The list owns the upload, whose
-            // GENERIC_READ state includes PREDICATION.
-            host.defer_fill(mapped, data, 8);
-            // SAFETY: the list retains the upload through execution.
-            unsafe { host.list.SetPredication(Some(&upload), 0, operation) };
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = (this, buffer, offset, operation);
-}
-
 #[cfg(windows)]
 fn event_payload(data: *const c_void, size: u32) -> (Option<*const c_void>, u32) {
     if data.is_null() || size == 0 {
@@ -930,12 +876,42 @@ fn event_payload(data: *const c_void, size: u32) -> (Option<*const c_void>, u32)
     }
 }
 
+#[cfg(all(windows, feature = "diagnostics"))]
+fn decode_marker_label(metadata: u32, data: Option<*const c_void>, size: u32) -> Option<String> {
+    let ptr = data?.cast::<u8>();
+    // SAFETY: caller provides `size` readable bytes for this marker call.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, size as usize) };
+    // PIX_EVENT_UNICODE_VERSION = 0, PIX_EVENT_ANSI_VERSION = 1.
+    let text = if metadata == 0 && bytes.len() >= 2 && bytes.len().is_multiple_of(2) {
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .take_while(|&u| u != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..len]).into_owned()
+    };
+    (!text.is_empty()).then_some(text)
+}
+
 extern "system" fn set_marker(this: This, metadata: u32, data: *const c_void, size: u32) {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
         let (data, size) = event_payload(data, size);
         #[cfg(feature = "diagnostics")]
-        host.note_op(|| format!("set marker metadata={metadata:#x} size={size}"));
+        if crate::host::dred_on() {
+            // `note_op` already emits a host `SetMarker` breadcrumb so
+            // `HostList::notes` stays 1:1 with `D3D12_AUTO_BREADCRUMB_OP_SETMARKER`.
+            host.note_op(|| match decode_marker_label(metadata, data, size) {
+                Some(label) => format!("set marker {label:?} metadata={metadata:#x}"),
+                None => format!("set marker metadata={metadata:#x} size={size}"),
+            });
+            return;
+        }
         // SAFETY: an open list; the caller provides `size` bytes for this call.
         unsafe { host.list.SetMarker(metadata, data, size) };
     }
@@ -1580,14 +1556,13 @@ const METHODS: [(usize, *const ()); 55] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 13] = [
+const MORE_METHODS: [(usize, *const ()); 12] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
     (28, query_mark as *const ()),                  // 0xe0 BeginQuery
     (29, query_mark as *const ()),                  // 0xe8 EndQuery
     (30, resolve_queries as *const ()),             // 0xf0
-    (31, set_predication as *const ()),             // 0xf8
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310
     (99, driver_hint as *const ()),                 // 0x318
@@ -1760,22 +1735,16 @@ mod tests {
         }
     }
 
-    type SetPredication = extern "system" fn(This, This, u64, u32);
     type Marker = extern "system" fn(This, u32, *const c_void, u32);
     type EndEvent = extern "system" fn(This);
 
     #[test]
-    fn predication_and_marker_slots_are_stable() {
-        let predication: SetPredication = set_predication;
+    fn marker_and_event_slots_are_stable() {
         let marker: Marker = set_marker;
         let begin: Marker = begin_event;
         let end: EndEvent = end_event;
         for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
             let object = Object::new(table);
-            assert_eq!(
-                slot::<SetPredication>(&object, 0xf8) as *const (),
-                predication as *const ()
-            );
             assert_eq!(
                 slot::<Marker>(&object, 0x1c0) as *const (),
                 marker as *const ()
@@ -1793,23 +1762,17 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn set_predication_and_markers_execute_on_gpu() {
-        use windows::Win32::Graphics::Direct3D12::*;
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
-        };
-        use windows::core::{IUnknown, Interface};
-
+    fn markers_and_events_execute_on_gpu() {
         let Some(device) = crate::host::host() else {
             assert!(
                 std::env::var_os("VICTORY_D3D12_WARP").is_none(),
                 "WARP unavailable"
             );
-            eprintln!("skipping predication readback: no host D3D12 device");
+            eprintln!("skipping marker and event test: no host D3D12 device");
             return;
         };
         let null = std::ptr::null();
-        let (mut allocator, mut list, mut predicate) = (null, null, null);
+        let (mut allocator, mut list) = (null, null);
         assert_eq!(
             create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
             S_OK
@@ -1819,97 +1782,10 @@ mod tests {
             S_OK
         );
         let host = host_list(list).unwrap();
-        let native = &host.list;
-        let buf = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: 16,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let default_heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                (&raw const default_heap).cast(),
-                0,
-                (&raw const buf).cast(),
-                0,
-                null.cast(),
-                &PAGEABLE_IIDS[0],
-                &mut predicate,
-            ),
-            S_OK
-        );
-        let (predicate_data, _) = crate::resource::buffer_bytes(predicate).unwrap();
-
-        let create = |heap, desc: &D3D12_RESOURCE_DESC, state| -> ID3D12Resource {
-            let properties = D3D12_HEAP_PROPERTIES {
-                Type: heap,
-                ..Default::default()
-            };
-            let mut resource = None;
-            // SAFETY: valid resource and heap descriptions and an initialized out pointer.
-            unsafe {
-                device
-                    .device
-                    .CreateCommittedResource(
-                        &properties,
-                        D3D12_HEAP_FLAG_NONE,
-                        desc,
-                        state,
-                        None,
-                        &mut resource,
-                    )
-                    .unwrap();
-            }
-            resource.unwrap()
-        };
-        let target_desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            ..buf
-        };
-        let target = create(
-            D3D12_HEAP_TYPE_DEFAULT,
-            &target_desc,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-        );
-        let dest = create(
-            D3D12_HEAP_TYPE_DEFAULT,
-            &D3D12_RESOURCE_DESC { Width: 48, ..buf },
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        );
-        let readback = create(
-            D3D12_HEAP_TYPE_READBACK,
-            &D3D12_RESOURCE_DESC { Width: 512, ..buf },
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        );
-        let (upload, upload_data) = device.upload_buffer(80).unwrap();
-        // SAFETY: the mapped upload has room for all three byte patterns.
-        unsafe {
-            upload_data.write_bytes(0x11, 48);
-            upload_data.add(48).write_bytes(0x22, 16);
-            upload_data.add(64).write_bytes(0x33, 16);
-        }
-
         let begin = slot::<Marker>(list, 0x1c8);
         let mark = slot::<Marker>(list, 0x1c0);
         let end = slot::<EndEvent>(list, 0x1d0);
-        let predicate_at = slot::<SetPredication>(list, 0xf8);
-        let label = b"predication test\0";
+        let label = b"marker test\0";
         begin(list, 1, label.as_ptr().cast(), label.len() as u32);
         mark(list, 1, label.as_ptr().cast(), label.len() as u32);
         end(list);
@@ -1918,104 +1794,14 @@ mod tests {
         mark(list, 0, null.cast(), 0);
         end(list);
 
-        let rtv = device.rtv(&target, None);
-        // SAFETY: the list is open and all resources outlive its execution.
-        // The texture copy locations borrow those resources without adding refs.
-        unsafe {
-            native.ClearRenderTargetView(rtv, &[1.0, 0.0, 0.0, 1.0], None);
-            native.CopyBufferRegion(&dest, 0, &upload, 0, 48);
-
-            predicate_at(list, predicate, 0, 0);
-            predicate_at(list, predicate, 8, u32::MAX);
-            predicate_at(list, predicate, 1, 0);
-            native.CopyBufferRegion(&dest, 0, &upload, 48, 16);
-            predicate_at(list, predicate, 8, 0);
-            native.CopyBufferRegion(&dest, 16, &upload, 48, 16);
-            predicate_at(list, predicate, 8, 1);
-            predicate_at(list, null, 0, 0);
-            native.CopyBufferRegion(&dest, 32, &upload, 64, 16);
-
-            native.ResourceBarrier(&[
-                crate::host::transition(
-                    &dest,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-                crate::host::transition(
-                    &target,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                ),
-            ]);
-            native.CopyBufferRegion(&readback, 256, &dest, 0, 48);
-            native.CopyTextureRegion(
-                &D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&readback),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                            Offset: 0,
-                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                                Width: 1,
-                                Height: 1,
-                                Depth: 1,
-                                RowPitch: 256,
-                            },
-                        },
-                    },
-                },
-                0,
-                0,
-                0,
-                &D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: std::mem::transmute_copy(&target),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: 0,
-                    },
-                },
-                None,
-            );
-        }
-
-        // SAFETY: these two predicate values fit in the guest buffer. Write
-        // after recording so only a submission-time fill observes them.
-        unsafe { predicate_data.cast::<[u64; 2]>().write_unaligned([0, 1]) };
         host.close();
         device.execute(&[host]);
-        // SAFETY: execution has finished and the readback contains 512 bytes.
-        unsafe {
-            device.device.GetDeviceRemovedReason().unwrap();
-            let mut mapped = std::ptr::null_mut();
-            readback
-                .Map(
-                    0,
-                    Some(&D3D12_RANGE { Begin: 0, End: 304 }),
-                    Some(&mut mapped),
-                )
-                .unwrap();
-            let bytes = std::slice::from_raw_parts(mapped.cast::<u8>(), 304);
-            assert_eq!(&bytes[..4], &[255, 0, 0, 255]);
-            assert_eq!(&bytes[256..272], &[0x11; 16], "zero skips the copy");
-            assert_eq!(&bytes[272..288], &[0x22; 16], "one allows the copy");
-            assert_eq!(&bytes[288..304], &[0x33; 16], "disabling allows the copy");
-            readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
-        }
+        // SAFETY: the device is live and execution has finished.
+        unsafe { device.device.GetDeviceRemovedReason().unwrap() };
 
-        fn release_native(object: impl Interface) -> u32 {
-            // SAFETY: all COM vtables begin with IUnknown. Release consumes the owned reference.
-            unsafe { (object.assume_vtable::<IUnknown>().Release)(object.into_raw()) }
-        }
-        let native = native.clone();
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
-        assert_eq!(release(predicate), 0);
-        assert_eq!(release_native(native), 0);
-        for resource in [target, dest, readback, upload] {
-            assert_eq!(release_native(resource), 0);
-        }
     }
 
     #[test]
