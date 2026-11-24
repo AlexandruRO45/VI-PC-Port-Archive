@@ -21,6 +21,11 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 
 /// [`build`] for a program with `nonuniform` per-lane handles.
 fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
+    build_checked(words, buffers, nonuniform, nonuniform == 0)
+}
+
+/// [`build_with`], with whether the program has a wave operation.
+fn build_checked(words: &[u32], buffers: bool, nonuniform: u32, wave_ops: bool) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -79,7 +84,7 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     // One access with each lane's own heap index, no wave operation.
     assert_eq!(lowered.nonuniform_handles, nonuniform);
     // (Without an access to prove the loop a waterfall, its first-lane read is a wave operation.)
-    assert_eq!(lowered.wave_ops, nonuniform == 0);
+    assert_eq!(lowered.wave_ops, wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -484,5 +489,49 @@ fn a_descriptor_only_read_as_data_gives_its_views_size() {
             .map(|l| if l & 1 == 0 { 7 | 3 << 16 } else { 3 | 1 << 16 })
             .collect();
         assert_eq!(got, want, "{label}");
+    }
+}
+
+/// Entry 0's buffer descriptor read only for its record count (dword 2), as
+/// `ShallowWaterSim:CS_MinTimestepReduce` (ceb5eb68cd99cb07) tests it before anything
+/// reads the buffer: each lane stores the count, none if it is 0.
+const RECORDS_ONLY_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0202,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF06_800A, // s_cmp_eq_u32 s10, 0
+    0xBF85_0003, // s_cbranch_scc1 -> s_endpgm
+    0x7E02_020A, // v_mov_b32 v1, s10
+    0xE070_1000,
+    0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn a_buffer_descriptor_only_measured_gives_its_record_count() {
+    // No instruction uses entry 0 as a descriptor; its dword 2 is read as a number. The
+    // lowering used to leave it without a value ("a descriptor's address or format read
+    // as data") and the program was refused.
+    let shader = build_checked(RECORDS_ONLY_WAVE32, true, 0, false);
+    let data: Vec<u32> = (0..24).collect();
+    let views = [
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(4),
+        },
+        View::Buffer {
+            data: &data,
+            stride: Stride::Structured(4),
+        },
+        View::RawUav(32),
+    ];
+    for (label, got) in run(&shader, &views) {
+        // 24 elements of 4 bytes: the console's record count.
+        assert_eq!(got, vec![24u32; 32], "{label}");
     }
 }

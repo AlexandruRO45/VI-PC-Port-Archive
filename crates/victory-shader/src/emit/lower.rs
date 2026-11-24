@@ -2663,14 +2663,10 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// The title address (low dword, bits from 32 up) of the buffer view
-    /// whose descriptor the scalar load at `site` reads from the start of
-    /// a table entry, as the host tells it when it binds (`shader.rs`
-    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
-    /// descriptor holds more in the second dword, the stride from bit 16
-    /// up; code that takes the address masks those away.)
-    fn view_address(&mut self, site: Site) -> Option<(V, V)> {
-        use super::shader::USER_VIEW_ADDRESS;
+    /// The table entry of a buffer view (four dwords, SRV or UAV) a descriptor load at a
+    /// constant, aligned table offset reads: the table's slot, the entry's first dword in
+    /// the table and the range that lists it.
+    fn buffer_view(&self, site: Site) -> Option<(u8, u32, &'a UsedResource)> {
         let a = self.scalar.get(&site).copied()?;
         let rp = *self.x.native.layout.get(a.param)?;
         if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
@@ -2691,8 +2687,20 @@ impl<'a> Lower<'a> {
         if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
             return None;
         }
-        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), rp.slot, dword);
-        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), rp.slot, dword);
+        Some((rp.slot, dword, used))
+    }
+
+    /// The title address (low dword, bits from 32 up) of the buffer view
+    /// whose descriptor the scalar load at `site` reads from the start of
+    /// a table entry, as the host tells it when it binds (`shader.rs`
+    /// `USER_VIEW_ADDRESS`); none for anything else. (The console's
+    /// descriptor holds more in the second dword, the stride from bit 16
+    /// up; code that takes the address masks those away.)
+    fn view_address(&mut self, site: Site) -> Option<(V, V)> {
+        use super::shader::USER_VIEW_ADDRESS;
+        let (slot, dword, _) = self.buffer_view(site)?;
+        let lo = self.host_word(RootType::Other(USER_VIEW_ADDRESS), slot, dword);
+        let hi = self.host_word(RootType::Other(USER_VIEW_ADDRESS + 1), slot, dword);
         Some((lo, hi))
     }
 
@@ -5700,17 +5708,45 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
-            // A buffer view the code only takes the address of, to walk
-            // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // A buffer view the code only takes the address of, to walk the memory behind
+            // it (a ray-tracing structure), or only measures (its record count, dword 2: a
+            // size test such as `if (n == 0) return` before anything reads the buffer): the
+            // address and the count from the host, the other dwords have no value.
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((_, _, used)) = self.buffer_view(site)
             {
+                let read = |k: u32| {
+                    inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
+                        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.reads.iter().any(|r| r.1 == v))
+                    })
+                };
+                let address = if read(0) || read(1) { self.view_address(site) } else { None };
+                let records = if count > 2 && read(2) {
+                    let src = Source::Loaded { load: site, first: 0 };
+                    let u = if used.kind == ResourceType::Uav { 0x1000 } else { 0 };
+                    let h = self.handle(site, &src, false, (11 | u, 0))?;
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let mip = self.s.m.undef(i32t);
+                    let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                    // A raw view counts bytes; the descriptor's record count is in elements.
+                    let n = self.s.m.extract(c, d, 0);
+                    Some(if used.stride > 1 {
+                        let k = self.s.m.i32(used.stride);
+                        self.s.m.bin(c, Bin::UDiv, n, k)
+                    } else {
+                        n
+                    })
+                } else {
+                    None
+                };
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
+                    match (k, address, records) {
+                        (0, Some((lo, _)), _) => self.write(inst, reg, lo, None),
+                        (1, Some((_, hi)), _) => self.write(inst, reg, hi, None),
+                        (2, _, Some(n)) => self.write(inst, reg, n, None),
                         _ => {
                             if let Some(v) = inst.write(reg) {
                                 self.vals.insert(v, Val::Missing(OTHER));
