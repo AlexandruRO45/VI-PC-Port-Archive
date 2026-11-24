@@ -820,21 +820,36 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     }
 }
 
+/// The dimension of the null UAV for a title view description's dimension
+/// word (the host's `D3D12_UAV_DIMENSION` values: 3D is 8, 6 and 7 are
+/// multisampled). Multisampled UAVs need a capability, and unknown words
+/// name no dimension: those get a 2D null view, as before.
+fn null_uav_dimension(word: u32) -> D3D12_UAV_DIMENSION {
+    match D3D12_UAV_DIMENSION(word as i32) {
+        d @ (D3D12_UAV_DIMENSION_BUFFER
+        | D3D12_UAV_DIMENSION_TEXTURE1D
+        | D3D12_UAV_DIMENSION_TEXTURE1DARRAY
+        | D3D12_UAV_DIMENSION_TEXTURE2DARRAY
+        | D3D12_UAV_DIMENSION_TEXTURE3D) => d,
+        _ => D3D12_UAV_DIMENSION_TEXTURE2D,
+    }
+}
+
 /// An unordered access view that safely drops writes and reads zeros, matching
 /// the title's dimension from `words` (1D, 2D, arrays, 3D, buffer).
 fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
-    let dim = words[1];
+    let dim = null_uav_dimension(words[1]);
     let desc = match dim {
-        1 => return null_uav_buffer_view(at, 0),
-        2 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UAV_DIMENSION_BUFFER => return null_uav_buffer_view(at, 0),
+        D3D12_UAV_DIMENSION_TEXTURE1D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1D,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Texture1D: D3D12_TEX1D_UAV { MipSlice: 0 },
             },
         },
-        3 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -845,7 +860,7 @@ fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
                 },
             },
         },
-        5 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -857,7 +872,7 @@ fn null_uav_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
                 },
             },
         },
-        6 => D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        D3D12_UAV_DIMENSION_TEXTURE3D => D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_UINT,
             ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
@@ -1069,12 +1084,31 @@ mod tests {
             &View::Unordered(0, 0, Some([0, 1, 0, 0, 0, 0, 0, 0, 0, 0])),
             heap.cpu(1),
         );
-        // Unordered access Texture3D (dim 6)
+        // Unordered access Texture3D (dim 8)
         null_for(
-            &View::Unordered(0, 0, Some([0, 6, 0, 0, 0, 0, 0, 0, 0, 0])),
+            &View::Unordered(0, 0, Some([0, 8, 0, 0, 0, 0, 0, 0, 0, 0])),
             heap.cpu(2),
         );
         // Placed UAV on a buffer (resource[0] == 1)
         null_for(&View::Placed(true, [1; 14], [0; 16]), heap.cpu(3));
+    }
+
+    #[test]
+    fn null_uavs_follow_the_hosts_dimension_numbers() {
+        let cases = [
+            (1, D3D12_UAV_DIMENSION_BUFFER),
+            (2, D3D12_UAV_DIMENSION_TEXTURE1D),
+            (3, D3D12_UAV_DIMENSION_TEXTURE1DARRAY),
+            (4, D3D12_UAV_DIMENSION_TEXTURE2D),
+            (5, D3D12_UAV_DIMENSION_TEXTURE2DARRAY),
+            (6, D3D12_UAV_DIMENSION_TEXTURE2D),
+            (7, D3D12_UAV_DIMENSION_TEXTURE2D),
+            (8, D3D12_UAV_DIMENSION_TEXTURE3D),
+            (0, D3D12_UAV_DIMENSION_TEXTURE2D),
+            (99, D3D12_UAV_DIMENSION_TEXTURE2D),
+        ];
+        for (word, want) in cases {
+            assert_eq!(null_uav_dimension(word), want, "word {word}");
+        }
     }
 }
