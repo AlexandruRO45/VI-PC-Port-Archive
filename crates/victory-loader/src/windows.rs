@@ -163,7 +163,8 @@ fn map_dll(
 
 /// The file `name` in `dir`, its case ignored as the Windows loader ignores
 /// it. A folder can be case-sensitive (WSL makes the folders it creates
-/// so), where joining the name finds only that exact spelling.
+/// so), where joining the name finds only that exact spelling. A folder
+/// spelled the same way ignoring case is passed over, not taken for the DLL.
 fn file_in(dir: &Path, name: &str) -> Option<PathBuf> {
     let exact = dir.join(name);
     if exact.is_file() {
@@ -172,13 +173,13 @@ fn file_in(dir: &Path, name: &str) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
-        .find(|e| {
+        .filter(|e| {
             e.file_name()
                 .to_str()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
         .map(|e| e.path())
-        .filter(|p| p.is_file())
+        .find(|p| p.is_file())
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
