@@ -741,6 +741,20 @@ fn vs_inputs_fit(io: StageIo) -> Result<StageIo, ShaderError> {
     {
         return Err(Malformed("vertex input over a system VGPR"));
     }
+    // Two inputs loading one VGPR would leave it labeled as the first; the
+    // fetch would have overwritten it with the second, which raising drops.
+    if let StageIo::Vs { inputs, .. } = &io {
+        let mut taken = [false; 256];
+        for i in inputs {
+            for c in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                // The first check keeps `vgpr + c` within v255.
+                let r = usize::from(i.vgpr) + c;
+                if std::mem::replace(&mut taken[r], true) {
+                    return Err(Malformed("vertex inputs overlap"));
+                }
+            }
+        }
+    }
     Ok(io)
 }
 
@@ -1404,6 +1418,24 @@ mod tests {
                     input(vgpr, mask),
                     Err(Malformed("vertex input over a system VGPR"))
                 ),
+                "v{vgpr} mask {mask:#x}"
+            );
+        }
+        // Two inputs: x-w in v4 and the second at `vgpr` with `mask`.
+        let inputs = |vgpr: u8, mask: u8| {
+            let mut blob = vs.clone();
+            blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            blob[e + VS_INPUTS..][..10].copy_from_slice(&[0, 0, 0xf, 4, 0, 0, 1, mask, vgpr, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(inputs(8, 0xf).is_ok());
+        assert!(inputs(5, 0).is_ok(), "no channel is loaded");
+        // x in v1 sits below the first input; any channel on v4-v7 overlaps
+        // it, including w of an input in v1.
+        assert!(inputs(1, 0x1).is_ok());
+        for (vgpr, mask) in [(4, 0xf), (7, 0x1), (6, 0x2), (1, 0x8), (5, 0x4)] {
+            assert!(
+                matches!(inputs(vgpr, mask), Err(Malformed("vertex inputs overlap"))),
                 "v{vgpr} mask {mask:#x}"
             );
         }
