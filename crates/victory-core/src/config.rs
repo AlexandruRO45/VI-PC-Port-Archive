@@ -2738,6 +2738,78 @@ mod tests {
     }
 
     #[test]
+    fn a_tilde_spelling_of_home_or_above_is_refused_as_a_cache_or_data_folder() {
+        // `~` is expanded before the folder checks, so every spelling that
+        // lands on home (or a folder holding it) is caught, from a variable
+        // or the config file, and whether home came from HOME (with or
+        // without a trailing slash) or the USERPROFILE fallback.
+        let home = PathBuf::from(abs("home")).join("me");
+        let homes: [(&str, OsString); 3] = [
+            ("HOME", home.clone().into()),
+            ("HOME", home.join("").into()),
+            ("USERPROFILE", home.clone().into()),
+        ];
+        for (home_key, home_value) in &homes {
+            for (value, what) in [
+                ("~", "your home folder"),
+                ("~/", "your home folder"),
+                ("~/.", "your home folder"),
+                ("~/games/..", "your home folder"),
+                ("~/..", "a folder holding"),
+            ] {
+                for key in ["VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+                    let env = |k: &str| match k {
+                        k if k == *home_key => Some(home_value.clone()),
+                        k if k == key => Some(OsString::from(value)),
+                        // USERPROFILE alone gives no default base.
+                        "XDG_CACHE_HOME" => Some(abs("xc")),
+                        "XDG_DATA_HOME" => Some(abs("xd")),
+                        _ => None,
+                    };
+                    let err = Config::resolve(FilePaths::default(), None, env)
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains(what), "{home_key} {key}={value}: {err}");
+                    assert!(err.contains(&format!("(from {key})")), "{err}");
+                }
+                let text = format!("[paths]\ncache_dir = '{value}'\n");
+                let parsed: FileConfig = toml::from_str(&text).unwrap();
+                let file = parsed
+                    .anchored_at(&PathBuf::from(abs("configs")), Some(&home))
+                    .unwrap();
+                let env = |k: &str| match k {
+                    k if k == *home_key => Some(home_value.clone()),
+                    "VICTORY_DATA_DIR" => Some(home.join("victory-data").into()),
+                    "XDG_CACHE_HOME" => Some(abs("xc")),
+                    _ => None,
+                };
+                let err = Config::resolve(file, None, env).unwrap_err().to_string();
+                assert!(err.contains(what), "{home_key} file {value}: {err}");
+                assert!(err.contains("(from config file)"), "{err}");
+            }
+        }
+
+        // A folder under home spelled with `~` stays fine.
+        let env = |k: &str| match k {
+            "HOME" => Some(home.join("").into()),
+            "VICTORY_CACHE_DIR" => Some("~/victory/../victory-cache".into()),
+            "VICTORY_DATA_DIR" => Some("~/./victory-data".into()),
+            _ => None,
+        };
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        assert!(
+            cfg.cache_dir.starts_with(&home),
+            "{}",
+            cfg.cache_dir.display()
+        );
+        assert!(
+            cfg.data_dir.starts_with(&home),
+            "{}",
+            cfg.data_dir.display()
+        );
+    }
+
+    #[test]
     fn cache_or_data_at_a_shared_user_folder_is_refused() {
         let home = PathBuf::from(abs("home")).join("me");
         let xdg_cache = PathBuf::from(abs("xc"));
