@@ -12,9 +12,9 @@ use std::sync::{Mutex, OnceLock};
 // ---------------------------------------------------------------------------
 //
 // `std::thread::scope` creates and joins OS threads on every call, costing
-// ~100–200 µs per spawn. With 27 submissions/frame, each calling
+// ~100â€“200 Âµs per spawn. With 27 submissions/frame, each calling
 // `read_parallel` and/or `changed_pieces` (shadow.rs) on big buffers, that
-// is 50–500 ms per frame of pure thread-management overhead. A persistent
+// is 50â€“500 ms per frame of pure thread-management overhead. A persistent
 // pool eliminates that by keeping worker threads alive between calls.
 //
 // API: `Pool::scope(items, f)` fans `f` over each item on the pool's
@@ -110,7 +110,7 @@ impl Pool {
     /// `R` per item in order. Waits for all workers to finish before
     /// returning (scope-like).
     ///
-    /// For item counts ≤ 1, thread count < 2, or nested calls from within a
+    /// For item counts â‰¤ 1, thread count < 2, or nested calls from within a
     /// pool worker, the work runs inline on the calling thread to avoid lock
     /// overhead, recursion, and deadlock.
     ///
@@ -480,7 +480,7 @@ fn agility_factory() -> Option<ID3D12DeviceFactory> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(AGILITY_SDK_VERSION);
     let dir = std::fs::canonicalize(&dir)
-        .map(|p| p.to_string_lossy().trim_start_matches(r"\?\").to_owned())
+        .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_owned())
         .unwrap_or(dir);
     let path = std::ffi::CString::new(dir.clone()).ok()?;
     // SAFETY: plain D3D12 SDK configuration calls with a NUL-terminated path.
@@ -1686,7 +1686,7 @@ impl Batch {
     fn flush(&mut self) {
         // Each entry in `refreshes` is a distinct shadow (deduped in `add`),
         // so the updates are independent and safe to run concurrently on the
-        // persistent pool. For small counts (≤ 1) the pool fast-paths to the
+        // persistent pool. For small counts (â‰¤ 1) the pool fast-paths to the
         // calling thread to avoid lock overhead.
         let due = std::mem::take(&mut self.textures_due);
         if !due.is_empty() {
@@ -1803,7 +1803,7 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 /// readable.
 /// Local build: [`read`] of a big range in 2 MiB pieces on the persistent thread pool (the copies
 /// of title memory took one core of twenty: ~0.5 GB/s in the world; thread spawning overhead was
-/// 50–200 ms/frame). True if every piece was whole.
+/// 50â€“200 ms/frame). True if every piece was whole.
 fn read_parallel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     const PIECE: usize = 2 << 20;
     let threads = pool_threads();
