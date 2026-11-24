@@ -937,3 +937,224 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// Lowers a wave32 compute program of one group of `threads` threads (one
+/// wave), with the root constants in s0..s3 and the table at s4 as
+/// [`build_valu_cs`] has them, and the thread index in v0. `body` loads the
+/// UAV's descriptor and stores what it computes.
+fn build_wave32_cs(body: &[u32], threads: u32) -> HostShader {
+    let code: Vec<u8> = body.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [threads, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// Whether `host` runs waves of `lanes` lanes (WARP's are narrower).
+fn runs_waves_of(host: &Host, lanes: u32) -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a feature query with a matching out structure.
+    let ok = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut o).cast(),
+            size_of_val(&o) as u32,
+        )
+    }
+    .is_ok();
+    ok && o.WaveOps.as_bool() && (o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&lanes)
+}
+
+/// SCC of a lane-mask operation is "some lane of the result is set"
+/// (RDNA2 ISA, S_AND_B32: `SCC = (D != 0)`; S_AND_SAVEEXEC_B32:
+/// `SCC = (EXEC != 0)`). Read as a number it was "a lane mask read as
+/// data". Each lane of one wave32 stores, from root constants k and j:
+/// 1 if some lane is k (`s_and` with EXEC, then `s_cselect`), 4 the same
+/// way through a uniform branch (`s_cselect vcc, exec, 0`), 8 if some lane
+/// is below j (`s_and_saveexec`'s SCC); and in the lanes below j, which
+/// alone take the branch, 2 if one of them is k and 16 if one of them is
+/// not (`s_xor` of the compare with EXEC). With 24 threads, lanes 24 to 31
+/// are outside EXEC from the start: their compare bits are clear, so they
+/// count for neither.
+#[test]
+fn the_scc_of_a_mask_operation_is_whether_some_lane_is_set() {
+    // Assembled with llvm-mc (gfx1030, wave32).
+    let mut words = vec![s_mov_b32(5, 0x80)]; // s_mov_b32 s5, 0
+    words.extend_from_slice(&s_load_dwordx4(8, 4)); // s_load_dwordx4 s[8:11], s[4:5], 0x0
+    words.extend_from_slice(&[
+        0x7E04_0280, // v_mov_b32_e32 v2, 0
+        0x7D84_0000, // v_cmp_eq_u32_e32 vcc_lo, s0, v0
+        0x8706_7E6A, // s_and_b32 s6, vcc_lo, exec_lo
+        0x8507_8081, // s_cselect_b32 s7, 1, 0
+        0x7E02_0207, // v_mov_b32_e32 v1, s7
+        0x856A_807E, // s_cselect_b32 vcc_lo, exec_lo, 0
+        0xBF86_0001, // s_cbranch_vccz 1
+        0x4A02_0284, // v_add_nc_u32_e32 v1, 4, v1
+        0x7D88_0001, // v_cmp_gt_u32_e32 vcc_lo, s1, v0
+        0xBE8C_3C6A, // s_and_saveexec_b32 s12, vcc_lo
+        0x850F_8088, // s_cselect_b32 s15, 8, 0
+        0xBF88_0007, // s_cbranch_execz 7
+        0x7D84_0000, // v_cmp_eq_u32_e32 vcc_lo, s0, v0
+        0x870D_7E6A, // s_and_b32 s13, vcc_lo, exec_lo
+        0x850E_8082, // s_cselect_b32 s14, 2, 0
+        0x8910_7E6A, // s_xor_b32 s16, vcc_lo, exec_lo
+        0x8511_8090, // s_cselect_b32 s17, 16, 0
+        0x800E_110E, // s_add_u32 s14, s14, s17
+        0x7E04_020E, // v_mov_b32_e32 v2, s14
+        0x887E_0C7E, // s_or_b32 exec_lo, exec_lo, s12
+        0x4A02_020F, // v_add_nc_u32_e32 v1, s15, v1
+        0x4A02_0501, // v_add_nc_u32_e32 v1, v1, v2
+        0x3406_0082, // v_lshlrev_b32_e32 v3, 2, v0
+        0xE070_1000,
+        0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+        S_ENDPGM,
+    ]);
+    let cases: &[(u32, u32)] = &[
+        (0, 0),
+        (5, 16),
+        (1, 2),
+        (3, 2),
+        (0, 1),
+        (1, 1),
+        (20, 16),
+        (25, 32),
+        (31, 32),
+        (99, 16),
+    ];
+    // What lane `lane` of `n` running lanes stores.
+    let expect = |n: u32, k: u32, j: u32, lane: u32| {
+        if lane >= n {
+            return 0;
+        }
+        let below = j.min(n);
+        let mut x = 0;
+        if k < n {
+            x += 1 + 4;
+        }
+        if j > 0 {
+            x += 8;
+        }
+        if lane < j {
+            if k < below {
+                x += 2;
+            }
+            if (0..below).any(|l| l != k) {
+                x += 16;
+            }
+        }
+        x
+    };
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for n in [32, 24] {
+        let shader = build_wave32_cs(&words, n);
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            if !runs_waves_of(&host, 32) {
+                eprintln!("{label}: no 32-lane waves; skipped");
+                continue;
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+            for &(k, j) in cases {
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot, u.dword) {
+                        (RootType::Constants, 0, 0) => k,
+                        (RootType::Constants, 0, 1) => j,
+                        (RootType::Table, 1, _) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(32)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let want: Vec<u32> = (0..32).map(|lane| expect(n, k, j, lane)).collect();
+                assert_eq!(out[0], want, "{label}: {n} threads, k {k}, j {j}");
+            }
+            ran += 1;
+        }
+    }
+    if ran == 0 {
+        eprintln!("no device runs 32-lane waves; skipped");
+    }
+}

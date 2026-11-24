@@ -299,6 +299,17 @@ impl Bools {
         r
     }
 
+    /// Whether `b` is clear in a lane outside EXEC on entry: no vector
+    /// instruction ran there, so all its compare and carry bits are clear.
+    fn clear_in_idle_lanes(&mut self, mut b: Bool) -> bool {
+        for v in self.vars(b) {
+            if matches!(self.atoms[v as usize], Atom::Lane(_)) {
+                b = self.restrict(b, v, false, &mut Map::default());
+            }
+        }
+        b == Bool::FALSE
+    }
+
     /// `b` with each atom that `known` decides replaced by its value.
     fn given(&mut self, mut b: Bool, known: Bool) -> Bool {
         for v in self.vars(b) {
@@ -353,6 +364,13 @@ pub struct Structured {
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+    /// SCC of a lane-mask operation (`s_and_b64`, `s_and_saveexec_b64`,
+    /// ...), "some lane of the result is set", by its value: the lane's bit
+    /// of the result. Only results set in no lane but those running where
+    /// the operation does (clear outside EXEC there, and in the lanes
+    /// outside EXEC on entry), so read as a number SCC is whether some lane
+    /// running there has its bit set.
+    pub any_lane: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -413,6 +431,12 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::any_lane`].
+    any_lane: Map<Value, Bool>,
+    /// Masks clear in the lanes outside EXEC on entry, which run no vector
+    /// instruction: compare and carry results, and what operations that
+    /// keep such lanes clear make of them and of EXEC.
+    clear: HashSet<Key>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -432,6 +456,11 @@ struct SopMasks {
     derived: bool,
     /// For branches: SCC ("result is not zero") per lane.
     scc: Option<Bool>,
+    /// Whether the result (EXEC's new value for the `saveexec` forms) is
+    /// clear in the lanes outside EXEC on entry (see [`Lanes::clear`]).
+    clear: bool,
+    /// The same for the destination (EXEC's old value for `saveexec`).
+    dst_clear: bool,
 }
 
 const MAX_ROUNDS: usize = 256;
@@ -476,6 +505,8 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            any_lane: Map::default(),
+            clear: HashSet::new(),
         })
     }
 
@@ -488,6 +519,8 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.any_lane.clear();
+        self.clear.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -634,6 +667,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            any_lane: self.any_lane.into_iter().collect(),
             bools: self.b,
             exits,
             guards,
@@ -824,16 +858,20 @@ impl<'a> Lanes<'a> {
             derived |= d;
             Some(m)
         };
+        let clear = |n: usize, l: &mut Self| src.get(n).is_some_and(|o| l.clear_idle(inst, o));
         if let Some(saveexec) = save {
             let s = arg(0, self)?;
             let exec = self.exec(inst);
             let new = self.combine(f, s, exec)?;
             let saved = if saveexec { exec } else { new };
+            let new_clear = keeps_clear(f, clear(0, self), true);
             return Some(SopMasks {
                 dst: dst.map(|d| (d, saved)),
                 exec: exec_out.map(|e| (e, new)),
                 derived,
                 scc: Some(new),
+                clear: new_clear,
+                dst_clear: saveexec || new_clear,
             });
         }
         let (result, scc) = match op {
@@ -864,12 +902,43 @@ impl<'a> Lanes<'a> {
                 (r, Some(r))
             }
         };
+        let result_clear = match op {
+            "mov" => clear(0, self),
+            "not" | "wqm" => false,
+            "cselect" => clear(0, self) && clear(1, self),
+            _ => keeps_clear(op, clear(0, self), clear(1, self)),
+        };
         Some(SopMasks {
             dst: dst.map(|d| (d, result)),
             exec: exec_out.map(|e| (e, result)),
             derived,
             scc,
+            clear: result_clear,
+            dst_clear: result_clear,
         })
+    }
+
+    /// Whether operand `op` of `inst` is clear in the lanes outside EXEC on
+    /// entry (see [`Lanes::clear`]).
+    fn clear_idle(&mut self, inst: &Inst, op: &Operand) -> bool {
+        match *op {
+            Operand::Scalar { code, .. } if code != NULL => {
+                let Some(k) = self.key(|r| inst.read(r), code) else {
+                    return false;
+                };
+                // EXEC on entry or joined at a block's entry: lanes outside
+                // it on entry never join (whole-wave sections end in their
+                // block).
+                let joined = |v: Value| !self.defs.contains_key(&v);
+                if self.clear.contains(&k) || code == EXEC && joined(k.0) && joined(k.1) {
+                    return true;
+                }
+                let m = self.mask(k).0;
+                self.b.clear_in_idle_lanes(m)
+            }
+            Operand::Const(128) | Operand::Literal(0) => true,
+            _ => false,
+        }
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -930,6 +999,12 @@ impl<'a> Lanes<'a> {
                 if (takes_mask || touches_exec)
                     && let Some(r) = self.sop(inst).filter(|r| r.derived)
                 {
+                    if let Some((k, _)) = r.dst.filter(|_| r.dst_clear) {
+                        self.clear.insert(k);
+                    }
+                    if let Some((k, _)) = r.exec.filter(|_| r.clear) {
+                        self.clear.insert(k);
+                    }
                     for (k, m) in r.dst.into_iter().chain(r.exec) {
                         self.masks.insert(k, m);
                         // EXEC itself holds the lanes that run here.
@@ -941,6 +1016,18 @@ impl<'a> Lanes<'a> {
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
                         self.scc_lane.insert(scc, m);
+                        // As data, "some lane is set" needs every lane that
+                        // has the bit to be running here: set only where
+                        // EXEC is, and clear in the lanes outside EXEC on
+                        // entry (EXEC is `TRUE` there, and the complement of
+                        // a compare is set in them). Lowering takes
+                        // `s_wqm`'s quads for all lanes, which is no count.
+                        let here = r.exec.is_some_and(|e| e.1 == m)
+                            || exec.is_some_and(|e| self.b.implies(m, e));
+                        let quads = self.b.support(m).iter().any(|a| matches!(a, Atom::Quad(_)));
+                        if here && r.clear && !quads {
+                            self.any_lane.insert(scc, m);
+                        }
                     }
                 }
                 // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
@@ -972,6 +1059,8 @@ impl<'a> Lanes<'a> {
                     let m = l.b.and(exec, a);
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
+                    // A compare or carry writes 0 for lanes outside EXEC.
+                    l.clear.insert(k);
                 };
                 // A select reads a mask nothing else may: a join of compare
                 // results is resolved here, as for EXEC.
@@ -1076,6 +1165,18 @@ impl<'a> Lanes<'a> {
             offset: 0,
             reason: "lane conditions do not settle",
         })
+    }
+}
+
+/// Whether lane-mask operation `f` (as [`Lanes::combine`] names it) leaves
+/// a lane clear where its operands `a` and `c` are known clear.
+fn keeps_clear(f: &str, a: bool, c: bool) -> bool {
+    match f {
+        "and" => a || c,
+        "or" | "xor" => a && c,
+        "andn2" => a,
+        "andn1" => c,
+        _ => false,
     }
 }
 

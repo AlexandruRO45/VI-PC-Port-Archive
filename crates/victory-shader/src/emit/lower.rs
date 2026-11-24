@@ -284,6 +284,41 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+/// Whether the program reads SCC of a lane-mask operation as a number (see
+/// [`Structured::any_lane`]): an instruction other than a branch reads it
+/// (`s_cselect`, a carry), or a join of it is read, branches included
+/// (structurisation takes a joined SCC as a uniform value).
+fn reads_any_lane(st: &Structured, p: &Program) -> bool {
+    let phis: HashMap<Value, &crate::ir::Phi> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.phis)
+        .map(|phi| (phi.value, phi))
+        .collect();
+    let mut read: Vec<Value> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| {
+            let v = i.read(Reg::Scc)?;
+            (!matches!(i.fields, Fields::Sopp { .. }) || phis.contains_key(&v)).then_some(v)
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    while let Some(v) = read.pop() {
+        if !seen.insert(v) {
+            continue;
+        }
+        if st.any_lane.contains_key(&v) {
+            return true;
+        }
+        if let Some(phi) = phis.get(&v) {
+            read.extend(&phi.args);
+        }
+    }
+    false
+}
+
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
 /// channel of `elements`, none for padding. Channel c of `a` is half c;
@@ -398,6 +433,8 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            // "Some lane is set" read as a number is the console wave's.
+            console_lanes |= reads_any_lane(x.st, p);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
@@ -1120,7 +1157,12 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
-            Some(&Val::Missing(w)) => return Err(w),
+            Some(&Val::Missing(w)) => {
+                return match self.x.st.any_lane.get(&v) {
+                    Some(&m) => self.any_lane(v, m, w),
+                    None => Err(w),
+                };
+            }
             Some(&val) => return Ok(val),
             None => {}
         }
@@ -1218,6 +1260,38 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// SCC of a lane-mask operation read as a number: whether some lane has
+    /// its bit of `m` ([`Structured::any_lane`]) set, taken where the
+    /// operation runs. Every lane with the bit set runs there, so it is the
+    /// wave's any-true of the bit: the console wave's in compute, which then
+    /// declares the console's wave size; the host wave's in pixel and vertex
+    /// programs, where it means the same on any wave, as `s_cmp_lg_u64 m, 0`
+    /// does (see [`MaskData::Host`]). Mesh programs keep `why`.
+    fn any_lane(&mut self, scc: Value, m: Bool, why: Why) -> Result<Val, Why> {
+        let wave = match self.mask_data {
+            MaskData::Console => self.s.wave_size.is_some(),
+            MaskData::Host => true,
+            MaskData::None => false,
+        };
+        if !wave {
+            return Err(why);
+        }
+        let at = match self.def_block.get(&scc) {
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+            None => return Err(why),
+        };
+        let bit = self.boolean(m, at)?;
+        let i1 = self.s.t.i1;
+        let any = self
+            .s
+            .op(at, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let val = Val::Bit(any);
+        self.vals.insert(scc, val);
+        Ok(val)
     }
 
     // ---- operands ----
@@ -7417,5 +7491,149 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// Lowers a pixel program with one root constant in s0, SV_Position.x
+    /// in v0 (`SPI_PS_INPUT_ADDR` bit 8) and one colour target.
+    fn lower_pixel(words: &[u32], wave64: bool) -> Result<Lowered, crate::ShaderError> {
+        use super::SigElement;
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64,
+            vgprs: 256,
+            layout: vec![root(RootType::Constants, 0, 0)],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 8,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let el = |name: &str, kind, interp, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![el("SV_Position", 3, 4, 1)],
+            outputs: vec![el("SV_Target", 16, 0, 15)],
+            prims: vec![],
+            mesh_stride: 0,
+        })?;
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone()).expect("DXIL validation");
+        }
+        Ok(l)
+    }
+
+    /// The refusal a program stops with, if any.
+    fn refusal(l: Result<Lowered, crate::ShaderError>) -> Option<&'static str> {
+        match l {
+            Ok(_) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Assembled with llvm-mc (gfx1030): a pixel's x against the root
+    /// constant, `op` on the compare and EXEC, the tail that reads its SCC,
+    /// then a colour export. `vcc` is `vcc_lo` in wave32.
+    fn any_lane_pixel(op: u32, tail: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0x7E02_0F00, // v_cvt_u32_f32_e32 v1, v0
+            0x7E04_02F2, // v_mov_b32_e32 v2, 1.0
+            0x7D88_0200, // v_cmp_gt_u32_e32 vcc, s0, v1
+            op,
+        ];
+        words.extend_from_slice(tail);
+        words.extend_from_slice(&[
+            0xF800_180F,
+            0x0202_0202, // exp mrt0 v2, v2, v2, v2 done vm
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    /// SCC read as a number, by `s_cselect_b32`.
+    const SELECT: &[u32] = &[
+        0x8506_80F2, // s_cselect_b32 s6, 1.0, 0
+        0x7E04_0206, // v_mov_b32_e32 v2, s6
+    ];
+
+    #[test]
+    fn the_scc_of_a_mask_operation_is_whether_some_lane_is_set() {
+        // SCC as a uniform branch: a select of EXEC, then a branch on VCC.
+        let branch64: &[u32] = &[
+            0x85EA_807E, // s_cselect_b64 vcc, exec, 0
+            0xBF87_0001, // s_cbranch_vccnz 1
+            0x7E04_0280, // v_mov_b32_e32 v2, 0
+        ];
+        let branch32: &[u32] = &[
+            0x856A_807E, // s_cselect_b32 vcc_lo, exec_lo, 0
+            0xBF87_0001, // s_cbranch_vccnz 1
+            0x7E04_0280, // v_mov_b32_e32 v2, 0
+        ];
+        // Some lane passes; some lane fails (XOR and ANDN2 with EXEC: the
+        // lanes outside EXEC stay clear).
+        let ops64 = [
+            0x8784_7E6A, // s_and_b64 s[4:5], vcc, exec
+            0x8984_7E6A, // s_xor_b64 s[4:5], vcc, exec
+            0x8A84_6A7E, // s_andn2_b64 s[4:5], exec, vcc
+        ];
+        let ops32 = [
+            0x8704_7E6A, // s_and_b32 s4, vcc_lo, exec_lo
+            0x8904_7E6A, // s_xor_b32 s4, vcc_lo, exec_lo
+            0x8A04_6A7E, // s_andn2_b32 s4, exec_lo, vcc_lo
+        ];
+        for (wave64, ops, branch) in [(true, ops64, branch64), (false, ops32, branch32)] {
+            for op in ops {
+                for tail in [SELECT, branch] {
+                    let words = any_lane_pixel(op, tail);
+                    let l = lower_pixel(&words, wave64)
+                        .unwrap_or_else(|e| panic!("{op:08x} {tail:08x?}: {e}"));
+                    assert!(l.wave_ops, "{op:08x} {tail:08x?}: no wave operation");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_scc_of_a_mask_holding_lanes_elsewhere_stays_refused() {
+        // Each sets the bits of the lanes outside EXEC on entry: some lane
+        // of the result can be set where every running lane's bit is clear.
+        let ops = [
+            0xBE84_086A, // s_not_b64 s[4:5], vcc
+            0x8984_C16A, // s_xor_b64 s[4:5], vcc, -1
+            0x8B84_6A7E, // s_orn2_b64 s[4:5], exec, vcc
+        ];
+        for op in ops {
+            assert_eq!(
+                refusal(lower_pixel(&any_lane_pixel(op, SELECT), true)),
+                Some("a lane mask read as data"),
+                "{op:08x}"
+            );
+        }
     }
 }
