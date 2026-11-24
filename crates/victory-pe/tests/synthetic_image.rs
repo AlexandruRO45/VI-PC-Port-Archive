@@ -1992,3 +1992,110 @@ fn stack_sizes_are_read_as_64_bit_values() {
     assert_eq!(info.stack_reserve, 0x1_0020_0000);
     assert_eq!(info.stack_commit, 0x2_0000_2000);
 }
+
+/// The synthetic image with its NT headers moved 0x40 bytes further in, so
+/// that header offsets only come out right when they follow `e_lfanew`.
+fn image_after_a_stub() -> Vec<u8> {
+    let mut d = image();
+    let end = OPT + 240 + 40;
+    let headers = d[0x40..end].to_vec();
+    d[0x40..end].fill(0);
+    d[0x80..end + 0x40].copy_from_slice(&headers);
+    put32(&mut d, layout::DOS_E_LFANEW, 0x80);
+    d
+}
+
+#[test]
+fn layout_offsets_patch_the_fields_image_info_reads() {
+    // Patching code writes through `layout`; `ImageInfo` reads through
+    // `object`. Both must name the same bytes, wherever the headers are.
+    let mut d = image_after_a_stub();
+    let fh = layout::file_header_offset(&d).unwrap();
+    let opt = layout::optional_header_offset(&d).unwrap();
+    assert_eq!((fh, opt), (0x84, OPT + 0x40));
+
+    put16(
+        &mut d,
+        fh + layout::FILE_HEADER_CHARACTERISTICS,
+        0x0022 | layout::file_flags::DLL,
+    );
+    put32(
+        &mut d,
+        opt + layout::OPT_ADDRESS_OF_ENTRY_POINT,
+        ENTRY + 0x10,
+    );
+    let flags = layout::dll_flags::HIGH_ENTROPY_VA
+        | layout::dll_flags::DYNAMIC_BASE
+        | layout::dll_flags::NX_COMPAT;
+    put16(&mut d, opt + layout::OPT_DLL_CHARACTERISTICS, flags);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(info.is_dll());
+    assert_eq!(info.entry_rva, ENTRY + 0x10);
+    assert_eq!(info.dll_characteristics, flags);
+
+    // The TLS directory slot found through `layout` is the one parsed.
+    let tls = layout::data_directory_offset(&d, DIR_TLS).unwrap();
+    assert_eq!(layout::read_u32(&d, tls), Some(TLS_DIRECTORY));
+    assert_eq!(info.tls.unwrap().directory_rva, TLS_DIRECTORY);
+}
+
+#[test]
+fn directories_set_through_layout_are_the_ones_reported() {
+    let plain = ImageInfo::parse(&image_after_a_stub()).unwrap();
+    assert!(!plain.has_relocations && !plain.has_exception_table && !plain.has_load_config);
+    for (index, check) in [
+        (
+            dir::BASERELOC,
+            (|i: &ImageInfo| i.has_relocations) as fn(&ImageInfo) -> bool,
+        ),
+        (dir::EXCEPTION, |i| i.has_exception_table),
+        (dir::LOAD_CONFIG, |i| i.has_load_config),
+    ] {
+        let mut d = image_after_a_stub();
+        let slot = layout::data_directory_offset(&d, index).unwrap();
+        put32(&mut d, slot, 0x1300);
+        put32(&mut d, slot + 4, 8);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert!(check(&info), "directory {index}");
+    }
+}
+
+#[test]
+fn the_checksum_bound_import_and_iat_directories_change_nothing_read() {
+    // Prepare rewrites the checksum and may clear bound imports; neither is
+    // part of what `ImageInfo` reports, nor is the IAT directory, which only
+    // says where the loader may write.
+    let plain = ImageInfo::parse(&image()).unwrap();
+    let mut d = image();
+    let opt = layout::optional_header_offset(&d).unwrap();
+    put32(&mut d, opt + layout::OPT_CHECKSUM, 0xDEAD_BEEF);
+    for index in [dir::BOUND_IMPORT, dir::IAT] {
+        let slot = layout::data_directory_offset(&d, index).unwrap();
+        put32(&mut d, slot, 0x1380);
+        put32(&mut d, slot + 4, 0x20);
+    }
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(format!("{info:?}"), format!("{plain:?}"));
+}
+
+#[test]
+fn dll_characteristic_flags_are_distinct_single_bits() {
+    use layout::dll_flags::*;
+    let all = [
+        HIGH_ENTROPY_VA,
+        DYNAMIC_BASE,
+        FORCE_INTEGRITY,
+        NX_COMPAT,
+        APPCONTAINER,
+        GUARD_CF,
+    ];
+    let mut seen = 0u16;
+    for flag in all {
+        assert_eq!(flag.count_ones(), 1, "{flag:#x}");
+        assert_eq!(seen & flag, 0, "{flag:#x}");
+        seen |= flag;
+    }
+    let mut d = image();
+    put16(&mut d, OPT + layout::OPT_DLL_CHARACTERISTICS, seen);
+    assert_eq!(ImageInfo::parse(&d).unwrap().dll_characteristics, seen);
+}
