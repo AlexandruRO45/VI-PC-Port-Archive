@@ -105,7 +105,15 @@ impl Timeline {
                     }
                 }
                 Op::Memory(mut wait) => {
-                    if !wait.register(self) {
+                    // With no intervening operation, identical fresh predicates
+                    // may all retire at this observation. A latched wake from
+                    // an earlier write must re-sample the next predicate.
+                    if !wait.register(self, |predicate| {
+                        while matches!(s.ops.front(), Some(Op::Memory(next)) if next.is_fresh_repeat(predicate)) {
+                            s.ops.pop_front();
+                            s.done += 1;
+                        }
+                    }) {
                         s.ops.push_front(Op::Memory(wait));
                         s.held = true;
                         break;

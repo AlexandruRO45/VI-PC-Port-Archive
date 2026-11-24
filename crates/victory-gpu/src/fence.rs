@@ -97,7 +97,7 @@ fn watch_notify() {
 }
 
 /// The two list methods have distinct operand widths. Only Wait32 takes a mask.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operand {
     Dword(u32),
     Qword,
@@ -112,7 +112,7 @@ impl Operand {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Predicate {
     pub address: usize,
     pub operand: Operand,
@@ -235,7 +235,15 @@ impl MemoryWait {
         }
     }
 
-    pub(crate) fn register(&mut self, queue: &Arc<Timeline>) -> bool {
+    pub(crate) fn is_fresh_repeat(&self, predicate: Predicate) -> bool {
+        self.observed.is_none() && self.predicate == predicate
+    }
+
+    pub(crate) fn register(
+        &mut self,
+        queue: &Arc<Timeline>,
+        on_fresh_match: impl FnOnce(Predicate),
+    ) -> bool {
         if let Some(observed) = &self.observed {
             return observed.load(Ordering::Acquire);
         }
@@ -243,6 +251,7 @@ impl MemoryWait {
         let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let possible = self.predicate.can_match();
         if possible && self.predicate.reached(&fences) {
+            on_fresh_match(self.predicate);
             return true;
         }
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -662,7 +671,7 @@ mod tests {
             reference: 1,
         };
         let mut wait = MemoryWait::new(predicate);
-        assert!(!wait.register(&timeline));
+        assert!(!wait.register(&timeline, |_| {}));
         let mut pending = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
         let ours = |entry: &Pending| entry.predicate.address == predicate.address;
         let index = pending.iter().position(ours).unwrap();
@@ -672,7 +681,7 @@ mod tests {
         isolated[0].since = Instant::now() - STALL;
         assert!(scan_memory(&live(), &mut isolated, None).0.is_empty());
         assert!(isolated[0].warned);
-        assert!(!wait.register(&timeline));
+        assert!(!wait.register(&timeline, |_| {}));
         drop(timeline);
         assert!(weak.upgrade().is_none());
         assert!(!scan_memory(&live(), &mut isolated, None).1);
@@ -715,6 +724,35 @@ mod tests {
             }
             .can_match()
         );
+    }
+
+    #[test]
+    fn a_previous_latch_cannot_satisfy_the_next_identical_wait() {
+        use crate::timeline::Op;
+        let word = AtomicU64::new(0);
+        let predicate = Predicate {
+            address: word.as_ptr() as usize,
+            operand: Operand::Qword,
+            comparison: 3,
+            reference: 1,
+        };
+        let queue = Arc::new(Timeline::default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        queue.submit_batch([
+            Op::Memory(MemoryWait::new(predicate)),
+            Op::Memory(MemoryWait::new(predicate)),
+            Op::Run(Box::new(move || tx.send(()).unwrap())),
+        ]);
+        let write = |value| crate::queue::Written::Value(value).write(word.as_ptr().cast(), 8);
+        let first = write(1);
+        write(2).run();
+        first.run();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        write(1).run();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap();
     }
 
     #[cfg(windows)]
@@ -760,8 +798,8 @@ mod tests {
             );
         }
         assert!(rx.try_recv().is_err());
-        // SAFETY: recommit our own reserved page before writing it.
         assert_eq!(
+            // SAFETY: recommit our own reserved page before writing it.
             unsafe { VirtualAlloc(page, 4096, MEM_COMMIT, PAGE_READWRITE) },
             page
         );
