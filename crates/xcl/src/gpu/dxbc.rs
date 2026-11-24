@@ -24,7 +24,7 @@ impl SigElement {
 }
 
 fn rd32(b: &[u8], o: usize) -> Option<u32> {
-    b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    b.get(o..o.checked_add(4)?).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
 }
 
 fn cstr(b: &[u8], o: usize) -> String {
@@ -42,6 +42,10 @@ pub fn signature(blob: &[u8], fourcc: &str) -> Option<Vec<SigElement>> {
     let first = rd32(d, 4)? as usize;
     let v1 = fourcc.ends_with('1');
     let size = if v1 { 32 } else { 24 };
+    let table_end = count.checked_mul(size).and_then(|n| first.checked_add(n))?;
+    if table_end > d.len() {
+        return None;
+    }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
         let mut e = first + i * size;
@@ -99,7 +103,7 @@ pub fn psv(blob: &[u8]) -> Option<Psv> {
     let p = parts.iter().find(|p| p.fourcc == "PSV0")?;
     let d = &blob[p.offset..p.offset + p.size];
     let size = rd32(d, 0)? as usize;
-    let r = d.get(4..4 + size)?;
+    let r = d.get(4..4usize.checked_add(size)?)?;
     let u16at = |o: usize| r.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let mut v = Psv { min_wave: rd32(r, 16)?, max_wave: rd32(r, 20)?, ..Default::default() };
     if size >= 36 {
@@ -177,5 +181,15 @@ mod tests {
         assert_eq!((s[0].semantic().as_str(), s[0].register, s[0].mask, s[0].component_type), ("POSITION0", 0, 7, 3));
         assert_eq!((s[1].name.as_str(), s[1].system_value, s[1].register), ("SV_VertexID", 6, 1));
         assert_eq!(signatures(&isg1()).0, s);
+    }
+
+    #[test]
+    fn truncated_or_oversized_signature_returns_none_without_allocating() {
+        // 8-byte ISG1 claiming u32::MAX elements must return None before Vec::with_capacity(count).
+        let huge_count = crate::gpu::xbox::tests::container(&[(b"ISG1", &[0xFF, 0xFF, 0xFF, 0xFF, 8, 0, 0, 0])]);
+        assert_eq!(signature(&huge_count, "ISG1"), None);
+        // Offset near u32::MAX overflowing first + count * size.
+        let huge_first = crate::gpu::xbox::tests::container(&[(b"ISGN", &[1, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF])]);
+        assert_eq!(signature(&huge_first, "ISGN"), None);
     }
 }
