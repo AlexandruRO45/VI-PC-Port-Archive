@@ -448,16 +448,16 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             let host_dst = crate::resource::host_copy(dst);
             let host_src = crate::resource::host_copy(src);
-            if let (Some(hd), Some(hs)) = (host_dst.as_ref(), host_src.as_ref()) {
-                if hd.mip_drop != hs.mip_drop {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(
-                            "copy_resource between textures with different mip_drop skipped"
-                        );
-                    });
-                    return;
-                }
+            if let (Some(hd), Some(hs)) = (host_dst.as_ref(), host_src.as_ref())
+                && hd.mip_drop != hs.mip_drop
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        "copy_resource between textures with different mip_drop skipped"
+                    );
+                });
+                return;
             }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
@@ -525,22 +525,22 @@ extern "system" fn copy_texture_region(
             return;
         };
         let mut to_sub = dst.footprint.offset as u32;
-        if dst.kind != FOOTPRINT {
-            if let Some(host_dst) = crate::resource::host_copy(dst.resource) {
-                let Some(host_sub) = host_dst.host_subresource(to_sub) else {
-                    return;
-                };
-                to_sub = host_sub;
-            }
+        if dst.kind != FOOTPRINT
+            && let Some(host_dst) = crate::resource::host_copy(dst.resource)
+        {
+            let Some(host_sub) = host_dst.host_subresource(to_sub) else {
+                return;
+            };
+            to_sub = host_sub;
         }
         let mut from_sub = src.footprint.offset as u32;
-        if src.kind != FOOTPRINT {
-            if let Some(host_src) = crate::resource::host_copy(src.resource) {
-                let Some(host_sub) = host_src.host_subresource(from_sub) else {
-                    return;
-                };
-                from_sub = host_sub;
-            }
+        if src.kind != FOOTPRINT
+            && let Some(host_src) = crate::resource::host_copy(src.resource)
+        {
+            let Some(host_sub) = host_src.host_subresource(from_sub) else {
+                return;
+            };
+            from_sub = host_sub;
         }
         let mut from = src;
         if src.kind != FOOTPRINT {
