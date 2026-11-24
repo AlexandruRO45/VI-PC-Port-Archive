@@ -44,11 +44,13 @@ ctest:      runtime tests, RelWithDebInfo, the D3D12 layer on Vulkan against thi
             alike" against this GPU (96 of 97 accounted for); against WARP "71 of 71
             match, 0 host quirks, 7 refusals alike". The output names no failing case.
             #66 is open for this test.
-            d3d12_vulkan_device: exit 1, reproduced when run on its own. Every summary
-            line it prints reports 0 mismatches or 0 failures (FORMAT_INFO 195 queries,
-            CheckFeatureSupport 46, FORMAT_SUPPORT 98 formats, copy comparison 0 of 75
-            differ, resolve comparison 60 of 60). The cause was not identified from the
-            output.
+            d3d12_vulkan_device: exit 1, reproduced when run on its own, at
+            "line 6576: tiles == 1", right after "device slot 78 routed to
+            SetFrameIntervalX". Every comparison before it reports 0 mismatches
+            (FORMAT_INFO 195 queries, CheckFeatureSupport 46, FORMAT_SUPPORT 98 formats,
+            copy comparison 0 of 75 differ, resolve comparison 60 of 60). This is the
+            failure #262 and #238 are open for (CreateReservedResource2 called through
+            the Xbox proxy, whose slot 78 is SetFrameIntervalX), not a GPU effect.
 Notes:
 - Built with cmake -S runtime -B <build> -G "Visual Studio 17 2022" -A x64
   -DLEONIDA_VULKAN_HEADERS_FETCH=ON -DLEONIDA_SDL3_FETCH=ON and
