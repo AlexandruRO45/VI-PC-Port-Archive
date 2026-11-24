@@ -836,6 +836,14 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
     if drop == 0 {
         return 0;
     }
+    let min_size = crate::texture::texture_mip_drop_min_size();
+    compute_mip_drop_explicit(desc, drop, min_size)
+}
+
+pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 {
+        return 0;
+    }
     // Only drop for pure sampled textures: not buffers, not render targets,
     // not depth buffers, not UAVs, not 3D textures, and not textures with MSAA.
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
@@ -846,10 +854,19 @@ pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
     {
         return 0;
     }
-    // Size floor: drop only textures >= 1024 on at least one axis.
-    // Small utility textures (1x1, LUTs, noise, UI) account for < 2.5% of VRAM
-    // but cause copy coordinate underflow and 1x1 degenerate collapses.
-    if desc.width.max(u64::from(desc.height)) < 1024 {
+    // Exclude non-power-of-two (NPOT) textures: display artwork, loading screens,
+    // video frames, and UI presentation surfaces (e.g. 1920x1080, 1280x720, 2560x1440).
+    // These are 2D presentation assets whose titles copy only subresource 0;
+    // dropping them causes flat-colour loading screens while saving negligible VRAM (<10 MB).
+    // In contrast, 3D world streaming textures in RAGE are strictly power-of-two.
+    if !desc.width.is_power_of_two() || !desc.height.is_power_of_two() {
+        return 0;
+    }
+    // Size floor: drop only textures where both dimensions are at least `min_size`
+    // (default 1024). Small utility textures account for < 2.5% of VRAM but cause
+    // copy coordinate underflow and 1x1 degenerate collapses. Testers can configure
+    // this via VICTORY_TEXTURE_MIP_DROP_MIN_SIZE (e.g. 2048 for conservative mode).
+    if desc.width < min_size || u64::from(desc.height) < min_size {
         return 0;
     }
     let mut k = drop;
@@ -1503,28 +1520,51 @@ mod tests {
         assert_eq!(sample_tex.flags, 0);
 
         // When drop is 0:
-        // (compute_mip_drop checks crate::texture::texture_mip_drop())
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 0, 1024), 0);
+
         // Render targets and depth buffers should never drop mips:
         let mut rt_tex = sample_tex;
         rt_tex.flags = 1; // RENDER_TARGET
-        assert_eq!(compute_mip_drop(&rt_tex), 0);
+        assert_eq!(compute_mip_drop_explicit(&rt_tex, 1, 1024), 0);
 
         let mut depth_tex = sample_tex;
         depth_tex.flags = 2; // DEPTH
-        assert_eq!(compute_mip_drop(&depth_tex), 0);
+        assert_eq!(compute_mip_drop_explicit(&depth_tex, 1, 1024), 0);
 
         let mut uav_tex = sample_tex;
         uav_tex.flags = 4; // UNORDERED
-        assert_eq!(compute_mip_drop(&uav_tex), 0);
+        assert_eq!(compute_mip_drop_explicit(&uav_tex, 1, 1024), 0);
 
         // Textures with 1 mip should never drop:
         let mut single_mip = sample_tex;
         single_mip.mip_levels = 1;
-        assert_eq!(compute_mip_drop(&single_mip), 0);
+        assert_eq!(compute_mip_drop_explicit(&single_mip, 1, 1024), 0);
 
         // Buffer should never drop:
         let buf = buffer(1024);
-        assert_eq!(compute_mip_drop(&buf), 0);
+        assert_eq!(compute_mip_drop_explicit(&buf, 1, 1024), 0);
+
+        // Non-power-of-two textures (loading artwork, UI e.g. 1920x1080, 1280x720) must never drop:
+        let loading_art = texture(1920, 1080, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&loading_art, 1, 1024), 0);
+        let ui_art = texture(1280, 720, 28, 10);
+        assert_eq!(compute_mip_drop_explicit(&ui_art, 1, 1024), 0);
+
+        // Standard POT 3D textures >= 1024 drop properly:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 1024), 1);
+        let large_tex = texture(2048, 2048, 28, 12);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 1024), 1);
+        let non_square_pot = texture(2048, 1024, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 1024), 1);
+
+        // Textures under min_size floor (e.g. 512x512) are preserved:
+        let small_tex = texture(512, 512, 28, 9);
+        assert_eq!(compute_mip_drop_explicit(&small_tex, 1, 1024), 0);
+
+        // Conservative min_size = 2048 preserves 1024 textures and drops >= 2048:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 2048), 1);
     }
 
     #[test]

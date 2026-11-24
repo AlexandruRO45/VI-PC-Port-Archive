@@ -45,6 +45,20 @@ pub(crate) fn texture_mip_drop() -> u32 {
     })
 }
 
+/// The minimum texture dimension (both width and height) eligible for mip-dropping.
+/// Defaults to 1024. Textures smaller than this on either axis (or under 2048 if configured)
+/// are preserved at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
