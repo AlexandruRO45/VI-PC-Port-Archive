@@ -27,22 +27,35 @@ histories merge rather than being grafted: this fork's commit log contains
 fxceless's own commits and upstream's, unsquashed. See
 [Sources and attribution](#sources-and-attribution) for what came from where.
 
-## Status (2026-11-24)
+## Status, checked against `b3b8533`
 
-**Not playable.** The menus work; a rendered world frame has never come out of
-this tree. The base this fork adopted reports a cutscene and a prologue on an
-NVIDIA card, which is why it was adopted; those numbers are the base's, on the
-base's machine, and this tree has not reproduced them yet.
+**Not playable.** The menus and the opening cutscene draw; a world frame has
+never been captured. The base this fork adopted reports a cutscene and a
+prologue on an NVIDIA card, which is why it was adopted, and on this PC the
+adopted base now draws the cutscene too. Those are two different claims and the
+table keeps them apart.
 
-| Stage | State | Produced by |
-|---|---|---|
-| Boot, first-boot screens, start screen, menus | works at the title's own 30 fps | this PC's card (AMD RX 6700 XT), upstream code, in the menus |
-| The opening cutscene window (frames 1,280–1,300) | the presented image changes frame to frame (24–144 distinct values in a 64x64 downscale, means 105,84,100 → 63,53,64 → 72,60,70 → 33,32,44 → 44,40,53, with 1,295 nearly flat); the 3840x2160 `f19` depth target reads **one unique value, zero**, at all five | WARP, diagnostics build, keyed pad-A soak, offscreen — **not** a rendered 3D frame |
-| The world, first frame | every run on this PC ends here: access violation at `victory-image-…+0x8f92a`, read of `0x17`, rax all-ones — a descriptor slot holding `-1` used as a pointer. Runs end between frames 1,250 and 1,650, or not at all | this PC's card, in the world's first frame |
-| The world, the base's claim | the opening cutscene plays start to finish and the prologue renders characters, textures, sky, HUD and pause menu at **2–4 fps** | fxceless/victory-gta6, RTX 4070 12 GB / i7-14700KF, Series X profile, in the world |
-| The world, this tree | **never rendered a frame** | — |
-| Frame rate | 30 fps in the menus; 0.5–1.8 s per world frame | this PC's card, in the world, before the world-frame crash |
-| Frame rate, the base's numbers | 420–450 ms per frame by default; 240–350 ms with `VICTORY_RELAY=2` or with `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024` | fxceless/victory-gta6, RTX 4070, in the world |
+Every claim in this file carries one of three marks, and the file is re-checked
+whenever `main` moves. At **`b3b8533`** (2026-11-24):
+
+- **verified** — read in the code at that sha, or measured by this fork and
+  reproduced from the artefact it rests on;
+- **superseded** — a measurement of a tree that no longer exists in that form.
+  It stays here so the record is not rewritten, but it is not a statement about
+  this tree;
+- **unverified** — quoted from somewhere the author of this file did not check.
+
+| Stage | State | Produced by | Checked |
+|---|---|---|---|
+| Boot, first-boot screens, start screen, menus | works at the title's own 30 fps | this PC's card (AMD RX 6700 XT), upstream code, in the menus | unverified — upstream's own README |
+| The cutscene, on the adopted base | the card presents it: 51 presents over 2,240 frames in a 180 s window, 0.0 % of captured pixels black, 27k–214k distinct colours per capture (means 118,115,45 at 512; 98,79,95 at 1024; 64,55,69 at 1280; 117,92,109 at 1300; 128,66,99 at 2048, the last a flat magenta fill) | the card, in the cutscene and menus, on the adopted base at `eb6d3a3` | measured at `eb6d3a3`, not re-measured after `b3b8533`, whose one new shader pass does not touch presentation |
+| The cutscene window's depth target (frames 1,280–1,300) | the presented image changed frame to frame (24–144 distinct values in a 64x64 downscale, means 105,84,100 → 63,53,64 → 72,60,70 → 33,32,44 → 44,40,53, with 1,295 nearly flat) while the 3840x2160 `f19` depth target read **one unique value, zero** at all five | WARP, diagnostics build, keyed pad-A soak, offscreen, on the pre-adoption tree | **superseded** — measured at `0f564f8`. No run since has dumped a target, so this question is open on this base, not answered |
+| The world, first frame, on our tree | every run ended here: access violation at `victory-image-…+0x8f92a`, read of `0x17`, rax all-ones — a descriptor slot holding `-1` used as a pointer — between frames 1,250 and 1,650 or not at all | this PC's card, in the world's first frame, on the pre-adoption tree | **superseded** — the adopted base has not reached a world frame in any window this crew has run, so the fault is neither reproduced nor disproved there |
+| The world, the base's claim | the opening cutscene plays start to finish and the prologue renders characters, textures, sky, HUD and pause menu at **2–4 fps** | fxceless/victory-gta6, RTX 4070 12 GB / i7-14700KF, Series X profile, in the world | unverified — the base's own README |
+| The world, this tree | **never captured**: the one card window on the adopted base ran 180 s with pad A every four seconds and never left the cutscene and the menus | the card, 2,240 frames, 0 device removals, 0 panics | verified — that window is the evidence, and it says nothing about the world |
+| What a world-phase frame cost, on the adopted base | **7,379.8 ms**, of which textures were 6,950.0 ms and 6,896.6 ms of that was one wait for title memory to stop being remapped | a diagnostics build's frame log, read by the host lane | measured at `eb6d3a3`, in a world phase — [docs/host-cost.md](docs/host-cost.md) |
+| Frame rate, on our tree | 30 fps in the menus; 0.5–1.8 s per world frame | this PC's card, in the world, before the world-frame crash | **superseded** — the pre-adoption tree |
+| Frame rate, the base's numbers | 420–450 ms per frame by default; 240–350 ms with `VICTORY_RELAY=2` or with `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024` | fxceless/victory-gta6, RTX 4070, in the world | unverified — the base's own README |
 
 Every number here says what produced it: which tree, which adapter, and
 whether the run was in the menus or in the world. Offline numbers — a
@@ -52,25 +65,20 @@ number nobody can reproduce, and this file does not carry those.
 
 Three statements this fork can stand behind today:
 
-- **The cutscene window draws colour and no depth.** Five frames of a keyed
-  WARP run were dumped — 1,280, 1,290, 1,292, 1,295 and 1,300 — and every
-  texture each frame wrote is on disk as
-  `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`. The 3840x2160 `f19` depth
-  target has exactly one unique value, zero, in all five. The colour target the
-  present is copied from holds structure that changes from frame to frame: 24 to
-  144 distinct values in a 64x64 downscale, with the mean sliding
-  (105,84,100) → (63,53,64) → (72,60,70) → (33,32,44) → (44,40,53). Frame
-  1,295's present is the exception — nearly flat at 2 distinct values while that
-  frame's second colour target still holds 83, so it reads as a fade rather than
-  a drawn frame. Geometry that writes colour and never depth does not exist in
-  this title as far as anyone here has seen, so what is on screen is composited
-  or copied content, not a rendered 3D frame.
-- **No world frame has rendered in this tree.** The window above is the title's
-  cutscene, and the run ends at the first world frame with the `-1` descriptor
-  fault, every time, at a frame number that moves between 1,250 and 1,650.
-- **The frame rate belongs to a tree and a machine.** The 30 fps above is the
-  menus on an RX 6700 XT; the 2–4 fps above is the base's prologue on an RTX
-  4070. Neither number describes the merged tree, which has not been measured.
+- **The cutscene draws on this PC, on the adopted base.** A 180 s window on the
+  card, pad A every four seconds, presented 51 frames over 2,240 with no black
+  pixels in any capture and 27,000 to 214,000 distinct colours in each —
+  measured at `eb6d3a3`, in the cutscene and the menus. Whether that image is
+  depth-tested is **open**: on the pre-adoption tree five dumped frames read
+  zero in the 3840x2160 depth target at every one, and no run since has dumped a
+  target.
+- **No world frame has been captured.** The window above never left the
+  cutscene. What the world phase does do is dispatch: once in the world the
+  title asks for about 11,879 groups a frame, by its own summary line. The
+  earlier "the world dispatches nothing" reading came from the menu phase and
+  is wrong.
+- **The frame rate belongs to a tree and a machine, and on the adopted base it
+  belongs to one lock** — [What a frame costs](#what-a-frame-costs).
 
 ### What this file did not check itself
 
@@ -106,10 +114,11 @@ with the re-application of its fixes onto the adopted base.
   title's ray-traced bounce light and its lamp and sun shadows are not lit yet.
   The scaffold is in [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md), is off
   by default, and by that document nothing is lit by it.
-- **The first world frame crashes.** A descriptor slot holds `-1` and the title
-  dereferences it, at a frame number that moves between 1,250 and 1,650 or
-  does not come at all. It stands between this tree and any rendering
-  measurement, and it is the one thing worth fixing first.
+- **The first world frame crashed on our tree** — *superseded*: a descriptor
+  slot held `-1` and the title dereferenced it, at a frame number that moved
+  between 1,250 and 1,650 or did not come at all. On the adopted base no window
+  has reached a world frame yet, so whether that fault survives the adoption is
+  unknown rather than fixed.
 - **Entering the world on a real GPU can hang the card**, and Windows then
   resets the display driver (every monitor goes black for a moment, and one
   2026-11-24 hang needed a restart). Use `VICTORY_D3D12_WARP=1` for anything
@@ -127,8 +136,9 @@ with the re-application of its fixes onto the adopted base.
 - Around 24 GB of memory is in use during play in the base's tree.
 - On this PC the Rockstar boot movie was reported at 15 fps with broken audio in
   one 2026-11-24 build, while our own baseline measured 30 fps with
-  sample-identical audio at `b77a938`; that bisect is open. Read it as a
-  regression in one build, not as a property of the layer.
+  sample-identical audio at `b77a938`. *Superseded* for the adopted base, which
+  presented the movie at 33–36 fps with one token per present, so the cadence
+  there is not the defect; the 15 fps build was never bisected to a commit.
 
 ## Sources and attribution
 
@@ -178,21 +188,25 @@ developed with Claude Code.
 
 ### What this fork's own crew added
 
-Each row is a landed commit on `fork/main`, with the file it lives in, the test
-that pins it, and the measurement that justifies it. Where there is no number,
-the row says what it protects instead.
+Each row is a change this fork wrote, with the file it lives in, the test that
+pinned it, and the measurement that justifies it. The third column is what
+`b3b8533` actually contains, read at that sha: the adoption merge resolved the
+conflicted GPU files in the base's favour, so several of these are no longer in
+the tree and are waiting to be re-applied. A row marked *carried by the base*
+kept its effect without our commit, and a row marked *unverified* means nobody
+has checked whether the base's own form does the same thing.
 
-| Change | Where | Measurement, with its conditions |
-|---|---|---|
-| An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc` → `keep_clear`) | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
-| A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `once_render`, `clears_render_target`), `list.rs` (both clears) | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
-| Mesh shaders declare no wave size | `crates/victory-shader/src/emit/lower.rs`, `emit/shader.rs` (the `PSV0` header) | In the title, WARP, one keyed soak, one commit apart: mesh pipelines refused **545 → 0** with **338** mesh modules translated in both runs. Offline, `victory translate <slice> --validate` ([docs/emit-gaps.md](docs/emit-gaps.md)): chunk `d010` emits 448 of 450 mesh programs and every emitted one validates, where none validated before; `d011` emits 427 of 427 and all validate. The two that do not emit stop at a resource-layer refusal, not a validation failure |
-| Mesh output bounded by the program's declaration | `crates/victory-shader/src/emit/lower.rs` | The console's 10-bit `exp prim` indices reach 1023 while the program declares 128 vertices; a primitive naming a vertex past the declaration is culled, lanes past the declared outputs store nothing, and a group count past 65535 is clamped. Undefined behaviour on the card, so there is no failure count to quote |
-| A scalar a pixel program spills through a VGPR lane | `crates/victory-shader/src/emit/lower.rs` (`v_readlane_b32` before cross-lane work) | A pixel program refused an SGPR moved through a VGPR lane and read back at a constant lane as "a cross-lane operation outside compute" with nothing crossing lanes. The resolution is constant-lane only, phi arms must agree, and the write stays under the instruction's guard |
-| Bindless pointer chasing, with its host half | `crates/victory-gpu/src/draw.rs`, `crates/victory-shader/src/emit/lower.rs`, `resource.rs` | The register encodes `((dword + 1) << 8) \| slot`, so the decode is `at >> 8` after `checked_sub(256)`; an address not on 16 bytes stays unbound rather than bound into an invalid call. Lane measurement (emitted DXIL validity, not a drawn frame): dump set A 13/24 → 19/29, set B 0/15 → 6/20 |
-| Remembered buffer state on the shadow | `crates/victory-gpu/src/shadow.rs` (`state`), `indirect.rs`, `list.rs` | A barrier naming a before-state the buffer was not in. An explicit transition does not decay, so the indirect buffer's UNORDERED_ACCESS and the copy's COPY_DEST are states a later barrier must leave from. Found by review, pinned by `clamp_preserves_record_offsets_and_shared_budget`; no run measurement |
-| The instrument set | `host.rs` (`VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE`, the crumb ring, the frame log), `draw.rs` (`VICTORY_INDIRECT_RECORD`), `pipeline/host.rs` (retry diagnostics) | What turned "the application made an invalid call" into `dispatch 1x1x1 [compute e30970f1727063fd]`, then into `submission=31371 list=0 of=1`, then into `op=resource_create a=0xb6456ee00 b=3 (invalid call, 0x887A0001)`. Each switch is in [Debugging](#debugging) with its cost |
-| The test gate | `host.rs` (`the_device_tests_have_a_device`), `shadow.rs` per-copy accounting, `frame.rs` (`waits_end_on_ticks_and_count_frames`) | A green `victory-gpu` suite where every device test early-returned is a suite that asserted nothing. The other two measured the machine rather than the code: one flip per tick against a 1.67 ms clock (4 of 20 parallel runs failed on unmodified `main`), and a process-global registry every other test writes (1 of 20) |
+| Change | Where | In `b3b8533`? | Measurement, with its conditions |
+|---|---|---|---|
+| An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc` → `keep_clear`) | **No** — `host_texture_desc` and `keep_clear` are absent; re-apply pending | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
+| A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `once_render`, `clears_render_target`), `list.rs` (both clears) | **No** — `once_render` and `clears_render_target` are absent, and the base's own `allows` is a different gate; re-apply pending | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
+| Mesh shaders declare no wave size | `crates/victory-shader/src/emit/lower.rs`, `emit/shader.rs` (the `PSV0` header) | **Carried by the base** — our test `a_mesh_shader_declares_no_wave_size` is absent, and mesh pipelines were refused 1 of 755 on the card and 0 of 69 on WARP at `eb6d3a3`, so the effect holds without our commit | In the title, WARP, one keyed soak, one commit apart: mesh pipelines refused **545 → 0** with **338** mesh modules translated in both runs. Offline, `victory translate <slice> --validate` ([docs/emit-gaps.md](docs/emit-gaps.md)): chunk `d010` emits 448 of 450 mesh programs and every emitted one validates, where none validated before; `d011` emits 427 of 427 and all validate. The two that do not emit stop at a resource-layer refusal, not a validation failure |
+| Mesh output bounded by the program's declaration | `crates/victory-shader/src/emit/lower.rs` | **Carried by the base in its own form** — `max_vertices` is in `emit/container.rs`, `lower.rs`, `mod.rs` and `rect.rs`; our clamp and its test are not | The console's 10-bit `exp prim` indices reach 1023 while the program declares 128 vertices; a primitive naming a vertex past the declaration is culled, lanes past the declared outputs store nothing, and a group count past 65535 is clamped. Undefined behaviour on the card, so there is no failure count to quote |
+| A scalar a pixel program spills through a VGPR lane | `crates/victory-shader/src/emit/lower.rs` (`v_readlane_b32` before cross-lane work) | **Unverified** — `v_readlane_b32` is in the base's emitter, and whether it resolves a constant-lane read the same way has not been checked | A pixel program refused an SGPR moved through a VGPR lane and read back at a constant lane as "a cross-lane operation outside compute" with nothing crossing lanes. The resolution is constant-lane only, phi arms must agree, and the write stays under the instruction's guard |
+| Bindless pointer chasing, with its host half | `crates/victory-gpu/src/draw.rs`, `crates/victory-shader/src/emit/lower.rs`, `resource.rs` | **No** — `pointer_address` is absent from the tree; both halves were dropped and re-apply as one unit | The register encodes `((dword + 1) << 8) \| slot`, so the decode is `at >> 8` after `checked_sub(256)`; an address not on 16 bytes stays unbound rather than bound into an invalid call. Lane measurement (emitted DXIL validity, not a drawn frame): dump set A 13/24 → 19/29, set B 0/15 → 6/20 |
+| Remembered buffer state on the shadow | `crates/victory-gpu/src/shadow.rs` (`state`), `indirect.rs`, `list.rs` | **No** — no `Shadow` state under that name, and `indirect.rs` names `INDIRECT_ARGUMENT` in comments only; re-apply pending | A barrier naming a before-state the buffer was not in. An explicit transition does not decay, so the indirect buffer's UNORDERED_ACCESS and the copy's COPY_DEST are states a later barrier must leave from. Found by review, pinned by `clamp_preserves_record_offsets_and_shared_budget`; no run measurement |
+| The instrument set | `host.rs` (`VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE`, the crumb ring, the frame log), `draw.rs` (`VICTORY_INDIRECT_RECORD`), `pipeline/host.rs` (retry diagnostics) | **Partly** — the crumb ring, the frame log and `VICTORY_INDIRECT_RECORD` are in; `VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE` and `VICTORY_SERIAL_PIPELINES` are not | What turned "the application made an invalid call" into `dispatch 1x1x1 [compute e30970f1727063fd]`, then into `submission=31371 list=0 of=1`, then into `op=resource_create a=0xb6456ee00 b=3 (invalid call, 0x887A0001)`. Each switch is in [Debugging](#debugging) with its cost |
+| The test gate | `host.rs` (`the_device_tests_have_a_device`), `shadow.rs` per-copy accounting, `frame.rs` (`waits_end_on_ticks_and_count_frames`) | **Partly** — `waits_end_on_ticks_and_count_frames` exists (the base has its own), `the_device_tests_have_a_device` does not | A green `victory-gpu` suite where every device test early-returned is a suite that asserted nothing. The other two measured the machine rather than the code: one flip per tick against a 1.67 ms clock (4 of 20 parallel runs failed on unmodified `main`), and a process-global registry every other test writes (1 of 20) |
 
 Two more are written and measured but **not in this tree yet**, so no row above
 claims them:
@@ -260,10 +274,11 @@ cargo test --workspace -- --test-threads=1   # the result that gates a merge
 
 Two assertions in `victory-gpu` have measured the clock and a process-global
 registry rather than the code (`frame::tests::waits_end_on_ticks_and_count_frames`
-and the shadow snapshot tests). Both were rewritten, and a serial run is what a
-merge decision reads: a compile error prints neither `FAILED` nor a
-`test result:` line, so green means a `test result: ok` you read for every crate,
-never the absence of a failure.
+and the shadow snapshot tests). Both were rewritten in this fork, and the base
+carries its own form of each — its `frame.rs` has a test of that name too — so
+the serial run is what a merge decision reads whichever version is in the tree:
+a compile error prints neither `FAILED` nor a `test result:` line, so green means
+a `test result: ok` you read for every crate, never the absence of a failure.
 
 Input is XInput pads. With none connected, the keyboard is a pad while the
 title's window has focus:
@@ -297,8 +312,13 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 ```
 
 The switches are grouped by what you would reach for. Everything marked
-*diagnostics* exists only in that build, except `VICTORY_D3D12_VALIDATE`, whose
-code is compiled in either way.
+*diagnostics* exists only in that build. Three rows are marked **not in this
+tree**: `VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE` and
+`VICTORY_SERIAL_PIPELINES` are this fork's own instruments, written and used,
+which the adoption merge dropped — they describe what the re-apply restores,
+not switches you can set against `b3b8533` today. The base carries about a
+hundred more of its own, mostly experiments, each described in a comment where
+it is read; its README is the index for those.
 
 ### What is on screen
 
@@ -312,9 +332,10 @@ code is compiled in either way.
 
 | Variable | Effect |
 |---|---|
-| `VICTORY_GPU_CHECK=1` | *diagnostics.* Asks the device after every recorded host operation whether it has been removed, so the first operation after which it has names itself: `the device was removed right after op=clear_rtv a=… b=…`. One device query per operation, so it is very slow — never compare frame times with it on |
-| `VICTORY_D3D12_VALIDATE=1` | One submission per command list, each asked for the removal reason as it lands; the first that comes back removed is logged as the submission that removed the device with that list's newest operations. It removes the overlap between lists, so a removal needing two lists in flight will not reproduce under it: take the list it names as guilty, not the whole story |
+| `VICTORY_GPU_CHECK=1` | **Not in this tree** (re-apply pending). *diagnostics.* Asks the device after every recorded host operation whether it has been removed, so the first operation after which it has names itself: `the device was removed right after op=clear_rtv a=… b=…`. One device query per operation, so it is very slow — never compare frame times with it on |
+| `VICTORY_D3D12_VALIDATE=1` | **Not in this tree** (re-apply pending). One submission per command list, each asked for the removal reason as it lands; the first that comes back removed is logged as the submission that removed the device with that list's newest operations. It removes the overlap between lists, so a removal needing two lists in flight will not reproduce under it: take the list it names as guilty, not the whole story |
 | `VICTORY_INDIRECT_RECORD=1` | *diagnostics.* Logs an indirect execution's record: kind, stride, count, the words the title left, the thread count or draw count they name, and whether the range fits the buffer. The first 64 executions and then every 256th, so the log stays readable |
+| `VICTORY_NO_ARGS_REFRESH=1` | **A probe, never an option.** Stops the host uploading its copy of the title's argument buffer over the GPU copy before an indirect execution (`crates/victory-gpu/src/draw.rs`, `host.rs`: `no_args_refresh`). With it set, 102 of 102 summary lines read 0 groups asked per frame against a control's 11,879 — the measurement that proved this upload is the **only** path the title's records take to a dispatch, since nothing else moved a record to the card. Leave it off: it disables every indirect dispatch in the title. Its other result is about the instrument rather than the title: the clamp's counters are trustworthy, while a per-record decode of a skipped upload prints impossible counts (`counts=(1065353216,…)`, thread count 1.8e19), so read the counters and not the words |
 | `VICTORY_GPU_TIMING=1` | *diagnostics.* Runs and times each list of a submission on its own, and logs slow ones with their slowest commands |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | *diagnostics.* Omits draws and dispatches, indirect ones included, whose pipeline contains a listed 16-digit shader hash — the way to subtract a suspect pipeline and confirm cause rather than neighbour |
 | `VICTORY_D3D12_DRED=1` | *diagnostics.* Enables device-removed data: the allocation a fault hit and the commands in flight |
@@ -331,7 +352,7 @@ code is compiled in either way.
 |---|---|
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | *diagnostics.* Translated loops stop after `n` iterations per lane (decimal or `0x` hex, at least 1) instead of 2^20. The value is part of the translation, so it takes its own cache entries. If a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | as above: omits work whose pipeline contains that shader |
-| `VICTORY_SERIAL_PIPELINES=1` | Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
+| `VICTORY_SERIAL_PIPELINES=1` | **Not in this tree** (re-apply pending). Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
 
 ### What the process did
 
@@ -353,6 +374,17 @@ title's data folder.
 These change what runs, not just what is logged. All are off by default unless
 the row says otherwise, and the base's README is where their measurements live
 (RTX 4070, in the world).
+
+**Before reaching for any of them: on the adopted base a frame's cost is one
+lock.** In a world-phase frame that logged **7,379.8 ms**, textures were
+6,950.0 ms of it and **6,896.6 ms of those — 99.2 % — was a single wait at
+`crates/victory-gpu/src/texture.rs:676`**, `waited(2, watch::title_memory_reading)`:
+waiting for the runtime to stop remapping title memory, not copying anything.
+Per byte that is 46 ms/MB against 0.59 ms/MB for a plain copy, eighty times, and
+the copies themselves were 76.9 ms — about 1 % of the frame. So a log line whose
+`textures` field is large does not say copying is the problem, and a change that
+halves copy cost will not move a frame that is waiting. Taking that read once per
+submission instead of once per texture is the fix under test.
 
 | Variable | Effect |
 |---|---|
