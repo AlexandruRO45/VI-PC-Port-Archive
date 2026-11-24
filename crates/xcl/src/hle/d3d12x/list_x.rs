@@ -2054,14 +2054,19 @@ impl CopyScratchCache {
         if let Some(scratch) = self.active.get_mut(&key) {
             // Reset can happen while the previous recording is executing on another queue.
             if !scratch.recorded && !scratch.idle() {
-                return None;
+                if bytes > MAX_COPY_SCRATCH - self.bytes {
+                    return None;
+                }
+                // Keep the in-flight allocation charged until its fence completes.
+                self.released.push(self.active.remove(&key).unwrap());
+            } else {
+                if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
+                    scratch.recorded = true;
+                    return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
+                }
+                // Drop the old allocation before growing so the peak stays within the budget.
+                self.bytes -= self.active.remove(&key).unwrap().bytes;
             }
-            if scratch.recorded || scratch.bytes >= bytes || bytes > MAX_COPY_SCRATCH - self.bytes + scratch.bytes {
-                scratch.recorded = true;
-                return Some((scratch.buffer.as_raw() as usize, scratch.bytes));
-            }
-            // Drop the old allocation before growing so the peak stays within the budget.
-            self.bytes -= self.active.remove(&key).unwrap().bytes;
         }
         if bytes > MAX_COPY_SCRATCH - self.bytes {
             return None;
@@ -4042,6 +4047,41 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn busy_copy_scratch_is_retired_when_budget_allows_a_replacement() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let ty = D3D12_COMMAND_LIST_TYPE_DIRECT;
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(ty).unwrap();
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, ty, &alloc, None).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut cache = CopyScratchCache::default();
+            let bytes = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
+            let key = list.as_raw() as usize;
+            let first = cache.acquire(list.as_raw(), bytes).unwrap();
+            let scratch = cache.active.get_mut(&key).unwrap();
+            scratch.recorded = false;
+            scratch.marks.insert(fence.as_raw() as usize, (fence.clone(), 1));
+            let second = cache.acquire(list.as_raw(), bytes).unwrap();
+            assert_ne!(first.0, second.0);
+            assert_eq!(cache.bytes, bytes * 2);
+            assert_eq!(cache.released.len(), 1);
+            fence.Signal(1).unwrap();
+            cache.collect_released();
+            assert_eq!(cache.bytes, bytes);
+            assert!(cache.released.is_empty());
+            cache.release(key);
+            assert_eq!(cache.bytes, 0);
+        }
+    }
 
     #[test]
     fn copy_scratch_budget_counts_resources_until_gpu_completion() {
