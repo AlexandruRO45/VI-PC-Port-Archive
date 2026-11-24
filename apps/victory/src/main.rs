@@ -83,7 +83,7 @@ enum Command {
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
-        jobs: Option<usize>,
+        jobs: Option<std::num::NonZeroUsize>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -161,7 +161,13 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(
+                paths,
+                validate,
+                pipelines,
+                list,
+                jobs.map(std::num::NonZeroUsize::get),
+            )
         }
         Command::Run {
             exe,
