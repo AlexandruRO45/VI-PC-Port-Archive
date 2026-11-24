@@ -12,6 +12,9 @@
 /tests/fixtures/*/target/
 /dist/
 
+# Left by a run with cwd = the repo root (vkd3d-proton's shader cache).
+/vkd3d-proton.cache
+
 # Local configuration (contains paths to YOUR files)
 /victory.toml
 /victory.proton.toml
