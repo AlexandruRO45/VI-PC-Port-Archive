@@ -2165,6 +2165,93 @@ mod tests {
         );
     }
 
+    /// Ignore files are read as git reads them, not as they are stored: a
+    /// rule ending in CRLF ignores `crlf`, its carriage return dropped, so a
+    /// directory named `crlf\r` stays visible and is refused. A
+    /// `.gitignore` that is a symlink is not followed at all (git opens it
+    /// without following links), so a directory only it names is visible
+    /// and refused too, though the file it leads to would ignore it. A
+    /// candidate may ignore its own contents: under `self/.gitignore`
+    /// holding `*`, the temporary directory made there is taken, and that
+    /// `.gitignore`, matching its own rule, is not listed either.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_ignore_files_as_git_reads_them() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/crlf/\r\n").unwrap();
+        let rules = outside.path().join("rules");
+        std::fs::write(&rules, "/linked/\n").unwrap();
+        let crlf = root.join("crlf");
+        let carriage = root.join("crlf\r");
+        let linked = root.join("sl/linked");
+        let own = root.join("self");
+        for dir in [&crlf, &carriage, &linked, &own] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&rules, root.join("sl/.gitignore")).unwrap();
+        std::fs::write(own.join(".gitignore"), "*\n").unwrap();
+
+        let tmp = tempdir_in_first(root, [carriage.clone(), linked.clone(), crlf.clone()]);
+        assert_eq!(tmp.path().parent(), Some(crlf.as_path()));
+        let tmp_own = tempdir_in_first(root, [linked.clone(), own.clone()]);
+        assert_eq!(tmp_own.path().parent(), Some(own.as_path()));
+        for dir in [&carriage, &linked] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_own.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(carriage.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(linked.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [
+                ".gitignore",
+                "crlf\r/a.rs",
+                "sl/.gitignore",
+                "sl/linked/b.rs"
+            ]
+        );
+        super::run(root, false).unwrap();
+    }
+
+    /// In a linked worktree, where `.git` is a file, the repository's
+    /// shared `info/exclude` still applies: a TMPDIR it alone ignores in
+    /// the worktree is taken, a visible sibling is refused, and only the
+    /// worktree's own files are listed, not the main checkout's.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_a_linked_worktrees_shared_exclude() {
+        let repo = tempdir();
+        let main = repo.path().join("main");
+        let linked = repo.path().join("linked");
+        std::fs::create_dir(&main).unwrap();
+        git_str(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.rs"), b"fn a() {}\n").unwrap();
+        git_str(&main, &["add", "--", "a.rs"]);
+        git_str(&main, &["commit", "-q", "-m", "a"]);
+        git_str(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        std::fs::create_dir_all(main.join(".git/info")).unwrap();
+        std::fs::write(main.join(".git/info/exclude"), "/shared/\n").unwrap();
+        assert!(linked.join(".git").is_file());
+        let visible = linked.join("visible");
+        let shared = linked.join("shared");
+        std::fs::create_dir(&visible).unwrap();
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::write(main.join("main-only.rs"), b"fn m() {}\n").unwrap();
+
+        let tmp = tempdir_in_first(&linked, [visible.clone(), shared.clone()]);
+        assert_eq!(tmp.path().parent(), Some(shared.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(visible.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(&linked, false), ["a.rs", "visible/b.rs"]);
+        super::run(&linked, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
