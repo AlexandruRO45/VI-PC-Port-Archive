@@ -176,6 +176,16 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Descriptor heap entries whose indices can be checked by the host.
     pub descriptor_bindings: Vec<DescriptorBinding>,
+    /// Words of title buffer addresses exposed through the user-data constants.
+    pub buffer_addresses: Vec<BufferAddress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferAddress {
+    pub index: u32,
+    pub table: u8,
+    pub byte_offset: u32,
+    pub high: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -194,9 +204,10 @@ impl HostShader {
         let n = self
             .user_data
             .iter()
-            .map(|u| u.index + 1)
+            .map(|u| u.index)
+            .chain(self.buffer_addresses.iter().map(|a| a.index))
             .max()
-            .unwrap_or(0);
+            .map_or(0, |i| i + 1);
         n.next_multiple_of(4)
     }
 }
@@ -339,6 +350,7 @@ pub fn emit(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         descriptor_bindings: l.descriptor_bindings,
+        buffer_addresses: l.buffer_addresses,
     })
 }
 
@@ -735,6 +747,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             descriptor_bindings: Vec::new(),
+            buffer_addresses: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -747,6 +760,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 descriptor_bindings: Vec::new(),
+                buffer_addresses: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

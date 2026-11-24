@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
-use super::{DESCRIPTOR_DATA_SLOT, DescriptorBinding, UserData};
+use super::{BufferAddress, DESCRIPTOR_DATA_SLOT, DescriptorBinding, UserData};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
@@ -49,6 +49,7 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
     pub descriptor_bindings: Vec<DescriptorBinding>,
+    pub buffer_addresses: Vec<BufferAddress>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -161,6 +162,12 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+#[derive(Clone, Copy)]
+enum ScalarUse {
+    Phi(Reg, Value),
+    Inst(Site),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -183,6 +190,8 @@ struct Lower<'a> {
     barycentrics: HashMap<Value, (Barycentric, u8)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    buffer_addresses: Vec<BufferAddress>,
+    scalar_uses: Option<HashMap<Value, Vec<ScalarUse>>>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -488,6 +497,8 @@ impl<'a> Lower<'a> {
             barycentrics: HashMap::new(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            buffer_addresses: Vec::new(),
+            scalar_uses: None,
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -1054,6 +1065,7 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             descriptor_bindings: self.descriptor_bindings.into_iter().collect(),
+            buffer_addresses: self.buffer_addresses,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1359,6 +1371,10 @@ impl<'a> Lower<'a> {
                 dword,
             },
         );
+        Val::I32(self.user_dword(index))
+    }
+
+    fn user_dword(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1378,7 +1394,7 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3538,7 +3554,7 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
         let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
-        let words: Vec<(u32, V)> = match image {
+        let mut words: Vec<(u32, V)> = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
                 let w = field(self, 0);
@@ -3577,6 +3593,25 @@ impl<'a> Lower<'a> {
             }
             None => vec![(2, field(self, 0))],
         };
+        if props == (11, 0)
+            && first == 0
+            && count >= 4
+            && let Some(a) = self.scalar.get(&site)
+            && a.dynamic.is_none()
+            && a.offset.is_multiple_of(32)
+            && let Some(table) = self.x.native.layout.get(a.param)
+            && table.root == RootType::Table
+        {
+            let (slot, offset) = (table.slot, a.offset);
+            for (word, known_bits) in [(0, u32::MAX), (1, 0xffff)] {
+                if let Some(value) = inst.write(Reg::S(code + word as u8))
+                    && self.address_bits_only(value, known_bits)
+                    && let Some(value) = self.buffer_address_word(slot, offset, word == 1)
+                {
+                    words.push((word, value));
+                }
+            }
+        }
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
             match words.iter().find(|w| w.0 == rel) {
@@ -3589,6 +3624,125 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The second address dword also carries fields we do not reconstruct.
+    /// Follow copies and joins, then require all numeric reads to mask off
+    /// those fields. The descriptor operands themselves use D3D12 handles.
+    fn address_bits_only(&mut self, start: Value, known_bits: u32) -> bool {
+        let uses = self.scalar_uses.get_or_insert_with(|| {
+            let mut uses = HashMap::<Value, Vec<ScalarUse>>::new();
+            for (b, block) in self.x.p.blocks.iter().enumerate() {
+                for p in &block.phis {
+                    for &arg in &p.args {
+                        uses.entry(arg).or_default().push(ScalarUse::Phi(p.reg, p.value));
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    for &(reg, value) in &inst.reads {
+                        if matches!(reg, Reg::S(_)) {
+                            uses.entry(value).or_default().push(ScalarUse::Inst((b, i)));
+                        }
+                    }
+                }
+            }
+            uses
+        });
+        let mut work = vec![start];
+        let mut seen = HashSet::new();
+        let mut numeric = false;
+        while let Some(value) = work.pop() {
+            if !seen.insert(value) {
+                continue;
+            }
+            for usage in uses.get(&value).into_iter().flatten() {
+                let (b, i) = match *usage {
+                    ScalarUse::Phi(Reg::S(0..=105), result) => {
+                        work.push(result);
+                        continue;
+                    }
+                    ScalarUse::Phi(..) => return false,
+                    ScalarUse::Inst(at) => at,
+                };
+                let inst = &self.x.p.blocks[b].insts[i];
+                let reads_value = |op: &Operand| match *op {
+                    Operand::Scalar { code, dwords } => {
+                        (code..code + dwords).any(|r| inst.read(Reg::S(r)) == Some(value))
+                    }
+                    _ => false,
+                };
+                match &inst.fields {
+                    Fields::Smem { base, soffset, .. }
+                        if inst.name().starts_with("s_buffer_load_dword")
+                            && reads_value(base)
+                            && !reads_value(soffset) => {}
+                    Fields::Buffer { rsrc, soffset, .. }
+                        if reads_value(rsrc) && !reads_value(soffset) => {}
+                    Fields::Sop { dst, src, .. } => match (inst.name(), src.as_slice()) {
+                        ("s_mov_b32", [op]) if reads_value(op) => {
+                            let Some(Operand::Scalar {
+                                code: code @ 0..=105,
+                                dwords: 1,
+                            }) = dst
+                            else {
+                                return false;
+                            };
+                            let Some(result) = inst.write(Reg::S(*code)) else {
+                                return false;
+                            };
+                            work.push(result);
+                        }
+                        ("s_and_b32", [a, b]) => {
+                            let mask = match (reads_value(a), reads_value(b)) {
+                                (true, false) => b,
+                                (false, true) => a,
+                                _ => return false,
+                            };
+                            if !crate::ir::scalar_immediate(*mask)
+                                .is_some_and(|mask| mask & !known_bits == 0)
+                            {
+                                return false;
+                            }
+                            numeric = true;
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                }
+            }
+        }
+        numeric
+    }
+
+    fn buffer_address_word(&mut self, table: u8, byte_offset: u32, high: bool) -> Option<V> {
+        let index = if let Some(a) = self
+            .buffer_addresses
+            .iter()
+            .find(|a| (a.table, a.byte_offset, a.high) == (table, byte_offset, high))
+        {
+            a.index
+        } else {
+            let native_end = self
+                .x
+                .native
+                .layout
+                .iter()
+                .filter(|r| matches!(r.root, RootType::Table | RootType::Constants))
+                .map(|r| u32::from(r.user_data).saturating_add(r.sgprs))
+                .max()?;
+            let index = native_end.checked_add(self.buffer_addresses.len() as u32)?;
+            if index >= 64 {
+                return None;
+            }
+            self.buffer_addresses.push(BufferAddress {
+                index,
+                table,
+                byte_offset,
+                high,
+            });
+            index
+        };
+        Some(self.user_dword(index))
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -8202,6 +8356,62 @@ mod tests {
         if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
             validator.validate(&mut shader.dxil).unwrap();
         }
+    }
+
+    #[test]
+    fn scalar_descriptor_address_can_reach_a_masked_phi_read() {
+        let mut words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_and_b32
+            0xBE89_0310, // s_mov_b32 s9, s16
+            0x8711_FF09, // s_and_b32 s17, s9, 0x100
+            0x100,
+            0x7E02_0211, // v_mov_b32 v1, s17
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let lower = |words: &[u32]| {
+            lower_with(
+                words,
+                vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
+                vec![UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 1,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+            )
+        };
+        let mut shader = lower(&words).unwrap();
+        assert_eq!(
+            shader.buffer_addresses,
+            [super::BufferAddress {
+                index: 2,
+                table: 0,
+                byte_offset: 0,
+                high: true,
+            }]
+        );
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
+        words[10] = 1 << 16; // STRIDE shares the high address dword.
+        assert!(matches!(
+            lower(&words),
+            Err(crate::ShaderError::Unsupported { .. })
+        ));
     }
 
     #[test]

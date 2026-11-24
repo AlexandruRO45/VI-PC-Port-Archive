@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{DescriptorBinding, HostShader, StaticSampler, UserData};
+use victory_shader::emit::{BufferAddress, DescriptorBinding, HostShader, StaticSampler, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -221,6 +221,12 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
+    word(&mut out, s.buffer_addresses.len() as u32);
+    for a in &s.buffer_addresses {
+        for v in [a.index, u32::from(a.table), a.byte_offset, u32::from(a.high)] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
@@ -297,6 +303,21 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             });
         }
     }
+    let mut buffer_addresses = Vec::new();
+    if !r.0.is_empty() {
+        for _ in 0..r.word()? {
+            buffer_addresses.push(BufferAddress {
+                index: r.word()?,
+                table: u8::try_from(r.word()?).ok()?,
+                byte_offset: r.word()?,
+                high: match r.word()? {
+                    0 => false,
+                    1 => true,
+                    _ => return None,
+                },
+            });
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -307,6 +328,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         descriptor_bindings,
+        buffer_addresses,
     })
 }
 
@@ -338,6 +360,12 @@ mod tests {
                 table: Some(1),
                 byte_offset: 32,
                 properties: (10, 0x409),
+            }],
+            buffer_addresses: vec![BufferAddress {
+                index: 9,
+                table: 1,
+                byte_offset: 64,
+                high: true,
             }],
         }
     }

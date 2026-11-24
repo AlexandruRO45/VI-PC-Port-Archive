@@ -820,6 +820,23 @@ impl State {
                             };
                             values[u.index as usize] = value;
                         }
+                        for a in &t.host.buffer_addresses {
+                            let value = self.table_base(compute, a.table).and_then(|(base, heap)| {
+                                if heap.samplers() {
+                                    return None;
+                                }
+                                let handle = base.checked_add(u64::from(a.byte_offset))?;
+                                heap.index(handle)?;
+                                let view = crate::descriptor::view(handle)?;
+                                crate::descriptor::host::buffer_address_word(&view, a.high)
+                            });
+                            let Some(value) = value else {
+                                once!(pipeline = %p.name, slot = a.table,
+                                    "draw or dispatch dropped: invalid buffer address constant");
+                                return false;
+                            };
+                            values[a.index as usize] = value;
+                        }
                         RootArgument::Constants(values)
                     }
                     RootBinding::Buffer { slot, kind } => {
