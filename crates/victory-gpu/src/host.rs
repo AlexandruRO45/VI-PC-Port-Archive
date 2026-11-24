@@ -82,6 +82,51 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
 ];
 
+/// A submission cheap enough not to appear in the frame log's breakdown.
+#[cfg(feature = "diagnostics")]
+const NOTABLE_MS: u64 = 25;
+/// How many costly submissions a frame-rate window keeps.
+#[cfg(feature = "diagnostics")]
+const KEPT: usize = 4;
+
+/// What one submission cost, for the breakdown the frame log carries: its
+/// GPU time, the lists it ran, the commands it recorded and the pipelines
+/// it bound. Diagnostics builds keep the costliest of each window.
+#[cfg(feature = "diagnostics")]
+#[derive(Clone)]
+pub(crate) struct Submission {
+    pub ms: u64,
+    pub lists: u32,
+    pub commands: u32,
+    pub draws: u64,
+    pub dispatches: u64,
+    pub pipelines: String,
+}
+
+/// The submissions since the last frame-rate line: how many, and the
+/// costliest kept.
+#[cfg(feature = "diagnostics")]
+static SUBMISSIONS: Mutex<(u64, Vec<Submission>)> = Mutex::new((0, Vec::new()));
+
+/// Keeps a costly submission, costliest first.
+#[cfg(feature = "diagnostics")]
+fn keep(submission: Submission) {
+    let mut kept = SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.0 += 1;
+    if submission.ms < NOTABLE_MS {
+        return;
+    }
+    kept.1.push(submission);
+    kept.1.sort_by_key(|s| std::cmp::Reverse(s.ms));
+    kept.1.truncate(KEPT);
+}
+
+/// The window's submissions: how many there were, and the costliest kept.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_submissions() -> (u64, Vec<Submission>) {
+    std::mem::take(&mut *SUBMISSIONS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// The host operations recorded since the host GPU was made, for a removal
 /// no layer explains: this host keeps neither the debug layer's messages nor
 /// device-removed breadcrumbs, so the last calls the host recorded are the
@@ -725,6 +770,10 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
+        let drawn_before = crate::draw::drawn();
+        #[cfg(feature = "diagnostics")]
+        let dispatched_before = crate::draw::dispatched();
+        #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
@@ -772,16 +821,41 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing() && started.elapsed() > std::time::Duration::from_millis(NOTABLE_MS) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                tracing::warn!(
+                    ms = started.elapsed().as_millis(),
+                    commands,
+                    list = i,
+                    of = runs.len(),
+                    "slow host list"
+                );
                 for (ms, op) in runs[i].slowest(frequency, 6) {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
             let _ = (i, started);
+            // A device removed here was removed by a command in this list:
+            // the timings it has so far are the only account of what it
+            // cost, so they are logged before the failure is reported.
+            #[cfg(feature = "diagnostics")]
+            if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                tracing::warn!(
+                    list = i,
+                    of = runs.len(),
+                    ms = started.elapsed().as_millis(),
+                    "the host GPU was removed during this list"
+                );
+                // SAFETY: a plain query.
+                if let Ok(frequency) = unsafe { self.queue.GetTimestampFrequency() } {
+                    for (ms, op) in runs[i].slowest(frequency, 8) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
+                }
+                break;
+            }
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -794,6 +868,25 @@ impl Host {
                 .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let commands: usize = runs
+                .iter()
+                .map(|l| l.notes.lock().unwrap_or_else(|e| e.into_inner()).len())
+                .sum();
+            let pipelines: std::collections::BTreeSet<String> = runs
+                .iter()
+                .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .collect();
+            keep(Submission {
+                ms: gpu.as_millis() as u64,
+                lists: runs.len() as u32,
+                commands: commands as u32,
+                draws: crate::draw::drawn() - drawn_before,
+                dispatches: crate::draw::dispatched() - dispatched_before,
+                pipelines: pipelines.into_iter().collect::<Vec<_>>().join(", "),
+            });
         }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
@@ -1214,24 +1307,33 @@ impl HostList {
 
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
+        // Timing alone needs the texts and the stamps; the marker commands
+        // are for the device-removed report, so they stay behind it.
+        let timed = timing();
+        if !timed && !dred_on() {
+            return;
+        }
+        let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if timed
+            && let Some((heap, _)) = self.stamps()
+            && at < STAMPS - 1
+        {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        let what = what();
         if dred_on() {
-            let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
-            }
-            let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
                 self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
-            self.notes
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((what, range));
         }
+        self.notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((what, range));
     }
 
     /// Notes a pipeline the list binds.
@@ -1771,6 +1873,31 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                let (total, slow) = take_submissions();
+                if let Some(worst) = slow.first() {
+                    tracing::info!(
+                        "submissions per frame: {:.1}, {:.1} of them over {NOTABLE_MS} ms; costliest \
+                         {:.1} ms with {} lists, {} commands, {} draws, {} dispatches",
+                        total as f64 / frames,
+                        slow.len() as f64 / frames,
+                        worst.ms as f64,
+                        worst.lists,
+                        worst.commands,
+                        worst.draws,
+                        worst.dispatches,
+                    );
+                    for s in &slow {
+                        tracing::info!(
+                            "  submission {} ms, {} lists, {} commands, {} draws, {} dispatches: {}",
+                            s.ms,
+                            s.lists,
+                            s.commands,
+                            s.draws,
+                            s.dispatches,
+                            s.pipelines
+                        );
+                    }
+                }
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
