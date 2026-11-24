@@ -280,6 +280,10 @@ impl State {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
             };
+            if crate::host::legal_state(texture, 0x4) != 0x4 {
+                once!(resource = ?record.resource, "title render target has no writable host view");
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
