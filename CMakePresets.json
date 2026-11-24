@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 5,
   "configurePresets": [
     {
       "name": "dev",
@@ -7,7 +7,9 @@
       "binaryDir": "${sourceDir}/out/build/dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_CXX_COMPILER": "cl"
+        "CMAKE_CXX_COMPILER": "cl",
+        "CMAKE_CXX_FLAGS": "/I\"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/include\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/winrt\"",
+        "CMAKE_EXE_LINKER_FLAGS": "/LIBPATH:\"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/lib/x64\" /LIBPATH:\"C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64\" /LIBPATH:\"C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64\""
       }
     },
     {
@@ -16,7 +18,9 @@
       "binaryDir": "${sourceDir}/out/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_CXX_COMPILER": "cl"
+        "CMAKE_CXX_COMPILER": "C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64/cl.exe",
+        "CMAKE_CXX_FLAGS": "/I\"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/include\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um\" /I\"C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/winrt\"",
+        "CMAKE_EXE_LINKER_FLAGS": "/LIBPATH:\"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/lib/x64\" /LIBPATH:\"C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64\" /LIBPATH:\"C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64\""
       }
     }
   ],
