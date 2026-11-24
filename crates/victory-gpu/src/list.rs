@@ -222,14 +222,33 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 
 /// The most host lists kept idle, and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
-/// do not share them, `VICTORY_SCRATCH_POOL=0`).
+/// do not share them, `VICTORY_SCRATCH_POOL=0`), scaled from CPU cores and
+/// total system RAM.
 #[cfg(windows)]
-// (512 since run 221: with submissions prepared by a thread of ours the
+// (Floor 512 since run 221: with submissions prepared by a thread of ours the
 // title has its lists back at once and resets them while the flights of
 // the frame before are still in the air, so more than 128 are out at a
 // time: 80 host lists were made and as many thrown away every frame,
 // 8 ms to make and more to free, on the thread that submits.)
-const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+fn idle_most(total_ram_bytes: Option<u64>, cores: usize) -> (usize, u64) {
+    const GIB: u64 = 1 << 30;
+    let lists = cores.saturating_mul(64).clamp(512, 1024);
+    let bytes = match total_ram_bytes {
+        Some(ram) if ram <= 16 * GIB => 128 << 20,
+        Some(ram) if ram >= 32 * GIB => 512 << 20,
+        _ => 256 << 20,
+    };
+    (lists, bytes)
+}
+
+#[cfg(windows)]
+fn idle_limits() -> (usize, u64) {
+    static LIMITS: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(8, usize::from);
+        idle_most(crate::total_system_ram_bytes(), cores)
+    })
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -266,11 +285,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
+    let (max_lists, max_bytes) = idle_limits();
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= max_lists {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -278,7 +298,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < max_lists && idle.1 + bytes <= max_bytes {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -2225,5 +2245,18 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn idle_most_scales_with_ram_and_cores() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+        assert_eq!(idle_most(None, 8), (128, 256 * MIB));
+        assert_eq!(idle_most(Some(8 * GIB), 4), (64, 128 * MIB));
+        assert_eq!(idle_most(Some(16 * GIB), 8), (128, 128 * MIB));
+        assert_eq!(idle_most(Some(24 * GIB), 12), (192, 256 * MIB));
+        assert_eq!(idle_most(Some(32 * GIB), 16), (256, 512 * MIB));
+        assert_eq!(idle_most(Some(64 * GIB), 32), (256, 512 * MIB));
     }
 }
