@@ -24,6 +24,7 @@ use windows::core::{Interface, PCSTR, PCWSTR};
 use crate::object::This;
 
 pub(crate) mod framegen;
+pub(crate) mod rgb9e5;
 
 type ReturnCode = u32;
 const OK: ReturnCode = 0;
@@ -479,13 +480,39 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
             crate::resource::host_copy(d.resources[2].resource as This),
         )
     });
+    let output = d.resources[OUTPUT].resource as This;
+    let input = d.resources[0].resource as This;
+    let Some(destination) = crate::resource::host_resource(output) else {
+        missing_texture(OUTPUT, output);
+        return ERROR_PARAMETER;
+    };
+    let packed_output = if crate::host::legal_state(destination, HOST_UNORDERED_ACCESS)
+        != HOST_UNORDERED_ACCESS
+    {
+        let Some(packed) = crate::resource::rgb9e5_fsr_output(output)
+            .filter(|packed| packed.matches(d.upscale_size))
+        else {
+            static REPORTED: std::sync::Once = std::sync::Once::new();
+            REPORTED.call_once(|| {
+                tracing::warn!(?output, size = ?d.upscale_size, "ffx: output is not writable and has no matching RGB9E5 fallback");
+            });
+            return ERROR_PARAMETER;
+        };
+        Some(packed)
+    } else {
+        None
+    };
     for (i, r) in d.resources.iter_mut().enumerate() {
+        if i == OUTPUT && let Some(packed) = packed_output {
+            *r = packed.sdk_resource(list);
+            continue;
+        }
         if r.resource.is_null() {
             continue;
         }
         let title = r.resource as This;
         let Some(texture) = crate::resource::host_resource(title) else {
-            tracing::warn!(slot = i, "ffx: an upscale resource without a host texture");
+            missing_texture(i, title);
             r.resource = std::ptr::null_mut();
             continue;
         };
@@ -511,15 +538,43 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     d.command_list = list.list.as_raw();
     // SAFETY: the SDK's call on an open host list with live textures.
     let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
-    if r == OK && let Some((Some(depth), Some(motion))) = geometry {
-        // SAFETY: the SDK just accepted this context.
-        framegen::record(list, unsafe { *context }, &d, depth, motion);
+    if r == OK {
+        if let Some(packed) = packed_output {
+            packed.copy_to(list, output, destination);
+            static FIRST_PACK: std::sync::Once = std::sync::Once::new();
+            FIRST_PACK.call_once(|| {
+                tracing::info!(?output, size = ?d.upscale_size, "ffx: recorded RGB9E5 output conversion");
+            });
+        }
+        crate::texture::host_written(output);
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::capture::note_target(input);
+            crate::capture::note_target(output);
+        }
+        if let Some((Some(depth), Some(motion))) = geometry {
+            // SAFETY: the SDK just accepted this context.
+            framegen::record(list, unsafe { *context }, &d, depth, motion);
+        }
     }
     // The upscaler bound its own heaps, root signature and pipeline.
     crate::list::forget_host_bindings(title_list);
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
-        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, "ffx: first upscale recorded on the host GPU");
+        // SAFETY: the destination is a live host texture.
+        let format = unsafe { destination.GetDesc() }.Format.0;
+        tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, result = r, ?input, ?output, format, packed = packed_output.is_some(), "ffx: first upscale recorded on the host GPU");
     });
     r
+}
+
+fn missing_texture(slot: usize, title: This) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static REPORTED: AtomicU8 = AtomicU8::new(0);
+    let bit = 1 << slot;
+    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        let (title_address, desc) = crate::resource::texture_memory(title)
+            .map_or((0, None), |(address, desc)| (address as usize, Some(desc)));
+        tracing::warn!(slot, ?title, title_address, ?desc, "ffx: an upscale resource without a host texture");
+    }
 }
