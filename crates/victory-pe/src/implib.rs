@@ -263,4 +263,52 @@ mod tests {
         assert_eq!(lib.imports, [name("a.dll", "Plain", LibImportKind::Code)]);
         assert_eq!(lib.other_members, 2);
     }
+
+    /// One export name in two DLLs, or once as code and once as data, is
+    /// two different imports: deduplication only drops exact repeats.
+    #[test]
+    fn keeps_the_same_name_from_other_dlls_and_of_other_kinds() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("b.dll", "Shared", 0, CODE, BY_NAME),
+            short_import("a.dll", "Shared", 0, DATA, BY_NAME),
+            short_import("a.dll", "Shared", 0, CODE, BY_NAME),
+            short_import("a.dll", "Shared", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [
+                name("a.dll", "Shared", LibImportKind::Code),
+                name("a.dll", "Shared", LibImportKind::Data),
+                name("b.dll", "Shared", LibImportKind::Code),
+            ]
+        );
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// Names that are not UTF-8 are read lossily rather than rejected.
+    #[test]
+    fn reads_names_that_are_not_utf8() {
+        let mut member = short_import("x.dll", "Ab", 0, CODE, BY_NAME);
+        // After the 20-byte header: `Ab\0x.dll\0`. Damage one byte of the
+        // symbol and one of the DLL name.
+        member[20 + 1] = 0xFF;
+        member[20 + 3] = 0xFE;
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert_eq!(
+            lib.imports,
+            [name("\u{FFFD}.dll", "A\u{FFFD}", LibImportKind::Code)]
+        );
+    }
+
+    /// A member that looks like an import object but lacks its `0xFFFF`
+    /// signature is a regular member, not an import.
+    #[test]
+    fn a_member_with_a_bad_signature_is_another_member() {
+        let mut member = short_import("a.dll", "Plain", 0, CODE, BY_NAME);
+        member[2] = 0xFE; // Sig2 is no longer 0xFFFF
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert!(lib.imports.is_empty());
+        assert_eq!(lib.other_members, 1);
+    }
 }

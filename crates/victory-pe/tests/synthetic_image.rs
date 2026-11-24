@@ -783,3 +783,82 @@ fn every_truncation_of_the_image_returns() {
         let _ = ImageInfo::parse(&d[..len]);
     }
 }
+
+/// A second import descriptor, `XAPI.dll!Sleep` (hint 9), in the free gap
+/// between the first descriptor's terminator and the first name table.
+#[test]
+fn reads_every_import_module_in_descriptor_order() {
+    const SECOND_DESCRIPTOR: u32 = IMPORT_DESCRIPTORS + 20;
+    // Past the new terminator, which ends at 0x113C.
+    const NAMES: u32 = 0x1140;
+    const SLOTS: u32 = 0x1150;
+    const DLL: u32 = 0x1160;
+    const HINT: u32 = 0x1170;
+    let mut d = image();
+    set_directory(&mut d, dir::IMPORT, IMPORT_DESCRIPTORS, 60);
+    let desc = at(SECOND_DESCRIPTOR);
+    put32(&mut d, desc, NAMES);
+    put32(&mut d, desc + 12, DLL);
+    put32(&mut d, desc + 16, SLOTS);
+    for table in [NAMES, SLOTS] {
+        put64(&mut d, at(table), u64::from(HINT));
+    }
+    put_bytes(&mut d, DLL, b"XAPI.dll\0");
+    put16(&mut d, at(HINT), 9);
+    put_bytes(&mut d, HINT + 2, b"Sleep\0");
+
+    let info = ImageInfo::parse(&d).unwrap();
+    let modules: Vec<_> = info
+        .imports
+        .iter()
+        .map(|m| (m.dll.as_str(), m.entries.len()))
+        .collect();
+    assert_eq!(modules, [("KERNEL32.dll", 2), ("XAPI.dll", 1)]);
+    let sleep = &info.imports[1].entries[0];
+    assert_eq!(
+        sleep.symbol,
+        ImportSymbol::Name {
+            hint: 9,
+            name: "Sleep".into()
+        }
+    );
+    assert_eq!(sleep.iat_slot_rva, SLOTS);
+    assert_eq!(info.import_count(), 3);
+}
+
+#[test]
+fn section_names_fill_all_eight_bytes_and_keep_their_flags() {
+    let mut d = image();
+    let sec = OPT + 240;
+    d[sec..sec + 8].copy_from_slice(b".textbss");
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.sections[0].name, ".textbss");
+    assert_eq!(info.sections[0].characteristics, 0xE000_0020);
+    // A shorter name loses its NUL padding.
+    let info = ImageInfo::parse(&image()).unwrap();
+    assert_eq!(info.sections[0].name, ".text");
+}
+
+#[test]
+fn rva_to_file_offset_stops_at_the_virtual_size_and_never_overflows() {
+    // Raw data padded past a smaller virtual size: the padding is not mapped.
+    let mut d = image();
+    put32(&mut d, OPT + 240 + 8, 0x300);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(
+        info.rva_to_file_offset(SECTION_RVA + 0x2FF),
+        Some(at(SECTION_RVA + 0x2FF) as u32)
+    );
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x300), None);
+    // Below every section, and far past it.
+    assert_eq!(info.rva_to_file_offset(0), None);
+    assert_eq!(info.rva_to_file_offset(u32::MAX), None);
+
+    // A section claiming a file offset near 4 GiB maps nothing instead of
+    // wrapping around. Built by hand: such an image does not parse.
+    let mut info = ImageInfo::parse(&image()).unwrap();
+    info.sections[0].file_offset = u32::MAX - 0x10;
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA), Some(u32::MAX - 0x10));
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x10), Some(u32::MAX));
+    assert_eq!(info.rva_to_file_offset(SECTION_RVA + 0x11), None);
+}
