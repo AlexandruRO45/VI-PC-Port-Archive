@@ -689,6 +689,20 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     }) {
         return Err(Malformed("pixel inputs read a row two ways"));
     }
+    // A packed input's halves past its own row's come from its second row
+    // (`row2`), which lowering reads as that row's signature element
+    // (`packed_half`). Another input naming that row, or a packed input of
+    // another row claiming it too, would read one element as two inputs.
+    let second = |i: &PsInput| (i.fp16 && i.pack2 && i.row2 != i.row).then_some(i.row2);
+    if inputs.iter().any(|a| {
+        second(a).is_some_and(|r2| {
+            inputs
+                .iter()
+                .any(|b| b.row == r2 || (b.row != a.row && second(b) == Some(r2)))
+        })
+    }) {
+        return Err(Malformed("pixel inputs claim a packed row"));
+    }
     let size = u32_at(data, PS_PATCH_SIZE)? as usize;
     if size > PATCH_SLOT_DWORDS {
         return Err(Malformed("implausible export patch size"));
@@ -1709,6 +1723,49 @@ mod tests {
                 matches!(
                     inputs(a, b),
                     Err(Malformed("pixel inputs read a row two ways"))
+                ),
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_pixel_inputs_claiming_a_packed_row() {
+        // Two inputs, attr0 and attr1, with these (row, row2, flags), as in
+        // `refuses_pixel_inputs_reading_a_row_two_ways`.
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let inputs = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let mut blob = ps.clone();
+            blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            blob[e + PS_INPUTS..][..16].copy_from_slice(&[
+                6, a.0, 0x3, 0, 0, a.1, 0, a.2, 6, b.0, 0xc, 1, 0, b.1, 1, b.2,
+            ]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (fp16, pack2) = (0x8, 0x18);
+        // A second row no input names; one row's inputs sharing theirs; a
+        // packed input with no second row; an unpacked input's unused row2.
+        for (a, b) in [
+            ((2, 3, pack2), (4, 5, pack2)),
+            ((2, 3, pack2), (2, 3, pack2)),
+            ((2, 2, pack2), (3, 3, fp16)),
+            ((2, 3, fp16), (3, 3, fp16)),
+            ((2, 3, 0), (3, 3, 0)),
+        ] {
+            assert!(inputs(a, b).is_ok(), "{a:?} {b:?}");
+        }
+        for (a, b, what) in [
+            ((2, 3, pack2), (3, 3, 0), "32-bit input on the second row"),
+            ((2, 3, pack2), (3, 3, fp16), "fp16 input on the second row"),
+            ((3, 3, fp16), (2, 3, pack2), "named before it is claimed"),
+            ((2, 4, pack2), (3, 4, pack2), "two rows claiming one"),
+            ((2, 3, pack2), (3, 2, pack2), "each claiming the other"),
+        ] {
+            assert!(
+                matches!(
+                    inputs(a, b),
+                    Err(Malformed("pixel inputs claim a packed row"))
                 ),
                 "{what}"
             );
