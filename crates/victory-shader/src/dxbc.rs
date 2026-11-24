@@ -689,4 +689,41 @@ mod tests {
         assert_eq!(c.parts.len(), 1);
         assert_eq!(&c.parts[0].data[16..20], b"PRIV");
     }
+
+    /// Any single corrupted byte of a valid container either fails with an
+    /// error or parses into parts that sit past the offset table, inside the
+    /// stated size, and claim no byte twice; it never panics.
+    #[test]
+    fn a_corrupted_byte_anywhere_fails_cleanly_or_parses_soundly() {
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[
+            (FourCC::SFI0, &[1; 8]),
+            (own, &[2; 3]),
+            (FourCC::HASH, &[3; 20]),
+        ]);
+        for i in 0..bytes.len() {
+            for value in [0x00, 0x01, 0x7F, 0x80, 0xFF, bytes[i] ^ 0x10] {
+                let mut bad = bytes.clone();
+                bad[i] = value;
+                let Ok(c) = Container::parse(&bad) else {
+                    continue;
+                };
+                let total = u32_at(&bad, 0x18).unwrap() as usize;
+                let table_end = HEADER_SIZE + 4 * c.parts.len();
+                let mut claimed = vec![false; total];
+                for p in &c.parts {
+                    let end = p.offset + 8 + p.data.len();
+                    assert!(
+                        p.offset >= table_end && end <= total,
+                        "byte {i} = {value:#x}"
+                    );
+                    assert_eq!(&bad[p.offset..p.offset + 4], &p.fourcc.0);
+                    for b in &mut claimed[p.offset..end] {
+                        assert!(!*b, "byte {i} = {value:#x}: overlap");
+                        *b = true;
+                    }
+                }
+            }
+        }
+    }
 }

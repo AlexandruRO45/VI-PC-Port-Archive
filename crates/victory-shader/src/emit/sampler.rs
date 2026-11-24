@@ -362,4 +362,47 @@ mod tests {
             (0x55, 1.0, 5.25)
         );
     }
+
+    /// Whatever the four words hold, the result is a sampler D3D12 accepts:
+    /// bias within its bounds, `MaxLOD >= MinLOD`, anisotropy 1-16, a
+    /// comparison function, a static border colour, an address mode and a
+    /// filter it defines; and the comparison form always takes the
+    /// comparison reduction.
+    #[test]
+    fn every_word_set_decodes_to_a_valid_host_sampler() {
+        // xorshift32 over a fixed seed, plus the all-zero and all-one words.
+        let mut x = 0x9E37_79B9u32;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let mut words = vec![[0; 4], [u32::MAX; 4]];
+        words.extend((0..4096).map(|_| [next(), next(), next(), next()]));
+        for w in words {
+            let s = StaticSampler::from_words(w);
+            let at = format!("{w:08x?}");
+            assert!(
+                (MIP_LOD_BIAS.0..=MIP_LOD_BIAS.1).contains(&s.mip_lod_bias),
+                "{at}"
+            );
+            assert!(s.min_lod >= 0.0 && s.max_lod >= s.min_lod, "{at}");
+            assert!(s.max_lod <= 4095.0 / 256.0, "{at}");
+            assert!(
+                s.max_anisotropy.is_power_of_two() && s.max_anisotropy <= 16,
+                "{at}"
+            );
+            assert!((1..=8).contains(&s.comparison), "{at}");
+            assert!(s.border <= 2, "{at}");
+            assert!(s.address.iter().all(|a| (1..=5).contains(a)), "{at}");
+            // Point/linear combinations, or anisotropic; reduction 0, 2 or 3.
+            let reduction = s.filter >> 7;
+            let base = s.filter & 0x7F;
+            assert!(matches!(reduction, 0 | 2 | 3), "{at}");
+            assert!(base == 0x55 || base & !0x15 == 0, "{at}");
+            let c = s.comparison();
+            assert_eq!((c.filter >> 7, c.filter & 0x7F), (1, base), "{at}");
+        }
+    }
 }
