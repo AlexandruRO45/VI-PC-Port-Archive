@@ -1,4 +1,5 @@
 """Launch through the host PE loader, or through a selected userspace Wine provider."""
+import json
 import os
 from pathlib import Path
 import platform
@@ -32,6 +33,55 @@ def proton_installation(selection):
     if (local / "proton").is_file():
         return local.resolve()
     raise ValueError("Select an installed Proton distribution with --proton or PROTONPATH")
+
+
+PACKAGE_DRIVE_RECORD = "tuxbox-package-drive.json"
+
+
+def claim_package_drive(prefix, package):
+    """Record the prefix's G: links before the GDK provider replaces them with the package.
+
+    Returns False, and records nothing, when G: is not a drive link TuxBox can put back.
+    """
+    links = {}
+    for name in ("g:", "g::"):
+        link = prefix / "dosdevices" / name
+        if link.is_symlink():
+            links[name] = os.readlink(link)
+        elif os.path.lexists(link):
+            return False
+        else:
+            links[name] = None
+    (prefix / PACKAGE_DRIVE_RECORD).write_text(json.dumps({"package": str(package), "links": links}))
+    return True
+
+
+def restore_package_drive(prefix, report):
+    """Put back the G: links a launch replaced, including after an interrupted launch."""
+    record_path = prefix / PACKAGE_DRIVE_RECORD
+    try:
+        record = json.loads(record_path.read_text())
+        package, links = record["package"], record["links"]
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        report(f"Ignoring an unreadable G: record {record_path}: {exc}")
+        record_path.unlink(missing_ok=True)
+        return
+    try:
+        for name, target in links.items():
+            link = prefix / "dosdevices" / name
+            # Leave a link that something other than the provider changed meanwhile.
+            if link.is_symlink() and os.readlink(link) != package:
+                continue
+            if os.path.lexists(link) and not link.is_symlink():
+                continue
+            link.unlink(missing_ok=True)
+            if target is not None:
+                link.symlink_to(target)
+        record_path.unlink()
+    except OSError as exc:
+        report(f"Could not restore the prefix's G: drive from {record_path}: {exc}")
 
 
 class Host:
@@ -99,10 +149,12 @@ class Host:
         return subprocess.run([*self.command, str(executable), *arguments], cwd=executable.parent,
                               env=self.env, timeout=timeout, **options)
 
-    def run_game(self, executable, arguments, log, *, mangohud=False, profile_pipelines=False):
+    def run_game(self, executable, arguments, log, *, package=None, mangohud=False, profile_pipelines=False):
         env = self.env.copy()
         env.setdefault("TUXBOX_LOG", "stderr" if self.backend == "native" else "1")
         env.pop("TUXBOX_WINE_TITLE_TEMP", None)
+        env.pop("TUXBOX_WINE_PACKAGE_DRIVE", None)
+        drive_prefix = None
         if self.backend in ("proton", "wine") and env.get("WINEPREFIX"):
             prefix = Path(env["WINEPREFIX"])
             drive = prefix / "dosdevices/t:"
@@ -118,11 +170,33 @@ class Host:
                     log.status(f"Could not prepare the title scratch directory {storage}: {exc}")
                 else:
                     env["TUXBOX_WINE_TITLE_TEMP"] = str(storage)
+            # Xbox titles open their package files through G:, as on the console. The GDK
+            # provider replaces the prefix's G: with the package, so record the existing
+            # links and put them back when the title exits.
+            restore_package_drive(prefix, log.status)
+            if package is not None:
+                package = Path(package).resolve()
+                try:
+                    claimed = claim_package_drive(prefix, package)
+                except OSError as exc:
+                    log.status(f"Could not record the prefix's G: drive: {exc}")
+                    claimed = False
+                if claimed:
+                    env["TUXBOX_WINE_PACKAGE_DRIVE"] = str(package)
+                    drive_prefix = prefix
+                else:
+                    drive = prefix / "dosdevices/g:"
+                    log.status(f"The package is not mapped to G: because {drive} is not a drive link")
         if "-nullrhi" not in (arg.lower() for arg in arguments):
             configure_console_cbv(self.backend, env, executable, log.status)
         capture = performance_capture(self.backend, env, executable, log) if mangohud else nullcontext()
         pipelines = pipeline_capture(self.backend, env, log) if profile_pipelines else nullcontext()
-        with capture, pipelines, runtime_shader_compiler(self.backend, env, executable, log.status), \
-             game_diagnostics(self.backend, env, executable.parent, log.stderr_bytes, log_path=log.path) as stderr:
-            return log.run([*self.command, str(executable), *arguments], cwd=executable.parent, env=env,
-                           stderr_bytes=stderr)
+        try:
+            with capture, pipelines, runtime_shader_compiler(self.backend, env, executable, log.status), \
+                 game_diagnostics(self.backend, env, executable.parent, log.stderr_bytes,
+                                  log_path=log.path) as stderr:
+                return log.run([*self.command, str(executable), *arguments], cwd=executable.parent, env=env,
+                               stderr_bytes=stderr)
+        finally:
+            if drive_prefix is not None:
+                restore_package_drive(drive_prefix, log.status)

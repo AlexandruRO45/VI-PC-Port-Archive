@@ -12,7 +12,7 @@ OUTPUT = ROOT / "build"
 TARGETS = ("bvh", "route", "graphics", "xmem", "acphal", "xapu", "xgameruntime", "xcrdapi", "dxc-utils", "xg", "gameinput",
            "d3d12", "lanes")
 # rustc --print native-static-libs for the Windows MSVC target with +crt-static.
-RUST_STD_LIBS = ("kernel32.lib", "ntdll.lib", "userenv.lib", "ws2_32.lib", "dbghelp.lib",
+RUST_STD_LIBS = ("kernel32.lib", "ntdll.lib", "userenv.lib", "ws2_32.lib", "dbghelp.lib", "synchronization.lib",
                  "/defaultlib:libcmt")
 
 
@@ -54,7 +54,7 @@ class Toolchain:
         obj = source.stem + ".obj"
         directory.mkdir(parents=True, exist_ok=True)
         subprocess.run([require_tool(self.compiler[0]), *self.compiler[1:], "/nologo", "/c", "/O2", "/MT", "/Brepro",
-                        *language, *self.includes, *extra, f"/Fo{obj}", str(source)],
+                        *language, *self.includes, *extra, *(["-Wno-cast-function-type"] if self.compiler[0] == "clang-cl" else []), f"/Fo{obj}", str(source)],
                        cwd=directory, check=True)
         return obj
 

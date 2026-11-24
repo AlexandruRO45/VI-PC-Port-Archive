@@ -18,7 +18,7 @@ except ImportError:
 from project_tuxbox.backend_log import check_log_path
 from project_tuxbox.game_log import game_log
 from project_tuxbox.host import Host
-from project_tuxbox.inspect import binary_file, image, launch_target, package
+from project_tuxbox.inspect import binary_file, image, launch_target, package, package_root
 from project_tuxbox.d3d12_status import d3d12_table
 from project_tuxbox.progress_map import library_table, shader_table, write_map
 from project_tuxbox.shader_prep import prepare_for_launch
@@ -28,6 +28,7 @@ from project_tuxbox.verify import SUITES, verify, status
 
 def launch_game(args):
     exe = launch_target(args.target.expanduser(), args.app_id)
+    package_dir = package_root(args.target.expanduser(), exe)
     host = Host(args.backend, args.proton, args.prefix, offline=args.offline)
     if args.log_file:
         check_log_path(host.backend, host.env, exe.parent, args.log_file.expanduser().resolve())
@@ -55,8 +56,8 @@ def launch_game(args):
                         return 0 if supported else 1
             log.status("Starting game")
             start = monotonic()
-            code = host.run_game(exe, args.arguments, log, mangohud=args.mangohud,
-                                 profile_pipelines=args.profile_pipelines).returncode
+            code = host.run_game(exe, args.arguments, log, package=package_dir,
+                                 mangohud=args.mangohud, profile_pipelines=args.profile_pipelines).returncode
         except KeyboardInterrupt:
             log.status("Launch interrupted")
             return 130

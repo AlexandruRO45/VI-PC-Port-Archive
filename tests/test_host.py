@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from project_tuxbox.console_cbv import configure_console_cbv, console_cbv_layer
-from project_tuxbox.host import Host, proton_installation
+from project_tuxbox.host import Host, claim_package_drive, proton_installation
 
 
 class SelectProton(unittest.TestCase):
@@ -55,6 +55,63 @@ class SelectProton(unittest.TestCase):
             self.assertEqual(configured_target(), str(prefix / "custom"))
             host.backend = "native"
             self.assertIsNone(configured_target())
+
+    @unittest.skipUnless(sys.platform == "linux", "Wine prefix drive links require Linux")
+    def test_linux_package_drive_is_restored_after_the_title_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            prefix, package, other = root / "prefix", root / "game", root / "user-g"
+            dosdevices = prefix / "dosdevices"
+            for folder in (package, other, dosdevices):
+                folder.mkdir(parents=True)
+            host = Host.__new__(Host)
+            host.backend, host.command = "proton", ["umu-run"]
+            host.env = {"WINEPREFIX": str(prefix), "TUXBOX_RUNTIME_SHADERS": "0"}
+            log = Mock()
+            drive = dosdevices / "g:"
+
+            def provider_mounts_package(*args, **kwargs):
+                # Stand in for the GDK provider's mount manager call.
+                if "TUXBOX_WINE_PACKAGE_DRIVE" not in kwargs["env"]:
+                    return
+                drive.unlink(missing_ok=True)
+                (dosdevices / "g::").unlink(missing_ok=True)
+                drive.symlink_to(kwargs["env"]["TUXBOX_WINE_PACKAGE_DRIVE"])
+
+            def launch(package_dir):
+                log.run.side_effect = provider_mounts_package
+                host.run_game(package / "game.exe", ["-nullrhi"], log, package=package_dir)
+                return log.run.call_args.kwargs["env"].get("TUXBOX_WINE_PACKAGE_DRIVE")
+
+            # A prefix without G: gets the package during the launch and no G: after it.
+            self.assertEqual(launch(package), str(package))
+            self.assertFalse(os.path.lexists(drive))
+            self.assertIsNone(launch(None))
+
+            # The user's own G: and its device link come back after the title exits.
+            drive.symlink_to(other)
+            (dosdevices / "g::").symlink_to("/dev/sdz1")
+            self.assertEqual(launch(package), str(package))
+            self.assertEqual(os.readlink(drive), str(other))
+            self.assertEqual(os.readlink(dosdevices / "g::"), "/dev/sdz1")
+            self.assertFalse((prefix / "tuxbox-package-drive.json").exists())
+
+            # A launch killed before it could restore G: is repaired by the next one.
+            (dosdevices / "g::").unlink()
+            self.assertTrue(claim_package_drive(prefix, package))
+            drive.unlink()
+            drive.symlink_to(package)
+            self.assertIsNone(launch(None))
+            self.assertEqual(os.readlink(drive), str(other))
+            self.assertFalse(os.path.lexists(dosdevices / "g::"))
+
+            # A G: that is not a link is left alone and the package is not mapped.
+            drive.unlink()
+            drive.mkdir()
+            self.assertIsNone(launch(package))
+            self.assertTrue(drive.is_dir())
+            host.backend = "native"
+            self.assertIsNone(launch(package))
 
 
 @unittest.skipUnless(sys.platform == "linux", "Network namespaces require Linux")
