@@ -589,6 +589,16 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
                     file.display()
                 );
             }
+            // Otherwise a name on the way is not a folder (`ln -s
+            // profiles/main.toml victory.toml` with `profiles` a file, or
+            // VICTORY_CONFIG=notes.txt/victory.toml): say which, keeping
+            // the OS error underneath.
+            if let Some((blocker, kind)) = not_a_folder_on_the_way(&plain) {
+                return Err(err).context(format!(
+                    "{checking}: {} is {kind}, not a folder",
+                    blocker.display()
+                ));
+            }
             return Err(err).context(checking);
         }
         Err(err) => {
@@ -629,6 +639,52 @@ fn slashed_link_to_file(path: &Path) -> Option<(String, PathBuf)> {
         if as_folder && std::fs::metadata(&plain).is_ok_and(|m| m.is_file()) {
             return Some((shown.join(", "), plain));
         }
+    }
+    None
+}
+
+/// For a `path` the OS refused with "Not a directory": the first name on
+/// the way to where it leads (through its chain of links, as
+/// [`link_hops`] follows them) that is there but is not a folder, as it
+/// is written from that chain, with what it is ("a file", "a named
+/// pipe"...). `None` when no such name is found (it changed meanwhile).
+fn not_a_folder_on_the_way(path: &Path) -> Option<(PathBuf, &'static str)> {
+    let mut end = path.to_path_buf();
+    for target in link_hops(path) {
+        end = end.parent().unwrap_or(Path::new("")).join(&target);
+    }
+    let mut at = PathBuf::new();
+    for part in end.components() {
+        at.push(part);
+        let Ok(metadata) = std::fs::metadata(&at) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            continue;
+        }
+        let kind = if metadata.is_file() {
+            "a file"
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                let t = metadata.file_type();
+                if t.is_fifo() {
+                    "a named pipe"
+                } else if t.is_socket() {
+                    "a socket"
+                } else if t.is_char_device() || t.is_block_device() {
+                    "a device"
+                } else {
+                    "a special file"
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                "a special file"
+            }
+        };
+        return Some((at, kind));
     }
     None
 }
@@ -2801,7 +2857,8 @@ mod tests {
         );
 
         // The target's parent replaced by a file: the OS's "Not a
-        // directory", which is not the same as the file being gone.
+        // directory", which is not the same as the file being gone, with
+        // the file in the way named as the link reaches it.
         std::fs::remove_dir_all(&shared).unwrap();
         std::fs::write(&shared, "").unwrap();
         let err = config_file_or(None, &link).unwrap_err();
@@ -2811,7 +2868,11 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            format!("checking the config file {}", link.display())
+            format!(
+                "checking the config file {}: {} is a file, not a folder",
+                link.display(),
+                link.parent().unwrap().join("../shared").display()
+            )
         );
     }
 
@@ -3167,8 +3228,8 @@ mod tests {
         );
         std::fs::remove_file(&link).unwrap();
 
-        // A slashed target below a file is the OS error, as before: the
-        // slash is not what is wrong there.
+        // A slashed target below a file is the OS error naming the file
+        // in the way: the slash is not what is wrong there.
         std::os::unix::fs::symlink("real.toml/inner.toml/", &link).unwrap();
         let err = config_file_or(None, &link).unwrap_err();
         assert_eq!(
@@ -3177,12 +3238,131 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            format!("checking the config file {}", link.display())
+            format!(
+                "checking the config file {}: {} is a file, not a folder",
+                link.display(),
+                real.display()
+            )
         );
         // Without the slash, read as before.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink("real.toml", &link).unwrap();
         assert_eq!(config_file_or(None, &link).unwrap(), Some(link.clone()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_path_through_something_that_is_not_a_folder_names_it() {
+        // `VICTORY_CONFIG=notes.txt/victory.toml`, or `victory.toml ->
+        // profiles/main.toml` with `profiles` a file: the OS says only
+        // "Not a directory", so the name in the way is added, by kind,
+        // keeping the OS error underneath. Scratch folder under the system
+        // temp folder (keep TMPDIR short for the socket), removed when
+        // dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "").unwrap();
+        let named = |err: anyhow::Error| {
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::NotADirectory,
+                "{err:#}"
+            );
+            err.to_string()
+        };
+
+        // Straight, as VICTORY_CONFIG and as the default, deep below it.
+        let inside = notes.join("victory.toml");
+        assert_eq!(
+            named(config_file(Some(inside.clone())).unwrap_err()),
+            format!(
+                "checking VICTORY_CONFIG at {}: {} is a file, not a folder",
+                inside.display(),
+                notes.display()
+            )
+        );
+        let deep = notes.join("a/b/victory.toml");
+        assert_eq!(
+            named(config_file_or(None, &deep).unwrap_err()),
+            format!(
+                "checking the config file {}: {} is a file, not a folder",
+                deep.display(),
+                notes.display()
+            )
+        );
+        // The first name in the way, not a later one: a folder then a file.
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let file = folder.join("file");
+        std::fs::write(&file, "").unwrap();
+        let err = named(config_file(Some(file.join("victory.toml"))).unwrap_err());
+        assert!(
+            err.ends_with(&format!(": {} is a file, not a folder", file.display())),
+            "{err}"
+        );
+
+        // Through a link whose target goes through the file, named as the
+        // link writes it, from the link's folder.
+        let link = folder.join("victory.toml");
+        std::os::unix::fs::symlink("../notes.txt/main.toml", &link).unwrap();
+        assert_eq!(
+            named(config_file_or(None, &link).unwrap_err()),
+            format!(
+                "checking the config file {}: {} is a file, not a folder",
+                link.display(),
+                folder.join("../notes.txt").display()
+            )
+        );
+        std::fs::remove_file(&link).unwrap();
+
+        // A named pipe, a socket or a device in the way, by kind, checked
+        // without opening (the pipe would block).
+        let pipe = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let socket = dir.path().join("sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for (blocker, kind) in [
+            (pipe.clone(), "a named pipe"),
+            (socket.clone(), "a socket"),
+            (PathBuf::from("/dev/null"), "a device"),
+        ] {
+            let through = blocker.join("victory.toml");
+            assert_eq!(
+                named(config_file(Some(through.clone())).unwrap_err()),
+                format!(
+                    "checking VICTORY_CONFIG at {}: {} is {kind}, not a folder",
+                    through.display(),
+                    blocker.display()
+                )
+            );
+            // With a trailing slash on the name itself, the same name.
+            let slashed = PathBuf::from(format!("{}/", blocker.display()));
+            let err = named(config_file(Some(slashed)).unwrap_err());
+            assert!(
+                err.ends_with(&format!(": {} is {kind}, not a folder", blocker.display())),
+                "{err}"
+            );
+            assert!(!err.contains("drop it"), "{err}");
+        }
+
+        // Missing below a folder is still "does not exist", with no name
+        // in the way added.
+        let err = config_file(Some(folder.join("gone/victory.toml")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("which does not exist"), "{err}");
+        assert!(!err.contains("not a folder"), "{err}");
+
+        // Nothing in the way any more: no name to add.
+        assert_eq!(not_a_folder_on_the_way(&folder.join("x/y.toml")), None);
+        assert_eq!(
+            not_a_folder_on_the_way(&inside),
+            Some((notes.clone(), "a file"))
+        );
     }
 
     #[cfg(unix)]
@@ -5321,7 +5501,11 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            format!("checking VICTORY_CONFIG at {}", through.display())
+            format!(
+                "checking VICTORY_CONFIG at {}: {} is a file, not a folder",
+                through.display(),
+                to_file.display()
+            )
         );
         assert!(config_file_or(None, &through).is_err());
     }
