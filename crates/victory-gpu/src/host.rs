@@ -1,5 +1,3 @@
---- Start Of File crates/victory-gpu/src/host.rs ---
-```rust
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
@@ -2052,4 +2050,3 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 }
-```
