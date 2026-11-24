@@ -1464,4 +1464,50 @@ mod tests {
         let nested: Vec<_> = records(&inner).map(|r| r.name).collect();
         assert_eq!(nested, [Some("PS_inner")]);
     }
+
+    #[test]
+    fn container_longer_than_the_probe_is_one_record_whole_or_cut_off() {
+        // Only the first PROBE packed bytes are read to tell a stream from
+        // noise. A container stored as is (level 0), several probes long,
+        // holding a record past the probe: whole, it is one record and the
+        // one it stores is its own; cut off past the probe, it is a cut-off
+        // record, so the search ends and the stored record is not yielded.
+        let mut container: Vec<u8> = (0..3 * PROBE as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let stored_at = container.len();
+        container.extend(record_bytes("PS_inner", 0x32, b"inner container"));
+        let packed = miniz_oxide::deflate::compress_to_vec(&container, 0);
+        let marker = memchr::memmem::find(&packed, &MARKER).unwrap();
+        assert!(marker > 2 * PROBE, "stored past the probe: {marker}");
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("PS_before", 0x32, b"before"));
+        let outer = file.len() + 15;
+        file.extend_from_slice(b"\x09PS_outer\0\x32");
+        for v in [n, 0x000D_DCE7, n, container.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&packed);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(
+            names,
+            [Some("PS_before"), Some("PS_outer"), Some("PS_after")]
+        );
+        assert_eq!(found[1].offset, outer);
+        assert_eq!(found[1].span().len(), n as usize);
+        assert_eq!(found[1].unpack(), Some(container.clone()));
+        assert!(in_record(&found, outer + 12 + marker));
+        assert!(stored_at > PROBE);
+
+        // Cut off anywhere past the probe, up to the stored record's end.
+        let packed_at = outer + 12;
+        for cut in [PROBE + 1, 2 * PROBE, marker, marker + 12, packed.len() - 1] {
+            let names: Vec<_> = records(&file[..packed_at + cut]).map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_before")], "cut {cut} packed bytes in");
+        }
+    }
 }
