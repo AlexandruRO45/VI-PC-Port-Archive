@@ -222,6 +222,10 @@ struct Pc {
     max_lanes: Option<u32>,
     /// The Agility runtime folder beside this executable.
     agility_beside: bool,
+    /// The default adapter's name and user-mode driver version, as DXGI
+    /// gives them (also without shader model 6.6).
+    gpu_name: Option<String>,
+    driver: Option<String>,
 }
 
 /// The setup check's lines: status, what, and what to do.
@@ -252,6 +256,13 @@ fn verdicts(pc: &Pc) -> Vec<(Status, String, Option<String>)> {
             Some("The title needs it.".to_owned()),
         )
     });
+    if let Some(name) = &pc.gpu_name {
+        let what = match &pc.driver {
+            Some(d) => format!("GPU: {name} (driver {d})"),
+            None => format!("GPU: {name}"),
+        };
+        out.push((Status::Good, what, None));
+    }
     match pc.sm66 {
         Some(true) => out.push((Status::Good, "GPU: shader model 6.6".to_owned(), None)),
         Some(false) => out.push((
@@ -339,9 +350,51 @@ fn check() -> Pc {
             .unwrap_or(false),
         ..Pc::default()
     };
+    adapter(&mut pc);
     gpu(&mut pc);
     pc
 }
+
+/// A driver version as DXGI packs it (four 16-bit parts, high first).
+fn driver_version(v: u64) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        v >> 48,
+        (v >> 32) & 0xFFFF,
+        (v >> 16) & 0xFFFF,
+        v & 0xFFFF
+    )
+}
+
+/// The default adapter's name and driver, from DXGI.
+#[cfg(windows)]
+fn adapter(pc: &mut Pc) {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
+    use windows::core::Interface;
+    // SAFETY: plain DXGI queries; the descriptor is a local copy.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else {
+            return;
+        };
+        let Ok(adapter) = factory.EnumAdapters1(0) else {
+            return;
+        };
+        if let Ok(desc) = adapter.GetDesc1() {
+            let name = &desc.Description;
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            let name = String::from_utf16_lossy(&name[..len]).trim().to_owned();
+            if !name.is_empty() {
+                pc.gpu_name = Some(name);
+            }
+        }
+        if let Ok(v) = adapter.CheckInterfaceSupport(&IDXGIDevice::IID) {
+            pc.driver = Some(driver_version(v as u64));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn adapter(_: &mut Pc) {}
 
 #[cfg(windows)]
 fn windows_build() -> Option<u32> {
@@ -536,6 +589,72 @@ fn check_text(p: Paint, pc: &Pc, cfg: Option<&victory_core::Config>, columns: us
     out
 }
 
+/// The check as plain text for a GitHub report: no colour, no wrapping,
+/// the user's profile folder written as `%USERPROFILE%`.
+fn report_text(check: &str, home: Option<&str>) -> String {
+    let mut text = format!(
+        "VIctory {}, Check this PC\n{check}",
+        env!("CARGO_PKG_VERSION")
+    );
+    if let Some(home) = home.filter(|h| h.len() > 3) {
+        text = text.replace(home, "%USERPROFILE%");
+    }
+    text
+}
+
+/// Puts `text` on the clipboard as Unicode text (CRLF line ends, as
+/// Windows programs paste them).
+#[cfg(windows)]
+fn copy_to_clipboard(text: &str) -> bool {
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    /// `CF_UNICODETEXT`.
+    const UNICODE_TEXT: u32 = 13;
+    let wide: Vec<u16> = text
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    // SAFETY: the clipboard is opened and closed here; the memory handed to
+    // it is a movable block holding `wide`, which the clipboard owns once
+    // SetClipboardData succeeds (and is freed here otherwise).
+    unsafe {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2);
+        if mem.is_null() {
+            return false;
+        }
+        let at = GlobalLock(mem).cast::<u16>();
+        if at.is_null() {
+            GlobalFree(mem);
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), at, wide.len());
+        GlobalUnlock(mem);
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            GlobalFree(mem);
+            return false;
+        }
+        EmptyClipboard();
+        let set = !SetClipboardData(UNICODE_TEXT, mem).is_null();
+        CloseClipboard();
+        if !set {
+            GlobalFree(mem);
+        }
+        set
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_to_clipboard(_: &str) -> bool {
+    false
+}
+
 fn read_line(input: &mut impl BufRead) -> Option<String> {
     let mut line = String::new();
     match input.read_line(&mut line) {
@@ -687,7 +806,29 @@ pub fn run() -> Result<()> {
                 println!();
                 let cfg = victory_core::Config::load().ok();
                 print!("{}", check_text(p, &pc, cfg.as_ref(), console_columns()));
-                pause(p, &mut input);
+                print!(
+                    "\n  {} ",
+                    p.rgb(
+                        "Enter: back to the menu.  C, then Enter: copy this for a GitHub report.",
+                        DIM
+                    )
+                );
+                let _ = std::io::stdout().flush();
+                let Some(answer) = read_line(&mut input) else {
+                    return Ok(());
+                };
+                if choice(&answer) == Choice::Check {
+                    let plain = check_text(Paint { color: false }, &pc, cfg.as_ref(), usize::MAX);
+                    let home = std::env::var("USERPROFILE").ok();
+                    let text = report_text(&plain, home.as_deref());
+                    let said = if copy_to_clipboard(&text) {
+                        "Copied. Paste it into the report form on GitHub."
+                    } else {
+                        "Could not reach the clipboard."
+                    };
+                    println!("\n  {}", p.rgb(said, GOOD));
+                    pause(p, &mut input);
+                }
             }
             Choice::Data => {
                 let _ = std::fs::create_dir_all(&data_dir);
@@ -764,17 +905,23 @@ mod tests {
             mesh_shaders: Some(false),
             max_lanes: Some(32),
             agility_beside: false,
+            gpu_name: Some("NVIDIA GeForce RTX 3060".to_owned()),
+            driver: Some("32.0.15.6094".to_owned()),
         };
         let v = verdicts(&pc);
         let find = |what: &str| v.iter().find(|l| l.1.starts_with(what)).unwrap();
         assert_eq!(find("Windows 10").0, Status::Good);
         assert!(find("Windows 10").2.is_none());
         assert_eq!(find("CPU has AVX2").0, Status::Good);
+        assert_eq!(
+            find("GPU: NVIDIA").1,
+            "GPU: NVIDIA GeForce RTX 3060 (driver 32.0.15.6094)"
+        );
         assert_eq!(find("GPU: no mesh shaders").0, Status::Warn);
         assert_eq!(find("GPU: waves of 32").0, Status::Warn);
         let without_sm66 = verdicts(&Pc {
             sm66: Some(false),
-            ..pc
+            ..pc.clone()
         });
         assert_eq!(without_sm66[0].0, Status::Warn);
         assert!(without_sm66[0].2.as_deref().unwrap().contains("Agility"));
@@ -856,6 +1003,36 @@ mod tests {
         );
         assert_eq!(ended(Some(1)).1, "The run stopped: exit code 1.");
         assert_eq!(ended(None).0, Status::Bad);
+    }
+
+    #[test]
+    fn the_check_copies_as_a_plain_report_without_the_home_folder() {
+        assert_eq!(driver_version(0x0020_0000_0F00_17CE), "32.0.3840.6094");
+        let pc = Pc {
+            windows_build: Some(19045),
+            sm66: Some(false),
+            gpu_name: Some("NVIDIA GeForce GTX 1060 6GB".to_owned()),
+            ..Pc::default()
+        };
+        let long = "x ".repeat(200);
+        let plain = check_text(Paint { color: false }, &pc, None, usize::MAX);
+        let report = report_text(
+            &format!(
+                "{plain}  Data folder: C:\\Users\\someone\\AppData\\Local\\victory\\data\n{long}"
+            ),
+            Some(r"C:\Users\someone"),
+        );
+        assert!(report.starts_with("VIctory "));
+        assert!(report.contains("GPU: NVIDIA GeForce GTX 1060 6GB"));
+        assert!(report.contains(r"%USERPROFILE%\AppData\Local\victory\data"));
+        assert!(!report.contains("someone"));
+        assert!(!report.contains('\x1b'));
+        // Not wrapped: a hint stays on one line.
+        assert!(
+            report
+                .lines()
+                .any(|l| l.contains("shader model 6.5") && l.contains("Agility"))
+        );
     }
 
     #[test]

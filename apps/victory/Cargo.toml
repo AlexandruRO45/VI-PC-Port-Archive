@@ -20,13 +20,19 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
-# The double-click menu: the console, the Windows build, the GPU's features.
+# The double-click menu: the console, the clipboard, the Windows build, the
+# GPU's name and features.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_System_Registry",
 ] }
-windows = { workspace = true, features = ["Win32_Graphics_Direct3D12"] }
+windows = { workspace = true, features = [
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true
