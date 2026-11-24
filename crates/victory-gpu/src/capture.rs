@@ -248,12 +248,11 @@ fn dump_on() -> bool {
 
 /// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
 /// rendered to or wrote (first-use order, the `<i>` of a target dump's file
-/// names) instead of what the title presents; frames with fewer targets show
-/// the title's own picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
-/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide) the
-/// most draws wrote, which in a world frame is a G-buffer layer. A debugging
-/// view: it shows a buffer as it is (a G-buffer layer unlit, say), not a
-/// finished picture.
+/// names) instead of what the title presents. Missing or incompatible targets
+/// fall back to the title picture. `VICTORY_SHOW_TARGET=busiest`: the displayable
+/// target (8-bit, 10-bit or 16-bit float colour, 16:9, at least 1280 wide)
+/// with the most render-target binds and UAV uses. The preview shows the
+/// selected buffer directly, including unlit G-buffer layers.
 #[derive(Clone, Copy)]
 pub(crate) enum Show {
     Index(usize),
@@ -275,8 +274,16 @@ pub(crate) fn show_index() -> Option<Show> {
     })
 }
 
-/// Draws that wrote each noted target this frame (show mode `busiest`).
+/// Render-target binds and UAV uses noted this frame (show mode `busiest`).
 static HITS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The swap-chain copy requires matching subresource and sample counts.
+fn swap_copy_shape(d: &D3D12_RESOURCE_DESC) -> bool {
+    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && d.SampleDesc.Count == 1
+}
 
 /// At the present of `frame` in show mode: the noted target to show, if the
 /// frame has one. Clears the frame's list unless a dump still needs it.
@@ -292,19 +299,26 @@ pub(crate) fn shown(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTe
                 // SAFETY: a live resource.
                 let d = unsafe { c.texture.GetDesc() };
                 let n = hits.iter().find(|h| h.0 == *r).map_or(0, |h| h.1);
-                format!("{i}: {}x{} f{} ({n} draws)", d.Width, d.Height, d.Format.0)
+                format!("{i}: {}x{} f{} ({n} binds/uses)", d.Width, d.Height, d.Format.0)
             })
             .collect();
         tracing::info!(frame, ?list, "VICTORY_SHOW_TARGET: this frame's targets");
     }
     let pick = match show {
-        Show::Index(n) => targets.get(n).map(|(_, c)| c.clone()),
+        Show::Index(n) => targets
+            .get(n)
+            .filter(|(_, c)| {
+                // SAFETY: a live resource.
+                swap_copy_shape(&unsafe { c.texture.GetDesc() })
+            })
+            .map(|(_, c)| c.clone()),
         Show::Busiest => targets
             .iter()
             .filter(|(_, c)| {
                 // SAFETY: a live resource.
                 let d = unsafe { c.texture.GetDesc() };
-                d.Width >= 1280
+                swap_copy_shape(&d)
+                    && d.Width >= 1280
                     // Screen-shaped (16:9): not a shadow map, which more draws write.
                     && d.Width * 9 == u64::from(d.Height) * 16
                     && matches!(d.Format.0, 9..=14 | 23..=25 | 27..=32 | 87 | 90 | 91)
@@ -638,5 +652,28 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    #[test]
+    fn swap_copy_requires_one_single_sampled_2d_subresource() {
+        let mut d = super::D3D12_RESOURCE_DESC {
+            Dimension: super::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            MipLevels: 1,
+            DepthOrArraySize: 1,
+            SampleDesc: super::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        assert!(super::swap_copy_shape(&d));
+        d.MipLevels = 4;
+        assert!(!super::swap_copy_shape(&d));
+        d.MipLevels = 1;
+        d.DepthOrArraySize = 2;
+        assert!(!super::swap_copy_shape(&d));
+        d.DepthOrArraySize = 1;
+        d.SampleDesc.Count = 4;
+        assert!(!super::swap_copy_shape(&d));
+        d.SampleDesc.Count = 1;
+        d.Dimension = super::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        assert!(!super::swap_copy_shape(&d));
     }
 }
