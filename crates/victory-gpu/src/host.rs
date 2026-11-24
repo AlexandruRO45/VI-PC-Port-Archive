@@ -1663,6 +1663,10 @@ struct CardRange {
 
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
+    /// With [`relay`]: the number of the send of changed ranges taken for
+    /// this submission ([`QUEUE_ORDER`]): every send up to it went to the
+    /// queue ahead of the submission's lists.
+    sent_as: u64,
     ranges: Vec<CardRange>,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
@@ -1919,6 +1923,31 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// [`relay`]: the pieces of landed flights are fetched on a copy queue of
+/// the relay's own (`VICTORY_RELAY_COPY_QUEUE=1`; off by default), not
+/// behind everything sent to the title's queue since those flights.
+///
+/// The flights being landed have run (the card was waited for them), so
+/// the copy needs no wait of its own and runs beside the title's later
+/// work. Which sends of title bytes it read after is taken as the last one
+/// ahead of those flights (the largest [`CardPlan::sent_as`]): those had
+/// all run. A later send may or may not have run when the copy reads; its
+/// bytes are left out of the merge either way, as for a fetch on the
+/// title's queue sent before it (`Shadow::card_merge_relay`), which is
+/// right in both cases: run, the card holds the title's bytes there; not
+/// run, the title's bytes are the newer ones and will go up. A piece a
+/// later flight is still writing may be read halfway; that flight's own
+/// landing fetches and merges it again.
+fn relay_copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY_COPY_QUEUE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`relay_copy_queue`]: fetches on the
+/// relay's copy queue, pieces fetched there, pieces with title bytes sent
+/// after the flights (left to those bytes at the merge), microseconds waited.
+static RELAY_COPY_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
@@ -2555,6 +2584,9 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// With [`relay_copy_queue`]: a copy queue, allocator and list of the
+    /// relay's own, made at the first fetch.
+    copy: Option<(ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -2739,6 +2771,17 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        if relay_copy_queue() {
+            let c: Vec<f64> = RELAY_COPY_STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "the relay's own copy queue per frame (VICTORY_RELAY_COPY_QUEUE=1): {:.1} fetches of {:.0} pieces, {:.0} \
+                 of them with title bytes sent after their flights (left to those bytes), {:.1} ms waiting for them",
+                c[0],
+                c[1],
+                c[2],
+                c[3] / 1000.0,
+            );
+        }
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
@@ -3325,6 +3368,7 @@ impl Host {
         }
         drop(order);
         let mut plan = CardPlan {
+            sent_as,
             ranges: Vec::new(),
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
@@ -3452,6 +3496,7 @@ impl Host {
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                copy: None,
                 fence,
                 event,
                 sent: 0,
@@ -3535,6 +3580,72 @@ impl Host {
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
         // event are this thread's.
+        if relay_copy_queue() && f.copy.is_none() {
+            // SAFETY: plain objects of our own.
+            f.copy = unsafe {
+                (|| -> windows::core::Result<(ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
+                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })?;
+                    let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((queue, allocator, list))
+                })()
+                .map_err(|e| tracing::warn!(error = %e, "no copy queue for the relay's fetches (VICTORY_RELAY_COPY_QUEUE=1): the title's queue"))
+                .ok()
+            };
+        }
+        if let Some((queue, allocator, list)) = f.copy.clone() {
+            let after = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+            let later = pieces.iter().filter(|(shadow, lo, hi, _)| shadow.card_sent_after(*lo, *hi, after)).count();
+            // SAFETY: as below, on the relay's copy queue; the flights whose
+            // pieces these are have run.
+            let ran = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    for (shadow, lo, hi, at) in &pieces {
+                        list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                    }
+                    list.Close()?;
+                    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = ran {
+                fail(format_args!("what shaders wrote to the card's memory could not be fetched on the relay's copy queue ({e})"));
+            }
+            let us = waiting.elapsed().as_micros() as u64;
+            RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+            RELAY_COPY_STATS[0].fetch_add(1, Ordering::Relaxed);
+            RELAY_COPY_STATS[1].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            RELAY_COPY_STATS[2].fetch_add(later as u64, Ordering::Relaxed);
+            RELAY_COPY_STATS[3].fetch_add(us, Ordering::Relaxed);
+            {
+                use crate::shadow::CARD_STATS;
+                CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+                CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+                CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+                CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
+            }
+            let mut title = Vec::new();
+            let mut written = 0;
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            crate::shadow::relay_fetched(after);
+            return;
+        }
         let ran = unsafe {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;

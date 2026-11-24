@@ -2651,6 +2651,16 @@ impl Shadow {
     /// a copy has no other use for), as [`Shadow::merge_under_writes`].
     /// `title` is scratch memory. Returns the bytes written to title
     /// memory.
+    /// With [`relay`]: whether title bytes in `[lo, hi)` of this copy went
+    /// up with a send after `after` (their merge leaves them out).
+    pub(crate) fn card_sent_after(&self, lo: usize, hi: usize, after: u64) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
+        sent.iter().any(|s| s.2 > after && s.0 < hi && s.1 > lo)
+    }
+
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
