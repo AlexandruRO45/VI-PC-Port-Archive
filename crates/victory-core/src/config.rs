@@ -4943,6 +4943,77 @@ mod tests {
         ));
     }
 
+    /// A subfolder is checked and created through any link already inside
+    /// the cache or data folder, as the OS will follow it: a link that leads
+    /// into a repository (a folder holding the root marker) is refused
+    /// before anything is created there, a link to another folder is
+    /// followed, and a link that leads nowhere is an error naming the path,
+    /// left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn subfolders_follow_links_inside_their_root() {
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-subdir-links-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if ensure_outside_repo(&scratch).is_err() {
+            // `TMPDIR` is inside the checkout; every subfolder is refused,
+            // which `subfolders_are_created_nested_and_again_without_error`
+            // already checks.
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cache = scratch.join("cache");
+        let repo = scratch.join("repo");
+        let elsewhere = scratch.join("elsewhere");
+        for dir in [&cache, &repo, &elsewhere] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(repo.join(crate::policy::ROOT_MARKER), b"").unwrap();
+        std::os::unix::fs::symlink(&repo, cache.join("into-repo")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cache.join("elsewhere")).unwrap();
+        std::os::unix::fs::symlink(scratch.join("moved-away"), cache.join("dangling")).unwrap();
+        let cfg = Config {
+            cache_dir: cache.clone(),
+            data_dir: scratch.join("data"),
+            ..Default::default()
+        };
+
+        // Into a repository, directly or a few folders down: refused, and
+        // nothing is made inside it.
+        for sub in [
+            "into-repo",
+            "into-repo/shaders",
+            "into-repo/0000ABCD/shaders",
+        ] {
+            assert!(cfg.cache_subdir(sub).is_err(), "{sub}");
+        }
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 1);
+
+        // To an ordinary folder: followed, and the subfolder made there.
+        let dir = cfg.cache_subdir("elsewhere/0000ABCD").unwrap();
+        assert_eq!(dir, cache.join("elsewhere/0000ABCD"));
+        assert!(elsewhere.join("0000ABCD").is_dir());
+
+        // Leading nowhere: an error naming the path; the link is kept and
+        // its target not created.
+        let err = format!("{:#}", cfg.cache_subdir("dangling/inner").unwrap_err());
+        assert!(err.contains("creating"), "{err}");
+        assert!(err.contains("dangling"), "{err}");
+        assert!(
+            cache
+                .join("dangling")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!scratch.join("moved-away").exists());
+
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
     #[test]
     fn subfolders_refuse_a_leading_dot_and_allow_a_trailing_slash() {
         // A leading `./` is a `.` component; a trailing slash or a doubled
