@@ -1723,6 +1723,31 @@ mod tests {
     }
 
     #[test]
+    fn the_wave_size_is_flag_bit_five_in_every_stage() {
+        // `flags` in a lone `stage` program's record.
+        let program = |stage: HwStage, flags: u32| {
+            let mut blob = fssm(&[(stage, &VS_CODE)]);
+            let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+            blob[record + RECORD_FLAGS..][..4].copy_from_slice(&flags.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Only bit 5 says wave32, in a merged, mesh or compute program as
+        // in a pixel one; every other bit leaves it wave64.
+        for (stage, _) in SLOTS {
+            for (flags, wave64) in [
+                (0, true),
+                (FLAG_WAVE32, false),
+                (!FLAG_WAVE32, true),
+                (u32::MAX, false),
+            ] {
+                let p = program(stage, flags)
+                    .unwrap_or_else(|e| panic!("{stage:?}: {flags:#x}: {e:?}"));
+                assert_eq!((p[0].stage, p[0].wave64), (stage, wave64), "{flags:#x}");
+            }
+        }
+    }
+
+    #[test]
     fn the_vgpr_count_is_the_low_ten_bits() {
         let cs = fssm(&[(HwStage::Cs, &VS_CODE)]);
         let record = FSSM_HEADER + u64_at(&cs, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
