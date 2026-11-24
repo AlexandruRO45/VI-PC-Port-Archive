@@ -2716,3 +2716,99 @@ fn the_section_table_order_does_not_change_what_is_read() {
         assert_eq!(info.rva_to_file_offset(DATA_RVA + DATA_SIZE), None);
     }
 }
+
+#[test]
+fn exports_in_a_second_section_are_read_at_its_file_offset() {
+    // The export directory and every table it points at are in `.data`;
+    // the exported address is the entry point in `.text`, and a forwarder
+    // string inside the directory's range is in `.data` too.
+    const DIRECTORY: u32 = DATA_RVA + 0x20;
+    const ADDRESSES: u32 = DATA_RVA + 0x50;
+    const NAMES: u32 = DATA_RVA + 0x58;
+    const ORDINALS: u32 = DATA_RVA + 0x60;
+    const LOCAL: u32 = DATA_RVA + 0x68;
+    const FWD: u32 = DATA_RVA + 0x70;
+    const TO: u32 = DATA_RVA + 0x78;
+    const END: u32 = DATA_RVA + 0x100;
+    let mut d = with_data_section(false);
+    set_directory(&mut d, DIR_EXPORT, DIRECTORY, END - DIRECTORY);
+    let ed = at_data(DIRECTORY);
+    put32(&mut d, ed + 16, 4); // ordinal base
+    put32(&mut d, ed + 20, 2); // functions
+    put32(&mut d, ed + 24, 2); // names
+    put32(&mut d, ed + 28, ADDRESSES);
+    put32(&mut d, ed + 32, NAMES);
+    put32(&mut d, ed + 36, ORDINALS);
+    put32(&mut d, at_data(ADDRESSES), ENTRY);
+    put32(&mut d, at_data(ADDRESSES) + 4, TO);
+    // Sorted names: "fwd" (index 1) before "local" (index 0).
+    put32(&mut d, at_data(NAMES), FWD);
+    put32(&mut d, at_data(NAMES) + 4, LOCAL);
+    put16(&mut d, at_data(ORDINALS), 1);
+    put16(&mut d, at_data(ORDINALS) + 2, 0);
+    put_data_bytes(&mut d, LOCAL, b"local\0");
+    put_data_bytes(&mut d, FWD, b"fwd\0");
+    put_data_bytes(&mut d, TO, b"NTDLL.RtlBar\0");
+
+    let info = ImageInfo::parse(&d).unwrap();
+    let mut exports: Vec<_> = info
+        .exports
+        .iter()
+        .map(|e| (e.ordinal, e.name.as_deref(), e.rva, e.forward.as_deref()))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [
+            (4, Some("local"), Some(ENTRY), None),
+            (5, Some("fwd"), None, Some("NTDLL.RtlBar")),
+        ]
+    );
+    // The `.text` imports and TLS are read as before.
+    assert_eq!(info.import_count(), 2);
+    assert_eq!(info.tls.unwrap().callback_rvas, [0x1010, 0x1020]);
+
+    // An address in `.text` is not a forwarder, even when it holds a string
+    // that looks like one: only the directory's own range is.
+    let mut text_fwd = d.clone();
+    put_bytes(&mut text_fwd, 0x1080, b"NTDLL.RtlBar\0");
+    put32(&mut text_fwd, at_data(ADDRESSES) + 4, 0x1080);
+    let info = ImageInfo::parse(&text_fwd).unwrap();
+    let fwd = info.exports.iter().find(|e| e.ordinal == 5).unwrap();
+    assert_eq!((fwd.rva, fwd.forward.as_deref()), (Some(0x1080), None));
+
+    // Names are read only from the directory's section: the same name in
+    // `.text` makes the image malformed.
+    put_bytes(&mut d, 0x1080, b"local\0");
+    put32(&mut d, at_data(NAMES) + 4, 0x1080);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn a_debug_directory_in_another_section_than_its_record_is_read_there() {
+    // The debug directory entry is in `.data`; its CodeView record stays in
+    // `.text`, found through its file offset.
+    const DEBUG: u32 = DATA_RVA + 0x180;
+    let mut d = with_data_section(false);
+    add_codeview(&mut d, b"RSDS");
+    let old = at(DEBUG_DIRECTORY);
+    d.copy_within(old..old + 28, at_data(DEBUG));
+    d[old..old + 28].fill(0);
+    set_directory(&mut d, DIR_DEBUG, DEBUG, 28);
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("t.pdb", 0x2A));
+
+    // The record moved into `.data` is read there through its new file
+    // offset, whatever RVA the entry gives.
+    let record = at(CODEVIEW);
+    d.copy_within(record..record + 30, at_data(DATA_RVA + 0x1C0));
+    d[record..record + 30].fill(0);
+    put32(
+        &mut d,
+        at_data(DEBUG) + 24,
+        at_data(DATA_RVA + 0x1C0) as u32,
+    );
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("t.pdb", 0x2A));
+    assert_eq!(cv.symbol_key(), "030201000504070608090A0B0C0D0E0F2A");
+}
