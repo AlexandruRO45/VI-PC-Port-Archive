@@ -31,7 +31,7 @@ env:
   # Crates (plus xtask) that build, test and are clippy-clean on Linux today.
   LINUX_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
-    -p victory-game -p victory-loader -p xtask
+    -p victory-game -p victory-loader -p victory-shader -p xtask
   # Crates that are clippy-clean for the Windows target today.
   WINDOWS_CLIPPY_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
@@ -109,18 +109,11 @@ jobs:
       - name: clippy (all targets)
         run: cargo clippy --all-targets --locked $LINUX_CRATES -- -D warnings
 
-      # victory-shader's test module has a helper only the Windows tests use, so
-      # its test target is dead code on Linux; lint the library and run tests.
-      - name: clippy (victory-shader lib)
-        run: cargo clippy --lib --locked -p victory-shader -- -D warnings
-
       # The steps above build default features only, so code behind the
       # `diagnostics` (and victory-shader's `host`) features is never compiled.
       # Lint it too. Both builds stay: some code is cfg(not(feature = ...)).
       - name: clippy (all features)
-        run: |
-          cargo clippy --all-targets --all-features --locked $LINUX_CRATES -- -D warnings
-          cargo clippy --lib --all-features --locked -p victory-shader -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked $LINUX_CRATES -- -D warnings
 
       # Doc tests run under `cargo test` below, but rustdoc's own lints (a
       # renamed item leaving a dangling [`link`], a public doc linking to a
@@ -142,7 +135,7 @@ jobs:
       # --no-fail-fast: report failures from every test binary, not the first.
       - name: cargo test
         run: >
-          cargo test --locked --no-fail-fast $LINUX_CRATES -p victory-shader
+          cargo test --locked --no-fail-fast $LINUX_CRATES
           -- --exact
           --skip image::tests::parses_own_test_binary
           --skip image::tests::rva_to_file_offset_maps_entry_point
