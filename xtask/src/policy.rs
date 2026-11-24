@@ -2608,6 +2608,52 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A UTF-8 byte order mark is dropped only where it opens an ignore
+    /// file, as git reads it: `.gitignore` starting with one still ignores
+    /// `bom`, and `.git/info/exclude` starting with one still ignores
+    /// `excl`, so both are taken, while a directory named with the mark,
+    /// `\u{feff}bom`, stays visible and is refused. On any later line the
+    /// mark is part of the rule: `\u{feff}late/` takes a directory named
+    /// with it and leaves `late` visible, so that is refused, left empty.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_ignore_files_opened_by_a_byte_order_mark() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "\u{feff}/bom/\n\u{feff}late/\n").unwrap();
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "\u{feff}/excl/\n").unwrap();
+        let bom = root.join("bom");
+        let marked = root.join("\u{feff}bom");
+        let excl = root.join("excl");
+        let late = root.join("late");
+        let marked_late = root.join("\u{feff}late");
+        for dir in [&bom, &marked, &excl, &late, &marked_late] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [marked.clone(), bom.clone()]);
+        assert_eq!(tmp.path().parent(), Some(bom.as_path()));
+        let tmp_excl = tempdir_in_first(root, [late.clone(), excl.clone()]);
+        assert_eq!(tmp_excl.path().parent(), Some(excl.as_path()));
+        let tmp_late = tempdir_in_first(root, [late.clone(), marked_late.clone()]);
+        assert_eq!(tmp_late.path().parent(), Some(marked_late.as_path()));
+        for dir in [&marked, &late] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_excl.path(), tmp_late.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(marked.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(late.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "late/b.rs", "\u{feff}bom/a.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// In a linked worktree, where `.git` is a file, the repository's
     /// shared `info/exclude` still applies: a TMPDIR it alone ignores in
     /// the worktree is taken, a visible sibling is refused, and only the
