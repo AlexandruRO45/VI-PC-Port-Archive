@@ -401,6 +401,24 @@ fn committed_for(mut at: usize, len: usize, mask: u32) -> bool {
     true
 }
 
+/// Visit readable and unreadable runs without accessing title memory.
+pub(crate) fn read_runs(mut at: usize, len: usize, mut visit: impl FnMut(usize, usize, bool)) {
+    let Some(end) = at.checked_add(len) else {
+        visit(at, len, false);
+        return;
+    };
+    while at < end {
+        let Some(info) = region(at) else { break };
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
+        if next <= at { break; }
+        visit(at, next - at, accessible(&info, READABLE));
+        at = next;
+    }
+    if at < end {
+        visit(at, end - at, false);
+    }
+}
+
 /// Common case: one checked kernel read. On a partially mapped texture,
 /// hash run bounds and readable bytes only, using zeros for the holes.
 fn read_resident(src: *const u8, out: &mut [u8]) -> Option<(blake3::Hash, usize)> {
@@ -408,18 +426,13 @@ fn read_resident(src: *const u8, out: &mut [u8]) -> Option<(blake3::Hash, usize)
         return Some((blake3::hash(out), out.len()));
     }
     let base = src as usize;
-    let end = base.checked_add(out.len())?;
-    let mut at = base;
     let mut bytes = 0;
     let mut hash = blake3::Hasher::new();
     hash.update(b"partial texture");
-    while at < end {
-        let Some(info) = region(at) else { break };
-        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize).min(end);
-        if next <= at { break; }
+    read_runs(base, out.len(), |at, len, readable| {
         let start = at - base;
-        let part = &mut out[start..next - base];
-        if accessible(&info, READABLE) {
+        let part = &mut out[start..start + len];
+        if readable {
             let mut record = |offset: usize, p: &[u8]| {
                 hash.update(&offset.to_le_bytes());
                 hash.update(&p.len().to_le_bytes());
@@ -447,9 +460,7 @@ fn read_resident(src: *const u8, out: &mut [u8]) -> Option<(blake3::Hash, usize)
         } else {
             part.fill(0);
         }
-        at = next;
-    }
-    out[at - base..].fill(0);
+    });
     (bytes != 0).then(|| (hash.finalize(), bytes))
 }
 

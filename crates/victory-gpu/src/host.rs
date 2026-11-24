@@ -1911,18 +1911,23 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // A large lazy reservation can be mostly empty. Skip each unreadable
+    // VirtualQuery run in one operation; only race/remap failures need the
+    // page-sized fallback.
+    crate::texture::read_runs(src as usize, len, |at, n, readable| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        let zero = |at, n| {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { dst.wrapping_add(at - src as usize).write_bytes(0, n) };
+        };
+        if !readable {
+            zero(at, n);
+        } else if !read(at as *const u8, to, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                if !read(at as *const u8, dst.wrapping_add(at - src as usize), n) {
+                    zero(at, n);
                 }
             });
         }
