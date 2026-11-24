@@ -7479,7 +7479,9 @@ impl<'a> Lower<'a> {
                 // host device must support both (D3D12 options 9 and 11).
                 self.s.flags |= flags::INT64 | flags::ATOMIC64_TYPED | flags::ATOMIC64_HEAP;
             }
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
+            // The view's elements: U32 or U64, one component.
+            let element = if wide { 0x107 } else { 0x105 };
+            let h = self.handle(site, src, false, (kind | 0x1000, element))?;
             let at = self.begin_guarded(guard);
             let (ty, suffix) = if wide {
                 (i64t, "i64")
