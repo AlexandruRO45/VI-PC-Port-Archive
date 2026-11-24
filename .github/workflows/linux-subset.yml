@@ -35,7 +35,7 @@ env:
   # Crates that are clippy-clean for the Windows target today.
   WINDOWS_CLIPPY_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
-    -p victory-game -p victory-loader -p victory-shader
+    -p victory-game -p victory-loader -p victory-shader -p victory-gpu
   # Packages that are rustfmt-clean today. The rest (victory-formats,
   # victory-loader, victory-gpu, victory-hle) are not yet; add each one
   # once it is, and switch to `cargo fmt --all --check` when all are.
@@ -182,13 +182,6 @@ jobs:
           cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc
           $WINDOWS_CLIPPY_CRATES -- -D warnings
 
-      # victory-gpu's library is clean; one of its tests is not yet (a missing
-      # SAFETY comment in host.rs). Lint the non-test targets so new warnings in
-      # the D3D12 code fail here; switch to --all-targets once the test is fixed.
-      - name: clippy (victory-gpu lib, Windows target)
-        run: >
-          cargo clippy --locked --lib --bins --examples --target x86_64-pc-windows-msvc
-          -p victory-gpu -- -D warnings
 
       # The hle-probe fixture is outside the workspace (load_probe builds it on
       # demand on Windows), so the steps above never compile it. It is
