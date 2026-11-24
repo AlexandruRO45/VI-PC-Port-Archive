@@ -1389,30 +1389,25 @@ fn read_partial(src: *const u8, dst: *mut u8, len: usize) -> (bool, usize) {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let write_partial = |at: usize, n: usize| {
+    let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        let ok = unsafe {
-            WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0
-        };
-        (ok, done)
+        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 {
+    if len == 0 || write(dst as usize, len) {
         return;
     }
-    let (ok, done) = write_partial(dst as usize, len);
-    if ok {
-        return;
-    }
-    let done = done.min(len);
-    for_regions(dst as usize + done, len - done, |at, n, committed| {
-        if committed && !write_partial(at, n).0 {
+    // Restart from `dst` rather than `dst + done`: when the destination
+    // faults, Windows `WriteProcessMemory` can report `done` slightly past
+    // the bytes actually delivered (e.g. up to 16 bytes right before a hole).
+    for_regions(dst as usize, len, |at, n, committed| {
+        if committed && !write(at, n) {
             for_pieces(at, n, 64 << 10, |at, n| {
-                if !write_partial(at, n).0 {
+                if !write(at, n) {
                     for_pieces(at, n, 4 << 10, |at, n| {
-                        write_partial(at, n);
+                        write(at, n);
                     });
                 }
             });
@@ -2180,6 +2175,28 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
                     .iter()
                     .all(|&b| b == 0x92)
             );
+        }
+        // Also verify small prefix writes ending right at an unmapped hole
+        // (regression check: `WriteProcessMemory` can over-report `done` by a
+        // few bytes when the destination faults, so `write_mapped` must not
+        // skip the prefix).
+        for prefix in [1usize, 4, 8, 16, 24, 32] {
+            let tag = 0xA0u8.wrapping_add(prefix as u8);
+            let patch = vec![tag; prefix + 64];
+            // SAFETY: `CHUNK - prefix..CHUNK` is committed and writable.
+            unsafe {
+                base.add(CHUNK - prefix).write_bytes(0x00, prefix);
+                super::write_mapped(base.add(CHUNK - prefix), patch.as_ptr(), patch.len());
+                assert!(
+                    std::slice::from_raw_parts(base.add(CHUNK - prefix), prefix)
+                        .iter()
+                        .all(|&b| b == tag),
+                    "prefix {prefix} bytes before hole were not written"
+                );
+            }
+        }
+        // SAFETY: release the reservation.
+        unsafe {
             VirtualFree(base.cast(), 0, MEM_RELEASE);
         }
     }
