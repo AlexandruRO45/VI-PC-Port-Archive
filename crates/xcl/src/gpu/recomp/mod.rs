@@ -568,7 +568,9 @@ fn term(c: &Ctx, start: u64, end: u64) -> Term {
         (Some(t), "S_BRANCH" | "S_SETPC_B64") => Term::Jump(t),
         (Some(_), _) => Term::Other,
         (None, "S_ENDPGM") => Term::End,
-        (None, _) if d.inst.flags & rdna2::F_TERMINATOR != 0 => Term::Other,
+        // an indirect branch without a known target (geometry mode's ES → GS s_setpc_b64) ends
+        // the block: its flow is the emitter's, not a fall-through (#1360)
+        (None, _) if d.inst.flags & (rdna2::F_TERMINATOR | rdna2::F_INDIRECT) != 0 => Term::Other,
         _ => Term::Next,
     }
 }
@@ -1443,7 +1445,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (optimising one big dispatcher loop took minutes on large retail programs).
         let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
         let loops = loop_ranges(&insts);
-        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
+        // with geometry mode's ES → GS s_setpc_b64, which enters the GS code at gs_start
+        let es_gs = |d: &Decoded| match (gs_jump, d.inst.name, d.far_target) {
+            (Some(Some(t)), "S_SETPC_B64", None) if starts.contains(&t) => Some((d.pc, t)),
+            _ => None,
+        };
+        let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t)).or_else(|| es_gs(d))).collect();
         let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, loops: &loops, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();

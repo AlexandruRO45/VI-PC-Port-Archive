@@ -3608,6 +3608,34 @@ fn dump_retail_interfaces() {
 /// program (triangle from LDS through the v0/v1 offsets, a 4-vertex strip = 2 triangles,
 /// emit / cut) run as one compute shader; 25 triangles = 2 groups (21 + 4); records checked
 /// vertex by vertex (strip winding included), then drawn by the mesh pass-through.
+/// Geometry mode with branches in ES / GS: the ES's s_setpc_b64 ends its block and the GS
+/// starts its own at gs_start, where the GS phase of split wave64 enters (#1360).
+#[test]
+fn geometry_es_setpc_ends_a_block_before_gs_start() {
+    use super::GsInterface;
+    let e = |n: &str, enc: &str, f: &[(&str, u64)]| encode(n, enc, f, None).unwrap();
+    let mut code = Vec::new();
+    code.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 129)]));
+    code.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 1), ("SSRC0", 130)]));
+    code.extend(e("S_MOV_B32", "ENC_SOP1", &[("SDST", 7), ("SSRC0", 128)]));
+    code.extend(e("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 6)]));
+    let gs_start = code.len() as u64;
+    code.extend(e("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 0), ("SSRC1", 128)]));
+    code.extend(e("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 2)]));
+    code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", 129)]));
+    code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 130)]));
+    code.extend(e("S_ENDPGM", "ENC_SOPP", &[]));
+    let sig = |name: &str, sv: u32| crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 };
+    let g = GsInterface { es_inputs: vec![sig("POSITION", 0)], es_outputs: vec![sig("SV_Position", 1)], outputs: vec![sig("SV_Position", 1)], max_vertex_count: 3, gs_start: Some(gs_start) };
+    for split in [false, true] {
+        let t = translate(&code, &Options { mode: Mode::Geometry(g.clone()), wave64: true, split_wave64: split, ..Default::default() }).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        assert!(t.hlsl.contains(&format!("if (pc == {gs_start}u) {{")), "split {split}: no block at gs_start\n{}", t.hlsl);
+    }
+    let t = translate(&code, &Options { mode: Mode::Geometry(g), wave64: true, split_wave64: true, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains(&format!("pc = select(xcl_es_phase, 0xFFFFFFFFu, {gs_start}u);")), "{}", t.hlsl);
+}
+
 #[test]
 fn gpu_geometry_mode_es_gs_strip() {
     if !gpu_ready() || !mesh_ready() {
