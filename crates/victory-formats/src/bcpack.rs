@@ -1745,6 +1745,49 @@ mod tests {
         assert_eq!(out, want.to_le_bytes());
     }
 
+    /// `quads` writes each 2-bit residual symbol to one 2x2 quad of the 4x4
+    /// block, low bits first in the order top-left, top-right, bottom-left,
+    /// bottom-right; `pairs` writes a 3-bit residual to each of two raster
+    /// neighbours from bits 0-2 and 4-6. Both look the symbol up in the rank
+    /// table first, and `pairs` ignores the symbol's top two bits.
+    #[test]
+    fn quads_and_pairs_place_index_residuals() {
+        let mut rank = [0u8; 256];
+        for (i, r) in rank.iter_mut().enumerate() {
+            *r = !(i as u8);
+        }
+        // Symbol !v ranks to v: quad q gets v = 0b11_10_01_00 rotated by q.
+        let syms: Vec<u8> = (0..4).map(|q| !0b1110_0100u8.rotate_left(2 * q)).collect();
+        let mut ix = [9u8; 16];
+        quads(&rank, &syms, &mut ix);
+        assert_eq!(
+            ix,
+            [
+                0, 1, 3, 0, //
+                2, 3, 1, 2, //
+                2, 3, 1, 2, //
+                0, 1, 3, 0,
+            ]
+        );
+        // Fewer symbols leave the other quads alone.
+        let mut ix = [9u8; 16];
+        quads(&rank, &syms[..1], &mut ix);
+        assert_eq!(ix, [0, 1, 9, 9, 2, 3, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
+
+        let mut rank = [0u8; 64];
+        for (i, r) in rank.iter_mut().enumerate() {
+            // Bit 3 and bit 7 must be dropped.
+            *r = (i as u8 & 7) | 8 | ((7 - (i as u8 & 7)) << 4) | 0x80;
+        }
+        let syms: Vec<u8> = (0..8).map(|k| k | k << 6).collect();
+        let mut ix = [9u8; 16];
+        pairs(&rank, &syms, &mut ix);
+        assert_eq!(ix, [0, 7, 1, 6, 2, 5, 3, 4, 4, 3, 5, 2, 6, 1, 7, 0]);
+        let mut ix = [9u8; 16];
+        pairs(&rank, &syms[..3], &mut ix);
+        assert_eq!(ix, [0, 7, 1, 6, 2, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
+    }
+
     /// Compares with reference outputs made outside the repository:
     /// `VICTORY_BCPACK_CASES`, a directory of `<name>.bc<n>` packed chunks
     /// with `<name>.out` beside them. The tables are the built-in ones unless

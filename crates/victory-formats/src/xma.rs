@@ -1796,4 +1796,101 @@ mod tests {
             }
         }
     }
+
+    /// `channel_transform` reads FFmpeg's WMA Pro layout for one stereo
+    /// group: a 0 bit (1 is unsupported), then for two channels `1 0` for
+    /// no transform, `1 1` for an unsupported one, or `0` for M/S followed by
+    /// `1` (every band) or `0` and one flag per band. Mono reads nothing.
+    #[test]
+    fn channel_transform_reads_the_stereo_group() {
+        fn read(d: &mut Decoder, bits: &str) -> (Result<(), Error>, usize) {
+            let mut data = [0u8; 8];
+            for (i, c) in bits.bytes().enumerate() {
+                data[i / 8] |= u8::from(c == b'1') << (7 - i % 8);
+            }
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end: bits.len(),
+            };
+            (d.channel_transform(&mut b), b.consumed())
+        }
+        let mut d = Decoder::new(2, 44_100);
+        d.channels_for_cur_subframe = 2;
+        d.num_bands = 4;
+
+        assert_eq!(read(&mut d, "1").0, Err(Error("channel transform bit")));
+        assert_eq!(read(&mut d, "011").0, Err(Error("channel transform type")));
+
+        d.transform = true;
+        assert_eq!(read(&mut d, "010"), (Ok(()), 3));
+        assert!(!d.transform);
+
+        assert_eq!(read(&mut d, "001"), (Ok(()), 3));
+        assert!(d.transform);
+        assert_eq!(d.transform_band, [true; MAX_BANDS]);
+
+        assert_eq!(read(&mut d, "0001011"), (Ok(()), 7));
+        assert!(d.transform);
+        // Bands past `num_bands` keep their old flags.
+        assert_eq!(d.transform_band[..5], [true, false, true, true, true]);
+
+        assert_eq!(read(&mut d, "0000000"), (Ok(()), 7));
+        assert_eq!(d.transform_band[..5], [false, false, false, false, true]);
+
+        // A one-channel subframe of a stereo stream reads only the first bit.
+        d.channels_for_cur_subframe = 1;
+        assert_eq!(read(&mut d, "0111"), (Ok(()), 1));
+        assert!(!d.transform);
+
+        let mut mono = Decoder::new(1, 44_100);
+        mono.transform = true;
+        assert_eq!(read(&mut mono, "1111"), (Ok(()), 0));
+        assert!(!mono.transform);
+    }
+
+    /// `inverse_channel_transform` turns M/S bands into `(l - r, l + r)` and
+    /// scales the other bands of a transformed pair by 181/128 (about √2), up
+    /// to the subframe length; untransformed subframes are left alone.
+    #[test]
+    fn inverse_channel_transform_undoes_mid_side() {
+        let mut d = Decoder::new(2, 44_100);
+        d.table_idx = 1;
+        let sfb = d.sfb_offsets[1];
+        assert!(d.num_sfb[1] > 4);
+        d.num_bands = 3;
+        // Stop inside band 2.
+        d.subframe_len = sfb[2] + 2;
+        assert!(d.subframe_len < sfb[3]);
+        d.channels_for_cur_subframe = 2;
+        d.transform_band[..3].copy_from_slice(&[true, false, true]);
+        for y in 0..FRAME_SAMPLES {
+            d.ch[0].coeffs[y] = y as f32;
+            d.ch[1].coeffs[y] = 3.0 - (y % 7) as f32;
+        }
+        let fresh = (d.ch[0].coeffs, d.ch[1].coeffs);
+
+        // No transform, or only one channel in the subframe: unchanged.
+        d.transform = false;
+        d.inverse_channel_transform();
+        assert_eq!((d.ch[0].coeffs, d.ch[1].coeffs), fresh);
+        d.transform = true;
+        d.channels_for_cur_subframe = 1;
+        d.inverse_channel_transform();
+        assert_eq!((d.ch[0].coeffs, d.ch[1].coeffs), fresh);
+
+        d.channels_for_cur_subframe = 2;
+        d.inverse_channel_transform();
+        let (l, r) = fresh;
+        for y in 0..FRAME_SAMPLES {
+            let band = (0..3).find(|&b| y < sfb[b + 1]);
+            let want = match band {
+                _ if y >= d.subframe_len => (l[y], r[y]),
+                Some(1) => (l[y] * 181.0 / 128.0, r[y] * 181.0 / 128.0),
+                Some(_) => (l[y] - r[y], l[y] + r[y]),
+                None => (l[y], r[y]),
+            };
+            assert_eq!((d.ch[0].coeffs[y], d.ch[1].coeffs[y]), want, "y {y}");
+        }
+    }
 }
