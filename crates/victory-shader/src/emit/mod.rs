@@ -303,6 +303,9 @@ pub fn emit(
 /// The registers D3D12 links one stage's signature to the next through.
 const SIGNATURE_REGISTERS: u32 = 32;
 
+/// `D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`: an `SV_Target` names one of them.
+const RENDER_TARGETS: u32 = 8;
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -412,6 +415,13 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
                 "signature register past the 32 D3D12 has",
             ));
         }
+        // An `SV_Target`'s register is the render target it writes. The
+        // pipeline description has eight format slots, indexed by it; a
+        // target past them read past `RTVFormats` (a panic), and no colour
+        // export reaches it.
+        if kind == 16 && register != u32::MAX && register >= RENDER_TARGETS {
+            return Err(ShaderError::Malformed("render target past the 8 D3D12 has"));
+        }
         out.push(container::SigElement {
             name: String::from_utf8_lossy(name).into_owned(),
             index: u32_at(part, at + 8)?,
@@ -511,6 +521,34 @@ mod tests {
                 "register {register:#x}"
             );
         }
+    }
+
+    /// An `SV_Target` names one of D3D12's eight render targets by its
+    /// register; one past them is refused before the pipeline description
+    /// indexes its eight format slots with it. Other elements keep the 32.
+    #[test]
+    fn a_render_target_past_8_is_refused() {
+        let part = |sv: u32, register: u32| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, sv, 3, register, 0x0F, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(b"SV_Target\0");
+            p
+        };
+        for register in [0, 7] {
+            let rows = signature(&part(64, register)).expect("a render target D3D12 has");
+            assert_eq!((rows[0].kind, rows[0].row), (16, Some(register)));
+        }
+        let refused = ShaderError::Malformed("render target past the 8 D3D12 has");
+        for register in [8, 31] {
+            assert_eq!(
+                signature(&part(64, register)).unwrap_err().to_string(),
+                refused.to_string(),
+                "register {register}"
+            );
+        }
+        assert_eq!(signature(&part(0, 8)).unwrap()[0].row, Some(8));
     }
 
     /// A signature mask is a raw byte of the title's part. One with bits
