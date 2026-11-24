@@ -217,7 +217,7 @@ fn transform_aabb(m: &[[f32; 4]; 3], (mn, mx): Aabb) -> Aabb {
 fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
     let a = |r: usize, c: usize| m[r][c] as f64;
     let det = a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0)) + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0));
-    if !det.is_finite() || det.abs() <= 1e-30 {
+    if !det.is_finite() || det == 0.0 {
         return [0f32; 12];
     }
     let inv = [
@@ -234,7 +234,7 @@ fn world_to_object(m: &[[f32; 4]; 3]) -> [f32; 12] {
             out[3 + 3 * r + c] = inv[r][c] as f32;
         }
     }
-    out
+    if out.iter().all(|x| x.is_finite()) { out } else { [0.0; 12] }
 }
 
 fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -632,6 +632,25 @@ pub(crate) mod tests {
         assert!(triangle_hit(&big, [2e9, 2e9, -1.0], d).is_some());
     }
 
+    #[test]
+    fn inverse_preserves_small_scales_and_rejects_unrepresentable_results() {
+        let small = [
+            [1e-11, 0.0, 0.0, 0.0],
+            [0.0, 1e-11, 0.0, 0.0],
+            [0.0, 0.0, 1e-11, 0.0],
+        ];
+        let inverse = world_to_object(&small);
+        for i in [3, 7, 11] {
+            assert!((inverse[i] / 1e11 - 1.0).abs() < 1e-6);
+        }
+
+        let mut overflow = small;
+        overflow[0][3] = f32::MAX;
+        assert_eq!(world_to_object(&overflow), [0.0; 12]);
+        overflow[0][3] = 0.0;
+        overflow[0][0] = f32::MIN_POSITIVE * 0.01;
+        assert_eq!(world_to_object(&overflow), [0.0; 12]);
+    }
     #[test]
     fn zero_scale_or_singular_instance_transform_does_not_emit_nan() {
         // Zero-scale / culled dynamic instance (det == 0.0)
