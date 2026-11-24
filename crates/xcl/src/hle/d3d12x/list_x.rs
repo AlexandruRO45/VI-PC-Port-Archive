@@ -2006,6 +2006,13 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
 /// Process-wide committed scratch budget, including buffers awaiting GPU completion.
 const MAX_COPY_SCRATCH: u64 = 64 << 20;
 
+fn note_copy_scratch_budget(requested: u64) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: copy scratch request of {requested} bytes exceeds the available budget; using the in-place fallback");
+    }
+}
+
 struct CopyScratch {
     buffer: ID3D12Resource,
     bytes: u64,
@@ -2055,6 +2062,7 @@ impl CopyScratchCache {
             // Reset can happen while the previous recording is executing on another queue.
             if !scratch.recorded && !scratch.idle() {
                 if bytes > MAX_COPY_SCRATCH - self.bytes {
+                    note_copy_scratch_budget(bytes);
                     return None;
                 }
                 // Keep the in-flight allocation charged until its fence completes.
@@ -2069,6 +2077,7 @@ impl CopyScratchCache {
             }
         }
         if bytes > MAX_COPY_SCRATCH - self.bytes {
+            note_copy_scratch_budget(bytes);
             return None;
         }
         let buffer = make_copy_scratch(list, bytes)?;
@@ -2105,7 +2114,11 @@ fn release_copy_scratch(list: usize) {
 }
 
 unsafe fn copy_scratch(list: *mut c_void, n: u64) -> Option<(usize, u64)> {
-    if n > MAX_COPY_SCRATCH || list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
+    if n > MAX_COPY_SCRATCH {
+        note_copy_scratch_budget(n);
+        return None;
+    }
+    if list_type(list) == D3D12_COMMAND_LIST_TYPE_BUNDLE {
         return None;
     }
     let bytes = n.next_power_of_two().max(D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64);
