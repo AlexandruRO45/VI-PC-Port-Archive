@@ -1669,4 +1669,55 @@ mod tests {
             assert_eq!(r.unpack().as_deref(), Some(body));
         }
     }
+
+    #[test]
+    fn length_byte_that_misstates_the_name_gives_no_name() {
+        // `PS_wrong` and its NUL take 9 bytes. A length byte of 0, one off
+        // either way, or the most a byte can state is not its distance to
+        // the NUL, and no character of the name is either: no name. The
+        // record is still found, and so is a named one after it.
+        for len in [0_u8, 8, 10, 0xFF] {
+            let mut header = record_bytes("PS_wrong", 0x32, b"misnamed");
+            header[4] = len;
+            let mut file = MAGIC.to_vec();
+            file.extend(&header);
+            file.extend(record_bytes("PS_after", 0x41, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [None, Some("PS_after")], "length byte {len}");
+            assert_eq!(found[0].kind, 0x32);
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"misnamed"[..]));
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn printable_name_that_is_no_identifier_is_still_read() {
+        // Punctuation is printable: with no identifier among the length
+        // bytes, the earliest one wins, so the whole name is read.
+        for name in ["PS-x.y@1", "PS_a+b", "!"] {
+            let mut file = MAGIC.to_vec();
+            file.extend(record_bytes(name, 0x32, b"odd"));
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 1, "{name}");
+            assert_eq!(found[0].name, Some(name));
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"odd"[..]));
+        }
+    }
+
+    #[test]
+    fn name_with_unprintable_bytes_is_no_name() {
+        // Bytes that are not printable ASCII (UTF-8 past ASCII, a space, a
+        // control byte) cut the name off from its length byte: no name,
+        // rather than the tail after them. The record is still found.
+        for name in ["PS_\u{e9}t\u{e9}", "PS a", "PS_\tb"] {
+            let mut file = MAGIC.to_vec();
+            file.extend(record_bytes(name, 0x32, b"unprintable"));
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [None, Some("PS_after")], "{name:?}");
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"unprintable"[..]));
+        }
+    }
 }
