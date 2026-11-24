@@ -137,6 +137,8 @@ mod translated {
     use std::sync::OnceLock;
 
     const MAGIC: &[u8; 8] = b"XCLTRAN2";
+    const ERR_MAGIC: &[u8; 8] = b"XCLTERR1";
+    const MAX_CACHED_ERR_BYTES: usize = 64 * 1024;
 
     pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -219,6 +221,58 @@ mod translated {
         }
     }
 
+    fn err_header(ident: u64, blob: &[u8]) -> Vec<u8> {
+        let mut h = ERR_MAGIC.to_vec();
+        for v in [ident, blob.len() as u64, hash2(blob)] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h
+    }
+
+    fn is_cacheable_error(reason: &str) -> bool {
+        if reason.is_empty()
+            || reason.len() > MAX_CACHED_ERR_BYTES
+            || reason == "DXIL not compiled yet"
+        {
+            return false;
+        }
+        // Errors formatted by the lower DXIL cache (`dxc.rs`) are only cacheable when DXC itself
+        // deterministically rejected the HLSL (`: dxc: `). Transient failures such as OOM
+        // (`Compile: ... (0x8007000E)`), invalid DXIL containers, or lock errors stay retryable.
+        if reason.starts_with("DXIL cache ") {
+            return reason.contains(": dxc: ");
+        }
+        !reason.contains("dxcompiler.dll not found")
+            && !reason.contains("DxcCreateInstance")
+            && !reason.contains("is too old")
+    }
+
+    pub(super) fn load_err_in(path: &Path, ident: u64, blob: &[u8]) -> Option<String> {
+        let b = std::fs::read(path).ok()?;
+        let head = err_header(ident, blob);
+        let rest = b.strip_prefix(head.as_slice())?;
+        let (len_bytes, msg_bytes) = rest.split_first_chunk::<4>()?;
+        let len = u32::from_le_bytes(*len_bytes) as usize;
+        if len == 0 || len > MAX_CACHED_ERR_BYTES || msg_bytes.len() != len {
+            return None;
+        }
+        String::from_utf8(msg_bytes.to_vec()).ok()
+    }
+
+    pub(super) fn store_err_in(path: &Path, ident: u64, blob: &[u8], reason: &str) {
+        if !is_cacheable_error(reason) {
+            return;
+        }
+        let mut b = err_header(ident, blob);
+        b.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+        b.extend_from_slice(reason.as_bytes());
+        let Some(dir) = path.parent() else { return };
+        let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     pub(super) fn cached_in(
         dir: &Path,
         ident: u64,
@@ -233,13 +287,29 @@ mod translated {
             return translate();
         }
         let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        let err_path = path.with_extension("err");
         if let Some(c) = load_in(&path, ident, blob) {
             super::dxc::note_memory_hit();
             return Ok(c);
         }
-        let c = translate()?;
-        store_in(&path, ident, blob, &c);
-        Ok(c)
+        if let Some(reason) = load_err_in(&err_path, ident, blob) {
+            return Err(reason);
+        }
+        match translate() {
+            Ok(c) => {
+                if err_path.is_file() {
+                    let _ = std::fs::remove_file(&err_path);
+                }
+                store_in(&path, ident, blob, &c);
+                Ok(c)
+            }
+            Err(reason) => {
+                if !super::dxc::cached_only_missed() && is_cacheable_error(&reason) {
+                    store_err_in(&err_path, ident, blob, &reason);
+                }
+                Err(reason)
+            }
+        }
     }
 
     /// `translate` through the disk (`identity()` zero: not used).
@@ -985,6 +1055,101 @@ mod shader_cache_tests {
                 assert_eq!(thread.join().unwrap().unwrap().dxil[0], 1);
             }
         });
+    }
+
+    #[test]
+    fn translated_cache_caches_refusals_by_capability_identity() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-neg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-shader-with-unsupported-op";
+        let ident_v1 = translated::identity_for("src-v1", "dxc-v1");
+        let ident_v2 = translated::identity_for("src-v2", "dxc-v1");
+
+        // 1. First refusal lowers once and writes capability-scoped `.err` marker with reason text.
+        let mut calls = 0usize;
+        let err1 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, || {
+            calls += 1;
+            Err("image_atomic_add_64 is not supported".into())
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err1, "image_atomic_add_64 is not supported");
+        assert_eq!(calls, 1);
+
+        // 2. Second run with unchanged capability identity returns the identical reason with 0 lowerings.
+        let err2 = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, false, || {
+            panic!("cached refusal must not re-lower")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(err2, err1);
+
+        // 3. Changing wave mode (`split: true`) or translator source identity (`ident_v2`) invalidates
+        //    the marker and allows the shader to succeed cleanly.
+        let ok_split = translated::cached_in(&dir, ident_v1, blob, Stage::Compute, 0, 1, true, || {
+            Ok(compiled(3))
+        })
+        .unwrap();
+        assert_eq!(ok_split.dxil[0], 3);
+
+        let ok_v2 = translated::cached_in(&dir, ident_v2, blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(4))
+        })
+        .unwrap();
+        assert_eq!(ok_v2.dxil[0], 4);
+
+        // 4. Disabled cache (`ident == 0`) bypasses negative markers completely.
+        let ok_disabled = translated::cached_in(&dir, 0, blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(5))
+        })
+        .unwrap();
+        assert_eq!(ok_disabled.dxil[0], 5);
+
+        // 5. A deferred `cached_only` miss is never recorded as a permanent refusal.
+        let deferred_blob = b"console-shader-deferred";
+        let (res, missed) = dxc::cached_only(|| {
+            translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
+                let dxil = dxc::compile_cached_in(&dir, "deferred probe", "main", "cs_6_6")?.0;
+                Ok(Compiled { dxil, samplers: Vec::new() })
+            })
+        });
+        assert!(res.is_err() && missed);
+        let ok_after_defer = translated::cached_in(&dir, ident_v1, deferred_blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(6))
+        })
+        .unwrap();
+        assert_eq!(ok_after_defer.dxil[0], 6);
+
+        // 6. A transient DXC failure (e.g. OOM `0x8007000E`) formatted by `dxc.rs` is NOT cached
+        //    in `translated`, so the next call retries and succeeds; deterministic `: dxc: `
+        //    compile errors remain cached.
+        let transient_blob = b"console-shader-transient-dxc-oom";
+        let oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache C:\\cache\\0001.dxil (cs_6_6, entry \"main\", 128 B HLSL): Compile: E_OUTOFMEMORY (0x8007000E)".into())
+        })
+        .err()
+        .unwrap();
+        assert!(oom.contains("0x8007000E"));
+        let ok_after_oom = translated::cached_in(&dir, ident_v1, transient_blob, Stage::Compute, 0, 1, false, || {
+            Ok(compiled(7))
+        })
+        .unwrap();
+        assert_eq!(ok_after_oom.dxil[0], 7);
+
+        let dxc_err_blob = b"console-shader-deterministic-dxc-err";
+        let dxc_err1 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, || {
+            Err("DXIL cache C:\\cache\\0002.dxil (cs_6_6, entry \"main\", 128 B HLSL): dxc: error: invalid op".into())
+        })
+        .err()
+        .unwrap();
+        let dxc_err2 = translated::cached_in(&dir, ident_v1, dxc_err_blob, Stage::Compute, 0, 1, false, || {
+            panic!("deterministic DXC rejection must stay cached in translated")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(dxc_err2, dxc_err1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
