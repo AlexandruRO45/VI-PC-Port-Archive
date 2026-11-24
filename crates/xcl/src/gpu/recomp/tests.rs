@@ -7667,8 +7667,12 @@ fn split_int64_atomics_emit_32_bit_atomics() {
     assert!(windows.complete(), "{:?}", windows.unsupported_why);
     assert_eq!(windows.hlsl.matches("xcl_mInterlockedAdd64(").count(), 1, "{}", windows.hlsl);
     assert!(windows.hlsl.matches("xcl_mInterlockedAdd(").count() >= 4, "{}", windows.hlsl);
+    // and with the windows taken from the descriptor heap
+    let heap = translate(&code, &Options { split_int64_atomics: true, mem_windows: 2, heap_windows: true, ..Default::default() }).unwrap();
+    assert!(heap.complete(), "{:?}", heap.unsupported_why);
+    assert_eq!(heap.hlsl.matches("xcl_mInterlockedAdd64(").count(), 1, "{}", heap.hlsl);
     if super::dxc::location().is_ok() {
-        for t in [&split, &native, &windows, &returned] {
+        for t in [&split, &native, &windows, &heap, &returned] {
             super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         }
     }
