@@ -28,6 +28,16 @@ enum SlotState {
     ViewNull(u64, Option<(u32, u32)>),
 }
 
+/// Outcome of [`HostHeap::mirror_for_draw`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Mirror {
+    /// Slot mirrored in place (or already up to date), with the title view if any.
+    Done(Option<View>),
+    /// Refused: the slot already holds a typed null of another kind, left
+    /// untouched so earlier draws keep reading it and the caller can go fresh.
+    Refused,
+}
+
 /// A null descriptor description derived from a shader's DXIL
 /// `ResourceProperties` annotation.
 #[derive(Clone, Copy)]
@@ -381,38 +391,24 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
-        self.mirror_slot(index, handle, for_draw, None)
+        match self.mirror_slot(index, handle, for_draw, None) {
+            Mirror::Done(view) => view,
+            Mirror::Refused => None,
+        }
     }
 
     /// As [`HostHeap::mirror`] for a draw or dispatch, placing a typed null
     /// descriptor matching `null_props` when the title slot has no view (or its
-    /// view cannot be made on the host).
+    /// view cannot be made on the host). Returns [`Mirror::Refused`] under the
+    /// slot lock without touching the slot if it already holds a typed null of
+    /// another kind, so the caller can give the table fresh dynamic slots.
     pub(crate) fn mirror_for_draw(
         &self,
         index: u32,
         handle: u64,
         null_props: Option<(u32, u32)>,
-    ) -> Option<View> {
+    ) -> Mirror {
         self.mirror_slot(index, handle, true, null_props)
-    }
-
-    /// Whether mirroring `index` for a draw annotating `props` would overwrite
-    /// a different typed null already placed in the slot (for an empty slot or
-    /// the same unmakeable view). Earlier draws recorded against this heap may
-    /// still read the old kind, so the caller should give the table fresh
-    /// dynamic slots instead of rewriting the mirrored slot in place.
-    pub(crate) fn typed_null_conflict(&self, index: u32, handle: u64, props: (u32, u32)) -> bool {
-        if self.sampler {
-            return false;
-        }
-        let state = {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(&state) = made.get(index as usize) else {
-                return false;
-            };
-            state
-        };
-        slot_typed_null_conflict(state, handle, props)
     }
 
     fn mirror_slot(
@@ -421,7 +417,7 @@ impl HostHeap {
         handle: u64,
         for_draw: bool,
         null_props: Option<(u32, u32)>,
-    ) -> Option<View> {
+    ) -> Mirror {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -434,7 +430,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return Mirror::Done(None);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let cpu = self.cpu(index);
@@ -448,6 +444,7 @@ impl HostHeap {
         );
         match write {
             SlotWrite::None => {}
+            SlotWrite::Refused => return Mirror::Refused,
             SlotWrite::DefaultNull => {
                 if self.sampler {
                     self.null_sampler(index);
@@ -465,7 +462,7 @@ impl HostHeap {
         if let Some(resource) = keep {
             self.keep(index, resource);
         }
-        view
+        Mirror::Done(view)
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -515,27 +512,9 @@ enum SlotWrite {
     TypedNull(NullDesc),
     /// Write the view's own-dimension null (`null_for`).
     ViewNull,
-}
-
-/// Pure check behind [`HostHeap::typed_null_conflict`]: true when `state`
-/// holds a typed null of a different kind than `props`, and the title record
-/// at `handle` is still empty or still the same unmakeable view.
-fn slot_typed_null_conflict(state: SlotState, handle: u64, props: (u32, u32)) -> bool {
-    let cur_key = match state {
-        SlotState::TypedNull(p0, p1) if (p0, p1) != props => None,
-        SlotState::ViewNull(key, Some(p)) if p != props => Some(key),
-        _ => return false,
-    };
-    // SAFETY: the handle is a descriptor slot in title memory.
-    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let live = (tag == VIEW_TAG)
-        .then(|| view_at(i, generation))
-        .flatten()
-        .is_some();
-    if !live {
-        return true;
-    }
-    cur_key == Some(u64::from(generation) << 32 | u64::from(i))
+    /// Refused: the slot already holds a typed null of another kind, so leave
+    /// it untouched and report the refusal to the caller.
+    Refused,
 }
 
 /// Updates `state` for the title descriptor at `handle`, calling `try_make`
@@ -563,18 +542,20 @@ fn mirror_slot_state(
             && let Some(props) = null_props
             && let Some(desc) = null_desc_for_props(props)
         {
-            let want = SlotState::TypedNull(props.0, props.1);
-            if *state != want {
-                *state = want;
-                return (None, SlotWrite::TypedNull(desc), Some(None));
-            }
+            return match *state {
+                SlotState::TypedNull(p0, p1) if (p0, p1) == props => (None, SlotWrite::None, None),
+                SlotState::TypedNull(..) if for_draw => (None, SlotWrite::Refused, None),
+                _ => {
+                    *state = SlotState::TypedNull(props.0, props.1);
+                    (None, SlotWrite::TypedNull(desc), Some(None))
+                }
+            };
+        }
+        if matches!(*state, SlotState::Null | SlotState::TypedNull(..)) {
             return (None, SlotWrite::None, None);
         }
-        if *state != SlotState::Null {
-            *state = SlotState::Null;
-            return (None, SlotWrite::DefaultNull, Some(None));
-        }
-        return (None, SlotWrite::None, None);
+        *state = SlotState::Null;
+        return (None, SlotWrite::DefaultNull, Some(None));
     };
     match *state {
         SlotState::View(k) if k == key => (Some(view), SlotWrite::None, None),
@@ -582,11 +563,16 @@ fn mirror_slot_state(
             if for_draw
                 && !sampler
                 && let Some(props) = null_props
-                && cur_props != Some(props)
                 && let Some(desc) = null_desc_for_props(props)
             {
-                *state = SlotState::ViewNull(key, Some(props));
-                return (Some(view), SlotWrite::TypedNull(desc), None);
+                return match cur_props {
+                    Some(p) if p == props => (Some(view), SlotWrite::None, None),
+                    Some(_) => (Some(view), SlotWrite::Refused, None),
+                    None => {
+                        *state = SlotState::ViewNull(key, Some(props));
+                        (Some(view), SlotWrite::TypedNull(desc), None)
+                    }
+                };
             }
             (Some(view), SlotWrite::None, None)
         }
@@ -1693,35 +1679,35 @@ mod tests {
         }
         heap.release(slot, 1);
 
-        // Mirrored slot: empty -> typed null -> updated typed null -> real view.
+        // Mirrored slot: empty -> typed null -> refused other kind -> real view.
         let mut title = [0u32; 8];
         let handle = title.as_mut_ptr() as u64;
-        assert!(
-            heap.mirror_for_draw(0, handle, Some((11 | 0x1000, 0)))
-                .is_none()
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some((11 | 0x1000, 0))),
+            Mirror::Done(None)
         );
         assert_eq!(
             heap.made.lock().unwrap()[0],
             SlotState::TypedNull(11 | 0x1000, 0)
         );
-        assert!(
-            heap.mirror_for_draw(0, handle, Some((12 | 0x1000, 16)))
-                .is_none()
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some((12 | 0x1000, 16))),
+            Mirror::Refused
         );
         assert_eq!(
             heap.made.lock().unwrap()[0],
-            SlotState::TypedNull(12 | 0x1000, 16)
+            SlotState::TypedNull(11 | 0x1000, 0)
         );
         // Out-of-bounds mirrored slot is ignored cleanly.
-        assert!(
-            heap.mirror_for_draw(heap.count(), handle, Some((11 | 0x1000, 0)))
-                .is_none()
+        assert_eq!(
+            heap.mirror_for_draw(heap.count(), handle, Some((11 | 0x1000, 0))),
+            Mirror::Done(None)
         );
 
         // Writing a real view later still triggers `mirror` to make it.
         super::super::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
         let view = heap.mirror_for_draw(0, handle, Some((13, 0x1_0000)));
-        assert_eq!(view, Some(View::Constant(0x1000, 256)));
+        assert_eq!(view, Mirror::Done(Some(View::Constant(0x1000, 256))));
         assert!(matches!(heap.made.lock().unwrap()[0], SlotState::View(_)));
 
         // SAFETY: live host device.
@@ -1791,13 +1777,13 @@ mod tests {
             });
         assert!(matches!(write, SlotWrite::None));
 
-        // 4. A different draw annotation updates the typed null.
+        // 4. A different draw annotation is refused instead of rewriting in place.
         let (_, write, _) =
             mirror_slot_state(&mut state, false, handle, true, Some(raw_uav_props), |_| {
                 panic!("try_make must not run again for the same view key")
             });
-        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Uav(_))));
-        assert!(matches!(state, SlotState::ViewNull(_, Some((0x100b, 0)))));
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(matches!(state, SlotState::ViewNull(_, Some((2, 0x409)))));
 
         // 5. Same transition when the first draw has no annotation and a later
         // draw annotates the slot.
@@ -1850,7 +1836,7 @@ mod tests {
         ));
         assert_eq!(
             heap.mirror_for_draw(0, handle, Some(tex2d_props)),
-            Some(View::Shader(0, Some(tex1d)))
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
         );
         assert!(matches!(
             heap.made.lock().unwrap()[0],
@@ -1867,27 +1853,52 @@ mod tests {
     }
 
     #[test]
-    fn typed_null_conflict_detects_mismatched_kinds() {
+    fn typed_null_refusal_and_unannotated_mirrors() {
         let mut title = [0u32; 8];
         let handle = title.as_mut_ptr() as u64;
         let tex2d = (2, 0x409);
         let raw_uav = (11 | 0x1000, 0);
 
-        // 1. Default Null state never conflicts.
-        assert!(!slot_typed_null_conflict(SlotState::Null, handle, tex2d));
-        assert!(!slot_typed_null_conflict(SlotState::Null, handle, raw_uav));
-
-        // 2. An empty slot mirrored with `tex2d` does not conflict with `tex2d`,
-        // but conflicts with `raw_uav`.
+        // 1. Default Null state accepts a typed null with no refusal.
         let mut state = SlotState::Null;
-        let (_, write, _) =
+        let (view, write, keep) =
             mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| None);
+        assert!(view.is_none());
         assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
+        assert!(keep.is_some());
         assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
-        assert!(!slot_typed_null_conflict(state, handle, tex2d));
-        assert!(slot_typed_null_conflict(state, handle, raw_uav));
 
-        // 3. A slot holding a real host view never conflicts.
+        // 2. Same kind short-circuits with no write and no refusal.
+        let (view, write, keep) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| None);
+        assert!(view.is_none());
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 3. Different kind on the same empty slot refuses without writing or
+        // changing state.
+        let (view, write, keep) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav), |_| None);
+        assert!(view.is_none());
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 4. An unannotated draw and a non-draw mirror both leave TypedNull
+        // untouched with no write.
+        let (_, write, keep) = mirror_slot_state(&mut state, false, handle, true, None, |_| None);
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        let (_, write, keep) = mirror_slot_state(&mut state, false, handle, false, None, |_| None);
+        assert!(matches!(write, SlotWrite::None));
+        assert!(keep.is_none());
+        assert_eq!(state, SlotState::TypedNull(tex2d.0, tex2d.1));
+
+        // 5. Once the title writes a real view over the empty slot, mirroring
+        // is not refused and builds the view.
         let tex1d = [
             DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
             D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32,
@@ -1901,56 +1912,133 @@ mod tests {
             0,
         ];
         super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, handle);
-        // Once the title writes a record over an empty slot, the old TypedNull
-        // state no longer conflicts because the mirror will see the new record.
-        assert!(!slot_typed_null_conflict(state, handle, raw_uav));
+        let (view, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav), |_| {
+                Some(None)
+            });
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(state, SlotState::View(_)));
 
-        let mut live_state = SlotState::Null;
-        let _ = mirror_slot_state(&mut live_state, false, handle, true, Some(tex2d), |_| {
-            Some(None)
+        // A slot holding a real host view is never refused or replaced.
+        let (_, write, _) = mirror_slot_state(&mut state, false, handle, true, Some(tex2d), |_| {
+            panic!("live view must short-circuit")
         });
-        assert!(matches!(live_state, SlotState::View(_)));
-        assert!(!slot_typed_null_conflict(live_state, handle, tex2d));
-        assert!(!slot_typed_null_conflict(live_state, handle, raw_uav));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(state, SlotState::View(_)));
 
-        // 4. An unmakeable view in ViewNull(key, None) has no typed null yet, so
-        // it does not conflict; once a draw places typed null `tex2d`, it
-        // conflicts with `raw_uav` but not `tex2d`.
+        // 6. Unmakeable view: ViewNull(key, None) upgrades on first annotation,
+        // same kind short-circuits, different kind refuses, and None leaves it
+        // alone.
         let mut unmakeable = SlotState::Null;
-        let _ = mirror_slot_state(&mut unmakeable, false, handle, false, None, |_| None);
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, false, None, |_| None);
+        assert!(matches!(write, SlotWrite::ViewNull));
         assert!(matches!(unmakeable, SlotState::ViewNull(_, None)));
-        assert!(!slot_typed_null_conflict(unmakeable, handle, tex2d));
-        assert!(!slot_typed_null_conflict(unmakeable, handle, raw_uav));
 
-        let _ = mirror_slot_state(&mut unmakeable, false, handle, true, Some(tex2d), |_| None);
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(tex2d), |_| None);
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
         assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
-        assert!(!slot_typed_null_conflict(unmakeable, handle, tex2d));
-        assert!(slot_typed_null_conflict(unmakeable, handle, raw_uav));
 
-        // Once the title writes a different record there, the old ViewNull no
-        // longer conflicts.
+        let (_, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(tex2d), |_| {
+                panic!("same kind must short-circuit")
+            });
+        assert!(matches!(write, SlotWrite::None));
+
+        let (_, write, keep) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(raw_uav), |_| {
+                panic!("refusal must not call try_make")
+            });
+        assert!(matches!(write, SlotWrite::Refused));
+        assert!(keep.is_none());
+        assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
+
+        for for_draw in [true, false] {
+            let (_, write, keep) =
+                mirror_slot_state(&mut unmakeable, false, handle, for_draw, None, |_| {
+                    panic!("unannotated mirror must leave ViewNull alone")
+                });
+            assert!(matches!(write, SlotWrite::None));
+            assert!(keep.is_none());
+            assert!(matches!(unmakeable, SlotState::ViewNull(_, Some(p)) if p == tex2d));
+        }
+
+        // Once the title writes a different view record there, mirroring is not
+        // refused.
         super::super::create_cbv(std::ptr::null(), &[0x2000, 0, 256, 0], handle);
-        assert!(!slot_typed_null_conflict(unmakeable, handle, raw_uav));
+        let (view, write, _) =
+            mirror_slot_state(&mut unmakeable, false, handle, true, Some(raw_uav), |_| {
+                Some(None)
+            });
+        assert_eq!(view, Some(View::Constant(0x2000, 256)));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(unmakeable, SlotState::View(_)));
 
-        // 5. End-to-end on a host heap when a D3D12 device is available.
+        // 7. End-to-end on a host heap when a D3D12 device is available.
         let Some(heap) = HostHeap::new(false, 4) else {
             return;
         };
         let mut empty = [0u32; 8];
         let empty_handle = empty.as_mut_ptr() as u64;
-        assert!(!heap.typed_null_conflict(0, empty_handle, tex2d));
-        assert!(heap.mirror_for_draw(0, empty_handle, Some(tex2d)).is_none());
-        assert!(!heap.typed_null_conflict(0, empty_handle, tex2d));
-        assert!(heap.typed_null_conflict(0, empty_handle, raw_uav));
-        assert!(!heap.typed_null_conflict(heap.count(), empty_handle, raw_uav));
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(tex2d)),
+            Mirror::Done(None)
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(tex2d)),
+            Mirror::Done(None)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, Some(raw_uav)),
+            Mirror::Refused
+        );
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(0, empty_handle, None),
+            Mirror::Done(None)
+        );
+        assert_eq!(heap.mirror(0, empty_handle, false), None);
+        assert_eq!(
+            heap.made.lock().unwrap()[0],
+            SlotState::TypedNull(tex2d.0, tex2d.1)
+        );
+        assert_eq!(
+            heap.mirror_for_draw(heap.count(), empty_handle, Some(raw_uav)),
+            Mirror::Done(None)
+        );
 
         let mut view_slot = [0u32; 8];
         let view_handle = view_slot.as_mut_ptr() as u64;
         super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, view_handle);
-        assert!(heap.mirror_for_draw(1, view_handle, Some(tex2d)).is_some());
-        assert!(!heap.typed_null_conflict(1, view_handle, tex2d));
-        assert!(heap.typed_null_conflict(1, view_handle, raw_uav));
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(tex2d)),
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
+        );
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(tex2d)),
+            Mirror::Done(Some(View::Shader(0, Some(tex1d))))
+        );
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(raw_uav)),
+            Mirror::Refused
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[1],
+            SlotState::ViewNull(_, Some(p)) if p == tex2d
+        ));
         super::super::create_cbv(std::ptr::null(), &[0x3000, 0, 256, 0], view_handle);
-        assert!(!heap.typed_null_conflict(1, view_handle, raw_uav));
+        assert_eq!(
+            heap.mirror_for_draw(1, view_handle, Some(raw_uav)),
+            Mirror::Done(Some(View::Constant(0x3000, 256)))
+        );
     }
 }

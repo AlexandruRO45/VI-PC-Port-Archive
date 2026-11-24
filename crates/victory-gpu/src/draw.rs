@@ -618,43 +618,63 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, p: &HostPipeline, compute: bool) {
+    /// Mirrors a used table entry in place and prepares its resource for the
+    /// draw. Returns `true` if the mirror was refused because the slot already
+    /// holds a typed null of another kind (so the table must be made afresh).
+    fn table_entry(
+        &self,
+        list: &HostList,
+        u: &UsedResource,
+        p: &HostPipeline,
+        compute: bool,
+    ) -> bool {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
         let props = table_view_props(p, u.slot, u.table_offset_dwords);
-        if let Some(view) = host.mirror_for_draw(index, handle, props) {
-            readable(list, u, &view);
+        match host.mirror_for_draw(index, handle, props) {
+            crate::descriptor::host::Mirror::Done(view) => {
+                if let Some(view) = view {
+                    readable(list, u, &view);
+                }
+                false
+            }
+            crate::descriptor::host::Mirror::Refused => true,
         }
     }
 
     /// A table slot the shaders annotate but no used-resource entry names
     /// (a later element of a descriptor range): a typed null when the title
     /// has no view there. Slots with a view are left as before; making one
-    /// here would skip what `readable` does for it.
-    fn table_view_entry(&self, slot: u8, dword: u32, p: &HostPipeline, compute: bool) {
+    /// here would skip what `readable` does for it. Returns `true` if the
+    /// mirror was refused because the slot already holds a typed null of
+    /// another kind.
+    fn table_view_entry(&self, slot: u8, dword: u32, p: &HostPipeline, compute: bool) -> bool {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
-            return;
+            return false;
         };
         let handle = table + u64::from(dword) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return;
+            return false;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
+            return false;
         };
         if crate::descriptor::view(handle).is_some() {
-            return;
+            return false;
         }
         let props = table_view_props(p, slot, dword);
-        let _ = host.mirror_for_draw(index, handle, props);
+        matches!(
+            host.mirror_for_draw(index, handle, props),
+            crate::descriptor::host::Mirror::Refused
+        )
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -690,20 +710,12 @@ impl State {
         };
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own. So are tables
-        // whose annotated empty or unmakeable slot already holds a mirrored
-        // typed null of another kind: rewriting it in place would change what
-        // earlier draws read.
+        // title's slots there have no host slot of their own.
         for (slot, dword) in used
             .iter()
             .filter(tables)
             .map(|u| (u.slot, u.table_offset_dwords))
-            .chain(
-                stage_views
-                    .iter()
-                    .filter(|v| !in_used(v.slot, v.dword))
-                    .map(|v| (v.slot, v.dword)),
-            )
+            .chain(stage_views.iter().map(|v| (v.slot, v.dword)))
         {
             if fresh.contains(&slot) {
                 continue;
@@ -711,33 +723,35 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let handle = table + u64::from(dword) * 4;
+            let end = table + u64::from(dword) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count()
-                || table_view_props(p, slot, dword)
-                    .is_some_and(|props| host.typed_null_conflict(index, handle, props))
-            {
+            if index >= host.count() {
                 fresh.push(slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
+        // Mirror non-fresh tables in place. If a slot already holds a typed
+        // null of another kind, the mirror refuses under the slot lock so
+        // earlier draws keep reading the old kind, and that table goes fresh.
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
-                self.table_entry(list, u, p, compute);
+            if !fresh.contains(&u.slot) && self.table_entry(list, u, p, compute) {
+                fresh.push(u.slot);
             }
         }
         for tv in stage_views {
             if fresh.contains(&tv.slot) || in_used(tv.slot, tv.dword) {
                 continue;
             }
-            self.table_view_entry(tv.slot, tv.dword, p, compute);
+            if self.table_view_entry(tv.slot, tv.dword, p, compute) {
+                fresh.push(tv.slot);
+            }
         }
+        fresh.sort_unstable();
+        fresh.dedup();
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
