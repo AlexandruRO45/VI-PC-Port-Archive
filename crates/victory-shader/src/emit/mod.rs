@@ -370,6 +370,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             8 => 2,
             9 => 13,
             10 => 12,
+            23 => 28, // barycentrics
             64 => 16,
             65 => 17,
             66 => 14,
@@ -607,6 +608,71 @@ mod tests {
             super::validator::Validator::default_path().as_deref(),
         ) {
             v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
+    #[test]
+    fn direct_barycentrics_reach_pixel_export_through_a_join() {
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001,    // s_cbranch_scc1 to the export
+            0x7E00_0280,    // v_mov_b32 v0, 0
+            0xF800_180F,
+            0x0100_0100, // exp mrt0 v0, v1, v0, v1 done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![crate::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1, // Perspective center I and J.
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg = container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 0,
+                half: false,
+            }],
+            false,
+            false,
+        );
+        let c = crate::dxbc::build(&[(FourCC::OSG1, &osg)]);
+        let c = Container::parse(&c).unwrap();
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track_native(&p, &native, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let output = Container::parse(&shader.dxil).unwrap();
+        let sig = super::signature(output.part(FourCC::ISG1).unwrap().data).unwrap();
+        assert_eq!((sig[0].kind, sig[0].row, sig[0].cols), (28, None, 3));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut shader.dxil.clone()).unwrap();
         }
     }
 
