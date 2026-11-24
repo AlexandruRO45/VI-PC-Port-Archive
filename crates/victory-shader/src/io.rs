@@ -967,6 +967,31 @@ mod tests {
         assert_eq!(mesh_io(&[S_ENDPGM]).unwrap().inputs, vec![]);
     }
 
+    /// Memory instructions name v5 as a source by their role: an address or
+    /// the data a store or atomic sends is a per-lane read, and a VGPR range
+    /// covers every register in it; the data a load writes is not a source.
+    #[test]
+    fn memory_operands_read_the_mesh_group_by_their_role() {
+        let per_lane = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "the mesh group input read per lane",
+        });
+        // ds_write_b32 v0, v5: stored data.
+        assert_eq!(mesh_io(&[0xD834_0000, 0x0000_0500, S_ENDPGM]), per_lane);
+        // ds_write_b32 v5, v1: the address.
+        assert_eq!(mesh_io(&[0xD834_0000, 0x0000_0105, S_ENDPGM]), per_lane);
+        // ds_write_b64 v0, v[4:5]: v5 as the pair's high dword.
+        assert_eq!(mesh_io(&[0xD934_0000, 0x0000_0400, S_ENDPGM]), per_lane);
+        // ds_read_b32 v5, v0: the load replaces v5 and reads only v0.
+        assert!(mesh_io(&[0xD8D8_0000, 0x0500_0000, S_ENDPGM]).is_ok());
+        // buffer_store_dword v5, v0, s[8:11], 0 idxen: stored data.
+        assert_eq!(mesh_io(&[0xE070_2000, 0x8002_0500, S_ENDPGM]), per_lane);
+        // buffer_load_dword v1, v5, s[8:11], 0 idxen: the index.
+        assert_eq!(mesh_io(&[0xE030_2000, 0x8002_0105, S_ENDPGM]), per_lane);
+        // buffer_load_dword v5, v0, s[8:11], 0 idxen: v5 is written.
+        assert!(mesh_io(&[0xE030_2000, 0x8002_0500, S_ENDPGM]).is_ok());
+    }
+
     fn vertex(inputs: Vec<crate::native::VsInput>) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Vs,
