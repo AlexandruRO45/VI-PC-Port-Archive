@@ -2341,6 +2341,107 @@ mod tests {
     }
 
     #[test]
+    fn an_xbch_header_cut_anywhere_is_truncated() {
+        let good = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        // Cut inside the version, the packed size or the unpacked size: each
+        // field is read whole or not at all.
+        for len in [4, 6, 8, 12, 16, 23] {
+            assert_eq!(refused_blob(&good[..len]), "truncated", "{len}");
+        }
+        // Cut inside the magic, there is no magic to find.
+        for len in [1, 3] {
+            assert_eq!(
+                refused_blob(&good[..len]),
+                "native blob lacks XBCH magic",
+                "{len}"
+            );
+        }
+        // The header alone, stating an empty stream, reads no stream at all.
+        let mut header = good[..XBCH_HEADER].to_vec();
+        header[8..16].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            refused_blob(&header),
+            "XBCH stream does not inflate to its stated size"
+        );
+    }
+
+    #[test]
+    fn an_xbch_stream_must_be_sound_zlib() {
+        let fssm_blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let expect = native_programs(&part(&[(KIND_NATIVE, &xbch(&fssm_blob))])).unwrap();
+        // Any compression level, stored blocks included, reads the same.
+        for level in [0, 1, 9, 10] {
+            let stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm_blob, level);
+            let mut blob = xbch(&fssm_blob);
+            blob.truncate(XBCH_HEADER);
+            blob[8..16].copy_from_slice(&(stream.len() as u64).to_le_bytes());
+            blob.extend_from_slice(&stream);
+            assert_eq!(
+                native_programs(&part(&[(KIND_NATIVE, &blob)])).unwrap(),
+                expect,
+                "{level}"
+            );
+        }
+
+        let with_stream = |stream: &[u8]| {
+            let mut blob = xbch(&fssm_blob);
+            blob.truncate(XBCH_HEADER);
+            blob[8..16].copy_from_slice(&(stream.len() as u64).to_le_bytes());
+            blob.extend_from_slice(stream);
+            refused_blob(&blob)
+        };
+        let why = "XBCH stream does not inflate to its stated size";
+        // A raw deflate stream, with no zlib header, is refused.
+        assert_eq!(
+            with_stream(&miniz_oxide::deflate::compress_to_vec(&fssm_blob, 6)),
+            why
+        );
+        // As is a zlib stream whose checksum no longer matches its bytes.
+        let mut stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm_blob, 0);
+        let last = stream.len() - 1;
+        stream[last] ^= 1;
+        assert_eq!(with_stream(&stream), why);
+        // Or whose header names another method.
+        let mut stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm_blob, 6);
+        stream[0] = 0x79;
+        assert_eq!(with_stream(&stream), why);
+        // Or whose final block is cut off.
+        let stream = miniz_oxide::deflate::compress_to_vec_zlib(&fssm_blob, 6);
+        assert_eq!(with_stream(&stream[..stream.len() - 5]), why);
+        // Bytes that are not a stream at all.
+        assert_eq!(with_stream(&[0xFF; 32]), why);
+    }
+
+    #[test]
+    fn only_native_entries_need_their_bounds_in_the_index() {
+        let native = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
+        // The last entry of another kind cut after its kind: its offset and
+        // size are never read, so the part still yields the native programs.
+        let data = part(&[(KIND_NATIVE, &native), (0x0a, b"xbop")]);
+        let last_kind = XDAT_OFFSET + 12 + 12;
+        let mut index_only = data[..last_kind + 4].to_vec();
+        // Keep the native entry's blob reachable after the cut index.
+        let blob_at = index_only.len() as u32;
+        index_only[XDAT_OFFSET + 12 + 4..][..4].copy_from_slice(&blob_at.to_le_bytes());
+        index_only.extend_from_slice(&native);
+        assert_eq!(native_programs(&index_only).unwrap().len(), 1);
+        // The same cut after a native kind is truncated.
+        let data = part(&[(0x0a, b"xbop"), (KIND_NATIVE, &native)]);
+        assert_eq!(refused(&data[..last_kind + 4]), "truncated");
+
+        // An index stating no entries reads none, whatever follows it.
+        let mut empty = part(&[(KIND_NATIVE, &native)]);
+        empty[XDAT_OFFSET + 4..][..4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(native_programs(&empty).unwrap().is_empty());
+        // Nor does it need anything after its count.
+        assert!(
+            native_programs(&empty[..XDAT_OFFSET + 8])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn names_each_fssm_header_refusal() {
         let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
         let with = |at: usize, value: &[u8]| {
