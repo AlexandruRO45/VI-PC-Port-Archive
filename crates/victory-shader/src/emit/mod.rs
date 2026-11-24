@@ -575,6 +575,24 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+
+    /// The switch's edges: the largest value in either base, a leading
+    /// plus, leading zeros read as decimal (not octal), and surrounding
+    /// tabs and newlines trimmed. The prefix is lower-case `0x` only, a
+    /// hex zero is still zero, and a sign or space after the prefix is no
+    /// number.
+    #[test]
+    fn the_loop_limit_switch_at_its_edges() {
+        assert_eq!(parse_loop_limit(Some("4294967295")), u32::MAX);
+        assert_eq!(parse_loop_limit(Some("0xFFFFFFFF")), u32::MAX);
+        assert_eq!(parse_loop_limit(Some("0xffff")), 0xFFFF);
+        assert_eq!(parse_loop_limit(Some("+5")), 5);
+        assert_eq!(parse_loop_limit(Some("010")), 10);
+        assert_eq!(parse_loop_limit(Some("\t64\n")), 64);
+        for bad in ["0X10", "0x0", "0x100000000", "0x-5", "0x 10", "1 0", "1e3"] {
+            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
     use super::container::SigElement;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
@@ -587,6 +605,50 @@ mod tests {
             d.extend(n.to_le_bytes());
         }
         d
+    }
+
+    fn shader_reading(indices: &[u32]) -> HostShader {
+        HostShader {
+            stage: HwStage::Ps,
+            dxil: Vec::new(),
+            user_data: indices
+                .iter()
+                .map(|&index| UserData {
+                    index,
+                    slot: 0,
+                    root: RootType::Constants,
+                    dword: index,
+                })
+                .collect(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+        }
+    }
+
+    /// The user-data buffer reaches the highest dword read, rounded up to
+    /// a whole vector of four: dword 3 still fits in 4, dword 4 needs 8.
+    /// Only the highest index counts, in any order, read once or twice,
+    /// and a shader that reads none declares no buffer.
+    #[test]
+    fn user_data_dwords_round_the_highest_index_up_to_four() {
+        for (indices, dwords) in [
+            (&[][..], 0),
+            (&[0][..], 4),
+            (&[3][..], 4),
+            (&[4][..], 8),
+            (&[7, 0, 2][..], 8),
+            (&[8, 8][..], 12),
+            (&[1, 15, 15, 9][..], 16),
+            (&[63][..], 64),
+        ] {
+            assert_eq!(
+                shader_reading(indices).user_data_dwords(),
+                dwords,
+                "{indices:?}"
+            );
+        }
     }
 
     /// A mesh group id strides by the HLSL group's whole thread count, not

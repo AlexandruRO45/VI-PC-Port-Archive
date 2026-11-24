@@ -1225,6 +1225,39 @@ mod tests {
         assert_eq!(ps_vgprs(1 << 15), [(0, Input::FixedPosition)]);
     }
 
+    /// A disabled bit takes no VGPRs: the next enabled input starts right
+    /// after the last enabled one, however many bits lie between. The
+    /// pull model alone fills v0-v2, and the front face after the
+    /// perspective sample pair lands in v2, not at its all-bits slot (v20).
+    #[test]
+    fn disabled_pixel_input_bits_leave_no_gap() {
+        let pull = |index| Input::Barycentric {
+            kind: Barycentric::PerspectivePullModel,
+            index,
+        };
+        assert_eq!(ps_vgprs(1 << 3), [(0, pull(0)), (1, pull(1)), (2, pull(2))]);
+        let sample = |index| Input::Barycentric {
+            kind: Barycentric::PerspectiveSample,
+            index,
+        };
+        assert_eq!(
+            ps_vgprs(1 << 0 | 1 << 12),
+            [(0, sample(0)), (1, sample(1)), (2, Input::FrontFace)]
+        );
+        // Position w alone is v0, with x, y and z disabled.
+        assert_eq!(ps_vgprs(1 << 11), [(0, Input::Position(3))]);
+        // The pull model then the sample coverage: v0-v2, then v3.
+        assert_eq!(
+            ps_vgprs(1 << 3 | 1 << 14),
+            [
+                (0, pull(0)),
+                (1, pull(1)),
+                (2, pull(2)),
+                (3, Input::SampleCoverage)
+            ]
+        );
+    }
+
     /// The six-bit export target: colours, depth, null, positions, the
     /// primitive and parameters each name a target; the numbers between
     /// them are refused, and a pixel shader has no parameter to export.
