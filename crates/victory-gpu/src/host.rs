@@ -413,40 +413,81 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeshSupport {
+    Native,
+    Emulate,
+    Unsupported,
+}
+
 impl Host {
-    /// Whether the host runs mesh shaders at shader model 6.6 (translated
-    /// mesh shaders need both); logged once.
-    pub(crate) fn mesh_shaders(&self) -> bool {
-        static MESH: OnceLock<bool> = OnceLock::new();
+    fn mesh_support(&self) -> MeshSupport {
+        static MESH: OnceLock<MeshSupport> = OnceLock::new();
         *MESH.get_or_init(|| {
             let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
             let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
             // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
+            let (opt_ok, sm_ok) = unsafe {
+                (
+                    self.device
+                        .CheckFeatureSupport(
+                            D3D12_FEATURE_D3D12_OPTIONS7,
+                            (&raw mut options).cast(),
+                            size_of_val(&options) as u32,
+                        )
+                        .is_ok(),
+                    self.device
                         .CheckFeatureSupport(
                             D3D12_FEATURE_SHADER_MODEL,
                             (&raw mut model).cast(),
                             size_of_val(&model) as u32,
                         )
-                        .is_ok()
+                        .is_ok(),
+                )
             };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            let sm66 = sm_ok && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let hardware = opt_ok && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED;
+            let override_env = std::env::var("VICTORY_MESH_EMULATION").ok();
+            let mode = match override_env.as_deref().map(str::trim) {
+                Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => {
+                    if sm66 {
+                        MeshSupport::Emulate
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => {
+                    if sm66 && hardware {
+                        MeshSupport::Native
+                    } else {
+                        MeshSupport::Unsupported
+                    }
+                }
+                _ => {
+                    if !sm66 {
+                        MeshSupport::Unsupported
+                    } else if hardware {
+                        MeshSupport::Native
+                    } else {
+                        MeshSupport::Emulate
+                    }
+                }
+            };
+            tracing::info!(?mode, sm66, hardware, "host mesh shader support");
+            mode
         })
+    }
+
+    /// Whether the host runs native mesh shaders at shader model 6.6; logged once.
+    pub(crate) fn mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Native
+    }
+
+    /// Whether mesh shaders should be emulated with compute + vertex shaders at SM 6.6.
+    pub(crate) fn emulate_mesh_shaders(&self) -> bool {
+        self.mesh_support() == MeshSupport::Emulate
     }
 
     /// A new list, open for recording.
@@ -1809,6 +1850,57 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A default-heap GPU buffer (starting in `UNORDERED_ACCESS` when `flags`
+    /// allows unordered access, else `COMMON`).
+    pub(crate) fn default_buffer(
+        &self,
+        size: u64,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let state = if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0 {
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap buffer allocation with valid heap and resource descriptions.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
                 None
             }
         }

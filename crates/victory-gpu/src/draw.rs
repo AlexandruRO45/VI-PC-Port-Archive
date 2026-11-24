@@ -14,14 +14,14 @@ use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
-use crate::host::HostList;
+use crate::host::{HostList, transition};
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, Stage};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -397,6 +397,11 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        self.ensure_targets(list);
+        true
+    }
+
+    fn ensure_targets(&self, list: &HostList) {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
@@ -405,18 +410,9 @@ impl State {
         if self.depth != 0 {
             crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
         }
-        true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a table it reads could
-    /// not be made.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
-        let l = &list.list;
+    fn ensure_heaps(&mut self, list: &HostList) {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -429,91 +425,194 @@ impl State {
                 .collect();
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { list.list.SetDescriptorHeaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
-        let root = p.root.as_raw() as usize;
-        if self.host_roots[usize::from(compute)] != root {
+    }
+
+    fn bind_pipeline(
+        &mut self,
+        list: &HostList,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        name: &str,
+        host_compute: bool,
+    ) {
+        let l = &list.list;
+        self.ensure_heaps(list);
+        let root_raw = root.as_raw() as usize;
+        if self.host_roots[usize::from(host_compute)] != root_raw {
             // SAFETY: an open list and a live root signature.
             unsafe {
-                if compute {
-                    l.SetComputeRootSignature(&p.root);
+                if host_compute {
+                    l.SetComputeRootSignature(root);
                 } else {
-                    l.SetGraphicsRootSignature(&p.root);
+                    l.SetGraphicsRootSignature(root);
                 }
             }
-            self.host_roots[usize::from(compute)] = root;
+            self.host_roots[usize::from(host_compute)] = root_raw;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
+            unsafe { l.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
+            list.used_pipeline(name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep(pso);
+            list.keep(root);
         }
-        for stage in &p.stages {
-            let t = stage.translated();
-            self.table_failed = false;
-            let made = self.tables(list, &t.used, compute);
-            if self.table_failed {
-                static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
-                let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_power_of_two() {
-                    tracing::warn!(
-                        dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
-                    );
-                }
-                return false;
+    }
+
+    fn bind_stage(
+        &mut self,
+        list: &HostList,
+        stage: &Stage,
+        title_compute: bool,
+        host_compute: bool,
+    ) -> bool {
+        let l = &list.list;
+        let t = stage.translated();
+        self.table_failed = false;
+        let made = self.tables(list, &t.used, title_compute);
+        if self.table_failed {
+            static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
+            let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    dropped = n,
+                    "a draw or dispatch dropped: no dynamic slots for its tables"
+                );
             }
-            if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
-                for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
-                    };
+            return false;
+        }
+        if let Some((param, dwords)) = stage.user_data {
+            let mut values = vec![0u32; dwords as usize];
+            for u in &t.host.user_data {
+                let fresh = made
+                    .iter()
+                    .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                values[u.index as usize] = match fresh {
+                    Some(&(_, offset)) => offset,
+                    None => self.user_value(title_compute, u.slot, u.root, u.dword),
+                };
+            }
+            // SAFETY: an open list; `values` covers the parameter.
+            unsafe {
+                if host_compute {
+                    l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                } else {
+                    l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                 }
-                // SAFETY: an open list; `values` covers the parameter.
+            }
+        }
+        for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+            for &(slot, param) in views {
+                let Some(Root::View(address)) = self.roots_ref(title_compute).get(usize::from(slot))
+                else {
+                    once!(slot, "a shader reads a root view the title did not set");
+                    continue;
+                };
+                let Some(gpu) = root_view(list, *address, srv) else {
+                    continue;
+                };
+                // SAFETY: an open list; the address is in live memory.
                 unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
-            }
-            for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
-                for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
-                    };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
-                    };
-                    // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
+                    match (host_compute, srv) {
+                        (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+                        (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                        (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+                        (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
                     }
                 }
             }
         }
         true
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a table it reads could
+    /// not be made.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_pipeline(list, &p.root, &p.pso, &p.name, compute);
+        for stage in &p.stages {
+            if !self.bind_stage(list, stage, compute, compute) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn bind_emulated_cs(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        buffers: &crate::mesh_emu::Buffers,
+        base_group: u32,
+        slot_map_gpu: u64,
+    ) -> bool {
+        let Some(emu) = &p.mesh_emu else {
+            return false;
+        };
+        self.bind_pipeline(list, &emu.cs_root, &emu.cs_pso, &p.name, true);
+        if !self.bind_stage(list, &emu.cs_stage, false, true) {
+            return false;
+        }
+        let l = &list.list;
+        // SAFETY: an open list; emulation buffers remain alive via static pool + `keep`.
+        unsafe {
+            l.SetComputeRootUnorderedAccessView(emu.cs_uav_param, buffers.output_gpu);
+            if let Some(param) = emu.cs_cbv_param {
+                let constants = [base_group, 0, 0, 0];
+                l.SetComputeRoot32BitConstants(param, 4, constants.as_ptr().cast(), 0);
+            }
+            if let Some(param) = emu.cs_srv_param {
+                l.SetComputeRootShaderResourceView(param, slot_map_gpu);
+            }
+        }
+        list.keep(&buffers.output);
+        list.keep(&buffers.slot_map);
+        list.keep(&buffers.dummy_srv);
+        true
+    }
+
+    fn bind_emulated_gfx(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        buffers: &crate::mesh_emu::Buffers,
+    ) -> bool {
+        let Some(emu) = &p.mesh_emu else {
+            return false;
+        };
+        self.bind_pipeline(list, &p.root, &p.pso, &p.name, false);
+        for stage in &p.stages {
+            if !self.bind_stage(list, stage, false, false) {
+                return false;
+            }
+        }
+        let l = &list.list;
+        // SAFETY: an open list; `output_gpu` is a valid default buffer transitioned to SRV.
+        unsafe {
+            l.SetGraphicsRootShaderResourceView(emu.draw_srv_param, buffers.output_gpu);
+            self.ensure_targets(list);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
+        true
+    }
+
+    fn restore_mesh_emu_state(&mut self, list: &HostList) {
+        if self.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST.0 as u32 {
+            self.set_topology(list, self.topology);
+        }
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
     }
 
     /// Runs a dispatch on the host.
@@ -563,7 +662,13 @@ impl State {
         let views = (self.heaps[0] != 0)
             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
             .flatten();
-        for stage in &p.stages {
+        for stage in p
+            .mesh_emu
+            .as_ref()
+            .map(|e| &e.cs_stage)
+            .into_iter()
+            .chain(&p.stages)
+        {
             let t = stage.translated();
             let _ = write!(text, " | {}:", stage.shader.hash);
             for u in &t.host.user_data {
@@ -591,6 +696,16 @@ impl State {
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.mesh_emu.is_some()
+        {
+            if !self.dispatch_mesh_emulated(list, p, x) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -608,6 +723,76 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    fn dispatch_mesh_emulated(&mut self, list: &HostList, p: &HostPipeline, x: u32) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            return false;
+        }
+        let Some(emu_pipe) = &p.mesh_emu else {
+            return false;
+        };
+        if x == 0 {
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
+        let Some(buffers) = crate::mesh_emu::buffers() else {
+            return false;
+        };
+        let group_cap = buffers.group_cap(emu_pipe.emu.group_bytes());
+        if group_cap == 0 {
+            once!(
+                group_bytes = emu_pipe.emu.group_bytes(),
+                "mesh emulation buffer too small for one group"
+            );
+            return false;
+        }
+        let mut base = 0u32;
+        while base < x {
+            let chunk = (x - base).min(group_cap);
+            if !self.bind_emulated_cs(list, p, buffers, base, buffers.dummy_srv_gpu) {
+                self.restore_mesh_emu_state(list);
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| self.op_text(format!("mesh-emu {chunk} (base {base})"), false));
+            // SAFETY: open list with emulated CS PSO, root signature, and `output` in UAV state.
+            unsafe {
+                list.list.Dispatch(chunk, 1, 1);
+                list.list.ResourceBarrier(&[transition(
+                    &buffers.output,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                )]);
+            }
+            if !self.bind_emulated_gfx(list, p, buffers) {
+                // SAFETY: restore `output` to UAV before returning early.
+                unsafe {
+                    list.list.ResourceBarrier(&[transition(
+                        &buffers.output,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                }
+                self.restore_mesh_emu_state(list);
+                return false;
+            }
+            // SAFETY: open list with unpack VS/PS PSO, TRIANGLELIST topology, and `output` in SRV state.
+            unsafe {
+                list.list
+                    .DrawInstanced(chunk * emu_pipe.emu.max_primitives * 3, 1, 0, 0);
+                list.list.ResourceBarrier(&[transition(
+                    &buffers.output,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            base += chunk;
+        }
+        self.restore_mesh_emu_state(list);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -815,7 +1000,13 @@ impl State {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
-        for stage in &p.stages {
+        for stage in p
+            .mesh_emu
+            .as_ref()
+            .map(|e| &e.cs_stage)
+            .into_iter()
+            .chain(&p.stages)
+        {
             let t = stage.translated();
             for u in &t.used {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
@@ -1000,6 +1191,19 @@ impl State {
             },
             None => None,
         };
+        if kind == MESH
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && p.mesh_emu.is_some()
+        {
+            return self.execute_indirect_mesh_emulated(
+                list,
+                p,
+                (stride, max),
+                (&args, arguments, len),
+                counter.as_ref().map(|(s, at)| (s, *at)),
+                &why,
+            );
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -1058,6 +1262,152 @@ impl State {
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        true
+    }
+
+    fn execute_indirect_mesh_emulated(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        (stride, max): (u32, u32),
+        (args, arguments, len): (&std::sync::Arc<crate::shadow::Shadow>, u64, u64),
+        counter: Option<(&std::sync::Arc<crate::shadow::Shadow>, u64)>,
+        why: &dyn Fn(&str),
+    ) -> bool {
+        if stride < 12 {
+            why("indirect mesh stride smaller than 12 bytes");
+            return false;
+        }
+        let Some(emu_pipe) = &p.mesh_emu else {
+            return false;
+        };
+        let Some(buffers) = crate::mesh_emu::buffers() else {
+            why("no mesh emulation buffers");
+            return false;
+        };
+        let group_cap = buffers.group_cap(emu_pipe.emu.group_bytes());
+        if group_cap == 0 {
+            why("mesh emulation buffer smaller than one group");
+            return false;
+        }
+        let (Some(dispatch_sig), Some(draw_sig)) =
+            (host_signature(2, 12), host_signature(0, 16))
+        else {
+            why("no host indirect command signature");
+            return false;
+        };
+        let count_gpu = counter.map(|(s, at)| s.gpu(at));
+        if count_gpu.is_some_and(|g| !g.is_multiple_of(4)) {
+            why("count not 4-byte aligned");
+            return false;
+        }
+        args.refresh(list, arguments, len);
+        if let Some((s, at)) = counter {
+            s.refresh(list, at, 4);
+        }
+        if !crate::indirect::clamp_only(list, args.gpu(arguments), (10, stride, max)) {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            return false;
+        }
+        buffers.prepare_indirect(
+            list,
+            args.gpu(arguments),
+            count_gpu,
+            stride,
+            max,
+            emu_pipe.emu.max_primitives,
+            group_cap,
+        );
+        list.keep(&buffers.indirect_args);
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+
+        let finish_indirect = |list: &HostList| {
+            let args_back = transition(
+                &buffers.indirect_args,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            );
+            // SAFETY: open list; restoring emulation buffers to UNORDERED_ACCESS.
+            unsafe {
+                if max > 1 {
+                    let map_back = transition(
+                        &buffers.slot_map,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    );
+                    list.list.ResourceBarrier(&[args_back, map_back]);
+                } else {
+                    list.list.ResourceBarrier(&[args_back]);
+                }
+            }
+        };
+
+        let (base_group, slot_map_gpu) = if max > 1 {
+            (
+                victory_shader::emit::INDIRECT_SLOT_MAP_FLAG,
+                buffers.slot_map_gpu,
+            )
+        } else {
+            (0, buffers.dummy_srv_gpu)
+        };
+        if !self.bind_emulated_cs(list, p, buffers, base_group, slot_map_gpu) {
+            finish_indirect(list);
+            self.restore_mesh_emu_state(list);
+            why("prepare emulated mesh CS failed");
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("indirect mesh-emu max {max} at {arguments:#x}"), false));
+        // SAFETY: open list with emulated CS PSO, `indirect_args` in INDIRECT_ARGUMENT, and `output` in UAV.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &dispatch_sig,
+                1,
+                &buffers.indirect_args,
+                0,
+                None,
+                0,
+            );
+            list.list.ResourceBarrier(&[transition(
+                &buffers.output,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            )]);
+        }
+        if !self.bind_emulated_gfx(list, p, buffers) {
+            // SAFETY: restore `output` back to UNORDERED_ACCESS before returning early.
+            unsafe {
+                list.list.ResourceBarrier(&[transition(
+                    &buffers.output,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+            finish_indirect(list);
+            self.restore_mesh_emu_state(list);
+            why("prepare emulated mesh graphics failed");
+            return false;
+        }
+        // SAFETY: open list with unpack VS/PS PSO, TRIANGLELIST topology, `indirect_args` at offset 16, and `output` in SRV.
+        unsafe {
+            list.list.ExecuteIndirect(
+                &draw_sig,
+                1,
+                &buffers.indirect_args,
+                16,
+                None,
+                0,
+            );
+            list.list.ResourceBarrier(&[transition(
+                &buffers.output,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+        }
+        finish_indirect(list);
+        self.restore_mesh_emu_state(list);
+        DRAWN.fetch_add(1, Ordering::Relaxed);
         true
     }
 }

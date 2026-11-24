@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        emulate_mesh: false,
     })
     .expect("lower");
 
@@ -148,6 +149,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        mesh_emu: None,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

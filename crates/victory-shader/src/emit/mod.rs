@@ -82,6 +82,7 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod mesh_emu;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -96,8 +97,9 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use mesh_emu::{INDIRECT_SLOT_MAP_FLAG, MeshEmu, MeshMode, MeshOutput, unpack_vertex_shader};
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{MESH_EMU_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -156,6 +158,9 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Populated when a mesh program (`HwStage::Ms`) was translated in
+    /// [`MeshMode::Emulate`] mode as a `cs_6_6` compute shader.
+    pub mesh_emu: Option<MeshEmu>,
 }
 
 impl HostShader {
@@ -186,8 +191,14 @@ pub struct UserData {
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// shader container with native mesh output.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with(container, MeshMode::Native)
+}
+
+/// Translates the vertex, pixel, compute or mesh program of a console
+/// shader container using `mesh` mode for mesh programs (`HwStage::Ms`).
+pub fn translate_with(container: &[u8], mesh: MeshMode) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -211,10 +222,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, mesh)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, with native mesh output.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -222,6 +233,20 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, MeshMode::Native)
+}
+
+/// Emits a program whose earlier stages already ran, using `mesh` mode for
+/// mesh programs (`HwStage::Ms`).
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    mesh: MeshMode,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -288,6 +313,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        emulate_mesh: native.stage == HwStage::Ms && mesh == MeshMode::Emulate,
     })?;
     Ok(HostShader {
         stage: native.stage,
@@ -308,6 +334,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        mesh_emu: l.mesh_emu,
     })
 }
 
@@ -565,6 +592,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            mesh_emu: None,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -575,6 +603,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                mesh_emu: None,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

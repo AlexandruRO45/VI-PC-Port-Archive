@@ -150,6 +150,20 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    mesh: emit::MeshMode,
+}
+
+fn mesh_mode(host: Option<&Host>) -> emit::MeshMode {
+    match std::env::var("VICTORY_MESH_EMULATION")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => emit::MeshMode::Emulate,
+        Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => emit::MeshMode::Native,
+        _ if host.is_some_and(|h| !h.mesh_shaders()) => emit::MeshMode::Emulate,
+        _ => emit::MeshMode::Native,
+    }
 }
 
 pub fn run(
@@ -169,15 +183,19 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    let probe_host = if pipelines || !pairs.is_empty() {
+        Some(Host::new(false).map_err(anyhow::Error::msg)?)
+    } else {
+        None
+    };
+    let mesh = mesh_mode(probe_host.as_ref());
+    drop(probe_host);
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -211,6 +229,7 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            mesh,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -277,11 +296,15 @@ pub fn run(
         for (v, p) in &pairs {
             let made = match (find(v), find(p)) {
                 (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
-                    host.mesh_pipeline(vs, ps)
+                    if vs.mesh_emu.is_some() {
+                        host.emulated_mesh_pipelines(vs, ps).map(drop)
+                    } else {
+                        host.mesh_pipeline(vs, ps).map(drop)
+                    }
                 } else {
-                    host.pipeline(vs, ps)
+                    host.pipeline(vs, ps).map(drop)
                 }
-                .map(|_| "pipeline created".to_owned())
+                .map(|()| "pipeline created".to_owned())
                 .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
@@ -390,7 +413,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit_with(&container, &p, &program, &s, &i, &r, checks.mesh) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -441,6 +464,9 @@ fn check(
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
+            HwStage::Ms if shader.mesh_emu.is_some() => {
+                h.emulated_mesh_pipelines(&shader, stub_ps).map(drop)
+            }
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
@@ -457,7 +483,14 @@ fn check(
     let Some(v) = checks.validator.as_mut() else {
         return;
     };
-    match v.validate(&mut shader.dxil) {
+    let res = v.validate(&mut shader.dxil).and_then(|()| {
+        if let Some(emu) = &shader.mesh_emu {
+            let mut unpack = emit::unpack_vertex_shader(emu, None).map_err(|e| e.to_string())?;
+            v.validate(&mut unpack)?;
+        }
+        Ok(())
+    });
+    match res {
         Ok(()) => {
             *counter(t, shader.stage, 2) += 1;
             if t.list {

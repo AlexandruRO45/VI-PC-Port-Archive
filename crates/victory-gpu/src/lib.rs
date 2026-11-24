@@ -32,6 +32,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 pub mod list;
+#[cfg(windows)]
+mod mesh_emu;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

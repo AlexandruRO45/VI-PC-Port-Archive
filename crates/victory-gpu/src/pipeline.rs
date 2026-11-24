@@ -107,7 +107,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, self.stage);
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -130,9 +130,17 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], stage: &str) -> Result<Translated, String> {
+    use victory_shader::emit::MeshMode;
     use victory_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
+    let mesh = if stage == "mesh"
+        && crate::host::host().is_some_and(crate::host::Host::emulate_mesh_shaders)
+    {
+        MeshMode::Emulate
+    } else {
+        MeshMode::Native
+    };
+    let host = crate::shader_cache::host_shader(container, mesh)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
