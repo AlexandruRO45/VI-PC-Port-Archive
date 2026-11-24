@@ -644,7 +644,12 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
             pack2: e[7] & 0x10 != 0,
             row2: e[5],
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Raising resolves `v_interp` of attribute n to the first input naming
+    // n, so a second input with the same attribute would be dropped.
+    if !distinct(inputs.iter().map(|i| i.attr)) {
+        return Err(Malformed("pixel inputs share an attribute"));
+    }
     let size = u32_at(data, PS_PATCH_SIZE)? as usize;
     if size > PATCH_SLOT_DWORDS {
         return Err(Malformed("implausible export patch size"));
@@ -709,8 +714,22 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             fp16: e[5] & 1 != 0,
             pack2: e[5] & 2 != 0,
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Raising resolves `exp param<n>` to the first output whose parameter
+    // (bit 7, a mesh program's per-primitive flag, aside) is n, so a second
+    // output with the same parameter would be dropped.
+    if !distinct(outputs.iter().map(|o| o.param & 0x7F)) {
+        return Err(Malformed("vertex outputs share a parameter"));
+    }
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+/// Whether no byte appears twice.
+fn distinct(bytes: impl IntoIterator<Item = u8>) -> bool {
+    let mut seen = [false; 256];
+    bytes
+        .into_iter()
+        .all(|b| !std::mem::replace(&mut seen[usize::from(b)], true))
 }
 
 /// The VGPRs a vertex program receives its vertex, primitive and instance
@@ -1554,5 +1573,49 @@ mod tests {
         for bad in [MAX_LDS_BYTES + 1, u32::MAX] {
             assert_eq!(refused_blob(&lds(bad)), "implausible LDS size", "{bad}");
         }
+    }
+
+    #[test]
+    fn refuses_outputs_sharing_a_parameter_and_inputs_sharing_an_attribute() {
+        // Two outputs: param0 and `param`. Bit 7 (per-primitive) does not
+        // make a separate index: `exp param<n>` matches n either way.
+        for stage in [HwStage::Vs, HwStage::Ms] {
+            let base = fssm(&[(stage, &VS_CODE)]);
+            let e = stage_data_at(&base, stage);
+            let outputs = |param: u8| {
+                let mut blob = base.clone();
+                blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+                blob[e + VS_OUTPUTS..][..12]
+                    .copy_from_slice(&[6, 0, 0, 0, 0, 0, 6, 1, param, 1, 0, 0]);
+                native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+            };
+            assert!(outputs(1).is_ok(), "{stage:?}");
+            assert!(outputs(31).is_ok(), "{stage:?}");
+            for param in [0, 0x80] {
+                assert!(
+                    matches!(
+                        outputs(param),
+                        Err(Malformed("vertex outputs share a parameter"))
+                    ),
+                    "{stage:?} param {param:#x}"
+                );
+            }
+        }
+
+        // Two inputs: attr0 and `attr`.
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let inputs = |attr: u8| {
+            let mut blob = ps.clone();
+            blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            blob[e + PS_INPUTS..][..16]
+                .copy_from_slice(&[6, 0, 0xf, 0, 0, 0, 0, 0, 6, 1, 0xf, attr, 0, 0, 1, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        assert!(inputs(1).is_ok());
+        assert!(matches!(
+            inputs(0),
+            Err(Malformed("pixel inputs share an attribute"))
+        ));
     }
 }
