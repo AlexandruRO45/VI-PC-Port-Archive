@@ -39,6 +39,6 @@ jobs:
           cargo test --workspace --locked 2>&1 | tee /tmp/test.log
           rc=$?
           if [ "$rc" -ne 0 ]; then
-            tail -n 35 /tmp/test.log | sed 's/^/::error::/'
+            awk '/^failures:/{flag=1} flag && NF{print "::error::" $0}' /tmp/test.log | head -n 10
             exit "$rc"
           fi
