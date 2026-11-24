@@ -174,6 +174,13 @@ pub(crate) fn remove_table(id: usize) -> bool {
     tables.len() != before
 }
 
+/// Every registered image's `[start, end)`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn image_ranges() -> Vec<(usize, usize)> {
+    let tables = TABLES.read().unwrap_or_else(|e| e.into_inner());
+    tables.iter().filter(|t| t.image.is_some()).map(|t| (t.start, t.end)).collect()
+}
+
 /// The registered image `pc` is in: its base, and its name.
 pub(crate) fn image_of(pc: usize) -> Option<(usize, String)> {
     let tables = TABLES.try_read().ok()?;

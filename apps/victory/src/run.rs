@@ -130,6 +130,8 @@ pub fn run(
     victory_hle::modules::lifecycle::end_on_signals();
     #[cfg(all(windows, feature = "diagnostics"))]
     diagnostics(&image, &cfg);
+    #[cfg(all(target_os = "linux", feature = "diagnostics"))]
+    victory_loader::dump_stacks_on_schedule();
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),
