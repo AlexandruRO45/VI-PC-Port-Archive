@@ -3112,6 +3112,30 @@ impl<'a> Lower<'a> {
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
+    /// The dwords of a constant buffer's descriptor that a program also
+    /// reads as numbers. HLSL can read none of them (no `GetDimensions` for
+    /// a constant buffer), so all four are hidden: refused when read, and at
+    /// a join with data the undefined path (see `fill_phis`). Dwords of the
+    /// load past this descriptor have no host value either.
+    fn cbv_words(&mut self, inst: &Inst, code: u8, count: u32, first: u8) -> Result<(), Why> {
+        const CBV: Why = "a constant buffer's descriptor read as data";
+        for k in 0..count {
+            let Some(v) = inst.write(Reg::S(code + k as u8)) else {
+                continue;
+            };
+            if k.wrapping_sub(u32::from(first)) < 4 {
+                self.vals.insert(v, Val::Missing(CBV));
+                self.stale.insert(v);
+            } else {
+                self.vals.insert(
+                    v,
+                    Val::Missing("a descriptor's address or format read as data"),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
@@ -3176,13 +3200,13 @@ impl<'a> Lower<'a> {
                             (11 | u, 0)
                         };
                         if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                            return Err("a constant buffer's descriptor read as data");
+                            return self.cbv_words(inst, code, count, first);
                         }
                         (props, None)
                     }
                     Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
                         if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                            return Err("a constant buffer's descriptor read as data");
+                            return self.cbv_words(inst, code, count, first);
                         }
                         ((11 | u, 0), None)
                     }
@@ -7906,6 +7930,15 @@ mod tests {
     /// before `tail` reads it, `join` adds a branch on s1 that overwrites s9
     /// with data on one path only.
     fn hidden_dword1(prelude: &[u32], join: bool) -> Result<Lowered, crate::ShaderError> {
+        hidden_dword1_of(ResourceType::Srv, prelude, join)
+    }
+
+    /// `hidden_dword1` with the table's range of `kind`.
+    fn hidden_dword1_of(
+        kind: ResourceType,
+        prelude: &[u32],
+        join: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
         let mut words = vec![
             0xBE84_0300, // s_mov_b32 s4, s0
             0xBE85_0380, // s_mov_b32 s5, 0
@@ -7930,7 +7963,7 @@ mod tests {
             S_ENDPGM,
         ]);
         let used = vec![UsedResource {
-            kind: ResourceType::Srv,
+            kind,
             root: RootType::Table,
             table_offset_dwords: 0,
             lower_bound: 0,
@@ -7986,6 +8019,22 @@ mod tests {
     fn a_spilled_hidden_word_comes_back_hidden() {
         refused_as_hidden(hidden_dword1(&SPILL, false));
         hidden_dword1(&SPILL, true).unwrap();
+    }
+
+    #[test]
+    fn a_constant_buffers_descriptor_words_are_hidden() {
+        // HLSL reads no word of a constant buffer's descriptor: read
+        // directly, dword 1 is refused under its own reason ...
+        let err = hidden_dword1_of(ResourceType::Cbv, &[], false)
+            .err()
+            .expect("a constant buffer's descriptor word read as data");
+        assert!(
+            err.to_string()
+                .contains("a constant buffer's descriptor read as data"),
+            "unexpected error: {err}"
+        );
+        // ... and joined with data it is the undefined path.
+        hidden_dword1_of(ResourceType::Cbv, &[], true).unwrap();
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
