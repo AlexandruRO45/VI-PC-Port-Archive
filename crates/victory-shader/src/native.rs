@@ -3915,4 +3915,160 @@ mod tests {
         .unwrap()[0];
         assert_eq!(vs.patched_code(), VS_CODE);
     }
+
+    /// The stages a blob's programs are read as, in order.
+    fn stages_of(blob: &[u8]) -> Vec<HwStage> {
+        native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]))
+            .unwrap()
+            .iter()
+            .map(|p| p.stage)
+            .collect()
+    }
+
+    #[test]
+    fn programs_come_in_slot_order_whatever_the_record_order() {
+        // Records laid out pixel before vertex and compute before mesh are
+        // still read in slot order: LS HS ES GS VS PS, then mesh, compute.
+        let blob = fssm(&[
+            (HwStage::Cs, &VS_CODE),
+            (HwStage::Ps, &PS_CODE),
+            (HwStage::Ms, &VS_CODE),
+            (HwStage::Vs, &VS_CODE),
+            (HwStage::Ls, &VS_CODE),
+        ]);
+        assert_eq!(
+            stages_of(&blob),
+            [
+                HwStage::Ls,
+                HwStage::Vs,
+                HwStage::Ps,
+                HwStage::Ms,
+                HwStage::Cs
+            ]
+        );
+        // Every slot filled, in reverse.
+        let all: Vec<(HwStage, &[u8])> = SLOTS
+            .iter()
+            .rev()
+            .map(|&(stage, _)| (stage, &VS_CODE[..]))
+            .collect();
+        let want: Vec<HwStage> = SLOTS.iter().map(|s| s.0).collect();
+        assert_eq!(stages_of(&fssm(&all)), want);
+        // A blob with every slot absent has no programs.
+        assert!(stages_of(&fssm(&[])).is_empty());
+    }
+
+    #[test]
+    fn payload_words_between_the_slots_are_never_read() {
+        // 0x38, 0x40, 0x50 and 0x58 sit among the slots but name no stage:
+        // whatever they hold, the programs read are the same.
+        let good = fssm(&[(HwStage::Vs, &VS_CODE), (HwStage::Cs, &VS_CODE)]);
+        let want = native_programs(&part(&[(KIND_NATIVE, &xbch(&good))])).unwrap();
+        for fill in [0x00, 0xFF, 0xDE] {
+            let mut blob = good.clone();
+            for at in [0x38, 0x40, 0x50, 0x58] {
+                blob[FSSM_HEADER + at..][..8].fill(fill);
+            }
+            assert_eq!(
+                native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap(),
+                want,
+                "{fill:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_exact_absent_marker_skips_a_slot() {
+        // Half the marker, or the marker with one bit off, is an offset like
+        // any other: far past the payload.
+        for near in [
+            0xDEAD_BEEFu64,
+            0xDEAD_BEEF_0000_0000,
+            ABSENT ^ 1,
+            ABSENT ^ 1 << 63,
+        ] {
+            let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+            blob[FSSM_HEADER + slot(HwStage::Ps)..][..8].copy_from_slice(&near.to_le_bytes());
+            assert_eq!(
+                refused_blob(&xbch(&blob)),
+                "FSSM record out of bounds",
+                "{near:#x}"
+            );
+        }
+        // A slot of 0 names the slot table itself as a record: its code
+        // offset is the slot count and its code size the LS slot, absent and
+        // so far past the payload.
+        let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        blob[FSSM_HEADER + slot(HwStage::Ps)..][..8].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(refused_blob(&xbch(&blob)), "native code out of bounds");
+    }
+
+    #[test]
+    fn two_slots_may_name_one_record() {
+        // Nothing ties a record to one slot: a pixel slot naming the vertex
+        // record reads it again, its stage data now as a pixel program's
+        // (empty here: no inputs, every patch absent).
+        let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let vs = u64_at(&blob, FSSM_HEADER + slot(HwStage::Vs)).unwrap();
+        blob[FSSM_HEADER + slot(HwStage::Ps)..][..8].copy_from_slice(&vs.to_le_bytes());
+        let p = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!((p[0].stage, p[1].stage), (HwStage::Vs, HwStage::Ps));
+        assert_eq!(p[0].code, p[1].code);
+        // The wave size is the record's, not the stage's.
+        assert_eq!((p[0].wave64, p[1].wave64), (true, true));
+        assert_eq!(
+            p[1].io,
+            StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn code_is_read_at_its_payload_relative_offset() {
+        let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
+        let record = stage_data_at(&good, HwStage::Vs) - RECORD_SIZE as usize;
+        let code_at = u64_at(&good, record).unwrap();
+        let payload = (good.len() - FSSM_HEADER) as u64;
+        // The code ends the payload.
+        assert_eq!(code_at + VS_CODE.len() as u64, payload);
+        let read = |offset: u64, size: u64| {
+            let mut blob = good.clone();
+            blob[record..][..8].copy_from_slice(&offset.to_le_bytes());
+            blob[record + 8..][..8].copy_from_slice(&size.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Offsets count from the payload, not the FSSM header: the slot
+        // count is the first word read from offset 0.
+        assert_eq!(
+            read(0, 8).unwrap()[0].code,
+            GRAPHICS_SLOT_COUNT.to_le_bytes()
+        );
+        // A window inside the code reads just those bytes.
+        assert_eq!(read(code_at + 2, 3).unwrap()[0].code, VS_CODE[2..5]);
+        // Empty code is read anywhere up to the payload's end, not past it.
+        assert!(read(payload, 0).unwrap()[0].code.is_empty());
+        assert_eq!(
+            refused_blob(&{
+                let mut blob = good.clone();
+                blob[record..][..8].copy_from_slice(&(payload + 1).to_le_bytes());
+                blob[record + 8..][..8].fill(0);
+                xbch(&blob)
+            }),
+            "native code out of bounds"
+        );
+        // Offset and size at their largest do not wrap round into the payload.
+        assert!(matches!(
+            read(u64::MAX, 2),
+            Err(Malformed("native code out of bounds"))
+        ));
+        assert!(matches!(
+            read(2, u64::MAX),
+            Err(Malformed("native code out of bounds"))
+        ));
+    }
 }
