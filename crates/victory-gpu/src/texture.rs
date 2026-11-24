@@ -193,16 +193,8 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
-                return 0;
-            }
-            last.asked = now;
-            // Read through the copy, which stands unmapped pages: memory of
-            // big pools is too slow to ask page by page.
-            with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-            return size;
+            return last
+                .refresh_watched(now, &written, self.memory, size, |tiled| self.detile(tiled));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -259,18 +251,38 @@ impl Staging {
     }
 }
 
-/// Reads a texture for the duration of its detile. Keep the initialized
-/// length so alternating large and small textures do not re-zero the tail.
-fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
-    SCRATCH.with_borrow_mut(|read| {
-        if size > read.len() {
-            read.reserve_exact(size - read.len());
-            read.resize(size, 0);
+impl Last {
+    /// Refresh the watched texture if a page changed. The copy tolerates unmapped pages.
+    /// Keep the previous write-watch number if the scratch buffer cannot grow.
+    fn refresh_watched(
+        &mut self,
+        now: u64,
+        written: &[(usize, u64)],
+        memory: *const u8,
+        size: usize,
+        detile: impl FnOnce(&[u8]),
+    ) -> usize {
+        if self.asked != 0 && written.iter().all(|&(_, write)| write <= self.asked) {
+            return 0;
         }
-        let tiled = &mut read[..size];
-        crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
-        detile(tiled);
-    });
+        SCRATCH.with_borrow_mut(|read| {
+            // Keep the initialized tail for the next large texture.
+            if size > read.len() {
+                if let Err(error) = read.try_reserve_exact(size - read.len()) {
+                    once!(size, %error, "could not grow the watched texture read buffer");
+                    return 0;
+                }
+                read.resize(size, 0);
+            }
+            let tiled = &mut read[..size];
+            crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
+            detile(tiled);
+            self.asked = now;
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+            size
+        })
+    }
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -374,16 +386,57 @@ mod tests {
         let small = [0x21; 128];
         let next = [0x43; 8192];
         let mut allocation = None;
-        for source in [&large[..], &small[..], &next[..]] {
-            with_tiled_copy(source.as_ptr(), source.len(), |tiled| {
-                assert_eq!(tiled, source);
-                if let Some(first) = allocation {
-                    assert_eq!(tiled.as_ptr(), first);
-                } else {
-                    allocation = Some(tiled.as_ptr());
-                }
-            });
+        let mut last = Last::default();
+        for (now, source) in [(1, &large[..]), (2, &small[..]), (3, &next[..])] {
+            let read =
+                last.refresh_watched(now, &[(0, now)], source.as_ptr(), source.len(), |tiled| {
+                    assert_eq!(tiled, source);
+                    if let Some(first) = allocation {
+                        assert_eq!(tiled.as_ptr(), first);
+                    } else {
+                        allocation = Some(tiled.as_ptr());
+                    }
+                });
+            assert_eq!(read, source.len());
         }
+    }
+
+    #[test]
+    fn failed_scratch_growth_leaves_the_watched_texture_due() {
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() == 2 {
+            return; // this mode skips all copies
+        }
+        let mut last = Last::default();
+        let mut staged = [0; 8];
+        // Exercise both a first refresh and a refresh of a previously staged texture.
+        for write in [1, 3] {
+            let pixels = [write as u8; 8];
+            let written = [(0, write)];
+            // Capacity overflow fails deterministically before any memory is read.
+            let skipped =
+                last.refresh_watched(write, &written, pixels.as_ptr(), usize::MAX, |_| {
+                    panic!("detiled after a failed reservation")
+                });
+            assert_eq!(skipped, 0);
+            assert_eq!(last.asked, write - 1);
+            let read = last.refresh_watched(
+                write + 1,
+                &written,
+                pixels.as_ptr(),
+                pixels.len(),
+                |tiled| {
+                    staged.copy_from_slice(tiled);
+                },
+            );
+            assert_eq!(read, pixels.len());
+            assert_eq!(staged, pixels);
+            assert_eq!(last.asked, write + 1);
+        }
+        let skipped = last.refresh_watched(5, &[(0, 3)], staged.as_ptr(), staged.len(), |_| {
+            panic!("detiled a clean texture")
+        });
+        assert_eq!(skipped, 0);
     }
 
     #[test]
@@ -399,9 +452,11 @@ mod tests {
         }
         const PAGE: usize = 4096;
         let previous = [0x65; 2 * PAGE];
-        with_tiled_copy(previous.as_ptr(), previous.len(), |tiled| {
+        let mut last = Last::default();
+        let read = last.refresh_watched(1, &[], previous.as_ptr(), previous.len(), |tiled| {
             assert_eq!(tiled, previous);
         });
+        assert_eq!(read, previous.len());
         // SAFETY: reserve two pages at an address chosen by Windows.
         let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) };
         assert!(!base.is_null());
@@ -410,10 +465,11 @@ mod tests {
         assert_eq!(mapped, base);
         // SAFETY: the first page is writable.
         unsafe { base.cast::<u8>().write_bytes(0x32, PAGE) };
-        with_tiled_copy(base.cast(), 2 * PAGE, |tiled| {
+        let read = last.refresh_watched(2, &[(0, 2)], base.cast(), 2 * PAGE, |tiled| {
             assert!(tiled[..PAGE].iter().all(|&b| b == 0x32));
             assert!(tiled[PAGE..].iter().all(|&b| b == 0));
         });
+        assert_eq!(read, 2 * PAGE);
         // SAFETY: this reservation is no longer used.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
