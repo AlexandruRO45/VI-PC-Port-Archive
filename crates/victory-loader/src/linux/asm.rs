@@ -38,6 +38,10 @@ use super::context::{Context, RuntimeFunction};
 // probe_read(address rdi, out rsi) -> eax: 1 and *out = [address], or 0 when the load faulted
 // (the signal handler moves a fault at victory_seh_probe_load to victory_seh_probe_fail).
 //
+// probe_write(address rdi) -> eax: 1 when the 8 bytes at address can be written, or 0 when the
+// store faulted (at victory_seh_probe_store, recovered the same way). An atomic or of zero: the
+// bytes are left as they are, whatever other threads write there meanwhile.
+//
 // The two function entries (frame call, boundary) and their UNWIND_INFO are RVAs from
 // victory_seh_asm_base, so they are all in this section.
 core::arch::global_asm!(
@@ -241,6 +245,16 @@ victory_seh_probe_fail:
     xorl %eax, %eax
     ret
 
+    .globl victory_seh_probe_write
+    .hidden victory_seh_probe_write
+victory_seh_probe_write:
+    .globl victory_seh_probe_store
+    .hidden victory_seh_probe_store
+victory_seh_probe_store:
+    lock orq $0, (%rdi)
+    movl $1, %eax
+    ret
+
     .p2align 2
 victory_seh_frame_info:
     .byte 0x19, 0, 39, 0
@@ -323,6 +337,8 @@ unsafe extern "C" {
     fn victory_seh_probe_read(address: u64, out: *mut u64) -> u32;
     static victory_seh_probe_load: u8;
     static victory_seh_probe_fail: u8;
+    fn victory_seh_probe_write(address: u64) -> u32;
+    static victory_seh_probe_store: u8;
 }
 
 unsafe extern "win64" {
@@ -395,8 +411,20 @@ pub(crate) fn read64(address: u64) -> Option<u64> {
     (unsafe { victory_seh_probe_read(address, &mut value) } != 0).then_some(value)
 }
 
-/// Where a fault at `rip` continues if it is the probe's load.
+/// Whether the 8 bytes at `address` (8-aligned) can be written now; they
+/// are left as they are. False where a write would fault (with the signal
+/// handler installed).
+pub(crate) fn writable64(address: u64) -> bool {
+    // SAFETY: the probe either stores nothing new or reports the fault (see the asm).
+    unsafe { victory_seh_probe_write(address) != 0 }
+}
+
+/// Where a fault at `rip` continues if it is a probe's load or store.
 pub(crate) fn probe_recovery(rip: u64) -> Option<u64> {
-    let (load, fail) = (&raw const victory_seh_probe_load as u64, &raw const victory_seh_probe_fail as u64);
-    (rip == load).then_some(fail)
+    let (load, store, fail) = (
+        &raw const victory_seh_probe_load as u64,
+        &raw const victory_seh_probe_store as u64,
+        &raw const victory_seh_probe_fail as u64,
+    );
+    (rip == load || rip == store).then_some(fail)
 }

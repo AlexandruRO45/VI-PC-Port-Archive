@@ -426,6 +426,10 @@ impl File {
     /// A regular file is read until full or at its end; a pipe or terminal
     /// hands over what it has.
     fn transfer(&self, write: bool, buf: &mut [u8], offset: Option<u64>) -> std::io::Result<usize> {
+        if !write {
+            // The kernel writes the buffer, and fails on blocks the GPU side guards.
+            victory_gpu::kernel_will_write(buf.as_ptr() as usize, buf.len());
+        }
         let mut file = &*self.file;
         let mut done = 0;
         while done < buf.len() {

@@ -96,13 +96,20 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-/// The clamp's DXIL, with its root signature.
+/// The clamp's DXIL, with its root signature, compiled once. DXC's LLVM
+/// replaces our fault handlers at its first compile (it registers its own
+/// once per process), so they are taken back right after; the device's
+/// creation compiles it, before any copy guards title memory.
 #[cfg(not(windows))]
-fn compiled() -> windows::core::Result<Vec<u8>> {
-    victory_shader::hostlib::compile_hlsl(SOURCE, "main", "cs_6_0").map_err(|e| {
-        tracing::warn!("argument clamp: {e}");
-        windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
+pub(crate) fn compiled() -> windows::core::Result<Vec<u8>> {
+    static DXIL: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    DXIL.get_or_init(|| {
+        let dxil = victory_shader::hostlib::compile_hlsl(SOURCE, "main", "cs_6_0");
+        victory_loader::linux::signals::reclaim();
+        dxil.inspect_err(|e| tracing::warn!("argument clamp: {e}")).ok()
     })
+    .clone()
+    .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
 }
 
 /// The clamp's DXBC, with its root signature.
@@ -238,6 +245,21 @@ mod tests {
         if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() {
             return; // no HLSL compiler named
         }
+        #[cfg(not(windows))]
+        let handler = || {
+            victory_loader::linux::signals::install();
+            // SAFETY: a query into a zeroed action of ours.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGSEGV, std::ptr::null(), &mut action);
+                action.sa_sigaction
+            }
+        };
+        #[cfg(not(windows))]
+        let ours = handler();
         assert!(super::clamp().is_some());
+        // DXC's LLVM took the fault handler at its first compile; ours is back.
+        #[cfg(not(windows))]
+        assert_eq!(handler(), ours);
     }
 }

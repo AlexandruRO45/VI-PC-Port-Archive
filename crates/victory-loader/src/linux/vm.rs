@@ -37,6 +37,12 @@
 //! placeholder the title reserves itself takes physical pages too: the
 //! mapped range becomes a reservation of its own, as a view would.
 //!
+//! Write watching for the GPU side ([`guard`], `watch`): blocks it copied
+//! are read-only underneath the table, which goes on answering the
+//! protection the title set. Every change of protection or mapping opens
+//! the guarded blocks it touches first, and the table knows which blocks
+//! show the same section pages, so a write through any of them is seen.
+//!
 //! Errors are Windows codes; the kernel32 layer sets the last error.
 //! Thread-safe: one leaf lock, never held across a read of `/proc`.
 
@@ -199,13 +205,19 @@ struct State {
     pool: Option<Arc<Section>>,
     pool_pages: u64,
     pool_free: Vec<u64>,
+    /// Section blocks (section, offset / 64 KiB) → the address blocks that
+    /// show them, for write watching.
+    shown: Shown,
 }
+
+type Shown = BTreeMap<(usize, u64), Vec<usize>>;
 
 static STATE: Mutex<State> = Mutex::new(State {
     runs: BTreeMap::new(),
     pool: None,
     pool_pages: 0,
     pool_free: Vec::new(),
+    shown: BTreeMap::new(),
 });
 
 fn state() -> MutexGuard<'static, State> {
@@ -615,6 +627,9 @@ pub fn alloc(
             start = whole(runs, base, end);
         }
         let ok = start.is_some_and(|s| runs[&s].kind != Kind::Placeholder);
+        if ok {
+            super::watch::open(base, end - base);
+        }
         let result = if !ok {
             Err(ERROR_INVALID_ADDRESS)
         } else if done {
@@ -674,7 +689,7 @@ pub fn free(address: usize, size: usize, kind: u32) -> Result<(), u32> {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let mut state = state();
-    let runs = &mut state.runs;
+    let State { runs, shown, .. } = &mut *state;
     let start = find(runs, a).ok_or(ERROR_INVALID_ADDRESS)?;
     let first = runs[&start].clone();
     let (base, limit) = (first.base, extent(runs, start));
@@ -696,6 +711,7 @@ pub fn free(address: usize, size: usize, kind: u32) -> Result<(), u32> {
         if (size == 0 && a != base) || hi > limit || first.kind == Kind::Placeholder {
             return Err(ERROR_INVALID_ADDRESS);
         }
+        unwatch(runs, shown, lo, hi);
         back_to_reserved(lo, hi)?;
         each(runs, lo, hi, |_, r| reserved(r));
         return Ok(());
@@ -728,6 +744,7 @@ pub fn free(address: usize, size: usize, kind: u32) -> Result<(), u32> {
         if a != base || hi != limit {
             return Err(ERROR_INVALID_ADDRESS);
         }
+        unwatch(runs, shown, a, hi);
         back_to_reserved(a, hi)?;
         each(runs, a, hi, |_, r| {
             reserved(r);
@@ -742,6 +759,7 @@ pub fn free(address: usize, size: usize, kind: u32) -> Result<(), u32> {
     if a != base {
         return Err(ERROR_INVALID_ADDRESS);
     }
+    unwatch(runs, shown, base, limit);
     // At vm.max_map_count this can fail; then nothing was unmapped.
     // SAFETY: the whole allocation, which the table owns.
     if unsafe { libc::munmap(base as *mut _, limit - base) } != 0 {
@@ -770,6 +788,7 @@ pub fn protect(address: usize, size: usize, new: u32) -> Result<u32, u32> {
     if runs.range(start..hi).any(|(_, r)| !r.committed) {
         return Err(ERROR_INVALID_ADDRESS);
     }
+    super::watch::open(lo, hi - lo);
     mprotect(lo, hi, prot)?;
     let old = runs[&first].protect;
     each(runs, lo, hi, |_, r| r.protect = new);
@@ -1033,7 +1052,7 @@ pub fn map_view(
     }
     let end_len = up(len, PAGE);
     let mut state = state();
-    let runs = &mut state.runs;
+    let State { runs, shown, .. } = &mut *state;
     let base = if replace_placeholder {
         let start = whole(runs, address, address + end_len).ok_or(ERROR_INVALID_ADDRESS)?;
         if runs[&start].kind != Kind::Placeholder {
@@ -1091,6 +1110,7 @@ pub fn map_view(
     } else {
         runs.insert(base, new);
     }
+    show(runs, shown, base, base + end_len);
     Ok(base)
 }
 
@@ -1098,13 +1118,14 @@ pub fn map_view(
 /// `preserve_placeholder` its range becomes a placeholder again.
 pub fn unmap_view(base: usize, preserve_placeholder: bool) -> Result<(), u32> {
     let mut state = state();
-    let runs = &mut state.runs;
+    let State { runs, shown, .. } = &mut *state;
     let start = find(runs, base).ok_or(ERROR_INVALID_ADDRESS)?;
     let r = &runs[&start];
     if r.kind != Kind::Mapped || r.base != base {
         return Err(ERROR_INVALID_ADDRESS);
     }
     let limit = extent(runs, start);
+    unwatch(runs, shown, base, limit);
     if preserve_placeholder {
         back_to_reserved(base, limit)?;
         each(runs, base, limit, |_, r| {
@@ -1140,7 +1161,7 @@ pub fn alias(to: usize, from: usize, len: usize) -> Result<(), u32> {
         return Err(ERROR_INVALID_PARAMETER);
     }
     let mut state = state();
-    let runs = &mut state.runs;
+    let State { runs, shown, .. } = &mut *state;
     let target = whole(runs, to, to + len).ok_or(ERROR_INVALID_ADDRESS)?;
     if !matches!(runs[&target].kind, Kind::Private | Kind::Mapped) {
         return Err(ERROR_INVALID_ADDRESS);
@@ -1164,6 +1185,8 @@ pub fn alias(to: usize, from: usize, len: usize) -> Result<(), u32> {
         ));
         at = end;
     }
+    unwatch(runs, shown, to, to + len);
+    let mut result = Ok(());
     for (lo, hi, section, offset, protect) in pieces {
         let dst = to + (lo - from);
         let prot = native_protect(protect).unwrap_or(libc::PROT_NONE);
@@ -1179,7 +1202,8 @@ pub fn alias(to: usize, from: usize, len: usize) -> Result<(), u32> {
             )
         };
         if p == libc::MAP_FAILED {
-            return Err(ERROR_NOT_ENOUGH_MEMORY);
+            result = Err(ERROR_NOT_ENOUGH_MEMORY);
+            break;
         }
         each(runs, dst, dst + (hi - lo), |s, r| {
             r.committed = true;
@@ -1187,7 +1211,8 @@ pub fn alias(to: usize, from: usize, len: usize) -> Result<(), u32> {
             r.view = Some((section.clone(), offset + (s - dst) as u64));
         });
     }
-    Ok(())
+    show(runs, shown, to, to + len);
+    result
 }
 
 /// Hands out `pages.len()` physical page numbers (64 KiB each): recycled
@@ -1236,6 +1261,8 @@ pub fn phys_free(pages: &[u64]) {
                 PHYS_PAGE as libc::off_t,
             )
         };
+        // Views still showing it now read zero: written.
+        open_shown(&state.shown, &pool, page);
         state.pool_free.push(page);
     }
 }
@@ -1256,7 +1283,7 @@ pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
     let mut state = state();
     let pool_pages = state.pool_pages;
     let pool = state.pool.clone().ok_or(ERROR_INVALID_PARAMETER)?;
-    let runs = &mut state.runs;
+    let State { runs, shown, .. } = &mut *state;
     let end = va + n * PHYS_PAGE;
     let start = whole(runs, va, end).ok_or(ERROR_INVALID_ADDRESS)?;
     if !matches!(runs[&start].kind, Kind::Private | Kind::Placeholder) {
@@ -1281,6 +1308,7 @@ pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
             }
         });
     }
+    unwatch(runs, shown, va, end);
     let mut done = 0;
     while done < n {
         // One mapping per run of consecutive page numbers.
@@ -1310,11 +1338,183 @@ pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
         });
         done += k;
     }
+    show(runs, shown, va, end);
     if done == n {
         Ok(())
     } else {
         Err(ERROR_NOT_ENOUGH_MEMORY)
     }
+}
+
+/// Physical pages were written other than through the table's views (into
+/// the pool's file, or through a view of our own): the blocks showing them
+/// are open again, which counts them written.
+pub fn pool_written(pages: &[u64]) {
+    let state = state();
+    if let Some(pool) = &state.pool {
+        for &page in pages {
+            open_shown(&state.shown, pool, page);
+        }
+    }
+}
+
+fn open_shown(shown: &Shown, section: &Arc<Section>, block: u64) {
+    for &b in shown.get(&(Arc::as_ptr(section) as usize, block)).into_iter().flatten() {
+        super::watch::open(b * BLOCK, BLOCK);
+    }
+}
+
+const BLOCK: usize = super::watch::BLOCK;
+
+/// The section blocks block `block` shows, each once.
+fn showing(runs: &Runs, block: usize) -> Vec<(usize, u64)> {
+    let (lo, hi) = (block * BLOCK, (block + 1) * BLOCK);
+    let mut keys = Vec::new();
+    let from = find(runs, lo).unwrap_or(lo);
+    for (&s, r) in runs.range(from..hi) {
+        let Some((section, offset)) = &r.view else {
+            continue;
+        };
+        let (a, b) = (s.max(lo), r.end.min(hi));
+        let at = |x: usize| (offset + (x - s) as u64) / BLOCK as u64;
+        let id = Arc::as_ptr(section) as usize;
+        keys.extend((at(a)..=at(b - 1)).map(|k| (id, k)));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// The blocks of `[lo, hi)` where a run shows a section.
+fn view_blocks(runs: &Runs, lo: usize, hi: usize) -> Vec<usize> {
+    let from = find(runs, lo).unwrap_or(lo);
+    let mut blocks: Vec<usize> = runs
+        .range(from..hi)
+        .filter(|(_, r)| r.view.is_some())
+        .flat_map(|(&s, r)| s.max(lo) / BLOCK..r.end.min(hi).div_ceil(BLOCK))
+        .collect();
+    blocks.dedup();
+    blocks
+}
+
+/// After the mappings of `[lo, hi)` changed: notes which blocks there show
+/// which section pages.
+fn show(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
+    for block in view_blocks(runs, down(lo, BLOCK), up(hi, BLOCK)) {
+        for key in showing(runs, block) {
+            let blocks = shown.entry(key).or_default();
+            if !blocks.contains(&block) {
+                blocks.push(block);
+            }
+        }
+    }
+}
+
+/// Before the protection or mappings of `[lo, hi)` change: its guarded
+/// blocks are open, and what its blocks show is forgotten ([`show`] notes
+/// it again).
+fn unwatch(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
+    super::watch::open(lo, hi - lo);
+    for block in view_blocks(runs, down(lo, BLOCK), up(hi, BLOCK)) {
+        for key in showing(runs, block) {
+            if let Some(blocks) = shown.get_mut(&key) {
+                blocks.retain(|&b| b != block);
+                if blocks.is_empty() {
+                    shown.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// For the GPU side's copies (`victory_gpu`'s watch, see `watch`): the
+/// 64 KiB blocks of `[lo, hi)` written since this last guarded them, which
+/// are guarded again. A block is watched when one run of committed
+/// read-write memory holds it, and every block showing the same section
+/// pages is watched with it (guarded too: a write through any of them
+/// counts); a block that cannot be counts as written every time. `None`
+/// when the table has nothing in the range, or (`views` false) when part
+/// of it is a view.
+pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
+    use super::watch::{guarded, mark};
+    let state = state();
+    let (runs, shown) = (&state.runs, &state.shown);
+    // The run holding all of `block` when it is watchable, as (start, run).
+    let watchable = |block: usize| {
+        find(runs, block * BLOCK)
+            .map(|s| (s, &runs[&s]))
+            .filter(|(_, r)| r.committed && r.protect == PAGE_READWRITE && r.end >= (block + 1) * BLOCK)
+    };
+    // The section block a run shows all of at `block`, if it lines up.
+    let shows = |s: usize, r: &Run, block: usize| {
+        let (section, offset) = r.view.as_ref()?;
+        let at = offset + (block * BLOCK - s) as u64;
+        at.is_multiple_of(BLOCK as u64)
+            .then(|| (Arc::as_ptr(section) as usize, at / BLOCK as u64))
+    };
+    let (first, last) = (lo / BLOCK, hi.div_ceil(BLOCK));
+    let (mut written, mut protect, mut ours) = (Vec::new(), Vec::new(), false);
+    let mut next = first; // blocks below are decided
+    let from = find(runs, first * BLOCK).unwrap_or(first * BLOCK);
+    for (&s, r) in runs.range(from..last * BLOCK) {
+        ours = true;
+        if r.view.is_some() && !views {
+            return None;
+        }
+        let (a, b) = (s.div_ceil(BLOCK).clamp(first, last), (r.end / BLOCK).clamp(first, last));
+        // Below this run: outside the table, or in more than one run.
+        written.extend(next..a.max(next));
+        next = next.max(a);
+        if !(r.committed && r.protect == PAGE_READWRITE) {
+            continue;
+        }
+        for block in next..b {
+            let group = match r.view {
+                None => Some(std::slice::from_ref(&block)),
+                Some(_) => shows(s, r, block).and_then(|key| shown.get(&key)).filter(|g| {
+                    g.iter().all(|&o| watchable(o).is_some_and(|(s2, r2)| shows(s2, r2, o) == shows(s, r, block)))
+                }).map(Vec::as_slice),
+            };
+            let mut clean = group.is_some();
+            for &o in group.into_iter().flatten() {
+                if !guarded(o) {
+                    clean = false;
+                    protect.push(o);
+                }
+            }
+            if !clean {
+                written.push(block);
+            }
+        }
+        next = next.max(b);
+    }
+    if !ours {
+        return None;
+    }
+    written.extend(next..last);
+    protect.sort_unstable();
+    protect.dedup();
+    // Marked first: a write before the protection lands, and is copied.
+    let mut i = 0;
+    while i < protect.len() {
+        let mut j = i + 1;
+        while j < protect.len() && protect[j] == protect[j - 1] + 1 {
+            j += 1;
+        }
+        let blocks = &protect[i..j];
+        blocks.iter().for_each(|&b| mark(b));
+        let (from, to) = (blocks[0] * BLOCK, (blocks[j - i - 1] + 1) * BLOCK);
+        if mprotect(from, to, libc::PROT_READ).is_err() {
+            // At vm.max_map_count: block by block, the ones that fail unguarded.
+            for &b in blocks {
+                if mprotect(b * BLOCK, (b + 1) * BLOCK, libc::PROT_READ).is_err() {
+                    super::watch::forget(b);
+                }
+            }
+        }
+        i = j;
+    }
+    Some(written)
 }
 
 /// The physical pool's `memfd`, once a page was allocated.
@@ -1748,5 +1948,101 @@ mod tests {
         assert_ne!(q(image).kind, MEM_IMAGE);
         // SAFETY: the mapping made above, no longer in the table.
         unsafe { libc::munmap(image as *mut _, 3 * PAGE) };
+    }
+
+    /// Write watching: a block counts written until guarded, then is clean
+    /// until a write from our code, from title code or (opened first) from
+    /// the kernel; the title's own protection calls never see the guard.
+    #[test]
+    fn guarded_blocks_see_every_writer() {
+        use std::os::unix::fs::FileExt;
+        crate::linux::signals::install();
+        let base = alloc(0, 4 * BLOCK, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        let (first, end) = (base / BLOCK, base + 4 * BLOCK);
+        assert_eq!(guard(base, end, true), Some((first..first + 4).collect()));
+        assert_eq!(guard(base, end, true), Some(vec![]));
+        assert_eq!((q(base).protect, q(base).region_size), (PAGE_READWRITE, 4 * BLOCK));
+        // SAFETY: committed read-write (to the table); the handler takes the write.
+        unsafe { ((base + BLOCK + 8) as *mut u8).write(1) };
+        // Title-like code (not ours, where a write fault is a title exception):
+        // mov [rdi], sil; ret.
+        let code = alloc(0, PAGE, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE).unwrap();
+        // SAFETY: four bytes of fresh code memory, then a call of them as the function they are.
+        let store = unsafe {
+            std::ptr::copy_nonoverlapping([0x40u8, 0x88, 0x37, 0xC3].as_ptr(), code as *mut u8, 4);
+            std::mem::transmute::<usize, extern "sysv64" fn(*mut u8, u8)>(code)
+        };
+        store((base + 3 * BLOCK + 1) as *mut u8, 5);
+        assert_eq!(guard(base, end, true), Some(vec![first + 1, first + 3]));
+        // SAFETY: committed.
+        assert_eq!(unsafe { ((base + 3 * BLOCK + 1) as *const u8).read() }, 5);
+        // The kernel fails on a guarded block, unless it was opened first.
+        let file = tempfile::tempfile().unwrap();
+        file.write_all_at(b"disk", 0).unwrap();
+        // SAFETY: four committed bytes nothing else refers to.
+        let into = unsafe { std::slice::from_raw_parts_mut((base + 2 * BLOCK) as *mut u8, 4) };
+        assert_eq!(file.read_at(into, 0).map_err(|e| e.raw_os_error()), Err(Some(libc::EFAULT)));
+        super::super::watch::open(base + 2 * BLOCK, 4);
+        assert_eq!(file.read_at(into, 0).unwrap(), 4);
+        assert_eq!(into, b"disk");
+        assert_eq!(guard(base, end, true), Some(vec![first + 2]));
+        // VirtualProtect: read-only is not watched; read-write again counts written once.
+        assert_eq!(protect(base, PAGE, PAGE_READONLY), Ok(PAGE_READWRITE));
+        assert_eq!(guard(base, end, true), Some(vec![first]));
+        assert_eq!(protect(base, PAGE, PAGE_READWRITE), Ok(PAGE_READONLY));
+        assert_eq!(guard(base, end, true), Some(vec![first]));
+        assert_eq!(guard(base, end, true), Some(vec![]));
+        // A decommit and commit: new pages, written.
+        free(base + BLOCK, BLOCK, MEM_DECOMMIT).unwrap();
+        alloc(base + BLOCK, BLOCK, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        // SAFETY: committed again.
+        unsafe { ((base + BLOCK) as *mut u8).write(2) };
+        assert_eq!(guard(base, end, true), Some(vec![first + 1]));
+        // Not the table's memory.
+        let host = vec![0u8; 2 * BLOCK];
+        assert_eq!(guard(host.as_ptr() as usize, host.as_ptr() as usize + BLOCK, true), None);
+        free(base, 0, MEM_RELEASE).unwrap();
+        free(code, 0, MEM_RELEASE).unwrap();
+    }
+
+    /// A physical page shown at several addresses is guarded at all of
+    /// them: a write through any counts for each, and so do writes into the
+    /// pool other than through a view.
+    #[test]
+    fn writes_through_any_alias_count() {
+        crate::linux::signals::install();
+        let _pool = POOL_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let g = PHYS_PAGE;
+        let mut pages = [0u64; 2];
+        phys_alloc(&mut pages).unwrap();
+        let va = alloc(0, 4 * g, MEM_RESERVE, PAGE_READWRITE, PAGE).unwrap();
+        let (b, end) = (va / g, va + 2 * g);
+        // Page 0 at 0 and 2, page 1 at 1.
+        phys_map(va, &[pages[0], pages[1], pages[0]], PAGE_READWRITE).unwrap();
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![]));
+        // SAFETY: mapped read-write (to the table).
+        unsafe { ((va + 2 * g + 5) as *mut u8).write(9) };
+        assert_eq!(guard(va, end, true), Some(vec![b]));
+        // SAFETY: mapped.
+        assert_eq!(unsafe { ((va + 5) as *const u8).read() }, 9);
+        // A new alias of page 1 (the GPU's page-mapping copies) counts once,
+        // then writes through it count.
+        alias(va + 3 * g, va + g, g).unwrap();
+        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![]));
+        // SAFETY: mapped read-write.
+        unsafe { ((va + 3 * g) as *mut u8).write(1) };
+        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        // Written into the pool outside the views (DirectStorage).
+        pool_written(&[pages[0]]);
+        assert_eq!(guard(va, end, true), Some(vec![b]));
+        assert_eq!(guard(va, end, false), None, "views are left to the caller");
+        free(va, 0, MEM_RELEASE).unwrap();
+        let state = state();
+        let pool = Arc::as_ptr(state.pool.as_ref().unwrap()) as usize;
+        assert!(!state.shown.keys().any(|&(s, p)| s == pool && pages.contains(&p)));
+        drop(state);
+        phys_free(&pages);
     }
 }

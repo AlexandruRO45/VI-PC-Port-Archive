@@ -39,21 +39,41 @@ pub fn install() {
         let ymm = core::arch::x86_64::__cpuid_count(0xD, 2);
         YMM_OFFSET.store(ymm.ebx, Ordering::Relaxed);
         for (i, &signal) in SIGNALS.iter().enumerate() {
-            // SAFETY: a zeroed sigaction is valid; ours points at `on_signal`, the previous one
-            // is saved before any fault can read it (the handler is installed after).
+            // SAFETY: the previous action is saved before any fault can read it (the handler is
+            // installed after).
             unsafe {
-                let mut action: libc::sigaction = std::mem::zeroed();
-                action.sa_sigaction = on_signal as *const () as usize;
-                // SA_NODEFER: a probe read inside the handler may fault and must reach it again.
-                action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
-                libc::sigemptyset(&mut action.sa_mask);
                 let previous = &raw mut PREVIOUS;
-                libc::sigaction(signal, &action, (*previous)[i].as_mut_ptr());
+                libc::sigaction(signal, &ours(), (*previous)[i].as_mut_ptr());
             }
         }
     });
     set_guard_page_hook(super::vm::take_guard);
     attach_thread();
+}
+
+fn ours() -> libc::sigaction {
+    // SAFETY: a zeroed sigaction is valid.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_signal as *const () as usize;
+    // SA_NODEFER: a probe inside the handler may fault and must reach it again.
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
+    // SAFETY: our own set.
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    action
+}
+
+/// Puts our handler back where a library replaced it: DXC's LLVM installs
+/// its own (`SA_RESETHAND`) at its first compile, after which the next
+/// fault in title code, or write to a block the GPU side guards, ended the
+/// process. What was there before ours stays the fallback.
+pub fn reclaim() {
+    if !INSTALL.is_completed() {
+        return;
+    }
+    for &signal in &SIGNALS {
+        // SAFETY: our action, as `install` set it.
+        unsafe { libc::sigaction(signal, &ours(), std::ptr::null_mut()) };
+    }
 }
 
 /// Gives the calling thread a 64 KiB alternate signal stack unless it has
@@ -334,6 +354,15 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
         return;
     }
     let trap = g[libc::REG_TRAPNO as usize] as u64;
+    // A write to a block the GPU side guards, by title code or ours: taken
+    // before anyone sees it, and the write is retried.
+    if signal == libc::SIGSEGV
+        && trap == 14
+        && g[libc::REG_ERR as usize] & 2 != 0
+        && super::watch::take_write(g[libc::REG_CR2 as usize] as usize)
+    {
+        return;
+    }
     let fault = Fault {
         signal,
         si_code: si.si_code,
