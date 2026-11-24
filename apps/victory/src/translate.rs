@@ -169,8 +169,16 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
+    let requested_wave = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok());
+    let wave = if pipelines {
+        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        requested_wave.or_else(|| host.max_wave_lanes())
+    } else {
+        requested_wave
+    };
+    if let Some(n) = wave {
+        emit::set_host_max_wave(n);
+        println!("wave max     {n}");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
