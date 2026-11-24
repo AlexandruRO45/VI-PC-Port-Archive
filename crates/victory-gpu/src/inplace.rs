@@ -307,6 +307,65 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// The views the runtime recorded that show part of `[at, at + len)`, as
+/// (base, bytes, section, offset in it): what a surface's memory looks like
+/// from the view table, so a detector that finds no second view can say
+/// whether there was none or whether its bytes were never recorded.
+pub fn views_at(at: usize, len: usize) -> Vec<(usize, usize, usize, u64)> {
+    let end = at.saturating_add(len.max(1));
+    let v = views();
+    v.views
+        .iter()
+        .filter(|(base, view)| **base < end && at < base.saturating_add(view.0))
+        .map(|(base, view)| (*base, view.0, view.1, view.2))
+        .collect()
+}
+
+/// Whether `[at, at + len)` shows bytes another view maps too: a write
+/// through that view does not fault on this one's pages, so no guard here
+/// can see it, and such a texture is hashed at every refresh instead of one
+/// frame in eight. A title's movie frame buffers are exactly that: the
+/// decoder writes the console's view of them thirty times a second while
+/// the movie's texture reads a second view of the same pages.
+pub(crate) fn another_view(at: usize, len: usize) -> bool {
+    another_view_in(&views(), at, len)
+}
+
+fn another_view_in(v: &Views, at: usize, len: usize) -> bool {
+    if len == 0 || v.views.is_empty() {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    // The section bytes this range shows.
+    let mut mine: Vec<(usize, u64, u64)> = Vec::new();
+    for (base, view) in &v.views {
+        let (from, to) = (*base, base.saturating_add(view.0));
+        if to <= at || end <= from {
+            continue;
+        }
+        let shown = (from.max(at), to.min(end));
+        let offset = view.2 + (shown.0 - base) as u64;
+        mine.push((view.1, offset, offset + (shown.1 - shown.0) as u64));
+    }
+    if mine.is_empty() {
+        return false;
+    }
+    // Any other view that shows some of those bytes: a write through it
+    // does not fault on the pages this range reads.
+    v.views
+        .iter()
+        .filter(|(base, view)| {
+            // Not one of the views this range already reads through.
+            let (from, to) = (**base, base.saturating_add(view.0));
+            to <= at || end <= from
+        })
+        .any(|(_, view)| {
+            let (from, to) = (view.2, view.2.saturating_add(view.0 as u64));
+            mine.iter()
+                .any(|(section, a, b)| *section == view.1 && *a < to && from < *b)
+        })
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -1041,6 +1100,21 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+    }
+
+    /// A second view of the same section bytes is what a guard cannot see.
+    #[test]
+    fn another_view_of_the_same_bytes_is_found() {
+        let at = 0x7_6000_0000usize;
+        let mut v: Views = Views { views: BTreeMap::new(), sections: Vec::new() };
+        v.views.insert(at, (4 * K64, 11, 0));
+        assert!(!another_view_in(&v, at, 4 * K64), "one view of its own bytes");
+        v.views.insert(at + 64 * K64, (2 * K64, 11, K64 as u64));
+        assert!(another_view_in(&v, at + K64, K64), "both views show it");
+        assert!(another_view_in(&v, at, 4 * K64), "one page of it is shared");
+        assert!(!another_view_in(&v, at + 3 * K64, K64), "only the first shows this page");
+        v.views.insert(at + 128 * K64, (2 * K64, 12, K64 as u64));
+        assert!(!another_view_in(&v, at + 129 * K64, K64), "another section");
     }
 
     /// What the runtime forgets when memory is mapped anew.

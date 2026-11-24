@@ -56,6 +56,11 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Whether another view maps this texture's bytes too, so that a write
+    /// through it never faults on the guard here: looked at once, because
+    /// the views a title makes for a buffer it decodes into stand for the
+    /// whole run (0 not asked, 1 yes, 2 no).
+    second_view: std::sync::atomic::AtomicU8,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -627,6 +632,21 @@ impl Staging {
         (self.memory as usize, self.layout.size as usize)
     }
 
+    /// Whether another view maps the bytes this texture reads
+    /// ([`crate::inplace::another_view`]), asked once per texture.
+    fn second_view(&self, start: usize, size: usize) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        match self.second_view.load(Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let second = crate::inplace::another_view(start, size);
+                self.second_view.store(if second { 1 } else { 2 }, Relaxed);
+                second
+            }
+        }
+    }
+
     /// With `VICTORY_MOVIE_DUMP` naming this frame, writes what the staging
     /// buffer now holds — the detiled memory the host texture is copied from
     /// — so the picture on screen and the decoder's own frame can be
@@ -736,7 +756,15 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // A write through another view of these same pages cannot fault
+            // on this one, so the guard's "nothing written" says nothing
+            // there: such a texture is hashed at every refresh, or its
+            // contents would arrive one frame in eight. A title's movie
+            // frame buffers are exactly that case — the decoder writes the
+            // console's view of them every frame while the movie's texture
+            // reads a second view of the same pages, and the runtime records
+            // both (127 view entries an end, section 3464, 64 KiB a slice).
+            if unwritten && !turn && !self.second_view(start, size) {
                 crate::movie::verdict("guarded view, no write seen, not its hash turn", start, size, || {
                     format!("asked {now}, last wrote at {}, one hash in {HASH_EVERY} frames", last.asked)
                 });
@@ -1159,6 +1187,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        second_view: std::sync::atomic::AtomicU8::new(0),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
