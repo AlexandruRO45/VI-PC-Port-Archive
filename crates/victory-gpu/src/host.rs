@@ -4,8 +4,9 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -309,6 +310,42 @@ mod tests {
     }
 }
 
+type DynamicSlotList = Mutex<Vec<(usize, u32, u32)>>;
+type DynamicSlots = Arc<DynamicSlotList>;
+
+/// Dynamic descriptor slot ranges held by lists whose GPU submission has
+/// completed (`Host::execute`), reclaimed on demand when dynamic slots run out.
+static COMPLETED_DYNAMIC: Mutex<VecDeque<Weak<DynamicSlotList>>> = Mutex::new(VecDeque::new());
+
+fn release_dynamic_vec(slots: &DynamicSlotList) -> usize {
+    let entries = std::mem::take(&mut *slots.lock().unwrap_or_else(|e| e.into_inner()));
+    let count = entries.len();
+    for (heap, first, n) in entries {
+        crate::descriptor::release_dynamic(heap, first, n);
+    }
+    count
+}
+
+/// Releases the dynamic descriptor slots of the oldest completed list that still
+/// retains any, returning `true` if any slots were reclaimed.
+pub(crate) fn reclaim_one_completed_dynamic() -> bool {
+    loop {
+        let weak = COMPLETED_DYNAMIC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        let Some(weak) = weak else {
+            return false;
+        };
+        let Some(slots) = weak.upgrade() else {
+            continue;
+        };
+        if release_dynamic_vec(&slots) > 0 {
+            return true;
+        }
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -318,6 +355,12 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Dynamic descriptor slot ranges (`heap`, `first`, `count`) allocated by
+    /// draws in this list, released on reset, drop, or on-demand reclamation
+    /// after execution finishes.
+    dynamic: DynamicSlots,
+    /// Whether `dynamic` is already queued in `COMPLETED_DYNAMIC`.
+    dynamic_queued: AtomicBool,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -564,6 +607,8 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                dynamic: Arc::default(),
+                dynamic_queued: AtomicBool::new(false),
                 states: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -736,6 +781,16 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        for run in runs {
+            if !run.dynamic.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                && !run.dynamic_queued.swap(true, Ordering::Relaxed)
+            {
+                COMPLETED_DYNAMIC
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(Arc::downgrade(&run.dynamic));
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -945,7 +1000,28 @@ impl Host {
     }
 }
 
+impl Drop for HostList {
+    fn drop(&mut self) {
+        self.release_dynamic();
+    }
+}
+
 impl HostList {
+    /// Records dynamic descriptor slots `(heap, first, n)` held until reset,
+    /// drop, or post-execution reclamation.
+    pub(crate) fn keep_dynamic(&self, heap: usize, first: u32, n: u32) {
+        self.dynamic
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((heap, first, n));
+    }
+
+    /// Releases any dynamic descriptor slots currently retained by this list.
+    pub(crate) fn release_dynamic(&self) {
+        release_dynamic_vec(&self.dynamic);
+        self.dynamic_queued.store(false, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1043,6 +1119,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.release_dynamic();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2207,5 +2284,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         list.reset();
         let pooled = host.scratch_pool.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert_eq!(pooled, super::SCRATCH_POOL_MAX);
+    }
+
+    #[test]
+    fn completed_dynamic_slots_reclaim_on_demand() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        // Verify queueing a live completed list allows `reclaim_one_completed_dynamic`
+        // to drain and return `true` when it holds dynamic slots.
+        list.keep_dynamic(0, 100, 16);
+        super::COMPLETED_DYNAMIC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(std::sync::Arc::downgrade(&list.dynamic));
+        assert!(super::reclaim_one_completed_dynamic());
+        assert!(list.dynamic.lock().unwrap().is_empty());
+        assert!(!super::reclaim_one_completed_dynamic());
     }
 }

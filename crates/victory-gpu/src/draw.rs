@@ -74,19 +74,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: table address → `(count, words, first)`
     /// entries so prefix-compatible draws reuse existing dynamic slots.
     fresh_tables: std::collections::HashMap<u64, Vec<FreshTable>>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
-    }
 }
 
 /// Draws recorded on the host GPU since the last frame line.
@@ -724,7 +713,15 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let first = loop {
+                if let Some(first) = host.dynamic(n) {
+                    break Some(first);
+                }
+                if !crate::host::reclaim_one_completed_dynamic() {
+                    break None;
+                }
+            };
+            let Some(first) = first else {
                 // Without its fresh table the shader would read the title's
                 // slots, which for constant buffer tables hold no constant
                 // view: a texture or null descriptor read as a buffer gives
@@ -737,8 +734,7 @@ impl State {
                 .entry(table)
                 .or_default()
                 .push((n, words, first));
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            list.keep_dynamic(std::ptr::from_ref(heap) as usize, first, n);
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
