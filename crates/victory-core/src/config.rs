@@ -637,12 +637,17 @@ fn slashed_link_to_file(path: &Path) -> Option<(String, PathBuf)> {
 /// in its link (what `ls -l` shows), followed from the folder of the link
 /// that holds it. Empty when `path` is not a link. Stops at the first name
 /// that is not a link and, so that a loop cannot hold it, after as many hops
-/// as Linux follows (40).
+/// as Linux follows (40). A hop written as a folder (`mid/` or `mid/.`) is
+/// read with the slash dropped: the OS follows `mid` through it, but
+/// `readlink("mid/")` reads where it leads rather than `mid` itself, so the
+/// chain would stop there and name a link that is present as the end that
+/// is missing.
 fn link_hops(path: &Path) -> Vec<PathBuf> {
     let mut hops = Vec::new();
     let mut at = path.to_path_buf();
     while hops.len() < 40 {
-        let Ok(target) = std::fs::read_link(&at) else {
+        let plain: PathBuf = at.components().collect();
+        let Ok(target) = std::fs::read_link(&plain) else {
             break;
         };
         at = at.parent().unwrap_or(Path::new("")).join(&target);
@@ -2874,6 +2879,81 @@ mod tests {
         // A link to itself stops after Linux's limit instead of spinning.
         std::os::unix::fs::symlink("current.toml", &current).unwrap();
         assert_eq!(link_hops(&current).len(), 40);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_config_links_through_a_hop_written_as_a_folder_names_the_missing_end() {
+        // `victory.toml -> mid/` (or `mid/.`) with `mid -> gone.toml`: the
+        // OS follows `mid` through the slash and finds `gone.toml` missing,
+        // but `readlink("mid/")` does not read `mid`, so the chain must not
+        // stop there and name `mid/`, which is present, as the missing end.
+        // Scratch folder under the system temp folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let mid = dir.path().join("mid");
+        std::os::unix::fs::symlink("gone.toml", &mid).unwrap();
+        let link = dir.path().join("victory.toml");
+        for target in ["mid/", "mid/.", "./mid//"] {
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            assert_eq!(
+                link_hops(&link),
+                [PathBuf::from(target), PathBuf::from("gone.toml")]
+            );
+            let err = config_file_or(None, &link).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "the config file {}, a link to {target}, a link to gone.toml, which does \
+                     not exist",
+                    link.display()
+                )
+            );
+            let err = config_file(Some(link.clone())).unwrap_err().to_string();
+            assert!(err.starts_with("VICTORY_CONFIG points at"), "{err}");
+            assert!(
+                err.ends_with(", a link to gone.toml, which does not exist"),
+                "{err}"
+            );
+            std::fs::remove_file(&link).unwrap();
+        }
+
+        // The slashed hop in the middle of a longer chain, the next hop
+        // relative to the slashed link's own folder:
+        // `victory.toml -> nested/mid/` with `nested/mid -> ../store/gone.toml`.
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::os::unix::fs::symlink("../store/gone.toml", nested.join("mid")).unwrap();
+        std::os::unix::fs::symlink("nested/mid/", &link).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, a link to nested/mid/, a link to ../store/gone.toml, \
+                 which does not exist",
+                link.display()
+            )
+        );
+
+        // The end put back as a file: the slash is now what is wrong, and
+        // the hint names the slashed link as before.
+        std::fs::create_dir(dir.path().join("store")).unwrap();
+        std::fs::write(dir.path().join("store/gone.toml"), "").unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(
+            err.ends_with(&format!(
+                "drop it from the link: {}",
+                nested.join("mid").display()
+            )),
+            "{err}"
+        );
+
+        // A slashed hop to a link that loops still stops after Linux's
+        // limit instead of spinning.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink("self", dir.path().join("self")).unwrap();
+        std::os::unix::fs::symlink("self/", &link).unwrap();
+        assert_eq!(link_hops(&link).len(), 40);
+        assert!(config_file_or(None, &link).is_err());
     }
 
     #[cfg(unix)]
