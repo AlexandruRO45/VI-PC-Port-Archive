@@ -42,3 +42,29 @@ class NullPriorityTests(unittest.TestCase):
         self.assertEqual(aggregate["orphan_rank_rows"],1)
         self.assertEqual(aggregate["overflow"],2)
         self.assertEqual(aggregate["unknown_identity_rows"],1)
+
+    def test_rejects_cross_kind_counts_and_invalid_stage_association(self):
+        cases=[
+            [summary(1,5,0,1,0,5),row(1,"compute",f"CS={A}",5,0)],
+            [summary(1,5,0,1,5,0),row(1,"raster",f"VS={A}",5,0)],
+            [summary(1,5,0,1,5,0),row(1,"compute",f"VS={A}",5,0)],
+            [summary(1,5,0,1,0,5),row(1,"raster",f"CS={A}",5,0)],
+            [summary(1,5,1,1,5,0)],
+            [summary(1,5,0,1,5,0),row(1,"compute",f"CS={A}",4,0)],
+            [summary(1,5,0,1,5,0),row(1,"compute",f"CS={A}",5,0).replace("present_sample","recording_checkpoint")],
+            [summary(1,2**64,0,1,2**64,0)],
+        ]
+        for lines in cases:
+            with self.subTest(lines=lines),self.assertRaises(ValueError):
+                build(lines,[])
+
+    def test_reports_missing_intervals_and_malformed_records(self):
+        lines=[summary(2,5,0,1,5,0),row(2,"compute",f"CS={A}",5,0),
+               summary(4,9,2,2,0,9),row(4,"raster",f"VS={B} PS={C}",2,2),
+               PREFIX+"null usage rank malformed"]
+        manifest,aggregate=build(lines,[Path(f"{B}.dxbc"),Path(f"{A}.dxbc")])
+        self.assertEqual(aggregate["missing_intervals_lower_bound"],2)
+        self.assertEqual(aggregate["malformed_records"],1)
+        self.assertEqual(aggregate["incomplete_intervals"],1)
+        self.assertEqual(aggregate["unranked_commands_lower_bound"],7)
+        self.assertEqual(manifest["requests"][0],f"{B}.dxbc")

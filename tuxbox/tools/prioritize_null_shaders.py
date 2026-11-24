@@ -19,16 +19,18 @@ STAGE = rf"(?:VS|PS|DS|HS|GS|CS|AS|MS)=(?:{HEX}|unknown)"
 ROW = re.compile(
     rf"null usage rank kind=(compute|raster) ((?:{STAGE})(?: {STAGE})*) "
     r"recorded=([0-9]{1,20}) display_bound=([0-9]{1,20}) "
-    r"interval=([0-9]{1,20}) trigger=(?:present_sample|recording_checkpoint)$")
+    r"interval=([0-9]{1,20}) trigger=(present_sample|recording_checkpoint)$")
 SUMMARY = re.compile(
     r"null usage interval recorded=([0-9]{1,20}) display_bound=([0-9]{1,20}) "
     r"tracked=([0-9]{1,4}) overflow=([0-9]{1,20}) overflow_display_bound=([0-9]{1,20}) "
     r"compute=([0-9]{1,20}) raster=([0-9]{1,20}) interval=([0-9]{1,20}) "
-    r"trigger=(?:present_sample|recording_checkpoint)$")
+    r"trigger=(present_sample|recording_checkpoint)$")
 
 
 def build(lines, sources, limit=64):
     summaries, ranked = {}, {}
+    malformed = 0
+    max_count = (1 << 64) - 1
     for line in lines:
         # Only the provider's diagnostic records are meaningful.
         marker = "TuxBox d3d12_xs: "
@@ -36,38 +38,57 @@ def build(lines, sources, limit=64):
             continue
         message = line.rstrip().split(marker, 1)[1]
         if m := SUMMARY.fullmatch(message):
-            total, display, tracked, overflow, overflow_display, compute, raster, interval = map(int, m.groups())
+            total, display, tracked, overflow, overflow_display, compute, raster, interval = map(int, m.groups()[:-1])
+            trigger = m.group(9)
+            if any(n > max_count for n in (total, display, overflow, overflow_display, compute, raster, interval)):
+                raise ValueError("usage counter exceeds u64")
             if interval == 0 or interval in summaries:
                 raise ValueError("duplicate/invalid interval; supply one process trace")
-            if display > total or overflow > total or overflow_display > min(display, overflow) or compute+raster != total or tracked > 1024:
+            if (display > raster or overflow > total or overflow_display > min(display, overflow)
+                    or compute+raster != total or tracked > 1024 or tracked > total-overflow
+                    or display-overflow_display > total-overflow):
                 raise ValueError("inconsistent usage summary")
-            summaries[interval] = (total, display, tracked, overflow, overflow_display)
+            summaries[interval] = (total, display, tracked, overflow, overflow_display, compute, raster, trigger)
         elif m := ROW.fullmatch(message):
-            kind, fields, count, display, interval = m.groups()
+            kind, fields, count, display, interval, trigger = m.groups()
             count, display, interval = map(int, (count, display, interval))
             stages = tuple(sorted(tuple(field.split("=", 1)) for field in fields.split()))
-            if count == 0 or display > count or (kind == "compute" and display) or interval == 0 or len({s for s,_ in stages}) != len(stages):
+            names = {name for name, _ in stages}
+            if (count == 0 or display > count or interval == 0 or count > max_count or interval > max_count
+                    or len(names) != len(stages)
+                    or (kind == "compute" and (display or names != {"CS"}))
+                    or (kind == "raster" and "CS" in names)):
                 raise ValueError("invalid usage rank")
             key = (interval, kind, stages)
             if key in ranked:
                 raise ValueError("duplicate usage rank; supply one process trace")
-            ranked[key] = (count, display)
+            ranked[key] = (count, display, trigger)
+        elif message.startswith(("null usage interval ", "null usage rank ")):
+            malformed += 1
     if not summaries:
         raise ValueError("no null usage interval summaries")
     by_interval = defaultdict(list)
-    for (interval, kind, stages), (count, display) in ranked.items():
-        by_interval[interval].append((kind, stages, count, display))
+    for (interval, kind, stages), (count, display, trigger) in ranked.items():
+        by_interval[interval].append((kind, stages, count, display, trigger))
     scores = defaultdict(lambda: [0,0])
     pairs = defaultdict(lambda: [0,0])
     unknown_rows = 0
     incomplete = 0
-    for interval, (total, display, tracked, overflow, overflow_display) in summaries.items():
+    for interval, (total, display, tracked, overflow, overflow_display, compute, raster, trigger) in summaries.items():
         rows = by_interval.pop(interval, [])
-        if len(rows) > min(tracked, 8) or sum(row[2] for row in rows) > total-overflow or sum(row[3] for row in rows) > display-overflow_display:
-            raise ValueError("rank rows exceed interval summary")
+        observed = sum(row[2] for row in rows)
+        observed_display = sum(row[3] for row in rows)
+        if (len(rows) > min(tracked, 8) or observed > total-overflow
+                or observed_display > display-overflow_display
+                or sum(row[2] for row in rows if row[0]=="compute") > compute
+                or sum(row[2] for row in rows if row[0]=="raster") > raster
+                or any(row[4] != trigger for row in rows)):
+            raise ValueError("rank rows disagree with interval summary")
         if len(rows) < min(tracked,8):
             incomplete += 1
-        for kind, stages, count, bound in rows:
+        elif tracked <= 8 and (observed != total-overflow or observed_display != display-overflow_display):
+            raise ValueError("complete rank rows do not account for tracked usage")
+        for kind, stages, count, bound, _ in rows:
             ids = {digest for _,digest in stages if digest != "unknown"}
             if any(digest == "unknown" for _, digest in stages):
                 unknown_rows += 1
@@ -102,6 +123,9 @@ def build(lines, sources, limit=64):
                 "requests":[name for _,_,name in chosen]}
     aggregate = {"schema":1,"scope":"Sampled null usage; lower-bound stage association; no identifiers",
                  "intervals":len(summaries),"incomplete_intervals":incomplete,"orphan_rank_rows":orphan_rows,
+                 "malformed_records":malformed, "missing_intervals_lower_bound":max(summaries)-len(summaries),
+                 "unranked_commands_lower_bound":sum(v[0] for v in summaries.values())-
+                     sum(count for (interval,_,_), (count,_,_) in ranked.items() if interval in summaries),
                  "unknown_identity_rows":unknown_rows,"recorded":sum(v[0] for v in summaries.values()),
                  "display_bound":sum(v[1] for v in summaries.values()),
                  "overflow":sum(v[3] for v in summaries.values()),

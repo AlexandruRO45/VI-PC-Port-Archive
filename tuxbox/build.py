@@ -55,7 +55,7 @@ class Toolchain:
         language = ["/std:c11"] if source.suffix == ".c" else ["/std:c++17", "/EHsc"]
         obj = source.stem + ".obj"
         directory.mkdir(parents=True, exist_ok=True)
-        subprocess.run([require_tool(self.compiler[0]), *self.compiler[1:], "/nologo", "/c", "/O2", "/MT", "/Brepro",
+        subprocess.run([require_tool(self.compiler[0]), *self.compiler[1:], "/nologo", "/c", "/O2", "/MT", "/Brepro", "/utf-8",
                         *language, *self.includes, *extra, *(["-Wno-cast-function-type"] if self.compiler[0] == "clang-cl" else []), f"/Fo{obj}", str(source)],
                        cwd=directory, check=True)
         return obj
@@ -184,9 +184,11 @@ def build_target(tools, target, dxc, d3d12_reference=None):
     elif target == "xmem":
         src, out = ROOT / "runtime/xmem", OUTPUT / "xmem-smoke"
         out.mkdir(parents=True, exist_ok=True)
-        dll = tools.rust_library("tuxbox-xmem")
-        tools.link(out / "xmem.dll", dll, *RUST_STD_LIBS, exports=src / "xmem.def")
+        # Link tuxbox_xhttp first so xmem.def's forwarder resolves under MSVC link.exe.
         tools.link(out / "tuxbox_xhttp.dll", tools.rust_library("tuxbox-xmem-http"), "winhttp.lib", *RUST_STD_LIBS, exports=src / "xhttp.def")
+        dll = tools.rust_library("tuxbox-xmem")
+        # Force DllMain from tuxbox_xmem before libcmt's stub to avoid LNK2005 on MSVC.
+        tools.link(out / "xmem.dll", dll, "tuxbox_xhttp.lib", "/include:DllMain", *RUST_STD_LIBS, exports=src / "xmem.def")
         http = tools.compile(src / "http_control.cpp", out, "/W4", "/WX")
         tools.link(out / "xmem-http.exe", http, "xmem.lib", "tuxbox_xhttp.lib", "kernel32.lib")
         guest = tools.compile(src / "guest.c", out, "/W4")
@@ -248,7 +250,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         src, out = ROOT / "runtime/d3d12", OUTPUT / "d3d12-smoke"
         out.mkdir(parents=True, exist_ok=True)
         provider = tools.rust_library("tuxbox-d3d12")
-        tools.link(out / "d3d12_xs.dll", provider, "dxgi.lib", "d3d12.lib", "user32.lib",
+        tools.link(out / "d3d12_xs.dll", provider, "dxgi.lib", "d3d12.lib", "d3dcompiler.lib", "user32.lib",
                    *RUST_STD_LIBS, exports=d3d12_exports(src, out, d3d12_reference))
         signature = tools.compile(src / "signature_guest.cpp", out, "/W4", "/WX")
         tools.link(out / "d3d12-signatures.exe", signature, "d3d12_xs.lib", "kernel32.lib")
@@ -258,7 +260,7 @@ def build_target(tools, target, dxc, d3d12_reference=None):
         tools.link(out / "d3d12-exports.exe", exports, "d3d12_xs.lib", "kernel32.lib")
         for name, source in (("features", "feature_guest.cpp"), ("queries", "query_guest.cpp"),
                              ("queues", "queue_guest.cpp"), ("heaps", "heap_guest.cpp"),
-                             ("placement", "placement_guest.cpp"), ("copy-resource", "copy_resource_guest.cpp"),
+                             ("placement", "placement_guest.cpp"), ("buffer-import", "buffer_import_guest.cpp"), ("copy-resource", "copy_resource_guest.cpp"),
                              ("frame-events", "frame_event_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX")
             tools.link(out / f"d3d12-{name}.exe", obj, "d3d12_xs.lib", "kernel32.lib", "dxgi.lib")
@@ -294,7 +296,8 @@ def build_target(tools, target, dxc, d3d12_reference=None):
             subprocess.run([dxc, "-T", profile, "-E", entry, "-O3", *payload, "-Fh", f"{header}.h",
                             "-Vn", variable, str(src / f"{shader}.hlsl")], cwd=out, check=True)
         for name, source in (("tables", "table_guest.cpp"), ("indirect", "indirect_guest.cpp"),
-                             ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp")):
+                             ("draw", "graphics_guest.cpp"), ("mesh", "mesh_guest.cpp"),
+                             ("null-usage", "null_usage_guest.cpp")):
             obj = tools.compile(src / source, out, "/W4", "/WX", f"/I{out}")
             tools.link(out / f"d3d12-{name}.exe", obj, "d3d12_xs.lib", "dxgi.lib", "kernel32.lib")
         guest = tools.compile(src / "guest.cpp", out, f"/I{out}")

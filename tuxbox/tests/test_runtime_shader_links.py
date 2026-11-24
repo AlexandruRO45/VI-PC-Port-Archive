@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from project_tuxbox.runtime_shaders import ShaderRefused, archive_request, compile_request, serve, snapshot_compiler_cache
+from project_tuxbox.runtime_shaders import O0_TIMEOUT, ShaderRefused, archive_request, compile_request, serve, snapshot_compiler_cache
 from project_tuxbox.scarlett_prep import scarlett_requests
 from project_tuxbox.shader_prep import SOURCE_CACHE, ToolFailure, prepare_for_launch
 
@@ -182,7 +182,7 @@ class RuntimeShaderLinks(unittest.TestCase):
             self.assertTrue(compile_request(source, key, self.tools, self.cache, self.session))
         self.assertEqual([call.args[0][0] for call in compiler.call_args_list], ["xshader", "dxc", "dxc", "dxv"])
         dxc_calls = [call for call in compiler.call_args_list if call.args[0][0] == "dxc"]
-        self.assertEqual([call.kwargs["timeout"] for call in dxc_calls], [15, 15])
+        self.assertEqual([call.kwargs["timeout"] for call in dxc_calls], [15, O0_TIMEOUT])
         self.assertNotIn("-O0", dxc_calls[0].args[0])
         self.assertIn("-O0", dxc_calls[1].args[0])
         self.assertEqual((self.session / (key + ".cso")).read_bytes(), dxil)
@@ -200,7 +200,7 @@ class RuntimeShaderLinks(unittest.TestCase):
                 args[args.index("--profile-out") + 1].write_text("cs_6_6")
             elif args[0] == "dxc":
                 self.assertIn("-O0", args)
-                self.assertEqual(timeout, 15)
+                self.assertEqual(timeout, O0_TIMEOUT)
                 args[args.index("-Fo") + 1].write_bytes(dxil)
             else:
                 self.assertEqual(args[0], "dxv")

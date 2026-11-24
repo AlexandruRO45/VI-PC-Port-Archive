@@ -527,6 +527,16 @@ impl Texture {
     }
 }
 
+/// Report an aliasing case that is handled by degrading, a bounded number of times.
+fn report_alias(what: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    let count = REPORTED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 16 || count.is_power_of_two() {
+        crate::diagnostics::log(&format!("placed texture alias handled without failing the queue (#{count}): {what}"));
+    }
+}
+
 fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
     a.start < b.end && b.start < a.end
 }
@@ -559,15 +569,19 @@ pub(crate) unsafe fn submit(
         return execute();
     }
     unique(textures);
+    // Distinct images over the same guest memory cannot be ordered inside one
+    // submission. Each is refreshed from guest memory and the writer publishes
+    // afterwards, so a pass that really reads data another pass wrote in this
+    // same batch sees the earlier contents. Failing the batch would poison the
+    // queue and fail the title's Present, which is worse. Stale descriptors
+    // left in a participating heap also land here.
     for writer in writes.iter() {
         if textures
             .iter()
             .any(|t| !Arc::ptr_eq(writer, t) && overlaps(&writer.range(), &t.range()))
         {
-            crate::diagnostics::recording_error(format_args!(
-                "overlapping placed texture layouts in one GPU write batch"
-            ));
-            return Err(E_NOTIMPL.into());
+            report_alias("overlapping placed texture layouts in one GPU write batch");
+            break;
         }
     }
 
@@ -596,10 +610,16 @@ pub(crate) unsafe fn submit(
             .filter(|w| overlaps(&texture.range(), &w.range))
         {
             if Arc::as_ptr(texture) != write.texture.as_ptr() {
-                crate::diagnostics::recording_error(format_args!(
-                    "placed texture layout alias before GPU write publication"
-                ));
-                return Err(E_NOTIMPL.into());
+                // Another image wrote this memory and has not published it yet.
+                // Refreshing now would read the old guest bytes, and waiting
+                // here for the publication can deadlock: that write may sit
+                // behind GPU work that waits on a fence this thread signals
+                // only after submit returns. Keep the current image for this
+                // batch; the next batch refreshes it once the write has landed
+                // and left `submission.writes`.
+                report_alias("placed texture refresh deferred until an overlapping write is published");
+                pending = true;
+                continue;
             }
             // CPU bytes still contain the old version. The native image contains
             // the ordered GPU write and can be read directly by the next batch.

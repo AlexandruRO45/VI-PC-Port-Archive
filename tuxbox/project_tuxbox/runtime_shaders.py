@@ -77,6 +77,12 @@ def archive_request(archive, source, inputs):
             raise
 
 
+# Unoptimised DXC is the last resort for a shader. The largest ProjectScarlett
+# compute program (CS_Emit_Dynamic_Model_Edge, 7,813 instructions) needs
+# about 18 s at -O0, so a 15 s cap refused it on every boot.
+O0_TIMEOUT = 90
+
+
 def compile_request(source, key, tools, cache, session, *, remember=None):
     linked = source.suffix == ".link"
     xshader, dxc, dxv = tools
@@ -154,13 +160,13 @@ def compile_request(source, key, tools, cache, session, *, remember=None):
         # compile at -O0 in a few seconds, and the driver optimises that DXIL
         # again when it builds the pipeline.
         if target == "cs_6_6":
-            run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
+            run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
         else:
             try:
                 run_tool([dxc, "-T", target, *entry, "-Fo", output, hlsl], timeout=15)
             except subprocess.TimeoutExpired:
                 output.unlink(missing_ok=True)
-                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=15)
+                run_tool([dxc, "-T", target, *entry, "-O0", "-Fo", output, hlsl], timeout=O0_TIMEOUT)
         run_tool([dxv, output], timeout=10)
         if not has_dxil_container(output.read_bytes()):
             raise ValueError("compiler returned an invalid DXIL container")

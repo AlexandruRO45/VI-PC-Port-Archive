@@ -178,14 +178,14 @@ std::string run(const wchar_t* requested, bool) {
     reject(base);
 
     using Enable = HRESULT (WINAPI*)(UINT64*, SIZE_T, UINT64*);
-    auto profile = reinterpret_cast<Enable>(GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"),
-                                                           "D3D12XboxEnableMemoryProfiling"));
+    auto enable_profiling = reinterpret_cast<Enable>(GetProcAddress(GetModuleHandleW(L"d3d12_xs.dll"),
+                                                                    "D3D12XboxEnableMemoryProfiling"));
     UINT64 cursor = 1, samples[]{7, 8, 9};
-    if (!profile) throw std::runtime_error("resolve memory profiler");
-    check(profile(&cursor, 2, samples), "register profiling buffer");
+    if (!enable_profiling) throw std::runtime_error("resolve memory profiler");
+    check(enable_profiling(&cursor, 2, samples), "register profiling buffer");
     { Texture one(first, base, device.Get()), alias(first, base, device.Get()); }
     { Texture two(adjacent, base, device.Get()); }
-    check(profile(nullptr, 0, nullptr), "unregister profiling buffer");
+    check(enable_profiling(nullptr, 0, nullptr), "unregister profiling buffer");
     { Texture three(first, base, device.Get()); }
     if (cursor != 3 || samples[0] != 7 || samples[1] == 8 || samples[2] != 9)
         throw std::runtime_error("profiling cursor, sample or guard");

@@ -71,7 +71,9 @@ ComPtr<ID3D12Resource> resource(ID3D12Device* dev, bool texture) {
     desc.Dimension = texture ? D3D12_RESOURCE_DIMENSION_TEXTURE2D : D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Width = texture ? width : bytes;
     desc.Height = texture ? height : 1;
-    desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
     desc.Format = texture ? format : DXGI_FORMAT_UNKNOWN;
     desc.Flags = texture ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
     desc.Layout = texture ? D3D12_TEXTURE_LAYOUT_UNKNOWN : D3D12_TEXTURE_LAYOUT_ROW_MAJOR;

@@ -21,7 +21,10 @@ pub(crate) fn log(detail: &str) {
     let Some(target) = std::env::var_os("TUXBOX_LOG") else { return };
     if target == OsStr::new("stderr") {
         // A closed console must not interrupt the game's rendering thread.
-        let _ = writeln!(io::stderr().lock(), "TuxBox d3d12_xs: {detail}");
+        // Build the complete line before writing it; formatting fragments
+        // can otherwise interleave with the native driver's stderr output.
+        let line = format!("TuxBox d3d12_xs: {detail}\n");
+        let _ = io::stderr().lock().write_all(line.as_bytes());
     } else if target == OsStr::new("1") {
         let line = format!("TuxBox d3d12_xs: {detail}\n\0");
         // SAFETY: All milestone text is ASCII and the buffer is NUL-terminated.

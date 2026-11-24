@@ -52,7 +52,9 @@ std::string run(const wchar_t* requested, bool) {
     D3D12_RESOURCE_DESC image{};
     image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     image.Width = image.Height = 64;
-    image.DepthOrArraySize = image.MipLevels = image.SampleDesc.Count = 1;
+    image.DepthOrArraySize = 1;
+    image.MipLevels = 1;
+    image.SampleDesc.Count = 1;
     image.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     image.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> texture;

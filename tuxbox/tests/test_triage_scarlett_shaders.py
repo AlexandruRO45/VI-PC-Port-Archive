@@ -24,22 +24,31 @@ class TriageScarlettShaders(unittest.TestCase):
 
     def test_paired_aggregate_counts_transitions_without_identifiers(self):
         from tools.triage_scarlett_shaders import paired_aggregate
-        sources = [self.cache / f"{i}.dxbc" for i in range(5)]
+        import hashlib
+        sources = [self.cache / (hashlib.sha256(bytes([i])).hexdigest()+".dxbc") for i in range(5)]
+        for i, source in enumerate(sources): source.write_bytes(bytes([i]))
+        old_tool, new_tool = self.root/"old", self.root/"new"
+        old_tool.write_text("old"); new_tool.write_text("new")
         old = [("refused", "scalar_dynamic_offset"), ("refused", "wave_divergent"),
                ("translated", None), ("translated", None), ("failed", "io_error")]
         new = [("translated", None), ("refused", "wave_other"),
                ("refused", "other_refusal"), ("translated", None), ("translated", None)]
         def probe_stub(compiler, source, timeout, *, aggregate_only):
             self.assertTrue(aggregate_only)
-            state, reason = (old if compiler == "old" else new)[sources.index(source)]
+            self.assertNotIn(source, sources)
+            i = source.read_bytes()[0]
+            state, reason = (old if compiler.parent.name == "baseline" else new)[i]
+            sources[i].write_bytes(b"changed after snapshot")
             return source, state, reason
         with unittest.mock.patch("tools.triage_scarlett_shaders.probe", side_effect=probe_stub):
-            report = paired_aggregate("old", "new", sources, 2, 1)
+            report = paired_aggregate(old_tool, new_tool, sources, 2, 1)
         self.assertEqual((report["recovered"], report["regressed"], report["inconclusive"]), (1,1,1))
         self.assertEqual(report["baseline_refusal_buckets"]["scalar_dynamic_offset"]["translated"], 1)
         self.assertEqual(report["baseline_refusal_buckets"]["wave_divergent"]["refused"], 1)
         self.assertEqual(sum(t["count"] for t in report["transitions"]), 5)
         self.assertNotIn(str(self.root), json.dumps(report))
+        self.assertEqual(report["failure_buckets"]["baseline"],{"io_error":1})
+        self.assertEqual(report["tool_sha256"]["baseline"],hashlib.sha256(b"old").hexdigest())
 
     def test_new_fixed_buckets_never_expose_raw_diagnostics(self):
         from project_tuxbox.scarlett_report import refusal_bucket

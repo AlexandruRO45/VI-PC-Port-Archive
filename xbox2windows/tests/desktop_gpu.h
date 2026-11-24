@@ -43,7 +43,8 @@ void check_stream_root_srv(ID3D12Device* device);
 void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario);
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
-enum class MeshDrawMode { color, textured, depth_pair };
+// multi_primitive: one native color draw whose export trace size comes from the fixture.
+enum class MeshDrawMode { color, textured, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;

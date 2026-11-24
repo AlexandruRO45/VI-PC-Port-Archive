@@ -42,7 +42,11 @@ ComPtr<ID3D12Resource> make_texture(ID3D12Device* device, D3D12_RESOURCE_STATES 
     heap.CreationNodeMask = heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<ID3D12Resource> texture;
     check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,

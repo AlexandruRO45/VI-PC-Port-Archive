@@ -35,6 +35,8 @@ from project_tuxbox.runtime_shaders import REQUEST_PATTERNS, XSHADER_UNSUPPORTED
 from project_tuxbox.scarlett_report import refusal_bucket, failure_bucket
 
 from project_tuxbox.shader_diagnostics import normalize_refusal as normalize
+from tools.scarlett_replay_integrity import snapshot_request, pin_emitter
+from project_tuxbox.inspect import digest
 
 
 def construct(reason):
@@ -165,22 +167,40 @@ def paired_aggregate(baseline, candidate, sources, jobs, timeout):
     transitions = Counter()
     buckets = defaultdict(Counter)
 
-    def compare(source):
-        _, old, old_reason = probe(baseline, source, timeout, aggregate_only=True)
-        _, new, new_reason = probe(candidate, source, timeout, aggregate_only=True)
-        return old, old_reason, new, new_reason
+    with TemporaryDirectory(prefix="tuxbox-triage-tools-") as temp:
+        old_tool, old_hash = pin_emitter(baseline, Path(temp) / "baseline")
+        new_tool, new_hash = pin_emitter(candidate, Path(temp) / "candidate")
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        for old, old_reason, new, new_reason in pool.map(compare, sources):
-            totals["baseline"][old] += 1
-            totals["candidate"][new] += 1
-            transitions[(old, new)] += 1
-            if old == "refused":
-                buckets[old_reason][new] += 1
+        def compare(source):
+            with TemporaryDirectory(prefix="tuxbox-triage-input-") as tmp:
+                try:
+                    snap = snapshot_request(source, Path(tmp))
+                except (OSError, ValueError):
+                    return "failed", "invalid_input", "failed", "invalid_input"
+                _, old, old_reason = probe(old_tool, snap, timeout, aggregate_only=True)
+                _, new, new_reason = probe(new_tool, snap, timeout, aggregate_only=True)
+                return old, old_reason, new, new_reason
+
+        failures = {"baseline": Counter(), "candidate": Counter()}
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            for old, old_reason, new, new_reason in pool.map(compare, sources):
+                totals["baseline"][old] += 1
+                totals["candidate"][new] += 1
+                transitions[(old, new)] += 1
+                if old == "refused":
+                    buckets[old_reason][new] += 1
+                if old == "failed":
+                    failures["baseline"][old_reason] += 1
+                if new == "failed":
+                    failures["candidate"][new_reason] += 1
+        if digest(old_tool) != old_hash or digest(new_tool) != new_hash:
+            raise ValueError("pinned emitter changed during comparison")
     return {
         "schema": 1,
         "aggregate_only": True,
-        "scope": "Same enumerated requests; emitter translation only, not DXC, GPU or gameplay. Use an unchanged archive.",
+        "scope": "Digest-verified per-request snapshots; emitter only, not DXC, GPU or gameplay.",
+        "tool_sha256": {"baseline": old_hash, "candidate": new_hash},
+        "failure_buckets": {side: dict(sorted(counts.items())) for side, counts in failures.items()},
         "requests": len(sources),
         "totals": {side: {state: counts[state] for state in ("translated", "refused", "failed")}
                    for side, counts in totals.items()},
@@ -245,6 +265,9 @@ def main(argv=None):
     parser.add_argument("--aggregate-only", action="store_true", help="fixed reason buckets only; omit paths, request names and raw error text")
     args = parser.parse_args(argv)
 
+    if args.json and (args.json.exists() or (not args.log and
+            args.json.resolve().is_relative_to(args.requests.resolve()))):
+        parser.error("choose a fresh report outside the request archive")
     if args.limit < 0:
         parser.error("--limit must be 0 (all) or positive")
     if args.baseline is not None and (not args.aggregate_only or args.xshader is None):
@@ -269,7 +292,10 @@ def main(argv=None):
             args.xshader = shader_compiler()
 
         if args.baseline is not None:
-            report = paired_aggregate(args.baseline, args.xshader, sources, args.jobs, args.timeout)
+            try:
+                report = paired_aggregate(args.baseline, args.xshader, sources, args.jobs, args.timeout)
+            except (OSError, ValueError):
+                parser.error("comparison integrity or tool setup failed")
             # Refuse overwrites and export only the fixed aggregate schema.
             if args.json:
                 with args.json.open("x", encoding="utf-8") as output:
@@ -280,7 +306,9 @@ def main(argv=None):
         report = triage(args.xshader, sources, max(1, args.jobs), args.timeout, args.examples, aggregate_only=args.aggregate_only)
     print(markdown(report, args.top))
     if args.json:
-        args.json.write_text(json.dumps(report, indent=2) + "\n")
+        with args.json.open("x", encoding="utf-8") as output:
+            json.dump(report, output, indent=2)
+            output.write("\n")
     return 0
 
 

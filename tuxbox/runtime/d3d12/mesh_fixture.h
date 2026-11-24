@@ -24,8 +24,8 @@ struct Context {
     UINT stride;
 
     Context(const wchar_t* selected, UINT viewCount) {
-        constexpr std::array<UINT, 18> profile{0x20004, 0, ~0u, 0, 0, 0, ~0u, ~0u, 0, 1};
-        device = create_device(selected, adapter, profile.data());
+        constexpr std::array<UINT, 18> mesh_profile{0x20004, 0, ~0u, 0, 0, 0, ~0u, ~0u, 0, 1};
+        device = create_device(selected, adapter, mesh_profile.data());
         check(device.As(&device2), "Xbox device2");
         D3D12_COMMAND_QUEUE_DESC q{};
         check(device->CreateCommandQueue(&q, IID_PPV_ARGS(&queue)), "mesh queue");

@@ -58,7 +58,7 @@ pub(super) unsafe extern "system" fn cbv(
         value.SizeInBytes = desktop_cbv_bytes(guest_bytes);
         let address = value.BufferLocation;
         if address != 0 && value.SizeInBytes != 0 {
-            match buffer_at(device, address, u64::from(value.SizeInBytes), 1, false) {
+            match buffer_at(device, address, u64::from(value.SizeInBytes), 1, false, D3D12_RESOURCE_FLAG_NONE) {
                 Ok(found) => {
                     if let Some(buffer) = &found {
                         value.BufferLocation = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
@@ -462,7 +462,7 @@ pub(super) struct AddressSrv {
 }
 const _: () = assert!(std::mem::offset_of!(AddressSrv, address) == 40);
 
-fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: bool)
+fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: bool, flags: D3D12_RESOURCE_FLAGS)
     -> windows::core::Result<Option<std::sync::Arc<TextureAddress>>> {
     use windows::Win32::Foundation::E_INVALIDARG;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
@@ -471,6 +471,7 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     if let Some(entry) = device.state.texture_addresses.preceding(address as usize).filter(|entry| !entry.is_stale()) {
         let host = unsafe { entry.native.GetDesc() };
         if host.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+            && host.Flags.0 & flags.0 == flags.0
             && entry.offset(address).is_multiple_of(u64::from(stride))
             && entry.offset(address).checked_add(bytes).is_some_and(|end| end <= host.Width) {
             return Ok(Some(entry));
@@ -488,7 +489,7 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     let mut host = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: bytes, Height: 1, DepthOrArraySize: 1,
         // D3D12_RESOURCE_FLAG_USE_TIGHT_ALIGNMENT (Agility SDK 617).
-        Flags: if tight { D3D12_RESOURCE_FLAGS(0x400) } else { D3D12_RESOURCE_FLAG_NONE },
+        Flags: D3D12_RESOURCE_FLAGS(flags.0 | if tight { 0x400 } else { 0 }),
         MipLevels: 1, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
     };
@@ -504,13 +505,13 @@ fn buffer_at(device: &Device, address: u64, bytes: u64, stride: u32, required: b
     } else { nearest };
     host.Width = bytes.checked_add(address - page).ok_or(E_INVALIDARG)?;
     if !tight { host.Width = host.Width.checked_next_multiple_of(65536).ok_or(E_INVALIDARG)?; }
-    let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON)?;
+    let (native, heap) = super::heap::import_buffer_with_heap(device, page, &host, D3D12_RESOURCE_STATE_COMMON, "view")?;
     Ok(Some(TextureAddress::with_heap(device, &native, page as usize, false, None, None, None, 0, Some(heap))))
 }
 
 pub(crate) unsafe fn command_buffer_address(device: *mut c_void, address: u64, bytes: u64) -> windows::core::Result<(Option<ID3D12Resource>, u64)> {
     let device = unsafe { &*device.cast::<Device>() };
-    let Some(buffer) = buffer_at(device, address, bytes, 1, false)? else { return Ok((None, address)) };
+    let Some(buffer) = buffer_at(device, address, bytes, 1, false, D3D12_RESOURCE_FLAG_NONE)? else { return Ok((None, address)) };
     let host = unsafe { buffer.native.GetGPUVirtualAddress() } + buffer.offset(address);
     Ok((Some(buffer.native.clone()), host))
 }
@@ -659,7 +660,7 @@ pub(super) unsafe extern "system" fn address_srv(
             unsafe { VirtualQuery(Some(desc.address as _), &mut r, size_of_val(&r)) };
             (r.AllocationBase.addr(), r.BaseAddress.addr(), r.RegionSize, r.State.0, r.Protect.0)
         };
-        let entry = match buffer_at(device, desc.address, resource_desc.Width, placement_stride, true) {
+        let entry = match buffer_at(device, desc.address, resource_desc.Width, placement_stride, true, D3D12_RESOURCE_FLAG_NONE) {
             Ok(Some(entry)) => entry,
             Ok(None) => fail_call(format_args!(
                 "import SRV at {:#x} produced no buffer ({} bytes)",
@@ -708,6 +709,70 @@ pub(super) unsafe extern "system" fn address_srv(
     } else {
         unsafe { device.native.CreateShaderResourceView(native, Some(&view), handle) };
     }
+}
+
+/// `D3D12XBOX_UNORDERED_ACCESS_VIEW_DESC`: the standard description followed
+/// by the buffer's address, an optional counter address and a memory type.
+#[repr(C)]
+pub(super) struct AddressUav {
+    view: D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    address: u64,
+    counter_address: u64,
+    memory_type: u32,
+}
+const _: () = assert!(
+    std::mem::offset_of!(AddressUav, address) == 40
+        && std::mem::offset_of!(AddressUav, counter_address) == 48
+        && std::mem::offset_of!(AddressUav, memory_type) == 56
+);
+
+/// CreatePlacedRawUnorderedAccessViewX (device slot 71): a buffer UAV at a
+/// guest address. The imported buffer must allow unordered access, so an
+/// earlier read-only import of the same pages is not reused. Texture UAVs,
+/// counters and byte-offset starts are refused rather than guessed.
+pub(super) unsafe extern "system" fn address_uav(
+    device: &Device,
+    resource_desc: &D3D12_RESOURCE_DESC,
+    desc: &AddressUav,
+    mut handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    let _write = super::descriptor_paging::Write::new(&device.state.descriptor_arenas, &mut handle);
+    check_destination(handle);
+    if desc.address == 0
+        || desc.counter_address != 0
+        || resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || desc.view.ViewDimension != D3D12_UAV_DIMENSION_BUFFER
+    {
+        fail_call(format_args!(
+            "unsupported address UAV: address={:#x} counter={:#x} resource dimension={} view dimension={}",
+            desc.address, desc.counter_address, resource_desc.Dimension.0, desc.view.ViewDimension.0
+        ));
+    }
+    crate::commands::page_mapping::GPU_APERTURE.wait(desc.address, 1)
+        .unwrap_or_else(|e| fail_call(format_args!("address UAV pending GPU mapping: {:?}", e.code())));
+    let mut view = desc.view;
+    let buffer = unsafe { view.Anonymous.Buffer };
+    let stride = element_stride(view.Format.0, buffer.StructureByteStride)
+        .unwrap_or_else(|| fail_call(format_args!("unsupported address UAV format {}", view.Format.0)));
+    rebase_view((0, resource_desc.Width), view.Format.0, buffer.StructureByteStride, buffer.FirstElement, buffer.NumElements);
+    let entry = match buffer_at(device, desc.address, resource_desc.Width, stride, true, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        Ok(Some(entry)) => entry,
+        Ok(None) => fail_call(format_args!("import UAV at {:#x} produced no buffer ({} bytes)", desc.address, resource_desc.Width)),
+        Err(error) => fail_call(format_args!(
+            "import UAV at {:#x}, {} bytes stride={stride} fmt={} first={} count={} failed {:?}",
+            desc.address, resource_desc.Width, view.Format.0, buffer.FirstElement, buffer.NumElements, error.code()
+        )),
+    };
+    let offset = entry.offset(desc.address);
+    if !offset.is_multiple_of(u64::from(stride)) {
+        fail_call(format_args!("address UAV at {:#x} starts {offset} bytes into its buffer, not a whole {stride}-byte element", desc.address));
+    }
+    view.Anonymous.Buffer.FirstElement = buffer.FirstElement + offset / u64::from(stride);
+    crate::diagnostics::display::texture_view(handle.ptr, None, None);
+    device.state.imported_views.store(handle.ptr, Some(DescriptorBacking::Registered { _address: entry.clone() }));
+    device.state.blas.views.store(handle.ptr, None);
+    device.state.placements.views.set(handle.ptr, None, true);
+    unsafe { device.native.CreateUnorderedAccessView(Some(&entry.native), None, Some(&view), handle) };
 }
 
 pub(super) unsafe extern "system" fn srv(

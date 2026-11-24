@@ -157,7 +157,7 @@ static bool check_depth_samples(Computer* obj, const ResourceDesc& desc, const B
     std::memcpy(&size, field + 8, sizeof(size));
     std::vector<BYTE> tiled(static_cast<size_t>(size), 0xcd), expected(pitch, 0xa5), actual(expected);
     for (UINT sample = 0; sample < desc.samples; ++sample) {
-        std::fill(actual.begin(), actual.end(), 0xa5);
+        std::fill(actual.begin(), actual.end(), static_cast<BYTE>(0xa5));
         for (UINT y = 0; y < desc.height; ++y) for (UINT x = 0; x < 17; ++x) {
             const UINT64 at = obj->methods->address(obj, plane, 0, x, y, 0, 0, nullptr) + bytes * sample;
             if (at > size || bytes > size - at) return false;
@@ -389,8 +389,8 @@ int wmain(int argc, wchar_t** argv) {
                 }
                 const UINT bpe = format==1 ? 1 : format==14 ? 2 : format==56 ? 4 : format==65 ? 8 : 16;
                 for (UINT m=0; m<mips; ++m) {
-                    const UINT depth = type==10 ? ((slices>>m)?(slices>>m):1) : 1;
-                    if (!check_copy(obj,layout.data(),m,mips,type==10?0:slices-1,depth,
+                    const UINT mip_depth = type==10 ? ((slices>>m)?(slices>>m):1) : 1;
+                    if (!check_copy(obj,layout.data(),m,mips,type==10?0:slices-1,mip_depth,
                                     w>>m, (h>>m)?(h>>m):1,bpe)) {
                         std::fprintf(stderr,"copy mismatch hw=%u type=%u sw=%u format=%u mip=%u\n",hw,type,sw,format,m);
                         return 21;

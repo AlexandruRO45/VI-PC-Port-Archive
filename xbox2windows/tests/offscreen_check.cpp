@@ -842,6 +842,12 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
                                                    ctx.argv[6]));
 }
 
+OperationResult run_mesh_multi(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false,
+                                               MeshConstantBinding::root, MeshDrawMode::multi_primitive));
+}
+
 OperationResult run_mesh_indexed(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
@@ -1210,6 +1216,48 @@ OperationResult run_startup_packed_position(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
+// width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
+// value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
+// row by row. Reports the first differing pixel and the number of differing pixels.
+OperationResult run_startup_pixel_words(const OperationContext& ctx)
+{
+    unsigned long width = 0, height = 0;
+    try {
+        width = std::stoul(ctx.argv[5]);
+        height = std::stoul(ctx.argv[6]);
+    } catch (const std::exception&) {
+        return {OutcomeKind::fail, "width and height must be numbers"};
+    }
+    if (width == 0 || height == 0 || width > 64 || height > 64)
+        return {OutcomeKind::fail, "width and height must be 1..64"};
+    std::vector<std::uint32_t> expected(size_t(width) * height * 4);
+    std::ifstream file(ctx.argv[7], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected.data()), std::streamsize(expected.size() * sizeof(std::uint32_t)));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
+    std::vector<std::uint32_t> pixels(expected.size());
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    unsigned long differing = 0;
+    for (unsigned long y = 0; y < height; ++y) {
+        for (unsigned long x = 0; x < width; ++x) {
+            const std::uint32_t* want = &expected[(y * width + x) * 4];
+            const std::uint32_t* got = &pixels[(y * width + x) * 4];
+            if (std::memcmp(want, got, 4 * sizeof(std::uint32_t)) == 0) continue;
+            if (differing++ == 0) {
+                std::fprintf(stderr, "pixel mismatch (%lu,%lu): expected %08x,%08x,%08x,%08x actual %08x,%08x,%08x,%08x\n",
+                             x, y, want[0], want[1], want[2], want[3], got[0], got[1], got[2], got[3]);
+            }
+        }
+    }
+    if (differing) {
+        std::fprintf(stderr, "%lu of %lu pixels differ\n", differing, width * height);
+        return {OutcomeKind::fail, "pixel readback differs"};
+    }
+    std::printf("all %lu pixels matched\n", width * height);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
 // comma separated.
@@ -1340,6 +1388,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1392,6 +1441,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},

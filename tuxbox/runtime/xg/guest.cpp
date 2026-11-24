@@ -73,7 +73,8 @@ bool verify(const Sample& sample) {
     desc.dimension = 3; // Texture2D
     desc.width = sample.width;
     desc.height = sample.height;
-    desc.slices = desc.samples = 1;
+    desc.slices = 1;
+    desc.samples = 1;
     desc.mips = sample.mips;
     desc.format = sample.format;
     desc.layout = sample.layout;

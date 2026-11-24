@@ -188,7 +188,9 @@ std::string run(const wchar_t* requested, bool stream, bool rectangle = false) {
     D3D12_RESOURCE_DESC target_desc{};
     target_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     target_desc.Width = target_desc.Height = extent;
-    target_desc.DepthOrArraySize = target_desc.MipLevels = target_desc.SampleDesc.Count = 1;
+    target_desc.DepthOrArraySize = 1;
+    target_desc.MipLevels = 1;
+    target_desc.SampleDesc.Count = 1;
     target_desc.Format = format;
     target_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> target;
@@ -248,8 +250,8 @@ std::string run(const wchar_t* requested, bool stream, bool rectangle = false) {
             const D3D12_DRAW_INDEXED_ARGUMENTS draws{3, 2, 1, 0, 0};
             D3D12_INDIRECT_ARGUMENT_DESC operation{};
             operation.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
-            D3D12_COMMAND_SIGNATURE_DESC signature{sizeof(draws), 1, &operation, 1};
-            check(device->CreateCommandSignature(&signature, nullptr, IID_PPV_ARGS(&draw_signature)),
+            D3D12_COMMAND_SIGNATURE_DESC command_signature{sizeof(draws), 1, &operation, 1};
+            check(device->CreateCommandSignature(&command_signature, nullptr, IID_PPV_ARGS(&draw_signature)),
                   "Xbox rectangle indirect signature");
             arguments = compute_fixture::buffer(device.Get(), D3D12_HEAP_TYPE_UPLOAD,
                                                  sizeof(draws), D3D12_RESOURCE_STATE_GENERIC_READ);

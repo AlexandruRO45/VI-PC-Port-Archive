@@ -26,7 +26,7 @@ int wmain(int argc, wchar_t** argv) {
         CHECK(XMemGetPartitionHandleAndId(kind,NULL,&id));
         MEMORY_BASIC_INFORMATION info = {0};
         CHECK(VirtualQuery(&id,&info,sizeof(info))==sizeof(info));
-        CHECK(id==(kind ? info.PartitionId : 0));
+        CHECK(id==(kind ? (UINT)info.PartitionId : 0u));
         if (XMemGetPartitionHandleAndId(kind,&handle,&id)) {
             DWORD flags;
             CHECK(GetHandleInformation(handle,&flags) && (flags & HANDLE_FLAG_INHERIT));

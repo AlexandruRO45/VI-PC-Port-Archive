@@ -78,6 +78,7 @@ class ToolFailure(ValueError):
     def __init__(self, tool, returncode, detail):
         super().__init__(f"{Path(tool).name} failed ({returncode}): {detail}")
         self.returncode = returncode
+        self.tool = Path(tool).name
 
 
 def run_tool(command, *, timeout=None):

@@ -41,8 +41,8 @@ pub fn exports_stencil_reference(code: &[u8]) -> bool {
     })
 }
 
-/// Tests whether a semantic present at both stages moves registers or needs
-/// components the producer did not allocate.
+/// Tests whether a semantic present at both stages moves registers, needs
+/// components the producer did not allocate, or changes component type.
 pub fn has_packing_mismatch(producer: &[u8], pixel: &[u8]) -> bool {
     let Some(outputs) = signature(producer, OUTPUTS) else {
         return false;
@@ -54,7 +54,9 @@ pub fn has_packing_mismatch(producer: &[u8], pixel: &[u8]) -> bool {
         outputs.iter().any(|output| {
             input.index == output.index
                 && input.name.eq_ignore_ascii_case(&output.name)
-                && (input.register != output.register || input.mask & !output.mask != 0)
+                && (input.register != output.register
+                    || input.mask & !output.mask != 0
+                    || (input.sysval == 0 && input.comp_type != output.comp_type))
         })
     })
 }
@@ -128,6 +130,21 @@ mod tests {
         }
         assert!(!has_packing_mismatch(&producer, &[]));
         assert!(!has_packing_mismatch(&[], &shader(b"ISGN", &inputs)));
+    }
+
+    #[test]
+    fn a_component_type_change_is_a_mismatch_except_for_system_values() {
+        // Console interpolants are raw dwords: a title can write float and read uint.
+        let producer = shader(
+            b"OSGN",
+            &[("TEXCOORD", 3, 0, 3, 8, 0b1111), ("SV_POSITION", 0, 1, 3, 0, 0b1111)],
+        );
+        let uint = shader(b"ISGN", &[("TEXCOORD", 3, 0, 1, 8, 0b1111)]);
+        assert!(has_packing_mismatch(&producer, &uint));
+        let float = shader(b"ISGN", &[("TEXCOORD", 3, 0, 3, 8, 0b1111)]);
+        assert!(!has_packing_mismatch(&producer, &float));
+        let position = shader(b"ISGN", &[("SV_POSITION", 0, 1, 1, 0, 0b1111)]);
+        assert!(!has_packing_mismatch(&producer, &position));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 """Check the single-store compute profile with original synthetic kernels."""
 from pathlib import Path
+import math
 import operator
 import os
 import operator
@@ -365,6 +366,8 @@ def controls():
     scalar_alu_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    vadd_nc_i32_controls()
+    cvt_u32_f32_controls()
     ff1_exec_controls()
     writelane_controls()
 
@@ -1862,6 +1865,288 @@ def ff1_exec_draw(directory, compiler, renderer, backend):
     bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
     if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
         raise AssertionError("ff1_exec: mutation escaped detection")
+    return 0
+
+
+CVT_U32_F32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x40a00000",
+    "v_lshl_add_u32 v3, s10, 5, v0",
+    "v_mul_lo_u32 v1, 0x00800000, v3",
+    "v_add_nc_u32_e32 v1, 0x3f400000, v1",
+    "v_cvt_u32_f32_e32 v4, v1",
+    "v_add_nc_u32_e32 v2, 0x4f7ffff0, v3",
+    "v_cvt_u32_f32_e32 v5, v2",
+    "v_add_nc_u32_e32 v2, 0x7f7ffff0, v3",
+    "v_cvt_u32_f32_e32 v6, v2",
+    "v_add_nc_u32_e32 v2, 0x7ffffff0, v3",
+    "v_cvt_u32_f32_e32 v7, v2",
+    "v_cvt_u32_f32_e32 v8, s4",
+    "v_cvt_u32_f32_e32 v9, 4.0",
+    "v_cvt_u32_f32_e32 v10, 0xff800000",
+    "v_cvt_u32_f32_e32 v11, -1.0",
+    "v_add_nc_u32_e32 v7, v8, v7",
+    "v_add_nc_u32_e32 v7, v9, v7",
+    "v_add_nc_u32_e32 v7, v10, v7",
+    "v_add_nc_u32_e32 v7, v11, v7",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx4 v[4:7], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+CVT_U32_F32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=16)
+
+
+def cvt_u32_f32_word(bits):
+    """Independent Python model of RDNA2 v_cvt_u32_f32: NaN -> 0, <= 0 -> 0, >= 2^32 -> 0xffffffff, else trunc."""
+    bits &= 0xffffffff
+    if (bits & 0x7fffffff) > 0x7f800000:
+        return 0
+    value = struct.unpack("<f", struct.pack("<I", bits))[0]
+    if math.isnan(value) or value <= 0.0:
+        return 0
+    if value >= 4294967296.0:
+        return 0xffffffff
+    return int(math.trunc(value))
+
+
+def cvt_u32_f32_words(*, convert=cvt_u32_f32_word):
+    """Independent reference for one CVT_U32_F32 group of 32 threads (128 active words, 128..319 sentinel)."""
+    words = [SENTINEL] * 320
+    extra = (convert(0x40a00000) + convert(0x40800000) + convert(0xff800000) + convert(0xbf800000)) & 0xffffffff
+    for flat in range(32):
+        w4 = convert((0x3f400000 + (flat << 23)) & 0xffffffff)
+        w5 = convert((0x4f7ffff0 + flat) & 0xffffffff)
+        w6 = convert((0x7f7ffff0 + flat) & 0xffffffff)
+        w7 = (convert((0x7ffffff0 + flat) & 0xffffffff) + extra) & 0xffffffff
+        words[4 * flat:4 * flat + 4] = [w4, w5, w6, w7]
+    return words
+
+
+def cvt_u32_f32_controls():
+    """v_cvt_u32_f32_e32: exact HLSL, helper gating, and one rejection per unsupported operand or modifier."""
+    source = aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+    lines = source.splitlines()
+    assert aot.CVT_U32_F32_HELPER.rstrip("\n") in lines, lines
+    assert lines[-2].startswith("    outputData.Store4(tid.x * 16u + 0u, uint4(cvt_u32_f32("), lines
+    # A program without v_cvt_u32_f32_e32 does not emit the helper.
+    assert "uint cvt_u32_f32(" not in aot.lower(READ_F32, 32, **READ_BINDING)
+    # Integer inline 0 and NaN/Inf/denormal constants are accepted.
+    assert "cvt_u32_f32(0x00000000u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v11, -1.0", "v_cvt_u32_f32_e32 v11, 0")),
+        32, **CVT_U32_F32_BINDING)
+    assert "cvt_u32_f32(0x7fc00000u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x7fc00000")),
+        32, **CVT_U32_F32_BINDING)
+    assert "cvt_u32_f32(0x00000001u)" in aot.lower(
+        variant(CVT_U32_F32, ("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x00000001")),
+        32, **CVT_U32_F32_BINDING)
+    unsupported, operand, bad_dst = "Unsupported compute instruction: ", "Unverified float operand", "Invalid vector destination"
+    for message, changes in (
+        # Unknown SGPR, pending SGPR, unknown VGPR, unaccepted float literal, out-of-range integer literal.
+        (operand, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v8, s30"),)),
+        (operand, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v8, s12"),)),
+        (operand, (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v40"),)),
+        (operand, (("v_cvt_u32_f32_e32 v9, 4.0", "v_cvt_u32_f32_e32 v9, 1.5"),)),
+        (operand, (("v_cvt_u32_f32_e32 v10, 0xff800000", "v_cvt_u32_f32_e32 v10, 0x100000000"),)),
+        # Destination past v255.
+        (bad_dst, (("v_cvt_u32_f32_e32 v8, s4", "v_cvt_u32_f32_e32 v256, s4"),)),
+        # Other spellings, input/output modifiers and register range.
+        (unsupported + "v_cvt_u32_f32_e64", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e64 v4, v1"),)),
+        (unsupported + "v_cvt_u32_f32 ", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32 v4, v1"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, -v1"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, |v1|"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v1 clamp"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v1 mul:2"),)),
+        (unsupported + "v_cvt_u32_f32_e32", (("v_cvt_u32_f32_e32 v4, v1", "v_cvt_u32_f32_e32 v4, v[1:2]"),)),
+    ):
+        rejects(message, aot.lower, variant(CVT_U32_F32, *changes), 32, **CVT_U32_F32_BINDING)
+
+
+def cvt_u32_f32_binary(directory, assembler, objcopy, library):
+    """The assembled CVT_U32_F32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, CVT_U32_F32), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_cvt_u32_f32")] == [
+        line for line in CVT_U32_F32 if line.startswith("v_cvt_u32_f32")], decoded
+    assert aot.lower(decoded, 32, **CVT_U32_F32_BINDING) == aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+
+
+def cvt_u32_f32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("cvt_u32_f32.hlsl", "cvt_u32_f32.cso", "cvt_u32_f32.case")]
+    source = aot.lower(CVT_U32_F32, 32, **CVT_U32_F32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = cvt_u32_f32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[128] ^= 1
+    def _round_ref(bits):
+        if (bits & 0x7fffffff) > 0x7f800000:
+            return 0
+        v = struct.unpack("<f", struct.pack("<I", bits & 0xffffffff))[0]
+        return 0 if v <= 0.0 else (0xffffffff if v >= 4294967296.0 else int(round(v)))
+    def _wrap_ref(bits):
+        if 0x4f800000 <= (bits & 0xffffffff) < 0x50000000:
+            return int(math.trunc(struct.unpack("<f", struct.pack("<I", bits & 0xffffffff))[0])) & 0xffffffff
+        return cvt_u32_f32_word(bits)
+    def _nan_sat_ref(bits):
+        if (bits & 0x7fffffff) > 0x7f800000:
+            return 0xffffffff
+        return cvt_u32_f32_word(bits)
+    for label, reference, word in (
+            ("round instead of trunc", cvt_u32_f32_words(convert=_round_ref), 0),
+            ("wrap at 2^32", cvt_u32_f32_words(convert=_wrap_ref), 65),
+            ("NaN saturates to 0xffffffff", cvt_u32_f32_words(convert=_nan_sat_ref), 3),
+            ("sentinel past group", off, 128)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"cvt_u32_f32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("2^32 saturation dropped", source.replace("x >= 4294967296.0f ? 0xffffffffu : uint(finite)", "uint(finite)")),
+            ("4.0 replaced by 2.0", source.replace("0x40800000u", "0x40000000u")),
+            ("0.75 replaced by 1.0", source.replace("0x3f400000u", "0x3f800000u"))):
+        if mutated == source:
+            raise AssertionError(f"cvt_u32_f32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"cvt_u32_f32: mutation '{label}' escaped detection")
+    return 0
+
+
+VADD_NC_I32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x80000005",
+    "s_mov_b32 s5, 0x80000001",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_i32 v4, v3, 0x7ffffff0",
+    "v_sub_nc_i32 v5, s5, v3",
+    "v_add_nc_i32 v6, v4, -16",
+    "v_sub_nc_i32 v7, v6, v5",
+    "v_add_nc_i32 v8, v7, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v8, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+VADD_NC_I32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4)
+
+
+def _signed32(word):
+    return word - 0x100000000 if word >= 0x80000000 else word
+
+
+def _clamp32(val):
+    return max(-0x80000000, min(0x7fffffff, val)) & 0xffffffff
+
+
+def vadd_nc_i32_words(*, add_op=lambda a, b: (a + b) & 0xffffffff,
+                      sub_op=lambda a, b: (a - b) & 0xffffffff):
+    """Independent reference for VADD_NC_I32: 32-bit two's-complement wrap-around without carry-out."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        v4 = add_op(flat, 0x7ffffff0)
+        v5 = sub_op(0x80000001, flat)
+        v6 = add_op(v4, -16)
+        v7 = sub_op(v6, v5)
+        v8 = add_op(v7, 0x80000005)
+        words[flat] = v8
+    return words
+
+
+def vadd_nc_i32_controls():
+    """v_add_nc_i32 / v_sub_nc_i32: exact HLSL output and one rejection per unsupported operand or modifier."""
+    lines = aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING).splitlines()
+    expected_expr = "((((tid.x + 0x7ffffff0u) + 0xfffffff0u) - (0x80000001u - tid.x)) + 0x80000005u)"
+    assert lines[3] == f"    outputData.Store(tid.x * 4u + 0u, {expected_expr});", lines
+    # 1. Unknown or pending sources
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, s30, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v40, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, s12, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 2. clamp and omod modifiers are refused
+    rejects("Unsupported compute instruction: v_add_nc_i32 v4, v3, 0x7ffffff0 clamp", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v3, 0x7ffffff0 clamp")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unsupported compute instruction: v_sub_nc_i32 v5, s5, v3 clamp", aot.lower,
+            variant(VADD_NC_I32, ("v5, s5, v3", "v5, s5, v3 clamp")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unsupported compute instruction: v_add_nc_i32 v4, v3, 0x7ffffff0 mul:2", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v3, 0x7ffffff0 mul:2")), 64, **VADD_NC_I32_BINDING)
+    # 3. Source modifiers are refused
+    for bad_src in ("-v3", "|v3|", "neg(v3)"):
+        rejects(f"Unsupported compute instruction: v_add_nc_i32 v4, {bad_src}, 0x7ffffff0", aot.lower,
+                variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", f"v4, {bad_src}, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 4. Invalid destination
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v256, v3, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 5. Other spellings (_e32 / _e64)
+    for bad_op in ("v_add_nc_i32_e32", "v_add_nc_i32_e64"):
+        rejects(f"Unsupported compute instruction: {bad_op} v4, v3, 0x7ffffff0", aot.lower,
+                variant(VADD_NC_I32, ("v_add_nc_i32 v4, v3, 0x7ffffff0", f"{bad_op} v4, v3, 0x7ffffff0")),
+                64, **VADD_NC_I32_BINDING)
+    for bad_op in ("v_sub_nc_i32_e32", "v_sub_nc_i32_e64"):
+        rejects(f"Unsupported compute instruction: {bad_op} v5, s5, v3", aot.lower,
+                variant(VADD_NC_I32, ("v_sub_nc_i32 v5, s5, v3", f"{bad_op} v5, s5, v3")),
+                64, **VADD_NC_I32_BINDING)
+
+
+def vadd_nc_i32_binary(directory, assembler, objcopy, library):
+    """The assembled VADD_NC_I32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, VADD_NC_I32), library, offsets=True))
+    assert [line for line in decoded if line.startswith(("v_add_nc_i32", "v_sub_nc_i32"))] == [
+        line for line in VADD_NC_I32 if line.startswith(("v_add_nc_i32", "v_sub_nc_i32"))], decoded
+    assert aot.lower(decoded, 64, **VADD_NC_I32_BINDING) == aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING)
+
+
+def vadd_nc_i32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("vadd_nc_i32.hlsl", "vadd_nc_i32.cso", "vadd_nc_i32.case")]
+    source = aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = vadd_nc_i32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (
+            ("add as sub", vadd_nc_i32_words(add_op=lambda a, b: (a - b) & 0xffffffff), 0),
+            ("sub as add", vadd_nc_i32_words(sub_op=lambda a, b: (a + b) & 0xffffffff), 0),
+            ("signed clamp instead of wrap",
+             vadd_nc_i32_words(
+                 add_op=lambda a, b: _clamp32(_signed32(a & 0xffffffff) + _signed32(b & 0xffffffff)),
+                 sub_op=lambda a, b: _clamp32(_signed32(a & 0xffffffff) - _signed32(b & 0xffffffff))), 0),
+            ("sentinel past group", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"vadd_nc_i32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("add replaced by sub", source.replace("+ 0x7ffffff0u)", "- 0x7ffffff0u)")),
+            ("sub replaced by add", source.replace("0x80000001u - tid.x", "0x80000001u + tid.x")),
+            ("literal off by one", source.replace("0x7ffffff0u", "0x7ffffff1u"))):
+        if mutated == source:
+            raise AssertionError(f"vadd_nc_i32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"vadd_nc_i32: mutation '{label}' escaped detection")
     return 0
 
 
@@ -4096,6 +4381,8 @@ def binary(directory, assembler, objcopy, library):
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    vadd_nc_i32_binary(directory, assembler, objcopy, library)
+    cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
@@ -6849,8 +7136,10 @@ if __name__ == "__main__":
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
+                 "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
                  "draw-writelane": writelane_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,

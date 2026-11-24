@@ -1237,6 +1237,17 @@ static DEVICE11_LIST_SLOTS: Slots<149> = {
     // from title RVA 0x248cbc1 with a one-command signature.
     slots[61] = crate::slot!(execute_indirect);
     slots[101] = crate::slot!(driver_hint);
+    // The entries below were traced under the older numbering (Frosty:
+    // CopyResourceX 84, DXR 117 to 121, DispatchMesh 127), two lower than the
+    // Scarlett layout in GDK d3d12_xs.h. The functions and signatures are the
+    // same, so a Scarlett title reaches them at these slots.
+    slots[86] = crate::slot!(copy_resource);
+    slots[119] = crate::slot!(build_raytracing::single);
+    slots[120] = crate::slot!(raytracing::postbuild);
+    slots[121] = crate::slot!(raytracing::copy);
+    slots[122] = crate::slot!(ray_dispatch::pipeline);
+    slots[123] = crate::slot!(ray_dispatch::dispatch);
+    slots[129] = crate::slot!(graphics::dispatch_mesh);
     slots[70] = crate::slot!(graphics::depth_bounds);
     slots[75] = crate::slot!(graphics::force_shader_depth_order);
     slots[142] = crate::slot!(graphics::sample_mask);

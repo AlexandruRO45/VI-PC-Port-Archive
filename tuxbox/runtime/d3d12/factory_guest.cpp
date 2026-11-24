@@ -48,7 +48,9 @@ void check_private_texture(ID3D12Device* device) {
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     desc.Width = desc.Height = 32;
-    desc.MipLevels = desc.DepthOrArraySize = desc.SampleDesc.Count = 1;
+    desc.MipLevels = 1;
+    desc.DepthOrArraySize = 1;
+    desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
     desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(0x00c00000 | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);

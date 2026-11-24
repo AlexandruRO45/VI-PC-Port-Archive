@@ -25,6 +25,8 @@ fn compute_extract(words: &[u32]) -> ShaderExtract {
         isa,
         isa_offset_in_fssm: 0,
         psv_threads: None,
+        flat_inputs: Vec::new(),
+        flat_outputs: Vec::new(),
         isa_preamble: [0, 64, 1, 1],
         has_input_sig: false,
         has_output_sig: false,
@@ -216,4 +218,86 @@ fn bounded_runtime_code_offset_uses_real_table_index_without_modulo() {
     branch.offset = 24;
     bad.push(branch);
     assert_eq!(super::code_offset::prove(&bad,3,24,40),None);
+}
+
+fn bounded_cbv_fixture() -> ShaderExtract {
+    // gfx1030: and s10,s8,1; lshl s10,s10,5; load descriptor s[16:19]
+    // from s[4:5]+s10; buffer_load s20; endpgm.
+    let mut ex = compute_extract(&[
+        0x870a8108, 0x8f0a850a, 0xf4080402, 0x14000000,
+        0xf4200508, 0xfa000000, 0xbf810000]);
+    ex.isa_preamble = [0,1,1,1];
+    ex.resources.push(crate::psv::PsvResource {res_type:2,space:0,lower:0,upper:1});
+    ex.root_sig = Some(crate::meta::RootSig {
+        version:1, flags:0, num_static_samplers:0, static_samplers:Vec::new(),
+        params:vec![crate::meta::RootParam {visibility:0, kind:crate::meta::RootParamKind::Table(vec![
+            crate::meta::RootRange {range_type:2,num:2,base_register:0,space:0,offset_in_table:0}
+        ])}]
+    });
+    ex
+}
+
+#[test]
+fn bounded_dynamic_cbv_descriptors_select_only_reflected_slots() {
+    let ex = bounded_cbv_fixture();
+    let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+    em.resolve_resources().unwrap();
+    assert_eq!(em.dsel_runtime.get(&2),Some(&(16,4,10,0)));
+    assert_eq!(em.bsel.get(&3).map(|x| x.1.len()),Some(2));
+    let translated = super::translate(&ex).unwrap();
+    assert!(translated.hlsl.contains("tb_dsel16 = 0x4000000u | (s10 + 0x0u)"));
+    assert!(translated.hlsl.contains("tb_dsel16 == 0x4000020u"));
+    println!("BEGIN_HLSL\n{}\nEND_HLSL",translated.hlsl);
+    let mut bad = bounded_cbv_fixture();
+    bad.resources[0].upper = 0;
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(0..0,0xbe850380u32.to_le_bytes()); // clobber base high
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(24..24,0xbe950310u32.to_le_bytes()); // descriptor word escapes
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa.splice(0..0,0xbf820000u32.to_le_bytes()); // control-flow boundary
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.root_sig = None;
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+    let mut bad = bounded_cbv_fixture();
+    bad.isa[4..8].copy_from_slice(&0x8f0a840au32.to_le_bytes());
+    assert!(Emitter::new(&bad,disassemble(&bad.isa)).resolve_resources().is_err());
+}
+
+#[test]
+fn dynamic_cbv_rejects_incompatible_reflection_and_range_bounds() {
+    use crate::meta::RootParamKind;
+    for variant in 0..8 {
+        let mut ex = bounded_cbv_fixture();
+        let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[0].kind
+            else { panic!("fixture root table") };
+        match variant {
+            0 => ranges[0].range_type = 0, // SRV rather than CBV
+            1 => ranges[0].num = 1, // second candidate out of bounds
+            2 => ranges[0].num = u32::MAX, // unbounded table
+            3 => ranges[0].offset_in_table = 1, // ambiguous physical base
+            4 => ranges[0].base_register = u32::MAX, // register overflow
+            5 => ex.resources[0].space = 1, // reflection space mismatch
+            6 => {
+                ex.resources.push(crate::psv::PsvResource {res_type:2,space:0,lower:1,upper:1});
+            }, // overlapping reflection
+            7 => ex.resources[0].res_type = 4, // wrong resource class
+            _ => unreachable!(),
+        }
+        let mut em = Emitter::new(&ex, disassemble(&ex.isa));
+        assert!(em.resolve_resources().is_err(), "accepted incompatible variant {variant}");
+    }
+    // A mask with five independently possible bits would expand to 32
+    // descriptors; even a large finite range does not bypass the cap.
+    let mut ex = bounded_cbv_fixture();
+    ex.isa[0..4].copy_from_slice(&0x870a9f08u32.to_le_bytes()); // AND 31
+    let RootParamKind::Table(ranges) = &mut ex.root_sig.as_mut().unwrap().params[0].kind
+        else { panic!("fixture root table") };
+    ranges[0].num = 32;
+    ex.resources[0].upper = 31;
+    assert!(Emitter::new(&ex,disassemble(&ex.isa)).resolve_resources().is_err());
 }

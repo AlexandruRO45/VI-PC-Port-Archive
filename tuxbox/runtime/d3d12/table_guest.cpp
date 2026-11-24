@@ -162,7 +162,11 @@ std::string run(const wchar_t* requested, bool) {
     alignas(256) std::array<BYTE, 256> backing{};
     D3D12_RESOURCE_DESC tex{};
     tex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    tex.Width = tex.Height = tex.DepthOrArraySize = tex.MipLevels = tex.SampleDesc.Count = 1;
+    tex.Width = 1;
+    tex.Height = 1;
+    tex.DepthOrArraySize = 1;
+    tex.MipLevels = 1;
+    tex.SampleDesc.Count = 1;
     tex.Format = DXGI_FORMAT_R32_FLOAT;
     tex.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(256);
     ComPtr<ID3D12Resource> placed;

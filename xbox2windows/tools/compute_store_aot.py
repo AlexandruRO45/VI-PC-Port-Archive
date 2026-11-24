@@ -29,6 +29,10 @@ ALU = {
     "v_min3_u32": "min(min({0}, {1}), {2})",
     "v_ashrrev_i32_e32": INTEGER["ashrrev_i32"][1],
     "v_sub_nc_u32_e32": "({0} - {1})",
+    # v_add_nc_i32 and v_sub_nc_i32 (VOP3, RDNA2 ISA: D.i = S0.i + S1.i; D.i = S0.i - S1.i)
+    # wrap modulo 2^32 without carry-out; clamp is refused.
+    "v_add_nc_i32": "({0} + {1})",
+    "v_sub_nc_i32": "({0} - {1})",
     # v_med3_u32 and v_med3_i32 (VOP3) are the median of src0, src1 and src2, compared unsigned or signed.
     "v_med3_u32": "max(min({0}, {1}), min(max({0}, {1}), {2}))",
     "v_med3_i32": "asuint(max(min(asint({0}), asint({1})), min(max(asint({0}), asint({1})), asint({2}))))",
@@ -74,6 +78,17 @@ F32_HELPERS = {
     name: f"uint f32_{name}(uint a, uint b) {{ precise float r = asfloat(a) {op} asfloat(b); return asuint(r); }}\n"
     for name, op in (("add", "+"), ("sub", "-"), ("mul", "*"))
 }
+# v_cvt_u32_f32_e32 D, S0 (VOP1 opcode 0x06 of the RDNA 2 ISA guide):
+#   if (isnan(S0.f)) D.u = 0;
+#   else if (S0.f <= 0.0) D.u = 0;
+#   else if (S0.f >= 4294967296.0) D.u = 0xffffffff;
+#   else D.u = (uint)trunc(S0.f);
+# Clamp finite values to 2^32 - 256 (0x4f7fffff, the largest binary32 below 2^32) before uint()
+# so even speculatively evaluated casts stay in range.
+CVT_U32_F32_HELPER = (
+    "uint cvt_u32_f32(uint bits) { float x = asfloat((bits & 0x7fffffffu) > 0x7f800000u ? 0u : bits); "
+    "float finite = clamp(x, 0.0f, 4294967040.0f); return x >= 4294967296.0f ? 0xffffffffu : uint(finite); }\n"
+)
 # The inline float constants of the encoding, as LLVM prints them, and the bits they hold.
 FLOAT_INLINE = {
     "0.5": 0x3f000000, "-0.5": 0xbf000000, "1.0": 0x3f800000, "-1.0": 0xbf800000, "2.0": 0x40000000,
@@ -1318,6 +1333,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if len(expression) > ALU_EXPRESSION_LIMIT:
                 raise ValueError("ALU expression too large")
             vector[dst] = ("alu", expression)
+        elif m := re.fullmatch(rf"v_cvt_u32_f32_e32 v(\d+), {FLOAT_SOURCE}", line):
+            dst = int(m[1])
+            if dst > 255:
+                raise ValueError("Invalid vector destination")
+            token = m[2]
+            word = FLOAT_INLINE.get(token) if "." in token else alu_word(token, scalar, vector, pending)
+            if word is None:
+                raise ValueError("Unverified float operand")
+            expression = f"cvt_u32_f32({hlsl_word(word)})"
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_or_b32_dpp v(\d+), v(\d+), v(\d+) quad_perm:\[([0-3]),([0-3]),([0-3]),([0-3])\] row_mask:0xf bank_mask:0xf", line):
             dst, src0, src1 = map(int, m.groups()[:3])
             # This lowering indexes the guest's logical 1D quad through group-shared memory.
@@ -1346,7 +1373,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                  f"    uint {value} = {source} | {hlsl_word(values[1])};"))
             vector[dst] = ("alu", value)
         elif ((m := re.fullmatch(rf"(v_(?:and_b32|lshrrev_b32|min_u32|max_u32|add_nc_u32|or_b32|xor_b32|lshlrev_b32|ashrrev_i32|sub_nc_u32|subrev_nc_u32)_e32) v(\d+), {ALU_SOURCE}, (v\d+)", line))
-              or (m := re.fullmatch(rf"(v_mul_lo_u32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
+              or (m := re.fullmatch(rf"(v_mul_lo_u32|v_add_nc_i32|v_sub_nc_i32) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}", line))
               or (m := re.fullmatch(rf"(v_mad_u32_u24|v_xor3_b32|v_max3_u32|v_min3_u32|v_med3_u32|v_med3_i32|v_mad_i32_i24) v(\d+), {ALU_SOURCE}, {ALU_SOURCE}, {ALU_SOURCE}", line))
               and None not in [alu_word(token, scalar, vector, pending) for token in m.groups()[2:]]):
             # VOP2 takes a VGPR as src1. A v_mad_u32_u24 with an address operand is a row pitch below.
@@ -1885,6 +1912,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         local += ", uint gindex : SV_GroupIndex"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
+    if "cvt_u32_f32(" in body:
+        cbuffer += CVT_U32_F32_HELPER
     uav_texel_type = image_atomic_type or ("float4" if rgba32_float_image else "uint4")
     uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
     return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"

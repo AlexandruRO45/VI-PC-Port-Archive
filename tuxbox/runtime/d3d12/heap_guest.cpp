@@ -22,7 +22,8 @@ struct VolumeCopy {
         desc.Width = width;
         desc.Height = height;
         desc.DepthOrArraySize = depth;
-        desc.MipLevels = desc.SampleDesc.Count = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
         desc.Format = DXGI_FORMAT_R32_UINT;
         check(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
                                               nullptr, IID_PPV_ARGS(&texture)), "create volume texture");
@@ -101,7 +102,10 @@ std::string run(const wchar_t* requested, bool) {
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     desc.Alignment = alignment;
     desc.Width = sizeof(UINT) * words;
-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     constexpr auto initial = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -136,7 +140,9 @@ std::string run(const wchar_t* requested, bool) {
     scanout.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     scanout.Width = 3840;
     scanout.Height = 2160;
-    scanout.DepthOrArraySize = scanout.MipLevels = scanout.SampleDesc.Count = 1;
+    scanout.DepthOrArraySize = 1;
+    scanout.MipLevels = 1;
+    scanout.SampleDesc.Count = 1;
     scanout.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
     scanout.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     ComPtr<ID3D12Resource> back;

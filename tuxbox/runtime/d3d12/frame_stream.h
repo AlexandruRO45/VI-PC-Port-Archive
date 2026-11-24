@@ -3,10 +3,17 @@
 #include "frame_abi.h"
 
 namespace frame_abi {
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 template <typename T> struct alignas(void *) Part {
   UINT tag;
   T payload;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 struct RasterPipelineStream {
   Part<UINT> flags{20, 0};
   Part<ID3D12RootSignature *> root{0, nullptr};

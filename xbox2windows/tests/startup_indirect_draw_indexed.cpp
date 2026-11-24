@@ -5,6 +5,8 @@
 #include <wrl/client.h>
 
 #include "desktop_gpu.h"
+#include "startup_indirect_mesh_mesh.h"
+#include "startup_indirect_mesh_pixel.h"
 
 #include <array>
 #include <cstdint>
@@ -50,6 +52,16 @@ void write_one_triangle() {
 [numthreads(1, 1, 1)]
 void write_two_triangles() {
     data.Store4(4, uint4(6, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_one_mesh_group() {
+    data.Store3(4, uint3(1, 1, 1));
+}
+
+[numthreads(1, 1, 1)]
+void write_two_mesh_groups() {
+    data.Store3(4, uint3(2, 1, 1));
 }
 
 struct Varying {
@@ -132,13 +144,13 @@ struct alignas(void*) Subobject {
     T value{};
 };
 
-ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Stage>
+ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root,
+                               D3D12_SHADER_BYTECODE source, D3D12_SHADER_BYTECODE pixel)
 {
-    const auto vs = compile("vertex", "vs_5_0");
-    const auto ps = compile("pixel", "ps_5_0");
     struct {
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root;
-        Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+        Subobject<Stage, D3D12_SHADER_BYTECODE> source;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> raster;
         Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth;
@@ -148,8 +160,8 @@ ComPtr<IUnknown> guest_pipeline(ID3D12Device* guest, ID3D12RootSignature* root)
     } stream;
     static_assert(sizeof(stream) == 16 + 24 + 24 + 48 + 56 + 8 + 40 + 16);
     stream.root.value = root;
-    stream.vs.value = {vs->GetBufferPointer(), vs->GetBufferSize()};
-    stream.ps.value = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    stream.source.value = source;
+    stream.ps.value = pixel;
     stream.raster.value.FillMode = D3D12_FILL_MODE_SOLID;
     stream.raster.value.CullMode = D3D12_CULL_MODE_NONE;
     stream.raster.value.DepthClipEnable = TRUE;
@@ -224,16 +236,36 @@ void submit(ID3D12Device* device, ID3D12GraphicsCommandList* list)
 }
 
 enum class Refusal { none, invalid_index, short_argument, missing_viewport };
+enum class DrawKind { indexed, vertices, mesh };
+
+constexpr UINT command_stride(DrawKind kind)
+{
+    switch (kind) {
+    case DrawKind::indexed: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+    case DrawKind::vertices: return sizeof(D3D12_DRAW_ARGUMENTS);
+    case DrawKind::mesh: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+    }
+    return 0;
+}
+
+bool supports_mesh(ID3D12Device* device)
+{
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 options{};
+    return SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &options, sizeof(options))) &&
+        options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
+}
 
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
-         bool indexed, bool draw_right, Refusal refusal, const char* label)
+         DrawKind kind, bool draw_right, Refusal refusal, const char* label)
 {
+    const bool indexed = kind == DrawKind::indexed;
+    const bool mesh = kind == DrawKind::mesh;
     const UINT index_bytes = indexed ? (draw_right ? sizeof(wide_indices) : sizeof(indices)) : 0;
     const UINT index_offset = 2 * (draw_right ? sizeof(std::uint32_t) : sizeof(std::uint16_t));
     const void* index_data = draw_right ? static_cast<const void*>(wide_indices.data()) : indices.data();
     Words initial_words = initial;
-    if (!indexed) initial_words[5] = 0x3c3c3c3c; // Guard immediately after the four-word Draw record.
+    if (!indexed) initial_words[1 + command_stride(kind) / sizeof(std::uint32_t)] = 0x3c3c3c3c;
     const PlacedBuffer arguments(device, guest, sizeof(initial_words), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
     std::optional<PlacedBuffer> index_buffer;
     if (indexed) index_buffer.emplace(device, guest, index_bytes, D3D12_RESOURCE_FLAG_NONE);
@@ -302,7 +334,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     slot<Targets>(wrapped, 50)(wrapped, 1, &rtv, FALSE, nullptr);
     slot<Bind>(wrapped, 25)(wrapped, graphics);
     slot<Bind>(wrapped, 34)(wrapped, graphics_root);
-    slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (!mesh) slot<Topology>(wrapped, 20)(wrapped, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
     if (index_buffer) {
@@ -312,9 +344,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                                          draw_right ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT};
         slot<Index>(wrapped, 47)(wrapped, &view);
     }
-    const auto record_bytes = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
     const UINT64 offset = refusal == Refusal::short_argument
-        ? sizeof(initial_words) - record_bytes + sizeof(std::uint32_t) : argument_offset;
+        ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : argument_offset;
     slot<Execute>(wrapped, 61)(wrapped, signature, 1, arguments.wrapped.Get(), offset, nullptr, 0);
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(wrapped, 9)(wrapped), "close guest command list");
     submit(device, list);
@@ -329,6 +360,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         expected[1] = !indexed && draw_right ? 6 : 3;
         expected[2] = 1;
         if (indexed) expected[3] = draw_right ? 4 : 1;
+        if (mesh) {
+            expected[1] = draw_right ? 2 : 1;
+            expected[3] = 1;
+        }
     }
     for (std::size_t i = 0; i < expected.size(); ++i) {
         if (observed[i] == expected[i]) continue;
@@ -374,8 +409,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
 
 int main(int argc, char** argv) try
 {
-    if (argc != 2 && (argc != 3 || std::strcmp(argv[2], "draw") != 0)) return 2;
-    const bool indexed = argc == 2;
+    DrawKind kind = DrawKind::indexed;
+    if (argc == 3 && std::strcmp(argv[2], "draw") == 0) kind = DrawKind::vertices;
+    else if (argc == 3 && std::strcmp(argv[2], "mesh") == 0) kind = DrawKind::mesh;
+    else if (argc != 2) return 2;
+    const bool indexed = kind == DrawKind::indexed;
+    const bool mesh = kind == DrawKind::mesh;
     const bool warp = std::strcmp(argv[1], "warp") == 0;
     if (!warp && std::strcmp(argv[1], "hardware") != 0) return 2;
     ComPtr<ID3D12Debug> debug;
@@ -390,12 +429,18 @@ int main(int argc, char** argv) try
     } else {
         for (UINT index = 0;; ++index) {
             const HRESULT hr = factory->EnumAdapters1(index, adapter.ReleaseAndGetAddressOf());
-            if (hr == DXGI_ERROR_NOT_FOUND) return 77;
+            if (hr == DXGI_ERROR_NOT_FOUND) {
+                std::puts("indirect graphics capability skip: no compatible physical adapter");
+                return 77;
+            }
             check(hr, "enumerate physical adapters");
             DXGI_ADAPTER_DESC1 desc{};
             check(adapter->GetDesc1(&desc), "get physical adapter description");
-            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-                SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device), nullptr))) break;
+            const bool basic_render_driver = desc.VendorId == 0x1414 && desc.DeviceId == 0x008c;
+            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) || basic_render_driver) continue;
+            ComPtr<ID3D12Device> probe;
+            if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&probe))) &&
+                (!mesh || supports_mesh(probe.Get()))) break;
         }
     }
     DXGI_ADAPTER_DESC1 desc{};
@@ -408,6 +453,10 @@ int main(int argc, char** argv) try
 
     ComPtr<ID3D12Device> device, guest;
     check(D3D12XboxCreateDevice(adapter.Get(), nullptr, IID_PPV_ARGS(&device)), "create desktop device through d3d12_xs");
+    if (mesh && !supports_mesh(device.Get())) {
+        std::puts("indirect mesh capability skip: mesh shaders unavailable");
+        return 77;
+    }
     check(SetEnvironmentVariableA("X2W_D3D12_PERMISSIVE", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable guest");
     check(SetEnvironmentVariableA("X2W_D3D12_LIST_NOOP", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable guest list");
     check(SetEnvironmentVariableA("X2W_D3D12_RENDER", "1") ? S_OK : HRESULT_FROM_WIN32(GetLastError()), "enable recording");
@@ -417,25 +466,46 @@ int main(int argc, char** argv) try
     if (debug) check(device.As(&info), "get debug message queue");
     const D3D12_ROOT_PARAMETER uav{D3D12_ROOT_PARAMETER_TYPE_UAV, {}, D3D12_SHADER_VISIBILITY_ALL};
     const D3D12_ROOT_SIGNATURE_DESC writer_desc{1, &uav, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    const auto root_flags = mesh ? D3D12_ROOT_SIGNATURE_FLAG_NONE : D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    const D3D12_ROOT_SIGNATURE_DESC graphics_desc{0, nullptr, 0, nullptr, root_flags};
     const auto writer = create_root(device.Get(), writer_desc);
     const auto graphics = create_root(guest.Get(), graphics_desc);
-    const auto left = writer_pipeline(device.Get(), writer.Get(), indexed ? "write_left" : "write_one_triangle");
-    const auto right = writer_pipeline(device.Get(), writer.Get(), indexed ? "write_right" : "write_two_triangles");
-    const auto pso = guest_pipeline(guest.Get(), graphics.Get());
+    const char* left_entry = indexed ? "write_left" : "write_one_triangle";
+    const char* right_entry = indexed ? "write_right" : "write_two_triangles";
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
-    const UINT stride = indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) : sizeof(D3D12_DRAW_ARGUMENTS);
-    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{stride, 1, &argument, 0};
+    ComPtr<IUnknown> pso;
+    if (mesh) {
+        left_entry = "write_one_mesh_group";
+        right_entry = "write_two_mesh_groups";
+        argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH;
+        pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS>(guest.Get(), graphics.Get(),
+            {startup_indirect_mesh_mesh, sizeof(startup_indirect_mesh_mesh)},
+            {startup_indirect_mesh_pixel, sizeof(startup_indirect_mesh_pixel)});
+    } else {
+        const auto vs = compile("vertex", "vs_5_0");
+        const auto ps = compile("pixel", "ps_5_0");
+        pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(guest.Get(), graphics.Get(),
+            {vs->GetBufferPointer(), vs->GetBufferSize()}, {ps->GetBufferPointer(), ps->GetBufferSize()});
+    }
+    const auto left = writer_pipeline(device.Get(), writer.Get(), left_entry);
+    const auto right = writer_pipeline(device.Get(), writer.Get(), right_entry);
+    const D3D12_COMMAND_SIGNATURE_DESC signature_desc{command_stride(kind), 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
     check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest draw signature");
 
     const auto verify = [&](ID3D12PipelineState* producer, bool draw_right, Refusal refusal, const char* label) {
         return run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
-                   indexed, draw_right, refusal, label);
+                   kind, draw_right, refusal, label);
     };
-    if (!verify(left.Get(), false, Refusal::none, indexed ? "left writer" : "one triangle") ||
-        !verify(right.Get(), true, Refusal::none, indexed ? "right writer" : "two triangles") ||
+    const char* left_label = indexed ? "left writer" : "one triangle";
+    const char* right_label = indexed ? "right writer" : "two triangles";
+    if (mesh) {
+        left_label = "one mesh group";
+        right_label = "two mesh groups";
+    }
+    if (!verify(left.Get(), false, Refusal::none, left_label) ||
+        !verify(right.Get(), true, Refusal::none, right_label) ||
         !verify(nullptr, false, Refusal::none, "omitted writer") ||
         !verify(left.Get(), false, Refusal::short_argument, "short argument range")) return 1;
     if (indexed ? !verify(left.Get(), false, Refusal::invalid_index, "invalid index range")

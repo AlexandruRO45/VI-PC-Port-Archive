@@ -168,7 +168,7 @@ static void run(int argc, wchar_t **argv) {
     std::printf("retail=%zu offset=%llu ", expected.size(), offset);
     return;
   }
-  std::fill(out.begin(), out.end(), 0xa5);
+  std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   r.options = 0;
   r.offset = 0;
   r.size = 16;
@@ -178,7 +178,7 @@ static void run(int argc, wchar_t **argv) {
   check(wait_status(status.Get(), 1), "raw read");
   require(std::equal(expected.begin(), expected.end(), out.begin() + 1),
           "raw bytes");
-  std::fill(out.begin(), out.end(), 0xa5);
+  std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   q->EnqueueRequest(&r);
   q->CancelRequestsWithTag(~UINT64(0), 17);
   q->EnqueueStatus(status.Get(), 0);
@@ -219,7 +219,7 @@ static void run(int argc, wchar_t **argv) {
   require(count == 0 && kind == UINT32_MAX, "cleared first failure");
   CloseHandle(event);
   check(f->OpenFile(file, IID_PPV_ARGS(&source)), "reopen file");
-  std::fill(out.begin(), out.end(), 0xa5);
+  std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   r.file = source.Get();
   q->EnqueueRequest(&r);
   q->Submit();
@@ -231,7 +231,7 @@ static void run(int argc, wchar_t **argv) {
   ComPtr<Queue> memory;
   QueueDesc mem_desc{1, 0x80, 2, "Memory queue"};
   check(f->CreateQueue(&mem_desc, IID_PPV_ARGS(&memory)), "memory queue");
-  std::fill(out.begin(), out.end(), 0xa5);
+  std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   r.options = (UINT64(1) << 22) | 1;
   r.file =
       reinterpret_cast<IUnknown *>(const_cast<unsigned char *>(compressed));
@@ -244,7 +244,7 @@ static void run(int argc, wchar_t **argv) {
               out.front() == 0xa5 && out.back() == 0xa5,
           "memory bytes and guards");
   r.capacity = 4;
-  std::fill(out.begin(), out.end(), 0xa5);
+  std::fill(out.begin(), out.end(), static_cast<unsigned char>(0xa5));
   memory->EnqueueRequest(&r);
   memory->EnqueueStatus(status.Get(), 2);
   memory->Close();

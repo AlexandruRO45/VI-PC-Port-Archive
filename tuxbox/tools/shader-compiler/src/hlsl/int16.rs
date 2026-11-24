@@ -14,6 +14,12 @@ enum Operation {
     ArithmeticShiftRight,
     SignedMax,
     SignedMin,
+    UnsignedMin3,
+    UnsignedMax3,
+    UnsignedMed3,
+    SignedMin3,
+    SignedMax3,
+    SignedMed3,
 }
 
 pub(super) fn half(src: &Opnd, select: u32) -> Result<String, String> {
@@ -27,7 +33,9 @@ pub(super) fn half(src: &Opnd, select: u32) -> Result<String, String> {
 
 pub(super) fn new_half(ins: &Insn) -> bool {
     ins.enc == Enc::Vop3 && matches!(ins.mnemonic.as_str(),
-        "v_mul_lo_u16" | "v_max_u16" | "v_min_u16")
+        "v_mul_lo_u16" | "v_max_u16" | "v_min_u16" | "v_add_nc_i16" | "v_sub_nc_i16"
+        | "v_mad_u16" | "v_mad_i16" | "v_min3_u16" | "v_max3_u16" | "v_med3_u16"
+        | "v_min3_i16" | "v_max3_i16" | "v_med3_i16")
 }
 
 pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
@@ -35,10 +43,11 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         return Ok(None);
     }
     let op = match ins.mnemonic.as_str() {
-        "v_add_nc_u16" | "v_pk_add_u16" | "v_pk_add_i16" => Operation::Add,
-        "v_sub_nc_u16" | "v_pk_sub_i16" | "v_pk_sub_u16" => Operation::Subtract,
+        // Without clamp the signed and unsigned forms have the same low 16 bits.
+        "v_add_nc_u16" | "v_add_nc_i16" | "v_pk_add_u16" | "v_pk_add_i16" => Operation::Add,
+        "v_sub_nc_u16" | "v_sub_nc_i16" | "v_pk_sub_i16" | "v_pk_sub_u16" => Operation::Subtract,
         "v_mul_lo_u16" | "v_pk_mul_lo_u16" => Operation::Multiply,
-        "v_pk_mad_i16" | "v_pk_mad_u16" => Operation::MultiplyAdd,
+        "v_mad_u16" | "v_mad_i16" | "v_pk_mad_i16" | "v_pk_mad_u16" => Operation::MultiplyAdd,
         "v_max_u16" | "v_pk_max_u16" => Operation::UnsignedMax,
         "v_min_u16" | "v_pk_min_u16" => Operation::UnsignedMin,
         "v_lshlrev_b16" | "v_pk_lshlrev_b16" => Operation::ShiftLeft,
@@ -46,12 +55,19 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
         "v_ashrrev_i16" | "v_pk_ashrrev_i16" => Operation::ArithmeticShiftRight,
         "v_max_i16" | "v_pk_max_i16" => Operation::SignedMax,
         "v_min_i16" | "v_pk_min_i16" => Operation::SignedMin,
+        "v_min3_u16" => Operation::UnsignedMin3,
+        "v_max3_u16" => Operation::UnsignedMax3,
+        "v_med3_u16" => Operation::UnsignedMed3,
+        "v_min3_i16" => Operation::SignedMin3,
+        "v_max3_i16" => Operation::SignedMax3,
+        "v_med3_i16" => Operation::SignedMed3,
         _ => return Ok(None),
     };
     let packed = ins.op >= 0x400;
     let new_packed = matches!(ins.mnemonic.as_str(),
         "v_pk_add_i16" | "v_pk_mad_i16" | "v_pk_mad_u16" | "v_pk_max_u16" | "v_pk_min_u16");
-    let arity = if matches!(op, Operation::MultiplyAdd) { 3 } else { 2 };
+    let arity = if matches!(op, Operation::MultiplyAdd | Operation::UnsignedMin3 | Operation::UnsignedMax3
+        | Operation::UnsignedMed3 | Operation::SignedMin3 | Operation::SignedMax3 | Operation::SignedMed3) { 3 } else { 2 };
     if !ins.is_complete() || ins.raw.len() < 2 || ins.src.len() < arity {
         return Err("incomplete 16-bit integer instruction".into());
     }
@@ -97,7 +113,10 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
                     }
                     _ => unreachable!("signed clamp arithmetic"),
                 };
-                return Ok(format!("asuint(clamp({value}, -32768, 32767))"));
+                // Keep the saturated representation unsigned before packing. The
+                // sign-biased ordering is exactly the signed ordering, but
+                // avoids narrow signed intermediates in the host optimizer.
+                return Ok(format!("(clamp((asuint({value}) ^ 0x80000000u), 0x7fff8000u, 0x80007fffu) ^ 0x80000000u)"));
             }
             // 65535*65535+65535 fits in uint32, and unsigned subtract
             // must clamp at zero before any modular underflow.
@@ -131,6 +150,18 @@ pub(super) fn expression(ins: &Insn) -> Result<Option<String>, String> {
             Operation::ArithmeticShiftRight => format!("asuint({} >> ({a} & 15u))", signed(&b)),
             Operation::SignedMax => format!("asuint(max({}, {}))", signed(&a), signed(&b)),
             Operation::SignedMin => format!("asuint(min({}, {}))", signed(&a), signed(&b)),
+            Operation::UnsignedMin3 | Operation::UnsignedMax3 | Operation::UnsignedMed3
+            | Operation::SignedMin3 | Operation::SignedMax3 | Operation::SignedMed3 => {
+                let c = half(&ins.src[2], (selectors >> 2) & 1)?;
+                let signed_op = matches!(op, Operation::SignedMin3 | Operation::SignedMax3 | Operation::SignedMed3);
+                let (a, b, c) = if signed_op { (signed(&a), signed(&b), signed(&c)) } else { (a, b, c) };
+                let value = match op {
+                    Operation::UnsignedMin3 | Operation::SignedMin3 => format!("min(min({a}, {b}), {c})"),
+                    Operation::UnsignedMax3 | Operation::SignedMax3 => format!("max(max({a}, {b}), {c})"),
+                    _ => format!("max(min({a}, {b}), min(max({a}, {b}), {c}))"),
+                };
+                if signed_op { format!("asuint({value})") } else { value }
+            }
         })
     };
     let lo = result(w0 >> 11)?;
@@ -176,6 +207,45 @@ mod tests {
     }
 
     #[test]
+    fn new_16_bit_forms_select_halves_and_preserve_the_other_half() {
+        let decode = |a: u32, b: u32| {
+            let bytes: Vec<u8> = [a, b].iter().flat_map(|v| v.to_le_bytes()).collect();
+            disassemble(&bytes).remove(0)
+        };
+        // LLVM gfx1030 words for `v7, v4, v5[, v6]` without op_sel.
+        for (first, second, name) in [
+            (0xd70d_0007u32, 0x0202_0b04u32, "v_add_nc_i16"),
+            (0xd70e_0007, 0x0202_0b04, "v_sub_nc_i16"),
+            (0xd740_0007, 0x041a_0b04, "v_mad_u16"),
+            (0xd75e_0007, 0x041a_0b04, "v_mad_i16"),
+            (0xd752_0007, 0x041a_0b04, "v_min3_i16"),
+            (0xd753_0007, 0x041a_0b04, "v_min3_u16"),
+            (0xd755_0007, 0x041a_0b04, "v_max3_i16"),
+            (0xd756_0007, 0x041a_0b04, "v_max3_u16"),
+            (0xd758_0007, 0x041a_0b04, "v_med3_i16"),
+            (0xd759_0007, 0x041a_0b04, "v_med3_u16"),
+        ] {
+            let ins = decode(first, second);
+            assert_eq!(ins.mnemonic, name);
+            assert!(new_half(&ins), "{name}");
+            let low = expression(&ins).unwrap().unwrap();
+            assert!(low.contains("v7 & 0xffff0000u") && low.contains("(v4 & 0xffffu)"), "{name}: {low}");
+            // op_sel source 0 high and destination high.
+            let high = expression(&decode(first | 0x4800, second)).unwrap().unwrap();
+            assert!(high.contains("v7 & 0xffffu") && high.contains("(v4 >> 16)"), "{name}: {high}");
+            if name.ends_with("_i16") && !name.contains("_nc_") && !name.starts_with("v_mad") {
+                assert!(low.contains("asint("), "{name} compares signed");
+            }
+            assert!(expression(&decode(first | 0x8000, second)).is_err(), "{name} clamp");
+            assert!(expression(&decode(first, (second & !511) | 4)).is_err(), "{name} sgpr");
+            assert!(expression(&decode(first | 0x100, second)).is_err(), "{name} abs");
+        }
+        // Source 2 selection for three-operand forms.
+        let med = expression(&decode(0xd759_2007, 0x041a_0b04)).unwrap().unwrap();
+        assert!(med.contains("(v6 >> 16)"));
+    }
+
+    #[test]
     fn new_packed_integer_forms_accept_ordinary_sources_only() {
         // LLVM gfx1030 native words. The default high selectors include
         // source 2 via dword0 bit 14 for the three-operand forms.
@@ -196,7 +266,11 @@ mod tests {
             if matches!(name, "v_pk_max_u16" | "v_pk_min_u16") {
                 assert!(expression(&native(first | 0x8000, second)).is_err());
             } else {
-                assert!(expression(&native(first | 0x8000, second)).unwrap().is_some());
+                let clamped = expression(&native(first | 0x8000, second)).unwrap().unwrap();
+                if name.ends_with("_i16") {
+                    assert!(clamped.contains("0x7fff8000u, 0x80007fffu"));
+                    assert!(clamped.contains("^ 0x80000000u"));
+                }
             }
             assert!(expression(&native(first | 0x8000, (second & !511) | 4)).is_err());
             assert!(expression(&native(first, (second & !511) | 4)).is_err());
