@@ -102,6 +102,19 @@ class SmokeBlockTests(unittest.TestCase):
         self.assertIn("the PR's regression run (`xcl-smoke` block of commit 1234567890) "
                       "has a non-numeric `frames shown`: many", problems)
 
+    def test_zero_baseline_frames_fail_the_comparison(self):
+        baseline = "title: G\nseconds: 60\ndevice removals: 0\ncrashes: 0\n"
+        for frames in (0, 100):
+            with self.subTest(pr_frames=frames):
+                problems = self.smoke_problems(
+                    baseline + "frames shown: 0 (PresentX 0)\n",
+                    baseline + f"frames shown: {frames}\n",
+                )
+                self.assertEqual(
+                    ["the main regression run shows zero frames; rerun it with a title that presents frames"],
+                    problems,
+                )
+
 
 class TemplatePlaceholderTests(unittest.TestCase):
     def test_untouched_pr_template_fails_all_required_sections(self):
