@@ -26,7 +26,7 @@ pub fn host_texture(
 ) -> Option<(ID3D12Resource, u32)> {
     let host = crate::list::host_list(list)?;
     let texture = crate::resource::host_resource(resource)?.clone();
-    crate::list::ensure_state(host, resource, state);
+    crate::list::ensure_state(&host, resource, state);
     let state = crate::host::legal_state(&texture, state);
     Some((texture, state))
 }
