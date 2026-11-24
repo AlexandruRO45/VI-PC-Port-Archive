@@ -122,6 +122,15 @@ impl<'a> Container<'a> {
             if FourCC::KNOWN.contains(&fourcc) && parts.iter().any(|p: &Part| p.fourcc == fourcc) {
                 return Err(ShaderError::Malformed("a part listed twice"));
             }
+            // A part whose bytes another part also claims reads that part's
+            // header or data as its own; DXC lays parts end to end.
+            let end = offset + 8 + size;
+            if parts
+                .iter()
+                .any(|p: &Part| offset < p.offset + 8 + p.data.len() && p.offset < end)
+            {
+                return Err(ShaderError::Malformed("two parts overlap"));
+            }
             parts.push(Part {
                 fourcc,
                 offset,
@@ -268,6 +277,38 @@ mod tests {
         // The first byte after the table is where parts start.
         let c = Container::parse(&bytes).unwrap();
         assert_eq!(c.parts[0].offset, HEADER_SIZE + 8);
+    }
+
+    #[test]
+    fn overlapping_parts_are_refused() {
+        // A title's own FourCC first, so the same offset twice is not
+        // refused as a known part listed twice.
+        let own = FourCC(*b"PRIV");
+        let bytes = build(&[(own, &[0; 8]), (FourCC::HASH, &[0; 4])]);
+        let first = HEADER_SIZE as u32 + 8;
+        let second = first + 16;
+        // The second part starting inside the first's header, inside its
+        // data, or on its very offset.
+        for offset in [first, first + 4, first + 8] {
+            let mut bad = bytes.clone();
+            bad[0x24..0x28].copy_from_slice(&offset.to_le_bytes());
+            assert_eq!(malformed(&bad), "two parts overlap", "offset {offset:#x}");
+        }
+        // The first part's size growing over the second's header.
+        let mut grown = bytes.clone();
+        grown[first as usize + 4..first as usize + 8].copy_from_slice(&9u32.to_le_bytes());
+        assert_eq!(malformed(&grown), "two parts overlap");
+        // Listed in reverse order, end to end, the parts still parse.
+        let mut swapped = bytes.clone();
+        swapped[0x20..0x24].copy_from_slice(&second.to_le_bytes());
+        swapped[0x24..0x28].copy_from_slice(&first.to_le_bytes());
+        let c = Container::parse(&swapped).unwrap();
+        assert_eq!(c.parts[0].fourcc, FourCC::HASH);
+        assert_eq!(c.parts[1].fourcc, own);
+        // A gap between parts is not an overlap.
+        let mut gap = bytes.clone();
+        gap[first as usize + 4..first as usize + 8].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(Container::parse(&gap).unwrap().parts[0].data.len(), 4);
     }
 
     #[test]
