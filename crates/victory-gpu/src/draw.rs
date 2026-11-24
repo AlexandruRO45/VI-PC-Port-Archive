@@ -133,16 +133,24 @@ fn frame_limit() -> usize {
 struct FrameTrace {
     head: Vec<String>,
     tail: std::collections::VecDeque<String>,
-    skipped: u64,
+    skipped: usize,
+    next_id: usize,
 }
 
 #[cfg(any(test, feature = "diagnostics"))]
 impl FrameTrace {
     const fn new() -> Self {
-        Self { head: Vec::new(), tail: std::collections::VecDeque::new(), skipped: 0 }
+        Self {
+            head: Vec::new(),
+            tail: std::collections::VecDeque::new(),
+            skipped: 0,
+            next_id: 0,
+        }
     }
 
-    fn push(&mut self, line: String, limit: usize) {
+    fn push(&mut self, line: String, limit: usize) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
         let head = limit.div_ceil(2);
         let tail = limit - head;
         if self.head.len() < head {
@@ -156,16 +164,22 @@ impl FrameTrace {
             }
             self.tail.push_back(line);
         }
+        id
     }
 
-    /// The draw pushed last, if it was kept.
-    fn last_mut(&mut self) -> Option<&mut String> {
-        if !self.tail.is_empty() {
-            self.tail.back_mut()
-        } else if self.skipped == 0 {
-            self.head.last_mut()
+    /// Marks a retained draw by its recording ID. IDs survive take() so
+    /// failures reported late cannot be assigned to a later frame.
+    fn mark_dropped(&mut self, id: usize) {
+        let tail_start = self.next_id - self.tail.len();
+        let head_start = tail_start - self.skipped - self.head.len();
+        let line = if id < tail_start {
+            id.checked_sub(head_start)
+                .and_then(|i| self.head.get_mut(i))
         } else {
-            None
+            self.tail.get_mut(id - tail_start)
+        };
+        if let Some(line) = line {
+            line.push_str(" DROPPED");
         }
     }
 
@@ -193,12 +207,15 @@ pub(crate) fn take_dropped() -> u64 {
 }
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Marks the last traced draw as not run on the host.
+/// Marks the traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped(pipeline: usize) {
+fn dropped(pipeline: usize, trace_id: Option<usize>) {
     crate::pipeline::note_drop(pipeline as This);
-    if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
-        last.push_str(" DROPPED");
+    if let Some(id) = trace_id {
+        FRAME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .mark_dropped(id);
     }
 }
 
@@ -668,7 +685,7 @@ impl State {
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
         #[cfg(feature = "diagnostics")]
-        self.trace("mesh", x, 0);
+        let trace_id = self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
@@ -684,7 +701,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 
@@ -849,10 +866,10 @@ impl State {
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
-    fn trace(&self, kind: &str, count: u32, first: u32) {
+    fn trace(&self, kind: &str, count: u32, first: u32) -> Option<usize> {
         static TRACED: AtomicU64 = AtomicU64::new(0);
         if !tracing::enabled!(tracing::Level::DEBUG) {
-            return;
+            return None;
         }
         let listed = crate::capture::listed(crate::queue::presented() + 1);
         let logged = listed || TRACED.fetch_add(1, Ordering::Relaxed) < 64;
@@ -879,7 +896,12 @@ impl State {
         if logged {
             tracing::debug!("draw {line}");
         }
-        FRAME.lock().unwrap_or_else(|e| e.into_inner()).push(line, frame_limit());
+        Some(
+            FRAME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line, frame_limit()),
+        )
     }
 
     /// What a draw's shaders read, one line per used resource (diagnostics
@@ -918,7 +940,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("draw", vertices, first);
+        let trace_id = self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
@@ -940,7 +962,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 
@@ -1009,7 +1031,7 @@ impl State {
         first_instance: u32,
     ) {
         #[cfg(feature = "diagnostics")]
-        self.trace("indexed", indices, first);
+        let trace_id = self.trace("indexed", indices, first);
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
@@ -1027,7 +1049,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            dropped(self.pipeline, trace_id);
         }
     }
 }
@@ -1322,21 +1344,36 @@ mod frame_trace_tests {
         assert!(t.take().is_empty());
     }
 
-    /// The draw pushed last is the one a drop is marked on, wherever it was
-    /// kept; one left out is not marked.
+
     #[test]
-    fn the_last_draw_is_the_one_marked() {
-        let mut t = FrameTrace::new();
-        t.push("a".into(), 2);
-        t.last_mut().unwrap().push_str(" DROPPED");
-        t.push("b".into(), 2);
-        t.push("c".into(), 2);
-        t.last_mut().unwrap().push_str(" DROPPED");
+    fn interleaved_failure_marks_the_draw_that_failed() {
+        let mut trace = FrameTrace::new();
+        let failed = trace.push("first".into(), 4);
+        trace.push("second".into(), 4);
+        trace.mark_dropped(failed);
+        assert_eq!(trace.take(), ["first DROPPED", "second"]);
+    }
+
+    #[test]
+    fn only_retained_draws_can_be_marked() {
+        let mut trace = FrameTrace::new();
+        let head = trace.push("a".into(), 2);
+        let evicted = trace.push("b".into(), 2);
+        let tail = trace.push("c".into(), 2);
+        trace.mark_dropped(head);
+        trace.mark_dropped(evicted);
+        trace.mark_dropped(tail);
         let skipped = format!("... 1 draws not kept here ({SKIP_HINT})");
-        assert_eq!(t.take(), ["a DROPPED", skipped.as_str(), "c DROPPED"]);
-        let mut one = FrameTrace::new();
-        one.push("x".into(), 1);
-        one.push("y".into(), 1);
-        assert!(one.last_mut().is_none());
+        assert_eq!(trace.take(), ["a DROPPED", skipped.as_str(), "c DROPPED"]);
+    }
+
+    #[test]
+    fn a_late_failure_keeps_the_next_frame_unchanged() {
+        let mut trace = FrameTrace::new();
+        let previous = trace.push("previous".into(), 2);
+        assert_eq!(trace.take(), ["previous"]);
+        trace.push("current".into(), 2);
+        trace.mark_dropped(previous);
+        assert_eq!(trace.take(), ["current"]);
     }
 }
