@@ -1176,7 +1176,19 @@ mod tests {
         assert_eq!(crate::dxbc::u32_at(psv0, 0).unwrap(), 52);
         #[cfg(windows)]
         {
-            validate_if_available(&cs.dxil);
+            // A validator older than 1.8 (DXC 1.7 and before) refuses the
+            // module's `dx.valver` 1.8 outright. Translated shaders never go
+            // through dxil.dll (they carry our container hash), so only this
+            // check depends on it.
+            let path = super::validator::Validator::default_path();
+            let version = super::validator::Validator::load(path.as_deref())
+                .ok()
+                .and_then(|v| v.version());
+            if version.is_some_and(|v| v < (1, 8)) {
+                eprintln!("dxil.dll validator {version:?} predates 1.8; validation skipped");
+            } else {
+                validate_if_available(&cs.dxil);
+            }
             if let Ok(host) = super::host::Host::new(false) {
                 host.compute_pipeline(&cs).unwrap();
             }
