@@ -729,7 +729,8 @@ impl<'a> Tracer<'a> {
 
     /// The location the pointer in `dynamic` was loaded from, when its
     /// `s_load`'s own address traces into the root constants (`hi` must be
-    /// the same load's high half). `extra`'s terms apply to what the
+    /// the same load's high half, through the masks and the carry of a
+    /// low-half add). `extra`'s terms apply to what the
     /// pointer points at, so they travel in [`Address::deref`]. One level:
     /// a pointer's location is itself never loaded. The pointer's value is
     /// read from the root constants as the title set them; masks on its
@@ -747,11 +748,7 @@ impl<'a> Tracer<'a> {
         let Some((load, low)) = self.shaped_load(v) else {
             return Ok(None);
         };
-        let high = match hi {
-            Term::Value(h) => self.shaped_load(h),
-            Term::Const(_) => None,
-        };
-        if low != 0 || high != Some((load, 1)) {
+        if low != 0 || !self.pointer_high(hi, load) {
             return Ok(None);
         }
         if depth != 0 {
@@ -812,6 +809,28 @@ impl<'a> Tracer<'a> {
             }
         }
         None
+    }
+
+    /// `hi` is the qword at `load`'s high half, through the masks on the
+    /// pointer's halves ([`Self::shaped_load`]) and the carry of the low
+    /// half's add (`s_addc_u32` adding nothing else: the bias is below
+    /// 4 GB, so its carry into the high half is one bit at most).
+    fn pointer_high(&self, hi: Term, load: Site) -> bool {
+        let Term::Value(mut v) = hi else {
+            return false;
+        };
+        loop {
+            if self.shaped_load(v) == Some((load, 1)) {
+                return true;
+            }
+            let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) else {
+                return false;
+            };
+            match (a, b) {
+                (Term::Value(w), Term::Const(0)) | (Term::Const(0), Term::Value(w)) => v = w,
+                _ => return false,
+            }
+        }
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
@@ -3418,6 +3437,71 @@ pub(crate) mod tests {
                 ((0, 5), biased),
                 ((0, 7), biased),
             ]
+        );
+    }
+
+    #[test]
+    fn a_bias_carrying_into_the_high_half_stays_a_pointer_chase() {
+        // The pointer's low half gains a constant whose add carries into the
+        // high half (s_add_u32 plus s_addc_u32, the compiler's 64-bit add):
+        // the carry only carries the bias, so both a scalar load and a
+        // global load through the pointer still chase the pointer the
+        // constants hold.
+        let words: Vec<u32> = s_load_dwordx2(4, 8, 0x10) // s[4:5] = the qword at dword 4
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0580, // s_addc_u32 s7, s5, 0 (the carry)
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let r = track_words(&words, &[param(Constants, 8, 8)], HwStage::Ps);
+        let chased = Address {
+            param: 0,
+            offset: 0x10,
+            dynamic: None,
+            deref: true,
+            bias: 8,
+        };
+        assert_eq!(
+            r.scalar,
+            [
+                ((0, 0), at(0, 0x10)),
+                ((0, 3), chased),
+                ((0, 5), chased),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pointer_whose_high_half_gains_a_constant_stays_refused() {
+        // The high half's s_addc_u32 may add nothing but the carry: a
+        // constant on it shifts the pointer by 4 GB, which the root view
+        // the host binds at the pointer's value cannot follow.
+        let code: Vec<u8> = s_load_dwordx2(4, 8, 0x10)
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0584, // s_addc_u32 s7, s5, 4
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                S_ENDPGM,
+            ])
+            .flat_map(|w: u32| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Constants, 8, 8)], HwStage::Ps, None).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 0x14, // the load through the pointer
+                what: "an address loaded from memory"
+            }
         );
     }
 }

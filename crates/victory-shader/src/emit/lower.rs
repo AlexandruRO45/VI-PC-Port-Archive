@@ -7732,4 +7732,75 @@ mod tests {
             "the pointer's dwords feed the root view"
         );
     }
+
+    /// The same binding, through a pointer biased by a constant whose add
+    /// carries into the high half (`s_add_u32` plus `s_addc_u32`, the
+    /// compiler's 64-bit add): the carry only carries the bias, so the root
+    /// view is bound where it was, for the scalar load and the flat load
+    /// alike.
+    #[test]
+    fn a_bias_carrying_into_the_high_half_binds_the_same_root_view() {
+        let words: Vec<u32> = [0x3D << 26 | 0x01 << 18 | 4 << 6, 125 << 25 | 0x10] // s_load_dwordx2 s[4:5], s[0:1], 0x10
+            .into_iter()
+            .chain([
+                0x8006_FF04, 8, // s_add_u32 s6, s4, 8
+                0x8207_0580, // s_addc_u32 s7, s5, 0 (the carry)
+                0xF408_0203,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7]
+                0x7E00_0280, // v_mov_b32 v0, 0
+                0xDC30_8000,
+                0x0106_0000, // global_load_dword v1, v0, s[6:7]
+                S_ENDPGM,
+            ])
+            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![crate::native::RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 8,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert_eq!(lowered.root_srvs, [0x500], "the pointer's root register");
+        assert_eq!(
+            lowered
+                .user_data
+                .iter()
+                .map(|u| (u.root, u.slot, u.index))
+                .collect::<Vec<_>>(),
+            [
+                (RootType::Constants, 0, 4),
+                (RootType::Constants, 0, 5),
+            ],
+            "the pointer's dwords feed the root view"
+        );
+    }
 }
