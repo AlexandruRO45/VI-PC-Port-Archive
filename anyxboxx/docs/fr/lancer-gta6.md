@@ -4,11 +4,33 @@
 
 Ce guide explique comment installer et lancer le projet, et tout ce qu'il faut installer pour refaire nos essais sur le build Xbox Series 1.0.2.1 de GTA VI, jusqu'au point où nous en sommes : la première cinématique. Il ne fournit pas le jeu et n'explique pas comment l'obtenir : vous apportez votre propre copie. Ne mettez jamais de fichier du jeu dans ce dépôt et ne les joignez à aucune issue.
 
-Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 ou ultérieure), suivi ici comme sous-module `third_party/victory`, épinglé sur la branche `anyxboxx/fork-7b0-lot5` du fork du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), qui assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) au commit `7b0f736` et sept de ses pull requests (voir plus bas), au commit `fd021bf`. Le script `tools/lancer_victory.ps1` le compile et le lance sur votre dossier du jeu.
+Le lancement passe par [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 ou ultérieure), suivi ici comme sous-module `third_party/victory`, épinglé sur la branche `anyxboxx/fork-7b0-lot8` du fork du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), qui assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) au commit `7b0f736` et huit de ses pull requests (voir plus bas), au commit `d138351`. Le script `tools/lancer_victory.ps1` le compile et le lance sur votre dossier du jeu.
 
-## Branche épinglée : fork plus sept pull requests (24 novembre, nuit)
+## Branche épinglée : lot 5 plus une pull request (25 novembre)
 
-`third_party/victory` pointe maintenant sur la branche `anyxboxx/fork-7b0-lot5` du fork VIctory du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `fd021bf26a7003749d668e5d9bf6b234bfab2e47`. Cette branche assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0, anciennement `fxceless/victory-gta6`) au commit `7b0f736` et sept de ses pull requests encore ouvertes, reprises avec `cherry-pick -x` :
+`third_party/victory` pointe maintenant sur la branche `anyxboxx/fork-7b0-lot8` du fork VIctory du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. C'est le lot 5 (plus bas) plus une pull request du fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), reprise avec `cherry-pick -x` :
+
+| Pull request du fork | Auteur | Effet | Commit |
+| --- | --- | --- | --- |
+| n°11 | cxchhh | Shaders : les paires de masques de lanes parqués à quelques instructions d'écart sont restaurées ; les lectures VGPR relatives gardent les lanes parqués | `d138351` (commit du fork `90228a7`) |
+
+Pourquoi : une capture PIX d'une image de cinématique montre que `IrradianceCache_Shade` et `IrradianceCache_ShadeSecondary` ne tournaient pas au lot 5 (0 dispatch). Leurs deux shaders ne se traduisaient pas (« a wave reduction where not every lane runs ») : le cache d'irradiance n'était donc jamais éclairé, et tout ce qui est hors de la lumière directe restait noir (côté ombré des visages, intérieurs). Avec le n°11, les deux shaders se traduisent et passent la validation DXIL, et leurs pipelines sont créés et liés en jeu.
+
+Mesuré ou observé par le mainteneur (Windows 11, RTX 4070 Super), avec les réglages du lanceur de `main` (`tools/lancer_victory.ps1`), d'après le journal VIctory et une capture PIX (essai du 25 novembre, vers 00:01 à 00:05) :
+
+- Lot 5 : capture PIX, 0 dispatch pour les deux passes du cache d'irradiance. Mesuré.
+- Lot 8 : les deux shaders se traduisent et valident, pipelines créés et liés en jeu. Observé.
+- Shaders non traduits : 6 au lieu de 9. Pipelines refusés par le pilote : 16, comme au lot 5. Mesuré.
+- 4,8 à 5,4 i/s, environ 6 550 draws par image, aucune perte du périphérique en environ 4 min 20. Mesuré.
+- Avis du mainteneur : « cette version est très bien ».
+
+Limites. L'issue n°75 du fork signale environ 80 refus de pipeline de plus sur une RTX 3070 : cela n'a pas été observé sur la 4070 Super, attendez-vous donc à plus de refus sur d'autres cartes. L'éclairage par ray tracing est toujours absent (le constructeur BVH reste coupé, environ 350 dispatches jetés par image). Avec le réglage `LATE_WAIT` du lanceur, certains murs de la première salle peuvent être transparents (issue n°168 du fork, correctifs en cours : n°191, n°206). La tenue longue n'est mesurée que sur environ 4 min 20.
+
+**Mettre à jour une copie existante.** L'URL du sous-module a changé avec la PR n°178 (constaté le 24 novembre). Dans une copie d'AnyXboxX qui a déjà le sous-module, lancez `git submodule sync third_party/victory` puis `git submodule update --init third_party/victory`. Les auteurs sont crédités dans [THIRD_PARTY.md](../../THIRD_PARTY.md).
+
+## Branche précédente : lot 5, fork plus sept pull requests (24 novembre, nuit)
+
+`third_party/victory` pointait sur la branche `anyxboxx/fork-7b0-lot5` du fork VIctory du mainteneur [LooperSalty/victory](https://github.com/LooperSalty/victory), au commit `fd021bf26a7003749d668e5d9bf6b234bfab2e47`. Cette branche assemble le fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0, anciennement `fxceless/victory-gta6`) au commit `7b0f736` et sept de ses pull requests encore ouvertes, reprises avec `cherry-pick -x` :
 
 | Pull request du fork | Auteur | Effet | Commit |
 | --- | --- | --- | --- |

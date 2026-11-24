@@ -89,6 +89,8 @@ mod screen_gather;
 mod reflection_far;
 mod sampler_heap;
 mod lane_reads;
+mod heap_offsets;
+mod heap_origins;
 use sampler_heap::DirectSampler;
 mod reflection_probe;
 mod wave_scan;
@@ -142,12 +144,12 @@ enum Sym {
     SamplerOffset(DirectSampler),
     HeapSampler(DirectSampler),
     HeapOffset,
-    HeapDescriptor(u32),
+    HeapDescriptor(u32, Option<usize>),
     /// Dword 1 and up of a descriptor fetched at a run-time heap index. The index itself
     /// lives in dword 0, so a use is valid only while the others are still the loaded ones.
-    HeapWord(u8),
+    HeapWord(u8, Option<usize>),
     /// Guest sampler-heap index read at a run-time byte offset (compute sampler heap).
-    HeapSamplerIndex,
+    HeapSamplerIndex(Option<usize>),
     /// Byte offset of a 16-byte sampler descriptor: a scalar shifted left by four.
     HeapSamplerOffset,
     /// See `lane_reads`.
@@ -1285,6 +1287,13 @@ fn translate_outputs(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, output_
     stencil_target: Option<u32>) -> Result<Translated, String> {
     let first = translate_outputs_once(ex, feeds_ps, output_order, stencil_target);
     if first.is_ok() || ex.stage != Stage::Compute || stencil_target.is_some() { return first; }
+    // Once this exact exchange subset is recognized, a later binding or
+    // emitter error must not silently replace its collectives with copies.
+    let mut original = disassemble(&ex.isa);
+    if (ex.root_sig.is_some() || original.iter().all(|i| !matches!(i.enc, Enc::Smem | Enc::Mubuf)))
+        && wave_sum::straight_exchange(&mut original, compute_group(ex)) {
+        return first;
+    }
     // Appends only: each lane may allocate for itself.
     let alone = lone_lane::retry(|| translate_outputs_once(ex, feeds_ps, output_order, stencil_target))
         .and_then(|t| lone_lane::check(&t.hlsl).map(|()| t));
@@ -1372,9 +1381,14 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
     if ex.stage == Stage::Pixel { wave_alloc::prepare(&mut insns); }
     let reflection = reflection_compact::prepare(ex, &mut insns);
     let group_extrema = group_extrema::prepare(ex, &mut insns);
+    let straight_exchange = ex.stage == Stage::Compute && !lone_lane::on()
+        && !wave_cull && !page_waves && !resolve_wave32 && !allocation_wave64
+        && (ex.root_sig.is_some() || insns.iter().all(|i| !matches!(i.enc, Enc::Smem | Enc::Mubuf)))
+        && wave_sum::straight_exchange(&mut insns, compute_group(ex));
     let required_wave_size = if wave_cull {
         fspx_wave.filter(|&width| width == 32)
-    } else { lower_wave_reductions(&mut insns)? };
+    } else if straight_exchange { None }
+      else { lower_wave_reductions(&mut insns)? };
     let required_wave_size = if resolve_wave32 {
         if matches!(required_wave_size, Some(64)) || insns.iter().any(is_quad_exchange) {
             return Err("resolve Wave32 requires a compatible wave reduction".into());
@@ -1517,8 +1531,9 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
             return Err(format!("wave operation requires complete {width}-lane compute waves"));
         }
     }
-    em.portable_wave64 = required_wave_size == Some(64)
-        && ex.stage == Stage::Compute && compute_group(ex) == [64, 1, 1]
+    em.portable_wave64 = (straight_exchange || (required_wave_size == Some(64)
+        && compute_group(ex) == [64, 1, 1]))
+        && ex.stage == Stage::Compute
         && !wave_cull && !page_waves && !allocation_wave64 && !requires_ballot
         && !em.compute_swizzle && !em.indexed_lane && !em.compute_heap
         && em.packed.is_none() && !uses_quad_add && !uses_bpermute && !probe_trace
@@ -1526,7 +1541,10 @@ fn translate_outputs_once(ex: &ShaderExtract, feeds_ps: Option<&InputInterp>, ou
         && !instance_cull && !hzb_cull && view_cull.is_none() && !post_cull
         && !hair_visibility_indirect && !hair_visibility_single && hair_compact.is_none()
         && !subsurface_setup && !material_classify && !classify_tiles && !reflection && !group_extrema
-        && wave_sum::portable_single_wave(&em.insns);
+        && (straight_exchange || wave_sum::portable_single_wave(&em.insns));
+    if straight_exchange && !em.portable_wave64 {
+        return Err("straight DPP8 exchange conflicts with a specialized lowering".into());
+    }
     if is_ps {
         em.find_export_epilogs();
         em.classify_interpolation();
@@ -2398,6 +2416,17 @@ impl<'a> Emitter<'a> {
 
         // Both passes read the same decoded program. Snapshot it once for all blocks.
         let program = self.insns.clone();
+        // Direct branches have explicit graph edges. Preserve the previous
+        // behavior for other control transfers, not modeled by this graph.
+        let track_heap_origin = (self.resource_heap_base.is_some() || self.sampler_heap_base.is_some())
+            && program.iter().enumerate().all(|(i, ins)| {
+            if ins.enc == Enc::Sopp && Self::branch_cond(ins.op).is_some() {
+                tgt.contains_key(&i)
+            } else {
+                !["branch", "setpc", "swappc", "call", "rfe", "trap"]
+                    .iter().any(|name| ins.mnemonic.contains(name))
+            }
+        }) && n <= (usize::MAX >> 17);
         // Fixpoint (analysis only: recordings are rolled back afterwards).
         let saved = (
             self.res.clone(),
@@ -2431,7 +2460,7 @@ impl<'a> Emitter<'a> {
             }
             budget -= 1;
             let (mut sym, mut written) = states[b].clone().unwrap();
-            if let Err(e) = self.res_block(&program, &mut sym, &mut written, ranges[b].clone()) {
+            if let Err(e) = self.res_block(&program, &mut sym, &mut written, ranges[b].clone(), track_heap_origin) {
                 if std::env::var_os("TB_DFDEBUG").is_some() {
                     eprintln!("block {b} analysis error: {e}");
                 }
@@ -2444,14 +2473,23 @@ impl<'a> Emitter<'a> {
             for &s in &succs[b] {
                 let changed = match &mut states[s] {
                     slot @ None => {
-                        *slot = Some((sym.clone(), written.clone()));
+                        let mut next = sym.clone();
+                        if track_heap_origin {
+                            heap_origins::canonicalize(&mut next, s);
+                        }
+                        *slot = Some((next, written.clone()));
                         true
                     }
                     Some((osym, owr)) => {
                         let before = (osym.clone(), owr.len());
+                        let heap = track_heap_origin.then(|| heap_origins::intersection(osym, &sym, s));
                         let keys: Vec<u16> = osym.keys().copied().collect();
                         for k in keys {
                             let a = osym[&k];
+                            if track_heap_origin && heap_origins::tracked(a) {
+                                osym.remove(&k);
+                                continue;
+                            }
                             match sym.get(&k).copied() {
                                 Some(b) if a == b => {}
                                 Some(b) => match self.join_desc(a, b) {
@@ -2482,6 +2520,9 @@ impl<'a> Emitter<'a> {
                                 osym.insert(*k, *v);
                             }
                         }
+                        if let Some(heap) = heap {
+                            osym.extend(heap);
+                        }
                         owr.extend(written.iter().copied());
                         before != (osym.clone(), owr.len())
                     }
@@ -2510,7 +2551,7 @@ impl<'a> Emitter<'a> {
         // Recording pass with the converged entry states.
         for (b, r) in ranges.iter().enumerate() {
             if let Some((mut sym, mut written)) = states[b].clone() {
-                self.res_block(&program, &mut sym, &mut written, r.clone()).map_err(|e| first_err.clone().unwrap_or(e))?;
+                self.res_block(&program, &mut sym, &mut written, r.clone(), track_heap_origin).map_err(|e| first_err.clone().unwrap_or(e))?;
             }
         }
         Ok(())
@@ -3160,6 +3201,7 @@ impl<'a> Emitter<'a> {
         sym: &mut HashMap<u16, Sym>,
         written: &mut BTreeSet<u16>,
         range: std::ops::Range<usize>,
+        track_heap_origin: bool,
     ) -> Result<(), String> {
         let dbg_reg = std::env::var("TB_DFDEBUG").ok().and_then(|v| v.parse::<u16>().ok());
         let mut dbg_prev: Option<Sym> = dbg_reg.and_then(|r| sym.get(&r).copied());
@@ -3179,18 +3221,11 @@ impl<'a> Emitter<'a> {
                 dbg_prev = cur;
             }
             let ins = &insns[idx];
-            // A compute-heap byte offset held in a VGPR (key 2000 + v) lasts until the
-            // VGPR is written again; `v_lshlrev_b32 v, 5, x` below re-marks it.
-            // v_nop writes nothing; its encoding can still carry stale VDST/SRC0 fields.
-            if self.compute_heap && ins.mnemonic != "v_nop" {
-                for d in &ins.dst {
-                    if let Opnd::Vgpr(v) = d {
-                        if sym.get(&(2000 + *v as u16)) == Some(&Sym::HeapOffset) {
-                            sym.remove(&(2000 + *v as u16));
-                        }
-                    }
-                }
-            }
+            let heap_origin = track_heap_origin.then_some(idx);
+            // Read reaching sources before invalidating every result word.
+            // In-place copies/selects must see the old value, while multiword
+            // image/buffer results must not leave stale offset proofs behind.
+            let heap_value = heap_offsets::transfer(ins, sym, self.compute_heap, self.pixel_heap);
             // Judged before the instruction's own writes: a load may overwrite its SOFFSET.
             if self.pixel_heap {
                 lane_reads::step(ins, sym, self.one_word_vector_mask());
@@ -3248,6 +3283,29 @@ impl<'a> Emitter<'a> {
                             sym.insert(d, Sym::MeshRawAddress { register, word: 2 });
                         }
                         written.insert(d);
+                    }
+                }
+                Enc::Sop2 if matches!(ins.mnemonic.as_str(), "s_xor_b32" | "s_or_b32" | "s_and_b32")
+                    && ins.src.len() == 2 && ins.src.iter().any(|o| matches!(o, Opnd::ConstInt(_) | Opnd::Literal(_)))
+                    && ins.src.iter().any(|o| matches!(sg(o).and_then(|s| sym.get(&s)), Some(Sym::HeapOffset | Sym::HeapSamplerOffset))) =>
+                {
+                    if let Some(d) = ins.dst.first().and_then(sg) {
+                        let known = |o: &Opnd| sg(o).and_then(|s| sym.get(&s).copied());
+                        let literal = |o: &Opnd| match o {
+                            Opnd::ConstInt(v) => Some(*v as u32),
+                            Opnd::Literal(v) => Some(*v),
+                            _ => None,
+                        };
+                        let result = [(0, 1), (1, 0)].into_iter().find_map(|(a,b)| {
+                            let kind = known(&ins.src[a])?;
+                            let mask = match kind { Sym::HeapOffset => 31, Sym::HeapSamplerOffset => 15, _ => return None };
+                            let value = literal(&ins.src[b])?;
+                            (ins.mnemonic == "s_and_b32" || value & mask == 0).then_some(kind)
+                        });
+                        // The ordinary scalar write invalidates all other facts.
+                        sym.remove(&d);
+                        written.insert(d);
+                        if let Some(kind) = result { sym.insert(d, kind); }
                     }
                 }
                 Enc::Sop2 if self.resource_heap_base.is_some() && ins.mnemonic == "s_lshl_b32" && ins.src.get(1) == Some(&Opnd::ConstInt(5)) => {
@@ -3358,34 +3416,9 @@ impl<'a> Emitter<'a> {
                 // `v_readfirstlane sBase, v` and `s_load [sBase]` is a constant-table lookup
                 // with a run-time index (ColorDeficiencyMain, cc45bda725a0f774). VGPRs are
                 // tracked under keys 2000+ for exactly this.
-                // A copy of, or a per-lane select between, heap byte offsets is still one.
-                Enc::Vop1 | Enc::Vop2 | Enc::Vop3
-                    if self.compute_heap
-                        && matches!(ins.mnemonic.as_str(), "v_mov_b32" | "v_cndmask_b32")
-                        && matches!(ins.dst.first(), Some(Opnd::Vgpr(_)))
-                        && {
-                            let n = if ins.mnemonic == "v_mov_b32" { 1 } else { 2 };
-                            ins.src.len() >= n && ins.src[..n].iter().all(|o| matches!(o, Opnd::Vgpr(v) if sym.get(&(2000 + *v as u16)) == Some(&Sym::HeapOffset)))
-                        } =>
-                {
+                Enc::Vop1 | Enc::Vop2 | Enc::Vop3 if heap_value.is_some() => {
                     if let Some(Opnd::Vgpr(v)) = ins.dst.first() {
-                        sym.insert(2000 + *v as u16, Sym::HeapOffset);
-                    }
-                }
-                Enc::Vop2 | Enc::Vop3
-                    if self.compute_heap && ins.mnemonic == "v_lshlrev_b32" && ins.src.first() == Some(&Opnd::ConstInt(5)) =>
-                {
-                    // Per-lane heap byte offset (32-byte descriptors), see v_readfirstlane.
-                    if let Some(Opnd::Vgpr(v)) = ins.dst.first() {
-                        sym.insert(2000 + *v as u16, Sym::HeapOffset);
-                    }
-                }
-                Enc::Vop2 | Enc::Vop3
-                    if self.pixel_heap && ins.mnemonic == "v_lshlrev_b32" && ins.src.first() == Some(&Opnd::ConstInt(4)) =>
-                {
-                    // Per-pixel sampler heap byte offset (16-byte descriptors).
-                    if let Some(Opnd::Vgpr(v)) = ins.dst.first() {
-                        sym.insert(2000 + *v as u16, Sym::HeapSamplerOffset);
+                        sym.insert(2000 + *v as u16, heap_value.unwrap());
                     }
                 }
                 Enc::Vop2 | Enc::Vop3
@@ -3483,10 +3516,10 @@ impl<'a> Emitter<'a> {
                             && (ins.aux.imm == 0 || (ins.aux.imm >= 0 && ins.aux.imm % 32 == 0 && sym.get(&soff) == Some(&Sym::HeapOffset)))
                             && heap_offset {
                             for k in 0..n as u16 {
-                                sym.insert(d + k, Sym::HeapWord(k as u8));
+                                sym.insert(d + k, Sym::HeapWord(k as u8, heap_origin));
                                 written.insert(d + k);
                             }
-                            sym.insert(d, Sym::HeapDescriptor(n));
+                            sym.insert(d, Sym::HeapDescriptor(n, heap_origin));
                             self.res.insert(idx, vec![Res::HeapLoad(soff)]);
                             continue;
                         }
@@ -3499,10 +3532,10 @@ impl<'a> Emitter<'a> {
                             && !matches!(sym.get(&soff), Some(Sym::SamplerOffset(_)))
                         {
                             for k in 0..4 {
-                                sym.insert(d + k, Sym::HeapWord(k as u8));
+                                sym.insert(d + k, Sym::HeapWord(k as u8, heap_origin));
                                 written.insert(d + k);
                             }
-                            sym.insert(d, Sym::HeapSamplerIndex);
+                            sym.insert(d, Sym::HeapSamplerIndex(heap_origin));
                             self.res.insert(idx, vec![Res::HeapSamplerLoad(soff)]);
                             continue;
                         }
@@ -3748,7 +3781,7 @@ impl<'a> Emitter<'a> {
                                 samp_res.push((((table as u32) << 24) | offset, Res::Samp(slot)));
                             }
                         } else if self.chosen_samplers.contains(&idx)
-                            || sym.get(&ss) == Some(&Sym::HeapSamplerIndex) && heap_words(sym, ss, 4)
+                            || matches!(sym.get(&ss), Some(Sym::HeapSamplerIndex(_))) && heap_words(sym, ss, 4)
                         {
                             self.uses_heap_sampler = true;
                             samp_res.push((0, Res::HeapSamplerDyn(ss)));
@@ -6005,6 +6038,24 @@ uint tb_fmac_half(uint a, uint b, uint c) {
         if matches!(m.as_str(), "v_interp_p1ll_f16" | "v_interp_p1lv_f16" | "v_interp_p2_f16") {
             return self.emit_f16_interp(ins);
         }
+        if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP8_EXCHANGE {
+            if !self.portable_wave64 { return Err("DPP8 exchange without convergent group".into()); }
+            let a = r(&s[0])?;
+            let b = r(&s[1])?;
+            let selector = ins.aux.imm as u32;
+            let t = self.tmp;
+            self.tmp += 1;
+            self.line(&format!("uint t{t} = tb_reduction_read(gtid.x, {a}, (gtid.x & ~7u) | (({selector:#x}u >> (3u * (gtid.x & 7u))) & 7u));"));
+            let value = match m.as_str() {
+                "v_add_nc_u32" => format!("t{t} + {b}"),
+                "v_and_b32" => format!("t{t} & {b}"),
+                "v_or_b32" => format!("t{t} | {b}"),
+                "v_min_u32" => format!("min(t{t}, {b})"),
+                "v_max_u32" => format!("max(t{t}, {b})"),
+                _ => return Err("unsupported DPP8 exchange operation".into()),
+            };
+            return self.wv(&d, &value);
+        }
         if ins.enc == Enc::Vop2 && ins.op == wave_sum::DPP_REDUCE {
             // Read the partner before the EXEC-guarded write, including when VDST aliases VSRC.
             let lane = match ins.aux.imm {
@@ -6435,24 +6486,38 @@ uint tb_fmac_half(uint a, uint b, uint c) {
                 }
             };
         }
-        if m == "v_mad_u64_u32" {
+        if m == "v_mad_u64_u32" || m == "v_mad_i64_i32" {
+            let signed = m == "v_mad_i64_i32";
             let Opnd::Vgpr(low) = d else { return Err("expected VGPR pair".into()); };
             let high = Opnd::Vgpr(low.checked_add(1).ok_or("VGPR pair overflows")?);
+            // LLVM writes the carry to the null register when it is unused.
             let cout = match (ins.raw[0] >> 8) & 127 {
-                n @ 0..=104 => Opnd::Sgpr(n as u8),
-                106 => Opnd::VccLo,
+                n @ 0..=104 if !signed => Opnd::Sgpr(n as u8),
+                106 if !signed => Opnd::VccLo,
+                125 => Opnd::Null,
                 _ => return Err("unsupported multiply-add carry destination".into()),
             };
+            if signed && (self.ex.stage != Stage::Compute
+                || !ins.src[..3].iter().all(|s| matches!(s, Opnd::Vgpr(_)))) {
+                return Err("unverified signed 64-bit multiply-add source or stage".into());
+            }
             if ins.raw[0] & 0x8000 != 0 || ins.raw[1] >> 27 != 0 {
                 return Err("unsupported multiply-add modifiers".into());
             }
             let (a, b, c, ch) = (r(&s[0])?, r(&s[1])?, r(&s[2])?, self.pair_high(&s[2])?);
             let t = self.tmp;
             self.tmp += 1;
-            self.line(&format!("uint t{t}lo = {a} * {b} + {c}; uint t{t}sum = tb_mulhi_u32({a}, {b}) + {ch};"));
+            // The low product word is the same for signed and unsigned inputs;
+            // the signed high word comes from the signed 32x32 product.
+            let mulhi = if signed { "tb_mulhi_i32" } else { "tb_mulhi_u32" };
+            self.line(&format!("uint t{t}lo = {a} * {b} + {c}; uint t{t}sum = {mulhi}({a}, {b}) + {ch};"));
             self.line(&format!("uint t{t}hi = t{t}sum + uint(t{t}lo < {c}); uint t{t}co = uint(t{t}sum < {ch} || t{t}hi < t{t}sum);"));
             self.wv(&d, &format!("t{t}lo"))?;
+            self.touch(&high);
             self.wv(&high, &format!("t{t}hi"))?;
+            if cout == Opnd::Null {
+                return Ok(());
+            }
             if self.resolve_wave32 {
                 return self.ws(&cout, &format!("WaveActiveBallot((exec_lo & tb_lane_bit) != 0u && t{t}co != 0u).x"));
             }
@@ -9384,12 +9449,17 @@ fn mesh_heap_base(ex: &ShaderExtract) -> Option<u8> {
 
 /// Whether dwords `1..n` of the heap descriptor at `base` are still the loaded ones.
 fn heap_words(sym: &HashMap<u16, Sym>, base: u16, n: u16) -> bool {
-    (1..n).all(|k| sym.get(&(base + k)) == Some(&Sym::HeapWord(k as u8)))
+    let origin = match sym.get(&base) {
+        Some(Sym::HeapDescriptor(_, origin) | Sym::HeapSamplerIndex(origin)) => *origin,
+        _ => return false,
+    };
+    (1..n).all(|k| sym.get(&(base + k)) == Some(&Sym::HeapWord(k as u8, origin)))
 }
 
 /// A complete `n`-dword resource descriptor fetched at a run-time heap index.
 fn heap_descriptor(sym: &HashMap<u16, Sym>, base: u16, n: u16) -> bool {
-    sym.get(&base) == Some(&Sym::HeapDescriptor(n.into())) && heap_words(sym, base, n)
+    matches!(sym.get(&base), Some(Sym::HeapDescriptor(words, _)) if *words == u32::from(n))
+        && heap_words(sym, base, n)
 }
 
 /// Root-less pixel shaders receive descriptor heap bases like compute: the user SGPR

@@ -40,3 +40,23 @@ class D3D12RegressionTests(unittest.TestCase):
         record="TuxBox d3d12_xs: buffer backing path=strict_rejected count=1 source=place_virtual bytes=65536"
         self.assertTrue(validate("buffer-import-reject","10de:2704",0,negative+"\n"+record)[0])
         self.assertFalse(validate("buffer-import-reject","10de:2704",0,negative)[0])
+
+    def test_remap_requires_retirement_and_reimport(self):
+        line="d3d12-buffer-remap PASS pci=10de:2704 words=768/768 identical=1 replacement=1"
+        records=[("pool_open",1),("pool_open",2),("pool_hit",1)]+[("imported",i) for i in range(1,4)]
+        logs=[line]+[f"TuxBox d3d12_xs: buffer backing path={p} count={i} source=place_virtual_layout bytes=65536" for p,i in records]
+        logs.append("TuxBox d3d12_xs: page remap replaced imported range retired stale GPU import")
+        output="\n".join(logs)
+        self.assertTrue(validate("buffer-remap","10de:2704",0,output)[0])
+        self.assertFalse(validate("buffer-remap","10de:2704",0,"\n".join(logs[:-1]))[0])
+        self.assertFalse(validate("buffer-remap","10de:2704",0,output.replace("pool_open count=2","pool_hit count=2"))[0])
+        self.assertFalse(validate("buffer-remap","10de:2704",0,output+"\n"+logs[-1])[0])
+
+    def test_deferred_alias_refresh_requires_both_overlaps(self):
+        receipt="d3d12-alias-deferred PASS pci=10de:2704 overlaps=2 old=verified refreshed=verified no_cpu_wait=1"
+        line="placed texture refresh deferred until an overlapping write is published"
+        output="\n".join([receipt,line,line,"alias deferred observed ms=0"])
+        self.assertTrue(validate("alias-deferred","10de:2704",0,output)[0])
+        self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace("ms=0","ms=1999"))[0])
+        self.assertFalse(validate("alias-deferred","10de:2704",0,output.replace(line,"unrelated",1))[0])
+        self.assertFalse(validate("alias-deferred","10de:2704",0,output+"\nFailed to signal event")[0])

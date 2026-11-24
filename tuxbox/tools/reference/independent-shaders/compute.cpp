@@ -53,8 +53,10 @@ static void dispatch(Context &ctx, FILE *receipt, const std::string &name, UINT 
     if (view == "structured" && stride) uav.Format = DXGI_FORMAT_UNKNOWN;
     else if (view == "uint" && !stride) uav.Format = DXGI_FORMAT_R32_UINT;
     else if (view == "float" && !stride) uav.Format = DXGI_FORMAT_R32_FLOAT;
+    else if (view == "raw" && !stride) uav.Format = DXGI_FORMAT_R32_TYPELESS;
     else throw std::runtime_error("invalid UAV format");
-    uav.Buffer = {first_byte / element_size, view_bytes / element_size, stride, 0, D3D12_BUFFER_UAV_FLAG_NONE};
+    uav.Buffer = {first_byte / element_size, view_bytes / element_size, stride, 0,
+                  view == "raw" ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE};
     device->CreateUnorderedAccessView(out.Get(), nullptr, &uav, heap->GetCPUDescriptorHandleForHeapStart());
     D3D12_COMMAND_QUEUE_DESC qd{};
     ComPtr<ID3D12CommandAllocator> allocator;

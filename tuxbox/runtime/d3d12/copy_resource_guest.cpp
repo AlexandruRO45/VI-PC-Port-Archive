@@ -3,6 +3,7 @@
 #include "frame_cli.h"
 #include <algorithm>
 #include <future>
+#include <chrono>
 #include <vector>
 
 namespace {
@@ -345,8 +346,108 @@ std::string run(const wchar_t* requested, bool) {
                   adapter.VendorId, adapter.DeviceId, bufferBytes, subresources);
     return result;
 }
+// Blocked writer: defer overlapping image refresh until publication.
+std::string run_alias_deferred(const wchar_t* requested, bool) {
+    DXGI_ADAPTER_DESC1 adapter{};
+    auto device=create_device(requested,adapter,releaseProfile.data());
+    Layout layout(device.Get());
+    constexpr BYTE old_value=0x51,new_value=0xe3;
+    std::vector<BYTE> bytes(layout.length,new_value);
+    Resources src(device.Get(),layout,bytes);
+    TiledBacking backing;
+    if(!backing.address||!VirtualAlloc(backing.address,backing.size,MEM_COMMIT,PAGE_READWRITE))
+        throw std::runtime_error("alias deferred backing");
+    std::memset(backing.address,old_value,backing.size);
+    auto make=[&](UINT64 address,UINT16 slices,D3D12_RESOURCE_STATES initial) {
+        auto desc=layout.desc;
+        desc.Layout=static_cast<D3D12_TEXTURE_LAYOUT>(0x105);
+        desc.DepthOrArraySize=slices;
+        ComPtr<ID3D12Resource> out;
+        check(method<Place>(device.Get(),44)(device.Get(),address,&desc,initial,nullptr,IID_PPV_ARGS(&out)),"place alias-budget texture");
+        return out;
+    };
+    auto va=reinterpret_cast<UINT64>(backing.address);
+    auto writer=make(va,2,D3D12_RESOURCE_STATE_COPY_DEST);
+    auto first=make(va,1,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto second=make(va+8192,1,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_COMMAND_QUEUE_DESC q{};
+    ComPtr<ID3D12CommandQueue> wq,rq;
+    check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&wq)),"alias writer queue");
+    check(device->CreateCommandQueue(&q,IID_PPV_ARGS(&rq)),"alias reader queue");
+    ComPtr<ID3D12Fence> gate,wd,rd;
+    for(auto* f:{gate.GetAddressOf(),wd.GetAddressOf(),rd.GetAddressOf()})check(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(f)),"alias fence");
+    auto readback=buffer(device.Get(),D3D12_HEAP_TYPE_READBACK,layout.length,D3D12_RESOURCE_STATE_COPY_DEST);
+    std::array<ComPtr<ID3D12CommandAllocator>,4> allocs;
+    std::array<ComPtr<ID3D12GraphicsCommandList>,4> lists;
+    auto list=[&](UINT n){
+        check(device->CreateCommandAllocator(q.Type,IID_PPV_ARGS(&allocs[n])),"alias allocator");
+        const UINT desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT,0,1,0};
+        check(method<CreateList>(device.Get(),73)(device.Get(),desc,allocs[n].Get(),nullptr,IID_PPV_ARGS(&lists[n])),"alias list");
+        return lists[n].Get();
+    };
+    auto read=[&](UINT n){
+        auto l=list(n);
+        for(UINT slice=0;slice<2;++slice)for(UINT mip=0;mip<mipCount;++mip){
+            D3D12_TEXTURE_COPY_LOCATION from{},to{};
+            from.pResource=slice?second.Get():first.Get();
+            from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;from.SubresourceIndex=mip;
+            to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            to.PlacedFootprint=layout.tiles[slice*mipCount+mip];
+            method<Copy>(l,83)(l,&to,0,0,0,&from,nullptr,0);
+        }
+        check(l->Close(),"close alias read");
+        return l;
+    };
+    auto verify=[&](BYTE expected){
+        D3D12_RANGE range{0,layout.length},empty{};void* ptr{};
+        check(readback->Map(0,&range,&ptr),"alias deferred readback");
+        bool equal=true;
+        for(UINT sub=0;sub<subresources;++sub)for(UINT y=0;y<layout.rows[sub];++y)
+            for(UINT64 x=0;x<layout.bytesPerRow[sub];++x)
+                equal &= static_cast<const BYTE*>(ptr)[layout.tiles[sub].Offset+y*layout.tiles[sub].Footprint.RowPitch+x]==expected;
+        readback->Unmap(0,&empty);
+        if(!equal)throw std::runtime_error("alias deferred readback differs");
+    };
+    auto execute=[](ID3D12CommandQueue* queue,ID3D12GraphicsCommandList* l){
+        ID3D12CommandList* batch[]{l};queue->ExecuteCommandLists(1,batch);
+    };
+    execute(rq.Get(),read(0));
+    check(rq->Signal(rd.Get(),1),"initial alias signal");wait_for_fence(rd.Get(),1);
+    verify(old_value);
+    auto wl=list(1);
+    src.transfer(wl,layout,false);
+    src.make_copy_source(wl);
+    method<CopyResourceX>(wl,84)(wl,writer.Get(),src.texture.Get(),0);
+    check(wl->Close(),"close blocked writer");
+    auto blocked=read(2);
+    check(wq->Wait(gate.Get(),1),"block alias writer");
+    execute(wq.Get(),wl);
+    check(wq->Signal(wd.Get(),1),"signal blocked writer");
+    // Release the gate only after submit returns. The current provider must
+    // defer the refresh rather than wait for this CPU-dependent writer.
+    const auto start=std::chrono::steady_clock::now();
+    execute(rq.Get(),blocked);
+    const auto elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count();
+    std::printf("alias deferred observed ms=%lld\n",static_cast<long long>(elapsed));
+    std::fflush(stdout);
+    check(gate->Signal(1),"release blocked writer");
+    check(rq->Signal(rd.Get(),2),"signal degraded reader");
+    wait_for_fence(wd.Get(),1);wait_for_fence(rd.Get(),2);
+    verify(old_value);
+    execute(rq.Get(),read(3));
+    check(rq->Signal(rd.Get(),3),"signal refreshed reader");
+    wait_for_fence(rd.Get(),3);
+    verify(new_value);
+    if(elapsed>1000)throw std::runtime_error("alias refresh unexpectedly blocked submission");
+    char receipt[180];
+    std::snprintf(receipt,sizeof(receipt),"d3d12-alias-deferred PASS pci=%04x:%04x overlaps=2 old=verified refreshed=verified no_cpu_wait=1",adapter.VendorId,adapter.DeviceId);
+    return receipt;
+}
+
 }
 
 int wmain(int argc, wchar_t** argv) {
+    if(argc>1 && !std::wcscmp(argv[1],L"--alias-deferred"))
+        return tuxbox_test::frame_main(argc-1,argv+1,"d3d12-alias-deferred",false,run_alias_deferred);
     return tuxbox_test::frame_main(argc, argv, "copy-resource", false, run);
 }

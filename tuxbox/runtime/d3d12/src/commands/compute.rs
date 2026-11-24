@@ -60,7 +60,34 @@ use super::compute_bindings::BufferView;
 fn root_buffer<const COMPUTE: bool>(list: &List, index: u32, guest: u64, view: fn(u64) -> BufferView) {
     let mut state = recording(list);
     if state.can_record(&list.native) {
-        let Some(address) = address(list, &mut state, guest, 1) else { return };
+        // A desktop root CBV has no size: vkd3d binds min(host buffer end -
+        // address, 64 KiB). A one-byte import can leave a short, odd range,
+        // which NVIDIA rejects (Xid 13, SKEDCHECK23_CONSTANT_BUFFER_SIZE).
+        // Import the whole 64 KiB window a shader can read when it is mapped.
+        let cbv = matches!(view(0), BufferView::Cbv(_));
+        let wide = cbv.then(|| unsafe {
+            device::command_buffer_address(parent(&list.parent), guest, 65536)
+        }).and_then(Result::ok);
+        let address = match wide {
+            Some((buffer, va)) => {
+                if let Some(buffer) = buffer {
+                    if let Err(e) = super::raytracing::retain(&mut state, &[&buffer]) { state.error = e.code(); return; }
+                }
+                va
+            }
+            None => {
+                let Some(va) = address(list, &mut state, guest, 1) else { return };
+                if cbv && guest != 0 {
+                    static SHORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let n = SHORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n.is_power_of_two() {
+                        crate::diagnostics::log_once(&std::sync::Once::new(), || format!(
+                            "root CBV {guest:#x} has no mapped 64 KiB window; bound with a short range ({n} so far)"));
+                    }
+                }
+                va
+            }
+        };
         let view = view(address);
         unsafe { view.apply::<COMPUTE>(&list.native, index) };
         state.bindings.buffer::<COMPUTE>(index, view);

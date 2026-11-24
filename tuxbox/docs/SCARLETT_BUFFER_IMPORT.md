@@ -41,8 +41,7 @@ The separate slot 44 test registers two pages, imports A/B/A, releases
 and recreates A after GPU completion, and checks 1536 words. Expected
 native opens 3, cache hits 2, imports 5. The negative test releases a
 reservation and proves strict mode rejects the now unbacked address.
-These controls do not yet exercise a queue-ordered XMem remap or
-retail descriptor/pipeline failures.
+These initial controls do not exercise retail descriptor/pipeline failures. See the queue-ordered XMem follow-up below.
 
 182 Python tests and Windows-target D3D12 typecheck passed; full provider
 build succeeded. Nine physical controls passed on RTX 4080, including
@@ -134,6 +133,85 @@ AMD and retail not tested.
       "exit": 0,
       "seconds": 16.594,
       "receipt": "d3d12-mesh PASS pci=10de:2704 tier=1 stream=680 direct=6 amplified=12 indirect=2 zero=0 pixels=256/256 guards=32 rejected=5"
+    }
+  ],
+  "passed": true
+}
+```
+
+
+## Queue-ordered XMem follow-up
+
+Build both targets (build.py xmem and build.py d3d12), then invoke the
+existing regression runner with --xmem build/xmem-smoke/xmem.dll
+--case buffer-remap. The runner stages and fingerprints XMem alongside
+the GPU artifacts.
+
+Two physical pages contain independent patterns. Map A into the guest
+GPU aperture, create an imported buffer, repeat the same mapping and
+create a second view. Submit both copies before replacing A with B on
+queue slot 31, then immediately import the same VA again without a CPU
+fence wait. Read back the two pre-replacement copies and the new copy
+after queue completion. Keep the old resource references alive until
+the fence completes. Finally unmap the destination and release the
+physical pages.
+
+The control requires 768 exact words, one identical-map cache hit,
+two native opens, three imports, exactly one stale-import retirement
+and no device-local stand-ins. It exercises queue ordering, but does
+not force the driver to use the asynchronous worker path if the queue
+has already drained.
+
+On RTX 4080, driver 615.78.8, Proton Experimental, the control passed
+on the original fix and again after rebuilding from main d94e4e5.
+The other three buffer controls also passed on the latter build.
+192 Python tests passed. No retail or AMD run of this follow-up.
+
+```json
+{
+  "schema": 1,
+  "scope": "Synthetic D3D12 provider controls; not retail execution",
+  "adapter": "10de:2704",
+  "proton": "1794497090 experimental-11.0-20261112-x86_64",
+  "artifacts_sha256": {
+    "d3d12_xs.dll": "bd72f5dae4d24a2f08997a63b52144bd74065912436d786cba48f56e0a05eeb8",
+    "d3d12.dll": "fc2bbef02509fb11c334cc96dd211f64def94bb7b4eb82082a4808e6e0549543",
+    "d3d12core.dll": "9356501320114773be279506644aabd9a1717ff451d480ac802a4fd4e94b2576",
+    "dxgi.dll": "2814edc3350cae6d34a75b7900df19752889c310ef34255c7316c4a95e1b183f",
+    "dxcompiler.dll": "0689e2fee0a1c9df8662a59680469f24e2a3ad7ce6bbbcc9284f7a83172bfc59",
+    "dxil.dll": "64be2368211d257a038a7d4ea6bb3e24c878eb8d588c7b8414fccf759b69c2ac",
+    "d3d12-buffer-import.exe": "b3134947831647e7a962517d6ad8b8c0553c4994c13ba452c4a52e4d96419596",
+    "xmem.dll": "e892155317c6b46660b0c9b675acc09253dd0994b0eeed46e23b6bd2d6c96b60"
+  },
+  "unchanged": true,
+  "cases": [
+    {
+      "case": "buffer-remap",
+      "passed": true,
+      "exit": 0,
+      "seconds": 13.445,
+      "receipt": "d3d12-buffer-remap PASS pci=10de:2704 words=768/768 identical=1 replacement=1"
+    },
+    {
+      "case": "buffer-layout",
+      "passed": true,
+      "exit": 0,
+      "seconds": 13.458,
+      "receipt": "d3d12-buffer-layout PASS pci=10de:2704 slot=133 words=512/512 VA-offsets=0,4"
+    },
+    {
+      "case": "buffer-import",
+      "passed": true,
+      "exit": 0,
+      "seconds": 12.647,
+      "receipt": "d3d12-buffer-import PASS pci=10de:2704 pages=2 words=1536/1536 passes=2 aliases=2"
+    },
+    {
+      "case": "buffer-import-reject",
+      "passed": true,
+      "exit": 0,
+      "seconds": 22.59,
+      "receipt": "d3d12-buffer-import-reject PASS pci=10de:2704 rejected=1"
     }
   ],
   "passed": true

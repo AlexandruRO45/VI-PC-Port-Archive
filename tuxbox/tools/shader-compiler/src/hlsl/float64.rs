@@ -143,14 +143,15 @@ impl Emitter<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::{hlsl, ShaderExtract, Stage};
 
     const V4: [u32; 2] = [0x7e08_02ff, 0x1357_2468];
     const V5: [u32; 2] = [0x7e0a_02ff, 0x2468_1357];
     const ENDPGM: u32 = 0xbf81_0000;
 
-    fn translate(stage: Stage, body: &[u32]) -> Result<String, String> {
+    /// Translate `v_mov_b32 v4/v5, literal`, then `body`, then `s_endpgm`.
+    pub(in crate::hlsl) fn translate(stage: Stage, body: &[u32]) -> Result<String, String> {
         let words: Vec<u32> = V4.iter().chain(&V5).chain(body).chain(&[ENDPGM]).copied().collect();
         let isa: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let ex = ShaderExtract { flat_inputs: Vec::new(), flat_outputs: Vec::new(),

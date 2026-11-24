@@ -494,6 +494,117 @@ mod tests {
     }
 
     #[test]
+    fn sampled_value_must_not_keep_sampler_offset_proof() {
+        // v7 = v5 << 4; sample overwrites v7; readfirstlane s1,v7.
+        // The second sampler fetch must not treat sample bits as an aligned offset.
+        let mut words = SAMPLE[..6].to_vec();
+        words.push(0x340e0a84);
+        words.extend([SAMPLE[6],SAMPLE[7],0x7e020507,SAMPLE[4],SAMPLE[5],
+                      SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("dynamic soffset unsupported"));
+    }
+
+    #[test]
+    fn second_sample_component_must_kill_offset_proof() {
+        // A two-component image result starts at v7 and overwrites v8 as well.
+        let mut words = SAMPLE[..6].to_vec();
+        words.push(0x34100a84); // v8 = v5 << 4
+        words.extend([SAMPLE[6] | 0x200,SAMPLE[7],0x7e020508,SAMPLE[4],SAMPLE[5],
+                      SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("dynamic soffset unsupported"));
+    }
+
+    #[test]
+    fn sampler_heap_can_track_a_vector_offset_copy() {
+        // v6 = v5 << 4; v7 = v6; s1 = readfirstlane(v7).
+        // The aligned sampler offset survives a genuine copy.
+        let mut words = vec![SAMPLE[0],0x340c0a84,0x7e0e0306,0x7e020507];
+        words.extend(&SAMPLE[2..]);
+        assert!(super::super::translate(&pixel(&words)).is_ok());
+    }
+
+    #[test]
+    fn mixed_texture_words_are_not_an_intact_heap_descriptor() {
+        // Two independent indices and loads, then replace word 1 of A with
+        // word 1 of B. The old proof only checked the ordinal of each word.
+        let mut words = vec![SAMPLE[0],SAMPLE[1],0x8f02850b,0xf40c0607,0x04000000];
+        words.extend(&SAMPLE[2..6]);
+        words.extend([0xbe850319,SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("not an image descriptor"));
+    }
+
+    #[test]
+    fn mixed_sampler_words_are_not_an_intact_heap_descriptor() {
+        let mut words = vec![SAMPLE[0],SAMPLE[1],0x8f03840a,0xf4080608,0x06000000];
+        words.extend(&SAMPLE[2..6]);
+        words.extend([0xbe950319,SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("not a sampler descriptor"));
+    }
+
+    #[test]
+    fn complete_texture_descriptor_copy_stays_supported() {
+        let mut words = vec![SAMPLE[0],SAMPLE[1],0x8f02850b,0xf40c0607,0x04000000];
+        words.extend(&SAMPLE[2..6]);
+        words.extend([0xbe840418,0xbe86041a,0xbe88041c,0xbe8a041e,
+                      SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(super::super::translate(&pixel(&words)).is_ok());
+    }
+
+    #[test]
+    fn branch_must_not_hide_mixed_texture_words() {
+        let mut words = vec![SAMPLE[0],SAMPLE[1],0x8f02850b,0xf40c0607,0x04000000];
+        words.extend(&SAMPLE[2..6]);
+        // Unconditional branch to the next instruction, then mixed word.
+        words.extend([0xbf820000,0xbe850319,SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("not an image descriptor"));
+    }
+
+    #[test]
+    fn branch_can_select_complete_texture_descriptors() {
+        // SCC from s1 = s11 << 4. If SCC=0 skip A; otherwise use A.
+        // Each branch loads all eight words at the same destination.
+        let words = [SAMPLE[0],0x8f02850b,SAMPLE[1],0xbf840003,
+            SAMPLE[2],SAMPLE[3],0xbf820002,0xf40c0107,0x04000000,
+            SAMPLE[4],SAMPLE[5],SAMPLE[6],SAMPLE[7],SAMPLE[8]];
+        assert!(super::super::translate(&pixel(&words)).is_ok());
+    }
+
+    #[test]
+    fn branch_must_not_mix_only_on_one_path() {
+        let mut words = vec![SAMPLE[0],SAMPLE[1],0x8f02850b,0xf40c0607,0x04000000];
+        words.extend(&SAMPLE[2..6]);
+        words.extend([0xbf840001,0xbe850319,SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("not an image descriptor"));
+    }
+
+    #[test]
+    fn loop_reloads_must_not_keep_previous_generation_words() {
+        let mut words = SAMPLE[..6].to_vec();
+        // Save old word 1, reload the complete texture descriptor, decrement
+        // a counter and loop to the save. At exit graft the previous word.
+        words.extend([0xbe830382,0xbe990305,0x8900a000,SAMPLE[2],SAMPLE[3],
+                      0x80838103,0xbf068003,0xbf84fff9,
+                      0xbe850319,SAMPLE[6],SAMPLE[7],SAMPLE[8]]);
+        assert!(refusal(&pixel(&words)).contains("not an image descriptor"));
+        words.remove(words.len()-4);
+        assert!(super::super::translate(&pixel(&words)).is_ok());
+    }
+
+    #[test]
+    fn scalar_bitwise_offset_alignment_is_preserved_only_when_proven() {
+        for op in [0x8900a000, 0x8800a000, 0x87008100] {
+            let mut words = SAMPLE.to_vec();
+            words.insert(2, op);
+            assert!(super::super::translate(&pixel(&words)).is_ok(), "{op:#x}");
+        }
+        for op in [0x89008100, 0x88008100] {
+            let mut words = SAMPLE.to_vec();
+            words.insert(2, op);
+            assert!(refusal(&pixel(&words)).contains("dynamic soffset unsupported"));
+        }
+    }
+
+    #[test]
     fn root_less_constants_must_agree_everywhere() {
         let ex = pixel(&SAMPLE);
         let (start, key) = rootless_constants(&ex).unwrap();

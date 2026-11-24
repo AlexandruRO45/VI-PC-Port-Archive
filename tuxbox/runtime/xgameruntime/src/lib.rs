@@ -263,6 +263,7 @@ static SYSTEM_TABLE: [Slot; 32] = {
     slots[2] = slot!(release);
     slots[3] = slot!(services::system_console_id);
     slots[4] = slot!(sandbox_id);
+    slots[5] = slot!(services::system_app_device_id);
     slots
 };
 static SYSTEM_OBJECT: Object = Object {

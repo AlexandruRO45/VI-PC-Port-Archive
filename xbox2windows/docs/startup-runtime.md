@@ -560,10 +560,13 @@ ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
-controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control` and
-`startup_local_log_cache_failure_control`) verifies `src/startup_stubs/local_log.h`:
-`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
-`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control`,
+`startup_local_log_cache_failure_control` and `startup_local_log_wrap_control`) verifies
+`src/startup_stubs/local_log.h`: `env_on` (a leading `1` in values up to three characters,
+preserving `GetLastError`), the atomic `first_calls` gate (true for the first N calls; the
+counter stops at N, so a counter that a consumer polling in a loop drives past 2^31 cannot turn
+negative and let every call log again; the wrap control shows the old counting gate doing that
+from a counter set near the wrap point), `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
 truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
 the shared `x2w_trap::append_log` (one `X2W_TRAP_LOG` open per module: in a child process, 8
 threads write 2,000 lines each, every line must arrive intact and the open count must be 1; the
@@ -640,6 +643,7 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
 
 ## Input script
 
@@ -1138,9 +1142,11 @@ routing and sample format.
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
 and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
 handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
-`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
-`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
-when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+`XApuGetResultCount` and `XApuDequeueResult` can retire commands. A successful dequeue zeroes the
+`0x58`-byte result buffer. An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves
+the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+
+The all-zero result is a placeholder: its type field (`+0`) is not a measured
 completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
 not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
@@ -1285,20 +1291,29 @@ memory spent rather than by elapsed time. A physical page holds a slot from its 
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
 experimental `x2w_xmem_page_stats` export.
 
-The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
-created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
-created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
-slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
-in use and the slots free in the open slabs, which are the units that matter for commit now. This only
-reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
-without Windows calls. The heartbeat also prints while the request counters are unchanged
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
+its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
+committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
+calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
+injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
+can be mapped on retry. Caller-owned placeholders must already match the requested view size. The
+heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
+The live log window also shows DirectStorage heartbeat lines and `x2w-render totals` as they
+arrive. It reports frame counts and FPS from the graphics heartbeat without inferring whether
+draws were executed. Network refusals are shown when observed; the window does not establish
+that all network activity is blocked. To check this presentation with generated logs, run
+`python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
+for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
+the launcher's concurrent-hook limitation.
+
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
-ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|xmem_mapped_pages_commit(_failure)?|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then

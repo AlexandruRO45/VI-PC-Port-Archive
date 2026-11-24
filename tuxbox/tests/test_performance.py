@@ -90,7 +90,7 @@ class PerformanceTests(unittest.TestCase):
             file = root / "lanes_2026-11-22_01-00-00.csv"
             file.write_text("\ufeffos,cpu,gpu\nLinux,CPU,GPU\n\nfps,frametime,elapsed\n"
                             "90,0,1\n90,-1,2\n90,nan,3\n90,inf,4\n90,broken,5\n"
-                            "90,16.5,16500000\n\n90,20,")
+                            "90,16.5,16500000\n\n90,20,", encoding="utf-8")
             output = summarize_capture(root, "lanes.exe")
             session, = json.loads(output.read_text())["sessions"]
             self.assertEqual(session["frames"], 1)

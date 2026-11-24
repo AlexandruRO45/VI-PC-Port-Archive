@@ -2546,6 +2546,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 in (233, 234, 250):
+            return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
             extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
@@ -2695,12 +2697,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sbase_str = f"s[{sbase}:{sbase + base_width - 1}]"
         soffset = (w1 >> 25) & 0x7f
         imm_offset = w1 & 0x1fffff
+        if imm_offset & 0x100000:
+            # GFX9+ SMEM OFFSET[20:0] is a signed 21-bit byte offset (LLVM sign-extends it)
+            imm_offset -= 0x200000
+        imm_str = f"-0x{-imm_offset:x}" if imm_offset < 0 else f"0x{imm_offset:x}"
         if soffset == 125:
-            off_str = f"0x{imm_offset:x}"
+            off_str = imm_str
         else:
             off_str = decode_s_reg(soffset)
             if imm_offset:
-                off_str += f" offset:0x{imm_offset:x}"
+                off_str += f" offset:{imm_str}"
         mods = []
         if (w0 >> 16) & 1:
             mods.append("glc")
@@ -3205,17 +3211,22 @@ def main():
 
     args = parser.parse_args()
 
+    all_listings = []
+    missing = False
+
     # Hex decode mode
     if args.hex:
-        raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        try:
+            raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        except ValueError as exc:
+            parser.error(f"--hex: {exc}")
         insns = disassemble_binary(raw_bytes, "hex_input")
         print_disassembly("hex_input", insns)
-        return 0
-
-    if not args.targets:
+        all_listings.append(("hex_input", insns))
+        args.targets = []
+    elif not args.targets:
         parser.error("Specify targets or provide hex via --hex")
 
-    all_listings = []
     for target in args.targets:
         if target.is_file():
             data = target.read_bytes()
@@ -3230,6 +3241,9 @@ def main():
                 insns = disassemble_binary(data, f.name)
                 print_disassembly(f.name, insns)
                 all_listings.append((f.name, insns))
+        else:
+            print(f"error: {target}: not found", file=sys.stderr)
+            missing = True
 
     if args.output and all_listings:
         with args.output.open("w", encoding="utf-8") as out_f:
@@ -3240,7 +3254,7 @@ def main():
                 out_f.write("\n")
         print(f"[+] Disassembly saved to: {args.output}")
 
-    return 0
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":

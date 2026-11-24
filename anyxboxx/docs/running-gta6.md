@@ -4,11 +4,33 @@
 
 This guide installs and starts the project, and lists everything you need to repeat our tests on the Xbox Series 1.0.2.1 build of GTA VI, up to where we are today: the first cutscene. It does not provide the game and does not explain how to get it: you bring your own copy. Never put game files in this repository or attach them to an issue.
 
-The launch goes through [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), tracked here as the `third_party/victory` submodule, pinned to the branch `anyxboxx/fork-7b0-lot5` of the maintainer's fork [LooperSalty/victory](https://github.com/LooperSalty/victory), which assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) at `7b0f736` and seven of its pull requests (see below), at commit `fd021bf`. The script `tools/lancer_victory.ps1` builds it and starts it on your game folder.
+The launch goes through [VIctory](https://github.com/Marvisak/VIctory) (Marvisak, GPL-3.0 or later), tracked here as the `third_party/victory` submodule, pinned to the branch `anyxboxx/fork-7b0-lot8` of the maintainer's fork [LooperSalty/victory](https://github.com/LooperSalty/victory), which assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0) at `7b0f736` and eight of its pull requests (see below), at commit `d138351`. The script `tools/lancer_victory.ps1` builds it and starts it on your game folder.
 
-## Pinned branch: fork plus seven pull requests (24 November, night)
+## Pinned branch: batch 5 plus one pull request (25 November)
 
-`third_party/victory` now points to the branch `anyxboxx/fork-7b0-lot5` of the maintainer's VIctory fork [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `fd021bf26a7003749d668e5d9bf6b234bfab2e47`. That branch assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0, formerly `fxceless/victory-gta6`) at `7b0f736` and seven of its pull requests that were still open, cherry-picked with `-x`:
+`third_party/victory` now points to the branch `anyxboxx/fork-7b0-lot8` of the maintainer's VIctory fork [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `d138351de32f860ab9df1aa1aa736fce0a40365e`. It is batch 5 (below) plus one pull request of the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork), cherry-picked with `-x`:
+
+| Fork pull request | Author | What it does | Commit |
+| --- | --- | --- | --- |
+| #11 | cxchhh | Shaders: parked lane-mask pairs a few instructions apart are restored; relative VGPR reads keep parked lanes | `d138351` (fork commit `90228a7`) |
+
+Why: a PIX capture of one cutscene frame showed that `IrradianceCache_Shade` and `IrradianceCache_ShadeSecondary` did not run on batch 5 (0 dispatch). Their two shaders did not translate ("a wave reduction where not every lane runs"), so the irradiance cache was never lit and everything outside direct light stayed black (shaded side of faces, interiors). With #11 both shaders translate and pass DXIL validation, and their pipelines are created and bound in game.
+
+Measured or observed by the maintainer (Windows 11, RTX 4070 Super), with the launcher settings of `main` (`tools/lancer_victory.ps1`), from the VIctory log and a PIX capture (trial of 25 November, about 00:01 to 00:05):
+
+- Batch 5: PIX capture, 0 dispatch for both irradiance cache passes. Measured.
+- Batch 8: both shaders translate and validate, pipelines created and bound in game. Observed.
+- Untranslated shaders: 6 instead of 9. Pipelines refused by the driver: 16, as on batch 5. Measured.
+- 4.8 to 5.4 fps, about 6,550 draws per frame, no device loss in about 4 min 20. Measured.
+- Maintainer's opinion: "this version is very good".
+
+Limits. The fork's issue #75 reports about 80 more refused pipelines on an RTX 3070: this was not seen on the 4070 Super, so expect more refusals on other cards. Ray-traced lighting is still absent (the BVH builder stays off, about 350 dispatches dropped per frame). With the `LATE_WAIT` setting of the launcher, some walls of the first room can be transparent (fork issue #168, fixes in progress: #191, #206). Long-run stability is measured over only about 4 min 20.
+
+**Updating an existing copy.** The submodule URL changed with #178 (seen on 24 November). In a copy of AnyXboxX that already has the submodule, run `git submodule sync third_party/victory` then `git submodule update --init third_party/victory`. Authors are credited in [THIRD_PARTY.md](../THIRD_PARTY.md).
+
+## Previous pin: batch 5, fork plus seven pull requests (24 November, night)
+
+`third_party/victory` pointed to the branch `anyxboxx/fork-7b0-lot5` of the maintainer's VIctory fork [LooperSalty/victory](https://github.com/LooperSalty/victory), at commit `fd021bf26a7003749d668e5d9bf6b234bfab2e47`. That branch assembles the fork [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (GPL-3.0, formerly `fxceless/victory-gta6`) at `7b0f736` and seven of its pull requests that were still open, cherry-picked with `-x`:
 
 | Fork pull request | Author | What it does | Commit |
 | --- | --- | --- | --- |

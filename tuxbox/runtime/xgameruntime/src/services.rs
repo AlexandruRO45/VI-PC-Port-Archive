@@ -408,6 +408,18 @@ pub(super) unsafe extern "system" fn system_console_id(_: &Object, size: usize, 
     OK
 }
 
+/// XSystemGetAppSpecificDeviceId(size, buffer, used). ProjectScarlett passes
+/// size 45, XSystemAppSpecificDeviceIdBytes: a base64 SHA-256 (44 chars) and
+/// its terminator. A fixed local identifier, like the console id.
+pub(super) unsafe extern "system" fn system_app_device_id(_: &Object, size: usize, buffer: *mut u8, used: *mut usize) -> i32 {
+    const ID: &[u8] = b"VHV4Qm94TG9jYWxBcHBTcGVjaWZpY0RldmljZUlkMDA=\0";
+    if !used.is_null() { unsafe { used.write(ID.len()) } };
+    if buffer.is_null() { return POINTER; }
+    if size < ID.len() { return INSUFFICIENT_BUFFER; }
+    unsafe { core::ptr::copy_nonoverlapping(ID.as_ptr(), buffer, ID.len()) };
+    OK
+}
+
 // ---------------------------------------------------------------------------
 // XPersistentLocalStorage (class f4faf4d4)
 

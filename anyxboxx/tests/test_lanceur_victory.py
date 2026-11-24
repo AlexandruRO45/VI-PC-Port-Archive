@@ -1,4 +1,4 @@
-"""Épinglage de VIctory sur la branche anyxboxx/fork-7b0-lot5 de LooperSalty/victory (fork fxceless/victory-fork plus sept PR) et réglages par défaut du lanceur."""
+"""Épinglage de VIctory sur la branche anyxboxx/fork-7b0-lot8 de LooperSalty/victory (fork fxceless/victory-fork plus huit PR) et réglages par défaut du lanceur."""
 import configparser
 import re
 import subprocess
@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 RACINE = Path(__file__).resolve().parents[1]
-COMMIT_FORK = "fd021bf26a7003749d668e5d9bf6b234bfab2e47"
+COMMIT_FORK = "d138351de32f860ab9df1aa1aa736fce0a40365e"
 REGLAGES = (
     "VICTORY_SHADER_LOOP_LIMIT", "VICTORY_LATE_WAIT", "VICTORY_WIDE_BACK",
     "VICTORY_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MB",

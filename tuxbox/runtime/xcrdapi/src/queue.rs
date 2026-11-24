@@ -119,17 +119,17 @@ impl Read {
         if self.cancelled {
             return Ok(());
         }
+        // The title's staging size bounds one compressed read. Keep the limit,
+        // but decode into a per-request buffer so reads can run in parallel.
+        if self.options & 1 != 0
+            && matches!(self.source, Source::File(..))
+            && let Some((limit, _)) = lock(&STAGING).as_ref()
+            && self.size > *limit
+        {
+            return Err(E_OUTOFMEMORY);
+        }
         let mut local = Vec::new();
-        let mut staging = (self.options & 1 != 0 && matches!(self.source, Source::File(..)))
-            .then(|| lock(&STAGING));
-        let compressed = match staging.as_deref_mut().and_then(Option::as_mut) {
-            Some((limit, _)) if self.size > *limit => return Err(E_OUTOFMEMORY),
-            Some((_, bytes)) => {
-                bytes.clear();
-                bytes
-            }
-            None => &mut local,
-        };
+        let compressed = &mut local;
         let target = if self.options & 1 != 0 {
             compressed
                 .try_reserve_exact(self.size)
@@ -250,27 +250,93 @@ fn consume(shared: &Shared) {
         };
         state.ready -= 1;
         state.processing = true;
-        drop(state);
-        let result = match &entry {
-            Entry::Read(req) => {
-                {
-                    let mut stats = storage_stats();
-                    let p = &mut stats.priorities[shared.priority];
-                    p.pending += 1;
-                    p.requests = p.requests.saturating_add(1);
-                    p.source_bytes = p.source_bytes.saturating_add(req.size as u64);
-                    p.destination_bytes = p.destination_bytes.saturating_add(req.capacity as u64);
-                }
-                let result = req.execute();
-                storage_stats().priorities[shared.priority].pending -= 1;
-                result
+        // Reads between two status, signal or event entries may complete in
+        // any order. Take the ready run of reads and execute it in parallel:
+        // the console decompresses in hardware, one thread cannot keep up.
+        if matches!(entry, Entry::Read(_)) {
+            let mut batch = vec![entry];
+            while batch.len() < 256 && state.ready > 0 && matches!(state.entries.front(), Some(Entry::Read(_))) {
+                batch.extend(state.entries.pop_front());
+                state.ready -= 1;
             }
+            drop(state);
+            let results = if batch.len() > 1 {
+                execute_reads(shared, &batch)
+            } else {
+                vec![run_entry(shared, &batch[0], &mut last_error)]
+            };
+            for (entry, result) in batch.iter().zip(results) {
+                finish(shared, entry, result, &mut last_error);
+            }
+            lock(&shared.state).processing = false;
+            shared.changed.notify_all();
+            continue;
+        }
+        drop(state);
+        let result = run_entry(shared, &entry, &mut last_error);
+        finish(shared, &entry, result, &mut last_error);
+        lock(&shared.state).processing = false;
+        shared.changed.notify_all();
+    }
+}
+
+fn read_stats(shared: &Shared, req: &Read) -> Result<(), HRESULT> {
+    {
+        let mut stats = storage_stats();
+        let p = &mut stats.priorities[shared.priority];
+        p.pending += 1;
+        p.requests = p.requests.saturating_add(1);
+        p.source_bytes = p.source_bytes.saturating_add(req.size as u64);
+        p.destination_bytes = p.destination_bytes.saturating_add(req.capacity as u64);
+    }
+    let result = req.execute();
+    storage_stats().priorities[shared.priority].pending -= 1;
+    result
+}
+
+fn execute_reads(shared: &Shared, batch: &[Entry]) -> Vec<Result<(), HRESULT>> {
+    static WORKERS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("TUXBOX_STORAGE_THREADS").ok().and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get().min(8)))
+            .max(1)
+    });
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<Mutex<Result<(), HRESULT>>> = batch.iter().map(|_| Mutex::new(Ok(()))).collect();
+    thread::scope(|scope| {
+        for _ in 0..(*WORKERS).min(batch.len()) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(Entry::Read(req)) = batch.get(i) else { break };
+                *lock(&results[i]) = read_stats(shared, req);
+            });
+        }
+    });
+    results.into_iter().map(|r| r.into_inner().unwrap_or_else(|e| e.into_inner())).collect()
+}
+
+fn finish(shared: &Shared, entry: &Entry, result: Result<(), HRESULT>, last_error: &mut HRESULT) {
+    if let Err(hr) = result {
+        if last_error.is_ok() {
+            *last_error = hr;
+        }
+        {
+            let mut stats = storage_stats();
+            stats.errors = stats.errors.saturating_add(1);
+        }
+        signal_error(shared, entry, hr);
+    }
+}
+
+fn run_entry(shared: &Shared, entry: &Entry, last_error: &mut HRESULT) -> Result<(), HRESULT> {
+    {
+        let result = match entry {
+            Entry::Read(req) => read_stats(shared, req),
             Entry::Status(values, i) => {
                 let mut stats = storage_stats();
                 let p = &mut stats.priorities[shared.priority];
                 p.statuses = p.statuses.saturating_add(1);
                 values[*i].store(last_error.0, Ordering::Release);
-                last_error = S_OK;
+                *last_error = S_OK;
                 Ok(())
             }
             Entry::Signal(fence, value) => {
@@ -286,18 +352,7 @@ fn consume(shared: &Shared) {
                 unsafe { SetEvent(HANDLE(event.as_raw_handle())) }.map_err(|e| e.code())
             }
         };
-        if let Err(hr) = result {
-            if last_error.is_ok() {
-                last_error = hr;
-            }
-            {
-                let mut stats = storage_stats();
-                stats.errors = stats.errors.saturating_add(1);
-            }
-            signal_error(shared, &entry, hr);
-        }
-        lock(&shared.state).processing = false;
-        shared.changed.notify_all();
+        result
     }
 }
 

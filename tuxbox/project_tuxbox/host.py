@@ -16,6 +16,36 @@ from .pipeline_profile import pipeline_capture
 from .runtime_shaders import runtime_shader_compiler
 
 
+def _descendant_pids(pid):
+    """All descendants of pid, depth-first, via /proc (Linux)."""
+    children = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat", "r") as proc:
+                    raw = proc.read()
+                # /proc/<pid>/stat: "pid (comm) state ppid ..." -- comm may contain spaces.
+                close = raw.rfind(")")
+                if close == -1:
+                    continue
+                fields = raw[close + 2:].split()
+                parent = int(fields[1])
+                children.setdefault(parent, []).append(int(entry))
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return []
+    collected, stack = [], [pid]
+    while stack:
+        current = stack.pop()
+        for child in children.get(current, ()):
+            collected.append(child)
+            stack.append(child)
+    return collected
+
+
 def proton_installation(selection):
     if selection:
         path = Path(selection).expanduser()
@@ -265,8 +295,26 @@ class Host:
 
     def run(self, executable, arguments, *, timeout=None, capture=False):
         options = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT} if capture else {}
-        return subprocess.run([*self.command, str(executable), *arguments], cwd=executable.parent,
-                              env=self.env, timeout=timeout, **options)
+        # umu-run/proton forks wineserver, winedevice and the guest; “test” the whole
+        # tree so a timed-out check cannot leave processes behind that poison later runs.
+        process = subprocess.Popen([*self.command, str(executable), *arguments], cwd=executable.parent,
+                                   env=self.env, start_new_session=True, **options)
+        try:
+            stdout, _ = process.communicate(timeout=timeout) if options else process.communicate(timeout=timeout)
+            return subprocess.CompletedProcess([*self.command, str(executable), *arguments], process.returncode, stdout)
+        except subprocess.TimeoutExpired:
+            import signal
+            for descendant in _descendant_pids(process.pid):
+                try:
+                    os.kill(descendant, signal.SIGKILL)
+                except OSError:
+                    pass
+            try:
+                process.kill()
+            except OSError:
+                pass
+            process.wait()
+            raise subprocess.TimeoutExpired([*self.command, str(executable), *arguments], timeout)
 
     def run_game(self, executable, arguments, log, *, package=None, mangohud=False, profile_pipelines=False):
         env = self.env.copy()

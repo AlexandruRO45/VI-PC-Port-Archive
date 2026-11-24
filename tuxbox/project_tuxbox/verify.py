@@ -63,16 +63,35 @@ def xauthority_entry(cookie):
     return struct.pack(">H", 0xFFFF) + b"".join(struct.pack(">H", len(f)) + f for f in fields)
 
 
+def _free_display_number(start=2, attempts=16):
+    """Pick a display number free of lock files and sockets, or None."""
+    for candidate in range(start, start + attempts):
+        if Path(f"/tmp/.X{candidate}-lock").exists():
+            continue
+        if Path(f"/tmp/.X11-unix/X{candidate}").exists():
+            continue
+        return candidate
+    return None
+
+
 @contextmanager
 def private_x_server(directory, geometry="2560x1440", timeout=10):
     """Yield (DISPLAY, XAUTHORITY) for a temporary rootful Xwayland, or None if one can't start.
 
     The rootful server draws into its own Wayland window and keeps a readable root window, so
     Wine's screen samples work on a Wayland desktop. It accepts only its own random cookie,
-    picks a free display number itself (-displayfd) and is stopped when the block exits.
+    is started on a display number picked below the desktop's and is stopped when the block exits.
+
+    Xwayland takes its display number as the positional argument (":N"); "-displayfd" only
+    reports the number it took, so a free one is chosen here instead of trusting the default,
+    which is the inherited DISPLAY and collides with the desktop server.
     """
     xwayland = shutil.which("Xwayland")
     if not sys.platform.startswith("linux") or not xwayland or not os.environ.get("WAYLAND_DISPLAY"):
+        yield None
+        return
+    display = _free_display_number()
+    if display is None:
         yield None
         return
     auth = Path(directory) / "Xauthority"
@@ -81,8 +100,8 @@ def private_x_server(directory, geometry="2560x1440", timeout=10):
         stream.write(xauthority_entry(os.urandom(16)))
     read, write = os.pipe()
     try:
-        server = subprocess.Popen([xwayland, "-displayfd", str(write), "-geometry", geometry, "-noreset",
-                                   "-auth", str(auth)], pass_fds=(write,), stdin=subprocess.DEVNULL,
+        server = subprocess.Popen([xwayland, f":{display}", "-displayfd", str(write), "-geometry", geometry,
+                                   "-noreset", "-auth", str(auth)], pass_fds=(write,), stdin=subprocess.DEVNULL,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         os.close(read)
@@ -97,7 +116,11 @@ def private_x_server(directory, geometry="2560x1440", timeout=10):
             if not chunk:
                 break
             number += chunk
-        yield (f":{int(number)}", str(auth)) if number.strip().isdigit() else None
+        # A server that exits before being ready is not a display we can use.
+        if number.strip().isdigit() and server.poll() is None:
+            yield (f":{int(number)}", str(auth))
+        else:
+            yield None
     finally:
         os.close(read)
         server.terminate()
@@ -223,7 +246,7 @@ def verify(host, output, adapter, selected=None, samples=1):
                     exe = launch_target(folder, "Lanes")
                 else:
                     exe = launch_target(exe, None)
-                proc = host.run(exe, [*arguments, receipt.name], timeout=120, capture=True)
+                proc = host.run(exe, [*arguments, receipt.name], timeout=15, capture=True)
                 text = receipt.read_text(encoding="utf-8").rstrip("\r\n") if receipt.is_file() else None
                 row.update(exit_code=proc.returncode, receipt=text)
                 row["passed"] = (proc.returncode == expected_code and

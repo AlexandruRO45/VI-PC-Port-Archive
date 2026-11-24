@@ -40,7 +40,9 @@ with TemporaryDirectory(dir=w) as td:
   if mesh:inputs+="nointerpolation uint4 cluster:TEXCOORD7; "
   val="((cluster.x << 7) + 128u) | cluster.y" if mesh else "id"
   gate="uint(all(int2(pos.xy) >= rect.xy) && all(int2(pos.xy) < rect.zw))" if clip else "1u"
-  ps=f"RWTexture2D<uint64_t> uav0 : register(u0);\nstruct Input {{ {inputs} }};\nvoid main(Input i) {{\nfloat4 pos=i.pos; uint id=i.id; {"uint4 cluster=i.cluster;" if mesh else ""} {"int4 rect=i.rect;" if clip else ""}\nuint exec_lo = {gate}; uint v1 = (uint)pos.x, v2 = (uint)pos.y, v3 = {val}, v4 = asuint(pos.z);\n{body}\n}}\n"
+  cluster_decl="uint4 cluster=i.cluster;" if mesh else ""
+  rect_decl="int4 rect=i.rect;" if clip else ""
+  ps=f"RWTexture2D<uint64_t> uav0 : register(u0);\nstruct Input {{ {inputs} }};\nvoid main(Input i) {{\nfloat4 pos=i.pos; uint id=i.id; {cluster_decl} {rect_decl}\nuint exec_lo = {gate}; uint v1 = (uint)pos.x, v2 = (uint)pos.y, v3 = {val}, v4 = asuint(pos.z);\n{body}\n}}\n"
   source=trial/f"ps{index}.hlsl";source.write_text(ps)
   for stage,path,profile,defs in [("vs",p/"tools/reference/visibility/vertex.hlsl","vs_6_0",["-DMESH_INPUT=1"]*mesh+["-DCLIP_INPUT=1"]*clip),("ps",source,"ps_6_6",[])]:
    blob=trial/f"{stage}{index}.dxil"
