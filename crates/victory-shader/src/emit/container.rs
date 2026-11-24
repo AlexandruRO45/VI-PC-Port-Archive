@@ -126,6 +126,8 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
+    /// The entry point name in runtime info version 3 (validator 1.8).
+    pub entry_name: Option<&'a str>,
     /// PSV shader kind: 0 pixel, 1 vertex, 5 compute.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
@@ -142,7 +144,7 @@ pub(crate) struct Psv<'a> {
     pub wave_size: Option<u32>,
 }
 
-/// `PSV0` with runtime info version 2 (validator 1.6).
+/// `PSV0` with runtime info version 2, or version 3 with an entry name.
 pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     let vectors = |els: &[SigElement]| {
         els.iter()
@@ -158,7 +160,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
             out.extend(v.to_le_bytes());
         }
     };
-    u32s(&mut out, &[48]);
+    u32s(&mut out, &[if p.entry_name.is_some() { 52 } else { 48 }]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
     if p.stage == 0 {
@@ -190,6 +192,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[30] = p.prims.len() as u8;
     }
     out.extend(info);
+    if p.entry_name.is_some() {
+        u32s(&mut out, &[1]); // First name, after the empty string.
+    }
     u32s(&mut out, &[p.bindings.len() as u32]);
     if !p.bindings.is_empty() {
         u32s(&mut out, &[24]);
@@ -202,6 +207,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     }
     // Names of arbitrary semantics (system values use ""), then indices.
     let mut strings = vec![0u8];
+    if let Some(name) = p.entry_name {
+        strings.extend(name.bytes().chain([0]));
+    }
     let mut indices: Vec<u32> = Vec::new();
     let mut elements = Vec::new();
     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
