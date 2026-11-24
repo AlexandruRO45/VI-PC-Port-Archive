@@ -4751,8 +4751,10 @@ impl<'a> Lower<'a> {
     /// `q` is the quotient a division computed, `den` and `num` its
     /// denominator and numerator. A NaN operand (numerator first) comes
     /// back; 0/0 and inf/inf give NaN; x/0 and inf/x give a signed
-    /// infinity; 0/x and x/inf a signed zero; anything else is `|q|` with
-    /// the quotient's sign (the ISA's order of checks).
+    /// infinity; 0/x and x/inf a signed zero; a quotient with an all-ones
+    /// exponent (NaN included, as gfx1036 hardware gives) a signed infinity;
+    /// anything else is `|q|` with the quotient's sign (the ISA's order of
+    /// checks).
     fn div_fixup(&mut self, q: V, den: V, num: V) -> V {
         let c = self.cur;
         let (qi, di, ni) = (self.as_int(q), self.as_int(den), self.as_int(num));
@@ -4782,8 +4784,10 @@ impl<'a> Lower<'a> {
         let to_zero = self.s.m.bin(c, Bin::Or, d_inf, n_zero);
         // From the last check to the first, so the first that holds wins.
         let r = self.s.m.bin(c, Bin::Or, sign, q_abs);
-        let r = self.s.m.select(c, to_zero, sign, r);
         let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
+        let q_overflow = self.s.m.cmp(c, pred::IUGE, q_abs, kinf);
+        let r = self.s.m.select(c, q_overflow, signed_inf, r);
+        let r = self.s.m.select(c, to_zero, sign, r);
         let r = self.s.m.select(c, to_inf, signed_inf, r);
         let default_nan = k(self, 0x7FC0_0000);
         let r = self.s.m.select(c, invalid, default_nan, r);

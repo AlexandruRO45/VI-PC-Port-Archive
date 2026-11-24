@@ -445,8 +445,10 @@ fn div_fixup_f16_reference(q: u16, den: u16, num: u16) -> Option<u16> {
     if abs(den) == 0x7C00 || abs(num) == 0 {
         return Some(sign);
     }
-    if nan(q) {
-        return None;
+    // An all-ones exponent overflows, so a NaN quotient gives infinity
+    // (gfx1036 hardware).
+    if abs(q) >= 0x7C00 {
+        return Some(sign | 0x7C00);
     }
     Some(sign | abs(q))
 }
@@ -463,7 +465,7 @@ fn v_div_fixup_f16_follows_the_isa_special_cases() {
         0x0000u16, 0x8000, 0x3C00, 0xBE00, 0x0001, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE01,
     ];
     let mut cases = Vec::new();
-    for &q in &[0x4248u16, 0xC248, 0x7E00] {
+    for &q in &[0x4248u16, 0xC248, 0x7E00, 0x7C01] {
         for &den in &values {
             for &num in &values {
                 cases.push([u32::from(q), u32::from(den), u32::from(num), 0]);
