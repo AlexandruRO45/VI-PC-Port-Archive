@@ -305,6 +305,12 @@ pub extern "system" fn VirtualAlloc(at: *const c_void, size: usize, kind: u32, p
     if kind & (0x8_0000 | 0x100_0000) != 0 && !at.is_null() {
         count_call(3, at as usize, size, kind, !out.is_null());
     }
+    // A commit of the title's own in graphics memory (`XMemVirtualAlloc`
+    // reserved it): the GPU side's arenas are told, as for an
+    // `XMemVirtualAlloc` commit.
+    if kind & MEM_COMMIT != 0 && !out.is_null() && !at.is_null() && graphics_region(out as usize, size).is_some_and(|r| !r.2) {
+        victory_gpu::title_memory_committed(out as usize, size);
+    }
     out
 }
 
@@ -479,9 +485,13 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         if attributes & ALLOC_32BIT != 0 {
             // What the GPU side has in place there goes first (its pages
             // cannot be released while a heap is open on them).
-            let len = graphics_region(address as usize, 1).map_or_else(|| region_bytes(address), |r| r.1);
-            victory_gpu::title_memory_released(address as usize, len);
-            graphics_regions().remove(&(address as usize));
+            // (Only with the switches that install the wrappers: off,
+            // nothing is in place and nothing is asked.)
+            if memory_calls() {
+                let len = graphics_region(address as usize, 1).map_or_else(|| region_bytes(address), |r| r.1);
+                victory_gpu::title_memory_released(address as usize, len);
+                graphics_regions().remove(&(address as usize));
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }

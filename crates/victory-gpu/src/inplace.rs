@@ -126,6 +126,9 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// View memory in a section's arena: the section (`bias` is then the
+    /// title memory's offset in it).
+    pub(crate) section: Option<usize>,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -142,7 +145,7 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, section: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -163,7 +166,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         let kind = if r.kind == crate::arena::Kind::Section { 5 } else { 4 };
         crate::arena::ARENA_STATS[kind].fetch_add(len, Ordering::Relaxed);
         counted(window, len);
-        return Some(Placed { buffer: r.resource, heap: r.heap, gpu: r.gpu, bias: r.offset });
+        return Some(Placed { buffer: r.resource, heap: r.heap, gpu: r.gpu, bias: r.offset, section: r.section });
     }
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
@@ -227,8 +230,14 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
-    let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
+    let gone = crate::shadow::in_place_let_go(at as u64, len as u64, true);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
+}
+
+/// Whether `[at, at + len)` is still one run of `section` from `offset`
+/// (a window in place there stays good across the title's remapping).
+pub(crate) fn still_run(at: u64, len: u64, section: usize, offset: u64) -> bool {
+    cover(at as usize, len.max(1) as usize) == Cover::Run(section, offset)
 }
 
 /// The line of what is in place, every ten seconds while [`level`] is on.
@@ -245,7 +254,8 @@ fn say() {
         let a: Vec<u64> = crate::arena::ARENA_STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
         tracing::info!(
             "title memory in place, arenas: {parts} parts of private memory and {sections} sections open, {:.2} GiB locked (budget {:.1} GiB); \
-             since the start {} opened ({} MB), {} refused, {} retired, {} ranges resolved; buffers and windows placed in them: {} MB of private memory, {} MB of view memory",
+             since the start {} opened ({} MB), {} refused, {} retired, {} ranges resolved; buffers and windows placed in them: {} MB of private memory, {} MB of view memory; turned down: {}; \
+             remapped under a placement in a section: {} kept (still the same run), {} let go and placed again",
             locked as f64 / f64::from(1u32 << 30),
             crate::arena::most() as f64 / f64::from(1u32 << 30),
             a[0],
@@ -254,7 +264,10 @@ fn say() {
             a[2],
             a[6],
             a[4] >> 20,
-            a[5] >> 20
+            a[5] >> 20,
+            crate::arena::turned_down(),
+            crate::shadow::REMAPS[0].load(Ordering::Relaxed),
+            crate::shadow::REMAPS[1].load(Ordering::Relaxed)
         );
     }
     tracing::info!(

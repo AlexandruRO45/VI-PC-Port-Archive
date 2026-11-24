@@ -85,6 +85,8 @@ pub(crate) struct Resolved {
     /// Bytes from it to the arena's end.
     pub(crate) left: u64,
     pub(crate) kind: Kind,
+    /// With [`Kind::Section`]: the section.
+    pub(crate) section: Option<usize>,
 }
 
 enum Slot {
@@ -93,13 +95,70 @@ enum Slot {
     Open(Arc<Arena>),
     /// The host refused it, it is not committed whole, or over the budget:
     /// copies, as before.
-    Refused,
+    Refused(Why),
 }
+
+/// Why a range is not in place (counted in [`TURNED`], by this order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// View memory that is not one run of a section, or of a section not
+    /// made committed.
+    View = 0,
+    /// Not in memory the runtime reported committed (`XMemVirtualAlloc`).
+    NotTitle,
+    /// It spans pages not committed (a hole between the title's commits).
+    NotCommitted,
+    /// It spans pages of another protection than read-write.
+    Protection,
+    /// Its run of committed pages cannot hold it in one part (4 GiB - 64
+    /// KiB, from a part's start on the 2 GiB grid of the run).
+    Size,
+    /// The arenas' budget is used up.
+    Budget,
+    /// The host refused to open the part or section.
+    Host,
+    /// Its part or section is being opened on the arenas' thread.
+    Opening,
+}
+
+const WHY_NAMES: [&str; 8] = [
+    "view memory not one run of a committed section",
+    "not memory the runtime reported committed",
+    "spans pages not committed",
+    "spans pages of another protection",
+    "longer than a part of its run",
+    "over the budget",
+    "refused by the host",
+    "its arena still being opened",
+];
+
+/// Ranges turned down since the start, by [`Why`].
+pub(crate) static TURNED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// [`TURNED`] for the log: the kinds that turned something down.
+pub(crate) fn turned_down() -> String {
+    let parts: Vec<String> = WHY_NAMES
+        .iter()
+        .zip(&TURNED)
+        .filter_map(|(name, n)| match n.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(format!("{n} {name}")),
+        })
+        .collect();
+    if parts.is_empty() { "none".to_owned() } else { parts.join(", ") }
+}
+
+/// A run of pages with one state, as `VirtualQuery` gives them: start,
+/// end, and whether committed private read-write memory (else why not).
+type Run = (u64, u64, Result<(), Why>);
 
 #[derive(Default)]
 pub(crate) struct Arenas {
     /// Committed private title memory by address: bytes.
     regions: BTreeMap<u64, u64>,
+    /// Per region (by its start), its runs of pages as Windows has them,
+    /// asked when first needed and forgotten when the region changes.
+    runs: HashMap<u64, Vec<Run>>,
     /// Parts by (start, bytes).
     parts: BTreeMap<(u64, u64), Slot>,
     /// Section heaps by the section's handle.
@@ -112,14 +171,65 @@ pub(crate) struct Arenas {
 /// bytes opened; ranges resolved in place.
 pub(crate) static ARENA_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// The runs of pages of `[from, to)` as Windows has them now: one
+/// `VirtualQuery` per run.
+fn runs_of(from: u64, to: u64) -> Vec<Run> {
+    use windows_sys::Win32::System::Memory as mem;
+    let mut runs = Vec::new();
+    let mut at = from;
+    while at < to {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(at as *const std::ffi::c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            runs.push((at, to, Err(Why::NotCommitted)));
+            break;
+        }
+        let end = (info.BaseAddress as u64 + info.RegionSize as u64).min(to);
+        let state = if info.State != mem::MEM_COMMIT || info.Type != mem::MEM_PRIVATE {
+            Err(Why::NotCommitted)
+        } else if info.Protect != mem::PAGE_READWRITE {
+            Err(Why::Protection)
+        } else {
+            Ok(())
+        };
+        runs.push((at, end, state));
+        at = end;
+    }
+    runs
+}
+
+/// Of a run `[lo, hi)` of committed pages (both on 64 KiB), the part that
+/// holds `[at, end)`: the lowest of the parts every [`STRIDE`] from `lo`,
+/// each at most [`PART`] and within the run, that holds it whole.
+pub(crate) fn grid_part(lo: u64, hi: u64, at: u64, end: u64) -> Result<(u64, u64), Why> {
+    if at < lo || end > hi {
+        return Err(Why::NotCommitted);
+    }
+    let mut start = lo;
+    while start <= at {
+        let bytes = (hi - start).min(PART) & !(K64 as u64 - 1);
+        if bytes > 0 && end <= start + bytes {
+            return Ok((start, bytes));
+        }
+        start += STRIDE;
+    }
+    Err(Why::Size)
+}
+
 impl Arenas {
     /// Committed private title memory `[at, at + len)`, joined with what
-    /// it continues or overlaps.
+    /// it continues or overlaps. The region's runs are asked anew when next
+    /// needed (a commit may join two runs: a range over both then opens a
+    /// new, longer part beside the older one, which stays for what was
+    /// placed in it).
     pub(crate) fn committed(&mut self, at: u64, len: u64) {
         let (mut from, mut to) = (at & !(K64 as u64 - 1), (at + len).next_multiple_of(4096));
         let touching: Vec<u64> = self.regions.range(..=to).filter(|&(&b, &n)| b + n >= from).map(|(&b, _)| b).collect();
         for base in touching {
             if let Some(n) = self.regions.remove(&base) {
+                self.runs.remove(&base);
                 from = from.min(base);
                 to = to.max(base + n);
             }
@@ -135,6 +245,7 @@ impl Arenas {
         let hit: Vec<(u64, u64)> = self.regions.range(..end).filter(|&(&b, &n)| b + n > at).map(|(&b, &n)| (b, n)).collect();
         for (base, n) in hit {
             self.regions.remove(&base);
+            self.runs.remove(&base);
             if base < at {
                 self.regions.insert(base, at - base);
             }
@@ -152,22 +263,28 @@ impl Arenas {
         parts
     }
 
-    /// The part a range `[at, end)` of private title memory lies in: the
-    /// lowest of its region's parts that holds it whole.
-    fn part_for(&self, at: u64, end: u64) -> Option<(u64, u64)> {
-        let (&base, &n) = self.regions.range(..=at).next_back()?;
+    /// The part a range `[at, end)` of private title memory lies in. The
+    /// title commits its big regions in steps, with holes and other
+    /// protections between (the 3.4 GB region of run inplace3-t3 was not
+    /// committed whole): a part is cut from the run of committed read-write
+    /// pages that holds the range ([`grid_part`]), not from the region.
+    fn part_for(&mut self, at: u64, end: u64) -> Result<(u64, u64), Why> {
+        let (&base, &n) = self.regions.range(..=at).next_back().filter(|&(&b, &n)| at < b + n).ok_or(Why::NotTitle)?;
         if end > base + n {
-            return None;
+            return Err(Why::NotTitle);
         }
-        let mut start = base;
-        while start <= at {
-            let bytes = (n - (start - base)).min(PART) & !(K64 as u64 - 1);
-            if bytes > 0 && end <= start + bytes {
-                return Some((start, bytes));
-            }
-            start += STRIDE;
+        let runs = self.runs.entry(base).or_insert_with(|| runs_of(base, base + n));
+        let i = runs.partition_point(|r| r.1 <= at);
+        let &(lo, hi, state) = runs.get(i).ok_or(Why::NotCommitted)?;
+        state?;
+        if end > hi {
+            // Why the range ends outside its run: the next run's state.
+            return Err(match runs.get(i + 1) {
+                Some(&(_, _, Err(why))) => why,
+                _ => Why::NotCommitted,
+            });
         }
-        None
+        grid_part(lo.next_multiple_of(K64 as u64), hi & !(K64 as u64 - 1), at, end)
     }
 
     /// An open part that holds `[at, end)`, if one is open.
@@ -191,59 +308,91 @@ impl Arenas {
         most: u64,
         request: &mut dyn FnMut(Request),
     ) -> Option<Resolved> {
-        let end = at.checked_add(len.max(1))?;
+        match self.resolve_why(device, at, len, sync, most, request) {
+            Ok(resolved) => Some(resolved),
+            Err(why) => {
+                TURNED[why as usize].fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// [`Arenas::resolve_with`], with why not.
+    pub(crate) fn resolve_why(
+        &mut self,
+        device: &ID3D12Device,
+        at: u64,
+        len: u64,
+        sync: u64,
+        most: u64,
+        request: &mut dyn FnMut(Request),
+    ) -> Result<Resolved, Why> {
+        let end = at.checked_add(len.max(1)).ok_or(Why::NotTitle)?;
         // View memory: one run of a committed section.
-        if let Cover::Run(section, offset) = cover(at as usize, len.max(1) as usize) {
-            let bytes = crate::inplace::section_bytes(section)?;
+        let covered = cover(at as usize, len.max(1) as usize);
+        if covered != Cover::None && !matches!(covered, Cover::Run(..)) {
+            return Err(Why::View);
+        }
+        if let Cover::Run(section, offset) = covered {
+            let bytes = crate::inplace::section_bytes(section).ok_or(Why::View)?;
             let arena = match self.sections.get(&section) {
                 Some(Slot::Open(arena)) => arena.clone(),
-                Some(_) => return None,
+                Some(Slot::Opening) => return Err(Why::Opening),
+                Some(Slot::Refused(why)) => return Err(*why),
                 None if bytes > sync => {
                     self.sections.insert(section, Slot::Opening);
                     request(Request::Section(section, bytes));
-                    return None;
+                    return Err(Why::Opening);
                 }
                 None => {
                     let slot = self.open_section(device, section, bytes, most);
                     let arena = match &slot {
-                        Slot::Open(arena) => Some(arena.clone()),
-                        _ => None,
+                        Slot::Open(arena) => Ok(arena.clone()),
+                        Slot::Refused(why) => Err(*why),
+                        Slot::Opening => Err(Why::Opening),
                     };
                     self.sections.insert(section, slot);
                     arena?
                 }
             };
             if offset + len > arena.bytes {
-                return None;
+                return Err(Why::Size);
             }
             ARENA_STATS[6].fetch_add(1, Ordering::Relaxed);
-            return Some(Resolved {
+            return Ok(Resolved {
                 resource: arena.buffer.clone(),
                 heap: arena.heap.clone(),
                 offset,
                 gpu: arena.gpu + offset,
                 left: arena.bytes - offset,
                 kind: Kind::Section,
+                section: Some(section),
             });
         }
+        // Private memory: a part that is open already and holds it (an
+        // older, shorter part as well as a newer one), else the part of
+        // its run of committed pages.
         let arena = match self.open_part(at, end) {
             Some(arena) => arena,
             None => {
                 let key = self.part_for(at, end)?;
                 match self.parts.get(&key) {
-                    Some(_) => return None,
+                    Some(Slot::Open(arena)) => arena.clone(),
+                    Some(Slot::Opening) => return Err(Why::Opening),
+                    Some(Slot::Refused(why)) => return Err(*why),
                     None if key.1 > sync => {
                         self.parts.insert(key, Slot::Opening);
                         request(Request::Part(key.0, key.1));
-                        return None;
+                        return Err(Why::Opening);
                     }
                     None => {
                         let slot = self.open_part_now(device, key, most);
                         let arena = match &slot {
-                            Slot::Open(arena) => Some(arena.clone()),
-                            _ => None,
+                            Slot::Open(arena) => Ok(arena.clone()),
+                            Slot::Refused(why) => Err(*why),
+                            Slot::Opening => Err(Why::Opening),
                         };
-                        self.parts.insert(key, slot);
+                        self.keep(key, slot);
                         arena?
                     }
                 }
@@ -251,14 +400,28 @@ impl Arenas {
         };
         ARENA_STATS[6].fetch_add(1, Ordering::Relaxed);
         let offset = at - arena.base;
-        Some(Resolved {
+        Ok(Resolved {
             resource: arena.buffer.clone(),
             heap: arena.heap.clone(),
             offset,
             gpu: arena.gpu + offset,
             left: arena.bytes - offset,
             kind: Kind::InPlace,
+            section: None,
         })
+    }
+
+    /// Keeps what opening the part `key` gave. Pages found not committed
+    /// whole or of another protection at the opening mean the runs asked
+    /// before are out of date: they are asked anew, and nothing is kept,
+    /// so the next ask cuts its part from the runs as they are then.
+    fn keep(&mut self, key: (u64, u64), slot: Slot) {
+        if let Slot::Refused(Why::NotCommitted | Why::Protection) = slot {
+            self.parts.remove(&key);
+            self.runs.clear();
+            return;
+        }
+        self.parts.insert(key, slot);
     }
 
     fn open_part_now(&mut self, device: &ID3D12Device, (start, bytes): (u64, u64), most: u64) -> Slot {
@@ -293,7 +456,7 @@ impl Arenas {
             Request::Part(start, bytes) => {
                 if matches!(self.parts.get(&(start, bytes)), Some(Slot::Opening)) {
                     self.opened(&slot);
-                    self.parts.insert((start, bytes), slot);
+                    self.keep((start, bytes), slot);
                 }
             }
             Request::Section(section, _) => {
@@ -341,11 +504,13 @@ pub(crate) enum Request {
 fn open_part(device: &ID3D12Device, start: u64, bytes: u64, locked: u64, most: u64) -> Slot {
     if locked + bytes > most {
         note_refused(format_args!("part {start:#x}+{bytes:#x}: over the budget ({} MB locked of {} MB)", locked >> 20, most >> 20));
-        return Slot::Refused;
+        return Slot::Refused(Why::Budget);
     }
+    // The runs were asked when the part was cut; the title may have
+    // changed its pages since.
     if !private_whole(start as usize, bytes as usize) {
-        note_refused(format_args!("part {start:#x}+{bytes:#x}: not private memory committed whole and read-write"));
-        return Slot::Refused;
+        note_refused(format_args!("part {start:#x}+{bytes:#x}: its pages changed since they were asked (not committed whole and read-write now)"));
+        return Slot::Refused(Why::NotCommitted);
     }
     let started = std::time::Instant::now();
     let made = open(device, From::Part(start as usize, bytes as usize)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
@@ -364,7 +529,7 @@ fn open_part(device: &ID3D12Device, start: u64, bytes: u64, locked: u64, most: u
         }
         Err(e) => {
             note_refused(format_args!("part {start:#x}+{bytes:#x}: the host refused ({e})"));
-            Slot::Refused
+            Slot::Refused(Why::Host)
         }
     }
 }
@@ -373,11 +538,11 @@ fn open_section(device: &ID3D12Device, section: usize, bytes: u64, locked: u64, 
     let bytes = bytes & !(K64 as u64 - 1);
     if bytes > PART {
         note_refused(format_args!("section of {} MB: 4 GiB or more cannot be opened (VICTORY_POOL_SECTION_MB)", bytes >> 20));
-        return Slot::Refused;
+        return Slot::Refused(Why::Size);
     }
     if locked + bytes > most {
         note_refused(format_args!("section of {} MB: over the budget ({} MB locked of {} MB)", bytes >> 20, locked >> 20, most >> 20));
-        return Slot::Refused;
+        return Slot::Refused(Why::Budget);
     }
     let started = std::time::Instant::now();
     let made = open(device, From::Section(section)).and_then(|heap| place(device, &heap, 0, bytes).map(|b| (heap, b)));
@@ -395,7 +560,7 @@ fn open_section(device: &ID3D12Device, section: usize, bytes: u64, locked: u64, 
         }
         Err(e) => {
             note_refused(format_args!("section of {} MB: the host refused ({e}; a section made reserved is refused: VICTORY_INPLACE_POOL=1)", bytes >> 20));
-            Slot::Refused
+            Slot::Refused(Why::Host)
         }
     }
 }
@@ -501,13 +666,16 @@ pub fn title_memory_released(at: usize, len: usize) {
     let parts = with(|a| a.released(at as u64, len as u64));
     let mut gone = 0;
     for (start, bytes) in parts {
-        gone += crate::shadow::in_place_let_go(start, bytes);
+        gone += crate::shadow::in_place_let_go(start, bytes, false);
     }
     crate::inplace::let_go_counted(gone);
 }
 
 /// The runtime closed a section of physical pages.
 pub fn title_memory_section_gone(section: usize) {
+    if crate::inplace::level() < 3 {
+        return;
+    }
     with(|a| a.section_gone(section));
 }
 
@@ -519,38 +687,104 @@ mod tests {
 
     const G: u64 = 1 << 30;
 
-    /// The parts of a region: one up to 4 GiB - 64 KiB; beyond, every 2 GiB,
-    /// and a range takes the lowest part that holds it whole.
+    /// The parts of a run of committed pages: one up to 4 GiB - 64 KiB;
+    /// beyond, every 2 GiB, and a range takes the lowest part that holds it
+    /// whole. Committed regions join what they continue and are cut where
+    /// released.
     #[test]
-    fn a_range_takes_the_lowest_part_that_holds_it() {
-        let mut a = Arenas::default();
+    fn a_range_takes_the_lowest_part_of_its_run_that_holds_it() {
         let base = 0x10_0000_0000u64;
-        a.committed(base, 64 << 20);
-        assert_eq!(a.part_for(base + 0x1000, base + 0x2000), Some((base, 64 << 20)));
-        assert_eq!(a.part_for(base + (63 << 20), base + (65 << 20)), None, "past the region");
-        // Committed next to it: one region.
-        a.committed(base + (64 << 20), 64 << 20);
-        assert_eq!(a.part_for(base + (63 << 20), base + (65 << 20)), Some((base, 128 << 20)));
-        // A region of 9 GiB: parts at 0, 2, 4, 6 GiB.
-        let big = 0x20_0000_0000u64;
-        a.committed(big, 9 * G);
-        assert_eq!(a.part_for(big + G, big + 3 * G), Some((big, PART)));
-        assert_eq!(a.part_for(big + 3 * G, big + 5 * G), Some((big + 2 * G, PART)));
-        assert_eq!(a.part_for(big + 7 * G, big + 9 * G), Some((big + 6 * G, 3 * G)));
+        let run = |n: u64| (base, base + n);
+        let (lo, hi) = run(64 << 20);
+        assert_eq!(grid_part(lo, hi, base + 0x1000, base + 0x2000), Ok((base, 64 << 20)));
+        assert_eq!(grid_part(lo, hi, base + (63 << 20), base + (65 << 20)), Err(Why::NotCommitted), "past the run");
+        assert_eq!(grid_part(lo + K64 as u64, hi, base, base + 10), Err(Why::NotCommitted), "before the run");
+        // A run of 9 GiB: parts at 0, 2, 4, 6 GiB.
+        let (lo, hi) = run(9 * G);
+        assert_eq!(grid_part(lo, hi, base + G, base + 3 * G), Ok((base, PART)));
+        assert_eq!(grid_part(lo, hi, base + 3 * G, base + 5 * G), Ok((base + 2 * G, PART)));
+        assert_eq!(grid_part(lo, hi, base + 7 * G, base + 9 * G), Ok((base + 6 * G, 3 * G)));
+        assert_eq!(grid_part(lo, hi, base + G, base + 5 * G), Err(Why::Size), "4 GiB in no part");
         // Any range of 2 GiB - 64 KiB lies in one.
         for k in 0..64u64 {
-            let at = big + k * (7 * G / 64);
-            let end = (at + STRIDE - K64 as u64).min(big + 9 * G);
-            let (s, n) = a.part_for(at, end).unwrap_or_else(|| panic!("no part for {at:#x}"));
+            let at = base + k * (7 * G / 64);
+            let end = (at + STRIDE - K64 as u64).min(base + 9 * G);
+            let (s, n) = grid_part(lo, hi, at, end).unwrap_or_else(|e| panic!("no part for {at:#x}: {e:?}"));
             assert!(s <= at && end <= s + n && n <= PART);
         }
-        // Released in the middle: the region is cut in two.
-        let parts = a.released(big + 4 * G, G);
-        assert!(parts.is_empty(), "none open");
-        assert_eq!(a.part_for(big + 4 * G + 10, big + 4 * G + 20), None);
-        assert_eq!(a.part_for(big + 3 * G, big + 3 * G + 10), Some((big, PART)), "the region below is 4 GiB: its first part");
-        assert_eq!(a.part_for(big + 4 * G - 16, big + 4 * G - 8), Some((big + 2 * G, 2 * G)), "past the first part");
-        assert_eq!(a.part_for(big + 5 * G, big + 5 * G + 10), Some((big + 5 * G, PART)));
+        // Regions: joined, then cut where released.
+        let mut a = Arenas::default();
+        a.committed(base, 64 << 20);
+        a.committed(base + (64 << 20), 64 << 20);
+        assert_eq!(a.regions.iter().map(|(&b, &n)| (b, n)).collect::<Vec<_>>(), [(base, 128 << 20)]);
+        assert!(a.released(base + (32 << 20), 16 << 20).is_empty(), "none open");
+        assert_eq!(a.regions.iter().map(|(&b, &n)| (b, n)).collect::<Vec<_>>(), [(base, 32 << 20), (base + (48 << 20), 80 << 20)]);
+        // Not reported: not the title's.
+        assert_eq!(a.part_for(0x30_0000_0000, 0x30_0000_0010), Err(Why::NotTitle));
+    }
+
+    /// Design §11 follow-up (run inplace3-t3: the title's 3.4 GB region was
+    /// committed in steps, and a part over the whole region was refused):
+    /// a reservation committed in two runs with a hole between. A buffer in
+    /// either run is placed in its run's part; one over the hole is turned
+    /// down (a copy), and so is one over a page of another protection.
+    #[test]
+    fn warp_runs_of_committed_pages_are_parts_of_their_own() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        if device.cast::<windows::Win32::Graphics::Direct3D12::ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let bytes = 32 * K64;
+            let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | crate::inplace::MEM_WRITE_WATCH, mem::PAGE_NOACCESS).cast::<u8>();
+            let b = base as u64;
+            let page = |k: u64| b + k * K64 as u64;
+            // Run one: pages 0..8; a hole of 4 pages; run two: 12..20, of
+            // which page 18 is read-only; 20..32 stay reserved.
+            assert!(!mem::VirtualAlloc(base.cast(), 8 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            assert!(!mem::VirtualAlloc(base.add(12 * K64).cast(), 8 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            let mut old = 0;
+            assert_ne!(mem::VirtualProtect(base.add(18 * K64).cast(), K64, mem::PAGE_READONLY, &mut old), 0);
+            let mut a = Arenas::default();
+            // As the runtime reports them: two commits of one reservation.
+            a.committed(b, 8 * K64 as u64);
+            a.committed(page(12), 8 * K64 as u64);
+            let mut asked = Vec::new();
+            let mut resolve = |a: &mut Arenas, at: u64, len: u64| a.resolve_why(&device, at, len, u64::MAX, u64::MAX, &mut |r| asked.push(r));
+            let one = resolve(&mut a, b + 0x100, 0x2_0000).expect("in run one");
+            assert_eq!((one.offset, one.left), (0x100, 8 * K64 as u64 - 0x100));
+            let two = resolve(&mut a, page(13) + 8, 0x1_0000).expect("in run two");
+            assert_eq!(two.offset, K64 as u64 + 8, "run two's part begins at its first page");
+            assert_ne!(one.resource.as_raw(), two.resource.as_raw(), "a part each");
+            assert_eq!(resolve(&mut a, page(7), 2 * K64 as u64).err(), Some(Why::NotTitle), "over the hole, which nothing reported");
+            // The hole committed but not reported: still not the title's;
+            // reported, the region is one, and a range over the old hole
+            // gets a part of the longer run, beside the two older parts.
+            assert!(!mem::VirtualAlloc(base.add(8 * K64).cast(), 4 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            a.committed(page(8), 4 * K64 as u64);
+            let joined = resolve(&mut a, page(7), 2 * K64 as u64).expect("over the joined run");
+            assert_eq!(joined.offset, 7 * K64 as u64, "a part from the reservation's start");
+            assert_eq!(joined.left, 18 * K64 as u64 - 7 * K64 as u64, "up to the read-only page");
+            assert_eq!(resolve(&mut a, page(17), 2 * K64 as u64).err(), Some(Why::Protection), "over the read-only page");
+            assert_eq!(resolve(&mut a, page(18), 16).err(), Some(Why::Protection));
+            // The older parts serve what lies in them.
+            let again = resolve(&mut a, b + 0x200, 16).expect("in place");
+            assert_eq!(again.resource.as_raw(), one.resource.as_raw(), "an open part that holds it is taken");
+            assert_eq!(a.census().0, 3);
+            assert!(asked.is_empty());
+            // Through each part the GPU reads the title's bytes.
+            let mut rig = crate::inplace::Rig::new(&device).unwrap();
+            crate::inplace::fill(base.add(13 * K64 + 8), 64, 9);
+            let got = rig.fetch(&two.resource, two.offset, 64).unwrap();
+            assert!(crate::inplace::same(base.add(13 * K64 + 8), &got));
+            crate::inplace::fill(base.add(7 * K64), 2 * K64, 3);
+            let got = rig.fetch(&joined.resource, joined.offset, 2 * K64).unwrap();
+            assert!(crate::inplace::same(base.add(7 * K64), &got));
+            drop((one, two, joined, again));
+            drop(a);
+            mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
     }
 
     /// On the software adapter: a region opened as one arena; two title

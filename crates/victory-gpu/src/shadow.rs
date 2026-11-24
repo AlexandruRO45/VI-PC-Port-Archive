@@ -77,6 +77,12 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// In place in a section's arena (view memory): the section. Such a
+    /// window is not let go when the title remaps its pages; it is marked
+    /// (`remapped`) and looked at again when next asked for
+    /// ([`still_good`]).
+    section: Option<usize>,
+    remapped: std::sync::atomic::AtomicBool,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2140,6 +2146,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
+        shadow.section = placed.section;
         shadow.place = Some((placed.heap, placed.bias));
         shadow
     }
@@ -2177,6 +2184,8 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            section: None,
+            remapped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -3254,14 +3263,27 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
 /// goes when no list and no slot holds it any more. Returns how many.
-pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
+///
+/// With `remap` (the title maps pages anew, `inplace::title_memory_freeing`)
+/// what is in place in a section's arena is only marked: the run of pages
+/// it shows is looked at again when it is next asked for, and it stays if
+/// the range is still the same run of the same section ([`still_good`]).
+/// Run inplace3-pool-t3 let 9,755 windows go that way in three minutes.
+pub(crate) fn in_place_let_go(at: u64, len: u64, remap: bool) -> u64 {
     let end = at.saturating_add(len);
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let marked = |s: &Shadow| {
+        let mark = remap && s.section.is_some();
+        if mark {
+            s.remapped.store(true, Ordering::Relaxed);
+        }
+        mark
+    };
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at && !marked(shadow))
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
@@ -3270,7 +3292,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
-            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+            if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some() && !marked(s)) {
                 gone.extend(entry.shadow.take());
             }
         }
@@ -3280,6 +3302,29 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// Since the start: things in place in a section's arena whose pages the
+/// title remapped and that were found the same run again (kept), and that
+/// were not (placed again or copied).
+pub(crate) static REMAPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether `shadow` may be handed out: anything but a placement over view
+/// memory whose pages were remapped and no longer show the same run of
+/// the same section (looked at once per remapping).
+fn still_good(shadow: &Shadow) -> bool {
+    if !shadow.remapped.load(Ordering::Relaxed) {
+        return true;
+    }
+    let (Some(section), Some((_, offset))) = (shadow.section, shadow.place.as_ref()) else {
+        return true;
+    };
+    let good = crate::inplace::still_run(shadow.start, shadow.len, section, *offset);
+    if good {
+        shadow.remapped.store(false, Ordering::Relaxed);
+    }
+    REMAPS[usize::from(!good)].fetch_add(1, Ordering::Relaxed);
+    good
 }
 
 /// With arenas (`VICTORY_INPLACE=3`): a title buffer whose first use came
@@ -3380,6 +3425,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
+    if entry.shadow.as_ref().is_some_and(|s| !still_good(s)) {
+        crate::host::retire(entry.shadow.take());
+    }
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -3603,6 +3651,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
+    // A window in place whose pages the title remapped is looked at again.
+    let drop_stale = |map: &mut BTreeMap<(u64, u64), Arc<Shadow>>, key: (u64, u64)| {
+        if map.get(&key).is_some_and(|s| !still_good(s)) {
+            crate::host::retire(map.remove(&key));
+        }
+    };
+    drop_stale(&mut map, (start, len));
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
@@ -3615,6 +3670,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     if crate::inplace::level() >= 3
         && let Some((run, bytes)) = crate::inplace::run_window(address, end, unsized_ask)
     {
+        drop_stale(&mut map, (run, bytes));
         if let Some(shadow) = map.get(&(run, bytes)) {
             note(shadow);
             return Some(shadow.clone());
@@ -3745,6 +3801,54 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod remap_tests {
+    use super::*;
+
+    /// A placement over view memory in a section's arena outlives a
+    /// remapping that leaves its range the same run of the same section,
+    /// and not one that does not (counted in [`REMAPS`]).
+    #[test]
+    fn warp_a_placement_in_a_section_outlives_a_remapping_to_the_same_pages() {
+        let Some(device) = crate::inplace::tests::warp() else { return };
+        // SAFETY: the section and view of the test's own.
+        unsafe {
+            use windows_sys::Win32::System::Memory as mem;
+            const K: usize = 64 << 10;
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, (8 * K) as u32, std::ptr::null());
+            assert!(!handle.is_null());
+            let heap = crate::inplace::open(&device, crate::inplace::From::Section(handle as usize)).unwrap();
+            let buffer = crate::inplace::place(&device, &heap, 0, 8 * K as u64).unwrap();
+            let gpu = buffer.GetGPUVirtualAddress();
+            // A made-up view address: only the runtime's table is looked at.
+            let at = 0x7_e000_0000usize;
+            let section = handle as usize;
+            crate::inplace::title_memory_view(at, 2 * K, section, 3 * K as u64);
+            let placed = crate::inplace::Placed { buffer, heap, gpu: gpu + 3 * K as u64, bias: 3 * K as u64, section: Some(section) };
+            let shadow = Shadow::test_in_place(placed, at as u64, 2 * K as u64);
+            let before = [REMAPS[0].load(Ordering::Relaxed), REMAPS[1].load(Ordering::Relaxed)];
+            assert!(still_good(&shadow), "not remapped");
+            // Remapped to the same pages: kept.
+            shadow.remapped.store(true, Ordering::Relaxed);
+            crate::inplace::views_gone(at, 2 * K);
+            crate::inplace::title_memory_view(at, K, section, 3 * K as u64);
+            crate::inplace::title_memory_view(at + K, K, section, 4 * K as u64);
+            assert!(still_good(&shadow), "the same run");
+            assert!(!shadow.remapped.load(Ordering::Relaxed));
+            // Remapped elsewhere: not good.
+            shadow.remapped.store(true, Ordering::Relaxed);
+            crate::inplace::views_gone(at, 2 * K);
+            crate::inplace::title_memory_view(at, 2 * K, section, 5 * K as u64);
+            assert!(!still_good(&shadow), "other pages");
+            assert!(REMAPS[0].load(Ordering::Relaxed) > before[0] && REMAPS[1].load(Ordering::Relaxed) > before[1]);
+            crate::inplace::views_gone(at, 2 * K);
+            drop(shadow);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+    }
 }
 
 #[cfg(test)]

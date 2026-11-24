@@ -2726,6 +2726,10 @@ pub(crate) fn walls_trace() -> bool {
 /// them, as for ranges of copies (design §11, bug 2).
 fn in_place_writes(runs: &[&HostList]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
+    // Nothing is in place without the switch: not one more pass.
+    if crate::inplace::level() == 0 {
+        return ranges;
+    }
     for list in runs {
         ranges.extend(in_place_ranges(&list.deferred().copies));
     }
