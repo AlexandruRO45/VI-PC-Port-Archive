@@ -287,6 +287,9 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+// The host's retire path reads the count in every Windows build; only the
+// capture code that logs it is diagnostics-only.
+#[cfg(windows)]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
