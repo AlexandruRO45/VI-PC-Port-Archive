@@ -928,9 +928,10 @@ pub(crate) fn compile(
                     errors.GetBufferSize(),
                 )
             };
-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
+            tracing::info!("a shader of ours: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
         }
-        return Err(e);
+        return crate::dxc::compile_pcstr(source, entry, target)
+            .inspect_err(|e2| tracing::warn!(error = %e, dxc = %e2, "a shader of ours: DXC failed too"));
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
     // SAFETY: the blob's own bytes.
@@ -2908,7 +2909,7 @@ impl Host {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
-        unsafe {
+        let code: Vec<u8> = unsafe {
             D3DCompile(
                 CARD_COMPARE.as_ptr().cast(),
                 CARD_COMPARE.len(),
@@ -2921,9 +2922,14 @@ impl Host {
                 0,
                 &mut code,
                 None,
-            )?;
+            )
         }
-        let code = code.ok_or_else(windows::core::Error::empty)?;
+        .map(|()| {
+            let code = code.as_ref().expect("D3DCompile succeeded");
+            // SAFETY: the blob's own bytes.
+            unsafe { std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize()) }.to_vec()
+        })
+        .or_else(|_| crate::dxc::compile(CARD_COMPARE, "main", "cs_5_1"))?;
         let list = || self.make_prelude().ok_or_else(windows::core::Error::empty);
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
@@ -2933,7 +2939,7 @@ impl Host {
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let bytes = &code[..];
             let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),

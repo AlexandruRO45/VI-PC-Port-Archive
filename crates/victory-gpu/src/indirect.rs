@@ -180,24 +180,31 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
             Some(&mut errors),
         )
     };
-    if let Err(e) = compiled {
-        if let Some(errors) = errors {
-            // SAFETY: the blob's own bytes.
-            let text = unsafe {
-                std::slice::from_raw_parts(
-                    errors.GetBufferPointer().cast::<u8>(),
-                    errors.GetBufferSize(),
-                )
-            };
-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
-        }
-        return Err(e);
+    if let Err(e) = &compiled
+        && let Some(errors) = &errors
+    {
+        // SAFETY: the blob's own bytes.
+        let text = unsafe {
+            std::slice::from_raw_parts(
+                errors.GetBufferPointer().cast::<u8>(),
+                errors.GetBufferSize(),
+            )
+        };
+        tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
     }
-    let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let fallback = match &compiled {
+        Ok(()) => Vec::new(),
+        Err(_) => crate::dxc::compile(SOURCE, "main", "cs_5_1")
+            .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?,
+    };
+    // SAFETY: the blob's own bytes (or DXC's); the root signature is inside the shader.
     unsafe {
-        let bytes =
-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes = match (&compiled, &code) {
+            (Ok(()), Some(code)) => {
+                std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+            }
+            _ => &fallback[..],
+        };
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
