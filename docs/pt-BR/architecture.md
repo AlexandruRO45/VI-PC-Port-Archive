@@ -1,6 +1,6 @@
 # Arquitetura
 
-> Tradução de [docs/architecture.md](../architecture.md), feita em 2026-11-23.
+> Tradução de [docs/architecture.md](../architecture.md), atualizada em 2026-11-24.
 > Em caso de divergência, vale a versão em inglês.
 
 ```
@@ -97,6 +97,11 @@ wave viram desvios por lane, e instruções vetoriais mantêm uma guarda só ond
 uma lane pode alcançá-las com seu bit EXEC desligado.
 `victory_shader::resource` rastreia cada descritor e endereço de memória
 escalar até o parâmetro raiz de onde vem (tabela, heap, root descriptor ou
-constante). `victory translate` passa todos os shaders que encontra
-(containers, arquivos SGD5) por essas etapas e lista o que eles ainda não
-conseguem tratar.
+constante). Um descritor que um waterfall loop lê da primeira lane
+(`v_readfirstlane_b32`) é rastreado até o load ou a escolha por lane que dá a
+cada lane o seu próprio descritor (o `v_cndmask_b32` de uma máscara, ou um
+if/else em que cada ramo o define: rastreado nos caminhos que as lanes
+seguem, a partir da estruturação), e acessado com um índice de heap
+não uniforme numa única passada. `victory translate` passa todos os shaders
+que encontra (containers, arquivos SGD5) por essas etapas e lista o que eles
+ainda não conseguem tratar.
