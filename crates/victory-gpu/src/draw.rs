@@ -2014,6 +2014,7 @@ impl State {
                             shadow.refresh(list, address, u64::from(aligned_size));
                             host.constant_at(index, shadow.gpu(address), size);
                         } else {
+                            let size = crate::descriptor::constant_staging_bytes(size);
                             let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                                 host.make_null(index);
                                 continue;
