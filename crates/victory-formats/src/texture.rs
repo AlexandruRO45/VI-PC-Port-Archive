@@ -1161,6 +1161,113 @@ mod tests {
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
     }
 
+    /// The swizzle numbers GFX10 has: linear, 256 B `S`/`D`, 4 KiB and
+    /// 64 KiB `S`/`D`, their `_T`/`_X` XOR forms and the `Z_X`/`R_X` modes.
+    /// Each tiled mode has one kind, and XOR modes are exactly 16 and up.
+    #[test]
+    fn swizzle_numbers_classify() {
+        let known = [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 23, 24, 25, 26, 27];
+        for n in 0..64 {
+            let s = Swizzle(n);
+            assert_eq!(s.block_log2().is_some(), known.contains(&n), "{n}");
+            let Some(log2) = s.block_log2() else {
+                assert_eq!(
+                    Layout::new(&desc(4, 4, 1, 4, s)),
+                    Err(Error::Invalid),
+                    "{n}"
+                );
+                continue;
+            };
+            let rotated = matches!(n, 23 | 27);
+            let kinds = [s.standard(), s.display(), s.z_order(), rotated];
+            let expected = usize::from(n != 0);
+            assert_eq!(kinds.iter().filter(|&&k| k).count(), expected, "{n}");
+            assert_eq!(s.xor(), n >= 16, "{n}");
+            if n != 0 {
+                // A 1x1 texture still takes one whole block.
+                let l = Layout::new(&desc(1, 1, 1, 4, s)).unwrap();
+                assert_eq!((l.size, l.alignment), (1 << log2, 1 << log2), "{n}");
+            }
+        }
+    }
+
+    /// XOR and multisampled layouts have sizes and mips, but their addresses
+    /// depend on the GPU's pipes: in-range lookups and copies are
+    /// `Unsupported`, out-of-range ones still `Invalid`, and the sizes match
+    /// the non-XOR mode with the same block.
+    #[test]
+    fn xor_and_msaa_layouts_size_but_do_not_address() {
+        let pairs = [
+            (Swizzle::SW_64KB_S_T, Swizzle::SW_64KB_S),
+            (Swizzle::SW_64KB_D_T, Swizzle::SW_64KB_D),
+            (Swizzle::SW_4KB_S_X, Swizzle::SW_4KB_S),
+            (Swizzle::SW_4KB_D_X, Swizzle::SW_4KB_D),
+            (Swizzle::SW_64KB_S_X, Swizzle::SW_64KB_S),
+            (Swizzle::SW_64KB_D_X, Swizzle::SW_64KB_D),
+        ];
+        for (xor, plain) in pairs {
+            let d = desc(300, 200, 9, 4, xor);
+            let l = Layout::new(&d).unwrap();
+            let p = Layout::new(&Desc {
+                swizzle: plain,
+                ..d
+            })
+            .unwrap();
+            assert!(!l.addressable() && p.addressable(), "{xor:?}");
+            assert_eq!((l.size, l.alignment), (p.size, p.alignment), "{xor:?}");
+            assert_eq!(l.mips, p.mips, "{xor:?}");
+            assert_eq!(l.offset(0, 0, 0, 0), Err(Error::Unsupported));
+            assert_eq!(l.offset(0, 300, 0, 0), Err(Error::Invalid));
+            assert_eq!(l.offset(9, 0, 0, 0), Err(Error::Invalid));
+            let tiled = vec![0u8; l.size as usize];
+            let mut out = vec![0u8; 300 * 200 * 4];
+            assert_eq!(
+                l.detile(&tiled, 0, 0, &mut out, 1200, 0),
+                Err(Error::Unsupported)
+            );
+            assert_eq!(
+                l.detile(&tiled, 9, 0, &mut out, 1200, 0),
+                Err(Error::Invalid)
+            );
+        }
+        for swizzle in [
+            Swizzle::SW_64KB_Z_X,
+            Swizzle::SW_64KB_R_X,
+            Swizzle::SW_4KB_R_X,
+        ] {
+            let l = Layout::new(&desc(64, 64, 1, 4, swizzle)).unwrap();
+            assert_eq!(l.offset(0, 1, 1, 0), Err(Error::Unsupported), "{swizzle:?}");
+        }
+        let msaa = Layout::new(&Desc {
+            samples: 4,
+            ..desc(64, 64, 1, 4, Swizzle::SW_64KB_D)
+        })
+        .unwrap();
+        assert!(!msaa.addressable());
+        assert!(msaa.size >= 64 * 64 * 4 * 4);
+        assert_eq!(msaa.offset(0, 0, 0, 0), Err(Error::Unsupported));
+        // Multisampled textures have one mip and are 2D only.
+        for bad in [
+            Desc {
+                samples: 4,
+                ..desc(64, 64, 2, 4, Swizzle::SW_64KB_D)
+            },
+            Desc {
+                samples: 3,
+                ..desc(64, 64, 1, 4, Swizzle::SW_64KB_D)
+            },
+            Desc {
+                samples: 16,
+                ..desc(64, 64, 1, 4, Swizzle::SW_64KB_D)
+            },
+        ] {
+            assert_eq!(Layout::new(&bad), Err(Error::Invalid), "{bad:?}");
+        }
+        // Past the chain a subresource covers nothing.
+        assert_eq!(msaa.subresource_depth(0), 1);
+        assert_eq!(msaa.subresource_depth(1), 0);
+    }
+
     /// Random descriptions, coordinates and copy pitches give layouts or
     /// errors, never a panic or an overflow; every layout and copy stays
     /// inside the buffers it is given.
