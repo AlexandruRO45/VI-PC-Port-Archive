@@ -1766,6 +1766,54 @@ mod tests {
         );
     }
 
+    /// A one-program blob whose stage data is cut to `len` bytes: the code
+    /// is moved to the payload start (empty) so the stage data ends the blob.
+    fn cut_stage_data(stage: HwStage, len: usize) -> Result<Vec<NativeProgram>, ShaderError> {
+        let mut blob = fssm(&[(stage, &[])]);
+        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
+        blob[record..][..8].copy_from_slice(&0u64.to_le_bytes());
+        let e = stage_data_at(&blob, stage);
+        blob.truncate(e + len);
+        let payload = (blob.len() - FSSM_HEADER) as u64;
+        blob[8..16].copy_from_slice(&payload.to_le_bytes());
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    #[test]
+    fn refuses_stage_data_cut_short() {
+        // The fewest bytes each stage reads: a vertex program up to its
+        // output count, a mesh program up to its group info (after its
+        // outputs and clip control), compute up to the group size, a pixel
+        // program up to the last MRT's patch offset (every patch absent).
+        let needs = [
+            (HwStage::Vs, VS_OUTPUT_COUNT + 4),
+            (HwStage::Ms, MS_INFO + 8),
+            (HwStage::Cs, CS_THREADS + 12),
+            (HwStage::Ps, PS_PATCHES + (MRTS - 1) * PATCH_BYTES + 4),
+            (HwStage::Ls, 0),
+            (HwStage::Gs, 0),
+        ];
+        for (stage, need) in needs {
+            assert!(
+                cut_stage_data(stage, need).is_ok(),
+                "{stage:?} with {need} bytes"
+            );
+            for len in 0..need {
+                // Only a mesh program's group info is read as one span, named
+                // as such; every other field is a lone read past the end.
+                let why = if stage == HwStage::Ms && len >= VS_OUTPUT_COUNT + 4 {
+                    "stage data out of bounds"
+                } else {
+                    "truncated"
+                };
+                assert!(
+                    matches!(cut_stage_data(stage, len), Err(Malformed(w)) if w == why),
+                    "{stage:?} with {len} of {need} bytes"
+                );
+            }
+        }
+    }
+
     #[test]
     fn names_each_record_refusal() {
         let good = fssm(&[(HwStage::Vs, &VS_CODE)]);
