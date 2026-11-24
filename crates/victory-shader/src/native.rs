@@ -2904,6 +2904,71 @@ mod tests {
     }
 
     #[test]
+    fn mesh_info_breaking_several_rules_is_named_for_the_first_checked() {
+        let ms = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&ms, HwStage::Ms);
+        let mesh = |info: [u8; 8], lds: u32, shared_param: bool| {
+            let mut blob = ms.clone();
+            blob[e + MS_INFO..][..8].copy_from_slice(&info);
+            let record = e - RECORD_SIZE as usize;
+            blob[record + RECORD_LDS..][..4].copy_from_slice(&lds.to_le_bytes());
+            if shared_param {
+                // Two outputs on parameter 3, one per vertex and one per
+                // primitive: bit 7 aside, they name the same parameter.
+                blob[e + VS_OUTPUTS..][..12]
+                    .copy_from_slice(&[6, 0, 3, 0, 0, 0, 6, 1, 0x83, 0, 0, 0]);
+                blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            }
+            xbch(&blob)
+        };
+        let (no_lanes, too_many_vertices, no_topology) = (0u8, 0xffu8, 0u8);
+        let too_much_lds = MAX_LDS_BYTES + 1;
+        // Each mesh below also breaks every rule named after it: the outputs
+        // are checked first, then lanes, output counts, topology and LDS.
+        for (info, lds, shared, why) in [
+            (
+                [no_lanes, 0, 1, too_many_vertices, 1, 0, 0, no_topology],
+                too_much_lds,
+                true,
+                "vertex outputs share a parameter",
+            ),
+            (
+                [no_lanes, 0, 1, too_many_vertices, 1, 0, 0, no_topology],
+                too_much_lds,
+                false,
+                "implausible thread-group size",
+            ),
+            (
+                [1, 0, 1, too_many_vertices, 1, 0, 0, no_topology],
+                too_much_lds,
+                false,
+                "implausible mesh output count",
+            ),
+            (
+                [1, 0, 1, 0, 1, 0, 0, no_topology],
+                too_much_lds,
+                false,
+                "unknown mesh topology",
+            ),
+            (
+                [1, 0, 1, 0, 1, 0, 0, 2],
+                too_much_lds,
+                false,
+                "implausible LDS size",
+            ),
+        ] {
+            assert_eq!(refused_blob(&mesh(info, lds, shared)), why, "{info:?}");
+        }
+        // With every rule kept, the same mesh is read.
+        let p = native_programs(&part(&[(
+            KIND_NATIVE,
+            &mesh([1, 0, 1, 0, 1, 0, 0, 2], 0, false),
+        )]))
+        .unwrap();
+        assert!(matches!(&p[0].io, StageIo::Ms(m) if (m.threads, m.topology) == (1, 2)));
+    }
+
+    #[test]
     fn sparse_vertex_inputs_can_interleave_at_the_last_vgpr() {
         let mut blob = fssm(&[(HwStage::Vs, &VS_CODE)]);
         let data = stage_data_at(&blob, HwStage::Vs);
