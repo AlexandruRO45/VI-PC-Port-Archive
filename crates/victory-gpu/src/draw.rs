@@ -528,6 +528,16 @@ impl State {
                             }
                         },
                     };
+                    // A root view of a console address that is not on 16
+                    // bytes is the invalid call the README records: leave it
+                    // unbound, as the root UAV path does.
+                    if address % 16 != 0 {
+                        once!(
+                            address = format_args!("{address:#x}"),
+                            "a chased pointer not on 16 bytes is left unbound"
+                        );
+                        continue;
+                    }
                     let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };

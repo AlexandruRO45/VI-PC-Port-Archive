@@ -481,9 +481,10 @@ fn texture_to_buffer(
     }
     ensure_state(list, src.resource, COPY_SOURCE);
     from.resource = texture.as_raw().cast_const().cast();
-    // A buffer has no state a copy has to move it out of: a transition here
-    // would name a before-state we do not know, and D3D12 ignores a buffer's
-    // state for a copy anyway.
+    // shortcut: this host's hardware tolerates a buffer in any state for a
+    // copy, and D3D12 names COPY_DEST as the destination state, so a buffer
+    // left in UNORDERED_ACCESS by `indirect` copies without a barrier rather
+    // than through one that would have to guess its before-state.
     // The destination buffer reads title memory; what the copy writes there
     // goes back to it once the list has run.
     shadow.refresh(list, at, bytes);
