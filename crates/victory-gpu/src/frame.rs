@@ -204,21 +204,39 @@ mod tests {
 
         // The title's loop (the clock is global, so in the same test): an
         // origin poll that times out (and starts the frame), then a
-        // blocking flip wait. Each flip takes its own tick.
+        // blocking flip wait. Each flip takes its own tick, the next one
+        // unless the thread woke late (a loaded machine oversleeps): then
+        // it skips only the ticks that passed meanwhile.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        const INTERVAL: Duration = Duration::from_millis(5);
+        assert_eq!(
+            set_interval(null, null, INTERVAL.as_micros() as u32, 3, 0),
+            S_OK
+        );
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
-            .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
-                LAST[2].load(Ordering::Relaxed)
-            })
-            .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let mut flips: Vec<u64> = Vec::new();
+        for _ in 0..4 {
+            let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+            // The tick due now; the wait computes its own a moment later.
+            let (due, _) = next_tick(FLIP);
+            let asked = Instant::now();
+            assert_eq!(
+                wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                S_OK
+            );
+            let flip = LAST[2].load(Ordering::Relaxed);
+            // At most the ticks that passed during the call (its sleep
+            // included) later than due.
+            let passed = (asked.elapsed().as_nanos() / INTERVAL.as_nanos()) as u64;
+            assert!(
+                flip >= due && flip <= due + 1 + passed,
+                "{due} {flip} {passed}"
+            );
+            if let Some(&prev) = flips.last() {
+                assert!(flip > prev, "{flips:?} {flip}");
+            }
+            flips.push(flip);
+        }
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
