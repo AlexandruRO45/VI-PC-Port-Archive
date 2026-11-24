@@ -353,7 +353,8 @@ fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        n == 0 || info.State != MEM_COMMIT
+        (n == 0 || info.State != MEM_COMMIT)
+            && !LAZY_RESERVED.get().is_some_and(|lazy| lazy(page * PAGE, PAGE))
     };
     let mut taken = Vec::with_capacity(pages.len());
     let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
@@ -458,6 +459,14 @@ impl Drop for Writing {
 }
 
 static ON_KERNEL_WRITE: std::sync::OnceLock<fn(usize, usize)> = std::sync::OnceLock::new();
+static LAZY_RESERVED: std::sync::OnceLock<fn(usize, usize) -> bool> = std::sync::OnceLock::new();
+
+/// Unlike an unmapped physical view, a lazy page can become readable
+/// through a CPU fault without a mapping notification. Keep it dirty
+/// until we can protect and observe its writes.
+pub fn on_lazy_reserved(query: fn(usize, usize) -> bool) {
+    let _ = LAZY_RESERVED.set(query);
+}
 
 /// Register the runtime's lazy-page commit callback.
 pub fn on_kernel_write(before: fn(usize, usize)) {

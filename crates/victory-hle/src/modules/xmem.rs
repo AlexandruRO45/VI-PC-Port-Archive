@@ -1064,6 +1064,7 @@ pub(crate) fn host_memory_module() -> HleModule {
 
 pub(crate) fn module() -> HleModule {
     victory_gpu::on_kernel_write(lazy::before_write);
+    victory_gpu::on_lazy_reserved(lazy::overlaps);
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],

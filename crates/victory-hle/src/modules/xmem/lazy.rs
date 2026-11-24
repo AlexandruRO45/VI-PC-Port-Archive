@@ -157,6 +157,13 @@ pub(super) fn logical_query(at: usize, info: &mut MEMORY_BASIC_INFORMATION) {
     }
 }
 
+pub(super) fn overlaps(at: usize, len: usize) -> bool {
+    let map = RANGES.read().unwrap_or_else(|e| e.into_inner());
+    map.range(..at.saturating_add(len))
+        .next_back()
+        .is_some_and(|(_, r)| at < r.end)
+}
+
 /// Kernel writes cannot fault into the user-mode handler. Only commit
 /// private writable ranges; do not change existing protections.
 pub(super) fn before_write(at: usize, len: usize) {
