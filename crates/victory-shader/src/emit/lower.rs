@@ -901,6 +901,8 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
+            // A breadcrumb may have ended the block (a back edge's counting).
+            self.tail[b] = Some(self.cur);
         }
         self.fill_phis()?;
         let user_data = self.user_reads.values().copied().collect();
@@ -6848,19 +6850,24 @@ impl<'a> Lower<'a> {
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         let limit = self.s.m.i32(super::loop_limit());
+        // The breadcrumb may end the block (a store of one lane), so the
+        // back edge leaves from where it ends.
+        self.crumb(to, next);
+        let c = self.cur;
         self.counters
             .get_mut(&to)
             .expect("header")
             .1
             .push((next, c));
-        self.crumb(to, next);
         self.s.m.cmp(c, p, next, limit)
     }
 
     /// Breadcrumbs (see [`super::breadcrumbs`]): the count of the loop at
     /// header `to` goes to its word of the shader's slot, as the largest
-    /// any lane reached. The buffer's UAV is the view heap's entry at the
-    /// index in the first user-data dword past the console's.
+    /// any lane reached: the wave's largest, stored by its first active lane
+    /// (one atomic a wave, not one a lane). The buffer's UAV is the view
+    /// heap's entry at the index in the first user-data dword past the
+    /// console's.
     fn crumb(&mut self, to: usize, count: V) {
         let Some(slot) = self.x.crumbs else { return };
         let next = self.crumb_loops.len() as u32;
@@ -6883,12 +6890,20 @@ impl<'a> Lower<'a> {
             dword: 0,
         });
         let c = self.cur;
+        let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+        self.s.flags |= flags::WAVE_OPS;
+        // The largest count of the lanes that take the back edge (unsigned max).
+        let (k, u) = (self.s.m.i8(3), self.s.m.i8(1));
+        let count = self.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[count, k, u]);
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let guarded = self.begin_guarded(Some(first));
+        let c = self.cur;
         // A raw buffer UAV (`atomicMax`, operation 7, at the word's byte offset).
         let h = self.s.heap_handle(c, index, false, false, (11 | 0x1000, 0));
         let at = self.s.m.i32((slot * super::BREADCRUMB_LOOPS + n) * 4);
-        let (op, unused) = (self.s.m.i32(7), self.s.m.undef(self.s.t.i32));
-        let i32t = self.s.t.i32;
+        let (op, unused) = (self.s.m.i32(7), self.s.m.undef(i32t));
         self.s.op(c, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, op, at, unused, unused, count]);
+        self.end_guarded(guarded, &[]);
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
@@ -7130,6 +7145,7 @@ mod tests {
         let crumbs = counted_loop(Some(7));
         // The store (and the heap handle it goes through) are in the module.
         assert!(crumbs.dxil.len() > plain.dxil.len());
+        assert!(crumbs.wave_ops && !plain.wave_ops);
         // The first dword past the console's (one root constant: s0).
         let heap_index: Vec<_> = crumbs
             .user_data
