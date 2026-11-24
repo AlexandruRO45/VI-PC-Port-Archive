@@ -26,6 +26,10 @@ void write_word() { target.Store(0, value); }
 [RootSignature("SRV(t0), UAV(u0)")]
 [numthreads(1, 1, 1)]
 void read_word() { target.Store(0, source.Load(0)); }
+
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void read_constant() { target.Store(0, value); }
 "#;
 
 const UAV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -539,6 +543,58 @@ fn gpu_producer_copy_and_gpu_consumer_are_ordered() {
         "shader must see the GPU-produced value"
     );
     assert_eq!(b.words(), [500], "copy destination must reach title memory");
+}
+
+#[test]
+fn cpu_constant_in_a_declared_uav_range_reaches_the_gpu() {
+    let Some(gpu) = test_gpu() else { return };
+    const WORD: usize = 64;
+    const OFFSET: u64 = (WORD * size_of::<u32>()) as u64;
+    let writer = Shader::new(gpu.host, s!("write_word"));
+    let reader = Shader::new(gpu.host, s!("read_constant"));
+    let input = TitleBuffer::new(&[0; WORD * 2]);
+    input.set(WORD, 11);
+    let payload = TitleBuffer::new(&[0]);
+    let output = TitleBuffer::new(&[0]);
+    let commands = TitleList::new();
+    let shadow = shadow::find(input.address, input.len).unwrap();
+    {
+        let list = commands.recording();
+        shadow.refresh(&list, input.address, input.len);
+        shadow.gpu_writes(&list, input.address, input.len);
+        writer.write_gpu(&list, shadow.gpu(input.address), 77);
+    }
+    commands.transition(&input, UAV, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+
+    {
+        let list = commands.recording();
+        let constant = input.address + OFFSET;
+        list.defer_copy(constant as *mut u8, payload.address as *const u8, 4);
+        shadow.refresh(&list, constant, 256);
+        list.defer(move || {
+            // SAFETY: The fixture still owns this title allocation.
+            unsafe { (constant as *mut u32).write(61) };
+        });
+        let out = output.shadow(&list, 0, true);
+        // SAFETY: All the resources remain live and the CBV is aligned.
+        unsafe {
+            list.list.SetComputeRootSignature(&reader.root);
+            list.list.SetPipelineState(&reader.pipeline);
+            list.list.SetComputeRootConstantBufferView(0, shadow.gpu(constant));
+            list.list.SetComputeRootUnorderedAccessView(1, out.gpu(output.address));
+            list.list.Dispatch(1, 1, 1);
+        }
+    }
+    commands.close();
+
+    // The copy source changes after recording, before the deferred copy.
+    payload.set(0, 43);
+    gpu.execute(&[commands.host()]);
+    let observed = output.words()[0];
+    let words = input.words();
+    eprintln!("CBV readback {observed}, GPU/CPU title values {:?}", (words[0], words[WORD]));
+    assert_eq!(observed, 43);
+    assert_eq!((words[0], words[WORD]), (77, 61));
 }
 
 #[test]
