@@ -222,6 +222,25 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Lazily built SSA value-use index for speculative heap-load guarding.
+    uses: Option<HashMap<Value, Vec<UseSite>>>,
+    /// Pure compares hoisted ahead of a speculative heap load in the same
+    /// block, skipped when the block loop reaches them.
+    hoisted: HashSet<Site>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UseSite {
+    Inst(usize, usize),
+    Phi(usize, usize, usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardCond {
+    /// A per-lane or uniform BDD boolean active when equal to `want`.
+    Bool(Bool, bool),
+    /// A scalar compare's SCC value active when equal to `want`.
+    Scc(Value, bool),
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -515,6 +534,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            uses: None,
+            hoisted: HashSet::new(),
         }
     }
 
@@ -882,7 +903,9 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
-                self.inst(b, i)?;
+                if !self.hoisted.contains(&(b, i)) {
+                    self.inst(b, i)?;
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -1857,6 +1880,626 @@ impl<'a> Lower<'a> {
                 phi
             })
             .collect()
+    }
+
+    fn old_vgpr(&mut self, inst: &Inst, reg: u8) -> V {
+        match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
+            Some(Ok(o)) => o,
+            _ => self.s.m.i32(0),
+        }
+    }
+
+    fn in_section(&self, b: usize, i: usize) -> bool {
+        self.sections
+            .get(&b)
+            .is_some_and(|m| m.iter().any(|(&start, s)| (start..s.end).contains(&i)))
+    }
+
+    /// Whether `src` lowers through `createHandleFromHeap` (a heap/table
+    /// descriptor load rather than a root descriptor or static sampler).
+    fn is_heap_source(src: &Source) -> bool {
+        src.leaves()
+            .into_iter()
+            .any(|l| matches!(l, Source::Loaded { .. } | Source::Fetched { .. }))
+    }
+
+    fn ensure_uses(&mut self) {
+        if self.uses.is_some() {
+            return;
+        }
+        let mut map: HashMap<Value, Vec<UseSite>> = HashMap::new();
+        for (u, block) in self.x.p.blocks.iter().enumerate() {
+            if self.block[u].is_none() {
+                continue;
+            }
+            for (phi_idx, phi) in block.phis.iter().enumerate() {
+                for (pred_idx, &val) in phi.args.iter().enumerate() {
+                    map.entry(val)
+                        .or_default()
+                        .push(UseSite::Phi(u, phi_idx, pred_idx));
+                }
+            }
+            for (j, inst) in block.insts.iter().enumerate() {
+                for &(reg, val) in &inst.reads {
+                    if matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                        continue;
+                    }
+                    let list = map.entry(val).or_default();
+                    if list.last() != Some(&UseSite::Inst(u, j)) {
+                        list.push(UseSite::Inst(u, j));
+                    }
+                }
+            }
+        }
+        self.uses = Some(map);
+    }
+
+    fn operand_reads_value(inst: &Inst, op: &Operand, v: Value, dwords: u8) -> bool {
+        match *op {
+            Operand::Scalar { code, .. } if code != NULL => {
+                (0..dwords).any(|k| inst.read(Reg::S(code + k)) == Some(v))
+            }
+            Operand::Vector { reg, .. } => {
+                (0..dwords).any(|k| inst.read(Reg::V(reg + k)) == Some(v))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `(b, j)` (`j > i`) is a side-effect-free compare whose inputs
+    /// are all already lowered before `(b, i)` and can safely be hoisted.
+    fn is_hoistable_cmp(&self, b: usize, i: usize, j: usize) -> bool {
+        if j <= i || self.hoisted.contains(&(b, j)) || self.in_section(b, j) {
+            return false;
+        }
+        let inst = &self.x.p.blocks[b].insts[j];
+        let name = inst.name();
+        let is_cmp = match &inst.fields {
+            Fields::Sop { .. } => {
+                (name.starts_with("s_cmp_")
+                    || name.starts_with("s_cmpk_")
+                    || name.starts_with("s_bitcmp"))
+                    && inst.write(Reg::S(EXEC)).is_none()
+            }
+            Fields::Valu(v) => {
+                name.starts_with("v_cmp_")
+                    && v.dpp.is_none()
+                    && self.x.st.guards[b][j].is_none()
+            }
+            _ => false,
+        };
+        if !is_cmp {
+            return false;
+        }
+        inst.reads.iter().all(|&(reg, v)| {
+            if matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1) {
+                return true;
+            }
+            if self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v) {
+                return false;
+            }
+            matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_)))
+                || self.params.contains_key(&v)
+        })
+    }
+
+    fn def_inst_in_block(&self, b: usize, v: Value) -> Option<usize> {
+        if self.def_block.get(&v) != Some(&b) {
+            return None;
+        }
+        self.x.p.blocks[b]
+            .insts
+            .iter()
+            .position(|inst| inst.writes.iter().any(|&(_, w)| w == v))
+    }
+
+    fn can_eval_cond(&self, cond: GuardCond, b: usize, i: usize) -> bool {
+        match cond {
+            GuardCond::Scc(v, _) => {
+                matches!(self.vals.get(&v), Some(Val::Bit(_)))
+                    || self
+                        .def_inst_in_block(b, v)
+                        .is_some_and(|j| self.is_hoistable_cmp(b, i, j))
+            }
+            GuardCond::Bool(bool_id, _) => {
+                if bool_id == Bool::TRUE || bool_id == Bool::FALSE {
+                    return false;
+                }
+                self.x.st.bools.support(bool_id).into_iter().all(|atom| match atom {
+                    Atom::Uniform(v) => {
+                        matches!(self.vals.get(&v), Some(Val::Bit(_) | Val::I32(_)))
+                            || self.params.contains_key(&v)
+                            || self
+                                .def_inst_in_block(b, v)
+                                .is_some_and(|j| self.is_hoistable_cmp(b, i, j))
+                    }
+                    Atom::Lane(v) => {
+                        self.lane_bits.contains_key(&v)
+                            || self
+                                .def_inst_in_block(b, v)
+                                .is_some_and(|j| self.is_hoistable_cmp(b, i, j))
+                    }
+                    Atom::Phi(id) => {
+                        self.mask_phis.contains_key(&id)
+                            || self.phi_at.get(&id).is_some_and(|&(pb, _)| {
+                                self.block[pb].is_some() && self.rpo[pb] <= self.rpo[b]
+                            })
+                    }
+                    _ => false,
+                })
+            }
+        }
+    }
+
+    fn hoist_cmp(&mut self, b: usize, j: usize) -> Result<(), Why> {
+        if self.hoisted.contains(&(b, j)) {
+            return Ok(());
+        }
+        let inst: &'a Inst = &self.x.p.blocks[b].insts[j];
+        let name = inst.name();
+        let res = match &inst.fields {
+            Fields::Sop { .. } => self.sop(inst),
+            Fields::Valu(_) => {
+                let rest = name.strip_prefix("v_cmp_").ok_or("a compare")?;
+                self.compare(inst, rest)
+            }
+            _ => Err("a compare"),
+        };
+        if res.is_ok() {
+            self.hoisted.insert((b, j));
+        }
+        res
+    }
+
+    fn eval_cond(&mut self, cond: GuardCond, b: usize) -> Result<V, Why> {
+        let (bit, want) = match cond {
+            GuardCond::Scc(v, want) => {
+                if !matches!(self.vals.get(&v), Some(Val::Bit(_)))
+                    && let Some(j) = self.def_inst_in_block(b, v)
+                {
+                    self.hoist_cmp(b, j)?;
+                }
+                let Some(&Val::Bit(bit)) = self.vals.get(&v) else {
+                    return Err("SCC without a value");
+                };
+                (bit, want)
+            }
+            GuardCond::Bool(bool_id, want) => {
+                for atom in self.x.st.bools.support(bool_id) {
+                    match atom {
+                        Atom::Uniform(v)
+                            if !matches!(self.vals.get(&v), Some(Val::Bit(_) | Val::I32(_)))
+                                && !self.params.contains_key(&v) =>
+                        {
+                            if let Some(j) = self.def_inst_in_block(b, v) {
+                                self.hoist_cmp(b, j)?;
+                            }
+                        }
+                        Atom::Lane(v) if !self.lane_bits.contains_key(&v) => {
+                            if let Some(j) = self.def_inst_in_block(b, v) {
+                                self.hoist_cmp(b, j)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (self.boolean(bool_id, self.cur)?, want)
+            }
+        };
+        if want {
+            Ok(bit)
+        } else {
+            let t = self.s.m.bool(true);
+            Ok(self.s.m.bin(self.cur, Bin::Xor, bit, t))
+        }
+    }
+
+    /// Whether `inst` at `(u, j)` is a lane-local pure instruction whose
+    /// results depend only on its own inputs and carry no observable side
+    /// effects.
+    fn is_pure_forward(&self, u: usize, j: usize) -> bool {
+        if self.in_section(u, j) {
+            return false;
+        }
+        let inst = &self.x.p.blocks[u].insts[j];
+        let name = inst.name();
+        if inst.write(Reg::S(EXEC)).is_some()
+            || inst
+                .writes
+                .iter()
+                .any(|&(_, w)| self.x.st.masks.contains_key(&w) || self.x.st.highs.contains_key(&w))
+        {
+            return false;
+        }
+        match &inst.fields {
+            Fields::Sop { .. } => {
+                !name.starts_with("s_cbranch")
+                    && !name.starts_with("s_branch")
+                    && !name.starts_with("s_setpc")
+                    && !name.starts_with("s_swappc")
+                    && !name.starts_with("s_sendmsg")
+                    && !name.starts_with("s_setreg")
+                    && !name.starts_with("s_waitcnt")
+                    && !name.starts_with("s_endpgm")
+                    && !name.starts_with("s_barrier")
+            }
+            Fields::Valu(v) => {
+                v.dpp.is_none()
+                    && !name.starts_with("v_cmpx_")
+                    && !matches!(
+                        name,
+                        "v_readfirstlane_b32"
+                            | "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_mbcnt_lo_u32_b32"
+                            | "v_mbcnt_hi_u32_b32"
+                    )
+                    && !name.contains("permute")
+                    && !name.contains("permlane")
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `inst` at `(u, j)` is a non-cross-lane instruction whose
+    /// per-lane `EXEC` guard stops execution (and does not expose `v` via a
+    /// preserved destination register when inactive).
+    fn exec_guard_protects_use(&self, u: usize, j: usize, v: Value) -> bool {
+        let inst = &self.x.p.blocks[u].insts[j];
+        let name = inst.name();
+        // If `v` is the preserved old value of a destination VGPR, inactive
+        // lanes still observe `v`, so the EXEC guard does not make `v` dead.
+        for &(reg, _) in &inst.writes {
+            if matches!(reg, Reg::V(_)) && inst.read(reg) == Some(v) {
+                return false;
+            }
+        }
+        match &inst.fields {
+            Fields::Valu(val) => {
+                val.dpp.is_none()
+                    && !matches!(
+                        name,
+                        "v_readfirstlane_b32" | "v_readlane_b32" | "v_writelane_b32"
+                    )
+                    && !name.contains("permute")
+                    && !name.contains("permlane")
+            }
+            Fields::Buffer { .. } | Fields::Exp { .. } => true,
+            Fields::Image { .. } => {
+                name.starts_with("image_load")
+                    || name.starts_with("image_store")
+                    || name.starts_with("image_atomic")
+            }
+            Fields::Ds { .. } => !name.starts_with("ds_swizzle") && !name.contains("permute"),
+            _ => false,
+        }
+    }
+
+    /// Whether `cond` is invariant across any loop headed by block `u` (always
+    /// true for non-loop joins), so forwarding through a data phi in `u` cannot
+    /// mix iterations with different values of `cond`.
+    fn cond_invariant_at(&self, cond: GuardCond, u: usize) -> bool {
+        let is_loop_header = self.x.p.blocks[u]
+            .preds
+            .iter()
+            .any(|&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[u]);
+        if !is_loop_header {
+            return true;
+        }
+        let before = |v: Value| match self.def_block.get(&v) {
+            None => true,
+            Some(&db) => self.rpo[db] < self.rpo[u],
+        };
+        match cond {
+            GuardCond::Scc(v, _) => before(v),
+            GuardCond::Bool(b, _) => self.x.st.bools.support(b).into_iter().all(|a| match a {
+                Atom::Uniform(v) | Atom::Lane(v) | Atom::Phi(v) => before(v),
+                _ => false,
+            }),
+        }
+    }
+
+    /// Proves that whenever `cond` is false at `(b, i)`, replacing `defs` with
+    /// zero cannot change any observable value or side effect of the program.
+    fn dead_when_false(&self, b: usize, defs: &[Value], cond: GuardCond) -> bool {
+        let Some(uses) = &self.uses else {
+            return false;
+        };
+        let p = self.x.p;
+        // If `cond == false` forces block `b`'s exit branch onto one successor,
+        // compute all blocks reachable from that false successor without
+        // stepping past `b` (where `defs` are redefined).
+        let false_succ = match self.x.st.exits[b] {
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } if taken != not_taken => match cond {
+                GuardCond::Bool(cb, want) => {
+                    if !self.x.st.bools.meet(&[(cb, !want), (when, true)]) {
+                        Some(not_taken)
+                    } else if !self.x.st.bools.meet(&[(cb, !want), (when, false)]) {
+                        Some(taken)
+                    } else {
+                        None
+                    }
+                }
+                GuardCond::Scc(scc, want) => match self.x.st.bools.node(when) {
+                    Some((Atom::Uniform(u), Bool::FALSE, Bool::TRUE)) if u == scc => {
+                        Some(if want { not_taken } else { taken })
+                    }
+                    Some((Atom::Uniform(u), Bool::TRUE, Bool::FALSE)) if u == scc => {
+                        Some(if want { taken } else { not_taken })
+                    }
+                    _ => None,
+                },
+            },
+            _ => None,
+        };
+        let mut reach_on_false = HashSet::new();
+        if let Some(fs) = false_succ {
+            let mut stack = vec![fs];
+            while let Some(u) = stack.pop() {
+                if !reach_on_false.insert(u) || u == b {
+                    continue;
+                }
+                for succ in p.blocks[u].exit.successors() {
+                    if self.block[succ].is_some() {
+                        stack.push(succ);
+                    }
+                }
+            }
+        }
+
+        let mut visited: HashSet<Value> = defs.iter().copied().collect();
+        let mut work: Vec<Value> = defs.to_vec();
+        while let Some(v) = work.pop() {
+            let Some(sites) = uses.get(&v) else {
+                continue;
+            };
+            for &site in sites {
+                match site {
+                    UseSite::Phi(u, phi_idx, pred_idx) => {
+                        let pred = p.blocks[u].preds[pred_idx];
+                        if self.block[pred].is_none() {
+                            continue;
+                        }
+                        let guarded_edge = match false_succ {
+                            Some(fs) if pred == b => u != fs,
+                            Some(_) => !reach_on_false.contains(&pred),
+                            None => false,
+                        };
+                        if guarded_edge {
+                            continue;
+                        }
+                        let phi = &p.blocks[u].phis[phi_idx];
+                        let is_data_phi = !matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                            && !self.x.st.masks.contains_key(&phi.value)
+                            && !self.x.st.highs.contains_key(&phi.value);
+                        if is_data_phi && self.cond_invariant_at(cond, u) && visited.len() < 64 {
+                            if visited.insert(phi.value) {
+                                work.push(phi.value);
+                            }
+                            continue;
+                        }
+                        return false;
+                    }
+                    UseSite::Inst(u, j) => {
+                        if false_succ.is_some() && u != b && !reach_on_false.contains(&u) {
+                            continue;
+                        }
+                        let inst = &p.blocks[u].insts[j];
+                        let name = inst.name();
+                        // Guarded by an EXEC mask that implies `cond`?
+                        if let (GuardCond::Bool(cb, want), Some(g)) = (cond, self.x.st.guards[u][j])
+                            && !self.x.st.bools.meet(&[(g, true), (cb, !want)])
+                            && self.exec_guard_protects_use(u, j, v)
+                        {
+                            continue;
+                        }
+                        // Discarded by `s_cselect_b32` / `s_cselect_b64` on `cond`?
+                        if let (GuardCond::Scc(scc, want), Fields::Sop { src, .. }) =
+                            (cond, &inst.fields)
+                            && matches!(name, "s_cselect_b32" | "s_cselect_b64")
+                            && inst.read(Reg::Scc) == Some(scc)
+                            && v != scc
+                            && src.len() >= 2
+                        {
+                            let dwords = if name == "s_cselect_b64" { 2 } else { 1 };
+                            let inactive = usize::from(want);
+                            if !Self::operand_reads_value(inst, &src[inactive], v, dwords) {
+                                continue;
+                            }
+                        }
+                        // Discarded by `v_cndmask_b32` on a mask implying `cond`?
+                        if let (GuardCond::Bool(cb, want), Fields::Valu(val)) =
+                            (cond, &inst.fields)
+                            && name == "v_cndmask_b32"
+                            && val.src.len() >= 3
+                            && let Operand::Scalar { code, .. } = val.src[2]
+                            && let Some(mask_lo) = inst.read(Reg::S(code))
+                            && let Some(&m) = self.x.st.masks.get(&mask_lo)
+                        {
+                            let mask_dwords = if p.wave64 { 2 } else { 1 };
+                            let reads_mask = Self::operand_reads_value(
+                                inst,
+                                &val.src[2],
+                                v,
+                                mask_dwords,
+                            );
+                            let dst_kept = self.x.st.guards[u][j].is_some()
+                                && val
+                                    .dst
+                                    .as_ref()
+                                    .is_some_and(|d| Self::operand_reads_value(inst, d, v, 1));
+                            if !reads_mask && !dst_kept {
+                                let picks_src0_on_false =
+                                    !self.x.st.bools.meet(&[(cb, !want), (m, true)]);
+                                let picks_src1_on_false =
+                                    !self.x.st.bools.meet(&[(cb, !want), (m, false)]);
+                                if (picks_src0_on_false
+                                    && !Self::operand_reads_value(inst, &val.src[0], v, 1))
+                                    || (picks_src1_on_false
+                                        && !Self::operand_reads_value(inst, &val.src[1], v, 1))
+                                {
+                                    continue;
+                                }
+                            }
+                        }
+                        // Pure lane-local instruction: check all of its outputs.
+                        if self.is_pure_forward(u, j) && visited.len() < 64 {
+                            for &(_, w) in &inst.writes {
+                                if visited.insert(w) {
+                                    work.push(w);
+                                }
+                            }
+                            continue;
+                        }
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Finds a provably sound guard condition for a speculatively hoisted heap
+    /// descriptor load at `(b, i)`: when the condition is false, the loaded
+    /// values are dead on all paths, so skipping `createHandleFromHeap` and
+    /// the load avoids reading an incompatible descriptor (e.g. a null SRV at
+    /// heap slot 0 through a CBV handle, #1595).
+    fn speculative_guard(
+        &mut self,
+        b: usize,
+        i: usize,
+        src: &Source,
+    ) -> Result<Option<V>, Why> {
+        if !Self::is_heap_source(src) {
+            return Ok(None);
+        }
+        let defs: Vec<Value> = self.x.p.blocks[b].insts[i]
+            .writes
+            .iter()
+            .filter(|&&(reg, _)| !matches!(reg, Reg::S(c) if c == EXEC || c == EXEC + 1))
+            .map(|&(_, v)| v)
+            .collect();
+        if defs.is_empty() {
+            return Ok(None);
+        }
+        self.ensure_uses();
+        let has_uses = {
+            let uses = self.uses.as_ref().expect("uses built");
+            defs.iter().any(|v| uses.get(v).is_some_and(|l| !l.is_empty()))
+        };
+        if !has_uses {
+            return Ok(None);
+        }
+
+        let mut candidates = Vec::new();
+        let mut push_cand = |c: GuardCond| {
+            if !candidates.contains(&c) {
+                candidates.push(c);
+            }
+        };
+        if let LaneExit::Branch {
+            when,
+            taken,
+            not_taken,
+        } = self.x.st.exits[b]
+            && taken != not_taken
+        {
+            push_cand(GuardCond::Bool(when, true));
+            push_cand(GuardCond::Bool(when, false));
+        }
+
+        // Collect downstream select and EXEC-guard conditions reached through
+        // pure instructions from `defs`.
+        {
+            let uses = self.uses.as_ref().expect("uses built");
+            let mut seen: HashSet<Value> = defs.iter().copied().collect();
+            let mut work = defs.clone();
+            while let Some(v) = work.pop() {
+                let Some(sites) = uses.get(&v) else {
+                    continue;
+                };
+                for &site in sites {
+                    let UseSite::Inst(u, j) = site else {
+                        if let UseSite::Phi(u, phi_idx, _) = site {
+                            let phi = &self.x.p.blocks[u].phis[phi_idx];
+                            if !matches!(phi.reg, Reg::S(c) if c == EXEC || c == EXEC + 1)
+                                && !self.x.st.masks.contains_key(&phi.value)
+                                && !self.x.st.highs.contains_key(&phi.value)
+                                && seen.len() < 64
+                                && seen.insert(phi.value)
+                            {
+                                work.push(phi.value);
+                            }
+                        }
+                        continue;
+                    };
+                    if let Some(g) = self.x.st.guards[u][j] {
+                        push_cand(GuardCond::Bool(g, true));
+                    }
+                    let inst = &self.x.p.blocks[u].insts[j];
+                    let name = inst.name();
+                    if let Fields::Sop { src, .. } = &inst.fields
+                        && matches!(name, "s_cselect_b32" | "s_cselect_b64")
+                        && let Some(scc) = inst.read(Reg::Scc)
+                        && src.len() >= 2
+                    {
+                        let dwords = if name == "s_cselect_b64" { 2 } else { 1 };
+                        let in0 = Self::operand_reads_value(inst, &src[0], v, dwords);
+                        let in1 = Self::operand_reads_value(inst, &src[1], v, dwords);
+                        if in0 && !in1 {
+                            push_cand(GuardCond::Scc(scc, true));
+                        } else if in1 && !in0 {
+                            push_cand(GuardCond::Scc(scc, false));
+                        }
+                    } else if let Fields::Valu(val) = &inst.fields
+                        && name == "v_cndmask_b32"
+                        && val.src.len() >= 3
+                        && let Operand::Scalar { code, .. } = val.src[2]
+                        && let Some(mask_lo) = inst.read(Reg::S(code))
+                        && let Some(&m) = self.x.st.masks.get(&mask_lo)
+                    {
+                        let in0 = Self::operand_reads_value(inst, &val.src[0], v, 1);
+                        let in1 = Self::operand_reads_value(inst, &val.src[1], v, 1);
+                        if in1 && !in0 {
+                            push_cand(GuardCond::Bool(m, true));
+                        } else if in0 && !in1 {
+                            push_cand(GuardCond::Bool(m, false));
+                        }
+                    }
+                    if self.is_pure_forward(u, j) && seen.len() < 64 {
+                        for &(_, w) in &inst.writes {
+                            if seen.insert(w) {
+                                work.push(w);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Conjoin every provably sound non-tautological guard: if `defs` is
+        // dead whenever C1 is false and dead whenever C2 is false, it is dead
+        // whenever `C1 && C2` is false. This keeps a weaker or waterfall-only
+        // EXEC guard from shadowing a stronger downstream select/branch guard.
+        let mut combined: Option<V> = None;
+        for cand in candidates {
+            if self.can_eval_cond(cand, b, i)
+                && self.dead_when_false(b, &defs, cand)
+                && let Ok(cond_v) = self.eval_cond(cand, b)
+                && !matches!(self.s.m.int_value(cond_v), Some(-1 | 1))
+            {
+                combined = Some(match combined {
+                    None => cond_v,
+                    Some(prev) if prev == cond_v => prev,
+                    Some(prev) => self.s.m.bin(self.cur, Bin::And, prev, cond_v),
+                });
+            }
+        }
+        Ok(combined)
     }
 
     /// Code that depends on the lane layout: wave operations, and in compute
@@ -2850,65 +3493,85 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
-            return Ok(());
-        }
-        let h = self.handle(site, src, false, (13, 0x1_0000))?;
-        let constant = match addr {
-            V::Const(_)
-                if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
-            {
-                Some(*offset as u32)
-            }
-            _ => None,
-        };
-        let mut rows: HashMap<u32, V> = HashMap::new();
-        for k in 0..count {
-            let x = match constant {
-                Some(base) => {
-                    let byte = base + 4 * k;
-                    let row = match rows.get(&(byte >> 4)) {
-                        Some(&r) => r,
-                        None => {
-                            let ri = self.s.m.i32(byte >> 4);
-                            let r = self.s.op(
-                                c,
-                                "cbufferLoadLegacy.i32",
-                                Attr::ReadOnly,
-                                self.s.t.cbuf_ret,
-                                59,
-                                &[h, ri],
-                            );
-                            rows.insert(byte >> 4, r);
-                            r
-                        }
-                    };
-                    self.s.m.extract(c, row, (byte >> 2) & 3)
-                }
-                None => {
+        let guard = self.speculative_guard(site.0, site.1, src)?;
+        let at = self.begin_guarded(guard);
+        let loaded: Result<Vec<V>, Why> = (|| {
+            let c = self.cur;
+            if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+                let h = self.handle(site, src, false, (11, 0))?;
+                let mut out = Vec::with_capacity(count as usize);
+                for k in 0..count {
                     let off = self.s.m.i32(4 * k);
                     let a = self.s.m.bin(c, Bin::Add, addr, off);
-                    self.cbuffer_dword(h, a)
+                    let mask = self.s.m.i8(1);
+                    let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                    let r = self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
+                    let x = self.s.m.extract(c, r, 0);
+                    out.push(self.as_int(x));
                 }
+                return Ok(out);
+            }
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let constant = match addr {
+                V::Const(_)
+                    if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
+                {
+                    Some(*offset as u32)
+                }
+                _ => None,
             };
+            let mut rows: HashMap<u32, V> = HashMap::new();
+            let mut out = Vec::with_capacity(count as usize);
+            for k in 0..count {
+                let x = match constant {
+                    Some(base) => {
+                        let byte = base + 4 * k;
+                        let row = match rows.get(&(byte >> 4)) {
+                            Some(&r) => r,
+                            None => {
+                                let ri = self.s.m.i32(byte >> 4);
+                                let r = self.s.op(
+                                    c,
+                                    "cbufferLoadLegacy.i32",
+                                    Attr::ReadOnly,
+                                    self.s.t.cbuf_ret,
+                                    59,
+                                    &[h, ri],
+                                );
+                                rows.insert(byte >> 4, r);
+                                r
+                            }
+                        };
+                        self.s.m.extract(c, row, (byte >> 2) & 3)
+                    }
+                    None => {
+                        let off = self.s.m.i32(4 * k);
+                        let a = self.s.m.bin(c, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
+                out.push(x);
+            }
+            Ok(out)
+        })();
+        let loaded = match loaded {
+            Ok(vals) => vals,
+            Err(why) => {
+                self.end_guarded(at, &[]);
+                return Err(why);
+            }
+        };
+        let z = self.s.m.i32(0);
+        let pairs: Vec<(V, V)> = loaded.into_iter().map(|x| (x, z)).collect();
+        let results = self.end_guarded(at, &pairs);
+        for (k, x) in results.into_iter().enumerate() {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
@@ -5761,8 +6424,14 @@ impl<'a> Lower<'a> {
                     self.float_of(v)?
                 });
             }
-            let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
+            let h = match self.handle(site, src, false, props) {
+                Ok(h) => h,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
             let mut args = vec![h];
             args.extend(cs);
             args.extend(vals);
@@ -5830,10 +6499,100 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
+        if !sample {
+            // `image_load` / `image_load_mip` (explicit coordinates, no quad
+            // derivatives): branch around handle creation and load when EXEC-
+            // or speculatively guarded so inactive lanes never touch an
+            // incompatible heap descriptor.
+            let Operand::Vector { reg, .. } = *data else {
+                return Err("an image result");
+            };
+            let iu = self.s.m.undef(self.s.t.i32);
+            let mut cs = vec![iu; 3];
+            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+                *slot = addr_val(self, k)?;
+            }
+            let mip = if name == "image_load_mip" {
+                addr_val(self, coords)?
+            } else if uav {
+                // Our declarations have four channels.
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+                iu
+            } else {
+                self.s.m.i32(0)
+            };
+            let load_guard = match guard {
+                Some(g) => Some(g),
+                None => self.speculative_guard(b, i, src)?,
+            };
+            let channels: Vec<u32> = (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
+            let dst_regs = if *d16 {
+                channels.len().div_ceil(2)
+            } else {
+                channels.len()
+            };
+            let olds: Vec<V> = (0..dst_regs)
+                .map(|k| self.old_vgpr(inst, reg + k as u8))
+                .collect();
+            let at = self.begin_guarded(load_guard);
+            let loaded: Result<Vec<V>, Why> = (|| {
+                let c = self.cur;
+                let h = self.handle(site, src, false, props)?;
+                let mut args = vec![h, mip];
+                args.extend(&cs);
+                args.extend([iu, iu, iu]);
+                let r = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                let mut xs = Vec::with_capacity(channels.len());
+                for &ch in &channels {
+                    let x = self.s.m.extract(c, r, ch);
+                    xs.push(if *d16 {
+                        let i32t = self.s.t.i32;
+                        self.s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                    } else {
+                        self.as_int(x)
+                    });
+                }
+                if *d16 {
+                    let k16 = self.s.m.i32(16);
+                    xs = xs
+                        .chunks(2)
+                        .map(|p| match *p {
+                            [lo, hi] => {
+                                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                                self.s.m.bin(c, Bin::Or, lo, hi)
+                            }
+                            _ => p[0],
+                        })
+                        .collect();
+                }
+                Ok(xs)
+            })();
+            let loaded = match loaded {
+                Ok(xs) => xs,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
+            let pairs: Vec<(V, V)> = loaded.into_iter().zip(olds).collect();
+            let results = self.end_guarded(at, &pairs);
+            for (k, x) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, None);
+            }
+            return Ok(());
+        }
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let r = if sample {
+        let r = {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -6044,31 +6803,6 @@ impl<'a> Lower<'a> {
                     )
                 }
             }
-        } else {
-            let mut cs = vec![iu; 3];
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                *slot = addr_val(self, k)?;
-            }
-            let mip = if name == "image_load_mip" {
-                addr_val(self, coords)?
-            } else if uav {
-                // Our declarations have four channels.
-                self.s.flags |= flags::TYPED_UAV_LOADS;
-                iu
-            } else {
-                self.s.m.i32(0)
-            };
-            let mut args = vec![h, mip];
-            args.extend(&cs);
-            args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
@@ -6249,7 +6983,9 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -6258,14 +6994,36 @@ impl<'a> Lower<'a> {
                 }
                 None => off,
             };
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
+            let load_guard = match guard {
+                Some(g) => Some(g),
+                None => self.speculative_guard(b, i, src)?,
             };
-            for k in 0..count {
-                let four = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            let olds: Vec<V> = (0..count)
+                .map(|k| self.old_vgpr(inst, reg + k as u8))
+                .collect();
+            let at = self.begin_guarded(load_guard);
+            let loaded: Result<Vec<V>, Why> = (|| {
+                let c = self.cur;
+                let h = self.handle(site, src, false, (13, 0x1_0000))?;
+                let mut out = Vec::with_capacity(count as usize);
+                for k in 0..count {
+                    let four = self.s.m.i32(4 * k);
+                    let a = self.s.m.bin(c, Bin::Add, byte, four);
+                    out.push(self.cbuffer_dword(h, a));
+                }
+                Ok(out)
+            })();
+            let loaded = match loaded {
+                Ok(vals) => vals,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
+            let pairs: Vec<(V, V)> = loaded.into_iter().zip(olds).collect();
+            let results = self.end_guarded(at, &pairs);
+            for (k, x) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, None);
             }
             return Ok(());
         }
@@ -6275,16 +7033,15 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
+            let (props, coords) = match index {
                 Some(index) => {
                     let stride = used.map_or(0, |u| u.stride);
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    ((12 | u, stride), [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => ((11 | u, 0), [off, iu, iu]),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -6295,6 +7052,13 @@ impl<'a> Lower<'a> {
                 _ => self.s.m.i32(0),
             };
             let at = self.begin_guarded(guard);
+            let h = match self.handle(site, src, false, props) {
+                Ok(h) => h,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -6344,140 +7108,191 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
-            let mut args = Vec::new();
-            let (op, name) = if typed {
+            let (props, tail_args, op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let mut tail = vec![index.unwrap_or(self.s.m.i32(0)), iu];
                 for x in vals {
-                    args.push(self.as_float(x));
+                    tail.push(self.as_float(x));
                 }
-                (69, "bufferStore.f32")
+                tail.push(self.s.m.i8(0xF));
+                ((10 | u, 0x409), tail, 69, "bufferStore.f32")
             } else {
-                match index {
+                let (props, mut tail) = match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        ((12 | u, stride), vec![index, off])
                     }
-                    None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
-                    }
-                }
-                args.extend(&vals);
-                args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
+                    None => ((11 | u, 0), vec![off, iu]),
+                };
+                tail.extend(&vals);
+                tail.resize(2 + 4, iu);
+                tail.push(self.s.m.i8((1u8 << count) - 1));
+                tail.push(self.s.m.i32(4));
+                (props, tail, 140, "rawBufferStore.i32")
             };
-            args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
-            if !typed {
-                args.push(self.s.m.i32(4));
-            }
             let at = self.begin_guarded(guard);
+            let h = match self.handle(site, src, false, props) {
+                Ok(h) => h,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
+            let mut args = Vec::with_capacity(1 + tail_args.len());
+            args.push(h);
+            args.extend(tail_args);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
             return Ok(());
         }
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a buffer result");
+        };
         if let Some(f) = *format {
             if index.is_some() {
                 return Err("a typed-format load by index");
             }
-            let h = self.handle(site, src, false, (11 | u, 0))?;
-            let Some(Operand::Vector { reg, .. }) = *data else {
-                return Err("a buffer result");
+            let load_guard = match guard {
+                Some(g) => Some(g),
+                None => self.speculative_guard(b, i, src)?,
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            let olds: Vec<V> = (0..count)
+                .map(|k| self.old_vgpr(inst, reg + k as u8))
+                .collect();
+            let at = self.begin_guarded(load_guard);
+            let loaded: Result<Vec<V>, Why> = (|| {
+                let h = self.handle(site, src, false, (11 | u, 0))?;
+                self.format_load(h, off, f, count)
+            })();
+            let loaded = match loaded {
+                Ok(vals) => vals,
+                Err(why) => {
+                    self.end_guarded(at, &[]);
+                    return Err(why);
+                }
+            };
+            let pairs: Vec<(V, V)> = loaded.into_iter().zip(olds).collect();
+            let results = self.end_guarded(at, &pairs);
+            for (k, x) in results.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, None);
             }
             return Ok(());
         }
-        let r = if typed {
+        if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
-            let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
-        } else {
-            let mask = self.s.m.i8((1u8 << count) - 1);
-            let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
+        } else if index.is_some() {
+            let stride = used.map_or(0, |u| u.stride);
+            if stride < 4 || !stride.is_multiple_of(4) {
+                return Err("a structured buffer of unknown stride");
             }
-        };
-        let Some(Operand::Vector { reg, .. }) = *data else {
-            return Err("a buffer result");
-        };
-        if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
-            let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
-            for k in 0..count.div_ceil(2) {
-                let mut x = None;
-                for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
-                    x = Some(match x {
-                        Some(hi) => {
-                            let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
-                            self.s.m.bin(c, Bin::Or, h, hi)
-                        }
-                        None => h,
-                    });
-                }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
-            }
-            return Ok(());
         }
-        for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+        let load_guard = match guard {
+            Some(g) => Some(g),
+            None => self.speculative_guard(b, i, src)?,
+        };
+        let dst_regs = if d16 { count.div_ceil(2) } else { count };
+        let olds: Vec<V> = (0..dst_regs)
+            .map(|k| self.old_vgpr(inst, reg + k as u8))
+            .collect();
+        let at = self.begin_guarded(load_guard);
+        let loaded: Result<Vec<V>, Why> = (|| {
+            let c = self.cur;
+            let r = if typed {
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                let index = index.unwrap_or(self.s.m.i32(0));
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else {
+                let mask = self.s.m.i8((1u8 << count) - 1);
+                let align = self.s.m.i32(4);
+                match index {
+                    Some(index) => {
+                        let stride = used.map_or(0, |u| u.stride);
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, index, off, mask, align],
+                        )
+                    }
+                    None => {
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        self.s.op(
+                            c,
+                            "rawBufferLoad.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            139,
+                            &[h, off, iu, mask, align],
+                        )
+                    }
+                }
+            };
+            if d16 {
+                // Two f16 channels per VGPR (an odd last high half 0).
+                let k16 = self.s.m.i32(16);
+                let i32t = self.s.t.i32;
+                let mut out = Vec::with_capacity(count.div_ceil(2) as usize);
+                for k in 0..count.div_ceil(2) {
+                    let mut x = None;
+                    for ch in (2 * k..(2 * k + 2).min(count)).rev() {
+                        let f = self.s.m.extract(c, r, ch);
+                        let h = self
+                            .s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                        x = Some(match x {
+                            Some(hi) => {
+                                let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                                self.s.m.bin(c, Bin::Or, h, hi)
+                            }
+                            None => h,
+                        });
+                    }
+                    out.push(x.expect("a channel"));
+                }
+                Ok(out)
+            } else {
+                Ok((0..count)
+                    .map(|k| {
+                        let x = self.s.m.extract(c, r, k);
+                        self.as_int(x)
+                    })
+                    .collect())
+            }
+        })();
+        let loaded = match loaded {
+            Ok(vals) => vals,
+            Err(why) => {
+                self.end_guarded(at, &[]);
+                return Err(why);
+            }
+        };
+        let pairs: Vec<(V, V)> = loaded.into_iter().zip(olds).collect();
+        let results = self.end_guarded(at, &pairs);
+        for (k, x) in results.into_iter().enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), x, None);
         }
         Ok(())
     }

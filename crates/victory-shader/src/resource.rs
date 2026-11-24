@@ -1466,10 +1466,21 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
+        let exec_at = |at: usize| {
+            exec(&block.insts[at]).or_else(|| {
+                matches!(block.insts[at].fields, Fields::Smem { .. })
+                    .then(|| {
+                        block.insts[..at].iter().rev().find_map(|inst| {
+                            mask(inst.write(Reg::S(EXEC)), inst.write(Reg::S(EXEC + 1)))
+                        })
+                    })
+                    .flatten()
+            })
+        };
+        let selected = exec_at(access).ok_or(SELECT)?;
         if accesses
             .iter()
-            .any(|&i| exec(&block.insts[i]) != Some(selected))
+            .any(|&i| exec_at(i) != Some(selected))
         {
             return Err(SELECT);
         }

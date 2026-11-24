@@ -924,6 +924,9 @@ pub enum View<'a> {
     Cbv(&'a [u32]),
     /// A buffer SRV over these dwords.
     Buffer { data: &'a [u32], stride: Stride },
+    /// A null 1D texture SRV (`R32_UINT`, no backing resource), matching a
+    /// title's null descriptor in heap slot 0 (#1595).
+    NullTexture1dSrv,
 }
 
 /// How [`View::Buffer`] is viewed.
@@ -1280,6 +1283,20 @@ impl Host {
                         };
                         dev.CreateShaderResourceView(&b, Some(&desc), at);
                         keep.push(b);
+                    }
+                    View::NullTexture1dSrv => {
+                        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE1D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture1D: D3D12_TEX1D_SRV {
+                                    MipLevels: 1,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
                     }
                 }
             }
