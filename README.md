@@ -23,16 +23,22 @@ What it adds on top of upstream `ffe310e`:
 | Texture to buffer copies (a read back through a placed footprint) | Replaces a silent drop that left streamed data stale |
 | Descriptor dwords nothing reads as a number keep a stand-in | A load whose only consumers hold host handles no longer stops the program |
 | Root UAV views bounded by their buffer | One class of invalid view, and the device removal it caused |
+| A clear value only on a texture that can take one | The title's NV12 and B4G4R4A4 textures were never created: three creation failures per run, and the title then died at frame 1,479 reading `0xffffffffffffffff`. Both are gone |
+| A view needs its resource's permission, and a clear is skipped when it cannot take one | The device removal the operation check named (`op=clear_rtv`): a console texture that is both a render target and a UAV loses the render-target flag on its host copy, so its views are null and its clears are skipped instead of being handed to the driver |
+| Bindless pointer chasing, with its host half | A descriptor behind a pointer the shader computes is followed through the root constants and the pointed buffer is bound. A pointer not on 16 bytes is left unbound rather than bound into an invalid call |
+| Bounded mesh output | The console's `exp prim` carries 10-bit vertex indices, so a primitive can name vertex 1023 while 128 exist: those are culled, lanes past the declared outputs store nothing, and group counts are clamped |
+| A short DirectStorage stream fills its destination | A stream shorter than its block left the tail holding `-1` and reported success — the only true member of the `-1` family a host audit found |
+| Host breadcrumbs, and `VICTORY_GPU_CHECK` | Every host operation leaves a crumb in a lock-free ring, and a removal dumps the newest 64; the check asks the device after each one, which turns "the application made a call that is invalid" into `op=clear_rtv a=0x…`. The check costs one COM call per operation and is very slow: never compare frame times with it on |
 
 Where a session gets to, and where it stops:
 
 | Measurement | Value |
 |-------------|-------|
-| Frames before the run ends | ~1,180–1,466 (upstream baseline: 853) |
-| Presented image at frame 1,024 | holds content (mean 125/255, range 26–231) |
-| 3840x2160 `D32_FLOAT_S8X24` depth target | still all zeros: the 3D pass has not drawn |
-| Shader programs that translate, from a run's dumps | 4 of 5 vertex/pixel, 13 of 23 compute |
-| Remaining translation failures, by reason | 21 `an address not from a root parameter`, 15 `a descriptor's address or format read as data`, 9 `an address from a root parameter that is no address`, 4 per-lane computed descriptors, plus singletons |
+| Frames before the run ends | 1,290–1,320 on this branch (upstream baseline: 853) |
+| Presented image at frame 1,024 and 1,500 | holds content (mean 120/255 at 1,500, every pixel non-zero) |
+| 3840x2160 `D32_FLOAT_S8X24` depth target | still all zeros at frames 1,100, 1,180, 1,240 and 1,500, with pad A pressed every four seconds: the title has not asked for a 3D frame |
+| Device removals | 0 in one run of 1,290 frames, one event in 1,320; the CPU-side invalid call the check names is fixed, a GPU-side removal after a render-target ping-pong remains |
+| Remaining translation failures | 28–45 per run, nearly all `an address not from a root parameter`: 38 programs across two dump sets whose descriptor address is read out of a buffer's contents, one hop beyond what the binder resolves |
 
 The remaining crash is understood and is the same defect as the missing
 geometry. The console lets a shader's UAV descriptor point at any dword, but a
