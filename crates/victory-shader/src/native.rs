@@ -4754,6 +4754,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_export_patches_share_an_offset_but_sized_ones_do_not() {
+        // Two dwords of code; every MRT patches dword 1.
+        let code = [0x5a; 8];
+        let ps = fssm(&[(HwStage::Ps, &code)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let every_mrt_at_one = |size: u32| {
+            let mut blob = ps.clone();
+            blob[e + PS_PATCH_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+            for mrt in 0..MRTS {
+                let at = e + PS_PATCHES + mrt * PATCH_BYTES;
+                blob[at..][..4].copy_from_slice(&1u32.to_le_bytes());
+            }
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // Empty patches write no dword, so none clobbers another: all are
+        // kept, in MRT order, and the code is left as stored.
+        let p = &every_mrt_at_one(0).unwrap()[0];
+        let StageIo::Ps { patches, .. } = &p.io else {
+            panic!("{:?}", p.io)
+        };
+        let read: Vec<_> = patches
+            .iter()
+            .map(|p| (p.mrt, p.offset, p.code.len()))
+            .collect();
+        assert_eq!(read, (0..MRTS as u8).map(|m| (m, 1, 0)).collect::<Vec<_>>());
+        assert_eq!(p.patched_code(), code);
+        // One dword each, the second MRT already lands on the first's.
+        assert!(matches!(
+            every_mrt_at_one(1),
+            Err(Malformed("export patches overlap"))
+        ));
+    }
+
+    #[test]
     fn patched_code_writes_every_mrt_and_keeps_the_stored_code() {
         let code = [0xBF80_0000u32; 6]; // s_nop
         let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
