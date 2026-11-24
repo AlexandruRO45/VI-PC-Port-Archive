@@ -3042,6 +3042,43 @@ cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_packed_(warp|hardware)$' -V
 ```
 
+### gfx1030 2D image stores
+
+`image_store` and `image_store_mip` lower to `RWTexture2D<uint4>` at `u0`.
+Supply `--image-descriptor`, `--image-format R32G32B32A32_UINT` and
+`--image-uav-mip` to select the texture output. `--descriptor-offset` remains
+required for the raw buffer output mode. The caller supplies the same linear
+RGBA32 UINT 2D descriptor contract as for typed loads, with base mip zero,
+identity channels, and in-range coordinates. Each invocation must write a
+distinct texel. The image descriptor must come from one `s_load_dwordx8`,
+completed before use by `s_waitcnt lgkmcnt(0)`.
+
+The store reads consecutive VGPRs in ascending DMASK channel order. It
+overwrites all four channels and writes zero to channels the mask leaves out.
+The address has the same layout as a 2D load, including the `a16` mip halfword.
+The UAV exposes one mip. Use mip 0 for `image_store`. For `image_store_mip`,
+the translator requires a known constant equal to the bound UAV mip. This
+profile supports one image store per shader, and accepts an explicit
+`s_waitcnt_vscnt null, 0x0` after the store as well as the implicit wait at
+`s_endpgm`. Packed data and unmodelled flags such as `d16` are rejected.
+See the MIMG section of the
+[AMD RDNA 2 ISA](https://docs.amd.com/v/u/en-US/rdna2-shader-instruction-set-architecture).
+
+The fixture binds mip 0, 1 or 2 of a 32x8 texture. Its 18 cases cover both
+address widths, DMASKs `0x1`, `0xa` and `0xf`, and one or two groups per
+dispatch. The CPU reference compares all 1,344 channel values across the
+three levels, including untouched texels and mips. A nonzero value in a
+masked channel first differs at mip 0, word 0 (`00000000` versus `deadbeef`).
+Binding mip 0 for a mip 1 shader first differs at mip 0, word 0 (`c0000000`
+versus `11000000`). LLVM 15 assembles and disassembles all cases, and the
+synthetic-container CLI reproduces the HLSL emitted by the text path. The
+GPU fixture executes the translated desktop DXIL.
+
+```powershell
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mimg_store_(warp|hardware)$' -V
+```
+
 ### Bounded gfx1030 DS lane routing
 
 The `gfx1030` compute profile lowers `ds_bpermute_b32` (gather) and

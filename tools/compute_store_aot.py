@@ -76,7 +76,8 @@ ALU_EXPRESSION_LIMIT = 1024
 # Caller guarantees for a MIMG image descriptor: an 8-dword resource descriptor that names a 2D,
 # linear (non-swizzled) image of the listed format. The translator checks where the eight words were
 # loaded from, not the 9-bit GFX10 format, type, swizzle, level or size fields inside them; the two
-# 16-byte descriptor slots are bound to t0. Value: (HLSL texel type, channel count).
+# 16-byte descriptor slots are bound to t0 for reads or u0 for writes.
+# Value: (HLSL texel type, channel count).
 IMAGE_FORMATS = {"R32G32B32A32_UINT": ("uint4", 4), "R8G8B8A8_UINT": ("uint4", 4)}
 # Template operands are the old LDS word and the source VGPR, both HLSL uints.
 LDS_RMW = {
@@ -183,10 +184,10 @@ MUBUF_SOURCE_FORMAT = MUBUF_UINT_FORMATS[-1]
 MUBUF_TEXEL_BYTES = 16
 
 
-def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
+def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
-          cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
+          image_uav_mip=None, cpu="gfx1013", lds_bytes=0, lds_f32_mode=None, lds_f64_mode=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     gfx10 compute waves receive each local ID in its own VGPR. Y and Z are bound only when that
@@ -195,18 +196,29 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     the MUBUF source descriptor format, and output_format declares the u0 descriptor format
     for formatted MUBUF stores. Both declarations require identity channel selectors.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
-    the caller's statement of the image format inside it, and the texel is bound to t0.
+    the caller's statement of the image format inside it. The image binds to t0 for loads or u0
+    for stores, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
     """
     dims = checked_group(group)
     if cpu not in ("gfx1013", "gfx1030"):
         raise ValueError("Unsupported compute target")
     ds_group = cpu == "gfx1030" and dims == (32, 1, 1)
-    if not 0 <= table_reg <= 105 or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
+    if not 0 <= table_reg <= 105:
         raise ValueError("Invalid table or thread group binding")
-    descriptor_bindings = {descriptor_offset: "uav"}
+    image_output = image_uav_mip is not None
+    if image_output:
+        if (cpu != "gfx1030" or descriptor_offset is not None or stride is not None
+                or image_descriptor is None or image_format != "R32G32B32A32_UINT"
+                or not 0 <= image_uav_mip <= 15):
+            raise ValueError("Invalid image UAV binding")
+        descriptor_bindings = {}
+    else:
+        if descriptor_offset is None or not 0 <= descriptor_offset < 1 << 20 or descriptor_offset % 4:
+            raise ValueError("Invalid table or thread group binding")
+        descriptor_bindings = {descriptor_offset: "uav"}
     if constant_descriptor is not None:
         if (not 0 <= constant_descriptor < 1 << 20 or constant_descriptor % 4
-                or abs(constant_descriptor - descriptor_offset) < 16):
+                or any(abs(constant_descriptor - offset) < 16 for offset in descriptor_bindings)):
             raise ValueError("Invalid or overlapping constant descriptor binding")
         descriptor_bindings[constant_descriptor] = "cbv"
     if source_descriptor is not None:
@@ -221,7 +233,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                       or source_stride is None or source_stride % MUBUF_TEXEL_BYTES):
         raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
-        # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
+        # The 8-dword image descriptor occupies two 16-byte slots.
         if (image_format not in IMAGE_FORMATS or image_descriptor is None or source_descriptor is not None
                 or not 0 <= image_descriptor < 1 << 20 or image_descriptor % 4
                 or any(image_descriptor + half in descriptor_bindings for half in (0, 16))
@@ -302,6 +314,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     else:
                         vector[reg] = value
                 loading.clear()
+        elif image_output and stores and line == "s_waitcnt_vscnt null, 0x0":
+            # The single image write becomes visible when the dispatch completes.
+            continue
         elif m := re.fullmatch(r"v_cmp_(gt|lt|ge|le)_u32_e32 vcc_lo, (s\d+|v\d+|-?\d+|0x[0-9a-f]+), v(\d+)", line):
             op, src, right = m[1], m[2], int(m[3])
             if src[0] in "sv":
@@ -1160,28 +1175,30 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                             raise ValueError("D16 buffer read expression is too large")
                     word = ("alu", field)
                 loading[reg] = word
-        elif m := re.fullmatch(r"image_load(_mip)?(?:_pck(?:_sgn)?)? (v\d+|v\[\d+:\d+\]), (v\d+|v\[\d+:\d+\]), "
-                               r"s\[(\d+):(\d+)\] dmask:0x([0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?( a16)?", line):
-            # The non-sampler 2D address is (x, y[, mip]). A16 packs x and y into the first
-            # dword and takes the mip from the low half of the second dword when present.
-            mip, a16 = bool(m[1]), bool(m[7])
-            vaddr = [int(n) for n in re.findall(r"\d+", m[3])]
+        elif m := re.fullmatch(r"image_(?P<kind>load|store)(?P<mip>_mip)?(?P<packed>_pck(?:_sgn)?)? "
+                               r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>v\d+|v\[\d+:\d+\]), "
+                               r"s\[(?P<base>\d+):(?P<high>\d+)\] dmask:0x(?P<mask>[0-9a-f]+) "
+                               r"dim:SQ_RSRC_IMG_2D(?: unorm)?(?P<a16> a16)?", line):
+            # A16 packs x/y into one dword and takes the mip from the low half of the next dword.
+            mip, a16 = bool(m["mip"]), bool(m["a16"])
+            write = m["kind"] == "store"
+            vaddr = [int(n) for n in re.findall(r"\d+", m["addr"])]
             address_words = (1 if a16 else 2) + int(mip)
-            base, high = int(m[4]), int(m[5])
-            dmask = int(m[6], 16)
+            base, high = int(m["base"]), int(m["high"])
+            dmask = int(m["mask"], 16)
             # DMASK selects components in XYZW order and packs them into consecutive VGPRs.
             channels = [component for index, component in enumerate("xyzw") if dmask & (1 << index)]
             count = len(channels)
-            destination = [int(n) for n in re.findall(r"\d+", m[2])]
-            first, last = destination[0], destination[-1]
-            if (cpu != "gfx1030" or image_format is None or guard_span is not None
+            data = [int(n) for n in re.findall(r"\d+", m["data"])]
+            first, last = data[0], data[-1]
+            if (cpu != "gfx1030" or image_format is None or guard_span is not None or write != image_output
                     or len(vaddr) != min(address_words, 2) or vaddr[-1] != vaddr[0] + address_words - 1
                     or vaddr[-1] > 255 or last != first + count - 1
                     or not 0 < dmask < (1 << IMAGE_FORMATS[image_format][1])
-                    or any(first + index > 255 or first + index in loading for index in range(count))):
-                raise ValueError("Unsupported image load target")
-            opcode = line.split(" ", 1)[0]
-            if ("_pck" in opcode) != (image_format == "R8G8B8A8_UINT"):
+                    or any(first + index > 255 or first + index in loading for index in range(count))
+                    or (write and (m["packed"] or stores))):
+                raise ValueError(f"Unsupported image {m['kind']} target")
+            if bool(m["packed"]) != (image_format == "R8G8B8A8_UINT"):
                 raise ValueError("Image load opcode does not match the image format")
             if high != base + 7 or base % 4 or pending.intersection(range(base, high + 1)):
                 raise ValueError("Unresolved image descriptor")
@@ -1196,6 +1213,18 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 x, y = f"{packed} & 0xffffu", f"{packed} >> 16u"
             else:
                 x, y = map(hlsl_word, coordinates[:2])
+            if write:
+                # A D3D12 Texture2D UAV names one mip. Verify native and desktop mip selection agree.
+                level = coordinates[-1] if mip else 0
+                if not isinstance(level, int) or (level & 0xffff if a16 else level) != image_uav_mip:
+                    raise ValueError("Image store mip does not match the UAV view")
+                values = [vector.get(first + index) for index in range(count)]
+                if not all(is_word(value) for value in values):
+                    raise ValueError("Unverified image store data")
+                selected = dict(zip(channels, map(hlsl_word, values)))
+                texel = ", ".join(selected.get(channel, "0u") for channel in "xyzw")
+                stores.append(f"    outputData[uint2({x}, {y})] = uint4({texel});")
+                continue
             lod = "0"
             if mip:
                 mip_word = hlsl_word(coordinates[-1])
@@ -1204,7 +1233,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             name = f"image_load_{image_step_count}"
             image_step_count += 1
             staged_steps.append((None, f"    {IMAGE_FORMATS[image_format][0]} {name} = imageData.Load({address});"))
-            if opcode.endswith("_sgn"):
+            if m["packed"] and m["packed"].endswith("_sgn"):
                 # The UINT SRV exposes raw bytes. Extend each byte from bit 7 to a full VGPR.
                 staged_steps.append((None, f"    {name} = asuint(asint({name} << 24u) >> 24u);"))
             for index, component in enumerate(channels):
@@ -1217,6 +1246,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
+            if image_output:
+                raise ValueError("Buffer stores require a raw UAV binding")
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
             components = len(channels.removeprefix("d16_")) if channels else int(m["raw_count"] or 1)
@@ -1354,7 +1385,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                if constant_descriptor is not None else "")
     if source_descriptor is not None:
         cbuffer += "ByteAddressBuffer inputData : register(t0);\n"
-    if image_descriptor is not None:
+    if image_descriptor is not None and not image_output:
         cbuffer += f"Texture2D<{IMAGE_FORMATS[image_format][0]}> imageData : register(t0);\n"
     local = ""
     if staged_steps:
@@ -1365,7 +1396,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
             local = ", uint3 local : SV_GroupThreadID"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
-    return (f"{cbuffer}RWByteAddressBuffer outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
+    uav = "RWTexture2D<uint4>" if image_output else "RWByteAddressBuffer"
+    return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
 
@@ -1381,7 +1413,7 @@ def main():
                         help="Private LDS f64 comparisons use normal values or positive zero")
     parser.add_argument("--lds-bytes", type=int, default=0, help="Known native group LDS allocation")
     parser.add_argument("--table-reg", type=int, required=True)
-    parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), required=True)
+    parser.add_argument("--descriptor-offset", type=lambda n: int(n, 0), help="Table byte offset bound to raw u0")
     parser.add_argument("--constant-descriptor", type=lambda n: int(n, 0), help="Table byte offset bound to b0")
     parser.add_argument("--group-reg", type=int, help="SGPR holding the group X ID")
     parser.add_argument("--group-reg-y", type=int, help="SGPR holding the group Y ID")
@@ -1395,10 +1427,14 @@ def main():
     parser.add_argument("--output-format", choices=MUBUF_UINT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
-                        help="Table byte offset of the 8-dword image descriptor bound to t0")
+                        help="Table byte offset of the 8-dword image descriptor bound to t0 or u0")
+    parser.add_argument("--image-uav-mip", type=int,
+                        help="Bind the image to u0 at this mip instead of binding a raw output descriptor")
     parser.add_argument("--image-format", choices=sorted(IMAGE_FORMATS),
                         help="Caller statement of the format inside the image descriptor")
     args = parser.parse_args()
+    if (args.descriptor_offset is None) == (args.image_uav_mip is None):
+        parser.error("Choose either --descriptor-offset or --image-uav-mip")
     if args.output.suffix.lower() != ".hlsl" or args.output.resolve() == args.container.resolve():
         parser.error("Choose an HLSL destination distinct from the input")
     blob = args.container.read_bytes()
@@ -1413,7 +1449,8 @@ def main():
                    group_reg_z=args.group_reg_z, source_descriptor=args.source_descriptor,
                    source_stride=args.source_stride, source_format=args.source_format,
                    output_format=args.output_format,
-                   image_descriptor=args.image_descriptor, image_format=args.image_format, cpu=args.cpu, lds_bytes=args.lds_bytes,
+                   image_descriptor=args.image_descriptor, image_format=args.image_format,
+                   image_uav_mip=args.image_uav_mip, cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")

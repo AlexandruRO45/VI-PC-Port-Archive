@@ -3078,6 +3078,10 @@ def binary(directory, assembler, objcopy, library):
     ds_binary(directory, assembler, objcopy, library)
     mtbuf_load_controls()
     mimg_load_binary(directory, assembler, objcopy, library)
+    mimg_store_controls()
+    gfx1030_binary(directory, assembler, objcopy, library,
+                   [(name, lines, binding) for name, _, _, lines, binding in mimg_store_cases()],
+                   "image_", group=(4, 2, 1))
     mimg_packed_controls()
     gfx1030_binary(directory, assembler, objcopy, library,
                    [(name, lines, MIMG_PACKED_BINDING) for name, _, _, _, _, _, _, lines in mimg_packed_cases()],
@@ -4143,6 +4147,124 @@ def mimg_packed_draw(directory, compiler, renderer, backend):
     return 0
 
 
+MIMG_STORE_GROUP = (4, 2, 1)
+MIMG_STORE_BINDING = {key: value for key, value in MIMG_BINDING.items()
+                      if key not in ("descriptor_offset", "stride")}
+
+
+def mimg_store_cases():
+    for mip in (0, 1, 2):
+        for a16 in (False, True):
+            for mask, groups in ((0x1, 1), (0xa, 2), (0xf, 1)):
+                lines = ["s_mov_b32 s12, s7", "s_mov_b32 s13, 0",
+                         "s_load_dwordx8 s[24:31], s[12:13], 0x40",
+                         "v_lshl_add_u32 v8, s10, 2, v0", "v_lshl_add_u32 v9, s11, 1, v1",
+                         "v_mad_u32_u24 v11, v9, 32, v8"]
+                addr = "v[8:9]"
+                if a16:
+                    lines.append("v_mad_u32_u24 v8, v9, 0x10000, v8")
+                    addr = "v8"
+                if mip:
+                    if a16:
+                        lines.append(f"v_mov_b32_e32 v9, {0xabcd0000 | mip:#x}")
+                    else:
+                        lines += [f"v_mov_b32_e32 v10, {mip}"]
+                    addr = "v[8:9]" if a16 else "v[8:10]"
+                channels = MIMG_CHANNELS[mask]
+                for index, channel in enumerate(channels):
+                    lines += [f"v_or_b32_e32 v{14 + index}, {(channel + 1) * 0x11000000:#x}, v11"]
+                data = "v14" if len(channels) == 1 else f"v[14:{13 + len(channels)}]"
+                op = "image_store_mip" if mip else "image_store"
+                flags = " unorm a16" if a16 else ""
+                lines += ["s_waitcnt lgkmcnt(0)",
+                          f"{op} {data}, {addr}, s[24:31] dmask:0x{mask:x} dim:SQ_RSRC_IMG_2D{flags}",
+                          "s_waitcnt_vscnt null, 0x0", "s_endpgm"]
+                name = f"{op}_{mip}{'_a16' if a16 else ''}_{mask:x}"
+                yield name, mask, groups, lines, MIMG_STORE_BINDING | {"image_uav_mip": mip}
+
+
+def mimg_store_controls():
+    _, _, _, lines, binding = next(mimg_store_cases())
+    for diagnostic, change in (
+        ("Unresolved image descriptor", ("s_waitcnt lgkmcnt(0)", "")),
+        ("Unresolved compute descriptor load", ("s_load_dwordx8 s[24:31], s[12:13], 0x40",
+                                         "s_load_dwordx8 s[24:31], s[12:13], 0x50")),
+        ("Unverified image store data", ("image_store v14", "image_store v15")),
+        ("Unsupported image store target", ("dmask:0x1", "dmask:0x0")),
+        ("Unsupported compute instruction", ("dim:SQ_RSRC_IMG_2D", "dim:SQ_RSRC_IMG_2D d16")),
+        ("Unsupported compute instruction", ("s_waitcnt_vscnt null, 0x0", "s_waitcnt_vscnt null, 0x1")),
+    ):
+        rejects(diagnostic, aot.lower, variant(lines, change), MIMG_STORE_GROUP, **binding)
+    image = next(line for line in lines if line.startswith("image_store "))
+    rejects("Unsupported image store target", aot.lower,
+            variant(lines, (image, f"{image}\n{image}")), MIMG_STORE_GROUP, **binding)
+    assert aot.lower(variant(lines, ("s_waitcnt_vscnt null, 0x0", "")), MIMG_STORE_GROUP, **binding) == aot.lower(
+        lines, MIMG_STORE_GROUP, **binding)
+    rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
+            **(binding | {"image_format": "R8G8B8A8_UINT"}))
+    rejects("Invalid image UAV binding", aot.lower, lines, MIMG_STORE_GROUP,
+            **(binding | {"descriptor_offset": 0x30}))
+    rejects("Image store mip does not match the UAV view", aot.lower, lines, MIMG_STORE_GROUP,
+            **(binding | {"image_uav_mip": 1}))
+    _, _, _, lines, binding = next(case for case in mimg_store_cases() if case[4]["image_uav_mip"] == 1)
+    rejects("Image store mip does not match the UAV view", aot.lower,
+            variant(lines, ("v_mov_b32_e32 v10, 1", "v_mov_b32_e32 v10, v8")), MIMG_STORE_GROUP, **binding)
+
+
+def mimg_store_reference(mask, groups, mip):
+    initial, expected = [], []
+    for level in range(3):
+        for y in range(TEXTURE_HEIGHT >> level):
+            for x in range(TEXTURE_WIDTH >> level):
+                for channel in range(TEXTURE_CHANNELS):
+                    before = 0xc0000000 | (level << 20) | (y << 12) | (x << 4) | channel
+                    initial.append(before)
+                    if level != mip or x >= 4 * groups or y >= 2:
+                        expected.append(before)
+                    else:
+                        expected.append((channel + 1) * 0x11000000 + 32 * y + x if mask & (1 << channel) else 0)
+    return initial, expected
+
+
+def mimg_store_draw(directory, compiler, renderer, backend):
+    mimg_store_controls()
+    for name, mask, groups, lines, binding in mimg_store_cases():
+        mip = binding["image_uav_mip"]
+        src, cso, case = (directory / f"{name}.{ext}" for ext in ("hlsl", "cso", "case"))
+        code = aot.lower(lines, MIMG_STORE_GROUP, **binding)
+        src.write_text(code, encoding="ascii")
+        compile_shader = [compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src]
+        subprocess.run(compile_shader, check=True)
+        initial, expected = mimg_store_reference(mask, groups, mip)
+        payload = struct.pack(f"<{len(initial) + len(expected)}I", *initial, *expected)
+        case.write_bytes(struct.pack("<2I", groups, mip) + payload)
+        run = [renderer, backend, "--compute-texture-store-case", cso, case]
+        result = subprocess.run(run)
+        if result.returncode:
+            return result.returncode
+        if name == "image_store_0_a":
+            # An unselected channel must be zero, even if the previous texel was nonzero.
+            mutate = code.replace("= uint4(0u,", "= uint4(0xdeadbeefu,", 1)
+            assert mutate != code
+            src.write_text(mutate, encoding="ascii")
+            subprocess.run(compile_shader, check=True)
+            mismatch = "mip=0 word=0 expected=00000000 actual=deadbeef"
+        elif name == "image_store_mip_1_f":
+            case.write_bytes(struct.pack("<2I", groups, 0) + payload)
+            mismatch = "mip=0 word=0 expected=c0000000 actual=11000000"
+        else:
+            continue
+        bad = subprocess.run(run, capture_output=True, text=True)
+        if bad.returncode != 1 or mismatch not in bad.stderr:
+            raise AssertionError(f"{name}: modified store escaped detection\n{bad.stderr}")
+        print(bad.stderr, end="")
+    if record := os.environ.get("FORM_COVERAGE_RECORD"):
+        path = Path(record)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("image_store\nimage_store_mip\n", encoding="utf-8")
+    return 0
+
+
 def mimg_mip_draw(directory, compiler, renderer, backend):
     return mimg_load_draw(directory, compiler, renderer, backend, mip=True)
 
@@ -4813,6 +4935,7 @@ if __name__ == "__main__":
                  "draw-mimg-load": mimg_load_draw,
                  "draw-mimg-mip": mimg_mip_draw,
                  "draw-mimg-packed": mimg_packed_draw,
+                 "draw-mimg-store": mimg_store_draw,
                  "draw-ds-route": ds_draw,
                  "draw-lds-qword": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_QWORD_CASES),
                  "draw-lds-strided": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_STRIDED_CASES),
