@@ -2210,4 +2210,118 @@ mod tests {
             }
         }
     }
+
+    /// A non-final stored deflate block holding `data` as is.
+    fn stored_block(data: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(data.len()).expect("one stored block");
+        let mut out = vec![0]; // BFINAL 0, stored
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// A file of the magic, a record named `PS_outer` with these packed
+    /// bytes stating `unpacked` bytes, and `PS_after`; and the outer
+    /// record's marker offset.
+    fn outer_then_after(packed: &[u8], unpacked: usize) -> (Vec<u8>, usize) {
+        let n = (packed.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x09PS_outer\0\x32");
+        let marker = file.len() + 4;
+        for v in [n, 0x000D_DCE7, n, unpacked as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(packed);
+        file.extend(record_bytes("PS_after", 0x32, b"after"));
+        (file, marker)
+    }
+
+    #[test]
+    fn record_split_across_stored_blocks_is_inside_the_one_storing_it() {
+        // A container holding a record, stored as is in two stored blocks
+        // split at every byte of that record: a block header (5 bytes) may
+        // cut its header, its marker, its sizes or its packed bytes. Where
+        // the marker survives whole, the record it starts is no stream
+        // (its packed bytes are cut) or is the outer one's own: either way
+        // the outer record is the one yielded, it unpacks to the container
+        // whole, and the record after it is found. Offsets past every
+        // record, the end of the file among them, are in none.
+        let inner = record_bytes("PS_inner", 0x41, &[9; 64]);
+        let mut container = b"DXBC head ".to_vec();
+        let inner_at = container.len();
+        container.extend_from_slice(&inner);
+        container.extend_from_slice(b" DXBC tail");
+        for split in inner_at..=inner_at + inner.len() {
+            let (head, tail) = container.split_at(split);
+            let mut packed = stored_block(head);
+            packed.extend(miniz_oxide::deflate::compress_to_vec(tail, 0));
+            assert!(starts_stream(&packed, container.len()), "split {split}");
+
+            let (file, marker) = outer_then_after(&packed, container.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "split {split}");
+            assert_eq!(found[0].offset, marker, "split {split}");
+            assert_eq!(found[0].unpack(), Some(container.clone()), "split {split}");
+            assert_eq!(found[1].span().end, file.len(), "split {split}");
+            if let Some(at) = memchr::memmem::find(&file[marker + 1..], &MARKER) {
+                let at = marker + 1 + at;
+                if at < found[0].span().end {
+                    assert!(in_record(&found, at), "split {split}");
+                }
+            }
+            for past in [file.len(), file.len() + 1, usize::MAX] {
+                assert!(!in_record(&found, past), "split {split}, offset {past}");
+            }
+        }
+    }
+
+    #[test]
+    fn stream_broken_past_the_probe_still_hides_the_record_it_stores() {
+        // Only the first PROBE packed bytes tell a stream from noise. A
+        // record whose stored block (more than a probe long, holding a
+        // record past the probe) is followed by a broken block reads as a
+        // stream: it wins over the record it stores, is yielded with its
+        // whole span, and does not unpack. Broken within the probe, the
+        // same bytes are noise and the stored record wins instead.
+        let inner = record_bytes("PS_inner", 0x32, b"stored past the probe");
+        let bad_nlen = [1, 4, 0, 4, 0, b'x', b'y', b'z', b'w'];
+        for lead in [PROBE + 64, PROBE / 4] {
+            let mut first: Vec<u8> = (0..lead as u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+                .collect();
+            first.extend_from_slice(&inner);
+            assert!(memchr::memmem::find(&first[..lead], &MARKER).is_none());
+            let mut packed = stored_block(&first);
+            packed.extend_from_slice(&bad_nlen);
+            let stated = first.len() + 4;
+            let broken_at = packed.len() - bad_nlen.len();
+            assert_eq!(
+                starts_stream(&packed, stated),
+                broken_at >= PROBE,
+                "lead {lead}"
+            );
+
+            let (file, marker) = outer_then_after(&packed, stated);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            if broken_at >= PROBE {
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "lead {lead}");
+                assert_eq!(found[0].span().end, marker + 12 + packed.len());
+                assert_eq!(found[0].unpack(), None, "lead {lead}");
+                let stored = marker + 12 + 5 + lead + 19;
+                assert_eq!(&file[stored..stored + 4], &MARKER);
+                assert!(in_record(&found, stored), "lead {lead}");
+            } else {
+                assert_eq!(names, [Some("PS_inner"), Some("PS_after")], "lead {lead}");
+                assert_eq!(
+                    found[0].unpack().as_deref(),
+                    Some(&b"stored past the probe"[..])
+                );
+                assert!(!in_record(&found, marker), "lead {lead}");
+            }
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
 }
