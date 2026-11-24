@@ -1618,7 +1618,6 @@ impl GpuWrites {
 impl Batch {
     fn queue_write(&mut self, shadow: &Arc<crate::shadow::Shadow>, from: usize, len: usize) {
         self.flush();
-        shadow.queue_write(from, len);
         self.writes.push((shadow.clone(), from, from + len));
     }
 

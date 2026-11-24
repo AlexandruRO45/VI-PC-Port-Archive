@@ -969,7 +969,6 @@ fn copyback_merges_cpu_changes_after_the_snapshot() {
         let start = buffer.address as usize;
         let len = buffer.len as usize;
         assert_eq!(shadow.update(start, len), len);
-        shadow.queue_write(start, len);
         shadow.snapshot(start, len);
         buffer.set(0, cpu_first);
         buffer.set(1, cpu_second);

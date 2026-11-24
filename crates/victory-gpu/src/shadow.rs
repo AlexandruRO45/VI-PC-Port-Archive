@@ -37,9 +37,6 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
@@ -116,7 +113,6 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
-            pending: Mutex::default(),
             before: Mutex::default(),
         }
     }
@@ -130,9 +126,8 @@ impl Shadow {
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
     /// (unordered access): after the list's submission has run, the range
-    /// is copied back into title memory, where the title reads it; until
-    /// then no refresh copies title memory over it. Call after the
-    /// [`Shadow::refresh`] that gives the shaders the title's data.
+    /// is copied back into title memory, where the title reads it. Call after
+    /// the [`Shadow::refresh`] that gives the shaders the title's data.
     ///
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
@@ -142,16 +137,8 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// Prevent later CPU refreshes from replacing a pending GPU write.
-    pub(crate) fn queue_write(&self, address: usize, len: usize) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-    }
-
-    /// Once all CPU refreshes are done, keep the bytes the GPU starts with.
-    /// Refreshes can still fill gaps between earlier queued writes.
+    /// Once all CPU refreshes are done, keep the bytes the GPU starts with,
+    /// including refreshed title writes inside declared UAV ranges.
     pub(crate) fn snapshot(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
@@ -244,10 +231,6 @@ impl Shadow {
     /// After every range from this shadow has been copied back.
     pub(crate) fn finish_writes(&self) {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         if let Some((_, bytes)) = snapshot.take() {
             give_back(bytes);
         }
@@ -255,44 +238,14 @@ impl Shadow {
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
-    /// write-watched). Returns the bytes copied.
+    /// write-watched). Earlier batches have already copied back, and this
+    /// batch has yet to execute. Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
-                }
-                at = at.max(e);
-            }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
-        }
-        self.update_free(from, to)
-    }
-
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
-    /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
