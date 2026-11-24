@@ -10,6 +10,11 @@
 //! Off, every hook is one relaxed load of a flag. On, a hook is a few
 //! relaxed atomic adds on a [`Stat`] its call site looked up once.
 //!
+//! [`gpu`] keeps the GPU's side: the noted commands' times, the slowest
+//! submission, draws and dispatches dropped or of zero groups.
+//! `VICTORY_PROFILE_LIVE=1` writes a line a second, with warnings at once
+//! for slow work and stalls ([`live`]).
+//!
 //! `VICTORY_PROFILE_OVERLAY=1` (or `VICTORY_PROFILE=overlay`) turns it on
 //! with an on-screen panel as well, which F3 shows and hides; see
 //! [`overlay`].

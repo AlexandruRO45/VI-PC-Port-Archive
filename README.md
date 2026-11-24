@@ -159,6 +159,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_PROFILE=1` or `=<dir>` | any build: frame times, memory, caches and loads; see [Profiling](#profiling) |
 | `VICTORY_PROFILE_OVERLAY=1` | any build: the same with an on-screen panel, F3 to hide and show it; see [Profiling](#profiling) |
+| `VICTORY_PROFILE_LIVE=1` | any build: a line a second on the console and in a file synced to disk, with warnings for slow work and GPU stalls; see [Profiling](#profiling) |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
@@ -177,11 +178,16 @@ unset, it costs one flag test per hook.
 | `VICTORY_PROFILE_HITCH_MS=<ms>` | a frame interval above this is a hitch (default 50) |
 | `VICTORY_PROFILE_TRACE_US=<us>` | timed scopes shorter than this are counted, not traced (default 100) |
 | `VICTORY_PROFILE_DUMP=30,90` | a full report at those seconds (with every thread's stack in a diagnostics build); one is also logged when the host GPU fails |
+| `VICTORY_PROFILE_LIVE=1`, `=frame` or `=<file>` | live lines, each second or after each frame, on the console and in `<dir>\live.log` (or `%TEMP%\victory-live.log`, or `<file>`), synced to disk at each line |
+| `VICTORY_PROFILE_LIVE_SLOW_MS=<ms>` | a command or submission slower than this is warned of at once (default 100) |
+| `VICTORY_PROFILE_LIVE_STALL_MS=<ms>` | the GPU on one marker this long is warned of at once, then at each doubling (default 1000) |
 
 A summary has the frame rate and 1% low, frame interval avg, p50, p95,
 p99 and max, hitches and stutters (over twice the median); per frame, the
 time preparing submissions, waiting for the GPU and presenting, and the
-submissions, draws and dispatches; process memory, video memory and its
+submissions, draws and dispatches, and those dropped (not run on the
+host) or of zero groups; the slowest submission and the pipelines it
+bound; process memory, video memory and its
 budget, and resident bytes (GPU memory, host textures, shader containers,
 the default allocator); cache hits and misses (shader containers, the
 shader disk cache, host pipelines, detiled textures); the timed scopes that took longest
@@ -211,6 +217,44 @@ read rates in MB/s over the last second. F3, while the window has focus,
 hides and shows it; the title sees the key as well. It is copied into the
 back buffer after the frame (no shaders), so `VICTORY_CAPTURE` images do
 not have it, and it scales with the window: twice as big from 1440 lines.
+
+### GPU hangs and slow GPU work
+
+With a diagnostics build, `VICTORY_D3D12_DRED=1` and `VICTORY_GPU_TIMING=1`
+(lists then run one at a time, so a list's time is its own), the summaries
+add the commands that took longest on the GPU: each by its marker text cut
+to the command, its groups and its pipeline's shader hashes (`dispatch
+64x1x1 [compute 8bbcbda6008eaa37]`, `mesh 3 [mesh ..., pixel ...]`,
+`indirect kind 2 max 1 [...]`), with its longest, median and total time,
+its runs, and its list's time when it took longest. Addresses and other
+hexadecimal values are left out, so the lines can be pasted as they are.
+A dump (`VICTORY_PROFILE_DUMP`, or a host failure) has them since the
+start.
+
+`VICTORY_PROFILE_LIVE=1` writes one line a second:
+
+```text
+[  95.0 s] frames 3 (last 4210) | cpu 41.3 ms gpu 290.0 ms /frame | slowest submission 812.4 ms (11 lists) [compute ...], ... | slowest command 387.8 ms (list 412.0) mesh 3 [mesh ..., pixel ...] | last marker done: dispatch 4x1x1 [compute ...] | dropped 12.0 zero-group 3.0 /frame | vram 6.12 GB / 7.50 GB, shared 250.0 MB / 16.00 GB
+```
+
+and `WARNING` lines at once: `SLOW COMMAND` and `SLOW SUBMISSION` over
+`VICTORY_PROFILE_LIVE_SLOW_MS`, and `STALL` when the GPU has not passed a
+marker for `VICTORY_PROFILE_LIVE_STALL_MS`, naming the list, the commands
+of it done, the last one done and the one it is in. Those come from two
+words per list in read-back memory the GPU writes before each noted
+command and at the end (`WriteBufferImmediate`), read while the submission
+runs (a diagnostics build with `VICTORY_D3D12_DRED=1`: the noted commands
+are its markers). The device-removed data names the same commands only
+after a removal; the live file has them on disk before, and a `FAILURE`
+line when the host GPU fails. The writes wait for the work before them,
+so the GPU runs slower with them. Without markers a stall still names the
+submission and its pipelines.
+
+What a dropped count does not say is why: `VICTORY_D3D12_DRED` notes each
+dropped command (`DROPPED dispatch (why) ...`), and the reasons are in the
+log. Zero-group work is counted for direct draws and dispatches; for
+indirect ones, a frame listed in `VICTORY_CAPTURE_FRAMES` with
+`VICTORY_DUMP_TARGETS` logs how many records asked for work.
 
 `victory_profile`'s documentation lists the other hooks (`count!`,
 `cache!`, `resident!`, `load`).
