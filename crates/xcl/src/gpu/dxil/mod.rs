@@ -26,6 +26,7 @@ mod lower_wide;
 pub mod module;
 pub mod ops;
 pub mod ops_core;
+pub mod opt;
 mod prelude;
 pub mod shader;
 pub mod ssa;

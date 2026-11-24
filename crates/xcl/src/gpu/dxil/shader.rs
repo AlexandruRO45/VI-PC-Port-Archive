@@ -457,6 +457,11 @@ impl Shader {
         }
     }
 
+    /// Optimizes the shader's IR (CFG, PHI, InstCombine, CSE, DCE, compaction, feature flags).
+    pub fn optimize(&mut self) {
+        super::opt::optimize(self);
+    }
+
     /// Writes metadata, bitcode and the signed container (panics on a builder error: tests;
     /// translators use [`Shader::try_finish`]).
     pub fn finish(self, numthreads: [u32; 3], wave_size: Option<u32>) -> Vec<u8> {
