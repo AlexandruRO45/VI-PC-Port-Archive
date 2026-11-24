@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -963,22 +965,34 @@ fn into_destination(
         return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
+    let mut pages = vec![0usize; (offset + len).div_ceil(PAGE)];
+    let read_pages = |pages: &mut [usize]| {
+        let bytes = std::mem::size_of_val(pages);
+        let mut read = 0;
+        // SAFETY: the destination is our writable slice. Read through the
+        // kernel because the title may still be filling its source list.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                request.destination.cast(),
+                pages.as_mut_ptr().cast(),
+                bytes,
+                &mut read,
+            ) != 0
+        };
+        ok && read == bytes
     };
+    if !read_pages(&mut pages) {
+        return Err(E_INVALIDARG);
+    }
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    if super::xmem::write_physical(pages, offset, &data[..n]) {
+    if super::xmem::write_physical(&pages, offset, &data[..n]) {
         return Ok(());
     }
     // A list naming page 0 (no page: numbers start at 0x10_0000) may not be
@@ -990,11 +1004,10 @@ fn into_destination(
         static STILL_ZERO: AtomicU32 = AtomicU32::new(0);
         for _ in 0..8 {
             std::thread::sleep(std::time::Duration::from_millis(1));
-            // SAFETY: as above; the title's list, read again.
-            let again = unsafe {
-                std::slice::from_raw_parts(request.destination.cast::<usize>(), pages.len())
-            };
-            if !again.contains(&0) && super::xmem::write_physical(again, offset, &data[..n]) {
+            if !read_pages(&mut pages) {
+                break;
+            }
+            if !pages.contains(&0) && super::xmem::write_physical(&pages, offset, &data[..n]) {
                 let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
                 if late.is_power_of_two() {
                     tracing::info!(late, still_zero = STILL_ZERO.load(Ordering::Relaxed), "dstorage: a page list filled after its request started: written late");
@@ -1563,23 +1576,22 @@ mod tests {
         assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
 
         // The title's list, still empty when the request is submitted.
-        let list = Box::leak(Box::new([0usize; 1]));
-        let at = std::ptr::from_mut(list) as usize;
+        let list = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let plain = pattern(4096);
         let (queue, array) = (new_queue(1), status_array(1));
         let r = request(
             PAGE_DESTINATION | MEMORY_SOURCE,
-            list.as_mut_ptr().cast(),
+            std::sync::Arc::as_ptr(&list).cast_mut().cast(),
             plain.len(),
             plain.as_ptr().cast(),
             0,
             plain.len(),
         );
         let number = page[0];
+        let writer = list.clone();
         let filler = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(2));
-            // SAFETY: the leaked list, alive for the whole test.
-            unsafe { std::ptr::write_volatile(at as *mut usize, number) };
+            writer.store(number, Ordering::Release);
         });
         enqueue(queue, &r);
         enqueue_status(queue, array, 0);
