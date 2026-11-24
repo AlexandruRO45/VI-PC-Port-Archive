@@ -244,6 +244,8 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::Graphics::Direct3D12::*;
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -340,5 +342,217 @@ mod tests {
             return; // no host GPU here
         };
         assert!(twice.iter().all(|&count| count == 0));
+    }
+
+    #[test]
+    fn bound_rejects_unaligned_gpu_or_stride() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if super::clamp().is_none() {
+            return;
+        }
+        let list = host.new_list().unwrap();
+        let buf = committed_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+            256,
+        );
+        // SAFETY: valid default buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        assert!(!super::bound(&list, &buf, gpu + 2, (0, 16, 1)));
+        assert!(!super::bound(&list, &buf, gpu, (0, 14, 1)));
+        list.close();
+    }
+
+    #[test]
+    fn argument_clamp_bounds_and_budget_on_gpu() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        if super::clamp().is_none() {
+            return;
+        }
+
+        // Draw (kind = 0, stride = 16):
+        // 0: normal draw stays untouched.
+        // 1: oversized vertices & instances clamp to (1<<24, 4), keeping start args.
+        // Total cost = 400 + (1<<26) <= BUDGET (1<<27), so neither is zeroed.
+        let draw_in: [[u32; 4]; 2] = [[100, 4, 1, 2], [u32::MAX, 100, 7, 9]];
+        // Second draw on the same HostList pushes its accumulated budget past
+        // BUDGET (400 + 2*(1<<26) > 1<<27), so its count is deterministically zeroed.
+        let draw_over_in: [[u32; 4]; 1] = [[1 << 24, 5, 3, 4]];
+        let (draw_out, draw_over_out) = run_clamp_pair(host, 0, 16, &draw_in, &draw_over_in);
+        assert_eq!(draw_out[0], [100, 4, 1, 2]);
+        assert_eq!(draw_out[1], [1 << 24, 4, 7, 9]);
+        assert_eq!(draw_over_out[0][0], 0);
+        assert_eq!(draw_over_out[0][2..], [3, 4]);
+
+        // Dispatch (kind = 2, stride = 16):
+        // 0: normal dispatch stays untouched.
+        // 1: per-dimension limit clamps X to 65535 (65535*2*2 <= 1<<20).
+        // 2: product exceeding GROUPS (1<<20) is zeroed.
+        // 3: 3D overflow guard zeroes (65535, 65535, 65535).
+        let disp_in: [[u32; 4]; 4] = [
+            [10, 2, 3, 0],
+            [70_000, 2, 2, 0],
+            [2048, 1024, 1, 0],
+            [65_535, 65_535, 65_535, 0],
+        ];
+        let disp_out = run_clamp(host, 2, 16, &disp_in);
+        assert_eq!(disp_out[0], [10, 2, 3, 0]);
+        assert_eq!(disp_out[1], [65_535, 2, 2, 0]);
+        assert_eq!(disp_out[2], [0, 0, 0, 0]);
+        assert_eq!(disp_out[3], [0, 0, 0, 0]);
+
+        // Mesh dispatch (kind = 3, stride = 16): clamped to (65535, 1, 1).
+        let mesh_in: [[u32; 4]; 1] = [[70_000, 4, 8, 5]];
+        let mesh_out = run_clamp(host, 3, 16, &mesh_in);
+        assert_eq!(mesh_out[0], [65_535, 1, 1, 5]);
+    }
+
+    fn run_clamp(
+        host: &crate::host::Host,
+        kind: u32,
+        stride: u32,
+        records: &[[u32; 4]],
+    ) -> Vec<[u32; 4]> {
+        let list = host.new_list().unwrap();
+        let (stage, readback) = record_clamp(host, &list, kind, stride, records);
+        list.close();
+        host.execute(&[&list]);
+        let out = read_back(&readback, records.len());
+        drop(stage);
+        out
+    }
+
+    fn run_clamp_pair(
+        host: &crate::host::Host,
+        kind: u32,
+        stride: u32,
+        first: &[[u32; 4]],
+        second: &[[u32; 4]],
+    ) -> (Vec<[u32; 4]>, Vec<[u32; 4]>) {
+        let list = host.new_list().unwrap();
+        let (stage1, rb1) = record_clamp(host, &list, kind, stride, first);
+        let (stage2, rb2) = record_clamp(host, &list, kind, stride, second);
+        list.close();
+        host.execute(&[&list]);
+        let out1 = read_back(&rb1, first.len());
+        let out2 = read_back(&rb2, second.len());
+        drop((stage1, stage2));
+        (out1, out2)
+    }
+
+    fn record_clamp(
+        host: &crate::host::Host,
+        list: &crate::host::HostList,
+        kind: u32,
+        stride: u32,
+        records: &[[u32; 4]],
+    ) -> ((ID3D12Resource, ID3D12Resource), ID3D12Resource) {
+        let bytes = std::mem::size_of_val(records) as u64;
+        let upload = committed_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            bytes,
+        );
+        let uav = committed_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+            bytes,
+        );
+        let readback = committed_buffer(
+            &host.device,
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            bytes,
+        );
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: upload buffer is `bytes` bytes on an upload heap.
+        unsafe {
+            upload.Map(0, None, Some(&mut mapped)).unwrap();
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), mapped.cast(), bytes as usize);
+            upload.Unmap(0, None);
+        }
+
+        // SAFETY: valid open list and live buffers sized `bytes`.
+        let gpu = unsafe {
+            list.list.CopyBufferRegion(&uav, 0, &upload, 0, bytes);
+            list.list.ResourceBarrier(&[super::transition(
+                &uav,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            uav.GetGPUVirtualAddress()
+        };
+        assert!(super::bound(list, &uav, gpu, (kind, stride, records.len() as u32)));
+        super::done(list, &uav);
+        // SAFETY: `done` leaves `uav` in UNORDERED_ACCESS; copy back to readback.
+        unsafe {
+            list.list.ResourceBarrier(&[super::transition(
+                &uav,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyBufferRegion(&readback, 0, &uav, 0, bytes);
+        }
+        ((upload, uav), readback)
+    }
+
+    fn read_back(readback: &ID3D12Resource, count: usize) -> Vec<[u32; 4]> {
+        let mut out = vec![[0u32; 4]; count];
+        let bytes = std::mem::size_of_val(out.as_slice());
+        let mut back = std::ptr::null_mut();
+        // SAFETY: `host.execute` waits for completion; readback buffer is `bytes` bytes.
+        unsafe {
+            readback.Map(0, None, Some(&mut back)).unwrap();
+            std::ptr::copy_nonoverlapping(back.cast::<u8>(), out.as_mut_ptr().cast(), bytes);
+            readback.Unmap(0, None);
+        }
+        out
+    }
+
+    fn committed_buffer(
+        device: &ID3D12Device,
+        heap: D3D12_HEAP_TYPE,
+        flags: D3D12_RESOURCE_FLAGS,
+        state: D3D12_RESOURCE_STATES,
+        bytes: u64,
+    ) -> ID3D12Resource {
+        let heap_props = D3D12_HEAP_PROPERTIES {
+            Type: heap,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut res = None;
+        // SAFETY: valid device, heap properties, and buffer resource descriptor.
+        unsafe {
+            device
+                .CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut res)
+                .unwrap();
+        }
+        res.unwrap()
     }
 }
