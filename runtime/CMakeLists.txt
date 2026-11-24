@@ -1376,30 +1376,41 @@ endif()
 # headers it uses in a "Vulkan headers:" line (cmake/vulkan_headers_report.cmake).
 option(LEONIDA_VULKAN_HEADERS_FETCH "Build against the pinned Khronos Vulkan-Headers release (downloaded once), even when other Vulkan headers are installed" OFF)
 option(LEONIDA_REQUIRE_VULKAN "Fail the configure instead of warning when no Vulkan headers are found" OFF)
-# The pinned Khronos Vulkan-Headers commit, which the "Vulkan headers:" line names.
+# The pinned Khronos Vulkan-Headers commit, which the "Vulkan headers:" line names, and its VK_HEADER_VERSION.
 set(LEONIDA_VULKAN_HEADERS_PIN 6802bb4733b63ed5efd3adb308a6c885ef180ea1)
+set(LEONIDA_VULKAN_HEADERS_PIN_VERSION 363)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_report.cmake")
 set(leonida_vulkan_headers_origin FOUND)
 if(LEONIDA_VULKAN_HEADERS_FETCH OR FETCHCONTENT_SOURCE_DIR_VULKANHEADERS)
   # Before find_package(Vulkan): it would define Vulkan::Headers from whatever headers it finds first, and the pin
   # would never be used. FindVulkan leaves an existing Vulkan::Headers alone.
   include(FetchContent)
+  # OVERRIDE_FIND_PACKAGE: FetchContent_MakeAvailable never tries find_package(VulkanHeaders) in place of the pin, even
+  # with -DFETCHCONTENT_TRY_FIND_PACKAGE_MODE=ALWAYS, and a later find_package(VulkanHeaders) gets the pin.
   FetchContent_Declare(VulkanHeaders
     # vulkan-sdk-1.4.363.0 (same commit pinned in .github/workflows/runtime.yml)
     URL https://github.com/KhronosGroup/Vulkan-Headers/archive/${LEONIDA_VULKAN_HEADERS_PIN}.tar.gz
     URL_HASH SHA256=9044fbb356160e43201dc2094acb44c8a906722a63a35f48fc0f051579db9bb6
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    OVERRIDE_FIND_PACKAGE)
   set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
   set(VULKAN_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
   set(VULKAN_HEADERS_ENABLE_MODULE OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(VulkanHeaders)
-  if(NOT TARGET Vulkan::Headers)
-    message(FATAL_ERROR "The Vulkan-Headers project in ${vulkanheaders_SOURCE_DIR} defines no Vulkan::Headers target")
-  endif()
+  FetchContent_GetProperties(VulkanHeaders)
   if(FETCHCONTENT_SOURCE_DIR_VULKANHEADERS)
     set(leonida_vulkan_headers_origin SOURCE_DIR)
   else()
     set(leonida_vulkan_headers_origin PIN)
   endif()
+  # A dependency provider or an earlier FetchContent_Declare(VulkanHeaders) can still answer FetchContent_MakeAvailable
+  # with other headers; fail rather than build against them and call them the pin.
+  set(leonida_vk_include_dirs "")
+  if(TARGET Vulkan::Headers)
+    get_target_property(leonida_vk_include_dirs Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+  endif()
+  leonida_vulkan_headers_check("${leonida_vk_include_dirs}" "${vulkanheaders_SOURCE_DIR}"
+                               ${leonida_vulkan_headers_origin})
 endif()
 # Also finds glslangValidator (Vulkan_GLSLANG_VALIDATOR_EXECUTABLE), which the shader-building tests below use.
 find_package(Vulkan QUIET)
@@ -1416,7 +1427,6 @@ if(NOT TARGET Vulkan::Headers)
   endif()
 endif()
 if(TARGET Vulkan::Headers)
-  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_report.cmake")
   get_target_property(leonida_vk_include_dirs Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
   leonida_vulkan_headers_report("${leonida_vk_include_dirs}" ${leonida_vulkan_headers_origin})
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test

@@ -5,10 +5,10 @@
 # Radeon 780M skipped ps_texoff, ps_texoff_forms and ps_texoff_implicit (225/248 passed instead of 228/248).
 # Kept in its own file so tests/test_cmake_vulkan_headers_pin.py can run it with `cmake -P`.
 
-# include_dirs: the INTERFACE_INCLUDE_DIRECTORIES of Vulkan::Headers. Generator expressions such as
-# $<BUILD_INTERFACE:...> (FetchContent's target) are unwrapped. origin: PIN (the hash-checked download of
-# LEONIDA_VULKAN_HEADERS_PIN), SOURCE_DIR (FETCHCONTENT_SOURCE_DIR_VULKANHEADERS) or FOUND (anything else).
-function(leonida_vulkan_headers_report include_dirs origin)
+# Sets dir_var to the first of include_dirs (the INTERFACE_INCLUDE_DIRECTORIES of Vulkan::Headers) that holds
+# vulkan/vulkan_core.h or vulkan/vulkan.h, or to "" when none does, and version_var to its VK_HEADER_VERSION, or to
+# "unknown". Generator expressions such as $<BUILD_INTERFACE:...> (FetchContent's target) are unwrapped.
+function(leonida_vulkan_headers_find include_dirs dir_var version_var)
   set(dir "")
   set(header "")
   foreach(d IN LISTS include_dirs)
@@ -33,7 +33,16 @@ function(leonida_vulkan_headers_report include_dirs origin)
     if(line MATCHES "VK_HEADER_VERSION ([0-9]+)")
       set(version "${CMAKE_MATCH_1}")
     endif()
-  else()
+  endif()
+  set(${dir_var} "${dir}" PARENT_SCOPE)
+  set(${version_var} "${version}" PARENT_SCOPE)
+endfunction()
+
+# include_dirs: the INTERFACE_INCLUDE_DIRECTORIES of Vulkan::Headers. origin: PIN (the hash-checked download of
+# LEONIDA_VULKAN_HEADERS_PIN), SOURCE_DIR (FETCHCONTENT_SOURCE_DIR_VULKANHEADERS) or FOUND (anything else).
+function(leonida_vulkan_headers_report include_dirs origin)
+  leonida_vulkan_headers_find("${include_dirs}" dir version)
+  if(NOT dir)
     set(dir "${include_dirs}")
   endif()
   if(origin STREQUAL "PIN")
@@ -47,4 +56,43 @@ function(leonida_vulkan_headers_report include_dirs origin)
   endif()
   string(CONCAT what ${what})
   message(STATUS "Vulkan headers: ${dir} (VK_HEADER_VERSION ${version}), ${what}")
+endfunction()
+
+# Fails the configure unless Vulkan::Headers (include_dirs) is the Vulkan-Headers copy FetchContent populated in
+# source_dir (empty when it populated none). FetchContent_MakeAvailable(VulkanHeaders) can return other headers
+# without populating anything: a dependency provider can answer it, and so can find_package() when an earlier
+# FetchContent_Declare(VulkanHeaders) asked for that or when FETCHCONTENT_TRY_FIND_PACKAGE_MODE=ALWAYS applies (an
+# installed VulkanHeadersConfig.cmake with VK_HEADER_VERSION 111 was named as the pin that way). origin PIN also needs
+# the pinned version, LEONIDA_VULKAN_HEADERS_PIN_VERSION, which a build folder populated before the pin changed and
+# configured with FETCHCONTENT_FULLY_DISCONNECTED=ON does not have.
+function(leonida_vulkan_headers_check include_dirs source_dir origin)
+  leonida_vulkan_headers_find("${include_dirs}" dir version)
+  set(same FALSE)
+  if(dir AND source_dir)
+    file(REAL_PATH "${dir}" used)
+    file(REAL_PATH "${source_dir}/include" wanted)
+    if(used STREQUAL wanted)
+      set(same TRUE)
+    endif()
+  endif()
+  if(NOT same)
+    if(source_dir)
+      set(wanted "${source_dir}/include")
+    else()
+      set(wanted "a folder FetchContent populated (it populated none)")
+    endif()
+    message(FATAL_ERROR
+      "-DLEONIDA_VULKAN_HEADERS_FETCH=ON or FETCHCONTENT_SOURCE_DIR_VULKANHEADERS asks for the Vulkan headers in "
+      "${wanted}, but Vulkan::Headers includes \"${include_dirs}\". Something other than that download answered "
+      "FetchContent_MakeAvailable(VulkanHeaders): a dependency provider (CMAKE_PROJECT_TOP_LEVEL_INCLUDES) or an "
+      "earlier FetchContent_Declare(VulkanHeaders). Remove it, or configure without either of the two to build "
+      "against the installed headers.")
+  endif()
+  if(origin STREQUAL "PIN" AND NOT version STREQUAL "${LEONIDA_VULKAN_HEADERS_PIN_VERSION}")
+    message(FATAL_ERROR
+      "${dir} has VK_HEADER_VERSION ${version}, but the pinned Khronos Vulkan-Headers ${LEONIDA_VULKAN_HEADERS_PIN} "
+      "are version ${LEONIDA_VULKAN_HEADERS_PIN_VERSION}, so ${source_dir} is not the pin. A dependency provider may "
+      "have populated it, or the build folder was populated before the pin changed and FETCHCONTENT_FULLY_DISCONNECTED "
+      "is ON, which keeps the old copy: configure once with -DFETCHCONTENT_FULLY_DISCONNECTED=OFF to download the pin.")
+  endif()
 endfunction()

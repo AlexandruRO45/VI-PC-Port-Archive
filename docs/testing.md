@@ -96,9 +96,11 @@ On macOS, add `-DVulkan_INCLUDE_DIR=/opt/homebrew/include` to the first command.
 For a result you will post, add `-DLEONIDA_VULKAN_HEADERS_FETCH=ON` to the first command. It builds against the
 repository's pinned Khronos Vulkan-Headers (downloaded once at configure time and hash-checked;
 `-DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<path>` uses a local copy instead), even when `VULKAN_SDK`,
-`Vulkan_INCLUDE_DIR` or installed headers name others, so two records of the same GPU compare. The headers decide
-what the test programs can ask the driver for: built against conda-forge's Vulkan 1.3 headers instead of the pin, a
-Radeon 780M skipped `ps_texoff`, `ps_texoff_forms` and `ps_texoff_implicit` (225/248 passed instead of 228/248,
+`Vulkan_INCLUDE_DIR` or installed headers name others, so two records of the same GPU compare. When something else
+would supply other headers in place of the pin (a dependency provider, or a stale download kept by
+`FETCHCONTENT_FULLY_DISCONNECTED`), the configure fails instead. The headers decide what the test programs can ask the
+driver for: built against conda-forge's Vulkan 1.3 headers instead of the pin, a Radeon 780M skipped `ps_texoff`,
+`ps_texoff_forms` and `ps_texoff_implicit` (225/248 passed instead of 228/248,
 [#14](https://github.com/ubiquitarianism/leonida/issues/14#issuecomment-7122653687)). Every configure names the
 headers it uses in one line; quote it in the record:
 
