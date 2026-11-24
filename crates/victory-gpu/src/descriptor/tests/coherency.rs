@@ -649,6 +649,105 @@ fn directly_indexed_srv_sees_producer_in_same_submission() {
 
 #[cfg(feature = "diagnostics")]
 #[test]
+fn title_constants_in_a_declared_uav_range_reach_the_gpu() {
+    let Some((host, dxc)) = test_host() else {
+        return;
+    };
+    const PAGE: u64 = crate::watch::PAGE as u64;
+    let title = TitleBuffer::watched(3 * PAGE);
+    let payload = TitleBuffer::watched(4);
+    title.set(PAGE, 11);
+    title.set(2 * PAGE, 13);
+    let shadow = crate::shadow::find(title.base, title.size).unwrap();
+    let producer = host.new_list().unwrap();
+    shadow.refresh(&producer, title.base, title.size);
+    shadow.gpu_writes(&producer, title.base, title.size);
+    let writer = compile(
+        host,
+        &dxc,
+        r#"
+RWByteAddressBuffer target : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, 77); }
+"#,
+    );
+    // SAFETY: Recording on the live list with the live writable shadow.
+    unsafe {
+        producer.list.SetComputeRootSignature(&writer.root);
+        producer.list.SetPipelineState(&writer.pso);
+        producer
+            .list
+            .SetComputeRootUnorderedAccessView(0, shadow.gpu(title.base));
+        producer.list.Dispatch(1, 1, 1);
+        producer.list.ResourceBarrier(&[crate::host::transition(
+            &shadow.buffer,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        )]);
+    }
+    producer.close();
+
+    let consumer = host.new_list().unwrap();
+    for offset in [PAGE, 2 * PAGE] {
+        consumer.defer_copy(
+            (title.base + offset) as *mut u8,
+            payload.base as *const u8,
+            4,
+        );
+    }
+    shadow.refresh(&consumer, title.base + PAGE, 256);
+    let rewrite = (title.base + PAGE) as usize;
+    consumer.defer(move || {
+        // SAFETY: The fixture owns the live, writable title mapping.
+        unsafe { (rewrite as *mut u32).write(61) };
+    });
+    let reader = compile(
+        host,
+        &dxc,
+        r#"
+cbuffer Input : register(b0) { uint word; }
+RWByteAddressBuffer report : register(u0);
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { report.Store(0, word); }
+"#,
+    );
+    let (cbv_output, cbv_readback) = host.shared_buffer(4).unwrap();
+    let (srv_output, srv_readback) = host.shared_buffer(4).unwrap();
+    let heap = TestHeap::new(64);
+    title.srv(heap.handle(1), 2 * PAGE, 4);
+    let direct = pipeline(host, &dxc);
+    // SAFETY: The bound shadow range is 256-byte aligned and all resources
+    // and pipelines are live through both dispatches.
+    unsafe {
+        consumer.list.SetComputeRootSignature(&reader.root);
+        consumer.list.SetPipelineState(&reader.pso);
+        consumer
+            .list
+            .SetComputeRootConstantBufferView(0, shadow.gpu(title.base + PAGE));
+        consumer
+            .list
+            .SetComputeRootUnorderedAccessView(1, cbv_output.GetGPUVirtualAddress());
+        consumer.list.Dispatch(1, 1, 1);
+    }
+    record(&consumer, heap.0, &direct, 1, &srv_output);
+    consumer.close();
+
+    // Set the CPU copy source after recording. The deferred copies come
+    // after the first list has declared the whole title buffer writable.
+    payload.set(0, 43);
+    host.execute(&[&producer, &consumer]);
+    let observed = (read(cbv_readback), read(srv_readback));
+    let title_values = (read(title.base as *mut u8), read(rewrite as *mut u8));
+    eprintln!("CBV/SRV readback {observed:?}, GPU/CPU title values {title_values:?}");
+    assert_eq!(observed, (43, 43));
+    assert_eq!(title_values, (77, 61));
+}
+
+#[cfg(feature = "diagnostics")]
+#[test]
 fn directly_indexed_srv_unwatched_range_preserves_watched_refreshes() {
     let Some((host, dxc)) = test_host() else {
         return;
