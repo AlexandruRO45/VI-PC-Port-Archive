@@ -1319,6 +1319,35 @@ mod tests {
         );
     }
 
+    /// The edges of the folded moves: a 64-bit move of null is zero in both
+    /// dwords; the inline integer range's ends sign-extend (64 to zero, -16
+    /// to ones); the bit-reversed and inverted forms take a float constant's
+    /// bits; `s_movk_i32` of all ones is -1; and a 64-bit move of a literal,
+    /// whose high dword the folding does not model, is left untraced.
+    #[test]
+    fn folded_moves_at_the_edges_of_their_ranges() {
+        let moved = |words: &[u32], k: usize| copy_source(&first_inst(words).1, k);
+        let c = |x: u32| Some(Moved::Const(x));
+        // s_mov_b64 s[0:1], null
+        assert_eq!(moved(&[0xBE80_047D, S_ENDPGM], 0), c(0));
+        assert_eq!(moved(&[0xBE80_047D, S_ENDPGM], 1), c(0));
+        // s_mov_b64 s[0:1], 64 / -16
+        assert_eq!(moved(&[0xBE80_04C0, S_ENDPGM], 0), c(64));
+        assert_eq!(moved(&[0xBE80_04C0, S_ENDPGM], 1), c(0));
+        assert_eq!(moved(&[0xBE80_04D0, S_ENDPGM], 0), c(-16i32 as u32));
+        assert_eq!(moved(&[0xBE80_04D0, S_ENDPGM], 1), c(u32::MAX));
+        // s_brev_b32 s0, 1.0 and s_not_b32 s0, -1
+        assert_eq!(
+            moved(&[0xBE80_0BF2, S_ENDPGM], 0),
+            c(1.0f32.to_bits().reverse_bits())
+        );
+        assert_eq!(moved(&[0xBE80_07C1, S_ENDPGM], 0), c(0));
+        // s_movk_i32 s0, 0xffff
+        assert_eq!(moved(&[0xB000_FFFF, S_ENDPGM], 0), c(u32::MAX));
+        // s_mov_b64 s[0:1], 0x1234_5678 (literal)
+        assert_eq!(moved(&[0xBE80_04FF, 0x1234_5678, S_ENDPGM], 0), None);
+    }
+
     fn track_err(words: &[u32], layout: &[RootParam], stage: HwStage) -> ShaderError {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
