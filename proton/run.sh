@@ -18,6 +18,10 @@ usage: proton/run.sh [options] [--] [victory args...]
   --z DIR        link DIR into the prefix's Z: drive as Z:\<basename>
   --config NAME  victory config to use, relative to the repo root
                  (default: victory.toml if present; see docs/proton.md)
+  --texture-no-wait
+                 set VICTORY_TEXTURE_NO_WAIT=1: the texture lane stops
+                 waiting on the title's remap lock under Wine (#178);
+                 costs up to two textures a frame, deferred one frame
 
 Examples:
   proton/run.sh config
@@ -31,6 +35,7 @@ exe="${VICTORY_EXE:-$repo/target/x86_64-pc-windows-gnu/release/victory.exe}"
 proton="${PROTON:-}"
 z_dir=""
 config=""
+texture_no_wait=""
 
 while [[ $# -gt 0 && $1 != -- ]]; do
     case "$1" in
@@ -39,6 +44,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do
         --proton) proton=$2; shift 2 ;;
         --z)      z_dir=$2; shift 2 ;;
         --config) config=$2; shift 2 ;;
+        --texture-no-wait) texture_no_wait=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *)      break ;;
     esac
@@ -105,6 +111,19 @@ export STEAM_COMPAT_CLIENT_INSTALL_PATH=${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOM
 # this as a non-Steam launch, so the script runs wine directly, waits, and
 # stdout/exit code come back to this terminal.
 export UMU_ID=victory
+
+# Wine's built-in d3d12/dxgi stubs answer E_INVALIDARG and draw nothing;
+# the GPU path needs the dxvk/vkd3d-proton copies Proton syncs into the
+# prefix as native. Recent Proton forces this itself; saying it too keeps
+# hand-made prefixes behaving the same (docs/proton.md, #41).
+export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-"d3d12=n;d3d12core=n;dxgi=n"}
+
+# The texture lane's remap-lock wait is a Wine-side mapping lock that
+# costs seconds while the world streams; the flag trades up to two
+# textures a frame for it (#178).
+if [[ -n $texture_no_wait ]]; then
+    export VICTORY_TEXTURE_NO_WAIT=1
+fi
 
 # Wine resolves the process' Unix cwd through its Z: mapping, so a config
 # given relative to the repo root works on both sides unchanged.
