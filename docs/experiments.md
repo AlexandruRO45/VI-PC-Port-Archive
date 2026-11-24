@@ -2,6 +2,12 @@
 
 Run commands from the repository root. Start with the [project overview](../README.md) and [contribution guide](../CONTRIBUTING.md). Package-specific observations below used local inputs. Community regression tests use fixtures built from this repository.
 
+## Immediate INSERTQ during a diagnostic startup
+
+Set `X2W_STARTUP_INSERTQ=1` when launching through the Windows startup debugger to handle first-chance illegal-instruction exceptions for the six-byte SSE4a register-to-register immediate form in the main image. The fallback handles XMM0 through XMM7 and defined bit ranges within the low 64 bits. High XMM bits are unspecified by the instruction. Native execution on SSE4a hardware takes precedence. The debugger's stop-first-chance mode retains its original behavior.
+
+Build `startup_insertq_fixture` and run `ctest --preset release --no-tests=error -R '^startup_insertq$' -V`. On an Intel Core i9-14900HX, the source-built fixture stopped at the instruction with the fallback off and exited with code zero after one emulation with it on. The fixture checks destination neighbors, source bits and flags. Byte-level context controls cover length zero (64 bits), bit 63, unrelated bytes and unsupported encodings.
+
 ## Local tools
 
 For optional static dependency inspection, build Microsoft's pinned version of xbdepends from PowerShell with x64 Visual Studio Build Tools, CMake and the Windows SDK.

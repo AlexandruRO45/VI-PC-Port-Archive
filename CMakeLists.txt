@@ -1072,6 +1072,13 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(docs_links PROPERTIES SKIP_RETURN_CODE 77)
 
     enable_language(ASM_MASM)
+    add_executable(startup_insertq_fixture tests/cpu/startup_insertq.asm)
+    set_target_properties(startup_insertq_fixture PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_libraries(startup_insertq_fixture PRIVATE kernel32)
+    target_link_options(startup_insertq_fixture PRIVATE /ENTRY:entry /SUBSYSTEM:CONSOLE /NODEFAULTLIB /INCREMENTAL:NO)
+    add_test(NAME startup_insertq COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_insertq_check.py"
+        "$<TARGET_FILE:startup_insertq_fixture>" "${CMAKE_CURRENT_BINARY_DIR}/startup-insertq-results")
+
     function(cpu_asm_fixture image source)
         if(ARGC GREATER 2)
             set(exports "${ARGV2}")

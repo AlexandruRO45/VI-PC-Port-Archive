@@ -8,6 +8,8 @@ Stops at the first second-chance exception, at a breakpoint inside the main imag
 """
 import ctypes
 import ctypes.wintypes as wt
+
+from insertq import apply_insertq
 import os
 import struct
 import sys
@@ -101,6 +103,8 @@ def main():
     main_base = None
     event = (ctypes.c_ubyte * 176)()
     start = time.time()
+    allow_insertq = os.environ.get("X2W_STARTUP_INSERTQ") == "1"
+    insertq_count = 0
     loader_break_seen = False
     stop = None
     exit_code = None
@@ -143,6 +147,26 @@ def main():
     def set_ctx(thread):
         k32.SetThreadContext(wt.HANDLE(thread), ctypes.c_void_p(ctx_addr))
         k32.CloseHandle(wt.HANDLE(thread))
+
+    def handle_insertq(tid, address):
+        # Query the Windows loader for the mapped main image extent.
+        module = ctypes.create_string_buffer(24)  # x64 MODULEINFO
+        if not k32.K32GetModuleInformation(wt.HANDLE(pi.hProcess), wt.HMODULE(main_base),
+                                           ctypes.byref(module), ctypes.sizeof(module)):
+            return False
+        base, size = struct.unpack_from("<QI", module.raw)
+        if not base <= address <= base + size - 6:
+            return False
+        code = read(address, 6)
+        thread, ctx = get_ctx(tid)
+        if not thread:
+            return False
+        try:
+            if not apply_insertq(code, ctx, address):
+                return False
+            return bool(k32.SetThreadContext(wt.HANDLE(thread), ctypes.c_void_p(ctx_addr)))
+        finally:
+            k32.CloseHandle(wt.HANDLE(thread))
 
     def ustr(addr):  # UNICODE_STRING*
         raw = read(addr, 16)
@@ -454,6 +478,10 @@ def main():
             params = struct.unpack_from("<" + "Q" * min(nparams, 15), event, 16 + 32) if nparams else ()
             first = struct.unpack_from("<I", event, 16 + 152)[0]
             label = NAMES.get(ex_code, "")
+            if first and ex_code == 0xc000001d and allow_insertq and not stop_first and handle_insertq(tid, ex_addr):
+                insertq_count += 1
+                k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
+                continue
             if ex_code == 0x80000003 and ex_addr in breakpoints:
                 handle_breakpoint(tid, ex_addr)
                 k32.ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -582,6 +610,8 @@ def main():
               ", ".join(f"{k} x{v}" for k, v in sorted(tops.items(), key=lambda kv: -kv[1])[:8]))
         if asserts_seen:
             print("  asserts continued: " + ", ".join(f"{where(a)} x{n}" for a, n in asserts_seen.items()))
+    if insertq_count:
+        print(f"  immediate INSERTQ emulated: {insertq_count}")
     bink_report()
     if os.environ.get("X2W_COUNT"):
         print("  hit counts: " + ", ".join(f"+{item} x{hit_counts.get('+' + item, 0)}"
