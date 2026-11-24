@@ -80,6 +80,9 @@ pub struct Container<'a> {
 
 const HEADER_SIZE: usize = 0x20;
 const MAX_PARTS: usize = 256;
+/// DXC's `DxilContainerMaxSize`: `IsValidDxilContainer` refuses a larger
+/// container, and offsets past it no longer fit a signed 32-bit integer.
+const MAX_SIZE: usize = 0x8000_0000;
 
 impl<'a> Container<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self, ShaderError> {
@@ -94,6 +97,11 @@ impl<'a> Container<'a> {
             return Err(ShaderError::Malformed("container major version is not 1"));
         }
         let total = u32_at(data, 0x18)? as usize;
+        // Checked before the data length, so a forged size is named as such
+        // even when the buffer is short.
+        if total > MAX_SIZE {
+            return Err(ShaderError::Malformed("container larger than DXC allows"));
+        }
         if total > data.len() || total < HEADER_SIZE {
             return Err(ShaderError::Malformed("container size disagrees with data"));
         }
@@ -242,6 +250,25 @@ mod tests {
         let mut padded = bytes.clone();
         padded.extend_from_slice(&[0xAA; 16]);
         assert_eq!(Container::parse(&padded).unwrap().parts.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_container_past_dxcs_maximum_size() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        for size in [MAX_SIZE as u32 + 1, u32::MAX] {
+            let mut bad = bytes.clone();
+            bad[0x18..0x1C].copy_from_slice(&size.to_le_bytes());
+            assert_eq!(
+                malformed(&bad),
+                "container larger than DXC allows",
+                "size {size:#x}"
+            );
+        }
+        // Exactly the maximum is a size, not a forgery; here it only
+        // disagrees with the (short) data.
+        let mut max = bytes;
+        max[0x18..0x1C].copy_from_slice(&(MAX_SIZE as u32).to_le_bytes());
+        assert_eq!(malformed(&max), "container size disagrees with data");
     }
 
     #[test]
