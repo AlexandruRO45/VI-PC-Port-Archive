@@ -403,10 +403,9 @@ int main() {
         // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another
         // vertex draw, which the layer splits into a full, a mesh and a full segment; query 1 holds one mesh draw;
         // query 2 the two vertex draws alone. A mesh draw has no input assembly or vertex shader, so those fields
-        // count only the two full-screen triangles (3 vertices, 1 primitive each). How many clipping and pixel
-        // shader invocations a draw makes is the driver's (RADV's PSInvocations is not the pixel count), so query
-        // 0 is checked against query 2: more of both is the mesh segment's share. Under LEONIDA_VK_VALIDATION=1 the
-        // run must stay free of VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076.
+        // count only the two full-screen triangles (3 vertices, 1 primitive each). Vulkan also forbids counting
+        // clipping during mesh draws. Compare query 0 with query 2 to check that vertex clipping is preserved and
+        // the mesh draws contribute pixel-shader invocations. LEONIDA_VK_VALIDATION=1 checks VUID 07076.
         if (d.pipeline_statistics_query) {
             const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 3, 0};
             Ref<ID3D12QueryHeap> statistics;
@@ -463,20 +462,22 @@ int main() {
             const auto& mesh_only = data[1];
             const auto& vertex_only = data[2];
             std::printf("statistics, mixed: IA %llu/%llu VS %llu C %llu/%llu PS %llu CS %llu; mesh only: C %llu/%llu "
-                        "PS %llu; vertex only: C %llu PS %llu\n",
+                        "PS %llu; vertex only: C %llu/%llu PS %llu\n",
                         mixed.IAVertices, mixed.IAPrimitives, mixed.VSInvocations, mixed.CInvocations,
                         mixed.CPrimitives, mixed.PSInvocations, mixed.CSInvocations, mesh_only.CInvocations,
                         mesh_only.CPrimitives, mesh_only.PSInvocations, vertex_only.CInvocations,
-                        vertex_only.PSInvocations);
+                        vertex_only.CPrimitives, vertex_only.PSInvocations);
             EXPECT(mixed.IAVertices == 6 && mixed.IAPrimitives == 2 && mixed.VSInvocations >= 1);
             EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
             EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
                    mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
-            EXPECT(mixed.CInvocations > vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
+            EXPECT(vertex_only.CInvocations > 0 && vertex_only.CPrimitives > 0);
+            EXPECT(mixed.CInvocations == vertex_only.CInvocations && mixed.CPrimitives == vertex_only.CPrimitives);
+            EXPECT(mixed.PSInvocations > vertex_only.PSInvocations);
             EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
                    mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
                    mesh_only.DSInvocations == 0 && mesh_only.CSInvocations == 0);
-            EXPECT(mesh_only.CInvocations > 0 && mesh_only.PSInvocations > 0);
+            EXPECT(mesh_only.CInvocations == 0 && mesh_only.CPrimitives == 0 && mesh_only.PSInvocations > 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
