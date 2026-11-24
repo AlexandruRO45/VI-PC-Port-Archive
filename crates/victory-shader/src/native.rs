@@ -505,15 +505,9 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
             })
             .collect::<Vec<RootParam>>();
         // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
-        // root descriptor are computed from these bytes. Resource tracking
-        // reads that high half from the SGPR after the first whatever the
-        // stated count, so a descriptor spans at least two.
+        // root descriptor are computed from these bytes ([`sgpr_span`]).
         if layout.iter().any(|p| {
-            let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
-            let span = match p.root {
-                RootType::Descriptor => p.sgprs.max(2),
-                _ => p.sgprs.max(1),
-            };
+            let (first, span) = sgpr_span(stage, p);
             u64::from(first) + u64::from(span) > u64::from(SGPRS)
         }) {
             return Err(Malformed("root parameter outside the SGPRs"));
@@ -544,7 +538,7 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_inputs_fit(vs_io(stage_data)?)?,
-            HwStage::Cs => StageIo::Cs(compute_io(stage_data)?),
+            HwStage::Cs => StageIo::Cs(compute_io(stage_data, &layout)?),
             HwStage::Ms => ms_io(stage_data, u32_at(record, RECORD_LDS)?)?,
             _ => StageIo::None,
         };
@@ -565,7 +559,12 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 /// 9-bit count of 512-byte granules, so it can state up to 255.5 KiB, which
 /// lowering would declare as the group's shared memory; like a mesh group's,
 /// a compute group's LDS can't exceed 64 KiB.
-fn compute_io(data: &[u8]) -> Result<ComputeIo, ShaderError> {
+///
+/// The group ids and group info arrive in the SGPRs after the user SGPRs
+/// (`ComputeIo::system_sgprs`), and raising labels them there. A root
+/// parameter covering one of those SGPRs would make the same register both a
+/// root parameter and a group id, so such a layout is refused.
+fn compute_io(data: &[u8], layout: &[RootParam]) -> Result<ComputeIo, ShaderError> {
     let cs = ComputeIo {
         rsrc2: u32_at(data, CS_RSRC2)?,
         threads: group_size(data)?,
@@ -573,7 +572,30 @@ fn compute_io(data: &[u8]) -> Result<ComputeIo, ShaderError> {
     if cs.lds_bytes() > MAX_LDS_BYTES {
         return Err(Malformed("implausible LDS size"));
     }
+    let (ids, info) = cs.system_sgprs();
+    // The layout was checked first, so `first + span` stays below `SGPRS`.
+    let mut system = ids.into_iter().chain([info]).flatten().map(u32::from);
+    if system.any(|s| {
+        layout.iter().any(|p| {
+            let (first, span) = sgpr_span(HwStage::Cs, p);
+            (first..first + span).contains(&s)
+        })
+    }) {
+        return Err(Malformed("root parameter over a system SGPR"));
+    }
     Ok(cs)
+}
+
+/// The first SGPR of a root parameter and how many it takes. Resource
+/// tracking reads a root descriptor's high half from the SGPR after its
+/// first whatever the stated count, so a descriptor spans at least two.
+fn sgpr_span(stage: HwStage, p: &RootParam) -> (u32, u32) {
+    let first = u32::from(p.user_data) + u32::from(stage.user_sgpr(0));
+    let span = match p.root {
+        RootType::Descriptor => p.sgprs.max(2),
+        _ => p.sgprs.max(1),
+    };
+    (first, span)
 }
 
 /// A compute program's thread-group size. Lowering multiplies the
@@ -1090,6 +1112,53 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    #[test]
+    fn compute_root_params_stay_off_system_sgprs() {
+        // 4 user SGPRs, then group id x in s4, y in s5 and the group info
+        // in s6.
+        let rsrc2: u32 = 4 << 1 | 1 << 7 | 1 << 8 | 1 << 10;
+        let program = |rsrc2: u32, root: u32, sgprs: u32, user_data: u8| {
+            let mut blob = fssm(&[(HwStage::Cs, &VS_CODE)]);
+            let record =
+                FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Cs)).unwrap() as usize;
+            let e = record + RECORD_SIZE as usize;
+            blob[e + CS_RSRC2..][..4].copy_from_slice(&rsrc2.to_le_bytes());
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            for v in [root, 0, sgprs, 0] {
+                blob.extend_from_slice(&v.to_le_bytes());
+            }
+            blob.extend_from_slice(&[user_data, 0, 0, 0]);
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (constants, descriptor, table) = (0, 1, 3);
+        // s0-s3 are the user SGPRs; a table in s3 takes one of them.
+        let p = program(rsrc2, constants, 4, 0).unwrap();
+        assert_eq!(p[0].layout[0].sgprs, 4);
+        assert!(program(rsrc2, table, 1, 3).is_ok());
+        // Past the system SGPRs nothing collides.
+        assert!(program(rsrc2, constants, 1, 7).is_ok());
+        // With no group ids or info enabled, s4 is free.
+        assert!(program(4 << 1, constants, 1, 4).is_ok());
+        for (root, sgprs, user_data, what) in [
+            (constants, 5, 0, "five dwords from s0 reach group id x"),
+            (descriptor, 1, 3, "a descriptor's high half in s4"),
+            (constants, 1, 5, "group id y"),
+            (table, 1, 6, "the group info"),
+        ] {
+            assert!(
+                matches!(
+                    program(rsrc2, root, sgprs, user_data),
+                    Err(Malformed("root parameter over a system SGPR"))
+                ),
+                "{what}"
+            );
+        }
     }
 
     #[test]
