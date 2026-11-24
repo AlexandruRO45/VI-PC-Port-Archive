@@ -2429,6 +2429,17 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
     }
 }
 
+fn smem_load_dwords(name: &str) -> Option<u32> {
+    match name.strip_prefix("s_load_dword")? {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -3823,16 +3834,5 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
-    }
-}
-
-fn smem_load_dwords(name: &str) -> Option<u32> {
-    match name.strip_prefix("s_load_dword")? {
-        "" => Some(1),
-        "x2" => Some(2),
-        "x4" => Some(4),
-        "x8" => Some(8),
-        "x16" => Some(16),
-        _ => None,
     }
 }

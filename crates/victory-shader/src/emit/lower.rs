@@ -5540,50 +5540,46 @@ impl<'a> Lower<'a> {
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
+        let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+        let k16 = self.s.m.i32(16);
+        let sext = |l: &mut Self, x: V| {
+            let t = l.s.m.bin(c, Bin::Shl, x, k16);
+            l.s.m.bin(c, Bin::AShr, t, k16)
+        };
+        if name.ends_with("_i16") {
+            a = sext(self, a);
+            b = sext(self, b);
+        }
+        let k15 = self.s.m.i32(15);
         let r = match name {
-            _ => {
-                let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
-                let k16 = self.s.m.i32(16);
-                let sext = |l: &mut Self, x: V| {
-                    let t = l.s.m.bin(c, Bin::Shl, x, k16);
-                    l.s.m.bin(c, Bin::AShr, t, k16)
+            "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
+            "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
+            "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
+            "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
+            "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
+                // src0 is the shift (4 bits), src1 the value.
+                let sh = self.s.m.bin(c, Bin::And, a, k15);
+                let x = if name == "v_ashrrev_i16" {
+                    sext(self, b)
+                } else {
+                    b
                 };
-                if name.ends_with("_i16") {
-                    a = sext(self, a);
-                    b = sext(self, b);
-                }
-                let k15 = self.s.m.i32(15);
-                match name {
-                    "v_add_nc_u16" => self.s.m.bin(c, Bin::Add, a, b),
-                    "v_sub_nc_u16" => self.s.m.bin(c, Bin::Sub, a, b),
-                    "v_subrev_nc_u16" => self.s.m.bin(c, Bin::Sub, b, a),
-                    "v_mul_lo_u16" => self.s.m.bin(c, Bin::Mul, a, b),
-                    "v_lshlrev_b16" | "v_lshrrev_b16" | "v_ashrrev_i16" => {
-                        // src0 is the shift (4 bits), src1 the value.
-                        let sh = self.s.m.bin(c, Bin::And, a, k15);
-                        let x = if name == "v_ashrrev_i16" {
-                            sext(self, b)
-                        } else {
-                            b
-                        };
-                        let op = match name {
-                            "v_lshlrev_b16" => Bin::Shl,
-                            "v_lshrrev_b16" => Bin::LShr,
-                            _ => Bin::AShr,
-                        };
-                        self.s.m.bin(c, op, x, sh)
-                    }
-                    _ => {
-                        let p = match name {
-                            "v_max_u16" => pred::IUGT,
-                            "v_min_u16" => pred::IULT,
-                            "v_max_i16" => pred::SGT,
-                            _ => pred::SLT,
-                        };
-                        let t = self.s.m.cmp(c, p, a, b);
-                        self.s.m.select(c, t, a, b)
-                    }
-                }
+                let op = match name {
+                    "v_lshlrev_b16" => Bin::Shl,
+                    "v_lshrrev_b16" => Bin::LShr,
+                    _ => Bin::AShr,
+                };
+                self.s.m.bin(c, op, x, sh)
+            }
+            _ => {
+                let p = match name {
+                    "v_max_u16" => pred::IUGT,
+                    "v_min_u16" => pred::IULT,
+                    "v_max_i16" => pred::SGT,
+                    _ => pred::SLT,
+                };
+                let t = self.s.m.cmp(c, p, a, b);
+                self.s.m.select(c, t, a, b)
             }
         };
         self.write_half(inst, r, guard)
