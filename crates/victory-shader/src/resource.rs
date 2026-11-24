@@ -118,6 +118,8 @@ pub struct Resources {
     pub params: Vec<(Value, usize, u32)>,
     /// Scalar loads satisfied by the host root parameters.
     pub root_spills: Vec<Site>,
+    /// Scalar or global dword loads that use the title address space directly.
+    pub title_loads: Vec<Site>,
     pub waterfall: Waterfall,
 }
 
@@ -235,8 +237,11 @@ fn track_resources(t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.smem_address(inst, base, *offset, soffset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) if t.title_read(inst, why) => out.title_loads.push(site),
+                        Err(why) => return Err(fail(why)),
+                    }
                 }
                 Fields::Flat {
                     addr,
@@ -244,10 +249,11 @@ fn track_resources(t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
-                    out.scalar.push((site, address));
+                    match t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset) {
+                        Ok(address) => out.scalar.push((site, address)),
+                        Err(why) if t.title_read(inst, why) => out.title_loads.push(site),
+                        Err(why) => return Err(fail(why)),
+                    }
                 }
                 _ => {}
             }
@@ -341,6 +347,18 @@ const MAX_JOINS: usize = 8;
 const SPILL_FIRST: u8 = 16;
 
 impl<'a> Tracer<'a> {
+    fn title_read(&self, inst: &Inst, why: &str) -> bool {
+        self.stage == HwStage::Cs
+            && matches!(
+                why,
+                "an address loaded from memory"
+                    | "an address from a phi"
+                    | "an address not from a root parameter"
+            )
+            && (inst.name().starts_with("global_load_dword")
+                || inst.name().starts_with("s_load_dword"))
+    }
+
     fn new(
         p: &'a Program,
         layout: &'a [RootParam],

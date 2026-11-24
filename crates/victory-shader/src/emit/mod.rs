@@ -104,6 +104,13 @@ pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 /// resource heap. The register is outside the title's possible root slots.
 pub const DESCRIPTOR_DATA_SLOT: u8 = u8::MAX;
 
+/// Internal binding for the SRV table covering the title's GPU address space.
+pub const TITLE_MEMORY_SLOT: u8 = u8::MAX - 1;
+pub const TITLE_MEMORY_SPACE: u32 = 2;
+/// Each SRV holds at most 2^27 dwords. The 256 views cover 128 GiB.
+pub const TITLE_MEMORY_VIEW_SHIFT: u32 = 29;
+pub const TITLE_MEMORY_VIEWS: u32 = 256;
+
 /// Local build: the loop limit without an override (see [`loop_limit`]).
 const LOCAL_LOOP_LIMIT: u32 = 1024;
 

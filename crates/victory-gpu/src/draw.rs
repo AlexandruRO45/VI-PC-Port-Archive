@@ -10,7 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use victory_shader::emit::DESCRIPTOR_DATA_SLOT;
+use victory_shader::emit::{DESCRIPTOR_DATA_SLOT, TITLE_MEMORY_SLOT};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -428,20 +428,46 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let needs_title_memory = p
+            .stages
+            .iter()
+            .any(|s| s.root_srvs.iter().any(|&(slot, _)| slot == TITLE_MEMORY_SLOT));
+        let mut bound_heaps = self.heaps;
+        let mut title_memory = None;
+        let mut fallback = None;
+        if needs_title_memory {
+            title_memory = if self.heaps[0] != 0 {
+                crate::descriptor::heap(self.heaps[0] as This)
+                    .host()
+                    .and_then(|heap| heap.title_memory())
+            } else {
+                fallback = crate::mirror::read_heap();
+                bound_heaps[0] = usize::MAX;
+                // SAFETY: the fallback is a live shader-visible heap.
+                fallback.map(|heap| unsafe { heap.GetGPUDescriptorHandleForHeapStart() })
+            };
+            if title_memory.is_none() {
+                once!("a dispatch dropped: no title memory SRV table");
+                return false;
+            }
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
-        if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+        if self.host_heaps != bound_heaps {
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
                 .map(|h| Some(h.heap.clone()))
                 .collect();
+            if let Some(heap) = fallback {
+                heaps.push(Some(heap.clone()));
+            }
             heaps.iter().flatten().for_each(|h| list.keep(h));
             // SAFETY: an open list and shader-visible heaps.
             unsafe { l.SetDescriptorHeaps(&heaps) };
-            self.host_heaps = self.heaps;
+            self.host_heaps = bound_heaps;
             self.host_roots = [0; 2];
         }
         let root = p.root.as_raw() as usize;
@@ -517,6 +543,20 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == TITLE_MEMORY_SLOT {
+                        let Some(handle) = title_memory else {
+                            return false;
+                        };
+                        // SAFETY: the range lives in the current view heap.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootDescriptorTable(param, handle);
+                            } else {
+                                l.SetGraphicsRootDescriptorTable(param, handle);
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == DESCRIPTOR_DATA_SLOT {
                         let data = (self.heaps[0] != 0)
                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())

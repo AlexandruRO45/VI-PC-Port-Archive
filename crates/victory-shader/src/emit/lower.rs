@@ -602,6 +602,10 @@ impl<'a> Lower<'a> {
             "sshort" => (1, Some((16, true))),
             _ => return Err(name),
         };
+        if self.x.res.title_loads.contains(&(b, i)) {
+            let guard = self.guard(b, i)?;
+            return self.title_load(inst, n, guard);
+        }
         let a = *self
             .scalar
             .get(&(b, i))
@@ -670,6 +674,100 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Global memory loads whose pointers were computed in title memory.
+    fn title_load(&mut self, inst: &Inst, words: u32, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Flat {
+            addr: Some(Operand::Vector { reg: addr, .. }),
+            dst: Some(Operand::Vector { reg: dst, .. }),
+            saddr,
+            offset,
+            ..
+        } = inst.fields
+        else {
+            return Err("a global memory load");
+        };
+        let (base, extra) = match saddr {
+            Some(Operand::Scalar { code, .. }) if code != NULL => {
+                (Reg::S(code), Some(Reg::V(addr)))
+            }
+            _ => (Reg::V(addr), None),
+        };
+        let extra = extra.map(|reg| self.address_word(inst, reg)).transpose()?;
+        let address = self.title_address(inst, base, extra)?;
+        for word in 0..words {
+            let offset = i64::from(offset) + 4 * i64::from(word);
+            let value = self.title_dword(address, offset);
+            self.write(inst, Reg::V(dst + word as u8), value, guard);
+        }
+        Ok(())
+    }
+
+    fn address_word(&mut self, inst: &Inst, reg: Reg) -> Result<V, Why> {
+        let v = inst.read(reg).ok_or("a global address")?;
+        self.i32_of(v)
+    }
+
+    fn title_address(&mut self, inst: &Inst, base: Reg, extra: Option<V>) -> Result<V, Why> {
+        let high = match base {
+            Reg::S(reg) => Reg::S(reg.checked_add(1).ok_or("a global address")?),
+            Reg::V(reg) => Reg::V(reg.checked_add(1).ok_or("a global address")?),
+            Reg::Scc => unreachable!("an address uses a register pair"),
+        };
+        let lo = self.address_word(inst, base)?;
+        let hi = self.address_word(inst, high)?;
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, i64t);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, i64t);
+        let shift = self.s.m.int_const(i64t, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
+        let address = self.s.m.bin(c, Bin::Or, lo, hi);
+        self.s.flags |= flags::INT64;
+        Ok(match extra {
+            Some(extra) => {
+                let extra = self.s.m.cast(c, Cast::ZExt, extra, i64t);
+                self.s.m.bin(c, Bin::Add, address, extra)
+            }
+            None => address,
+        })
+    }
+
+    fn title_dword(&mut self, address: V, offset: i64) -> V {
+        use super::{TITLE_MEMORY_VIEW_SHIFT, TITLE_MEMORY_VIEWS};
+
+        let c = self.cur;
+        let i64t = self.s.m.int(64);
+        let i32t = self.s.t.i32;
+        let off = self.s.m.int_const(i64t, offset);
+        let addr = self.s.m.bin(c, Bin::Add, address, off);
+        let shift = self.s.m.int_const(i64t, i64::from(TITLE_MEMORY_VIEW_SHIFT));
+        let limit = self.s.m.int_const(i64t, i64::from(TITLE_MEMORY_VIEWS));
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        let valid = self.s.m.cmp(c, pred::IULT, index, limit);
+        let zero = self.s.m.i32(0);
+        let index = self.s.m.cast(c, Cast::Trunc, index, i32t);
+        let index = self.s.m.select(c, valid, index, zero);
+        let byte = self.s.m.cast(c, Cast::Trunc, addr, i32t);
+        // Dword instructions use a naturally aligned address in the view.
+        let offset_mask = self.s.m.i32((1 << TITLE_MEMORY_VIEW_SHIFT) - 4);
+        let byte = self.s.m.bin(c, Bin::And, byte, offset_mask);
+        let h = self.s.title_memory_handle(c, index);
+        let undef = self.s.m.undef(i32t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, undef, mask, align],
+        );
+        let value = self.s.m.extract(c, r, 0);
+        let value = self.as_int(value);
+        self.s.m.select(c, valid, value, zero)
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -904,7 +1002,13 @@ impl<'a> Lower<'a> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
-        let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_srvs = self
+            .s
+            .root_srvs
+            .iter()
+            .map(|r| r.0)
+            .chain(self.s.title_memory.then_some(super::TITLE_MEMORY_SLOT))
+            .collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -2944,6 +3048,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let Fields::Smem {
+            base,
             data,
             offset,
             soffset,
@@ -2953,6 +3058,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if self.x.res.title_loads.contains(&site) {
+            let Operand::Scalar { code, .. } = *base else {
+                return Err("a scalar memory address");
+            };
+            let extra = self.operand(inst, soffset)?;
+            let address = self.title_address(inst, Reg::S(code), Some(extra))?;
+            for (word, &(reg, _)) in inst.writes.iter().enumerate() {
+                let offset = i64::from(*offset) + 4 * word as i64;
+                let value = self.title_dword(address, offset);
+                self.write(inst, reg, value, None);
+            }
+            return Ok(());
+        }
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
@@ -3984,6 +4102,28 @@ impl<'a> Lower<'a> {
             return self.packed16(inst, op, guard);
         }
         match name {
+            "v_mad_u64_u32" => {
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let addend = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let sum = self.s.m.bin(c, Bin::Add, product, addend);
+                let (lo, hi) = self.split64(sum);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    let carry = self.s.m.cmp(c, pred::IULT, sum, product);
+                    self.lane_bits.insert(w, carry);
+                }
+                Ok(())
+            }
             "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => {
                 let n = s(self, 0)?;
                 let x = self.src64(inst, 1)?;
@@ -6510,17 +6650,19 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
             l.i32_of(v)
         };
-        let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
+        let mut index = if *idxen { Some(vaddr(self, 0)?) } else { None };
         let mut off = self.s.m.i32(u32::from(*offset));
-        if *offen {
-            let o = vaddr(self, u8::from(*idxen))?;
+        let voffset = (*offen).then(|| vaddr(self, u8::from(*idxen))).transpose()?;
+        if let Some(o) = voffset {
             off = self.s.m.bin(c, Bin::Add, off, o);
         }
-        if !matches!(
+        let soffset = (!matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
-            let so = self.operand(inst, soffset)?;
+        ))
+        .then(|| self.operand(inst, soffset))
+        .transpose()?;
+        if let Some(so) = soffset {
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
         let src = self
@@ -6564,6 +6706,61 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        // A raw host root descriptor can address a console record buffer in
+        // bytes when the compiler built it without swizzling or a record limit.
+        let mut root_index_valid = None;
+        if !typed
+            && format.is_none()
+            && !store_short
+            && subword.is_none()
+            && let Some(record) = index
+            && let Source::Built {
+                address,
+                bits,
+                words: [u32::MAX, flags],
+            } = src
+            && self
+                .x
+                .native
+                .layout
+                .get(address.param)
+                .is_some_and(|p| p.root == RootType::Descriptor)
+            && address.offset == 0
+            && address.dynamic.is_none()
+            && bits & !0x3fff_0000 == 0
+            && flags >> 28 & 3 == 1
+            && let Some(used) = used
+            && let stride = bits >> 16
+            && stride == used.stride
+            && stride >= 4
+            && stride.is_multiple_of(4)
+        {
+            let wide = self.s.m.int(64);
+            let n = self.s.m.cast(c, Cast::ZExt, record, wide);
+            let stride = self.s.m.int_const(wide, i64::from(stride));
+            let base = self.s.m.bin(c, Bin::Mul, n, stride);
+            let immediate = self.s.m.int_const(wide, i64::from(*offset));
+            let mut bytes = self.s.m.bin(c, Bin::Add, base, immediate);
+            for extra in [voffset, soffset].into_iter().flatten() {
+                let extra = self.s.m.cast(c, Cast::ZExt, extra, wide);
+                bytes = self.s.m.bin(c, Bin::Add, bytes, extra);
+            }
+            let limit = self
+                .s
+                .m
+                .int_const(wide, (1_i64 << 32) - 4 * i64::from(count));
+            let valid = self.s.m.cmp(c, pred::IULE, bytes, limit);
+            let bytes = self.s.m.cast(c, Cast::Trunc, bytes, self.s.t.i32);
+            let zero = self.s.m.i32(0);
+            off = self.s.m.select(c, valid, bytes, zero);
+            index = None;
+            root_index_valid = Some(valid);
+            self.s.flags |= flags::INT64;
+        }
+        let store_guard = match (guard, root_index_valid) {
+            (Some(lane), Some(valid)) => Some(self.s.m.bin(c, Bin::And, lane, valid)),
+            (lane, valid) => lane.or(valid),
+        };
         if store_short {
             if index.is_some() {
                 return Err("an indexed short buffer store");
@@ -6575,7 +6772,7 @@ impl<'a> Lower<'a> {
             let undef = self.s.m.undef(i16t);
             let mask = self.s.m.i8(1);
             let alignment = self.s.m.i32(2);
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(store_guard);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
@@ -6639,7 +6836,7 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(store_guard);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -6662,6 +6859,16 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
             let r = self.end_guarded(at, &[(r, old)])[0];
+            let r = if let Some(valid) = root_index_valid {
+                let zero = self.s.m.i32(0);
+                let invalid = match guard {
+                    Some(lane) => self.s.m.select(self.cur, lane, zero, old),
+                    None => zero,
+                };
+                self.s.m.select(self.cur, valid, r, invalid)
+            } else {
+                r
+            };
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
@@ -6725,7 +6932,7 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(store_guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -6822,6 +7029,12 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = if let Some(valid) = root_index_valid {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, valid, x, zero)
+            } else {
+                x
+            };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -7439,6 +7652,34 @@ mod tests {
         }];
         let mut shader = lower_with(&words, layout, used).unwrap();
         assert_eq!(shader.root_uavs, [0]);
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
+    }
+
+    #[test]
+    fn computed_title_pointer_load_uses_the_bounded_srv_table() {
+        let words = [
+            0x8F04_8200, // s_lshl_b32 s4, s0, 2
+            0xBE85_0390, // s_mov_b32 s5, 16 (high dword of the pointer)
+            0xF400_0182,
+            0xFA00_0000, // s_load_dword s6, s[4:5], null
+            0x7E02_0206, // v_mov_b32 v1, s6
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let mut shader = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(shader.root_srvs, [super::super::TITLE_MEMORY_SLOT]);
         use super::super::validator::Validator;
         if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
             validator.validate(&mut shader.dxil).unwrap();

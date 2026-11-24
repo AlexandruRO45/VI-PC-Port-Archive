@@ -153,6 +153,27 @@ impl Host {
         views.sort_unstable();
         views.dedup();
         for (slot, kind) in views {
+            if slot == super::TITLE_MEMORY_SLOT && kind == D3D12_ROOT_PARAMETER_TYPE_SRV.0 {
+                static RANGE: D3D12_DESCRIPTOR_RANGE1 = D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: super::TITLE_MEMORY_VIEWS,
+                    BaseShaderRegister: 0,
+                    RegisterSpace: super::TITLE_MEMORY_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                };
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &RANGE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE(kind),
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {

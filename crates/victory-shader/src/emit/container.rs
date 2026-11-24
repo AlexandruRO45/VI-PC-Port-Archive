@@ -121,6 +121,7 @@ pub(crate) struct Binding {
     pub kind: u32,
     pub space: u32,
     pub register: u32,
+    pub count: u32,
     /// DXIL resource kind (13 cbuffer, 14 sampler).
     pub dxil_kind: u32,
 }
@@ -201,7 +202,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         for b in p.bindings {
             u32s(
                 &mut out,
-                &[b.kind, b.space, b.register, b.register, b.dxil_kind, 0],
+                &[
+                    b.kind,
+                    b.space,
+                    b.register,
+                    b.register + b.count - 1,
+                    b.dxil_kind,
+                    0,
+                ],
             );
         }
     }

@@ -5,6 +5,7 @@
 
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
+use super::{TITLE_MEMORY_SPACE, TITLE_MEMORY_VIEWS};
 
 /// Where the shader reads its user data: `b0` in this space.
 pub const USER_DATA_SPACE: u32 = 0;
@@ -68,6 +69,7 @@ pub(crate) struct Shader {
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
     pub root_uavs: Vec<(u8, V)>,
+    pub title_memory: bool,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -126,6 +128,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            title_memory: false,
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -227,6 +230,29 @@ impl Shader {
     /// The handle of a root UAV bound as a raw buffer.
     pub fn root_uav_handle(&mut self, slot: u8) -> V {
         self.root_raw_handle(slot, true)
+    }
+
+    /// The raw view of the title at index `view`, which may differ by lane.
+    pub fn title_memory_handle(&mut self, block: usize, view: V) -> V {
+        self.title_memory = true;
+        self.flags |= flags::RAW_BUFFERS;
+        let bind = [
+            self.m.i32(0),
+            self.m.i32(TITLE_MEMORY_VIEWS - 1),
+            self.m.i32(TITLE_MEMORY_SPACE),
+            self.m.i8(0),
+        ];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let nonuniform = self.m.bool(true);
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, view, nonuniform],
+        );
+        self.annotate(block, h, 11, 0)
     }
 
     fn root_raw_handle(&mut self, slot: u8, uav: bool) -> V {
@@ -344,6 +370,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.title_memory
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -368,6 +395,7 @@ impl Shader {
                     kind: 2,
                     space: USER_DATA_SPACE,
                     register: 0,
+                    count: 1,
                     dxil_kind: 13,
                 });
             }
@@ -391,6 +419,7 @@ impl Shader {
                     kind: 2,
                     space: ROOT_CBV_SPACE,
                     register: u32::from(slot),
+                    count: 1,
                     dxil_kind: 13,
                 });
             }
@@ -398,7 +427,7 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            if !self.root_srvs.is_empty() || self.title_memory {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -422,6 +451,28 @@ impl Shader {
                         kind: 4,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        count: 1,
+                        dxil_kind: 11,
+                    });
+                }
+                if self.title_memory {
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, TITLE_MEMORY_SPACE)),
+                        Some(i32c(&mut self, 0)),
+                        Some(i32c(&mut self, TITLE_MEMORY_VIEWS)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 0)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 4,
+                        space: TITLE_MEMORY_SPACE,
+                        register: 0,
+                        count: TITLE_MEMORY_VIEWS,
                         dxil_kind: 11,
                     });
                 }
@@ -456,6 +507,7 @@ impl Shader {
                         kind: 7,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        count: 1,
                         dxil_kind: 11,
                     });
                 }
@@ -485,6 +537,7 @@ impl Shader {
                         kind: 1,
                         space: SAMPLER_SPACE,
                         register: n,
+                        count: 1,
                         dxil_kind: 14,
                     });
                 }
