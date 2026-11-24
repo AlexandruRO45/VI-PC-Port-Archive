@@ -67,6 +67,25 @@ jobs:
       - name: Asset policy
         run: cargo xtask policy
 
+      # Lints this workflow: expression and context typos, unknown keys, and
+      # (via the runner's preinstalled shellcheck) the `run:` scripts, which
+      # YAML parsing alone never checks. The release is pinned and its
+      # checksum verified, like the actions above. SC2086 (unquoted variable)
+      # is ignored because the *_CRATES lists are split into arguments on
+      # purpose.
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+          ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+        run: |
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar xzf "$tarball" actionlint
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/actionlint" -color -ignore 'SC2086:'
+
       # Fast, needs no build: keep the clean packages clean. load_probe.rs is
       # checked by itself, since the rest of victory-loader is not clean yet.
       - name: rustfmt (clean packages)
