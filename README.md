@@ -8,6 +8,42 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
+## This fork (2026-11-24)
+
+A working fork of upstream that folds in the shader and GPU fixes still open
+as pull requests there, plus a few of its own, and measures what they change
+in a real run. Everything below is measured, not projected.
+
+What it adds on top of upstream `ffe310e`:
+
+| Change | Effect |
+|--------|--------|
+| 30 upstream PRs merged (wave64 wave size, stranded-SGPR refusal, waterfall table offsets, dead mask dwords, heap UAV inference, cube and array image lowering, mip-drop under memory pressure, view-memory caching, writes-only tracking, …) | Shader coverage and GPU lifetime the fork needs; without them the run dies far earlier |
+| Lane masks read as numbers after a complement (`s_xor m, -1`) | The number is the base mask's ballot over the whole wave, so six compute programs stop failing on it |
+| Texture to buffer copies (a read back through a placed footprint) | Replaces a silent drop that left streamed data stale |
+| Descriptor dwords nothing reads as a number keep a stand-in | A load whose only consumers hold host handles no longer stops the program |
+| Root UAV views bounded by their buffer | One class of invalid view, and the device removal it caused |
+
+Where a session gets to, and where it stops:
+
+| Measurement | Value |
+|-------------|-------|
+| Frames before the run ends | ~1,180–1,466 (upstream baseline: 853) |
+| Presented image at frame 1,024 | holds content (mean 125/255, range 26–231) |
+| 3840x2160 `D32_FLOAT_S8X24` depth target | still all zeros: the 3D pass has not drawn |
+| Shader programs that translate, from a run's dumps | 4 of 5 vertex/pixel, 13 of 23 compute |
+| Remaining translation failures, by reason | 21 `an address not from a root parameter`, 15 `a descriptor's address or format read as data`, 9 `an address from a root parameter that is no address`, 4 per-lane computed descriptors, plus singletons |
+
+The remaining crash is understood and is the same defect as the missing
+geometry. The console lets a shader's UAV descriptor point at any dword, but a
+host raw view must start on 16 bytes: binding it at the console's address is
+refused with `DXGI_ERROR_INVALID_CALL` and takes the device down, while
+aligning it and dropping the write leaves the title reading stale memory and
+faulting on a `-1` index at frame ~1,180. The fix is to keep the view aligned
+and give the shader the missing `address & 15` as a runtime bias on that root
+UAV's accesses. Those same dropped writes are what the world's indirect draw
+arguments are built from, which is why the scene stays dark.
+
 ## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
