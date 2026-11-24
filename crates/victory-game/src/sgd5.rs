@@ -23,6 +23,16 @@ fn max_packed(unpacked: usize) -> usize {
     unpacked + unpacked / 8 + PACKED_SLACK
 }
 
+/// The fewest packed bytes a container of `unpacked` bytes can take. The
+/// smallest deflate stream (one empty fixed-code block) is 2 bytes, and no
+/// stream does better than one 258-byte match per 2 bits (1-bit length and
+/// distance codes, no extra bits): 1032 bytes a byte. Fewer packed bytes is
+/// not a record's, and taking it for one would make its span (12 bytes and
+/// up) swallow the header of a real record right after it.
+fn min_packed(unpacked: usize) -> usize {
+    (unpacked / 1032).max(2)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Record<'a> {
     /// Offset of the marker in the file.
@@ -74,7 +84,8 @@ pub fn is_sgd5(file: &[u8]) -> bool {
 /// of the next record's header or name, which must follow them. A record
 /// whose packed bytes run past the end of the file (a truncated file) is not
 /// yielded, and ends the search: every byte after its marker is its own.
-/// Sizes that no deflate stream of the stated unpacked size could have do
+/// Sizes that no deflate stream of the stated unpacked size could have (too
+/// many packed bytes, or too few) do
 /// not form a record, and neither do bytes running past the end that do not
 /// start a deflate stream, so such bytes neither end the search nor hide
 /// records.
@@ -126,7 +137,12 @@ fn record(file: &[u8], at: usize) -> Found<'_> {
     else {
         return Found::Nothing;
     };
-    if n2 != n || n < 12 || unpacked_size > MAX_UNPACKED || n - 12 > max_packed(unpacked_size) {
+    if n2 != n
+        || n < 12
+        || unpacked_size > MAX_UNPACKED
+        || n - 12 > max_packed(unpacked_size)
+        || n - 12 < min_packed(unpacked_size)
+    {
         return Found::Nothing;
     }
     let Some(packed) = at.checked_add(n).and_then(|end| file.get(at + 12..end)) else {
@@ -585,6 +601,72 @@ mod tests {
         assert_eq!(names, [Some("PS_one"), Some("PS_two")]);
         assert_eq!(found[1].kind, 0x41);
         assert_eq!(found[1].unpack().as_deref(), Some(&b"second file"[..]));
+    }
+
+    #[test]
+    fn packed_size_lower_bound_holds_for_every_level() {
+        // The most compressible bytes, at every level miniz writes: no real
+        // record has fewer packed bytes than the bound.
+        let zeros = vec![0_u8; 4 << 20];
+        for len in [0, 1, 2, 258, 259, 1032, 65_536, 1 << 20, zeros.len()] {
+            for level in 0..=10 {
+                let packed = miniz_oxide::deflate::compress_to_vec(&zeros[..len], level);
+                assert!(packed.len() >= min_packed(len), "len {len} level {level}");
+            }
+        }
+    }
+
+    #[test]
+    fn marker_with_too_few_packed_bytes_does_not_hide_the_next_record() {
+        // Bytes between records that read as a marker with no packed bytes
+        // (or one) for a 1 MiB container, right before a real record: taken
+        // for a record, its span would cover the real record's header.
+        for packed_len in [0_u32, 1, 2, 3] {
+            let mut file = MAGIC.to_vec();
+            file.extend(record_bytes("PS_first", 0x32, b"first"));
+            file.extend_from_slice(b"DXBC");
+            let n = 12 + packed_len;
+            for v in [n, 0x000D_DCE7, n, 1 << 20] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            // The next record from its length byte on: with packed bytes,
+            // the phantom's span would start over it.
+            let mut next = record_bytes("PS_after", 0x32, b"after");
+            next.drain(..4);
+            file.extend(next);
+            // Before: [PS_first, None, None] for a phantom of 1 to 3 packed
+            // bytes (its span swallowed PS_after's length byte, so PS_after
+            // lost its name), and [PS_first, None, PS_after] for none (a
+            // record that never unpacks).
+            let names: Vec<_> = records(&file).map(|r| r.name).collect();
+            assert_eq!(
+                names,
+                [Some("PS_first"), Some("PS_after")],
+                "{packed_len} packed bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn smallest_containers_are_records() {
+        // The fewest packed bytes deflate writes: every small container at
+        // every level is still found.
+        for len in [0_usize, 1, 2, 3] {
+            for level in 0..=10 {
+                let payload = vec![0x41; len];
+                let packed = miniz_oxide::deflate::compress_to_vec(&payload, level);
+                let n = (packed.len() + 12) as u32;
+                let mut file = MAGIC.to_vec();
+                file.extend_from_slice(b"\x05PS_s\0\x32");
+                for v in [n, 0x000D_DCE7, n, len as u32] {
+                    file.extend_from_slice(&v.to_le_bytes());
+                }
+                file.extend_from_slice(&packed);
+                let found: Vec<_> = records(&file).collect();
+                assert_eq!(found.len(), 1, "len {len} level {level}");
+                assert_eq!(found[0].unpack(), Some(payload), "len {len} level {level}");
+            }
+        }
     }
 
     #[test]
