@@ -44,7 +44,7 @@ AnyXboxX は 1 つのビルドに特化しています: **Xbox Series 版 Grand 
 - **GPU 命令：40 %。** コンソール向けゲームのシェーダーは、Series X の RDNA 2 GPU 向けにコンパイルされています。1,487 個の RDNA 2 エンコーディングのうち 599 個がリファレンスインタープリターで動作し、RDNA 2 → DXIL の再コンパイラーはすでに最初の頂点シェーダーとピクセルシェーダーを D3D12 で描画しています。
 - **システム関数：66 %。** テスト用パッケージの DLL がインポートする 1 337 個の関数のうち、この割合が隔離モードで解決できています。
 - **コンソール固有の DLL**：`xmem.dll`（4/4）と `d3d12_xs.dll`（2/2）は、パッケージが使う関数について変換済みです。D3D12.X（デバイスと `ID3D12*` インターフェース）は TomBox の `d3d12_xs.dll` が提供していますが、まだゲームでは試していません。
-- **GDK ランタイム：396 個の関数のうち 241 個**は AnyXboxX 内に C++ で書かれています。対象はタスクキュー（`XTaskQueue`、`XAsync`、`XThread`）、ユーザー（`XUser`、オフラインのローカルプロファイル）、Xbox Series X の識別情報（`XSystem`、Title ID、アナリティクス、ランタイムの機能）、セーブデータ（`XGameSave`、`XGameSaveFiles`、`XPersistentLocalStorage`）、ゲームパッケージ（`XPackage`）、オフラインのストア（`XStore`）、そしてオフラインでの招待・アクティベーション・エラー報告（`XGameInvite`、`XGameActivation`、`XGameProtocol`、`XError`）、ストリーミングクライアントのないゲームストリーミング（`XGameStreaming`）、さらに PC の実際の HDR 状態とネットワーク接続（`XDisplayTryEnableHdrMode`、`XNetworkingGetConnectivityHint`）です。これらは AnyXboxX がランタイムを単独で管理するとき（Gaming Services がない場合、または `ANYXBOXX_SYSTEM_RUNTIME=0` を指定した場合）に使われます。Windows の GDK ランタイムがある場合は、その API が自前のキューしか受け付けないため、タスクキューを含むすべてのインターフェースをそちらが提供します。トレース（`ANYXBOXX_TRACE=1`）は、要求された各インターフェースの名前を出力します。
+- **GDK ランタイム：396 個の関数のうち 269 個**は AnyXboxX 内に C++ で書かれています。対象はタスクキュー（`XTaskQueue`、`XAsync`、`XThread`）、ユーザー（`XUser`、オフラインのローカルプロファイル）、Xbox Series X の識別情報（`XSystem`、Title ID、アナリティクス、ランタイムの機能）、セーブデータ（`XGameSave`、`XGameSaveFiles`、`XPersistentLocalStorage`）、ゲームパッケージ（`XPackage`）、オフラインのストア（`XStore`）、そしてオフラインでの招待・アクティベーション・エラー報告（`XGameInvite`、`XGameActivation`、`XGameProtocol`、`XError`）、ストリーミングクライアントのないゲームストリーミング（`XGameStreaming`）、ゲームが独自の UI を用意している場合にそちらへ任せるシステムダイアログ（`XGameUi`）、さらに PC の実際の HDR 状態とネットワーク接続（`XDisplayTryEnableHdrMode`、`XNetworkingGetConnectivityHint`）です。これらは AnyXboxX がランタイムを単独で管理するとき（Gaming Services がない場合、または `ANYXBOXX_SYSTEM_RUNTIME=0` を指定した場合）に使われます。Windows の GDK ランタイムがある場合は、その API が自前のキューしか受け付けないため、タスクキューを含むすべてのインターフェースをそちらが提供します。トレース（`ANYXBOXX_TRACE=1`）は、要求された各インターフェースの名前を出力します。
 
 グラフは `scarlett.py --traduction <パッケージのフォルダー> docs/images/traduction.svg` で再生成されます。
 
@@ -88,7 +88,7 @@ C++ ランタイムは、ゲームの DXGI スワップチェーンの `Present`
 | 396 個の GDK 関数の表：インターフェースとメソッド番号を `xgameruntime.lib` から抽出（`tools/gdk_interfaces.py`） | ✅ 完了 |
 | `XTaskQueue`、`XAsync`、`XThread` を AnyXboxX が提供：testgdk が Windows のランタイムなしで動作 | ✅ 完了 |
 | その他の GDK のインターフェース：Windows の GDK ランタイムに委譲し、トレースで名前を表示 | 🟡 進行中 |
-| 750 件の自動テスト | ✅ 完了 |
+| 757 件の自動テスト | ✅ 完了 |
 | D3D12.X：`D3D12XboxCreateDevice`、コンソールの `ID3D12*` インターフェース、`DXGIXPresentArray` を TomBox の Rust 製 `d3d12_xs.dll`（MIT、実装済みエクスポート 48 個、`tools/build_tombox.py d3d12_xs` でビルド、`ANYXBOXX_D3D12_XS=<パス>` で読み込み）が提供。コンソール実行ファイルがないためここでは検証不可 | 🟡 進行中 |
 | AnyXboxX にないものを補う TomBox（Rust、GPL-3.0）のコンソールライブラリ：`xg_xs`（テクスチャレイアウト、エクスポート 23 個）と完全な `xmem`（エクスポート 38 個）、`ANYXBOXX_TOMBOX_DIR=<フォルダー>` で使用。`tools/build_tombox.py xg_xs xmem` でビルド | 🟡 進行中 |
 | オフラインの `XUser`：常にサインイン済みのローカルプロファイル、変更可能なゲーマータグ（`ANYXBOXX_GAMERTAG`）、testgdk のサインイン成功 | ✅ 完了 |
