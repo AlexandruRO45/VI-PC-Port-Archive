@@ -2034,7 +2034,7 @@ mod tests {
     /// set (a 0 bit) or send run-level changes to it (a 1 bit). Kept sets are
     /// carried to the new block size through `sf_offsets`.
     #[test]
-        fn scale_factors_read_deltas_then_run_level_changes() {
+    fn scale_factors_read_deltas_then_run_level_changes() {
         /// The bits of `sym` in `vlc`.
         fn code(vlc: &Vlc, sym: i32) -> String {
             let &(c, len, _) = vlc.codes.iter().find(|c| c.2 == sym).unwrap();
@@ -2124,6 +2124,161 @@ mod tests {
         assert_eq!(
             d.ch[0].max_scale_factor,
             full[d.sf_offsets[1][0][d.num_bands - 1]]
+        );
+    }
+    /// `coefficients` reads a table bit, then groups of four vector-coded
+    /// values (vec4, escaping to two vec2 pairs, escaping to vec1 values
+    /// with a large-value escape), each nonzero value followed by a sign
+    /// bit where 0 is negative. Run-level codes fill the rest of the
+    /// subframe: a run and level from the table, the end code, or an escape
+    /// with a large value and a 0-, 2- or `esc_len`-bit run.
+    #[test]
+    fn coefficients_read_vectors_then_run_levels() {
+        fn code(vlc: &Vlc, sym: i32) -> String {
+            let &(c, len, _) = vlc.codes.iter().find(|c| c.2 == sym).unwrap();
+            format!("{:032b}", c)[..len as usize].to_string()
+        }
+        fn read(d: &mut Decoder, bits: &str, end: usize) -> (Result<(), Error>, usize) {
+            let mut data = vec![0u8; bits.len() / 8 + 8];
+            for (i, c) in bits.bytes().enumerate() {
+                data[i / 8] |= u8::from(c == b'1') << (7 - i % 8);
+            }
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end,
+            };
+            (d.coefficients(&mut b, 0), b.consumed())
+        }
+        fn decoder(num_vec_coeffs: usize, transmit: bool) -> Decoder {
+            let mut d = Decoder::new(1, 44_100);
+            d.subframe_len = 256;
+            // As `subframe` sets it: 8 bits for 256 samples.
+            d.esc_len = log2(256 - 1) + 1;
+            d.ch[0].num_vec_coeffs = num_vec_coeffs;
+            d.transmit_num_vec_coeffs = transmit;
+            // Past the subframe stays untouched.
+            d.ch[0].coeffs.fill(99.0);
+            d
+        }
+        fn nonzero(d: &Decoder) -> Vec<(usize, f32)> {
+            (0..d.subframe_len)
+                .filter(|&i| d.ch[0].coeffs[i] != 0.0)
+                .map(|i| (i, d.ch[0].coeffs[i]))
+                .collect()
+        }
+        let c = codes();
+        let coef0 = &c.coef[0];
+        // Table 0: 0 escapes, 1 ends, 3 is run 1 level 1.
+        assert_eq!((COEF0_RUN[3], COEF0_LEVEL[3]), (1, 1.0));
+
+        let bits = [
+            "0".to_string(),
+            // 1, 1, 1, 1 with signs + - + -.
+            code(&c.vec4, 0x1111),
+            "1010".into(),
+            // vec4 escape: vec2 (1, 2), then a vec2 escape to vec1 3 and
+            // vec1's large-value escape: 100 + 5 in 8 bits.
+            code(&c.vec4, -1),
+            code(&c.vec2, 0x12),
+            code(&c.vec2, -1),
+            code(&c.vec1, 3),
+            code(&c.vec1, VEC1.len() as i32 - 1),
+            format!("0{:08b}", 5),
+            "0110".into(),
+            // 1, 2, 0, 0.
+            code(&c.vec4, 0x1200),
+            "10".into(),
+            // Run 1 level 1 at 13.
+            code(coef0, 3),
+            "1".into(),
+            // Escape: value 7, a 2-bit run of 1 + 1, negative, at 16.
+            code(coef0, 0),
+            format!("0{:08b}", 7),
+            "10".into(),
+            "01".into(),
+            "0".into(),
+            // Escape: value 9, an 8-bit run of 10 + 4, positive, at 31.
+            code(coef0, 0),
+            format!("0{:08b}", 9),
+            "110".into(),
+            format!("{:08b}", 10),
+            "1".into(),
+            // Escape with no run, at 32.
+            code(coef0, 0),
+            format!("0{:08b}", 3),
+            "0".into(),
+            "1".into(),
+            code(coef0, 1),
+        ]
+        .concat();
+        let mut d = decoder(12, true);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(
+            nonzero(&d),
+            [
+                (0, 1.0),
+                (1, -1.0),
+                (2, 1.0),
+                (3, -1.0),
+                (4, -1.0),
+                (5, 2.0),
+                (6, 3.0),
+                (7, -105.0),
+                (8, 1.0),
+                (9, -2.0),
+                (13, 1.0),
+                (16, -7.0),
+                (31, 9.0),
+                (32, 3.0),
+            ]
+        );
+        assert!(d.ch[0].coeffs[256..].iter().all(|&v| v == 99.0));
+
+        // Without a sent count, two zeros in a row (more than 256 >> 8)
+        // switch to run-level coding after that group.
+        let bits = format!("0{}10{}", code(&c.vec4, 0x1200), code(coef0, 1));
+        let mut d = decoder(12, false);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(nonzero(&d), [(0, 1.0), (1, -2.0)]);
+        // With fewer than four vector coefficients, none are read.
+        let bits = format!("0{}", code(coef0, 1));
+        let mut d = decoder(3, true);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(nonzero(&d), []);
+
+        // Table 1 has its own runs and levels: 104 is run 2 level 2.
+        assert_eq!((COEF1_RUN[104], COEF1_LEVEL[104]), (2, 2.0));
+        let bits = format!("1{}0{}", code(&c.coef[1], 104), code(&c.coef[1], 1));
+        let mut d = decoder(0, true);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(nonzero(&d), [(2, -2.0)]);
+
+        // A run past the subframe wraps the write, as in FFmpeg, and ends
+        // the coefficients without an end code: 253 + 4 lands on 257 & 255.
+        let bits = format!("0{}0{:08b}110{:08b}1", code(coef0, 0), 6, 253);
+        let mut d = decoder(0, true);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(nonzero(&d), [(1, 6.0)]);
+
+        // A broken escape (three 1 bits) ends the coefficients.
+        let bits = format!("0{}0{:08b}111", code(coef0, 0), 6);
+        let mut d = decoder(0, true);
+        assert_eq!(read(&mut d, &bits, bits.len()), (Ok(()), bits.len()));
+        assert_eq!(nonzero(&d), []);
+
+        // Reading past the end is an error in either part.
+        let bits = format!("0{}1010", code(&c.vec4, 0x1111));
+        let mut d = decoder(4, true);
+        assert_eq!(
+            read(&mut d, &bits, bits.len() - 1).0,
+            Err(Error("vector coefficients"))
+        );
+        let bits = format!("0{}1", code(coef0, 3));
+        let mut d = decoder(0, true);
+        assert_eq!(
+            read(&mut d, &bits, bits.len() - 1).0,
+            Err(Error("run level coefficients"))
         );
     }
 }
