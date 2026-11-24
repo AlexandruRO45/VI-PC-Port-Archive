@@ -28,6 +28,23 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+
+    /// The parts DXC knows. Its validator refuses a container that lists one
+    /// of them twice ("More than one ... part"); other FourCCs are a title's
+    /// own and may repeat.
+    const KNOWN: [FourCC; 11] = [
+        Self::DXIL,
+        Self::STAT,
+        Self::RTS0,
+        Self::PSV0,
+        Self::ISG1,
+        Self::OSG1,
+        Self::PSG1,
+        Self::SFI0,
+        Self::HASH,
+        Self::ILDB,
+        Self::ILDN,
+    ];
 }
 
 impl std::fmt::Debug for FourCC {
@@ -99,6 +116,12 @@ impl<'a> Container<'a> {
             let body = data
                 .get(offset + 8..offset + 8 + size)
                 .ok_or(ShaderError::Malformed("part data out of bounds"))?;
+            // `part` returns the first of a FourCC, so a second `ISG1` or
+            // `DXIL` was silently ignored while the host, the validator or a
+            // tool reading the container could take the other one.
+            if FourCC::KNOWN.contains(&fourcc) && parts.iter().any(|p: &Part| p.fourcc == fourcc) {
+                return Err(ShaderError::Malformed("a part listed twice"));
+            }
             parts.push(Part {
                 fourcc,
                 offset,
@@ -245,5 +268,25 @@ mod tests {
         // The first byte after the table is where parts start.
         let c = Container::parse(&bytes).unwrap();
         assert_eq!(c.parts[0].offset, HEADER_SIZE + 8);
+    }
+
+    #[test]
+    fn a_known_part_listed_twice_is_refused() {
+        for fourcc in FourCC::KNOWN {
+            let bytes = build(&[
+                (fourcc, &[1; 4]),
+                (FourCC::SFI0, &[0; 8]),
+                (fourcc, &[2; 4]),
+            ]);
+            assert_eq!(malformed(&bytes), "a part listed twice", "{fourcc}");
+        }
+        // Each known part once, and a title's own part twice, still parse.
+        let once: Vec<_> = FourCC::KNOWN.iter().map(|&f| (f, &[0u8; 4][..])).collect();
+        assert_eq!(Container::parse(&build(&once)).unwrap().parts.len(), 11);
+        let own = FourCC(*b"PRIV");
+        let twice = build(&[(own, &[1; 4]), (FourCC::DXIL, &[0; 4]), (own, &[2; 4])]);
+        let c = Container::parse(&twice).unwrap();
+        assert_eq!(c.parts.len(), 3);
+        assert_eq!(c.part(own).unwrap().data, &[1; 4]);
     }
 }
