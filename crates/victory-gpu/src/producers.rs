@@ -58,7 +58,10 @@ const MAX_WRITES: usize = 8192;
 
 static WRITES: Mutex<VecDeque<Write>> = Mutex::new(VecDeque::new());
 /// Whether [`WRITES`] holds anything (stored with it locked): a read checks
-/// this first, so the common case, nothing dropped, takes no lock.
+/// this first, so the common case, nothing dropped, takes no lock. It is
+/// read relaxed and before the lock, so a read racing the very first drop
+/// of a frame on another thread can miss it: one log line late, which a
+/// detector can afford.
 static PENDING: AtomicBool = AtomicBool::new(false);
 /// A (reader, dropped writer) pair already logged.
 type Pair = (String, Arc<str>);
@@ -207,18 +210,26 @@ pub(crate) fn live_target(resource: usize) {
     }
 }
 
+/// Frame `frame` was presented: forgets history (see [`prune`]) once a
+/// frame, so [`read`], which runs per bound resource, never walks it.
+pub(crate) fn presented(frame: u64) {
+    if on() && PENDING.load(Ordering::Relaxed) {
+        let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        prune(&mut writes, frame);
+        settle(&writes);
+    }
+}
+
 /// Work that runs reads through `view`: logs it once per (reader, dropped
-/// writer) if only dropped work wrote that. History (see [`prune`]) is
-/// forgotten first, so it is never logged against a reader.
+/// writer) if only dropped work wrote that. History is forgotten at each
+/// present ([`presented`]), so it is never logged against a reader.
 pub(crate) fn read(view: &View) {
     if !on() || !PENDING.load(Ordering::Relaxed) {
         return;
     }
     let Some(what) = target_of(view) else { return };
     let hits: Vec<(Arc<str>, Target)> = {
-        let mut writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
-        prune(&mut writes, crate::queue::presented());
-        settle(&writes);
+        let writes = WRITES.lock().unwrap_or_else(|e| e.into_inner());
         writes
             .iter()
             .filter(|w| w.what.overlaps(what))
