@@ -121,21 +121,32 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
 static ORIG_NT_TERMINATE: AtomicUsize = AtomicUsize::new(0);
 static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+fn on_nt_terminate(status: i32, under_wine: bool, write_final: impl FnOnce(Option<String>)) {
+    let probe = 0usize;
+    let (tid, stack) = unsafe {
+        (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16))
+    };
+    if status != 0 {
+        crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
+        dump_threads();
+    } else {
+        crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
+    }
+    // Under Wine, an exe's TLS callbacks never receive DLL_PROCESS_DETACH at exit (#1461),
+    // so report.json would otherwise keep only the initial pre-run state.
+    if under_wine {
+        write_final(None);
+    }
+    crate::log::flush();
+}
+
 /// ntdll!NtTerminateProcess: the process ending (ExitProcess, abort()'s _exit(3),
 /// TerminateProcess of itself) is logged once – status, the calls that led there and, when the
 /// status is not 0, every other thread – and the log written out. abort() leaves no other
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
     if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
-        let probe = 0usize;
-        let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
-        if status != 0 {
-            crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
-            dump_threads();
-        } else {
-            crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
-        }
-        crate::log::flush();
+        on_nt_terminate(status, crate::util::under_wine(), crate::report::write_final);
     }
     let orig: unsafe extern "system" fn(isize, i32) -> i32 = std::mem::transmute(ORIG_NT_TERMINATE.load(Ordering::Acquire));
     orig(h, status)
@@ -1150,5 +1161,16 @@ mod tests {
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn nt_terminate_writes_report_under_wine() {
+        let mut written_wine = false;
+        on_nt_terminate(0, true, |_| written_wine = true);
+        assert!(written_wine, "under Wine, NtTerminateProcess must write final report");
+
+        let mut written_win = false;
+        on_nt_terminate(0, false, |_| written_win = true);
+        assert!(!written_win, "on native Windows, NtTerminateProcess relies on TLS DLL_PROCESS_DETACH");
     }
 }
