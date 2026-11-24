@@ -2437,6 +2437,45 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// A fill of upload memory from title memory `[src, src + len)` waits for
+/// flights whose shaders may write `written` (in order, joined): said for
+/// the first 32 places, each at its 1st, 2nd, 4th... time, with where the
+/// first written byte lies in the fill. A root constant view has no size
+/// and is filled 64 KiB long (`draw::root_view`): a first written byte far
+/// into the fill is a neighbour, not the constants the shader reads.
+fn note_blocked_fill(written: &[(usize, usize)], src: usize, len: usize) {
+    static SEEN: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
+    let at = written.partition_point(|r| r.1 <= src);
+    let Some(&(a, b)) = written.get(at) else {
+        return;
+    };
+    let n = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        match seen.iter().position(|s| s.0 == src) {
+            Some(i) => {
+                seen[i].1 += 1;
+                seen[i].1
+            }
+            None if seen.len() < 32 => {
+                seen.push((src, 1));
+                1
+            }
+            None => return,
+        }
+    };
+    if !n.is_power_of_two() {
+        return;
+    }
+    tracing::info!(
+        src = format_args!("{src:#x}"),
+        len = format_args!("{len:#x}"),
+        written = format_args!("{a:#x}..{b:#x}"),
+        first_written_at = format_args!("+{:#x}", a.saturating_sub(src)),
+        times = n,
+        "a fill of upload memory waits for flights that may write what it reads"
+    );
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -2499,6 +2538,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            note_blocked_fill(written, src, len);
                         }
                         return Some(WHY_READ);
                     }
