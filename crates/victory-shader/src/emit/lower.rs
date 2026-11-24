@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -904,11 +905,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2193,7 +2196,7 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
+        // shortcut: LDS addresses are taken as naturally aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
         let dword = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
@@ -2204,6 +2207,29 @@ impl<'a> Lower<'a> {
             let lds = l.s.lds();
             l.s.m.element(c, lds, index)
         };
+        let subword = match name {
+            "ds_read_u8" | "ds_write_b8" => Some((8, false)),
+            "ds_read_i8" => Some((8, true)),
+            "ds_read_u16" | "ds_write_b16" => Some((16, false)),
+            "ds_read_i16" => Some((16, true)),
+            _ => None,
+        };
+        if let Some((width, signed)) = subword {
+            let off = self.s.m.i32(offset);
+            let byte = self.s.m.bin(c, Bin::Add, a, off);
+            let shift = self.subword_shift(byte, width);
+            let p = dword(self, offset);
+            if let Some(reg) = dst_reg {
+                let word = self.s.m.load(c, p);
+                let bits = self.s.m.i32(width);
+                let value = self.bfe(word, shift, bits, signed);
+                self.write(inst, Reg::V(reg), value, guard);
+            } else {
+                let value = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                self.lds_write_subword(p, value, shift, width, guard);
+            }
+            return Ok(());
+        }
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
             Some("b96") => 3,
@@ -2308,6 +2334,49 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
+    }
+
+    /// Bit offset of a naturally aligned byte or halfword in a dword.
+    fn subword_shift(&mut self, byte: V, width: u32) -> V {
+        let mask = self.s.m.i32(if width == 8 { 3 } else { 2 });
+        let three = self.s.m.i32(3);
+        let index = self.s.m.bin(self.cur, Bin::And, byte, mask);
+        self.s.m.bin(self.cur, Bin::Shl, index, three)
+    }
+
+    /// Retry a masked store atomically so that concurrent writes to different
+    /// bytes of the same word retain each other's data.
+    fn lds_write_subword(&mut self, ptr: V, value: V, shift: V, width: u32, guard: Option<V>) {
+        let at = self.begin_guarded(guard);
+        let entry = self.cur;
+        let mask = self.s.m.i32((1 << width) - 1);
+        let word_mask = self.s.m.bin(entry, Bin::Shl, mask, shift);
+        let all = self.s.m.i32(u32::MAX);
+        let preserve = self.s.m.bin(entry, Bin::Xor, word_mask, all);
+        let value = self.s.m.bin(entry, Bin::And, value, mask);
+        let value = self.s.m.bin(entry, Bin::Shl, value, shift);
+        let zero = self.s.m.i32(0);
+        let retry = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(entry, Term::Br(retry));
+        let expected = self.s.m.phi(retry, self.s.t.i32);
+        let count = self.s.m.phi(retry, self.s.t.i32);
+        let kept = self.s.m.bin(retry, Bin::And, expected, preserve);
+        let new = self.s.m.bin(retry, Bin::Or, kept, value);
+        let previous = self.s.m.cmpxchg(retry, ptr, expected, new);
+        let one = self.s.m.i32(1);
+        let step = self.s.m.bin(retry, Bin::Add, count, one);
+        let limit = self.s.m.i32(super::loop_limit());
+        let below_limit = self.s.m.cmp(retry, pred::IULT, step, limit);
+        let failed = self.s.m.cmp(retry, pred::NE, expected, previous);
+        let again = self.s.m.bin(retry, Bin::And, below_limit, failed);
+        self.s
+            .m
+            .set_phi(expected, vec![(zero, entry), (previous, retry)]);
+        self.s.m.set_phi(count, vec![(zero, entry), (step, retry)]);
+        self.s.m.terminate(retry, Term::CondBr(again, retry, done));
+        self.cur = done;
+        self.end_guarded(at, &[]);
     }
 
     // ---- instructions ----
@@ -2864,6 +2933,16 @@ impl<'a> Lower<'a> {
     }
 
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        if self.x.res.root_spills.contains(&site) {
+            // Root parameter words are bound by slot and materialized on use.
+            for &(_, v) in &inst.writes {
+                if !self.params.contains_key(&v) {
+                    self.vals
+                        .insert(v, Val::Missing("padding in the root spill table"));
+                }
+            }
+            return Ok(());
+        }
         let Fields::Smem {
             data,
             offset,
@@ -2918,8 +2997,13 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+            let props = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
+                0x100b
+            } else {
+                11
+            };
+            let h = self.handle(site, src, false, (props, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3516,7 +3600,10 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), 0x100b) => {
+                        Ok(self.s.root_uav_handle(rp.slot))
+                    }
+                    _ => Err("a root view with an incompatible type"),
                 }
             }
             Source::Phi { block, args } => {
@@ -6390,6 +6477,14 @@ impl<'a> Lower<'a> {
         };
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        let subword = match name {
+            "buffer_load_ubyte" => Some((8, false)),
+            "buffer_load_sbyte" => Some((8, true)),
+            "buffer_load_ushort" => Some((16, false)),
+            "buffer_load_sshort" => Some((16, true)),
+            _ => None,
+        };
+        let store_short = name == "buffer_store_short";
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -6397,6 +6492,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if subword.is_some() || store_short => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -6468,6 +6564,59 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        if store_short {
+            if index.is_some() {
+                return Err("an indexed short buffer store");
+            }
+            let value = self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, 1)?[0];
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let i16t = self.s.m.int(16);
+            let value = self.s.m.cast(c, Cast::Trunc, value, i16t);
+            let undef = self.s.m.undef(i16t);
+            let mask = self.s.m.i8(1);
+            let alignment = self.s.m.i32(2);
+            let at = self.begin_guarded(guard);
+            let void = self.s.t.void;
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i16",
+                Attr::NoUnwind,
+                void,
+                140,
+                &[h, off, iu, value, undef, undef, undef, mask, alignment],
+            );
+            self.end_guarded(at, &[]);
+            self.s.flags |= flags::NATIVE_LOW_PRECISION | flags::LOW_PRECISION_OPERATIONS;
+            return Ok(());
+        }
+        if let Some((width, signed)) = subword {
+            if index.is_some() {
+                return Err("an indexed subword buffer load");
+            }
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let aligned = self.s.m.i32(!3);
+            let byte = self.s.m.bin(c, Bin::And, off, aligned);
+            let mask = self.s.m.i8(1);
+            let alignment = self.s.m.i32(4);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, byte, iu, mask, alignment],
+            );
+            let word = self.s.m.extract(c, r, 0);
+            let word = self.as_int(word);
+            let shift = self.subword_shift(off, width);
+            let bits = self.s.m.i32(width);
+            let value = self.bfe(word, shift, bits, signed);
+            self.write(inst, Reg::V(reg), value, guard);
+            return Ok(());
+        }
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -7153,7 +7302,9 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let code: Vec<u8> = words.iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
@@ -7228,7 +7379,7 @@ mod tests {
         };
         let p = ir::build(&native.code, wave64, 256).unwrap();
         let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let res = resource::track_native(&p, &native, Some(&st))?;
         let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
@@ -7241,6 +7392,57 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
+    }
+
+    #[test]
+    fn spilled_roots_and_subword_stores_validate() {
+        let words = [
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], null
+            0xBE86_03C1, // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // s_mov_b32 s7, 0x11014fac (raw descriptor)
+            0x7E02_0288, // v_mov_b32 v1, 8
+            0xD87C_0002,
+            0x0000_0100, // ds_write_b16 v0, v1 offset:2
+            0xE068_0002,
+            0x8001_0100, // buffer_store_short v1, off, s[4:7], 0 offset:2
+            S_ENDPGM,
+        ];
+        let layout = vec![
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 16,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 18,
+                slot: 1,
+            },
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 1,
+            dwords: 4,
+            user_data: 16,
+            slot: 0,
+        }];
+        let mut shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.root_uavs, [0]);
+        use super::super::validator::Validator;
+        if let Ok(mut validator) = Validator::load(Validator::default_path().as_deref()) {
+            validator.validate(&mut shader.dxil).unwrap();
+        }
     }
 
     #[test]
@@ -7411,9 +7613,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,

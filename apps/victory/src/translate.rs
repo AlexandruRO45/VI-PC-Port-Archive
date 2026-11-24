@@ -806,7 +806,7 @@ fn translate(
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
-                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+                let res = match resource::track_native(&program, &p, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)

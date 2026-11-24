@@ -15,7 +15,7 @@
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand, inline};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, ScalarDword as Moved, Value};
-use crate::native::{HwStage, RootParam, RootType};
+use crate::native::{HwStage, NativeProgram, RootParam, RootType, StageIo};
 use crate::structure::{Bool, LaneExit, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
@@ -113,9 +113,11 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
-    /// User SGPRs holding root parameters: value on entry, layout index,
-    /// dword within the parameter.
+    /// Root parameters in entry SGPRs or loaded from the root spill table:
+    /// SSA value, layout index, and dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads satisfied by the host root parameters.
+    pub root_spills: Vec<Site>,
     pub waterfall: Waterfall,
 }
 
@@ -150,16 +152,38 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    track_resources(Tracer::new(p, layout, stage, lanes)?)
+}
+
+/// Tracks resources with the native stage's user-data ABI.
+pub fn track_native(
+    p: &Program,
+    native: &NativeProgram,
+    lanes: Option<&Structured>,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, &native.layout, native.stage, lanes)?;
+    if matches!(&native.io, StageIo::Cs(cs) if cs.user_sgprs() == 4)
+        && !native.layout.is_empty()
+        && native.layout.iter().all(|r| {
+            r.user_data >= SPILL_FIRST
+                && matches!(r.root, RootType::Constants | RootType::Descriptor)
+        })
+    {
+        t.find_root_spills();
+    }
+    track_resources(t)
+}
+
+fn track_resources(t: Tracer<'_>) -> Result<Resources, ShaderError> {
+    let p = t.p;
     let mut out = Resources {
-        params: p
-            .inputs
+        params: t
+            .root_words
             .iter()
-            .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
-                Some((v, param, dword))
-            })
+            .enumerate()
+            .filter_map(|(v, &root)| root.map(|(p, d)| (Value(v as u32), p, d)))
             .collect(),
+        root_spills: t.root_spills.clone(),
         ..Resources::default()
     };
     // Group accesses in the same loop so a shared mask can select several
@@ -172,6 +196,9 @@ pub fn track(
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
+            if t.root_spills.contains(&site) {
+                continue;
+            }
             let fail = |what| ShaderError::Unsupported {
                 offset: inst.machine.offset,
                 what,
@@ -295,6 +322,8 @@ struct Tracer<'a> {
     phis: Vec<Option<(usize, usize)>>,
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
+    root_words: Vec<Option<(usize, u32)>>,
+    root_spills: Vec<Site>,
     origin: Vec<Term>,
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
@@ -307,6 +336,9 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// Spilled compute user data starts at logical dword 16. Its memory
+/// address arrives in s[0:1] and the load's offset is relative to dword 16.
+const SPILL_FIRST: u8 = 16;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -357,12 +389,83 @@ impl<'a> Tracer<'a> {
             defs,
             phis,
             inputs,
+            root_words: vec![None; n],
+            root_spills: Vec::new(),
             origin: Vec::new(),
             lanes,
             rpo,
         };
         t.origin = t.propagate_copies(n)?;
+        for &(reg, v) in &p.inputs {
+            t.root_words[v.0 as usize] = t.param_of(reg);
+        }
         Ok(t)
+    }
+
+    fn find_root_spills(&mut self) {
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                let Some(words) = self.spill_words(inst) else {
+                    continue;
+                };
+                self.root_spills.push((b, i));
+                for (&(_, v), root) in inst.writes.iter().zip(words) {
+                    self.root_words[v.0 as usize] = root;
+                }
+            }
+        }
+    }
+
+    fn spill_words(&self, inst: &Inst) -> Option<Vec<Option<(usize, u32)>>> {
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            offset,
+            soffset,
+            ..
+        } = inst.fields
+        else {
+            return None;
+        };
+        if !inst.name().starts_with("s_load_dword")
+            || self.term(inst, &soffset) != Some(Term::Const(0))
+            || offset < 0
+            || offset % 4 != 0
+        {
+            return None;
+        }
+        let lo = inst.read(Reg::S(code))?;
+        let hi = inst.read(Reg::S(code + 1))?;
+        let is_input = |v: Value, code| self.inputs[v.0 as usize] == Some(Reg::S(code));
+        let Term::Value(lo) = self.origin(lo) else {
+            return None;
+        };
+        let Term::Value(hi) = self.origin(hi) else {
+            return None;
+        };
+        let hi = self.address_high(hi);
+        if !is_input(lo, 0) || !is_input(hi, 1) {
+            return None;
+        }
+        let first = u32::from(SPILL_FIRST) + offset as u32 / 4;
+        let words: Vec<_> = (first..first + inst.writes.len() as u32)
+            .map(|word| {
+                self.layout.iter().enumerate().find_map(|(i, r)| {
+                    let dword = word.checked_sub(u32::from(r.user_data))?;
+                    (dword < r.sgprs).then_some((i, dword))
+                })
+            })
+            .collect();
+        // Wide loads can run into padding. Only named words can be consumed.
+        words.iter().any(Option::is_some).then_some(words)
+    }
+
+    /// Scalar loads discard the descriptor bits above the 40-bit address.
+    fn address_high(&self, v: Value) -> Value {
+        match self.sop2(v, &["s_and_b32"]) {
+            Some((_, [Term::Const(0xff), Term::Value(x)]))
+            | Some((_, [Term::Value(x), Term::Const(0xff)])) => x,
+            _ => v,
+        }
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -497,9 +600,9 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+        if self.inputs[v.0 as usize].is_some() || self.root_words[v.0 as usize].is_some() {
+            return match self.root_words[v.0 as usize] {
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -656,31 +759,37 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
-        let (param, _) = self
-            .param_of(reg)
-            .ok_or("an address not from a root parameter")?;
-        let high = match self.layout[param].root {
-            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
+        let (param, _) =
+            self.root_words[base.0 as usize].ok_or("an address not from a root parameter")?;
+        let hi = match hi {
+            Term::Value(v) => Term::Value(self.address_high(v)),
+            _ => hi,
+        };
+        let dynamic = s.dynamic.or(extra.dynamic);
+        let high_matches = match self.layout[param].root {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => {
+                self.high_half(hi, None)
             }
+            RootType::Descriptor => self
+                .root_words
+                .iter()
+                .enumerate()
+                .filter(|(_, root)| **root == Some((param, 1)))
+                .any(|(v, _)| {
+                    let high = Value(v as u32);
+                    self.high_half(hi, Some(high)) || dynamic.is_some() && self.carried(hi, high)
+                }),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
-        if !self.high_half(hi, high)
-            && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
-        {
+        if !high_matches {
             return Err("an address with an untracked high half");
         }
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
         })
     }
 
@@ -1590,6 +1699,9 @@ impl<'a> Tracer<'a> {
             return None;
         };
         let load = self.defs[v0.0 as usize]?;
+        if self.root_spills.contains(&load) {
+            return None;
+        }
         let inst = self.inst(load);
         if !inst.name().starts_with("s_load_") {
             return None;

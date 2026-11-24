@@ -165,6 +165,8 @@ pub struct HostShader {
     /// The host binds [`DESCRIPTOR_DATA_SLOT`] through a descriptor table
     /// and the title's root SRVs as root descriptors.
     pub root_srvs: Vec<u8>,
+    /// Raw buffer UAVs bound as root descriptors by title root slot.
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -217,7 +219,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_native(&p, &native, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
@@ -317,6 +319,7 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -635,6 +638,7 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -645,6 +649,7 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

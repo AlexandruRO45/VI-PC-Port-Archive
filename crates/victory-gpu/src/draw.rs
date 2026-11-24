@@ -558,6 +558,33 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                else {
+                    once!(slot, "a dispatch dropped: no root UAV");
+                    return false;
+                };
+                let Some(shadow) = crate::shadow::find(*address, 4) else {
+                    return false;
+                };
+                let gpu = shadow.gpu(*address);
+                // SAFETY: the shadow retains a live D3D12 buffer.
+                let flags = unsafe { shadow.buffer.GetDesc().Flags };
+                if gpu % 4 != 0 || !flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+                    return false;
+                }
+                let len = shadow.left(*address);
+                shadow.refresh(list, *address, len);
+                shadow.gpu_writes(list, *address, len);
+                // SAFETY: the open list references a retained, UAV-capable buffer.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    }
+                }
+            }
         }
         true
     }
@@ -620,7 +647,7 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
