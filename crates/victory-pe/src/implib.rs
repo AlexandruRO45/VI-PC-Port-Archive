@@ -311,4 +311,77 @@ mod tests {
         assert!(lib.imports.is_empty());
         assert_eq!(lib.other_members, 1);
     }
+
+    const EXPORT_AS: u16 = 4;
+
+    /// A short-format import object with the extra export name that
+    /// `IMPORT_OBJECT_NAME_EXPORTAS` places after the DLL name.
+    fn export_as_import(dll: &str, symbol: &str, export: &str) -> Vec<u8> {
+        let mut out = short_import(dll, symbol, 0, CODE, EXPORT_AS);
+        out.extend_from_slice(export.as_bytes());
+        out.push(0);
+        let data_len = (out.len() - 20) as u32;
+        out[12..16].copy_from_slice(&data_len.to_le_bytes());
+        out
+    }
+
+    /// `EXPORTAS` names the export with its third string, not the symbol;
+    /// one that lacks that string is not an import.
+    #[test]
+    fn reads_the_export_name_of_an_export_as_import() {
+        let lib = ImportLibrary::parse(&archive(&[
+            export_as_import("a.dll", "__imp_Decorated@4", "Exported"),
+            // Same header, but SizeOfData stops after the DLL name.
+            short_import("a.dll", "Missing", 0, CODE, EXPORT_AS),
+        ]))
+        .unwrap();
+        assert_eq!(
+            lib.imports,
+            [name("a.dll", "Exported", LibImportKind::Code)]
+        );
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// Import type 3 and name types 5 to 7 are not defined. Such members
+    /// are counted, and the members around them are still read.
+    #[test]
+    fn undefined_import_and_name_types_are_other_members() {
+        let lib = ImportLibrary::parse(&archive(&[
+            short_import("a.dll", "BadType", 0, 3, BY_NAME),
+            short_import("a.dll", "Name5", 0, CODE, 5),
+            short_import("a.dll", "Kept", 0, CODE, BY_NAME),
+            short_import("a.dll", "Name6", 0, DATA, 6),
+            short_import("a.dll", "Name7", 0, CONST, 7),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Kept", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 4);
+    }
+
+    /// `NO_PREFIX` drops one leading `?`, `@` or `_`; `UNDECORATE` also
+    /// drops everything from the first `@` after that. Names without a
+    /// prefix are kept as written.
+    #[test]
+    fn strips_one_prefix_and_the_stdcall_suffix() {
+        let cases = [
+            ("?Question", NO_PREFIX, "Question"),
+            ("@At", NO_PREFIX, "At"),
+            ("__Twice", NO_PREFIX, "_Twice"),
+            ("Bare@4", NO_PREFIX, "Bare@4"),
+            ("_std@12", UNDECORATE, "std"),
+            ("@fast@8", UNDECORATE, "fast"),
+            ("?cpp@@YAXXZ", UNDECORATE, "cpp"),
+            ("plain", UNDECORATE, "plain"),
+        ];
+        for (symbol, name_ty, expected) in cases {
+            let lib =
+                ImportLibrary::parse(&archive(&[short_import("a.dll", symbol, 0, CODE, name_ty)]))
+                    .unwrap();
+            assert_eq!(
+                lib.imports,
+                [name("a.dll", expected, LibImportKind::Code)],
+                "{symbol} with name type {name_ty}"
+            );
+        }
+    }
 }
