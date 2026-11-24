@@ -2744,4 +2744,183 @@ mod tests {
             assert_eq!(found[1].span().end, file.len(), "{what}");
         }
     }
+
+    /// Canonical Huffman codes for these code lengths (0: no code), as
+    /// deflate assigns them: shorter codes first, then by symbol. Lengths
+    /// that are no code (oversubscribed) still get codes, which collide.
+    fn canonical(lengths: &[u32]) -> Vec<u32> {
+        let mut next = 0;
+        let mut codes = vec![0; lengths.len()];
+        for len in 1..=15 {
+            for (sym, _) in lengths.iter().enumerate().filter(|&(_, &l)| l == len) {
+                codes[sym] = next;
+                next += 1;
+            }
+            next <<= 1;
+        }
+        codes
+    }
+
+    /// Code lengths as code-length symbols with their extra bits' values:
+    /// runs of 11 zeros and more as 18, of 3 to 10 as 17, the rest as is.
+    fn length_symbols(lengths: &[u32]) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lengths.len() {
+            let run = lengths[i..].iter().take_while(|&&l| l == 0).count();
+            match run {
+                11.. => {
+                    let run = run.min(138);
+                    out.push((18, run as u32 - 11));
+                    i += run;
+                }
+                3..=10 => {
+                    out.push((17, run as u32 - 3));
+                    i += run;
+                }
+                _ => {
+                    out.push((lengths[i], 0));
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// Code-length symbols in the order a dynamic block's header sends
+    /// their own code lengths.
+    const LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    /// One final dynamic-code block of 257 literal/length codes and one
+    /// distance code: the code-length code of lengths `clen` (by symbol),
+    /// the code-length symbols `seq`, then `data` coded with literal/length
+    /// code lengths `lit` (literals, then 256 for the end of the block).
+    fn dynamic_block(clen: &[u32; 19], seq: &[(u32, u32)], lit: &[u32], data: &[u32]) -> Vec<u8> {
+        let mut bits = Bits::default();
+        bits.put(1, 1); // BFINAL
+        bits.put(2, 2); // dynamic codes
+        bits.put(0, 5); // HLIT: 257 literal/length codes
+        bits.put(0, 5); // HDIST: 1 distance code
+        bits.put(15, 4); // HCLEN: all 19 code-length code lengths
+        for sym in LENGTH_ORDER {
+            bits.put(clen[sym], 3);
+        }
+        let clen_codes = canonical(clen);
+        for &(sym, extra) in seq {
+            bits.code(clen_codes[sym as usize], clen[sym as usize]);
+            match sym {
+                16 => bits.put(extra, 2),
+                17 => bits.put(extra, 3),
+                18 => bits.put(extra, 7),
+                _ => {}
+            }
+        }
+        let lit_codes = canonical(lit);
+        for &sym in data {
+            bits.code(lit_codes[sym as usize], lit[sym as usize]);
+        }
+        bits.out
+    }
+
+    #[test]
+    fn dynamic_block_whose_code_lengths_form_no_code_is_noise() {
+        // A dynamic block sends its own codes, as code lengths: a set of
+        // lengths that is no prefix code (more codes of a length than fit,
+        // or a literal/length code without the end of the block), or a
+        // code-length sequence that repeats a length before there is one or
+        // runs past the codes the header states, breaks the stream, though
+        // its bits are laid out as a real one's. Such a record covers no
+        // other, so it is yielded and does not unpack, and the record after
+        // it is found either way.
+        let a = u32::from(b'A');
+        // Code-length code: 18 in 1 bit, 0 and 1 in 2 (a complete code).
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[1]) = (1, 2, 2);
+        // `A` and the end of the block in 1 bit each; one distance code,
+        // unused, of length 0.
+        let mut lit = vec![0; 258];
+        (lit[a as usize], lit[256]) = (1, 1);
+        let data = [a, a, a, a, 256];
+        let want = b"AAAA".to_vec();
+
+        let good = dynamic_block(&clen, &length_symbols(&lit), &lit[..257], &data);
+        assert_eq!(
+            miniz_oxide::inflate::decompress_to_vec(&good).ok(),
+            Some(want.clone())
+        );
+        assert!(starts_stream(&good, want.len()));
+
+        let mut bad = Vec::new();
+        // Code-length code of three 1-bit codes.
+        let mut over = clen;
+        over[0] = 1;
+        over[1] = 1;
+        bad.push((
+            "oversubscribed code-length code",
+            dynamic_block(&over, &length_symbols(&lit), &lit[..257], &data),
+        ));
+        // Literal/length code of three 1-bit codes.
+        let mut three = lit.clone();
+        three[usize::from(b'B')] = 1;
+        bad.push((
+            "oversubscribed literal/length code",
+            dynamic_block(&clen, &length_symbols(&three), &three[..257], &data),
+        ));
+        // No code for the end of the block.
+        let mut no_end = lit.clone();
+        no_end[256] = 0;
+        bad.push((
+            "no end of block",
+            dynamic_block(&clen, &length_symbols(&no_end), &lit[..257], &data),
+        ));
+        // Repeat of the previous length (16) as the first symbol.
+        let mut rep_clen = clen;
+        rep_clen[16] = 2;
+        rep_clen[1] = 3;
+        rep_clen[0] = 3;
+        let mut rep = vec![(16, 0)];
+        rep.extend(length_symbols(&lit));
+        bad.push((
+            "repeat with nothing before",
+            dynamic_block(&rep_clen, &rep, &lit[..257], &data),
+        ));
+        // A run of zeros past the 258 lengths the header states.
+        let mut past = length_symbols(&lit);
+        let last = past.pop().unwrap();
+        assert_eq!(last, (0, 0), "the distance code's length");
+        past.push((18, 0));
+        bad.push((
+            "zeros past the stated codes",
+            dynamic_block(&clen, &past, &lit[..257], &data),
+        ));
+
+        for (what, packed) in &bad {
+            assert!(
+                miniz_oxide::inflate::decompress_to_vec(packed).is_err(),
+                "{what}"
+            );
+            assert!(!starts_stream(packed, want.len()), "{what}");
+        }
+
+        for (what, packed) in [("good", &good)]
+            .into_iter()
+            .chain(bad.iter().map(|(w, p)| (*w, p)))
+        {
+            let (file, marker) = outer_then_after(packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            let unpacked = what == "good";
+            assert_eq!(found[0].unpack(), unpacked.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
