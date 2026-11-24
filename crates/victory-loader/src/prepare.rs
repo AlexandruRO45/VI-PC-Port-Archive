@@ -39,7 +39,8 @@ impl PreparedImage {
 ///   directory is cleared: we bind the original slots using `info.imports`;
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
-///   its base relocation is made a no-op so the 0 survives a rebase;
+///   every base relocation that writes into it is made a no-op so the 0
+///   survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
@@ -94,17 +95,22 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
             at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
             0,
         )?;
-        // The field's base relocation would turn the 0 into `delta` whenever
-        // the loader maps the copy away from its preferred base (Wine always
-        // does for DYNAMIC_BASE images), and the loader then reads callbacks
-        // from there. Make that entry a no-op.
+        // A base relocation that writes into the field would turn the 0
+        // into (part of) `delta` whenever the loader maps the copy away from
+        // its preferred base (Wine always does for DYNAMIC_BASE images), and
+        // the loader then reads callbacks from there. That is not only the
+        // field's own DIR64 entry: a HIGHLOW, HIGH, LOW or HIGHADJ entry, or
+        // a DIR64 entry a few bytes before it, patches some of its bytes
+        // too. Make every such entry a no-op.
         let field_rva = tls
             .directory_rva
             .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
             .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+        for reloc in relocations(&bytes, &info) {
+            if reloc.overlaps(field_rva, 8) {
+                for slot in 0..reloc.slots {
+                    write_u16(&mut bytes, reloc.entry + 2 * slot, 0)?; // ABSOLUTE
+                }
             }
         }
         // The parser reads the directory through `object`, which skips a
@@ -132,9 +138,34 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
-/// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+/// One base relocation entry that patches something.
+#[derive(Debug, PartialEq, Eq)]
+struct Relocation {
+    /// File offset of the entry.
+    entry: usize,
+    /// 16-bit slots it occupies: two for HIGHADJ, whose second slot holds
+    /// the low half of the adjusted value rather than an entry of its own.
+    slots: usize,
+    /// RVA it patches.
+    target: u32,
+    /// Bytes it writes at `target`. A type this table does not know is
+    /// taken to write a whole pointer.
+    width: u32,
+}
+
+impl Relocation {
+    fn overlaps(&self, rva: u32, len: u32) -> bool {
+        let (start, end) = (
+            u64::from(self.target),
+            u64::from(self.target) + u64::from(self.width),
+        );
+        start < u64::from(rva) + u64::from(len) && u64::from(rva) < end
+    }
+}
+
+/// Every base relocation that patches something (all but ABSOLUTE
+/// padding). Empty if the image has no readable relocation table.
+fn relocations(bytes: &[u8], info: &ImageInfo) -> Vec<Relocation> {
     let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
         return Vec::new();
     };
@@ -146,15 +177,20 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
         return Vec::new();
     };
     let start = start as usize;
-    dir64_entries(bytes, start, start.saturating_add(size as usize))
+    relocation_entries(bytes, start, start.saturating_add(size as usize))
 }
 
-/// The `IMAGE_REL_BASED_DIR64` entries of the relocation blocks in
-/// `bytes[start..end]`. An entry whose target does not fit in an RVA (a
+/// The entries of the relocation blocks in `bytes[start..end]`, ABSOLUTE
+/// padding left out. An entry whose target does not fit in an RVA (a
 /// damaged block near the top of the address space) patches nothing the
 /// image could hold, so it is left out rather than wrapped around to the
 /// RVA of some other field.
-fn dir64_entries(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, u32)> {
+fn relocation_entries(bytes: &[u8], start: usize, end: usize) -> Vec<Relocation> {
+    const ABSOLUTE: u16 = 0;
+    const HIGH: u16 = 1;
+    const LOW: u16 = 2;
+    const HIGHLOW: u16 = 3;
+    const HIGHADJ: u16 = 4;
     const DIR64: u16 = 10;
     let mut out = Vec::new();
     let mut at = start;
@@ -168,16 +204,35 @@ fn dir64_entries(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, u32)> {
         if block < 8 || at + block > end {
             break;
         }
-        for entry in (at + 8..at + block).step_by(2) {
+        let mut entry = at + 8;
+        while entry + 2 <= at + block {
             let Some(e) = bytes.get(entry..entry + 2) else {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64
-                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            let (kind, offset) = (e >> 12, u32::from(e & 0xFFF));
+            let (width, slots) = match kind {
+                ABSOLUTE => (0, 1),
+                HIGH | LOW => (2, 1),
+                HIGHADJ => (2, 2),
+                HIGHLOW => (4, 1),
+                DIR64 => (8, 1),
+                _ => (8, 1),
+            };
+            if kind != ABSOLUTE
+                && let Some(target) = page.checked_add(offset)
             {
-                out.push((entry, target));
+                // A HIGHADJ whose parameter slot is past the block still
+                // has its own slot cleared, and only that one.
+                let slots = slots.min((at + block - entry) / 2);
+                out.push(Relocation {
+                    entry,
+                    slots,
+                    target,
+                    width,
+                });
             }
+            entry += 2 * slots;
         }
         at += block;
     }
@@ -221,9 +276,9 @@ mod tests {
             assert_eq!(tls.callbacks_va, 0);
             let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
             assert!(
-                dir64_relocations(&prepared.bytes, &patched)
+                relocations(&prepared.bytes, &patched)
                     .iter()
-                    .all(|&(_, target)| target != field),
+                    .all(|r| !r.overlaps(field, 8)),
                 "the cleared callback pointer must not be relocated"
             );
         }
@@ -311,35 +366,90 @@ mod tests {
         b
     }
 
+    /// (entry, slots, target, width) of each relocation, for comparing.
+    fn entries(bytes: &[u8], end: usize) -> Vec<(usize, usize, u32, u32)> {
+        relocation_entries(bytes, 0, end)
+            .into_iter()
+            .map(|r| (r.entry, r.slots, r.target, r.width))
+            .collect()
+    }
+
     #[test]
-    fn dir64_entries_walk_blocks_and_skip_other_types() {
-        // DIR64 at +0x10, an ABSOLUTE pad, then a HIGHLOW (type 3) entry.
+    fn relocation_entries_walk_blocks_and_skip_padding() {
+        // DIR64 at +0x10, an ABSOLUTE pad, a HIGHLOW at +0x20, a DIR64.
         let mut bytes = block(0x1000, &[0xA010, 0x0000, 0x3020, 0xA018]);
         bytes.extend(block(0x2000, &[0xA000, 0x0000]));
         assert_eq!(
-            dir64_entries(&bytes, 0, bytes.len()),
-            [(8, 0x1010), (14, 0x1018), (24, 0x2000)]
+            entries(&bytes, bytes.len()),
+            [
+                (8, 1, 0x1010, 8),
+                (12, 1, 0x1020, 4),
+                (14, 1, 0x1018, 8),
+                (24, 1, 0x2000, 8)
+            ]
         );
         // A block that claims more than the directory holds ends the walk.
         let mut bytes = block(0x1000, &[0xA010, 0x0000]);
         bytes[4] = 0x40;
-        assert!(dir64_entries(&bytes, 0, bytes.len()).is_empty());
+        assert!(relocation_entries(&bytes, 0, bytes.len()).is_empty());
     }
 
     #[test]
-    fn dir64_entries_drop_targets_past_the_top_of_the_address_space() {
+    fn relocation_entries_know_each_width_and_the_highadj_parameter() {
+        // HIGH, LOW, HIGHADJ (its next slot is a parameter, here 0xA040,
+        // which must not be read as a DIR64 entry), then a type x64 loaders
+        // do not define, taken as pointer-wide.
+        let bytes = block(0x1000, &[0x1002, 0x2004, 0x4006, 0xA040, 0x5008, 0x0000]);
+        assert_eq!(
+            entries(&bytes, bytes.len()),
+            [
+                (8, 1, 0x1002, 2),
+                (10, 1, 0x1004, 2),
+                (12, 2, 0x1006, 2),
+                (16, 1, 0x1008, 8)
+            ]
+        );
+        // A HIGHADJ in the last slot of its block owns only that slot.
+        let bytes = block(0x1000, &[0xA010, 0x4006]);
+        assert_eq!(
+            entries(&bytes, bytes.len()),
+            [(8, 1, 0x1010, 8), (10, 1, 0x1006, 2)]
+        );
+    }
+
+    #[test]
+    fn a_relocation_overlaps_the_bytes_it_writes() {
+        let at = |target, width| Relocation {
+            entry: 0,
+            slots: 1,
+            target,
+            width,
+        };
+        // An 8-byte field at 0x1118.
+        assert!(at(0x1118, 8).overlaps(0x1118, 8));
+        assert!(at(0x1118, 4).overlaps(0x1118, 8));
+        assert!(at(0x111C, 4).overlaps(0x1118, 8), "upper half");
+        assert!(at(0x1110, 9).overlaps(0x1118, 8));
+        assert!(at(0x111F, 2).overlaps(0x1118, 8));
+        assert!(!at(0x1110, 8).overlaps(0x1118, 8), "ends where it starts");
+        assert!(!at(0x1120, 8).overlaps(0x1118, 8), "starts where it ends");
+        assert!(at(0xFFFF_FFFC, 8).overlaps(0xFFFF_FFF8, 8), "no wrap");
+    }
+
+    #[test]
+    fn relocation_entries_drop_targets_past_the_top_of_the_address_space() {
         // A damaged page RVA near u32::MAX: page + offset does not fit, and
         // wrapping it would name a low RVA (0x0 for 0xFFFF_FFF0 + 0x10) that
         // belongs to some other field. Entries whose target fits are kept.
         let bytes = block(0xFFFF_F000, &[0xA000, 0xAFFF, 0x0000]);
         assert_eq!(
-            dir64_entries(&bytes, 0, bytes.len()),
-            [(8, 0xFFFF_F000), (10, 0xFFFF_FFFF)]
+            entries(&bytes, bytes.len()),
+            [(8, 1, 0xFFFF_F000, 8), (10, 1, 0xFFFF_FFFF, 8)]
         );
         let bytes = block(0xFFFF_FFF0, &[0xA00F, 0xA010, 0xAFFF]);
-        assert_eq!(dir64_entries(&bytes, 0, bytes.len()), [(8, 0xFFFF_FFFF)]);
+        assert_eq!(entries(&bytes, bytes.len()), [(8, 1, 0xFFFF_FFFF, 8)]);
         // An end past the buffer stops at the bytes there are.
-        assert_eq!(dir64_entries(&bytes, 0, usize::MAX).len(), 1);
+        assert_eq!(relocation_entries(&bytes, 0, usize::MAX).len(), 1);
     }
 
     #[test]

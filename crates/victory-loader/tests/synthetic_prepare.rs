@@ -404,8 +404,10 @@ fn what_is_not_a_pe32_plus_image_is_an_error() {
     assert!(prepare(&x86).is_err());
 }
 
-/// Applies every DIR64 base relocation in `bytes` for a load `delta` bytes
-/// above the preferred base, as the Windows or Wine loader does on a rebase.
+/// Applies every base relocation in `bytes` for a load `delta` bytes above
+/// the preferred base, as the Windows or Wine loader does on a rebase:
+/// HIGH, LOW, HIGHLOW and DIR64 add the matching part of `delta` to the
+/// bytes they name, and HIGHADJ adds the high half and skips its parameter.
 fn rebase(bytes: &mut [u8], delta: u64) {
     let info = ImageInfo::parse(bytes).unwrap();
     let d = dir_offset(dir::BASERELOC);
@@ -423,14 +425,36 @@ fn rebase(bytes: &mut [u8], delta: u64) {
         let page = layout::read_u32(bytes, at).unwrap();
         let block = layout::read_u32(bytes, at + 4).unwrap() as usize;
         assert!(block >= 8 && at + block <= end, "well-formed blocks only");
-        for entry in (at + 8..at + block).step_by(2) {
+        let mut entry = at + 8;
+        while entry < at + block {
             let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
-            if e >> 12 == 10 {
-                let target = info
-                    .rva_to_file_offset(page + u32::from(e & 0xFFF))
-                    .unwrap() as usize;
-                let v = layout::read_u64(bytes, target).unwrap();
-                put64(bytes, target, v.wrapping_add(delta));
+            entry += 2;
+            if e >> 12 == 0 {
+                continue;
+            }
+            let target = info
+                .rva_to_file_offset(page + u32::from(e & 0xFFF))
+                .unwrap() as usize;
+            let add16 = |b: &mut [u8], v: u16| {
+                let old = u16::from_le_bytes([b[target], b[target + 1]]);
+                put16(b, target, old.wrapping_add(v));
+            };
+            match e >> 12 {
+                1 => add16(bytes, (delta >> 16) as u16),
+                2 => add16(bytes, delta as u16),
+                3 => {
+                    let v = layout::read_u32(bytes, target).unwrap();
+                    put32(bytes, target, v.wrapping_add(delta as u32));
+                }
+                4 => {
+                    add16(bytes, (delta >> 16) as u16);
+                    entry += 2;
+                }
+                10 => {
+                    let v = layout::read_u64(bytes, target).unwrap();
+                    put64(bytes, target, v.wrapping_add(delta));
+                }
+                kind => panic!("relocation type {kind} is not modelled"),
             }
         }
         at += block;
@@ -477,9 +501,9 @@ fn a_rebase_keeps_the_cleared_callback_pointer_at_zero() {
 
 #[test]
 fn the_callback_relocation_is_found_in_a_later_block() {
-    // Two blocks: the first covers the import page with a HIGHLOW entry for
-    // the same RVA (not a 64-bit pointer, so not ours to touch), the second
-    // holds the DIR64 entry for the callbacks pointer.
+    // Two blocks: the first holds the index pointer's DIR64 entry and a
+    // HIGHLOW entry for an import-table RVA, the second the DIR64 entry for
+    // the callbacks pointer.
     let mut original = image();
     let first = file(RELOCS);
     put32(&mut original, first, SECTION_RVA);
@@ -487,7 +511,7 @@ fn the_callback_relocation_is_found_in_a_later_block() {
     put16(
         &mut original,
         first + 8,
-        (3 << 12) | (callbacks_field() - SECTION_RVA) as u16,
+        (3 << 12) | (INT - SECTION_RVA) as u16,
     );
     put16(&mut original, first + 10, dir64(TLS + 16));
     let second = first + 12;
@@ -816,25 +840,28 @@ fn a_section_table_that_hides_the_tls_directory_is_an_error() {
 }
 
 #[test]
-fn only_the_relocation_of_the_callback_field_itself_is_cleared() {
-    // DIR64 entries four and eight bytes past the callbacks pointer (a
-    // misaligned one and one for SizeOfZeroFill, as a damaged table might
-    // hold) patch other RVAs, so they are not the pointer's and stay.
+fn only_relocations_that_write_into_the_callback_field_are_cleared() {
+    // A DIR64 entry four bytes past the callbacks pointer (misaligned, as a
+    // damaged table might hold) writes its upper half, so it goes too. One
+    // eight bytes past it patches SizeOfZeroFill and Characteristics, and
+    // one eight bytes before it patches the end of the index pointer's
+    // neighbour; neither touches the pointer, so they stay.
     let mut original = image();
     let block = file(RELOCS);
     put32(&mut original, block + 4, 20);
     let near = block + 14;
     put16(&mut original, near, dir64(callbacks_field() + 4));
     put16(&mut original, near + 2, dir64(callbacks_field() + 8));
-    put16(&mut original, near + 4, 0); // ABSOLUTE padding
+    put16(&mut original, near + 4, dir64(callbacks_field() - 8));
     set_dir(&mut original, dir::BASERELOC, RELOCS, 20);
 
     let prepared = prepare(&original).unwrap();
     assert_eq!(&prepared.bytes[callbacks_reloc()..][..2], &[0, 0]);
+    assert_eq!(&prepared.bytes[near..][..2], &[0, 0], "the upper half");
     assert_eq!(
-        &prepared.bytes[near..near + 6],
-        &original[near..near + 6],
-        "neighbouring entries are left alone"
+        &prepared.bytes[near + 2..near + 6],
+        &original[near + 2..near + 6],
+        "entries beside the field are left alone"
     );
     assert_eq!(
         &prepared.bytes[block + 8..block + 10],
@@ -843,6 +870,105 @@ fn only_the_relocation_of_the_callback_field_itself_is_cleared() {
     );
     let patched = ImageInfo::parse(&prepared.bytes).unwrap();
     assert_eq!(patched.tls.unwrap().callbacks_va, 0);
+}
+
+/// `image()` with the callbacks pointer's DIR64 entry replaced by the
+/// 16-bit `entries` (in the same block, padded with ABSOLUTE to a multiple
+/// of four bytes), as a table from a linker that emits 32-bit fixups might.
+fn with_callback_entries(entries: &[u16]) -> Vec<u8> {
+    let mut b = image();
+    let block = file(RELOCS);
+    // Slot 0: the index pointer, slot 1 onward: `entries`, then the
+    // callback array's own entry, then padding.
+    let mut slots = vec![dir64(TLS + 16)];
+    slots.extend_from_slice(entries);
+    slots.push(dir64(CALLBACKS));
+    if slots.len() % 2 == 1 {
+        slots.push(0);
+    }
+    let size = 8 + 2 * slots.len();
+    assert!(size <= 0x100, "room before the end of the section");
+    put32(&mut b, block + 4, size as u32);
+    for (i, e) in slots.iter().enumerate() {
+        put16(&mut b, block + 8 + 2 * i, *e);
+    }
+    set_dir(&mut b, dir::BASERELOC, RELOCS, size as u32);
+    b
+}
+
+#[test]
+fn a_32_bit_relocation_of_the_callback_field_cannot_rearm_it() {
+    // HIGHLOW on the field, or on its upper half; HIGH and LOW on parts of
+    // it; HIGHADJ (with its parameter slot). Each one adds a piece of
+    // `delta` to the cleared pointer on a rebase, and the loader would then
+    // call through whatever that names. 0x7_1234_5000 has bits in every
+    // 16-bit lane a fixup can touch.
+    let delta: u64 = 0x7_1234_5000;
+    let at =
+        |kind: u16, offset: u32| (kind << 12) | (callbacks_field() + offset - SECTION_RVA) as u16;
+    let cases: [(&str, Vec<u16>); 6] = [
+        ("HIGHLOW", vec![at(3, 0)]),
+        ("HIGHLOW on the upper half", vec![at(3, 4)]),
+        ("HIGH", vec![at(1, 0)]),
+        ("LOW", vec![at(2, 2)]),
+        ("HIGHADJ", vec![at(4, 0), 0x8000]),
+        (
+            "DIR64 and HIGHLOW",
+            vec![dir64(callbacks_field()), at(3, 0)],
+        ),
+    ];
+    for (what, entries) in cases {
+        let original = with_callback_entries(&entries);
+        // The table is as built: without prepare's no-op, a rebase of the
+        // cleared pointer would leave something other than 0 there.
+        let mut unpatched = original.clone();
+        put64(&mut unpatched, file(callbacks_field()), 0);
+        rebase(&mut unpatched, delta);
+        assert_ne!(
+            layout::read_u64(&unpatched, file(callbacks_field())),
+            Some(0),
+            "{what}: the fixture relocates the field"
+        );
+
+        let mut mapped = prepare(&original)
+            .unwrap_or_else(|e| panic!("{what}: {e}"))
+            .bytes;
+        rebase(&mut mapped, delta);
+        assert_eq!(
+            layout::read_u64(&mapped, file(callbacks_field())),
+            Some(0),
+            "{what}: the cleared callback pointer survives the rebase"
+        );
+        // The index pointer and the callback array still move.
+        assert_eq!(
+            layout::read_u64(&mapped, file(TLS) + 16),
+            Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta),
+            "{what}"
+        );
+        assert_eq!(
+            layout::read_u64(&mapped, file(CALLBACKS)),
+            Some(IMAGE_BASE + u64::from(CODE) + delta),
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_highadj_parameter_is_not_mistaken_for_a_callback_relocation() {
+    // HIGHADJ's second slot is a 16-bit addend, not an entry. Here it reads
+    // as a DIR64 entry for the callbacks pointer, but the HIGHADJ itself
+    // patches the index pointer, so neither slot is the field's.
+    let highadj = (4 << 12) | (TLS + 16 + 2 - SECTION_RVA) as u16;
+    let mut original = with_callback_entries(&[highadj, dir64(callbacks_field())]);
+    // Drop the index pointer's own DIR64 so only the HIGHADJ remains for it.
+    put16(&mut original, file(RELOCS) + 8, 0);
+    let slots = file(RELOCS) + 10;
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(
+        &prepared.bytes[slots..slots + 4],
+        &original[slots..slots + 4],
+        "the HIGHADJ entry and its parameter are left as they were"
+    );
 }
 
 #[test]
