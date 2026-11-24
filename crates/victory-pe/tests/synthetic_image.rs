@@ -3201,3 +3201,138 @@ fn import_descriptor_timestamp_and_forwarder_chain_are_not_read() {
     put32(&mut d, at(IMPORT_DESCRIPTORS) + 8, 0x1234_5678);
     assert_eq!(parsed(&d), before);
 }
+
+/// The image with the section's virtual size cut to `virtual_size`; its raw
+/// data stays 0x400 bytes, so everything past the cut is file padding.
+fn with_virtual_size(d: &mut [u8], virtual_size: u32) {
+    put32(d, OPT + 240 + 8, virtual_size);
+}
+
+#[test]
+fn directories_in_the_raw_padding_past_the_virtual_size_are_malformed() {
+    // Raw data past the virtual size is not part of the section in memory,
+    // so a directory there is as missing as one past the section's end. A
+    // virtual size of 0x280 keeps the imports and TLS (below 0x1280) and
+    // cuts the delay imports, the debug directory and the exports.
+    let mut d = image();
+    with_virtual_size(&mut d, 0x280);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.import_count(), 2);
+    assert_eq!(info.tls.unwrap().callback_rvas, [0x1010, 0x1020]);
+
+    type AddDirectory = fn(&mut [u8]);
+    let cases: [(&str, AddDirectory); 3] = [
+        ("delay imports", add_delay_import),
+        ("debug directory", |d| add_codeview(d, b"RSDS")),
+        ("exports", add_exports),
+    ];
+    for (what, add) in cases {
+        let mut d = image();
+        add(&mut d);
+        assert!(ImageInfo::parse(&d).is_ok(), "{what} before the cut");
+        with_virtual_size(&mut d, 0x280);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "{what}: {:?}",
+            ImageInfo::parse(&d)
+        );
+    }
+
+    // The import descriptors themselves, cut at 0x1100.
+    let mut d = image();
+    with_virtual_size(&mut d, 0x100);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn the_tls_callback_array_stops_at_the_virtual_size_not_the_raw_size() {
+    // The two callback slots sit at 0x1240 and 0x1248. Cutting the virtual
+    // size at 0x248 keeps the first slot and drops the second, though its
+    // bytes are still in the file.
+    let mut d = image();
+    with_virtual_size(&mut d, 0x248);
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.directory_rva, TLS_DIRECTORY);
+    assert_eq!(tls.callbacks_va, IMAGE_BASE + u64::from(TLS_CALLBACKS));
+    assert_eq!(tls.callback_rvas, [0x1010]);
+
+    // Cut at 0x244: half a slot is not read either.
+    let mut d = image();
+    with_virtual_size(&mut d, 0x244);
+    assert!(
+        ImageInfo::parse(&d)
+            .unwrap()
+            .tls
+            .unwrap()
+            .callback_rvas
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_tls_directory_cut_by_the_virtual_size_before_its_callback_field_is_malformed() {
+    // AddressOfCallBacks is at TLS_DIRECTORY + 0x18; a virtual size ending
+    // inside the directory before that field leaves it unreadable.
+    let mut d = image();
+    with_virtual_size(&mut d, TLS_DIRECTORY - SECTION_RVA + 0x10);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // Ending right after the field makes the directory readable, but the
+    // callback array it points to now starts past the cut.
+    let mut d = image();
+    with_virtual_size(
+        &mut d,
+        TLS_DIRECTORY - SECTION_RVA + layout::TLS64_ADDRESS_OF_CALLBACKS as u32 + 8,
+    );
+    let err = ImageInfo::parse(&d).unwrap_err().to_string();
+    assert!(err.contains("callback array"), "{err}");
+
+    // With no callback array, that directory is enough on its own.
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        0,
+    );
+    let tls = ImageInfo::parse(&d).unwrap().tls.unwrap();
+    assert_eq!(tls.directory_rva, TLS_DIRECTORY);
+    assert!(tls.callback_rvas.is_empty());
+}
+
+#[test]
+fn an_export_name_pointer_table_at_rva_zero_leaves_every_export_unnamed() {
+    // A name count with no name pointer table: the names are dropped, but
+    // the address table still gives every export, by ordinal.
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(EXPORT_DIRECTORY) + 32, 0);
+    let exports: Vec<_> = ImageInfo::parse(&d)
+        .unwrap()
+        .exports
+        .into_iter()
+        .map(|e| (e.name, e.ordinal, e.rva, e.forward))
+        .collect();
+    assert_eq!(
+        exports,
+        [
+            (None, 1, Some(ENTRY), None),
+            (None, 2, None, Some("NTDLL.RtlFoo".to_owned())),
+            (None, 3, None, Some("NTDLL.#7".to_owned())),
+        ]
+    );
+}
+
+#[test]
+fn an_export_name_ordinal_table_at_rva_zero_is_malformed_even_without_names() {
+    // Unlike the name pointer table, the name ordinal table is required:
+    // its absence makes the image malformed whatever the name count.
+    for names in [3, 0] {
+        let mut d = image();
+        add_exports(&mut d);
+        put32(&mut d, at(EXPORT_DIRECTORY) + 24, names);
+        put32(&mut d, at(EXPORT_DIRECTORY) + 36, 0);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "{names} names"
+        );
+    }
+}
