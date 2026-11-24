@@ -106,10 +106,17 @@ V punpckhwd(const V& a, const V& b) { V r{}; for (int i = 0; i < 4; ++i) { set_w
 std::uint8_t sat_u8(std::int16_t w) { return w < 0 ? 0 : w > 255 ? 255 : static_cast<std::uint8_t>(w); }
 V packuswb(const V& a, const V& b) { V r; for (int i = 0; i < 8; ++i) { r.b[i] = sat_u8(word(a, i)); r.b[8+i] = sat_u8(word(b, i)); } return r; }
 
-// Immediate shifts: a count above 15 fills arithmetic shifts with the sign and clears logical ones.
+// Shifts: a count above 15 fills arithmetic shifts with the sign and clears logical ones.
 V psraw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, word(a, i) >> (n > 15 ? 15 : n)); return r; }
 V psllw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, n > 15 ? 0 : uword(a, i) << n); return r; }
 V psrlw(const V& a, unsigned n) { V r{}; for (int i = 0; i < 8; ++i) set_word(r, i, n > 15 ? 0 : uword(a, i) >> n); return r; }
+// The count of the XMM or 16-byte memory form is the low 64 bits of the operand as one unsigned
+// integer; the upper quadword is ignored. Any count above 15, however large, saturates to 16, so
+// no bit of the quadword is lost to a narrower type.
+unsigned shift_count(const V& c) {
+    std::uint64_t q; std::memcpy(&q, c.b, 8);
+    return q > 15 ? 16u : static_cast<unsigned>(q);
+}
 }  // namespace
 """
 
@@ -189,6 +196,10 @@ def lift(start, code):
         elif op in SHIFTS and instruction.op_count == 3 and instruction.op2_kind == K.IMMEDIATE8:
             lines.append(f"{destination(instruction, rva)} = {SHIFTS[op]}("
                          f"{operand(instruction, 1, rva)}, {instruction.immediate8}u);")
+        elif op in SHIFTS and instruction.op_count == 3 and instruction.op2_kind in (K.REGISTER, K.MEMORY):
+            # The count is an XMM register or a 16-byte memory operand, read as one 16-byte value.
+            lines.append(f"{destination(instruction, rva)} = {SHIFTS[op]}("
+                         f"{operand(instruction, 1, rva)}, shift_count({operand(instruction, 2, rva)}));")
         else:
             raise ValueError(f"unsupported instruction {instruction} at RVA {rva:#x}")
         if op in MOVES or op in BINARY or op in SHIFTS:

@@ -2,10 +2,14 @@
 #include "quad_frames.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <fcntl.h>
+#include <io.h>
 #include <cstdint>
+#include <vector>
 
 using Word = std::uint64_t;
 extern "C" __declspec(dllimport) HRESULT WINAPI DStorageGetFactory(const GUID*, void**);
@@ -18,11 +22,18 @@ Result invoke(Ptr self, Args... args)
 {
     return reinterpret_cast<Result(WINAPI*)(Ptr, Args...)>(self->slots[slot])(self, args...);
 }
-struct Inputs { Word first, second, end, first_bias; };
+struct Inputs { const Word* words; Word bytes, file_size; unsigned first, second; Word bias; };
+alignas(8) std::array<Word, 8192> prefix;
+const wchar_t* archive_name;
 Inputs inputs{};
 Ptr file = nullptr, queue = nullptr, status = nullptr;
 constexpr unsigned page = 4096;
-std::array<unsigned char, 2 * page> blocks;
+constexpr unsigned guard = 32;
+struct Destination {
+    unsigned page_offset = 0;
+    std::vector<unsigned char> guarded;
+};
+std::array<Destination, 2> destinations;
 unsigned count = 0;
 FILE* trace = nullptr;
 
@@ -30,51 +41,75 @@ class CloseBatch {
 public:
     ~CloseBatch() {
         if (file) invoke<3, void>(file);
-        for (Ptr object : {file, status, queue})
-            if (object) invoke<2, unsigned>(object);
-        if (trace) std::fclose(trace);
+        const unsigned file_refs = file ? invoke<2, unsigned>(file) : 0;
+        const unsigned status_refs = status ? invoke<2, unsigned>(status) : 0;
+        const unsigned queue_refs = queue ? invoke<2, unsigned>(queue) : 0;
+        if (trace) {
+            std::fprintf(trace, "storage release %u %u %u\n", file_refs, status_refs, queue_refs);
+            std::fclose(trace);
+        }
     }
 };
 }
 
 extern "C" __declspec(dllexport) const Inputs* directory_input()
 {
-    // Read the first three compressed boundary words verbatim, after the raw metadata boundary.
-    std::ifstream input("fixture.ttpf", std::ios::binary);
-    char tag[4]{};
-    unsigned boundaries = 0;
-    if (!input.read(tag, 4) || std::memcmp(tag, "RDS5", 4) ||
-        !input.read(reinterpret_cast<char*>(&boundaries), sizeof(boundaries)) || boundaries < 4) return nullptr;
-    input.seekg(24);
-    if (!input.read(reinterpret_cast<char*>(&inputs), 3 * sizeof(Word)) ||
-        std::fread(&inputs.first_bias, sizeof(Word), 1, stdin) != 1) return nullptr;
+    // A fixed-size byte window limits the input to the EXE. Only the EXE interprets its directory.
+    if (_setmode(_fileno(stdin), _O_BINARY) == -1) return nullptr;
+    unsigned selector = 0;
+    if (std::fread(&inputs.first, sizeof(inputs.first), 1, stdin) != 1 ||
+        std::fread(&inputs.second, sizeof(inputs.second), 1, stdin) != 1 ||
+        std::fread(&inputs.bias, sizeof(inputs.bias), 1, stdin) != 1 ||
+        std::fread(&selector, sizeof(selector), 1, stdin) != 1 || selector > 1) return nullptr;
+    archive_name = selector ? L"../alternate.ttpf" : L"../fixture.ttpf";
+    std::ifstream input(archive_name, std::ios::binary | std::ios::ate);
+    if (!input || input.tellg() < 0) return nullptr;
+    inputs.file_size = static_cast<Word>(input.tellg());
+    input.seekg(0);
+    inputs.words = prefix.data();
+    inputs.bytes = (std::min)(inputs.file_size, static_cast<Word>(sizeof(prefix)));
+    if (!input.read(reinterpret_cast<char*>(prefix.data()), inputs.bytes)) return nullptr;
+    return &inputs;
+}
+
+bool begin_batch()
+{
     void* result = nullptr;
-    if (FAILED(DStorageGetFactory(nullptr, &result)) || !result) return nullptr;
+    if (FAILED(DStorageGetFactory(nullptr, &result)) || !result) return false;
     auto factory = static_cast<Ptr>(result);
     const GUID* iid = nullptr;
-    const HRESULT file_result = invoke<4, HRESULT>(factory, L"fixture.ttpf", iid, &file);
+    const HRESULT file_result = invoke<4, HRESULT>(factory, archive_name, iid, &file);
     const HRESULT queue_result = invoke<10, HRESULT>(factory, static_cast<const void*>(nullptr), iid, &queue);
     const HRESULT status_result = invoke<5, HRESULT>(factory, 2u, "BC pages", iid, &status);
     invoke<2, unsigned>(factory);
     trace = std::fopen("ranges.txt", "w");
-    if (FAILED(file_result) || FAILED(queue_result) || FAILED(status_result) || !trace) {
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (FAILED(file_result) || FAILED(queue_result) || FAILED(status_result) || !trace ||
+        FAILED((invoke<4, HRESULT>(file, &identity)))) {
         CloseBatch cleanup;
-        return nullptr;
+        return false;
     }
-    blocks.fill(0xa5);
-    return &inputs;
+    const Word id = (Word{identity.nFileIndexHigh} << 32) | identity.nFileIndexLow;
+    std::fprintf(trace, "file %016llx\n", id);
+    return true;
 }
 
-extern "C" __declspec(dllexport) unsigned enqueue_page(Word offset, unsigned size)
+extern "C" __declspec(dllexport) unsigned enqueue_page(unsigned index, Word offset, unsigned size, Word destination)
 {
-    if (count >= 2 || !size) return 0;
+    const unsigned capacity = static_cast<unsigned>(destination >> 32);
+    const unsigned page_offset = static_cast<unsigned>(destination);
+    if (count >= 2 || !size || (capacity != page && capacity != 16 * page) ||
+        page_offset % page || page_offset > capacity - page || (!count && !begin_batch())) return 0;
+    auto& output = destinations[count];
+    output.page_offset = page_offset;
+    output.guarded.assign(guard + capacity + guard, 0xa5);
     alignas(8) unsigned char record[0x48]{};
-    const Word fields[]{1, reinterpret_cast<Word>(blocks.data() + page * count), 0, page,
+    const Word fields[]{1, reinterpret_cast<Word>(output.guarded.data() + guard), 0, capacity,
                         reinterpret_cast<Word>(file), offset, size};
     std::memcpy(record, fields, sizeof(fields));
     invoke<3, void>(queue, record);
     invoke<4, void>(queue, status, count++);
-    std::fprintf(trace, "request %llu %u\n", static_cast<unsigned long long>(offset), size);
+    std::fprintf(trace, "request %u %llu %u %u %u\n", index, static_cast<unsigned long long>(offset), size, capacity, page_offset);
     return size;
 }
 
@@ -93,6 +128,13 @@ extern "C" __declspec(dllexport) unsigned draw_pages()
         const auto hr = invoke<4, HRESULT>(status, i);
         std::fprintf(trace, "status %08lx\n", static_cast<unsigned long>(hr));
         failed |= FAILED(hr);
+    }
+    std::array<unsigned char, 2 * page> blocks;
+    std::ofstream complete("destinations.bin", std::ios::binary);
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& out = destinations[i];
+        if (!complete.write(reinterpret_cast<const char*>(out.guarded.data()), out.guarded.size())) return 5;
+        std::memcpy(blocks.data() + page * i, out.guarded.data() + guard + out.page_offset, page);
     }
     std::ofstream pages("pages.bin", std::ios::binary);
     if (!pages.write(reinterpret_cast<const char*>(blocks.data()), blocks.size())) return 5;

@@ -1,10 +1,11 @@
 """Compare native and translated FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX, FCLEX and the 8087/287 controls
-FENI, FNENI, FDISI, FNDISI and FSETPM in the x87 profile.
+FENI, FNENI, FDISI, FNDISI and FSETPM, and FFREEP ST(0), in the x87 profile.
 
 Each export runs through the native harness (control word 0x027F, empty stack) and writes C0, C2 and C3
 after each status-word writer, and any stored m80 value, to its output block. An independent model gives
 the expected block: comparisons use exact rationals, and FXAM classifies the 80-bit encoding (unsupported,
-NaN, normal, infinity, zero, empty, denormal). Four mutated translations must each mismatch, and
+NaN, normal, infinity, zero, empty, denormal); FFREEP ST(0) gives the physical TOP after each pop and leaves the
+values below it unchanged. Six mutated translations must each mismatch, and
 translation must reject the sequences in check_rejections.
 """
 from fractions import Fraction
@@ -16,7 +17,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import x87_add as base  # noqa: E402  (tests/cpu is the script directory)
 
-EXPORTS = ("ftst_fxam", "ficom_m16", "ficom_m32", "fnop_fclex", "legacy_controls")
+EXPORTS = ("ftst_fxam", "ficom_m16", "ficom_m32", "fnop_fclex", "legacy_controls", "ffreep_top")
 INPUT, OUTPUT = base.INPUT, base.OUTPUT
 J = 1 << 63
 # Mutations of the lifted source that the check requires to mismatch: (pattern, replacement).
@@ -27,6 +28,10 @@ CONTROLS = {
                  "x87_compare(x87_slot[0], X87Value{0x8000000000000000ull, 0x3fff})"),
     # A legacy control that changed ST(0) instead of acting as FNOP.
     "legacy": (re.compile(re.escape(";  // fnsetpm")), "x87_slot[0].se ^= 0x8000;  // fnsetpm"),
+    # FFREEP that also overwrote the deepest register (slot 0, the input at depth 3 and 2) with the next one.
+    "ffreep": (re.compile(re.escape(";  // ffreep st(0)")), "x87_slot[0] = x87_slot[1];  // ffreep st(0)"),
+    # A TOP that FFREEP did not move: the status word after the first FFREEP keeps TOP 5.
+    "fftop": (re.compile(re.escape("x87_sw | 0x3000);  // fnstsw ax, top 6")), "x87_sw | 0x2800);  // fnstsw ax, top 6"),
 }
 
 
@@ -101,6 +106,10 @@ def reference(name, data):
     elif name in ("ficom_m16", "ficom_m32"):
         bits = compare(sig, se, Fraction(m16 if name == "ficom_m16" else m32))
         out[0:3] = out[3:6] = bytes(bits)
+    elif name == "ffreep_top":  # TOP 5 at depth 3, then 6, 7 and 0 after each FFREEP ST(0)
+        out[0:4] = bytes((5 << 3, 6 << 3, 7 << 3, 0))
+        out[16:26] = struct.pack("<QH", J, 0x3FFF)
+        out[32:42] = data[0:10]
     else:
         out[16:26] = data[0:10]
     return bytes(out)
@@ -128,7 +137,7 @@ INTEGERS32 = (*INTEGERS, 2147483647, -2147483648, 1 << 30)
 def cases():
     for sig, se in values():
         m80 = struct.pack("<QH", sig, se)
-        for name in ("ftst_fxam", "fnop_fclex", "legacy_controls"):
+        for name in ("ftst_fxam", "fnop_fclex", "legacy_controls", "ffreep_top"):
             yield name, (m80 + b"\0" * 6 + struct.pack("<h", 7) + b"\0" * 6 + struct.pack("<i", 9)).ljust(INPUT, b"\0")
         for n in INTEGERS:
             yield "ficom_m16", (m80 + b"\0" * 6 + struct.pack("<h", n)).ljust(INPUT, b"\0")
@@ -137,7 +146,8 @@ def cases():
 
 
 def check_rejections():
-    """Translation must reject an underflowing FTST or FICOMP and a reader of C0 after FNOP, FNCLEX, FNENI or FNSETPM."""
+    """Translation must reject an underflowing FTST, FICOMP or FFREEP, a reader of C0 after FNOP, FNCLEX, FNENI,
+    FNSETPM or FFREEP, and FFREE, FFREEP ST(i) for i > 0, FINCSTP and FDECSTP."""
     from iced_x86 import Decoder
     from ffx_version_query import lower
 
@@ -153,6 +163,16 @@ def check_rejections():
         "fnclex then a reader of C0": (sequence("dbe2"), "not known"),
         "fneni then a reader of C0": (sequence("dbe0"), "not known"),
         "fnsetpm then a reader of C0": (sequence("dbe4"), "not known"),
+        "ffreep on an empty stack": ("dfc0c3", "underflow"),
+        # fld1; fld1; ffreep st(0); then the reader of C0 of sequence()
+        "ffreep then a reader of C0": ("d9e8" + sequence("dfc0"), "not known"),
+        # fld1; fld1; ffreep st(0); fnstsw ax; test ah, 2 (C1); jne +0; fstp st(0); mov eax, 0; ret
+        "ffreep then a reader of C1": ("d9e8d9e8dfc0dfe0f6c4027500ddd8b800000000c3", "not known"),
+        "ffreep st(2)": ("d9e8d9e8d9e8dfc2ddd8ddd8c3", "unsupported x87 operand"),
+        "ffree st(0)": ("d9e8ddc0ddd8c3", "unsupported x87 operation"),
+        "ffree st(1)": ("d9e8d9e8ddc1ddd8ddd8c3", "unsupported x87 operation"),
+        "fincstp": ("d9e8d9f7ddd8c3", "unsupported x87 operation"),
+        "fdecstp": ("d9e8d9f6ddd8c3", "unsupported x87 operation"),
     }
     for label, code in accepted.items():
         lower(list(Decoder(64, bytes.fromhex(code))), [], {}, {}, {}, x87=True)

@@ -168,7 +168,8 @@ int open_stream_target(ID3D12Device* desktop, void* guest, void* pso, UINT width
 {
     const bool integer = format == DXGI_FORMAT_R32_UINT || format == DXGI_FORMAT_R32_SINT;
     const bool narrow = format == DXGI_FORMAT_A8_UNORM || format == DXGI_FORMAT_R8_UNORM;
-    const UINT count = state.count = integer ? 2 : 1;
+    // A caller that wants a second RGBA8 target sets state.count to 2 before the call.
+    const UINT count = state.count = integer || state.count == 2 ? 2 : 1;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
     // The wrapped heap gives the stand-in a descriptor shadow for the typed RTV.
     const struct {

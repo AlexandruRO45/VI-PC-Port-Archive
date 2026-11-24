@@ -23,6 +23,7 @@
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
+void check_spirv_window_float(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_qword_narrow(ID3D12Device* device, const char* shader_path);
 void check_sampler_index_control(ID3D12Device* device,
@@ -556,6 +557,12 @@ OperationResult run_spirv_address_window_atomic(const OperationContext& ctx)
 OperationResult run_spirv_address_window_signed(const OperationContext& ctx)
 {
     check_spirv_window_signed(ctx.device, ctx.argv[3]);
+    return {OutcomeKind::pass, nullptr};
+}
+
+OperationResult run_spirv_address_window_float(const OperationContext& ctx)
+{
+    check_spirv_window_float(ctx.device, ctx.argv[3]);
     return {OutcomeKind::pass, nullptr};
 }
 
@@ -1191,6 +1198,7 @@ const OperationSpec kOperations[] = {
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
+    {"--spirv-address-window-float", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_float},
     {"--spirv-address-window-qword", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword},
     {"--spirv-address-window-qword-narrow", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_qword_narrow},
     {"--spirv-compare-sampler", 6, 7, nullptr, kGateSm60CompareSampler, run_spirv_compare_sampler},

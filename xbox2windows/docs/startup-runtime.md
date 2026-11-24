@@ -150,6 +150,63 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 
+## Game saves
+
+With `X2W_FAKE_USER=1`, the game-save stand-in keeps containers and blobs below
+`X2W_STORAGE_PATH`, in `x2w-gamesave`: one directory per container, one file per blob
+([#1200](https://github.com/R0Y00/Xbox2Windows/issues/1200)). Opening a container whose directory
+exists succeeds. Names must be one plain path component of at most 128 bytes (no separators, `:`,
+`..`, control characters, device names or the reserved suffixes `.x2w-part` and `.x2w-old`, in any
+case) and a blob is at most 64 MiB. The storage root itself is trusted; a container directory or blob
+that is a symbolic link or, on Windows, a junction is refused by every operation.
+
+Blob writes and deletes are kept with the update and reach the disk only when the update is
+submitted (the public API makes the whole update atomic at submit). An update closed without a
+submit changes nothing. At submit every write goes to a staging file and every delete is checked
+first; then each old file is moved aside, the new one put in place and, on any failure, everything
+is put back, so a failing action publishes none of the update. This holds for failures inside this
+process.
+
+Readers and publication share one cross-process lock per container, a file named
+`<container>.x2w-lock` beside the container directory (the suffix is reserved like the other two).
+The replacement of the blobs of a submit, a blob or container delete, and every read take it
+(`LockFileEx` on Windows, `flock` elsewhere, in `src/startup_stubs/file_lock.h`). Publication takes
+it exclusively and releases it only after the last blob is in place; `read_blobs` reads several
+blobs under one shared hold, so a reader in another process sees the whole previous generation or the
+whole new one, never a missing old blob or a mix. Staging files are written before the lock is taken,
+so readers wait only for the renames. The wait is bounded (5 seconds by default, a `Store`
+parameter): on timeout the operation returns `busy` and changes nothing, and a holder that dies is
+harmless because the system drops its lock when its handle closes. This was preferred over a
+manifest or generation directory published by one rename because it keeps the layout the earlier
+commits of this work already write (one directory per container, one file per blob). A reader that
+does not use this store (another program reading the files directly) is not covered.
+
+Separate limitation, crash recovery: if the writing process is killed in the middle of the
+replacement, the lock is released but nothing rolls the update back or completes it. The container
+can then hold some blobs of the new generation and some of the old one, with `.x2w-old` and
+`.x2w-part` files left behind, and the next reader sees that state. There is no recovery pass yet.
+
+The slot numbers and argument layouts follow the public header order and stay a hypothesis.
+Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
+write and delete staged in an update (25, 26) and published by submit (27, 28 with its result in 29).
+Not yet persisted, because their argument layout is not established: blob reads (20 to 22) still
+report no blob, and the enumerations and queries (12 to 15, 18, 19) still report nothing.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
+slots call, not the slots: it writes in one process and reads in a second, including a close without
+submit, a failing second action, a second process that sees only committed state, and a redirected
+container directory.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_publish_'` pauses a writer, in a second
+process, at each step of the publication of a two-blob update (an old blob moved aside, a new one in
+place) through a handshake of files. While it is paused another process must be refused with `busy`
+(never shown a mix or a missing blob) and one that waits must see the whole new generation. The
+existing failing-second-action control checks that the previous generation stays whole, and a lock
+holder that ends without unlocking checks the bounded wait and the recovery. The `_unlocked` test runs
+the same checks on a generated copy of the headers whose lock does nothing and must be caught (a reader
+sees a mixed or incomplete generation). The pause points and that copy exist only in the test build.
+
+Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
+
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_submit_'` checks denied starts and retries, two overlapping blocks and completion that reads the file and slot 29 before slot 28 returns. The system variant uses the installed Windows gaming runtime with an immediate work/completion queue. It reports a capability skip when the runtime or queue is unavailable.
 
 ## Findings
 
@@ -179,6 +236,13 @@ These are measured on one executable; treat them as hypotheses for others.
   (a chunked read whose length ends inside a compressed chunk); its cause is open.
 - **Struct-returning methods.** When both register arguments of a wrapped method look like objects,
   the one on the calling thread's stack is the return buffer.
+- **Queue Wait.** Slots 18 (`GetTimestampFrequency`) and 32 (present) put the console queue's
+  Signal and Wait two slots after the desktop's, at 16 and 17. Slot 17 with a fence becomes a desktop
+  `ID3D12CommandQueue::Wait`. After one, Signals on that queue complete when the GPU reaches them,
+  so a fence never completes before the wait ends. Other queue slots that are given a fence are
+  still treated as Signals. The slot numbers are inferred from that layout; no title call to slot
+  17 has been logged yet. Run
+  `ctest --preset dev --no-tests=error -R "^startup_queue_wait_"`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
@@ -262,13 +326,25 @@ These are measured on one executable; treat them as hypotheses for others.
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
   unsupported by this path.
-- Translating the captured console colour-blend register state blocks remains open (#1216).
+- Colour-blend registers reach the draw path for pipelines created through device slot 57 only
+  (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
+  `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
+  state. `CB_TARGET_MASK` is not located, so all four channels are written; no fixture covers a
+  write mask on this path. A word the decoder refuses for any of the eight targets leaves the
+  registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
+  is drawn unblended in place of a refused word
+  (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
+  `tests/startup_slot57_blend_draw_check.py` draws through a source-built slot 57 pipeline: red
+  with alpha 0.5 over opaque blue reads (128, 0, 128, 191) within one step with SRC_ALPHA /
+  INV_SRC_ALPHA in target 0's word and (255, 0, 0, 128) with ENABLE clear or with the word four
+  bytes before or after +0xD0. With two targets bound each follows its own word, and a refused
+  word for the second leaves both unblended
+  (`ctest --preset release --no-tests=error -R "^startup_slot57_blend_draw_" -V`).
   A graphics stream can supply a desktop `D3D12_BLEND_DESC` directly. `src/startup_stubs/cb_blend.h`
   decodes `CB_BLENDn_CONTROL` and a `CB_TARGET_MASK` nibble into `D3D12_RENDER_TARGET_BLEND_DESC`. It
   refuses forms D3D12 can't express (`BOTH_SRC_ALPHA`, constant alpha without alpha blend factor
   support, MIN/MAX with factors other than ONE). Its draws match a CPU model of the register fields
-  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`). Where those registers sit in the
-  state block is not measured yet, so the draw path doesn't call it.
+  (`ctest --preset release --no-tests=error -R "^startup_cb_blend"`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
@@ -345,6 +421,49 @@ The `startup_heartbeat_commit` check starts the heartbeat before loading the pag
 maps two synthetic sections and compares the reported values with `GetProcessMemoryInfo` in the
 same process. It releases a separate commit allocation to check that a current-only change
 produces another report.
+
+## Allocation sizes for depth with stencil and multisampled textures
+
+A console executable reserves memory of its own for every placed texture, sized by the device's
+allocation-info answer. The stand-in forwarded the desktop answer. For two families that answer
+is larger than the console's: depth with stencil (the R32G8X24 family takes 8 bytes a texel on the
+desktop adapters measured, where the console keeps a 4-byte depth plane and a 1-byte stencil
+plane) and multisampled textures (4 MiB placement alignment on desktop, 64 KiB on the console).
+
+For a single description of one of those families the stand-in now answers the console size
+(`src/startup_stubs/console_plane_size.h`): each plane padded to whole 64 KiB tiles, where a tile
+holds 64 KiB of samples (128 x 128 texels at 4 bytes, 256 x 128 at 2, 256 x 256 at 1, 64 x 64 at
+4 bytes with four samples). The first eight uses are logged as `x2w-d3d12 allocation info:
+console size ...`. The desktop texture behind the description is unchanged; only the amount of
+memory the executable sets aside for it changes.
+
+Measured on one console executable under the startup debugger, with an NVIDIA adapter through
+vkd3d-proton: the executable commits one fixed block at start-up and takes its texture memory
+from it. With desktop sizes the block was exhausted after 352 texture allocations, the next
+allocation returned null, and the run stopped on a null object about 18 s in. Over the 1,561
+distinct descriptions queried up to that point the desktop answers were 154 MiB larger in total
+than the sizes above. With this change the same run passes that point. Whether native Windows
+drivers return the same larger sizes is not measured here; an adapter that already answers 5
+bytes a texel for the R32G8X24 family is left alone, because the console size is then not smaller.
+
+The tile rule reproduces the nine reference sizes that `tests/startup_plane_size_check.cpp`
+lists first. Those are console allocation sizes for descriptions the executable queries, taken
+from the log of an independent implementation of the same device interface; no code was taken
+from it.
+
+The rule covers a 2D texture with exactly one mip, dimensions within the D3D12 limits, 1, 2, 4 or
+8 samples at quality 0, the default layout and the default or 64 KiB alignment. Any other
+description keeps the desktop answer. A desktop failure is kept for desktop formats; only the
+console-only formats 118-120, which desktop cannot answer, are answered over it.
+
+- `ctest --preset release --no-tests=error -R '^startup_plane_size(_packed_control)?$' -V` checks
+  the rule without a device, including the shapes it refuses.
+- `ctest --preset release --no-tests=error -R '^startup_plane_size_device_' -V` goes through the
+  wrapper: slots 25 and 108 must both give the helper's result for this adapter's own desktop
+  answer, a placed texture (slot 133) is created over memory of the answered size and alignment,
+  and descriptions outside the rule must come back unchanged. The placed texture is a committed
+  desktop texture that does not alias the address, so this shows the answered size is accepted by
+  the creation path, not that the console layout fits in it.
 
 ## Physical pages in shared sections
 

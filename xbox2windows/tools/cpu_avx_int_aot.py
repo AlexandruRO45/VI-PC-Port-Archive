@@ -81,6 +81,7 @@ WIDE_BINARY_HELPERS = {
         "vpcmpgtb", "vpcmpgtw", "vpcmpgtd", "vpcmpgtq",
         "vpmaxsb", "vpmaxsw", "vpmaxsd", "vpmaxub", "vpmaxuw", "vpmaxud",
         "vpminsb", "vpminsw", "vpminsd", "vpminub", "vpminuw", "vpminud",
+        "vpsignb", "vpsignw", "vpsignd",
     )
 }
 WIDE_BINARY_CODES = {
@@ -92,7 +93,22 @@ WIDE_BINARY_CODES = {
         "VPCMPGTB", "VPCMPGTW", "VPCMPGTD", "VPCMPGTQ",
         "VPMAXSB", "VPMAXSW", "VPMAXSD", "VPMAXUB", "VPMAXUW", "VPMAXUD",
         "VPMINSB", "VPMINSW", "VPMINSD", "VPMINUB", "VPMINUW", "VPMINUD",
+        "VPSIGNB", "VPSIGNW", "VPSIGND",
     )
+}
+# 256-bit one-source forms: the 128-bit helper runs on each half. vpshufhw/vpshuflw use the
+# same imm8 for both halves.
+WIDE_UNARY_HELPERS = {
+    getattr(M, name.upper()): f"op_{name}" for name in ("vpabsb", "vpabsw", "vpabsd")
+}
+WIDE_UNARY_IMM_HELPERS = {
+    getattr(M, name.upper()): f"op_{name}" for name in ("vpshufhw", "vpshuflw")
+}
+WIDE_UNARY_CODES = {
+    getattr(Code, f"VEX_{name}_YMM_YMMM256") for name in ("VPABSB", "VPABSW", "VPABSD")
+}
+WIDE_UNARY_IMM_CODES = {
+    getattr(Code, f"VEX_{name}_YMM_YMMM256_IMM8") for name in ("VPSHUFHW", "VPSHUFLW")
 }
 
 # Unary: dst = helper(src)
@@ -345,7 +361,7 @@ ALLOWED_CODES = {
 }
 
 
-ALLOWED_CODES |= WIDE_BINARY_CODES
+ALLOWED_CODES |= WIDE_BINARY_CODES | WIDE_UNARY_CODES | WIDE_UNARY_IMM_CODES
 
 
 PRELUDE = """#include <cstdint>
@@ -714,6 +730,21 @@ using Op128 = Vec256 (*)(const Vec256&, const Vec256&);
 static Vec256 wide128(Op128 op, const Vec256& a, const Vec256& b) {
     const Vec256 lo = op({{a.q[0], a.q[1], 0ull, 0ull}}, {{b.q[0], b.q[1], 0ull, 0ull}});
     const Vec256 hi = op({{a.q[2], a.q[3], 0ull, 0ull}}, {{b.q[2], b.q[3], 0ull, 0ull}});
+    return {{lo.q[0], lo.q[1], hi.q[0], hi.q[1]}};
+}
+
+using Op128Unary = Vec256 (*)(const Vec256&);
+using Op128UnaryImm = Vec256 (*)(const Vec256&, std::uint8_t);
+
+static Vec256 wide128_unary(Op128Unary op, const Vec256& a) {
+    const Vec256 lo = op({{a.q[0], a.q[1], 0ull, 0ull}});
+    const Vec256 hi = op({{a.q[2], a.q[3], 0ull, 0ull}});
+    return {{lo.q[0], lo.q[1], hi.q[0], hi.q[1]}};
+}
+
+static Vec256 wide128_unary_imm(Op128UnaryImm op, const Vec256& a, std::uint8_t imm8) {
+    const Vec256 lo = op({{a.q[0], a.q[1], 0ull, 0ull}}, imm8);
+    const Vec256 hi = op({{a.q[2], a.q[3], 0ull, 0ull}}, imm8);
     return {{lo.q[0], lo.q[1], hi.q[0], hi.q[1]}};
 }
 
@@ -1304,11 +1335,14 @@ def lift_code(name, start, raw):
                 or ins.zeroing_masking or ins.is_broadcast):
             raise ValueError(f"unsupported EVEX instruction at RVA {ins.ip:#x}: {ins}")
         mnemonic = ins.mnemonic
+        wide_unary = ins.code in WIDE_UNARY_CODES
+        wide_unary_imm = ins.code in WIDE_UNARY_IMM_CODES
         wide_binary = ins.code in WIDE_BINARY_CODES
-        if (mnemonic in AVX_INT_128_ONLY_MNEMONICS and not wide_binary
+        wide_any = wide_unary or wide_unary_imm or wide_binary
+        if (mnemonic in AVX_INT_128_ONLY_MNEMONICS and not wide_any
                 and op_code.encoding == EncodingKind.VEX and op_code.l == 1):
             raise ValueError(f"unsupported VEX.256 (L=1) packed-integer encoding at RVA {ins.ip:#x}: {ins}")
-        if (mnemonic in REGISTER_ONLY_AVX_INT or wide_binary) and any(
+        if (mnemonic in REGISTER_ONLY_AVX_INT or wide_any) and any(
                 ins.op_kind(i) == OpKind.MEMORY for i in range(ins.op_count)):
             raise ValueError(
                 f"unsupported memory operand for register-domain AVX integer instruction at RVA {ins.ip:#x}: {ins}")
@@ -1358,6 +1392,18 @@ def lift_code(name, start, raw):
                     statements.append(f"store32({addr}, static_cast<std::uint32_t>({src_gpr}));")
             else:
                 raise ValueError(f"unsupported mov operands at RVA {ins.ip:#x}: {ins}")
+        elif wide_unary:
+            src, _ = read_vec(1, ins, allow_ymm=True)
+            dst_idx, dst, _ = write_vec(0, ins, allow_ymm=True)
+            statements.append(f"{dst} = wide128_unary({WIDE_UNARY_HELPERS[mnemonic]}, {src});")
+            defined_vec.add(dst_idx)
+        elif wide_unary_imm:
+            src, _ = read_vec(1, ins, allow_ymm=True)
+            dst_idx, dst, _ = write_vec(0, ins, allow_ymm=True)
+            imm = ins.immediate8 & 0xff
+            statements.append(
+                f"{dst} = wide128_unary_imm({WIDE_UNARY_IMM_HELPERS[mnemonic]}, {src}, {imm:#x}u);")
+            defined_vec.add(dst_idx)
         elif mnemonic in UNARY_HELPERS:
             src, _ = read_vec(1, ins)
             dst_idx, dst, _ = write_vec(0, ins)

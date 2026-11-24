@@ -1,7 +1,7 @@
 ; coverage: source cpu_aot_x87_examine
 ; Source-owned differential fixture for FTST, FXAM, FICOM, FICOMP, FNOP, FNCLEX and FCLEX, and the
 ; 8087/287 controls FENI, FNENI, FDISI, FNDISI and FSETPM (ML64 has no FNSETPM spelling and assembles
-; FSETPM without a WAIT), in the x87 leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
+; FSETPM without a WAIT), and FFREEP ST(0), in the x87 leaf-function profile. Each export reads an input block at RCX (an m80 value at +0, an m16 integer at
 ; +16 and an m32 integer at +24), records C0, C2 and C3 after each status-word writer as bytes of the
 ; output block at RDX, and returns with the x87 stack empty.
 .code
@@ -172,5 +172,36 @@ legacy_controls PROC FRAME
     mov eax, 0
     ret
 legacy_controls ENDP
+
+; FFREEP ST(0) pops without storing: physical TOP after each FFREEP (FNSTSW AX, AH masked to TOP) and the
+; values left below it must match. Output: TOP bytes (TOP << 3) at +0 (before), +1, +2 and +3 (after each
+; FFREEP, the last at depth 1 down to an empty stack), 1.0 at +16 and the input m80 at +32.
+ffreep_top PROC FRAME
+    .endprolog
+    fld tbyte ptr [rcx]
+    fld1
+    fldz
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+0], ah
+    ffreep st(0)
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+1], ah
+    fstp tbyte ptr [rdx+16]
+    fld1
+    ffreep st(0)
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+2], ah
+    fstp tbyte ptr [rdx+32]
+    fldz
+    ffreep st(0)
+    fnstsw ax
+    and ah, 38h
+    mov byte ptr [rdx+3], ah
+    mov eax, 0
+    ret
+ffreep_top ENDP
 
 END

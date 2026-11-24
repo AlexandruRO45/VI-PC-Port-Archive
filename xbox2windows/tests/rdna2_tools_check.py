@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -4849,6 +4850,101 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertEqual(summary["total_shaders_scanned"], 2)
             self.assertEqual(summary["translator_accepted"], 1)
             self.assertEqual(summary["opcodes_recognized_translator_rejected"], 1)
+
+    def test_unbound_operand_counted_separately(self):
+        """Issue #1314: a read of an entry register the scan does not bind is counted apart from real rejections.
+
+        The record keeps its verdict, opcode columns and lower_error text; the cause and the register are added.
+        """
+        bound_sample = [
+            "s_mov_b64 s[50:51], exec",
+            "s_wqm_b64 exec, exec",
+            "s_mov_b32 m0, s24",
+            "v_interp_p1_f32_e32 v8, v0, attr0.x",
+            "v_interp_p1_f32_e32 v9, v0, attr0.y",
+            "v_interp_p2_f32_e32 v9, v1, attr0.y",
+            "v_interp_p2_f32_e32 v8, v1, attr0.x",
+            "s_and_b64 exec, exec, s[50:51]",
+            "s_mov_b32 s21, 0",
+            "s_load_dwordx8 s[28:35], s[20:21], null",
+            "s_mov_b32 s40, 1",
+            "s_mov_b32 s41, 2",
+            "s_mov_b32 s42, 3",
+            "s_mov_b32 s43, 4",
+            "s_waitcnt lgkmcnt(0)",
+            "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+            "s_waitcnt vmcnt(0)",
+            "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+            "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+            "exp mrt0 v16, v16, v17, v17 done compr vm",
+            "s_endpgm",
+        ]
+        unbound_sgpr = ["s_mov_b32 m0, s9" if line == "s_mov_b32 m0, s24" else line for line in bound_sample]
+        unbound_vgpr = ["v_mov_b32_e32 v2, v3", *bound_sample]
+        unknown_opcode = [bound_sample[0], "v_imaginary_op_xyz v2, v0", *bound_sample[1:]]
+        results = [
+            analyze_shader_instructions("bound_ps", bound_sample),
+            analyze_shader_instructions("unbound_sgpr_ps", unbound_sgpr),
+            analyze_shader_instructions("unbound_vgpr_ps", unbound_vgpr),
+            analyze_shader_instructions("unknown_opcode_ps", unknown_opcode),
+        ]
+        bound, sgpr, vgpr, unknown = results
+
+        self.assertTrue(bound["translator_accepted"])
+        self.assertEqual(bound["compatibility_category"], "accepted")
+        self.assertIsNone(bound.get("lower_error_kind"))
+        self.assertIsNone(bound.get("lower_unbound"))
+
+        # Unbound operands: still recognized opcodes rejected by the translator, with the reason kept.
+        for record, bank, register, index, line in (
+                (sgpr, "scalar", "s9", 2, "s_mov_b32 m0, s9"),
+                (vgpr, "vector", "v3", 0, "v_mov_b32_e32 v2, v3")):
+            self.assertFalse(record["translator_accepted"])
+            self.assertEqual(record["compatibility_category"], "opcode_recognized_translator_rejected")
+            self.assertEqual(record["unsupported_opcodes"], {})
+            self.assertEqual(record["lower_status"], "rejected")
+            self.assertEqual(record.get("lower_error_kind"), "unbound_operand")
+            self.assertEqual(record.get("lower_error_type"), "UnboundOperand")
+            self.assertEqual(record["lower_error"], f"Unbound {bank} operand {register} at instruction {index}: {line}")
+            self.assertEqual(record.get("lower_unbound"), {"bank": bank, "register": register, "instruction_index": index,
+                                                       "byte_offset": None, "instruction": line})
+
+        # An unsupported opcode is an opcode-column result and a plain translator rejection, not a missing binding.
+        self.assertEqual(unknown["compatibility_category"], "unsupported_opcodes")
+        self.assertEqual(unknown["unsupported_opcodes"], {"v_imaginary_op_xyz": 1})
+        self.assertEqual(unknown.get("lower_error_kind"), "translator_rejection")
+        self.assertEqual(unknown.get("lower_error_type"), "ValueError")
+        self.assertEqual(unknown["lower_error"], "Unsupported instruction 1: v_imaginary_op_xyz v2, v0")
+        self.assertIsNone(unknown.get("lower_unbound"))
+
+        # A bare KeyError from the translator is a translator fault, never counted as an unbound operand.
+        import scan_unsupported_shaders
+        with mock.patch.object(scan_unsupported_shaders.pixel_aot, "lower", side_effect=KeyError("s9")):
+            fault = analyze_shader_instructions("fault_ps", bound_sample)
+        self.assertEqual((fault["lower_status"], fault["lower_error"]), ("rejected", "'s9'"))
+        self.assertEqual((fault.get("lower_error_kind"), fault.get("lower_error_type")), ("unexpected_error", "KeyError"))
+        self.assertIsNone(fault.get("lower_unbound"))
+        results.append(fault)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_file, md_file = generate_reports(results, Path(tmp))
+            summary = json.loads(json_file.read_text(encoding="utf-8"))["summary"]
+            self.assertEqual(summary["translator_accepted"], 1)
+            self.assertEqual(summary["opcodes_recognized_translator_rejected"], 3)
+            self.assertEqual(summary["unsupported_opcodes_count"], 1)
+            self.assertEqual(summary["translator_rejections_by_cause"],
+                             {"unbound_scalar_operand": 1, "unbound_vector_operand": 1,
+                              "translator_rejection": 1, "unexpected_error": 1})
+            self.assertEqual(summary["translator_bindings"],
+                             {"texture_sgpr": 20, "interp_sgpr": 24, "sampler": [1, 2, 3, 4],
+                              "constant_descriptor": None})
+            report = md_file.read_text(encoding="utf-8")
+            self.assertIn("  - Unbound scalar operand under the scanned inputs: 1\n", report)
+            self.assertIn("  - Unbound vector operand under the scanned inputs: 1\n", report)
+            self.assertIn("  - Other translator rejection: 1\n", report)
+            self.assertIn("  - Unexpected translator error: 1\n", report)
+            self.assertIn("Acceptance and rejection totals are conditional on the fixed entry bindings", report)
+            self.assertIn("- **Rejection Cause:** `Unbound scalar operand s9 at instruction 2: s_mov_b32 m0, s9`", report)
 
     def test_detect_shader_stage(self):
         """Verify pipeline stage detection from file names and relative paths."""

@@ -399,14 +399,16 @@ def check_shader_records():
                      | {("VOP3", f"{form}_e64") for form in all_compares})
     # Each name is counted once as VOPC and once as VOP3; the four sets must not share a name.
     assert len(compare_forms) == 2 * (len(narrow_int) + len(int64) + len(f16_compares) + len(f32_compares)), len(compare_forms)
-    # Issue #932 moved the VOPC e32 v_cmpx forms on binary32 and 32-bit integers (v_cmpx_lt_f32, v_cmpx_lt_i32)
-    # out of this set; the exec-writing compares of the other kinds stay rejected.
-    compare_neighbours = {"v_cmpx_lt_i16", "v_cmpx_lt_f16", "v_cmpx_class_f32", "v_cmpx_lt_i64", "v_cmpx_lt_u64",
-                          "v_cmp_class_f64", "v_cmp_lt_f64"}
-    # v_cmpx regions (issue #932): every binary32 and 32-bit integer predicate counts in VOPC (e32) only.
+    # Issue #932 moved the VOPC e32 v_cmpx forms on binary32 and on 16-, 32- and 64-bit integers out of this set;
+    # the exec-writing compares on binary16, binary64 and classes stay rejected.
+    compare_neighbours = {"v_cmpx_lt_f16", "v_cmpx_class_f32", "v_cmp_class_f64", "v_cmp_lt_f64"}
+    # v_cmpx regions (issue #932): every binary32 and integer predicate counts in VOPC (e32) only.
     cmpx_forms = ({("VOPC", f"v_cmpx_{op}_f32") for op in pixel.PREDICATES}
-                  | {("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.INT_PREDICATES for kind in ("i32", "u32")})
-    assert len(cmpx_forms) == 32, len(cmpx_forms)
+                  | {("VOPC", f"v_cmpx_{op}_{kind}") for op in pixel.INT_PREDICATES
+                     for kind in ("i32", "u32", "i64", "u64")}
+                  | {("VOPC", f"v_cmpx_{op}_{kind}") for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                     for kind in ("i16", "u16")})
+    assert len(cmpx_forms) == 60, len(cmpx_forms)
     for name in ("gfx1013.tsv", "rdna2.tsv"):
         reference = fc.load_reference(name)
         assert compare_forms | {("VOPC", n) for n in compare_neighbours} <= reference, name

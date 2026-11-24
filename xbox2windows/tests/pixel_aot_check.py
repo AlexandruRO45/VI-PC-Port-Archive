@@ -260,6 +260,21 @@ def expect_value_error(function, program, message):
         raise AssertionError(f"Expected rejection: {message}")
 
 
+def expect_unbound_operand(function, program, bank, register, index, offset, instruction):
+    """Require pixel_aot.UnboundOperand (a ValueError) naming the register and the instruction that reads it."""
+    try:
+        function(program)
+    except Exception as error:  # the type is the assertion
+        assert type(error).__name__ == "UnboundOperand" and isinstance(error, ValueError), \
+            f"Expected UnboundOperand for {register}, got {type(error).__name__}: {error}"
+        fields = (error.bank, error.register, error.index, error.offset, error.instruction)
+        assert fields == (bank, register, index, offset, instruction), fields
+        where = "" if offset is None else f" (byte offset {offset:#x})"
+        assert str(error) == f"Unbound {bank} operand {register} at instruction {index}{where}: {instruction}", error
+    else:
+        raise AssertionError(f"An unbound {register} was accepted")
+
+
 def compile_shader(compiler, source, shader, *, listing=None, mode=F32_DENORM_MODE, ieee=True):
     """Run DXC on one translated shader under an explicit binary32 denormal mode."""
     # DXC accepts -denorm only at shader model 6.2 and above; ps_6_2 is the minimum target.
@@ -663,8 +678,31 @@ def cmpx_predicate_group(kind, first):
     return with_constants(body)
 
 
+# The 16-bit kinds have no f/t forms: groups starting at lt and le draw lt, eq, le, gt, ne and ge.
 CMPX_PREDICATE_GROUPS = tuple((kind, first) for kind, firsts in (("f32", (0, 4, 8, 12)), ("i32", (0, 4)),
-                                                                 ("u32", (0, 4))) for first in firsts)
+                                                                 ("u32", (0, 4)), ("i16", (1, 3)), ("u16", (1, 3)))
+                              for first in firsts)
+# Pairs (s44, s45) for the 16-bit kinds: the high halves differ, so only the low 16 bits may decide.
+CMPX_INT16_PAIRS = ((0x12348000, 0xabcd0000), (0xffff1234, 0x00001234), (0x00000001, 0xffff0000),
+                    (0x0000ffff, 0x00000001))
+
+
+def cmpx_int16_relation(kind, left, right):
+    """0, 1 or 2 for less, equal or greater, on the low 16 bits as signed (i16) or unsigned (u16) values."""
+    a, b = left & 0xffff, right & 0xffff
+    if kind == "i16":
+        a, b = (v - 0x10000 if v & 0x8000 else v for v in (a, b))
+    return 0 if a < b else (1 if a == b else 2)
+
+
+def cmpx64_group(kind, group):
+    """cmp64_group with each e32 comparison opening a v_cmpx region that sets its channel to 1.0 (v22)."""
+    body = [f"v_mov_b32_e32 v{12 + channel}, 0" for channel in range(4)]
+    for channel in range(4):
+        src0, src1 = cmp64_sources(CMP64_SHAPES[(channel + group) % 4], "e32")
+        body += [CMPX_SAVE, f"v_cmpx_{CMP64_PREDICATES[4 * group + channel]}_{kind}_e32 {src0}, {src1}",
+                 f"v_mov_b32_e32 v{12 + channel}, v22", CMPX_MOV_RESTORE if channel % 2 == 0 else CMPX_OR_RESTORE]
+    return cmp64_program(body)
 
 
 def cmpx_observables():
@@ -755,11 +793,13 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
                 write_case(case, constants, tuple((op >> relation) & 1 for op in range(first, first + 4)))
                 cases.append((case, "pass"))
         else:
-            for left, right in int_pairs:
+            for left, right in (CMPX_INT16_PAIRS if kind in ("i16", "u16") else int_pairs):
                 lv, rv = left, right
                 if kind == "i32":
                     lv, rv = (v - 0x100000000 if v & 0x80000000 else v for v in (left, right))
                 relation = 0 if lv < rv else (1 if lv == rv else 2)
+                if kind in ("i16", "u16"):
+                    relation = cmpx_int16_relation(kind, left, right)
                 constants = bytearray(256)
                 struct.pack_into("<IIff", constants, 12, left, right, 0.0, 1.0)
                 case = directory / f"cmpx-{kind}-{first}-{left:08x}-{right:08x}.case"
@@ -773,11 +813,46 @@ def check_cmpx_draw(directory, compiler, renderer, backend):
             case = directory / "cmpx-i32-0-as-unsigned.case"
             case.write_bytes(constants + struct.pack("<4f", *((op >> 2) & 1 for op in range(4))) * 64)
             cases.append((case, "mismatch"))
+        if (kind, first) == ("i16", 1):
+            # Wrong references: the unsigned table on (0x8000, 0x0000), and a full 32-bit comparison of
+            # (0xffff1234, 0x00001234), whose low halves are equal.
+            for label, left, right, relation in (("as-unsigned", 0x12348000, 0xabcd0000, 2),
+                                                 ("as-32-bit", 0xffff1234, 0x00001234, 0)):
+                constants = bytearray(256)
+                struct.pack_into("<IIff", constants, 12, left, right, 0.0, 1.0)
+                case = directory / f"cmpx-i16-1-{label}.case"
+                case.write_bytes(constants + struct.pack("<4f", *((op >> relation) & 1
+                                                                 for op in range(first, first + 4))) * 64)
+                cases.append((case, "mismatch"))
         try:
             run_pixel_batch(renderer, backend, shader, cases)
         except AssertionError as error:
             error.add_note(f"v_cmpx predicate draw on {backend}, kind={kind}, first={first}")
             raise
+    # 64-bit v_cmpx regions against the cmp64 reference, on every CMP64_WORDS pattern and operand shape.
+    for kind in ("i64", "u64"):
+        for group in (0, 1):
+            source.write_text(translate_int(cmpx64_group(kind, group)), encoding="ascii")
+            compile_shader(compiler, source, shader)
+            cases = []
+            for index, words in enumerate(CMP64_WORDS):
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, *words)
+                case = directory / f"cmpx64-{kind}-{group}-{index}.case"
+                write_case(case, bytes(constants), cmp64_expected(kind, "e32", group, words), integer_rt=True)
+                cases.append((case, "pass"))
+            if (kind, group) == ("i64", 0):
+                # Wrong reference: the unsigned answers for the signed shader on -1 against 0.
+                constants = bytearray(256)
+                struct.pack_into("<4I", constants, 12, *CMP64_WORDS[3])
+                case = directory / "cmpx64-i64-0-as-unsigned.case"
+                write_case(case, bytes(constants), cmp64_expected("u64", "e32", 0, CMP64_WORDS[3]), integer_rt=True)
+                cases.append((case, "mismatch"))
+            try:
+                run_pixel_batch(renderer, backend, shader, cases)
+            except AssertionError as error:
+                error.add_note(f"64-bit v_cmpx draw on {backend}, kind={kind}, group={group}")
+                raise
     return 0
 
 
@@ -2270,12 +2345,7 @@ def check_mac_legacy_lowering():
         expect_value_error(translate, changed, "Invalid arithmetic operation")
     # The accumulator must hold a tracked value, as for v_mac_f32: v20 was never written.
     changed = swap("v_mac_legacy_f32_e32 v12, s44, v18", "v_mac_legacy_f32_e32 v20, s44, v18")
-    try:
-        translate(changed)
-    except KeyError as error:
-        assert error.args == ("v20",), error
-    else:
-        raise AssertionError("An untracked accumulator was accepted")
+    expect_unbound_operand(translate, changed, "vector", "v20", pos, None, "v_mac_legacy_f32_e32 v20, s44, v18")
 
 
 def check_e64_approx_draws(directory, compiler, renderer, backend):
@@ -2921,8 +2991,9 @@ def check_cmp64_controls():
                     == translate_int(cmp64_program([f"v_cmp_lt_u64_e64 vcc_lo, v[18:19], {token}"]))), token
         else:
             error(f"v_cmp_lt_u64 vcc_lo, v[18:19], {token}", invalid + token)
-    # The exec-writing forms and the other compare families stay refused.
-    for line in ("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
+    # An e32 v_cmpx is admitted only as a masked-region opener; the e64 spellings and the other families stay refused.
+    error("v_cmpx_lt_i64_e32 v[18:19], v[20:21]", "Unsupported v_cmpx execution mask save")
+    for line in ("v_cmpx_lt_u64_e64 v[18:19], v[20:21]",
                  "v_cmpx_lt_i64_e64 s52, v[18:19], v[20:21]", "v_cmp_lt_f64_e64 s52, v[18:19], v[20:21]",
                  "v_cmp_class_f64_e32 vcc_lo, v[18:19], v20", "v_cmp_lt_i64_sdwa vcc_lo, v[18:19], v[20:21]",
                  "v_cmp_lt_i64_dpp vcc_lo, v[18:19], v[20:21] quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
@@ -6653,12 +6724,8 @@ def check_three_constant_buffers() -> None:
                        "Constant descriptor differs from binding contract")
     expect_value_error(lambda p: bound(p, None, ()), program, "Unresolved constant buffer binding")
     # An entry register outside the contract stays unbound.
-    try:
-        bound(program, extra_constants=((20, 0x60),))
-    except KeyError as error:
-        assert error.args == ("s9",), error
-    else:
-        raise AssertionError("An unbound table register was accepted")
+    expect_unbound_operand(lambda p: bound(p, extra_constants=((20, 0x60),)), program,
+                           "scalar", "s9", program.index("s_mov_b32 s64, s9"), None, "s_mov_b32 s64, s9")
     # The table address needs a zero high word, and its low word is not a number.
     for high in ("s_mov_b32 s65, 1", "s_mov_b32 s65, s9", "s_mov_b32 s65, s20"):
         expect_value_error(bound, changed("s_mov_b32 s65, 0", high), "Unresolved constant buffer binding")
@@ -10210,11 +10277,16 @@ def check_cmpx_controls():
     assert selects(cmpx_skip()) == 2
     for kind, first in CMPX_PREDICATE_GROUPS:
         assert selects(cmpx_predicate_group(kind, first)) == 4
+    for kind in ("i64", "u64"):
+        for group in (0, 1):
+            assert selects(cmpx64_group(kind, group)) == 4
     # Each accepted comparison kind lowers like the v_cmp of the same kind.
     for compare, plain in (("v_cmpx_lt_f32_e32 s44, v12", "v_cmp_lt_f32_e32 vcc_lo, s44, v12"),
                            ("v_cmpx_ge_i32_e32 v13, v12", "v_cmp_ge_i32_e32 vcc_lo, v13, v12"),
                            ("v_cmpx_ne_u32_e32 0x3f000000, v12", "v_cmp_ne_u32_e32 vcc_lo, 0x3f000000, v12"),
-                           ("v_cmpx_nlg_f32_e32 -1.0, v12", "v_cmp_nlg_f32_e32 vcc_lo, -1.0, v12")):
+                           ("v_cmpx_nlg_f32_e32 -1.0, v12", "v_cmp_nlg_f32_e32 vcc_lo, -1.0, v12"),
+                           ("v_cmpx_gt_i16_e32 v13, v12", "v_cmp_gt_i16_e32 vcc_lo, v13, v12"),
+                           ("v_cmpx_le_u16_e32 0x8000, v12", "v_cmp_le_u16_e32 vcc_lo, 0x8000, v12")):
         expr = next(line for line in translate(cmpx_region(compare=compare)).splitlines() if "bool cmp" in line)
         reference = next(line for line in translate(uncompressed_export([plain])).splitlines() if "bool cmp" in line)
         assert expr.split(" = ", 1)[1] == reference.split(" = ", 1)[1], (compare, expr, reference)
@@ -10264,10 +10336,12 @@ def check_cmpx_controls():
     expect_value_error(translate, [CMPX_MOV_RESTORE.replace("60:61", "58:59") if line == "s_or_b64 exec, exec, s[60:61]"
                                    else line for line in masked_region()], "Unexpected execution mask restore")
     must_reject(translate, [line for line in region if line != CMPX_MOV_RESTORE])
-    # Out of scope for this stage: e64, SDWA, other widths and kinds, VSRC1 not a VGPR, and source modifiers.
+    # Out of scope for this stage: e64, SDWA, f16/f64 and class, VSRC1 not a VGPR (a VGPR pair at 64 bits),
+    # the 16-bit f/t forms gfx10 lacks, a float token on a 16-bit integer, and source modifiers.
     for compare in ("v_cmpx_gt_f32_e64 s44, v12", "v_cmpx_gt_f32_sdwa s44, v12 src0_sel:DWORD src1_sel:DWORD",
                     "v_cmpx_gt_f16_e32 s44, v12", "v_cmpx_gt_f64_e32 s[44:45], v[12:13]",
-                    "v_cmpx_gt_i16_e32 s44, v12", "v_cmpx_gt_u64_e32 s[44:45], v[12:13]",
+                    "v_cmpx_t_i16_e32 s44, v12", "v_cmpx_gt_i16_e32 1.0, v12", "v_cmpx_gt_u64_e32 s[44:45], v12",
+                    "v_cmpx_gt_i64_e32 v[12:13], s[44:45]", "v_cmpx_gt_u16_e64 s44, v12",
                     "v_cmpx_class_f32_e32 s44, v12", "v_cmpx_gt_f32_e32 v12, s44",
                     "v_cmpx_gt_f32_e32 -v13, v12", "v_cmpx_gt_f32_e32 |v13|, v12",
                     "v_cmpx_gt_f32 s44, v12", "v_cmpx_gt_f32_e32 s44"):
@@ -12574,7 +12648,101 @@ def check_f16_to_int_controls():
         expect_value_error(translate_f16, export, "Unsupported export")
 
 
+UNBOUND_SAMPLE = [
+    "s_mov_b64 s[50:51], exec",
+    "s_wqm_b64 exec, exec",
+    "s_mov_b32 m0, s24",
+    "v_interp_p1_f32_e32 v8, v0, attr0.x",
+    "v_interp_p1_f32_e32 v9, v0, attr0.y",
+    "v_interp_p2_f32_e32 v9, v1, attr0.y",
+    "v_interp_p2_f32_e32 v8, v1, attr0.x",
+    "s_and_b64 exec, exec, s[50:51]",
+    "s_mov_b32 s21, 0",
+    "s_load_dwordx8 s[28:35], s[20:21], null",
+    "s_mov_b32 s40, 1",
+    "s_mov_b32 s41, 2",
+    "s_mov_b32 s42, 3",
+    "s_mov_b32 s43, 4",
+    "s_waitcnt lgkmcnt(0)",
+    "image_sample v[12:15], v[8:9], s[28:35], s[40:43] dmask:0xf dim:SQ_RSRC_IMG_2D",
+    "s_waitcnt vmcnt(0)",
+    "v_cvt_pkrtz_f16_f32_e32 v16, v12, v13",
+    "v_cvt_pkrtz_f16_f32_e32 v17, v14, v15",
+    "exp mrt0 v16, v16, v17, v17 done compr vm",
+    "s_endpgm",
+]
+
+
+def check_unbound_operand_diagnostics():
+    """Issue #1314: a read of a register with no tracked value names the register and the instruction.
+
+    The sample binds the texture table (s20), the interpolation base (s24) and v0/v1, as the shader scan does.
+    Reading another entry register is an UnboundOperand (a ValueError), an unknown opcode stays a plain
+    rejection, and a missing key that is not a guest register stays a KeyError, so an internal lookup fault
+    is never reported as a missing binding.
+    """
+    def run(program):
+        return lower(program, 20, 24, [1, 2, 3, 4])
+
+    def expect_unbound(program, *diagnostic):
+        expect_unbound_operand(run, program, *diagnostic)
+
+    def replaced(old, new):
+        assert old in UNBOUND_SAMPLE
+        return [new if line == old else line for line in UNBOUND_SAMPLE]
+
+    # The bound sample still translates.
+    source = run(UNBOUND_SAMPLE)
+    assert "SV_Target0" in source and "tex." in source, source
+    # An unbound SGPR: the interpolation base copied from an entry register the caller did not bind. The
+    # positioned form also carries the byte offset.
+    at = UNBOUND_SAMPLE.index("s_mov_b32 m0, s24")
+    expect_unbound(replaced("s_mov_b32 m0, s24", "s_mov_b32 m0, s9"), "scalar", "s9", at, None, "s_mov_b32 m0, s9")
+    positioned = list(enumerate(replaced("s_mov_b32 m0, s24", "s_mov_b32 m0, s9")))
+    expect_unbound([(4 * k, line) for k, line in positioned], "scalar", "s9", at, 4 * at, "s_mov_b32 m0, s9")
+    # An unbound VGPR: v3 is neither a barycentric input nor written before the read.
+    expect_unbound(["v_mov_b32_e32 v2, v3", *UNBOUND_SAMPLE], "vector", "v3", 0, None, "v_mov_b32_e32 v2, v3")
+    # An unsupported opcode is a plain rejection, not an unbound operand.
+    unknown = UNBOUND_SAMPLE[:1] + ["v_imaginary_op_xyz v2, v0"] + UNBOUND_SAMPLE[1:]
+    try:
+        run(unknown)
+    except ValueError as error:
+        assert type(error) is ValueError and str(error) == "Unsupported instruction 1: v_imaginary_op_xyz v2, v0", \
+            f"{type(error).__name__}: {error}"
+    else:
+        raise AssertionError("An unknown opcode was accepted")
+    # Only s0-s105, vcc and v0-v255 read inside an instruction are unbound operands; any other missing key in
+    # the register state is an internal lookup error and stays a KeyError.
+    scalar = pixel_aot.TrackedScalar({}, {})
+    vector = pixel_aot.TrackedVector()
+    for registers, key in ((scalar, "s9"), (vector, "v3")):
+        try:
+            registers[key]
+        except KeyError as error:
+            assert type(error) is KeyError and error.args == (key,), error
+        else:
+            raise AssertionError(f"{key} read outside an instruction was accepted")
+    scalar.site = vector.site = (7, None, "s_nop 0")
+    for registers, key in ((scalar, "s106"), (scalar, "ttmp0"), (scalar, "v3"), (scalar, ("s9",)),
+                           (vector, "v256"), (vector, "s9")):
+        try:
+            registers[key]
+        except KeyError as error:
+            assert type(error) is KeyError and error.args == (key,), error
+        else:
+            raise AssertionError(f"{key!r} was accepted")
+    for registers, key, bank in ((scalar, "s105", "scalar"), (scalar, "vcc", "scalar"), (vector, "v255", "vector")):
+        try:
+            registers[key]
+        except Exception as error:  # the type is the assertion
+            assert type(error).__name__ == "UnboundOperand", f"Expected UnboundOperand for {key}, got {error!r}"
+            assert (error.bank, error.register, error.index) == (bank, key, 7), error
+        else:
+            raise AssertionError(f"{key} was accepted")
+
+
 def check_controls(directory):
+    check_unbound_operand_diagnostics()
     check_dpp_cvt_refusals()
     check_dpp_f16_contract_controls()
     check_smem_pointer_controls()
@@ -14715,6 +14883,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.extend((program, translate) for program in (
         cmpx_region(), cmpx_region(CMPX_OR_RESTORE), cmpx_observables(),
         *(cmpx_predicate_group(kind, first) for kind, first in CMPX_PREDICATE_GROUPS)))
+    fixtures.extend((cmpx64_group(kind, group), translate_int) for kind in ("i64", "u64") for group in (0, 1))
     fixtures.append((cmpx_skip_asm(), translate, "gfx1013", "", cmpx_skip()))
     fixtures.extend((program, translate_int) for op in SHIFT64_OPS for program in shift64_programs(op).values())
     fixtures.extend((region_body_program(body, approximate), translate)

@@ -1976,6 +1976,17 @@ def int64_operand(token, scalar, vector, pending, sample_dest, *, signed, encodi
     raise invalid
 
 
+def int64_comparison(i, op, kind, tokens, encoding, scalar, vector, pending, sample_dest):
+    """HLSL word declarations and the predicate of a 64-bit integer v_cmp or v_cmpx of `tokens`."""
+    words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
+                           encoding=encoding, position=n) for n, t in enumerate(tokens)]
+    word_type = "int" if kind == "i64" else "uint"
+    names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
+    lines = [f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};"
+             for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1]))]
+    return lines, INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])
+
+
 def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
     """Parse one DPP VGPR operand (allowing completed uv.* interpolation outputs in DPP)."""
     neg = False
@@ -2550,6 +2561,34 @@ def wait_counters(line):
     return None
 
 
+SCALAR_OPERAND = re.compile(r"s(?:\d|[1-9]\d|10[0-5])|vcc")
+VECTOR_OPERAND = re.compile(r"v(?:\d|[1-9]\d|1\d\d|2[0-4]\d|25[0-5])")
+
+
+class UnboundOperand(ValueError):
+    """A guest register is read while lower() holds no value for it.
+
+    The register is an entry register the caller did not bind (only the texture table, the interpolation base,
+    v0, v1 and the entry registers of the constant contract start bound) or a register no earlier instruction
+    wrote. bank is "scalar" or "vector", index the 0-based instruction number, offset its byte offset when lower()
+    received (offset, text) pairs and None otherwise. Only s0-s105, vcc and v0-v255 are reported this way: any
+    other missing key in the register state is an internal lookup error and stays a KeyError.
+    """
+
+    def __init__(self, bank, register, index, offset, instruction):
+        self.bank, self.register = bank, register
+        self.index, self.offset, self.instruction = index, offset, instruction
+        where = "" if offset is None else f" (byte offset {offset:#x})"
+        super().__init__(f"Unbound {bank} operand {register} at instruction {index}{where}: {instruction}")
+
+
+def unbound_operand(registers, key, pattern, bank):
+    """Raise UnboundOperand for a missing guest register read inside an instruction, else a plain KeyError."""
+    if registers.site is not None and isinstance(key, str) and pattern.fullmatch(key):
+        raise UnboundOperand(bank, key, *registers.site)
+    raise KeyError(key)
+
+
 class TrackedVector(VectorRegisters):
     """Vector register names that record reads, so a conditionally-written register can be refused."""
 
@@ -2558,10 +2597,14 @@ class TrackedVector(VectorRegisters):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # (index, byte offset or None, text) of the instruction being lowered
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, VECTOR_OPERAND, "vector")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2582,10 +2625,14 @@ class TrackedScalar(dict):
         self.reads = []
         self.masked = False
         self.conditional = set()
+        self.site = None  # as TrackedVector.site
 
     def __getitem__(self, key):
         self.reads.append(key)
         return super().__getitem__(key)
+
+    def __missing__(self, key):
+        unbound_operand(self, key, SCALAR_OPERAND, "scalar")
 
     def get(self, key, default=None):
         self.reads.append(key)
@@ -2626,6 +2673,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
     means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
     guest state; the translator does not measure or track it.
+    A read of a guest register that holds no tracked value raises UnboundOperand, a ValueError that names the
+    register and the instruction, so a missing entry binding is not mistaken for an unsupported instruction.
     """
     if title_ranges is not None and (isinstance(title_ranges, bool) or not isinstance(title_ranges, int)
                                      or not 1 <= title_ranges <= 0xffffffff):
@@ -2792,6 +2841,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     for i, (offset, line) in enumerate(positioned):
         vector.reads.clear()
         scalar.reads.clear()
+        scalar.site = vector.site = (i, offset, line)
         conditional = set(vector.conditional)
         scalar_conditional = set(scalar.conditional)
         def match(pattern):
@@ -3062,13 +3112,16 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             vector.masked = True
             scalar.masked = True
             scc = None
-        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32))_e32 "
-                        r"([^,]+), ([^,]+)"):
+        elif m := match(rf"v_cmpx_(?:({'|'.join(COMPARE)})_f32|({'|'.join(INT_COMPARE)})_(i32|u32|i64|u64)"
+                        rf"|(eq|ne|lt|le|gt|ge)_(i16|u16))_e32 ([^,]+), ([^,]+)"):
             # A masked-if opened by a VOPC e32 compare that writes EXEC (issue #932). It must directly
             # follow `s_mov_b64 s[a:b], exec` of the known entry mask, so EXEC becomes the entry mask
             # intersected with the comparison, as after s_and_saveexec_b64. v_cmpx writes neither VCC nor
             # SCC, so both keep their tracked values; the region closes with s_mov_b64 or s_or_b64.
-            fop, iop, kind, src0, src1 = m.groups()
+            # The integer forms compare as the v_cmp of the same width (gfx10 has no f/t forms at 16 bits).
+            fop, iop, kind, op16, kind16, src0, src1 = m.groups()
+            if op16 is not None:
+                iop, kind = op16, kind16
             previous = instructions[i - 1] if i else ""
             previous = previous[1] if isinstance(previous, tuple) else previous
             saved = re.fullmatch(r"s_mov_b64 (s\[\d+:\d+\]), exec", previous)
@@ -3076,13 +3129,19 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if (region is not None or mask != "entry" or pair is None
                     or [scalar.get(r) for r in pair] != [("entry", 0), ("entry", 1)]):
                 raise ValueError("Unsupported v_cmpx execution mask save")
-            # VOPC e32 encodes VSRC1 as a VGPR and carries no source modifiers.
-            if not re.fullmatch(r"v\d+", src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
+            # VOPC e32 encodes VSRC1 as a VGPR (a VGPR pair at 64 bits) and carries no source modifiers.
+            vsrc1 = r"v\[\d+:\d+\]" if kind in ("i64", "u64") else r"v\d+"
+            if not re.fullmatch(vsrc1, src1) or re.search(r"\||abs\(|neg\(|^-[vs]", src0):
                 raise ValueError(f"Invalid VOPC e32 operands: {line}")
             if fop is not None:
                 expr = f32_comparison(fop, [src0, src1], scalar, vector, pending, sample_dest)
+            elif kind in ("i64", "u64"):
+                declarations, expr = int64_comparison(i, iop, kind, [src0, src1], "e32",
+                                                      scalar, vector, pending, sample_dest)
+                lines.extend(declarations)
             else:
-                values = [int_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i32")
+                read = int16_operand if kind in ("i16", "u16") else int_operand
+                values = [read(t, scalar, vector, pending, sample_dest, signed=kind in ("i32", "i16"))
                           for t in (src0, src1)]
                 expr = INT_COMPARE[iop].format(*values)
             lines.append(f"    bool cmp{i} = {expr};")
@@ -4324,13 +4383,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 sgpr_name(dst)
             if mask != "entry" or pending.intersection(regs):
                 raise ValueError("Invalid comparison")
-            words = [int64_operand(t, scalar, vector, pending, sample_dest, signed=kind == "i64",
-                                   encoding=enc, position=n) for n, t in enumerate(tokens)]
-            word_type = "int" if kind == "i64" else "uint"
-            names = [f"cmp{i}_l0", f"cmp{i}_h0", f"cmp{i}_l1", f"cmp{i}_h1"]
-            for name, value in zip(names, (words[0][0], words[0][1], words[1][0], words[1][1])):
-                lines.append(f"    {'uint' if name[-2] == 'l' else word_type} {name} = {value};")
-            lines.append(f"    bool cmp{i} = {INT64_COMPARE[op].format(l0=names[0], h0=names[1], l1=names[2], h1=names[3])};")
+            declarations, expr = int64_comparison(i, op, kind, tokens, enc, scalar, vector, pending, sample_dest)
+            lines.extend(declarations)
+            lines.append(f"    bool cmp{i} = {expr};")
             for j, reg in enumerate(regs):
                 scalar[reg] = ("condition", f"cmp{i}", j, len(regs))
         elif m := match(rf"v_cmp_({'|'.join(COMPARE)})_f32_sdwa {LANE_MASK}, ([^,]+), ([^,]+) src0_sel:DWORD src1_sel:DWORD"):
@@ -5359,6 +5414,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
         if scalar_conditional.intersection(scalar.reads):
             raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+    # Reads after the last instruction are not operand reads: a missing key there stays a KeyError.
+    scalar.site = vector.site = None
     if region is not None:
         raise ValueError("Program ends inside a masked region")
     if not ended or samples != len(bindings):

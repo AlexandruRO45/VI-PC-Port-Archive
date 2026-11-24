@@ -15,7 +15,10 @@ is limited to direct float32 Texture1D, Texture2D, TextureCube and Texture3D sam
 array forms of the first three, in a single compute entry point. The ordinary kind takes any LOD
 operand whose result type is the sampled float type (a constant of any value or a computed value); the
 depth-comparison kind stays at constant LOD zero, the only form SM 6.0 has for it (SampleCmpLevelZero). Texture3D is
-only sampled by the ordinary kind: depth comparison on it, and an arrayed 3D image, are refused. The sampler must appear in the
+only sampled by the ordinary kind: depth comparison on it, and an arrayed 3D image, are refused.
+OpImageGather counts as an ordinary use and OpImageDrefGather as a comparison use, so a gather keeps its
+sampler kind. Both are accepted without image operands only, on 2D, 2D array, cube and cube array images
+(the forms D3D12 gathers), and OpImageGather needs an integer OpConstant component from 0 to 3. The sampler must appear in the
 entry-point interface. Any other use of that sampler is rejected with a specific diagnostic.
 """
 import argparse
@@ -26,6 +29,7 @@ import sys
 
 PREFIX = "%x2w_plain_sampler"
 ZERO = {"0", "0.0", "0x0p+0", "-0", "-0.0", "-0x0p+0"}
+GATHERS = {"OpImageGather": "ordinary", "OpImageDrefGather": "compare"}
 ANNOTATIONS = {"OpName", "OpMemberName", "OpDecorate", "OpMemberDecorate", "OpEntryPoint", "OpExecutionMode"}
 
 
@@ -49,6 +53,26 @@ def _standalone_sampler(definitions, loaded):
             or definitions.get(pointer[2]) != ["OpTypeSampler"]):
         return None
     return load[2]
+
+
+def _check_gather(image, use, texture, definitions):
+    """Accept OpImageGather/OpImageDrefGather %type %image %coord %component|%dref with no image operands."""
+    if len(use) != 5:
+        raise ValueError(f"{image}: {use[0]} with image operands is not supported")
+    if use[2] != image:
+        raise ValueError(f"{image}: {use[0]} must gather from the sampled image itself")
+    if texture[2] not in ("2D", "Cube"):
+        raise ValueError(f"{image}: {use[0]} is only supported on Texture2D, Texture2DArray, TextureCube "
+                         "and TextureCubeArray")
+    if use[0] == "OpImageGather":
+        component = definitions.get(use[4], [])
+        try:
+            value = int(component[2], 0)
+        except (IndexError, ValueError):
+            value = -1
+        if (len(component) != 3 or component[0] != "OpConstant"
+                or definitions.get(component[1], [])[:1] != ["OpTypeInt"] or not 0 <= value <= 3):
+            raise ValueError(f"{image}: OpImageGather requires an integer constant component from 0 to 3")
 
 
 def _ordinary_images(sampler, uses, definitions):
@@ -76,6 +100,10 @@ def _ordinary_images(sampler, uses, definitions):
                              "sampling (including the array forms of the first three) is supported")
         kinds = set()
         for _, use in uses[image]:
+            if use[0] in GATHERS:
+                _check_gather(image, use, texture, definitions)
+                kinds.add(GATHERS[use[0]])
+                continue
             ordinary = use[0] == "OpImageSampleExplicitLod" and len(use) == 6
             compare = use[0] == "OpImageSampleDrefExplicitLod" and len(use) == 7
             if not (ordinary or compare) or use[2] != image or use[-2] != "Lod":

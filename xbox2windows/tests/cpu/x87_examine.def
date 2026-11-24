@@ -4,3 +4,4 @@ EXPORTS
     ficom_m32
     fnop_fclex
     legacy_controls
+    ffreep_top

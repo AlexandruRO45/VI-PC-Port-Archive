@@ -182,7 +182,7 @@ bool bind_bc7(ID3D12Device* desktop, void* guest, const StartupBc7Input& input, 
 }  // namespace
 
 int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char* pixels, const StartupBc7Input* bc7,
-                      DXGI_FORMAT format, std::uint32_t export_word)
+                      DXGI_FORMAT format, std::uint32_t export_word, bool two_targets)
 {
     const bool bc = GetEnvironmentVariableW(L"X2W_TEST_BC_VIEW", nullptr, 0) != 0;
     const bool bc_chain = GetEnvironmentVariableW(L"X2W_TEST_BC_CHAIN", nullptr, 0) != 0;
@@ -197,6 +197,7 @@ int check_stream_draw(IDXGIAdapter* adapter, void* guest, void* pso, const char*
     Bc7Binding binding;
     if (bc7 && !bind_bc7(desktop.Get(), guest, *bc7, binding)) return 34;
     StreamTarget frame;
+    if (two_targets) frame.count = 2;  // a second RGBA8 target of the same size, written after the first
     if (const int rc = open_stream_target(desktop.Get(), guest, pso, width, height, format,
                                           legacy && !bc7 && !bc_chain ? width / 2 : width, frame)) return rc;
     auto* list = frame.list;

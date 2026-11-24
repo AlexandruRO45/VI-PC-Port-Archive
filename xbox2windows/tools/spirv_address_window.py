@@ -11,7 +11,7 @@ from spirv_sampler_views import split_sampler_views
 
 
 ID = r"%[A-Za-z0-9_]+"
-CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr64|arri|arr|ulong|uint|int) ({ID})")
+CAST = re.compile(rf"({ID}) = OpConvertUToPtr %_ptr_PSB_(arr64|arri|arrf|arr|ulong|uint|int|float) ({ID})")
 ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_uint ({ID}) ({ID})")
 SIGNED_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_int ({ID}) ({ID})")
 SIGNED_POINTER_TYPES = ("%_ptr_PSB_int = OpTypePointer PhysicalStorageBuffer %int",
@@ -19,6 +19,13 @@ SIGNED_POINTER_TYPES = ("%_ptr_PSB_int = OpTypePointer PhysicalStorageBuffer %in
 SIGNED_ARRAY_DECLARATIONS = ("%int = OpTypeInt 32 1", "%rt_int = OpTypeRuntimeArray %int", "OpDecorate %rt_int ArrayStride 4")
 # A signed DWORD access is a plain load or store of one naturally aligned 32-bit value.
 SIGNED_MEMORY_OPERANDS = ([], ["Aligned", "4"])
+FLOAT_ACCESS = re.compile(rf"({ID}) = OpAccessChain %_ptr_PSB_float ({ID}) ({ID})")
+FLOAT_POINTER_TYPES = ("%_ptr_PSB_float = OpTypePointer PhysicalStorageBuffer %float",
+                       "%_ptr_PSB_arrf = OpTypePointer PhysicalStorageBuffer %rt_float")
+FLOAT_ARRAY_DECLARATIONS = ("%float = OpTypeFloat 32", "%rt_float = OpTypeRuntimeArray %float",
+                            "OpDecorate %rt_float ArrayStride 4")
+# A float access is a plain load or store of one naturally aligned 32-bit value; atomics are not offered on floats.
+FLOAT_MEMORY_OPERANDS = ([], ["Aligned", "4"])
 CONSTANT = re.compile(rf"({ID}) = OpConstant %uint (\d+)")
 SIGNED_ATOMICS = {"OpAtomicSMin": "OpSLessThan", "OpAtomicSMax": "OpSGreaterThan"}
 # Atomics with no signedness, by operand count after the result type; their operands are bit-cast to unsigned.
@@ -211,6 +218,34 @@ def signed_access(fields, pointers, valid_of, words, label, stem, failures):
     return lines, stem + "_merge"
 
 
+def float_access(fields, pointers, valid_of, words, label, stem):
+    """Lower a float load or store into a branch taken only for a valid address.
+
+    The heap holds unsigned words, so OpBitcast moves the value between %uint and %float. A bit-cast keeps every
+    bit, including a NaN payload, the sign of a zero and a signalling-NaN bit. A load yields the bit pattern zero
+    (0.0) and a store changes nothing otherwise. Returns the lines and the label that follows."""
+    store = fields[0] == "OpStore"
+    pointer = fields[1] if store else fields[4]
+    operands = fields[3:] if store else fields[5:]
+    if store:
+        shape = len(fields) >= 3 and operands in FLOAT_MEMORY_OPERANDS and fields[2] not in pointers
+    else:
+        shape = fields[1:4] == ["=", "OpLoad", "%float"] and fields[4:5] and operands in FLOAT_MEMORY_OPERANDS
+    if not shape or pointer not in pointers or len(pointers) != 1:
+        raise ValueError("unhandled physical word pointer use")
+    ptr = stem + "_ptr"
+    lines = [f"OpSelectionMerge {stem}_merge None", f"OpBranchConditional {valid_of[pointer]} {stem}_issue {stem}_merge",
+             f"{stem}_issue = OpLabel", f"{ptr} = OpAccessChain %_ptr_PSB_uint %x2w_heap %c0 {words[pointer]}"]
+    if store:
+        lines.extend([f"{stem}_value = OpBitcast %uint {fields[2]}", " ".join(["OpStore", ptr, f"{stem}_value", *operands]),
+                      f"OpBranch {stem}_merge", f"{stem}_merge = OpLabel"])
+        return lines, stem + "_merge"
+    lines.extend([f"{stem}_loaded = OpLoad %uint {ptr} {' '.join(operands)}".rstrip(), f"OpBranch {stem}_merge",
+                  f"{stem}_merge = OpLabel", f"{stem}_old = OpPhi %uint {stem}_loaded {stem}_issue %c0 {label}",
+                  f"{fields[0]} = OpBitcast %float {stem}_old"])
+    return lines, stem + "_merge"
+
+
 def merge_pointer_types(lines):
     # The push-constant and physical pointer types can become the same logical
     # pointer type. SPIR-V validation requires a single such declaration.
@@ -271,12 +306,15 @@ def lower(assembly):
     physical_words = set()
     physical_qwords = set()
     physical_ints = set()
+    physical_floats = set()
     for line in lines:
         cast = CAST.fullmatch(line)
         access = ACCESS.fullmatch(line)
         wide = WIDE_ACCESS.fullmatch(line)
         if cast and cast[2] == "int" or SIGNED_ACCESS.fullmatch(line):
             physical_ints.add((cast or SIGNED_ACCESS.fullmatch(line))[1])
+        if cast and cast[2] == "float" or FLOAT_ACCESS.fullmatch(line):
+            physical_floats.add((cast or FLOAT_ACCESS.fullmatch(line))[1])
         if access or cast and cast[2] == "uint":
             physical_words.add((access or cast)[1])
         if wide or cast and cast[2] == "ulong":
@@ -290,6 +328,12 @@ def lower(assembly):
     signed_stores = 0
     if physical_ints or any(cast and cast[2] == "arri" for cast in map(CAST.fullmatch, lines)):
         if not set(SIGNED_POINTER_TYPES + SIGNED_ARRAY_DECLARATIONS) <= set(lines):
+            raise ValueError("unsupported physical pointer or scalar layout")
+    float_arrays = {}
+    float_words = {}
+    float_stores = 0
+    if physical_floats or any(cast and cast[2] == "arrf" for cast in map(CAST.fullmatch, lines)):
+        if not set(FLOAT_POINTER_TYPES + FLOAT_ARRAY_DECLARATIONS) <= set(lines):
             raise ValueError("unsupported physical pointer or scalar layout")
     if physical_qwords:
         declarations += ["%x2w_one = OpConstant %uint 1", "%x2w_shift_wide = OpConstant %uint 3",
@@ -315,7 +359,7 @@ def lower(assembly):
     for number, line in enumerate(lines):
         if line in ('OpExtension "SPV_KHR_physical_storage_buffer"', "OpCapability PhysicalStorageBufferAddresses",
                     "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
-                    WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE, *SIGNED_POINTER_TYPES):
+                    WIDE_POINTER_TYPE, WIDE_ARRAY_POINTER_TYPE, *SIGNED_POINTER_TYPES, *FLOAT_POINTER_TYPES):
             continue
         if line.startswith("OpDecorate ") and annotations:
             output.extend(annotations)
@@ -331,6 +375,12 @@ def lower(assembly):
                 wide_arrays[dst] = addr
             elif kind == "arri":
                 signed_arrays[dst] = addr
+            elif kind == "arrf":
+                float_arrays[dst] = addr
+            elif kind == "float":
+                new, valid_of[dst] = word_pointer(dst, addr, None, defer=True)
+                float_words[dst] = address_name(dst) + "_word"
+                output.extend(new)
             elif kind == "int":
                 new, valid_of[dst] = word_pointer(dst, addr, None, defer=True)
                 signed_words[dst] = address_name(dst) + "_word"
@@ -358,6 +408,14 @@ def lower(assembly):
             signed_words[dst] = address_name(dst) + "_word"
             output.extend(new)
             continue
+        if floating := FLOAT_ACCESS.fullmatch(line):
+            dst, pointer, index = floating.groups()
+            if pointer not in float_arrays:
+                raise ValueError("unknown physical array pointer")
+            new, valid_of[dst] = word_pointer(dst, float_arrays[pointer], index, defer=True)
+            float_words[dst] = address_name(dst) + "_word"
+            output.extend(new)
+            continue
         if wide := WIDE_ACCESS.fullmatch(line):
             dst, pointer, index = wide.groups()
             if pointer not in wide_arrays:
@@ -370,7 +428,7 @@ def lower(assembly):
             label = origin = opened[1]
         ids = set(re.findall(ID, line))
         wide_used = ids & physical_qwords
-        if (wide_used or ids & physical_ints) and number in loop_headers:
+        if (wide_used or ids & (physical_ints | physical_floats)) and number in loop_headers:
             raise ValueError("a guarded physical access cannot share a block with OpLoopMerge")
         if wide_used:
             fields = line.split()
@@ -385,6 +443,16 @@ def lower(assembly):
             pointer = fields[4] if wide_load else fields[1]
             stem = "%x2w_" + (f"load_{fields[0][1:]}" if wide_load else f"store_{wide_accesses}")
             new, label = wide_access(kind, stem, valid_of[pointer], label, wide_words[pointer], fields)
+            final_label[origin] = label
+            output.extend(new)
+            continue
+        if ids & physical_floats:
+            if ids & (physical_words | physical_qwords | physical_ints):
+                raise ValueError("unhandled physical word pointer use")
+            fields = line.split()
+            float_stores += fields[0] == "OpStore"
+            stem = "%x2w_float_" + (f"result_{fields[0][1:]}" if fields[0] != "OpStore" else f"store_{float_stores}")
+            new, label = float_access(fields, ids & physical_floats, valid_of, float_words, label, stem)
             final_label[origin] = label
             output.extend(new)
             continue
@@ -439,7 +507,8 @@ def lower(assembly):
             if line.split(" = ")[0] not in ("%_ptr_PC_UserData", "%_ptr_PC_uint", "%user_data"):
                 raise ValueError("unrecognized push-constant declaration")
             line = line.replace("PushConstant", "StorageBuffer")
-        elif any(word in line for word in ("PhysicalStorageBuffer", "OpConvertUToPtr", "OpConvertPtrToU", "%_ptr_PSB_arr")):
+        elif any(word in line for word in ("PhysicalStorageBuffer", "OpConvertUToPtr", "OpConvertPtrToU", "%_ptr_PSB_arr",
+                                                  "%_ptr_PSB_float")):
             raise ValueError("unhandled physical pointer operation")
         if " = OpPhi " in line:
             source_phis.append(len(output))

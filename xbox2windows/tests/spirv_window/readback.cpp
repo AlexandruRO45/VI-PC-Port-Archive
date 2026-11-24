@@ -65,6 +65,29 @@ constexpr SignedCase signed_cases[] = {
     {"signed write straddling the end of the descriptor", {4, 2, 52, 0}},
 };
 
+// A float case: base low, operand bits, destination byte address, base high. The shader loads the floats at base + 4,
+// base + 8 and base + 12, stores them at the destination address and the two words after it, then stores the operand
+// at the fourth word. Every move is a bit-cast, so a NaN payload and a negative zero must arrive unchanged.
+struct FloatCase {
+    const char* name;
+    std::array<UINT, 4> parameters;
+};
+
+constexpr UINT float_pi = 0x40490fdbu;
+constexpr FloatCase float_cases[] = {
+    {"float aligned", {8, float_pi, 44, 0}},
+    {"float NaN operand", {8, 0xffc00001u, 44, 0}},
+    {"float negative zero operand", {8, 0x80000000u, 44, 0}},
+    {"float misaligned base", {9, float_pi, 44, 0}},
+    {"float window end", {0xfffffff4u, float_pi, 44, 0}},
+    {"float base at the end of the window", {0xfffffffcu, float_pi, 44, 0}},
+    {"float index addition wraps", {0xfffffffcu, float_pi, 44, 0xffffffffu}},
+    {"float misaligned write", {8, float_pi, 45, 0}},
+    {"float write beyond descriptor", {8, float_pi, 64, 0}},
+    {"float write above the window", {8, float_pi, 0xfffffffcu, 0}},
+    {"float write straddling the end of the descriptor", {8, float_pi, 60, 0}},
+};
+
 // A QWORD case: base low, source QWORD index, destination byte address, base high. The shader adds the index
 // scaled by eight to the base, loads a QWORD there, adds one and stores it at the destination address.
 struct QwordCase {
@@ -174,6 +197,34 @@ void apply_signed_case(const SignedCase& test, std::array<UINT, 16>& words)
     for (uint64_t k = 0; k < 10; ++k) {
         const uint64_t address = static_cast<uint64_t>(test.parameters[2]) + 4 * k;
         if (address % 4 == 0 && address < 0xfffffffcull && address + 4 <= sizeof(words)) words[address / 4] = old[k];
+    }
+}
+
+// A quiet NaN with a payload, a negative zero and 1.5 where the shader loads, over words that would be wrong if read.
+void init_float_arena(std::array<UINT, 16>& words)
+{
+    words.fill(arena_fill);
+    words[3] = 0x7fc01234u;
+    words[4] = 0x80000000u;
+    words[5] = 0x3fc00000u;
+}
+
+// Independent CPU model of the float accesses. An address is used only when it is a multiple of four, below the
+// window end, and the base plus the offset does not wrap. The 64-byte view then returns zero for a read past it and
+// discards a write past it. All loads happen before any store, and a load that was not used yields the bit pattern 0.
+void apply_float_case(const FloatCase& test, std::array<UINT, 16>& words)
+{
+    const uint64_t base = (static_cast<uint64_t>(test.parameters[3]) << 32) | test.parameters[0];
+    const std::array<UINT, 16> source = words;
+    UINT value[4]{0, 0, 0, test.parameters[1]};
+    for (uint64_t k = 0; k < 3; ++k) {
+        const uint64_t address = base + 4 * (k + 1);
+        if (address < base || address % 4 != 0 || address >= 0xfffffffcull || address + 4 > sizeof(source)) continue;
+        value[k] = source[address / 4];
+    }
+    for (uint64_t k = 0; k < 4; ++k) {
+        const uint64_t address = static_cast<uint64_t>(test.parameters[2]) + 4 * k;
+        if (address % 4 == 0 && address < 0xfffffffcull && address + 4 <= sizeof(words)) words[address / 4] = value[k];
     }
 }
 
@@ -311,6 +362,11 @@ void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path)
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path)
 {
     check_window_cases(device, shader_path, signed_cases, init_signed_arena, apply_signed_case);
+}
+
+void check_spirv_window_float(ID3D12Device* device, const char* shader_path)
+{
+    check_window_cases(device, shader_path, float_cases, init_float_arena, apply_float_case);
 }
 
 void check_spirv_window_qword(ID3D12Device* device, const char* shader_path)

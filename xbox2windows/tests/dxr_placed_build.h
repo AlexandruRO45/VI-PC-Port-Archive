@@ -17,6 +17,22 @@ class PlacedBuildScene {
     Microsoft::WRL::ComPtr<IUnknown> guest_;
     std::array<Buffer, 5> buffers_;
 
+public:
+    void attach(ID3D12Device* device) {
+        device->AddRef();
+        x2w_startup::attach_device(device, reinterpret_cast<void**>(guest_.GetAddressOf()));
+    }
+    void* guest() const { return guest_.Get(); }
+    unsigned release() {
+        unsigned count = 0;
+        for (auto& buffer : buffers_) {
+            if (auto* wrapper = buffer.wrapper.Detach()) {
+                if (wrapper->Release()) throw std::runtime_error("Placed resource still referenced");
+                ++count;
+            }
+        }
+        return count;
+    }
     UINT64 place(unsigned index, UINT64 bytes, D3D12_RESOURCE_STATES state) {
         auto& buffer = buffers_.at(index);
         buffer.memory = VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -34,14 +50,12 @@ class PlacedBuildScene {
         return reinterpret_cast<UINT64>(buffer.memory);
     }
 
-public:
     void prepare(ID3D12Device* device,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& bottom_size,
         const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO& top_size,
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& bottom,
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC& top) {
-        device->AddRef();
-        x2w_startup::attach_device(device, reinterpret_cast<void**>(guest_.GetAddressOf()));
+        attach(device);
         constexpr UINT64 dest_offset = 512, scratch_offset = 768;
         constexpr auto dest_state = D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
         constexpr auto scratch_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -79,4 +93,13 @@ public:
             top_size.ResultDataMaxSizeInBytes, top_size.ScratchDataSizeInBytes);
     }
 };
+
+struct ResolvedBuild {
+    UINT64 dest, scratch;
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO sizes;
+};
+using ResolvedBatch = std::array<ResolvedBuild, 2>;
+struct BuildCounts { UINT records{}, submissions{}; };
+std::vector<UINT32> trace_placed_triangle(ID3D12Device* device, const ResolvedBatch* resolved,
+                                          PlacedBuildScene* placement = nullptr, BuildCounts* counts = nullptr);
 }

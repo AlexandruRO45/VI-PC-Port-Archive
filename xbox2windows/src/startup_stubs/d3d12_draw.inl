@@ -264,6 +264,8 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         // The pipeline's own description first (a derived pipeline overrides state), then its base's state block.
         std::size_t where = 0;
         const char* from = "none";
+        const char* refusal = nullptr;
+        unsigned refused_targets = 0;
         for (int depth = 0; info && info->path == 55 && info->base && depth < 8; ++depth) {
             if (!bound->has_blend && x2w_derived_blend::last_blend(info->desc.data(), info->desc.size(), bound->blend, where)) {
                 from = "derived blend patch";
@@ -274,6 +276,11 @@ BoundPipeline* translation_for(Wrapper* pipeline)
         if (!bound->has_blend && info && info->has_stream_blend) {
             from = "stream blend subobject";
             bound->blend = info->stream_blend;
+        } else if (!bound->has_blend && info && info->path == 57 &&
+                   x2w_startup::state_block_blend(info->state_a.data(), info->state_a.size(), false, &bound->blend, &refusal, &refused_targets)) {
+            // The colour-blend register words of a slot 57 pipeline (state_block_blend.h, #1216).
+            from = "colour-blend registers";
+            where = x2w_startup::state_block_blend_offset;
         } else if (!bound->has_blend && info && find_blend(info->state_a, &bound->blend, &where)) from = "state block A";
         else if (!bound->has_blend && info && find_blend(info->state_b, &bound->blend, &where)) from = "state block B";
         bound->has_blend = from[0] != 'n';
@@ -284,6 +291,8 @@ BoundPipeline* translation_for(Wrapper* pipeline)
                 "mask 0x%x; blocks %zu + %zu bytes", static_cast<void*>(pipeline), own ? own->path : 0, info ? info->path : 0, from, where,
                 t.BlendEnable, t.SrcBlend, t.DestBlend, t.BlendOp, t.SrcBlendAlpha, t.DestBlendAlpha, t.BlendOpAlpha, t.RenderTargetWriteMask,
                 info ? info->state_a.size() : 0, info ? info->state_b.size() : 0);
+            if (refusal || refused_targets)
+                log("x2w-draw   colour-blend registers not used: %s; refused targets 0x%x", refusal ? refusal : "refused", refused_targets);
             if (info && !bound->has_blend) {
                 char hex[3 * 0x1a0 + 1];
                 hex_text(info->state_a.data(), info->state_a.size() < 0x1a0 ? info->state_a.size() : 0x1a0, hex, sizeof(hex));

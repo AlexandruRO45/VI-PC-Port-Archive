@@ -257,8 +257,8 @@ def check_translator():
         ("vpminsw_xmm_still_carved_out", (*loads,
             Instruction.create_reg_reg_reg(Code.VEX_VPMINSW_XMM_XMM_XMMM128, R.XMM0, R.XMM1, R.XMM2), ret),
          "unsupported instruction"),
-        ("vpabsd_ymm_other_form", (*loads[:1], Instruction.create_reg_reg(
-            Code.VEX_VPABSD_YMM_YMMM256, R.YMM0, R.YMM1), ret),
+        ("vpmulld_ymm_other_form", (*loads, Instruction.create_reg_reg_reg(
+            Code.VEX_VPMULLD_YMM_YMM_YMMM256, R.YMM0, R.YMM1, R.YMM2), ret),
          "unsupported VEX.256 (L=1) packed-integer encoding"),
         ("vpmaxub_ymm_nonvolatile_dst", (*loads, Instruction.create_reg_reg_reg(
             Code.VEX_VPMAXUB_YMM_YMM_YMMM256, R.YMM6, R.YMM1, R.YMM2), ret), "nonvolatile vector register"),

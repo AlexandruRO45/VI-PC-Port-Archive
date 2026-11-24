@@ -50,6 +50,44 @@ static bool derive(void* device, void*& pipeline, bool child)
     return true;
 }
 
+// A slot-57 description as the stand-in reads it: 64-bit words 0 (root signature), 1-2 (state block
+// A and its size), 5-6 and 9-10 (the two shaders). spec lists "offset:word" pairs in hex, written
+// into a zeroed state block A; the colour-blend words of the eight targets start at +0xD0.
+// The shaders and the root signature are read from the files the stream pipeline was made from, so
+// both pipelines share one translation.
+static bool create_slot57(void* device, const char* vs_path, const char* ps_path, const char* root_path, const char* spec,
+                          void*& pipeline)
+{
+    static std::vector<char> vs, ps;
+    std::ifstream vs_file(vs_path, std::ios::binary), ps_file(ps_path, std::ios::binary), root_file(root_path, std::ios::binary);
+    vs.assign(std::istreambuf_iterator<char>(vs_file), {});
+    ps.assign(std::istreambuf_iterator<char>(ps_file), {});
+    const std::vector<char> blob{std::istreambuf_iterator<char>(root_file), {}};
+    if (vs.empty() || ps.empty() || blob.empty()) return false;
+    using CreateRoot = HRESULT (WINAPI*)(void*, UINT, const void*, SIZE_T, REFIID, void**);
+    void* root = nullptr;
+    if (FAILED(reinterpret_cast<CreateRoot>((*static_cast<void***>(device))[16])(device, 0, blob.data(), blob.size(),
+                                                                                  __uuidof(ID3D12RootSignature), &root))) return false;
+    alignas(8) static unsigned char desc[0x300];
+    alignas(8) static unsigned char state_a[0x200];
+    for (const char* at = spec; *at;) {
+        char* end = nullptr;
+        const unsigned long offset = std::strtoul(at, &end, 16);
+        if (*end != ':' || offset % 4 || offset + 4 > sizeof(state_a)) return false;
+        const UINT word = static_cast<UINT>(std::strtoul(end + 1, &end, 16));
+        std::memcpy(state_a + offset, &word, sizeof(word));
+        if (*end && *end != ',') return false;
+        at = *end ? end + 1 : end;
+    }
+    const UINT64 words[12] = {reinterpret_cast<UINT64>(root), reinterpret_cast<UINT64>(state_a), sizeof(state_a), 0, 0,
+                              reinterpret_cast<UINT64>(vs.data()), vs.size(), 0, 0, reinterpret_cast<UINT64>(ps.data()), ps.size(), 0};
+    std::memcpy(desc, words, sizeof(words));
+    using Create = HRESULT (WINAPI*)(void*, const void*, REFIID, void**);
+    pipeline = nullptr;
+    return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[57])(device, desc, __uuidof(ID3D12PipelineState), &pipeline)) &&
+           pipeline;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 4 && (argc < 6 || argc > 8) && argc != 10) return 2;
@@ -72,7 +110,14 @@ int main(int argc, char** argv)
     if (argc == 4) return 0;
     DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
     UINT export_word = 0;
-    if (argc == 7 && !std::isdigit(static_cast<unsigned char>(argv[6][0]))) {
+    bool two_targets = false;
+    if (argc == 8 && std::strncmp(argv[6], "slot57", 6) == 0) {
+        // The same shaders and root through device slot 57, with the given words in state block A.
+        // "slot57-mrt" binds a second RGBA8 target.
+        two_targets = std::strcmp(argv[6], "slot57-mrt") == 0;
+        if (!two_targets && std::strcmp(argv[6], "slot57") != 0) return 2;
+        if (!create_slot57(device, argv[1], argv[2], argv[3], argv[7], pso)) return 10;
+    } else if (argc == 7 && !std::isdigit(static_cast<unsigned char>(argv[6][0]))) {
         const std::string mode(argv[6]);
         if (mode != "parent-a8" && mode != "child-a8" && mode != "child-r8") return 2;
         if (!derive(device, pso, mode != "parent-a8")) return 10;
@@ -94,5 +139,5 @@ int main(int argc, char** argv)
         release_placed_vertices(true);
         return rc;
     }
-    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word);
+    return check_stream_draw(adapter.Get(), device, pso, argv[5], bc7.blocks ? &bc7 : nullptr, format, export_word, two_targets);
 }

@@ -92,6 +92,11 @@ LDS_RMW = {
     "ds_max_u32": "max({0}, {1})",
 }
 
+MUBUF_ATOMIC_REDUCTIONS = {
+    "add": "Add", "sub": "Add", "and": "And", "or": "Or", "xor": "Xor",
+    "smin": "Min", "umin": "Min", "smax": "Max", "umax": "Max",
+}
+
 
 def checked_group(group):
     """Return (x, y, z) within the D3D12 cs_6_0 numthreads limits."""
@@ -180,7 +185,12 @@ def labelled(decoded):
 
 MUBUF_UINT_FORMATS = tuple(f"BUF_FMT_{'32_' * count}UINT" for count in range(1, 5))
 MUBUF_SOURCE_FORMAT = MUBUF_UINT_FORMATS[-1]
+MUBUF_D16_OUTPUT_FORMATS = {1: "BUF_FMT_16_UINT", 2: "BUF_FMT_16_16_UINT", 4: "BUF_FMT_16_16_16_16_UINT"}
+MUBUF_OUTPUT_FORMATS = (*MUBUF_UINT_FORMATS, *MUBUF_D16_OUTPUT_FORMATS.values())
 MUBUF_TEXEL_BYTES = 16
+MUBUF_D16_SOURCE_FORMAT = "BUF_FMT_16_16_16_16_UINT"
+MUBUF_D16_TEXEL_BYTES = 8
+MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_FORMAT: MUBUF_D16_TEXEL_BYTES}
 
 
 def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, stride=None,
@@ -217,8 +227,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     if source_stride is not None and (source_descriptor is None or not 4 <= source_stride <= 0x3fff
                                       or source_stride % 4):
         raise ValueError("Indexed reads require a source binding and aligned stride")
-    if source_format is not None and (source_format != MUBUF_SOURCE_FORMAT or cpu != "gfx1030"
-                                      or source_stride is None or source_stride % MUBUF_TEXEL_BYTES):
+    source_texel_bytes = MUBUF_SOURCE_TEXELS.get(source_format)
+    if source_format is not None and (source_texel_bytes is None or cpu != "gfx1030"
+                                      or source_stride is None or source_stride % source_texel_bytes):
         raise ValueError("Unsupported formatted source binding")
     if image_descriptor is not None or image_format is not None:
         # The 8-dword image descriptor occupies two 16-byte slots, both bound to t0.
@@ -236,7 +247,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         raise ValueError("Invalid group register")
     if stride is not None and (not group_regs or not 4 <= stride <= 0x3fff or stride % 4):
         raise ValueError("Indexed stores require a group register and aligned stride")
-    if output_format is not None and (output_format not in MUBUF_UINT_FORMATS or cpu != "gfx1030"
+    if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
     scalar = {table_reg: "table"}
@@ -248,6 +259,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    atomic_reduction = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
     ds_step_count = 0
@@ -1066,21 +1078,16 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
         elif m := re.fullmatch(r"(?:buffer_load_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>[us](?:byte|short))"
                                r"|(?P<d16_kind>[us]byte|short)_d16(?P<hi>_hi)?)"
                                r"|tbuffer_load_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))"
-                               r"|buffer_load_format_(?P<resource_channels>x|xy|xyz|xyzw)) "
+                               r"|buffer_load_format_(?P<resource_channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<dst>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+), s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(channels) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?"
                                r"(?: offset:(?P<offset>\d+))?", line):
-            channels = m["channels"]
-            packed = channels is not None and channels.startswith("d16_")
+            channels, resource_channels = m["channels"], m["resource_channels"]
+            suffix = channels or resource_channels
+            packed = suffix is not None and suffix.startswith("d16_")
             raw_count = m["raw_count"]
-            resource_channels = m["resource_channels"]
-            if channels:
-                components = len(channels.removeprefix("d16_"))
-            elif resource_channels:
-                components = len(resource_channels)
-            else:
-                components = int(raw_count or 1)
+            components = len(suffix.removeprefix("d16_")) if suffix else int(raw_count or 1)
             count = (components + 1) // 2 if packed else components
             dst, *last = map(int, re.findall(r"\d+", m["dst"]))
             base, high = int(m["base"]), int(m["high"])
@@ -1100,6 +1107,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                     raise ValueError("Unsupported formatted buffer read target or address mode")
                 if source_format is None:
                     raise ValueError("Formatted buffer reads require a source format")
+                expected = MUBUF_D16_SOURCE_FORMAT if packed else MUBUF_SOURCE_FORMAT
+                if source_format != expected:
+                    raise ValueError("Formatted buffer read does not match source format")
             # The three-component D16 form uses the four-component 16-bit format.
             format_components = 4 if packed and components == 3 else components
             if channels and m["format"] != f"BUF_FMT_{('16_' if packed else '32_') * format_components}UINT":
@@ -1118,7 +1128,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Reads from the stored UAV are not supported")
             if kinds != tuple(("srv", i) for i in range(4)):
                 raise ValueError("Unverified buffer read descriptor")
-            alignment = MUBUF_TEXEL_BYTES if resource_channels else width
+            alignment = source_texel_bytes if resource_channels else width
             if offset % alignment or offset > 4095:
                 raise ValueError("Unverified read offset")
             tag = vector.get(int(addr[1:])) if addr != "off" else None
@@ -1132,7 +1142,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                   and tag[0] == "thread"):
                 # idxen: index * stride + instruction offset, inside one source element.
                 # A formatted load selects a prefix of a complete four-component texel.
-                read_bytes = MUBUF_TEXEL_BYTES if resource_channels else width * count
+                read_bytes = source_texel_bytes if resource_channels else width * count
                 if offset + read_bytes > source_stride:
                     raise ValueError("Read leaves its source element")
                 aligned = offset & ~3
@@ -1211,12 +1221,41 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 reg = first + index
                 vector.pop(reg, None)
                 loading[reg] = ("alu", f"{name}.{component}")
+        elif m := re.fullmatch(rf"buffer_atomic_({'|'.join(MUBUF_ATOMIC_REDUCTIONS)}) "
+                               r"v(\d+), off, s\[(\d+):(\d+)\], 0(?: offset:(\d+))?", line):
+            if cpu != "gfx1030" or stride is not None or output_format is not None:
+                raise ValueError("Unsupported atomic reduction target or binding")
+            if stores:
+                raise ValueError("An atomic reduction must be the only UAV operation")
+            op = m[1]
+            src, base, high = map(int, m.groups()[1:4])
+            offset = int(m[5] or 0)
+            if (high != base + 3 or base % 4 or pending.intersection(range(base, high + 1))
+                    or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
+                raise ValueError("Unverified atomic reduction descriptor")
+            if offset > 4095 or offset % 4:
+                raise ValueError("Unverified atomic reduction address")
+            value = vector.get(src)
+            if src > 255 or not is_word(value):
+                raise ValueError("Atomic reduction data is not a known word")
+            word = hlsl_word(value)
+            signed = op in ("smin", "smax")
+            if signed:
+                word = f"asint({word})"
+            elif op == "sub":
+                word = f"(0u - {word})"
+            # The pre-operation value has no consumer. Use the matching signedness of the DXIL overload.
+            stores.extend((f"    {'int' if signed else 'uint'} ignoredAtomic;",
+                           f"    outputData.Interlocked{MUBUF_ATOMIC_REDUCTIONS[op]}({offset}u, {word}, ignoredAtomic);"))
+            atomic_reduction = True
         elif m := re.fullmatch(r"(?:buffer_store_(?:dword(?:x(?P<raw_count>[234]))?|(?P<subword>byte|short)(?P<store_hi>_d16_hi)?)|"
                                r"(?P<typed>t)?buffer_store_format_(?P<channels>(?:d16_)?(?:x|xy|xyz|xyzw))) "
                                r"(?P<data>v\d+|v\[\d+:\d+\]), (?P<addr>off|v\d+|v\[\d+:\d+\]), "
                                r"s\[(?P<base>\d+):(?P<high>\d+)\], 0"
                                r"(?(typed) format:\[(?P<format>BUF_FMT_(?:(?:32_){1,4}|(?:16_){1,4})UINT)\])"
                                r"(?P<idxen> idxen)?(?P<offen> offen)?(?: offset:(?P<offset>\d+))?", line):
+            if atomic_reduction:
+                raise ValueError("An atomic reduction must be the only UAV operation")
             channels = m["channels"]
             packed = channels is not None and channels.startswith("d16_")
             components = len(channels.removeprefix("d16_")) if channels else int(m["raw_count"] or 1)
@@ -1233,12 +1272,15 @@ def lower(instructions, group, *, table_reg, descriptor_offset, group_reg=None, 
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
             formatted = channels is not None and not m["typed"]
             if formatted:
-                if cpu != "gfx1030" or packed or not idxen or offen:
+                if cpu != "gfx1030" or not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
                 if output_format is None:
                     raise ValueError("Formatted buffer stores require an output format")
                 # Only whole texels with identity selectors are proven here.
-                if output_format != MUBUF_UINT_FORMATS[components - 1]:
+                if packed and components not in MUBUF_D16_OUTPUT_FORMATS:
+                    raise ValueError("Formatted D16 buffer store requires a matching whole-texel format")
+                expected = MUBUF_D16_OUTPUT_FORMATS[components] if packed else MUBUF_UINT_FORMATS[components - 1]
+                if output_format != expected:
                     raise ValueError("Formatted buffer store width does not match output format")
             first, *last = map(int, re.findall(r"\d+", m["data"]))
             base, high = int(m["base"]), int(m["high"])
@@ -1390,9 +1432,9 @@ def main():
     parser.add_argument("--source-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset bound to stable read-only t0, with no overlap with u0")
     parser.add_argument("--source-stride", type=int, help="Indexed t0 byte stride")
-    parser.add_argument("--source-format", choices=(MUBUF_SOURCE_FORMAT,),
+    parser.add_argument("--source-format", choices=MUBUF_SOURCE_TEXELS,
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
-    parser.add_argument("--output-format", choices=MUBUF_UINT_FORMATS,
+    parser.add_argument("--output-format", choices=MUBUF_OUTPUT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
                         help="Table byte offset of the 8-dword image descriptor bound to t0")

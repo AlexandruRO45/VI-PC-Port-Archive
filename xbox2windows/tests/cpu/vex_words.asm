@@ -160,4 +160,59 @@ cmp_words PROC FRAME
     vmovdqu xmmword ptr [r8], xmm1
     ret
 cmp_words ENDP
+; Shifts by a count held in a register or in memory. The count is the low 64 bits of the count
+; operand as one unsigned integer, so any value above 15 (also 2^32 and 2^32 + 1, whose low 32 bits
+; are small) clears the lanes of a logical shift and fills those of an arithmetic one with the sign.
+; The upper quadword of the count operand is ignored. A is [RCX], the count operand is [RDX].
+sraw_count_reg PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vmovdqu xmm1, xmmword ptr [rdx]
+    vpsraw xmm2, xmm0, xmm1
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+sraw_count_reg ENDP
+
+sraw_count_mem PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vpsraw xmm2, xmm0, xmmword ptr [rdx]
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+sraw_count_mem ENDP
+
+sllw_count_reg PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vmovdqu xmm1, xmmword ptr [rdx]
+    vpsllw xmm2, xmm0, xmm1
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+sllw_count_reg ENDP
+
+sllw_count_mem PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vpsllw xmm2, xmm0, xmmword ptr [rdx]
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+sllw_count_mem ENDP
+
+srlw_count_reg PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vmovdqu xmm1, xmmword ptr [rdx]
+    vpsrlw xmm2, xmm0, xmm1
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+srlw_count_reg ENDP
+
+srlw_count_mem PROC FRAME
+    .endprolog
+    vmovdqu xmm0, xmmword ptr [rcx]
+    vpsrlw xmm2, xmm0, xmmword ptr [rdx]
+    vmovdqu xmmword ptr [r8], xmm2
+    ret
+srlw_count_mem ENDP
+
 END
