@@ -40,6 +40,17 @@ fn host_gpu_failed(what: &str) -> ! {
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
+    // The title's visible window is the console's own `sgaWindowClass`, so its
+    // window procedure never sees a key this process should read: the hook is
+    // taken with the shader cache, before the title runs, on a thread of its
+    // own, and lives for the run.
+    #[cfg(windows)]
+    {
+        use std::sync::OnceLock;
+        static KEYS: OnceLock<victory_gpu::keys::hook::Installed> = OnceLock::new();
+        KEYS.get_or_init(victory_gpu::keys::hook::install);
+    }
+
     #[cfg(windows)]
     {
         victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
