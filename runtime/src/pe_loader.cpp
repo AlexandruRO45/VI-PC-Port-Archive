@@ -1094,6 +1094,10 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    if (registered_xmem_hooks_) {
+        shims::notify_xmem_allocation_hooks(nullptr);
+        registered_xmem_hooks_ = false;
+    }
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -1353,11 +1357,22 @@ void Loader::initialise() {
 void Loader::initialise(Module& m) {
     if (m.initialised) return;
 
+    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL)) {
+        if (const auto hooks = m.exports.find("__XMemAllocationHooks__"); hooks != m.exports.end()) {
+            const auto addr = reinterpret_cast<uintptr_t>(hooks->second);
+            const auto base = reinterpret_cast<uintptr_t>(m.base);
+            if (addr >= base && addr + sizeof(void*) * 2 <= base + m.size) {
+                shims::notify_xmem_allocation_hooks(hooks->second);
+                registered_xmem_hooks_ = true;
+            }
+        }
+    }
+
     // TLS was installed by load(); initialise() only delivers the events, so no slot is allocated or written twice.
     run_tls_callbacks(m, DLL_PROCESS_ATTACH);
 
     // Only a DLL gets DllMain. An EXE's entry point has a different signature and is the caller's to run.
-    auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
         // lpvReserved "is NULL for dynamic loads and non-NULL for static loads" (DllMain docs). What Windows points
