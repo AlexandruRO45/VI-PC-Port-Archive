@@ -314,6 +314,35 @@ mod tests {
         assert_eq!((base.filter, base.mip_lod_bias), (0x15, 0.5));
     }
 
+    /// Bits of words 0 and 3 outside the address, anisotropy, comparison,
+    /// reduction and border fields change nothing either: word 0's 15-28
+    /// and 31 sit between and past the decoded fields, and word 3 is read
+    /// only at its top two bits.
+    #[test]
+    fn undecoded_bits_of_words_0_and_3_are_ignored() {
+        // Clamp, border and wrap, anisotropy 4, less-equal, minimum
+        // reduction, opaque white, over a linear mip with an LOD range.
+        let (w0, w3) = (0x2000_3432, 0x8000_0000);
+        let (w1, w2) = (0x0054_0100, 0x0850_0080);
+        let base = StaticSampler::from_words([w0, w1, w2, w3]);
+        let unused_w0 = 0x1FFF_8000 | 0x8000_0000;
+        let unused_w3 = 0x3FFF_FFFF;
+        assert_eq!(
+            StaticSampler::from_words([w0 | unused_w0, w1, w2, w3 | unused_w3]),
+            base
+        );
+        assert_eq!(
+            (base.address, base.max_anisotropy, base.comparison),
+            ([3, 4, 1], 4, 4)
+        );
+        assert_eq!((base.filter, base.border), (0x115, 2));
+        // The unused bits alone are the all-zero sampler.
+        assert_eq!(
+            StaticSampler::from_words([unused_w0, 0, 0, unused_w3]),
+            StaticSampler::from_words([0; 4])
+        );
+    }
+
     /// The clamp sits exactly at D3D12's bounds: the last bias step below
     /// 15.99 is kept and the next clamps; -16 and the step above it are kept.
     #[test]
