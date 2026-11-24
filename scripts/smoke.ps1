@@ -2,13 +2,14 @@
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
-#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe]
+#   .\scripts\smoke.ps1 -Game 'D:\Games\SomeTitle' [-Seconds 60] [-Xcl .\target\release\xcl.exe] [-Title <label>]
 #
 # Networking is off (XCL_NETWORK=0). Build first: cargo build --release -p xcl
 param(
     [Parameter(Mandatory = $true)][string]$Game,
     [int]$Seconds = 60,
-    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe')
+    [string]$Xcl = (Join-Path $PSScriptRoot '..\target\release\xcl.exe'),
+    [string]$Title = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -16,6 +17,23 @@ if (-not (Test-Path $Xcl)) { throw "no $Xcl - build it first (cargo build --rele
 $root = Split-Path $PSScriptRoot -Parent
 $commit = (git -C $root rev-parse HEAD).Trim()
 $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates Cargo.toml Cargo.lock)
+
+# Print a stable, non-identifying label for the title instead of its folder name
+# (issue #677): folder names leak the retail title. A caller may pass -Title to
+# use a readable label of their own.
+if ($Title) {
+    $titleLabel = $Title
+} else {
+    $leaf = Split-Path $Game -Leaf
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($leaf.ToLowerInvariant())
+        $hash = $sha.ComputeHash($bytes)
+        $titleLabel = ([BitConverter]::ToString($hash) -replace '-', '').Substring(0, 8).ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
 
 # Use ProcessStartInfo instead of Start-Process: the latter cannot build its
 # environment block on Windows PowerShell 5.1 when PATH is present twice with
@@ -73,7 +91,7 @@ $code = if ($timedOut) { 'killed (no exit)' } else { '0x{0:x}' -f $p.ExitCode }
 xcl-smoke v1
 commit: $commit$(if ($dirty) { ' (uncommitted changes)' })
 gpu: $gpu
-title: $(Split-Path $Game -Leaf)
+title: $titleLabel
 seconds: $Seconds
 exit: $code
 frames shown: $frames
