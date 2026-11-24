@@ -91,23 +91,40 @@ impl FileConfig {
     /// drive path on another host is refused (see [`ensure_native`]) rather
     /// than anchored here as a relative path, and so is a path holding a
     /// control character (see [`ensure_no_control`]).
+    ///
+    /// An empty value (`game_dir = ""`, a blank a template leaves to fill
+    /// in, or `test_titles = [""]`) counts as unset, like an empty variable.
+    /// Anchored, it would be the config file's own folder (often the
+    /// repository), or with `./victory.toml` the empty path, which reads
+    /// and writes the working directory.
     fn anchored_at(self, dir: &Path, home: Option<&Path>) -> Result<FilePaths> {
         let anchor = |key: &str, p: PathBuf| -> Result<PathBuf> {
             check_setting(&format!("[paths].{key}"), &p)?;
             let p = expand_home(p, home);
             Ok(if p.is_relative() { dir.join(p) } else { p })
         };
+        let set = |p: &PathBuf| !p.as_os_str().is_empty();
         let paths = self.paths;
         Ok(FilePaths {
-            game_dir: paths.game_dir.map(|p| anchor("game_dir", p)).transpose()?,
+            game_dir: paths
+                .game_dir
+                .filter(set)
+                .map(|p| anchor("game_dir", p))
+                .transpose()?,
             cache_dir: paths
                 .cache_dir
+                .filter(set)
                 .map(|p| anchor("cache_dir", p))
                 .transpose()?,
-            data_dir: paths.data_dir.map(|p| anchor("data_dir", p)).transpose()?,
+            data_dir: paths
+                .data_dir
+                .filter(set)
+                .map(|p| anchor("data_dir", p))
+                .transpose()?,
             test_titles: paths
                 .test_titles
                 .into_iter()
+                .filter(set)
                 .map(|p| anchor("test_titles", p))
                 .collect::<Result<_>>()?,
         })
@@ -863,6 +880,37 @@ mod tests {
         assert_eq!(paths.cache_dir.unwrap(), PathBuf::from(abs("elsewhere")));
         assert_eq!(paths.data_dir, None);
         assert_eq!(paths.test_titles, vec![dir.join("t/one")]);
+    }
+
+    #[test]
+    fn empty_file_values_count_as_unset() {
+        let text = "[paths]\ngame_dir = ''\ncache_dir = \"\"\ndata_dir = ''\n\
+                    test_titles = ['', 't/one', '']\n";
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        let dir = PathBuf::from(abs("configs"));
+        let paths = parsed.anchored_at(&dir, None).unwrap();
+        // Not the config file's folder.
+        assert_eq!(paths.game_dir, None);
+        assert_eq!(paths.cache_dir, None);
+        assert_eq!(paths.data_dir, None);
+        assert_eq!(paths.test_titles, vec![dir.join("t/one")]);
+        // With `./victory.toml` they are not the empty path either, and the
+        // defaults apply with nothing said to come from the file.
+        let parsed: FileConfig = toml::from_str(text).unwrap();
+        let paths = parsed.anchored_at(Path::new(""), None).unwrap();
+        let env = |k: &str| match k {
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(paths, None, env).unwrap();
+        assert_eq!(cfg.game_dir, None);
+        assert!(cfg.cache_dir.is_absolute(), "{}", cfg.cache_dir.display());
+        assert!(cfg.data_dir.is_absolute(), "{}", cfg.data_dir.display());
+        assert_eq!(cfg.origins.game_dir, Origin::Default);
+        assert_eq!(cfg.origins.cache_dir, Origin::Default);
+        assert_eq!(cfg.origins.data_dir, Origin::Default);
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("t/one")]);
+        assert_eq!(cfg.origins.test_titles, Origin::File);
     }
 
     #[test]
