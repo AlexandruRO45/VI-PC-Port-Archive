@@ -151,22 +151,34 @@ fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
-fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+fn tmp_sibling(dest: &Path, tag: &str) -> std::io::Result<PathBuf> {
     let parent = dest
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory"))?;
     let id = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!("{TMP_PREFIX}{}.{id}", std::process::id()));
+    Ok(parent.join(format!("{TMP_PREFIX}{tag}{}.{id}", std::process::id())))
+}
+
+/// Write and flush `data` into a unique sibling temporary file for `dest`.
+fn write_staged(dest: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let tmp = tmp_sibling(dest, "")?;
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
-        drop(f);
-        replace_file(&tmp, dest)?;
         Ok(())
     })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res.map(|()| tmp)
+}
+
+/// Write `data` to a unique sibling temp file, flush to disk, and atomically replace `dest`.
+fn write_atomic(dest: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = write_staged(dest, data)?;
+    let res = replace_file(&tmp, dest);
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -561,29 +573,113 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
+fn rollback_applied(applied: Vec<(PathBuf, Option<PathBuf>)>) {
+    for (dest, bak) in applied.into_iter().rev() {
+        match bak {
+            Some(b) => {
+                if replace_file(&b, &dest).is_err() {
+                    let _ = std::fs::remove_file(b);
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(dest);
+            }
+        }
+    }
+}
+
+fn remove_staged(items: impl IntoIterator<Item = (PathBuf, Option<PathBuf>)>) {
+    for (_, tmp) in items {
+        if let Some(p) = tmp {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
     let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
     let blobs = dir.join("b");
     if std::fs::create_dir_all(&blobs).is_err() {
         return crate::util::E_FAIL;
     }
-    if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
-            return crate::util::E_FAIL;
-        }
-    }
+    let mut coalesced: std::collections::BTreeMap<PathBuf, Option<&[u8]>> = std::collections::BTreeMap::new();
     for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
+        coalesced.insert(blobs.join(enc(name)), data.as_deref());
+    }
+    let mut targets: Vec<(PathBuf, Option<&[u8]>)> = Vec::with_capacity(coalesced.len() + usize::from(display.is_some()));
+    if let Some(d) = display {
+        targets.push((dir.join("display"), Some(d.as_bytes())));
+    }
+    targets.extend(coalesced);
+
+    // Phase 1: stage and flush every write into sibling temp files before touching existing state.
+    let mut staged: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(targets.len());
+    for (dest, data) in targets {
+        let tmp = match data {
+            Some(bytes) => match write_staged(&dest, bytes) {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    remove_staged(staged);
                     return crate::util::E_FAIL;
                 }
+            },
+            None => None,
+        };
+        staged.push((dest, tmp));
+    }
+
+    // Phase 2: back up existing targets and apply replacements/deletes, rolling back on any failure.
+    let mut applied: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(staged.len());
+    let mut it = staged.into_iter();
+    while let Some((dest, tmp)) = it.next() {
+        let bak = if dest.symlink_metadata().is_ok() {
+            let Ok(b) = tmp_sibling(&dest, "bak.") else {
+                if let Some(p) = tmp {
+                    let _ = std::fs::remove_file(p);
+                }
+                remove_staged(it);
+                rollback_applied(applied);
+                return crate::util::E_FAIL;
+            };
+            if std::fs::copy(&dest, &b).is_err() {
+                let _ = std::fs::remove_file(&b);
+                if let Some(p) = tmp {
+                    let _ = std::fs::remove_file(p);
+                }
+                remove_staged(it);
+                rollback_applied(applied);
+                return crate::util::E_FAIL;
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
+            Some(b)
+        } else {
+            None
+        };
+        let step = match &tmp {
+            Some(p) => replace_file(p, &dest),
+            None => match std::fs::remove_file(&dest) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            },
+        };
+        if step.is_err() {
+            if let Some(b) = bak {
+                let _ = std::fs::remove_file(b);
             }
+            if let Some(p) = tmp {
+                let _ = std::fs::remove_file(p);
+            }
+            remove_staged(it);
+            rollback_applied(applied);
+            return crate::util::E_FAIL;
+        }
+        applied.push((dest, bak));
+    }
+
+    // Phase 3: all mutations succeeded; discard backups.
+    for (_, bak) in applied {
+        if let Some(b) = bak {
+            let _ = std::fs::remove_file(b);
         }
     }
     S_OK
@@ -1132,6 +1228,78 @@ mod tests {
             XGameSaveCloseProvider(p);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn failed_submit_update_rolls_back_writes_and_deletes_without_leftovers() {
+        let dir = std::env::temp_dir().join(format!("xcl-gs-atomic-{}-{}", std::process::id(), NEXT_TMP.fetch_add(1, Ordering::Relaxed)));
+        let blobs = dir.join("b");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        // Seed initial container state: display "Old", blob "a" = "old".
+        assert_eq!(apply(&dir, Some("Old"), &[("a".into(), Some(b"old".to_vec()))]), S_OK);
+
+        // 1. Directory obstacle at blob "b" makes committing "b" fail: display, "a", and new "c" roll back.
+        std::fs::create_dir_all(blobs.join(enc("b"))).unwrap();
+        let ops = vec![
+            ("a".into(), Some(b"new".to_vec())),
+            ("c".into(), Some(b"created".to_vec())),
+            ("b".into(), Some(b"fail".to_vec())),
+        ];
+        assert_eq!(apply(&dir, Some("New"), &ops), E_FAIL);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Old");
+        assert_eq!(std::fs::read(blobs.join(enc("a"))).unwrap(), b"old");
+        assert!(!blobs.join(enc("c")).exists());
+
+        // 2. Delete "a" + fail on "b" must restore deleted "a" to "old".
+        let del_ops = vec![("a".into(), None), ("b".into(), Some(b"fail".to_vec()))];
+        assert_eq!(apply(&dir, Some("New"), &del_ops), E_FAIL);
+        assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Old");
+        assert_eq!(std::fs::read(blobs.join(enc("a"))).unwrap(), b"old");
+        std::fs::remove_dir(blobs.join(enc("b"))).unwrap();
+
+        // 3. Locked regular file at "b" (replace_file failure after backup copy) also rolls back.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::write(blobs.join(enc("b")), b"keep-b").unwrap();
+            let _lock = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1) // FILE_SHARE_READ only: copy succeeds, MoveFileExW replace fails
+                .open(blobs.join(enc("b")))
+                .unwrap();
+            assert_eq!(apply(&dir, Some("New"), &ops), E_FAIL);
+            drop(_lock);
+            assert_eq!(std::fs::read_to_string(dir.join("display")).unwrap(), "Old");
+            assert_eq!(std::fs::read(blobs.join(enc("a"))).unwrap(), b"old");
+            assert_eq!(std::fs::read(blobs.join(enc("b"))).unwrap(), b"keep-b");
+            assert!(!blobs.join(enc("c")).exists());
+        }
+
+        // 4. Duplicate blob ops in one update coalesce (last op wins).
+        assert_eq!(
+            apply(
+                &dir,
+                None,
+                &[
+                    ("a".into(), Some(b"v1".to_vec())),
+                    ("a".into(), Some(b"v2".to_vec())),
+                    ("d".into(), Some(b"temp".to_vec())),
+                    ("d".into(), None),
+                ]
+            ),
+            S_OK
+        );
+        assert_eq!(std::fs::read(blobs.join(enc("a"))).unwrap(), b"v2");
+        assert!(!blobs.join(enc("d")).exists());
+
+        // No ~xcltmp.* staging or backup files left behind anywhere in container or blobs dir.
+        for d in [&dir, &blobs] {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                assert!(!e.file_name().to_string_lossy().starts_with(TMP_PREFIX), "leftover temp file: {:?}", e.path());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }
