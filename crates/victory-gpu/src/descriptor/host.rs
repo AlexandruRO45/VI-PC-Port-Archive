@@ -240,8 +240,12 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
+        // Search from `next` on, then from the start — extending up to
+        // `next + n - 1` so free runs straddling `next` are not missed (#871).
+        let wrap_end = (*next as usize)
+            .saturating_add(n - 1)
+            .min(self.dynamic as usize);
+        let starts = (*next as usize..self.dynamic as usize).chain(0..wrap_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -623,6 +627,7 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// address and length.
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
+        &View::Constant(address, size) => return Some((address, u64::from(size))),
         View::Shader(r, Some(desc)) => (
             crate::resource::buffer_bytes(*r as crate::object::This)?.0 as u64,
             desc,
@@ -813,6 +818,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
+    // Packed 16-bit textures (`B5G6R5_UNORM`, `B5G5R5A1_UNORM`, `B4G4R4A4_UNORM`)
+    // that were widened to `R8G8B8A8_UNORM` (`28`) for RTV/UAV compatibility (#797).
+    if own == 28 && matches!(view, 85 | 86 | 115) {
+        if let Some(format) = format {
+            *format = d.Format;
+        }
+        return true;
+    }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
         return false;
@@ -873,6 +886,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            let padded = size.next_multiple_of(256);
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -882,11 +896,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 );
                 return None;
             }
+            if shadow.left(address) < u64::from(padded) {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    size,
+                    left = shadow.left(address),
+                    "constant buffer padded size reaches past its host copy"
+                );
+                return None;
+            }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: padded,
             };
-            // SAFETY: a slot of our heap; the range lies in the host copy.
+            // SAFETY: a slot of our heap; the 256-byte-rounded range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
         }
@@ -1261,6 +1284,34 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A contiguous free run that straddles the scan cursor `next` must still
+    /// be found on wraparound instead of spuriously returning `None` (#871).
+    #[test]
+    fn dynamic_slots_find_runs_straddling_next_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let d = heap.dynamic;
+        // Take the whole heap as three blocks: [0..10], [10..20], [20..d].
+        let a = heap.dynamic(10).unwrap();
+        let b = heap.dynamic(10).unwrap();
+        let c = heap.dynamic(d - 20).unwrap();
+        assert_eq!((a, b, c), (4, 14, 24));
+        // Free [0..10] and re-take [0..10] so `next` moves to 10; then free
+        // [6..10] and [10..16] creating a 10-slot free run [6..16] straddling
+        // `next == 10`, with nothing else free in the heap.
+        heap.release(a, 10);
+        assert_eq!(heap.dynamic(10), Some(4));
+        // `next` is now 10.
+        heap.release(4 + 6, 4); // free [6..10)
+        heap.release(4 + 10, 6); // free [10..16)
+        assert_eq!(
+            heap.dynamic(10),
+            Some(4 + 6),
+            "10-slot run straddling next=10 must be allocated"
+        );
     }
 
     #[test]

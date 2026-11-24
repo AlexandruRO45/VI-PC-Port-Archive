@@ -158,6 +158,10 @@ pub struct Waterfall {
     /// Descriptor loads at a table offset among `reads` (the console
     /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
+    /// Size-query waterfall loads that have no texture/buffer access inside
+    /// their own loop, mapped to an accessed load of the same table entry so
+    /// lowering knows the view's kind.
+    pub sizes: HashMap<Site, Site>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -299,6 +303,96 @@ pub fn track(
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
+        }
+    }
+    // Size-query waterfall loops: `v_readfirstlane_b32` + `v_cmpx_eq_u32` +
+    // `s_load_dword*` + bitfield extract into VGPR without a texture/buffer
+    // access inside the loop. Pair each candidate load with an accessed load
+    // of the exact same table entry (same table address & per-lane offset),
+    // and prove the loop using its per-lane VGPR writes as the accesses.
+    let offset_lane = |addr: &Address| -> Option<Term> {
+        if addr.param == CODE || addr.rel.is_some() {
+            return None;
+        }
+        let Term::Value(d) = addr.dynamic.map(|v| t.origin(v))? else {
+            return None;
+        };
+        let lane = t.first_lane_source(d).unwrap_or(d);
+        Some(t.lane_term(Term::Value(lane)))
+    };
+    let mut accessed_entries: Vec<(usize, u32, u32, Term, Site)> = Vec::new();
+    for d in &out.descriptors {
+        if d.role != Role::Resource {
+            continue;
+        }
+        for leaf in d.source.leaves() {
+            if let Source::Loaded { load, .. } = *leaf
+                && let Some((_, addr)) = out.scalar.iter().find(|s| s.0 == load)
+                && let Some(lane_term) = offset_lane(addr)
+            {
+                accessed_entries.push((addr.param, addr.param_dword, addr.offset, lane_term, load));
+            }
+        }
+    }
+    if !accessed_entries.is_empty() {
+        let mut size_loops =
+            std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<(Site, Site)>)>::new();
+        for &(load_site, ref addr) in &out.scalar {
+            if out.waterfall.loads.contains(&load_site) {
+                continue;
+            }
+            if !t.inst(load_site).name().starts_with("s_load_dword") {
+                continue;
+            }
+            if addr.param == CODE || addr.rel.is_some() {
+                continue;
+            }
+            let Some(Term::Value(v)) = addr.dynamic.map(|d| t.origin(d)) else {
+                continue;
+            };
+            let Some(lane_src) = t.first_lane_source(v) else {
+                continue;
+            };
+            let lane_term = t.lane_term(Term::Value(lane_src));
+            let Some(&(_, _, _, _, paired)) = accessed_entries.iter().find(|&&(p, pd, o, lt, _)| {
+                p == addr.param && pd == addr.param_dword && o == addr.offset && lt == lane_term
+            }) else {
+                continue;
+            };
+            let (b, li) = load_site;
+            let writes: Vec<usize> = p.blocks[b]
+                .insts
+                .iter()
+                .enumerate()
+                .skip(li + 1)
+                .filter(|(_, inst)| {
+                    !inst.name().starts_with("v_cmp")
+                        && inst.name() != "v_readfirstlane_b32"
+                        && inst.writes.iter().any(|(r, _)| matches!(r, Reg::V(_)))
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if writes.is_empty() {
+                continue;
+            }
+            let entry = size_loops.entry(b).or_default();
+            entry.0.extend(writes);
+            entry.1.push(v);
+            entry.2.push((load_site, paired));
+        }
+        for (block, (mut accesses, mut reads, pairs)) in size_loops {
+            accesses.sort_unstable();
+            accesses.dedup();
+            reads.sort_unstable();
+            reads.dedup();
+            if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                for (size_load, paired) in pairs {
+                    out.waterfall.loads.push(size_load);
+                    out.waterfall.sizes.insert(size_load, paired);
+                }
+            }
         }
     }
     Ok(out)
@@ -3126,7 +3220,7 @@ pub(crate) mod tests {
         let image = r
             .descriptors
             .iter()
-            .find(|d| d.role == Role::Resource)
+            .find(|d| matches!(d.role, Role::Resource))
             .unwrap();
         let Source::Loaded { load, first: 0 } = image.source else {
             panic!("{:?}", image.source)
@@ -3136,6 +3230,83 @@ pub(crate) mod tests {
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// Two console waterfall loops over the same per-lane table offset `v7`:
+    /// the first only queries `height - 1` from `T#` dword 2 into `v4` (no
+    /// texture access inside that loop); the second samples the same entry.
+    pub(crate) const WATERFALL_SIZE_AND_SAMPLE_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0x7E08_0280, // v_mov_b32 v4, 0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        // Loop 1: per-lane size query without an image access.
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x9016_8E0E, // s_lshr_b32 s22, s14, 14
+        0x7E08_0216, // v_mov_b32 v4, s22
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF7, // s_cbranch_execnz -> loop 1
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        // Loop 2: per-lane sample of the same table entry.
+        0x7E28_0507, // v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> loop 2
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0x7E08_0D04, // v_cvt_f32_u32 v4, v4
+        0x0618_090C, // v_add_f32 v12, v12, v4
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn size_query_waterfall_without_access_pairs_with_sample_loop() {
+        let r = waterfall(WATERFALL_SIZE_AND_SAMPLE_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded {
+            load: sample_load,
+            first: 0,
+        } = image.source
+        else {
+            panic!("{:?}", image.source);
+        };
+        assert_eq!(r.waterfall.sizes.len(), 1);
+        let (&size_load, &paired) = r.waterfall.sizes.iter().next().unwrap();
+        assert_eq!(paired, sample_load);
+        assert_ne!(size_load, sample_load);
+        assert!(r.waterfall.loads.contains(&sample_load));
+        assert!(r.waterfall.loads.contains(&size_load));
+        assert_eq!(r.waterfall.compares.len(), 2);
+        assert_eq!(r.waterfall.reads.len(), 2);
     }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes

@@ -1119,12 +1119,28 @@ impl Host {
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // Packed 16-bit textures widened to `R8G8B8A8_UNORM` (#797) need their
+        // RTV descriptor format matched to the host resource's format.
+        let adjusted = desc.map(|d| {
+            let mut copy = *d;
+            if matches!(copy.Format.0, 85 | 86 | 115) {
+                // SAFETY: a live resource.
+                let own = unsafe { resource.GetDesc() }.Format;
+                if own == DXGI_FORMAT_R8G8B8A8_UNORM {
+                    copy.Format = own;
+                }
+            }
+            copy
+        });
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
-            self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            self.device.CreateRenderTargetView(
+                resource,
+                adjusted.as_ref().map(|d| d as *const _),
+                handle,
+            );
             handle
         }
     }
@@ -1360,6 +1376,19 @@ impl HostList {
                 (before != wanted).then_some((texture, before))
             }
         }
+    }
+
+    /// Current tracked host state for a title texture in this list (falling
+    /// back to the texture's global state if this list has not touched it yet).
+    pub(crate) fn tracked_texture_state(&self, resource: crate::object::This) -> Option<u32> {
+        let copy = crate::resource::host_copy(resource)?;
+        let key = std::sync::Arc::as_ptr(&copy) as usize;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        Some(
+            states
+                .get(&key)
+                .map_or_else(|| copy.state.load(Ordering::Relaxed), |&(_, current, _)| current),
+        )
     }
 
     /// Moves a title buffer's host copy to `wanted` (a host buffer state) in
@@ -2177,13 +2206,21 @@ fn swap_color_space(format: DXGI_FORMAT, hdr: bool) -> DXGI_COLOR_SPACE_TYPE {
     }
 }
 
-/// Fullscreen bilinear scaling & format-conversion blit pipeline used when
-/// presenting a texture whose resolution or format differs from the swap chain.
+/// Maximum number of `PresentX` display planes composited in one present.
+const BLITTER_PLANES: u32 = 8;
+
+/// Fullscreen bilinear scaling & multi-plane compositing blit pipeline used
+/// when presenting textures whose resolution or format differs from the swap
+/// chain, or when `PresentX` supplies overlay planes (e.g. Series S 1080p
+/// scene + 4K UI overlay, #211).
 struct Blitter {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
+    /// Premultiplied-alpha blend (`ONE`, `INV_SRC_ALPHA`) for planes `1..`.
+    overlay: ID3D12PipelineState,
     pso_format: DXGI_FORMAT,
     srv_heap: ID3D12DescriptorHeap,
+    srv_step: u32,
 }
 
 impl Blitter {
@@ -2309,19 +2346,36 @@ float4 ps(VSOut i) : SV_Target {
             pso_desc.RTVFormats[0] = rtv_format;
             let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc)?;
 
+            pso_desc.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                ..Default::default()
+            };
+            let overlay: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc)?;
+
             let srv_heap: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: 1,
+                    NumDescriptors: BLITTER_PLANES,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                     NodeMask: 0,
                 })?;
+            let srv_step =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
             Ok(Self {
                 root,
                 pso,
+                overlay,
                 pso_format: rtv_format,
                 srv_heap,
+                srv_step,
             })
         }
     }
@@ -2474,10 +2528,18 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows one or more `PresentX` planes (plane 0 opaque, planes `1..`
+    /// composited on top with premultiplied alpha, #211), leaving each plane
+    /// in its incoming host state, as frame `frame` (saved if captures are
+    /// on). `None` if nothing was shown; else, in diagnostics builds, whether
+    /// the frame was black.
+    pub(crate) fn present_planes(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+    ) -> Option<bool> {
+        let &(texture, state) = planes.first()?;
+        let planes = &planes[..planes.len().min(BLITTER_PLANES as usize)];
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2485,9 +2547,16 @@ impl Host {
             return None;
         };
         let (tex_width, tex_height) = (desc.Width as u32, desc.Height);
+        // Size the initial swap chain to the largest plane (e.g. Series S 1080p
+        // game plane + 4K UI overlay plane).
+        let (max_width, max_height) = planes.iter().fold((tex_width, tex_height), |(mw, mh), &(t, _)| {
+            // SAFETY: live texture.
+            let d = unsafe { t.GetDesc() };
+            (mw.max(d.Width as u32), mh.max(d.Height))
+        });
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(tex_width, tex_height, format) {
+            *presenter = match self.presenter(max_width, max_height, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -2507,7 +2576,7 @@ impl Host {
             if ok && cw > 0 && ch > 0 {
                 (cw, ch)
             } else {
-                (tex_width, tex_height)
+                (max_width, max_height)
             }
         };
         let can_scale = desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
@@ -2544,7 +2613,7 @@ impl Host {
                 );
             }
         }
-        let need_blit = (tex_width, tex_height) != (width, height);
+        let need_blit = planes.len() > 1 || (tex_width, tex_height) != (width, height);
         if need_blit
             && p.blitter
                 .as_ref()
@@ -2559,7 +2628,7 @@ impl Host {
             };
         }
         let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -2569,33 +2638,66 @@ impl Host {
             let list = &p.copy.list;
             let used_blit = if need_blit
                 && let Some(blitter) = &p.blitter
-                && let Some(srv_fmt) = present_srv_format(desc.Format)
+                && present_srv_format(desc.Format).is_some()
+                && desc.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 == 0
             {
                 let rtv = self.rtv(&back, None);
-                let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                    Format: srv_fmt,
-                    ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Texture2D: D3D12_TEX2D_SRV {
-                            MipLevels: 1,
-                            ..Default::default()
+                let cpu_start = blitter.srv_heap.GetCPUDescriptorHandleForHeapStart();
+                let gpu_start = blitter.srv_heap.GetGPUDescriptorHandleForHeapStart();
+                let mut active: Vec<(&ID3D12Resource, D3D12_RESOURCE_STATES, u32)> = Vec::new();
+                for (slot, &(plane_tex, plane_state)) in planes.iter().enumerate() {
+                    let pd = plane_tex.GetDesc();
+                    if pd.Flags.0 & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
+                        continue;
+                    }
+                    let Some(srv_fmt) = present_srv_format(pd.Format) else {
+                        continue;
+                    };
+                    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: srv_fmt,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MipLevels: 1,
+                                ..Default::default()
+                            },
                         },
-                    },
-                };
-                self.device.CreateShaderResourceView(
-                    texture,
-                    Some(&srv_desc),
-                    blitter.srv_heap.GetCPUDescriptorHandleForHeapStart(),
-                );
-                list.ResourceBarrier(&[
-                    transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                    ),
-                ]);
+                    };
+                    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: cpu_start.ptr + slot * blitter.srv_step as usize,
+                    };
+                    self.device
+                        .CreateShaderResourceView(plane_tex, Some(&srv_desc), cpu);
+                    active.push((
+                        plane_tex,
+                        D3D12_RESOURCE_STATES(plane_state as i32),
+                        slot as u32,
+                    ));
+                }
+                // Transition unique source planes + back buffer before compositing.
+                let mut to_srv = Vec::with_capacity(active.len() + 1);
+                let mut transitioned: Vec<*mut std::ffi::c_void> = Vec::new();
+                for &(plane_tex, plane_state, _) in &active {
+                    let raw = plane_tex.as_raw();
+                    if !transitioned.contains(&raw) {
+                        transitioned.push(raw);
+                        if plane_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                            to_srv.push(transition(
+                                plane_tex,
+                                plane_state,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            ));
+                        }
+                    }
+                }
+                to_srv.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
+                list.ResourceBarrier(&to_srv);
+
                 let vp = D3D12_VIEWPORT {
                     TopLeftX: 0.0,
                     TopLeftY: 0.0,
@@ -2617,21 +2719,42 @@ impl Host {
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                 );
                 list.SetGraphicsRootSignature(&blitter.root);
-                list.SetPipelineState(&blitter.pso);
                 list.SetDescriptorHeaps(&[Some(blitter.srv_heap.clone())]);
-                list.SetGraphicsRootDescriptorTable(
-                    0,
-                    blitter.srv_heap.GetGPUDescriptorHandleForHeapStart(),
-                );
-                list.DrawInstanced(3, 1, 0, 0);
-                list.ResourceBarrier(&[
-                    transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state),
-                    transition(
-                        &back,
-                        D3D12_RESOURCE_STATE_RENDER_TARGET,
-                        D3D12_RESOURCE_STATE_PRESENT,
-                    ),
-                ]);
+                for (i, &(_, _, slot)) in active.iter().enumerate() {
+                    list.SetPipelineState(if i == 0 {
+                        &blitter.pso
+                    } else {
+                        &blitter.overlay
+                    });
+                    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                        ptr: gpu_start.ptr + u64::from(slot) * u64::from(blitter.srv_step),
+                    };
+                    list.SetGraphicsRootDescriptorTable(0, gpu);
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+
+                // Restore unique source planes and prepare back buffer.
+                let mut restore = Vec::with_capacity(active.len() + 1);
+                let mut restored: Vec<*mut std::ffi::c_void> = Vec::new();
+                for &(plane_tex, plane_state, _) in &active {
+                    let raw = plane_tex.as_raw();
+                    if !restored.contains(&raw) {
+                        restored.push(raw);
+                        if plane_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                            restore.push(transition(
+                                plane_tex,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                plane_state,
+                            ));
+                        }
+                    }
+                }
+                restore.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                ));
+                list.ResourceBarrier(&restore);
                 true
             } else {
                 false

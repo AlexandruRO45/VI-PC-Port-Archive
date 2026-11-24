@@ -188,6 +188,21 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Resets all command-list state to defaults while preserving any dynamic
+    /// table cache already allocated on this open host list (`ClearState`, #848).
+    pub(crate) fn clear(&mut self, list: &HostList, pipeline: This) {
+        let fresh_tables = std::mem::take(&mut self.fresh_tables);
+        *self = State::default();
+        self.fresh_tables = fresh_tables;
+        self.pipeline = pipeline as usize;
+        // SAFETY: an open list; passing `None` resets host state (PSO, root
+        // signatures, descriptor heaps, targets, viewports, scissors, topology,
+        // stencil ref, blend factor, predication) to defaults. Our `host_*`
+        // caches are now zeroed so the next draw rebinds `self.pipeline` and
+        // any newly set heaps/roots.
+        unsafe { list.list.ClearState(None::<&ID3D12PipelineState>) };
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -843,17 +858,33 @@ impl State {
         }
     }
 
-    /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// Whether a `View::Constant(address, size)` can be mirrored directly in
+    /// place inside the title's own host descriptor heap slot (256-byte host
+    /// GPU address alignment and padded size within its `Shadow` buffer),
+    /// avoiding dynamic slot allocation and scratch upload copies (#840).
+    fn can_mirror_cbv_in_place(address: u64, size: u32) -> bool {
+        if size == 0 {
+            return false;
+        }
+        let Some(padded) = size.checked_next_multiple_of(256) else {
+            return false;
+        };
+        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            return false;
+        };
+        shadow.gpu(address).is_multiple_of(256) && shadow.left(address) >= u64::from(padded)
+    }
+
+    /// The descriptors a shader reads through tables. Constant-buffer tables
+    /// whose views are 256-byte aligned and fit inside their host shadow buffer
+    /// are mirrored directly in place (#840). Tables that hold unaligned or
+    /// unshadowed constant buffers (the console requires only 16-byte alignment),
+    /// CBV descriptor arrays, or entries reaching past a capped host heap are
+    /// made afresh in dynamic slots, with unaligned constant data copied to
+    /// upload memory on submission.
     ///
-    /// Within a list, the same table holding the same descriptors is made
-    /// once: its constant data is copied at submission either way, and the
-    /// big tables the world binds would otherwise take hundreds of slots per
-    /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    /// Within a list, the same fresh table holding the same descriptors is made
+    /// once so dynamic slots do not wrap onto lists still in flight.
     fn tables(
         &mut self,
         list: &HostList,
@@ -862,15 +893,7 @@ impl State {
         uav_buffers: &mut Vec<usize>,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
+        let mut fresh: Vec<u8> = Vec::new();
         for u in used.iter().filter(tables) {
             if fresh.contains(&u.slot) {
                 continue;
@@ -878,15 +901,29 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
                 continue;
             };
             if index >= host.count() {
                 fresh.push(u.slot);
+                continue;
+            }
+            if u.kind == ResourceType::Cbv {
+                let needs_fresh = u.stride > 0
+                    || match crate::descriptor::view(handle) {
+                        Some(View::Constant(address, size)) => {
+                            !Self::can_mirror_cbv_in_place(address, size)
+                        }
+                        Some(_) => true,
+                        None => false,
+                    };
+                if needs_fresh {
+                    fresh.push(u.slot);
+                }
             }
         }
         fresh.sort_unstable();

@@ -16,6 +16,10 @@ use crate::{io, ir, resource, structure};
 /// s0 (textures, or with `buffers` structured buffers of dwords, at entries
 /// 0 and 1, a raw UAV at entry 2) and the table of samplers at s1.
 fn build(words: &[u32], buffers: bool) -> HostShader {
+    build_expecting(words, buffers, 1)
+}
+
+fn build_expecting(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -72,8 +76,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         max_wave_size: 64,
     })
     .expect("lower");
-    // One access with each lane's own heap index, no wave operation.
-    assert_eq!(lowered.nonuniform_handles, 1);
+    // Per-lane heap handles with no wave operation.
+    assert_eq!(lowered.nonuniform_handles, nonuniform);
     assert!(!lowered.wave_ops);
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -251,5 +255,31 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
         }
+    }
+}
+
+#[test]
+fn lanes_query_size_in_a_separate_waterfall_loop() {
+    use crate::resource::tests::WATERFALL_SIZE_AND_SAMPLE_WAVE32;
+    let shader = build_expecting(WATERFALL_SIZE_AND_SAMPLE_WAVE32, false, 2);
+    let first = [[1.0f32, 0.0, 0.0, 1.0]];
+    let second = [
+        [2.0f32, 0.0, 0.0, 1.0],
+        [2.0f32, 0.0, 0.0, 1.0],
+        [2.0f32, 0.0, 0.0, 1.0],
+    ];
+    let views = [
+        View::Texture(1, 1, &first),
+        View::Texture(1, 3, &second),
+        View::RawUav(32),
+    ];
+    let results = run(&shader, &views);
+    assert!(!results.is_empty());
+    for (label, words) in results {
+        let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
+        // Even lanes: 1x1 red=1.0 -> 1.0 + (1 - 1) = 1.0.
+        // Odd lanes:  1x3 red=2.0 -> 2.0 + (3 - 1) = 4.0.
+        let want: Vec<f32> = (0..32).map(|l| if l & 1 == 0 { 1.0 } else { 4.0 }).collect();
+        assert_eq!(got, want, "{label}");
     }
 }

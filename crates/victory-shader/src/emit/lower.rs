@@ -211,7 +211,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3423,19 +3423,25 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         // How the program uses the descriptor tells the view's kind.
-        let use_at = self
-            .x
-            .res
-            .descriptors
-            .iter()
-            .filter(|d| d.role == Role::Resource)
-            .find_map(|d| {
-                d.source.leaves().into_iter().find_map(|l| match *l {
-                    Source::Loaded { load, first } if load == site => Some((d.site, first)),
-                    _ => None,
+        // For per-lane size-query waterfall loops without an access inside
+        // the loop, borrow the view's kind from the paired accessed load.
+        let find_use = |target: Site| {
+            self.x
+                .res
+                .descriptors
+                .iter()
+                .filter(|d| d.role == Role::Resource)
+                .find_map(|d| {
+                    d.source.leaves().into_iter().find_map(|l| match *l {
+                        Source::Loaded { load, first } if load == target => Some((d.site, first)),
+                        _ => None,
+                    })
                 })
-            });
-        let Some((at, first)) = use_at else {
+        };
+        let Some((at, first)) = find_use(site).or_else(|| {
+            let paired = *self.x.res.waterfall.sizes.get(&site)?;
+            find_use(paired)
+        }) else {
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -3477,6 +3483,12 @@ impl<'a> Lower<'a> {
                     return Err("a constant buffer's descriptor read as data");
                 }
                 (props, None)
+            }
+            Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
+                if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                ((11 | u, 0), None)
             }
             _ => return Err("a scalar memory read as data"),
         };
@@ -4146,7 +4158,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props.0, props.1);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5276,15 +5288,22 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), zero (pad),
+        // or sign-extended above `WORD_0` (`UNUSED_SEXT`; above `WORD_1` there
+        // are no higher bits, so low bits pad to zero). Reserved `dst_unused`
+        // (3) is rejected.
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 0) | (6, 0 | 1 | 2) => keep = false,
+                (4, 1) => {
+                    keep = false;
+                    sext = true;
+                }
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
@@ -5294,15 +5313,20 @@ impl<'a> Lower<'a> {
             _ => self.s.m.i32(0),
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
+        let r = if sext {
+            let shifted = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, shifted, k16)
         } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            let x = self.s.m.bin(c, Bin::And, x, low);
+            if high {
+                let o = self.s.m.bin(c, Bin::And, old, low);
+                let x = self.s.m.bin(c, Bin::Shl, x, k16);
+                self.s.m.bin(c, Bin::Or, o, x)
+            } else {
+                let keep = self.s.m.i32(0xFFFF_0000);
+                let o = self.s.m.bin(c, Bin::And, old, keep);
+                self.s.m.bin(c, Bin::Or, o, x)
+            }
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
@@ -6177,10 +6201,12 @@ impl<'a> Lower<'a> {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
                 let f16 = ty == "f16";
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                // Apply abs/neg bitwise on raw IEEE bits so denormals are not
+                // flushed and signalling NaNs are not quieted before classing.
                 let x = if f16 {
-                    let Fields::Valu(v) = &inst.fields else {
-                        unreachable!()
-                    };
                     let mut h = self.half_src(inst, 0)?;
                     if v.abs & 1 != 0 {
                         let m = self.s.m.i32(0x7FFF);
@@ -6192,8 +6218,16 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    let mut w = self.src(inst, 0)?;
+                    if v.abs & 1 != 0 {
+                        let m = self.s.m.i32(0x7FFF_FFFF);
+                        w = self.s.m.bin(c, Bin::And, w, m);
+                    }
+                    if v.neg & 1 != 0 {
+                        let s = self.s.m.i32(0x8000_0000);
+                        w = self.s.m.bin(c, Bin::Xor, w, s);
+                    }
+                    w
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -6241,6 +6275,11 @@ impl<'a> Lower<'a> {
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
+            "f32" | "f16" if matches!(op, "f" | "tru") => {
+                // Constant comparisons: emitting `fcmp false`/`fcmp true`
+                // causes WARP device removal; lower directly to i1 constants.
+                self.s.m.bool(op == "tru")
+            }
             "f32" | "f16" => {
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
@@ -6257,7 +6296,6 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::Or, lt, gt)
                 } else {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
@@ -6271,7 +6309,6 @@ impl<'a> Lower<'a> {
                         "nle" => pred::UGT,
                         "neq" => pred::UNE,
                         "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
                         _ => return Err(inst.name()),
                     };
                     self.s.m.cmp(c, p, a, b)
@@ -9002,6 +9039,159 @@ mod tests {
         assert_ne!(bits & 0x8000, 0, "Int64Ops feature bit set");
         assert_ne!(bits & 0x40_0000, 0, "AtomicInt64OnTypedResource feature bit set");
         assert_ne!(bits & 0x1000_0000, 0, "AtomicInt64OnHeapResource feature bit set");
+    }
+
+    #[test]
+    fn an_image_atomic_after_a_size_query_gets_an_integer_handle() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+        // Same UAV texture descriptor `s[4:11]` used first by `image_get_resinfo`
+        // (float4 properties `0x409`), then by 32-bit `image_atomic_add` (`0x105`)
+        // and 64-bit `image_atomic_add` (`0x107`). Caching handles by both
+        // property words ensures each op gets its own properly typed handle.
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF40C_0100,
+            0xFA00_0000, // s_load_dwordx8 s[4:11], s[0:1], null
+            0x7E00_0280, // v_mov_b32 v0, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0281, // v_mov_b32 v2, 1
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xF038_0F08,
+            0x0001_0400, // image_get_resinfo v[4:7], v0, s[4:11] dmask:0xf dim:2D
+            0xF044_2108,
+            0x0001_0200, // image_atomic_add v2, v[0:1], s[4:11] dmask:0x1 dim:2D glc
+            0xF044_2308,
+            0x0001_0200, // image_atomic_add v[2:3], v[0:1], s[4:11] dmask:0x3 dim:2D glc
+            S_ENDPGM,
+        ];
+        let out = lower_cs(&words, layout, used)
+            .expect("image_get_resinfo followed by 32-bit and 64-bit image_atomic_add must lower");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone())
+                .expect("dxil.dll rejected image_atomic after image_get_resinfo");
+        }
+        let _ = out;
+    }
+
+    #[test]
+    fn s_buffer_load_descriptor_num_records_lowers_to_get_dimensions() {
+        let layout = vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0100,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+            0xF408_0200,
+            0xFA00_0020, // s_load_dwordx4 s[8:11], s[0:1], 0x20
+            0xF420_0302,
+            0xFA00_0000, // s_buffer_load_dword s12, s[4:7], 0x0
+            0x800D_0C06, // s_add_u32 s13, s6, s12 (reads V# dword 2 num_records)
+            0x7E00_020D, // v_mov_b32 v0, s13
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            S_ENDPGM,
+        ];
+        let out = lower_cs(&words, layout, used)
+            .expect("V# dword 2 read on an s_buffer_load descriptor must lower");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            crate::emit::validator::Validator::load(crate::emit::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone())
+                .expect("dxil.dll rejected s_buffer_load descriptor size query");
+        }
+        let _ = out;
+    }
+
+    #[test]
+    fn sdwa_16bit_word0_sext_lowers_and_reserved_unused_is_rejected() {
+        let mk = |dst_unused: u32| {
+            let layout = vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }];
+            let sdwa_ext = 1 | (4 << 8) | (dst_unused << 11) | (4 << 16) | (4 << 24);
+            let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0100,
+                0xFA00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x6400_04F9,
+                sdwa_ext, // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:...
+                0xE070_0000,
+                0x8001_0000, // buffer_store_dword v0, off, s[4:7], 0
+                S_ENDPGM,
+            ];
+            lower_cs(&words, layout, used)
+        };
+        mk(1).expect("SDWA WORD_0 + UNUSED_SEXT must lower");
+        assert!(
+            mk(3).is_err(),
+            "SDWA reserved dst_unused=3 on 16-bit op must be rejected"
+        );
     }
 
     #[test]

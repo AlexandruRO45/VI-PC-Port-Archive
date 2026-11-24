@@ -351,6 +351,9 @@ struct Slot {
 
 struct State {
     slots: [Slot; DEVICES],
+    /// Whether each host pad slot has reported non-rest input since it began
+    /// answering, filtering out wireless receivers answering for switched-off pads.
+    seen_input: [bool; PADS],
     callbacks: Vec<Registration>,
     /// Asynchronous enumerations, delivered by the next poll.
     pending: Vec<Event>,
@@ -397,6 +400,7 @@ impl Hub {
             source: Mutex::new(source),
             state: Mutex::new(State {
                 slots: Default::default(),
+                seen_input: [false; PADS],
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
@@ -499,8 +503,24 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
-        let any_pad = pads.iter().any(Option::is_some);
+        let mut active = [None; PADS];
         for (slot, pad) in pads.into_iter().enumerate() {
+            match pad {
+                Some(p) => {
+                    if p != PadState::default() {
+                        self.seen_input[slot] = true;
+                    }
+                    if self.seen_input[slot] {
+                        active[slot] = Some(p);
+                    }
+                }
+                None => {
+                    self.seen_input[slot] = false;
+                }
+            }
+        }
+        let any_pad = active.iter().any(Option::is_some);
+        for (slot, pad) in active.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
@@ -1137,6 +1157,18 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
+/// Updates `pressed` to contain exactly the virtual keys in `current` while
+/// preserving press order (required by `IGameInputReading::GetKeyState`).
+#[cfg(any(windows, test))]
+fn order_held_keys(pressed: &mut Vec<u8>, current: &[u8]) {
+    pressed.retain(|vk| current.contains(vk));
+    for &vk in current {
+        if !pressed.contains(&vk) {
+            pressed.push(vk);
+        }
+    }
+}
+
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1199,6 +1231,7 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        pressed: Vec<u8>,
     }
 
     impl Source for Host {
@@ -1225,11 +1258,18 @@ mod host {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
-                    .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
+                    .filter(|vk| !(0x10..=0x12).contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
+                super::order_held_keys(&mut self.pressed, &held);
+                for &vk in &self.pressed {
+                    if !down.contains(&vk) {
+                        down.push(vk);
+                    }
+                }
+            } else {
+                self.pressed.clear();
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1860,7 +1900,10 @@ mod tests {
             register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..PadState::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1965,7 +2008,10 @@ mod tests {
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
         }
         let (hub, host) = fake();
-        host.lock().unwrap().pads[0] = Some(PadState::default());
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..PadState::default()
+        });
         hub.poll();
         type Register = extern "system" fn(
             This,
@@ -1995,7 +2041,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         // Connect pad 1 while blocking enumeration is still inside `cb`.
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..PadState::default()
+        });
         let poll_thread = std::thread::spawn(move || hub.poll());
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(CALLS.load(Ordering::SeqCst), 1, "poll thread must wait for active callback");
@@ -2004,5 +2053,66 @@ mod tests {
         poll_thread.join().unwrap();
         assert!(!OVERLAPPED.load(Ordering::SeqCst), "callbacks ran concurrently");
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_receiver_with_a_switched_off_pad_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        let _token = register(hub, GAMEPAD_KIND, ASYNC_ENUMERATION, &log);
+        // Wireless receiver answers for slot 0 while the pad is switched off (all zeros).
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+        assert!(current(hub, GAMEPAD_KIND, 0).is_err());
+        // The keyboard stand-in still drives gamepad input.
+        host.lock().unwrap().keys = vec![KeyState {
+            virtual_key: 0x0D, // Enter -> A
+            ..Default::default()
+        }];
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).expect("fallback reading");
+        assert_eq!(pad(r).buttons, A);
+        release(r);
+
+        // First real press on slot 0 connects pad 0 and disconnects the stand-in.
+        log.lock().unwrap().clear();
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: B,
+            ..PadState::default()
+        });
+        hub.poll();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [
+                (0, STATUS_CONNECTED, 0),
+                (FALLBACK, 0, STATUS_CONNECTED),
+            ]
+        );
+
+        // Releasing all buttons on slot 0 keeps pad 0 connected with no churn.
+        log.lock().unwrap().clear();
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert!(log.lock().unwrap().is_empty());
+        let r = current(hub, GAMEPAD_KIND, 0).expect("pad 0 stays connected");
+        assert_eq!(pad(r), PadState::default());
+        release(r);
+    }
+
+    #[test]
+    fn held_keys_preserve_press_order() {
+        let mut pressed = Vec::new();
+        order_held_keys(&mut pressed, &[0x5A]); // Z
+        assert_eq!(pressed, [0x5A]);
+        // A (0x41) pressed after Z (0x5A): Z must stay first despite smaller VK for A.
+        order_held_keys(&mut pressed, &[0x41, 0x5A]);
+        assert_eq!(pressed, [0x5A, 0x41]);
+        // Release Z, press B (0x42): A first, then B.
+        order_held_keys(&mut pressed, &[0x41, 0x42]);
+        assert_eq!(pressed, [0x41, 0x42]);
+        // Release all.
+        order_held_keys(&mut pressed, &[]);
+        assert!(pressed.is_empty());
     }
 }

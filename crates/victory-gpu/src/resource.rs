@@ -460,14 +460,22 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let info = if count > 0 && descs.is_null() {
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
+        }
+    } else if count == 0 {
+        place(std::iter::empty(), |_, _| ())
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        // SAFETY: `count > 0` and `descs` is non-null; the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter(), |_, _| ())
     };
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    // SAFETY: the caller passes room for the value (null tolerated defensively).
+    if let Some(slot) = unsafe { out.as_mut() } {
+        *slot = info;
+    }
     out
 }
 
@@ -498,32 +506,44 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
-    } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
-    };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
-        if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
+    let total = if count > 0 && descs.is_null() {
+        AllocationInfo {
+            size: u64::MAX,
+            alignment: 0,
         }
-    });
-    // SAFETY: the caller passes room for the value.
-    unsafe { out.write(total) };
+    } else if count == 0 {
+        place(std::iter::empty(), |_, _| ())
+    } else {
+        // SAFETY: `count > 0` and `descs` is non-null; the title passes `count` descriptions.
+        let descs = unsafe { std::slice::from_raw_parts(descs, count as usize) };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
+    };
+    // SAFETY: the caller passes room for the value (null tolerated defensively).
+    if let Some(slot) = unsafe { out.as_mut() } {
+        *slot = total;
+    }
     out
 }
 
 /// Resources placed one after another: the whole footprint, telling `each`
-/// where every resource goes. Unknown sizes give the documented `u64::MAX`.
+/// where every resource goes. Unknown sizes or overflow give the documented
+/// `u64::MAX`.
 fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
+    };
+    let invalid = AllocationInfo {
+        size: u64::MAX,
+        alignment: 0,
     };
     for (i, desc) in descs.enumerate() {
         let Some(one) = footprint(desc) else {
@@ -536,13 +556,31 @@ fn place<'a>(
                     size: u64::MAX,
                 },
             );
-            return AllocationInfo {
-                size: u64::MAX,
-                alignment: 0,
-            };
+            return invalid;
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
+        let Some(offset) = total.size.checked_next_multiple_of(one.alignment) else {
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return invalid;
+        };
+        let Some(next_size) = offset.checked_add(one.size) else {
+            each(
+                i,
+                AllocationInfo1 {
+                    offset: u64::MAX,
+                    alignment: 0,
+                    size: u64::MAX,
+                },
+            );
+            return invalid;
+        };
         each(
             i,
             AllocationInfo1 {
@@ -551,7 +589,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = next_size;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -847,24 +885,34 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
-    // 16-bit BGRA formats (`B5G6R5_UNORM`, `B5G5R5A1_UNORM`, `B4G4R4A4_UNORM`)
-    // have no typeless family and do not support UAV creation on PC D3D12.
-    if d.flags & UNORDERED != 0 && matches!(d.format, 85 | 86 | 115) {
-        d.flags &= !UNORDERED;
-    }
+    const RENDER_TARGET: u32 = 1;
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let mut clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
         value
     });
+    // Packed 16-bit BGRA formats (`B5G6R5_UNORM` 85, `B5G5R5A1_UNORM` 86,
+    // `B4G4R4A4_UNORM` 115) have no UAV support and often no RTV support on
+    // PC D3D12 (e.g. Bink video surfaces, #797). Widen UAV-flagged ones (or
+    // any RTV/UAV creation that the driver refuses) to `R8G8B8A8_UNORM` (28)
+    // so both RTV and UAV views work natively.
+    let packed_16 = matches!(d.format, 85 | 86 | 115);
+    if packed_16 && d.flags & UNORDERED != 0 {
+        d.format = 28;
+        if let Some(cv) = clear_value.as_mut() {
+            cv[0] = 28;
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let try_create = |desc: &ResourceDesc| -> windows::core::Result<ID3D12Resource> {
+    let try_create = |desc: &ResourceDesc,
+                      cv: Option<&[u32; 5]>|
+     -> windows::core::Result<ID3D12Resource> {
         let mut texture: Option<ID3D12Resource> = None;
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
@@ -877,20 +925,39 @@ fn host_texture(
                     crate::host::legal_for(desc.flags, crate::host::texture_state(state)) as i32,
                 ),
                 // The same layout: format, then color or depth and stencil.
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                cv.map(|v| std::ptr::from_ref(v).cast()),
                 &mut texture,
             )?;
         }
         texture.ok_or_else(windows::core::Error::empty)
     };
-    let texture = match try_create(&d) {
+    let texture = match try_create(&d, clear_value.as_ref()) {
         Ok(t) => Some(t),
+        Err(e) if packed_16 && d.flags & (RENDER_TARGET | UNORDERED) != 0 => {
+            d.format = 28;
+            if let Some(cv) = clear_value.as_mut() {
+                cv[0] = 28;
+            }
+            match try_create(&d, clear_value.as_ref()) {
+                Ok(t) => {
+                    tracing::debug!(
+                        error = %e,
+                        "packed 16-bit texture widened to R8G8B8A8_UNORM for RTV/UAV support"
+                    );
+                    Some(t)
+                }
+                Err(e2) => {
+                    tracing::warn!(error = %e2, desc = ?d, "no host texture");
+                    None
+                }
+            }
+        }
         Err(e) if d.flags & UNORDERED != 0 => {
             // Retry without `ALLOW_UNORDERED_ACCESS` for formats the host
-            // driver refuses as UAVs (such as block-compressed or narrow
-            // packed formats) so SRV/RTV use still gets a host texture.
+            // driver refuses as UAVs (such as block-compressed formats) so
+            // SRV/RTV use still gets a host texture.
             d.flags &= !UNORDERED;
-            match try_create(&d) {
+            match try_create(&d, clear_value.as_ref()) {
                 Ok(t) => {
                     tracing::debug!(
                         error = %e,
@@ -1885,5 +1952,78 @@ mod tests {
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+
+    #[test]
+    fn allocation_info_handles_null_empty_alignment_and_overflow() {
+        let mut info = AllocationInfo {
+            size: 123,
+            alignment: 456,
+        };
+        // Non-zero count with null pointer returns documented invalid sentinel (#782).
+        allocation_info(&mut info, std::ptr::null(), 0, 1, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+        // Zero count returns size 0, alignment 1.
+        allocation_info(&mut info, std::ptr::null(), 0, 0, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0,
+                alignment: 1
+            }
+        );
+        // Two individually valid buffers whose sum overflows u64 return the invalid sentinel.
+        let half = (u64::MAX / 2) & !(KIB_64 - 1);
+        let huge = [buffer(half), buffer(half + 2 * KIB_64)];
+        allocation_info(&mut info, std::ptr::null(), 0, 2, huge.as_ptr());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+        // `allocation_info2` handles null+nonzero the same way.
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: u64::MAX,
+                alignment: 0
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_16bit_rtv_uav_textures_widen_to_rgba8_on_host() {
+        if crate::host::host().is_none() {
+            return;
+        }
+        // Format 86 (B5G5R5A1_UNORM) with RTV|UAV (5) and format 115 (B4G4R4A4_UNORM) with RTV (1).
+        let mut d86 = texture(64, 64, 86, 1);
+        d86.flags = 5;
+        let t86 = host_texture(&d86, 0, std::ptr::null()).expect("format 86 RTV|UAV widened");
+        // SAFETY: live texture.
+        assert_eq!(unsafe { t86.GetDesc() }.Format.0, 28);
+
+        let mut d115 = texture(64, 64, 115, 1);
+        d115.flags = 1;
+        let t115 = host_texture(&d115, 0, std::ptr::null()).expect("format 115 RTV created");
+        // SAFETY: live texture.
+        assert!(matches!(unsafe { t115.GetDesc() }.Format.0, 28 | 115));
     }
 }

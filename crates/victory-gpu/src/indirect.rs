@@ -63,9 +63,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    bool allowed = (cost == 0);
+    if (!allowed) {
+        uint cur = budget.Load(0);
+        [loop] while (true) {
+            if (cur >= BUDGET || cost > BUDGET - cur) {
+                break;
+            }
+            uint prev;
+            budget.InterlockedCompareExchange(0, cur, cur + cost, prev);
+            if (prev == cur) {
+                allowed = true;
+                break;
+            }
+            cur = prev;
+        }
+    }
+    if (!allowed) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -199,5 +213,38 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// Massive rejected indirect records must saturate the frame budget rather
+    /// than wrapping the 32-bit atomic counter and letting later records pass.
+    #[test]
+    fn budget_saturation_never_wraps_on_massive_rejected_records() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        const RECORDS: usize = 256;
+        // Each record asks for 2^26 vertices (half the 2^27 budget): 256
+        // records total 2^34 vertices, wrapping u32 four times under naive
+        // InterlockedAdd, whereas saturating CAS allows at most 2 records.
+        let mut buf: Vec<[u32; 4]> = vec![[0x0400_0000, 1, 0, 0]; RECORDS];
+        let addr = buf.as_mut_ptr() as u64;
+        let byte_len = std::mem::size_of_val(buf.as_slice()) as u64;
+        let token = addr as usize;
+        crate::shadow::register(token, addr, byte_len);
+        let shadow = crate::shadow::find(addr, byte_len).expect("shadow buffer");
+        let list = host.new_list().expect("host list");
+        shadow.refresh(&list, addr, byte_len);
+        shadow.gpu_writes(&list, addr, byte_len);
+        let gpu = shadow.gpu(addr);
+        assert!(super::bound(&list, &shadow, gpu, (0, 16, RECORDS as u32)));
+        list.close();
+        host.execute(&[&list]);
+        crate::shadow::unregister(token, addr);
+
+        let survived = buf.iter().filter(|r| r[0] != 0).count();
+        assert_eq!(
+            survived, 2,
+            "saturating budget (2^27) must admit exactly two 2^26-vertex draws and reject the rest"
+        );
     }
 }

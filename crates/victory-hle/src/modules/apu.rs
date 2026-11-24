@@ -181,7 +181,13 @@ pub extern "system" fn XApuConnect(
     }
     let event = if input.options & RESULT_EVENT != 0 {
         // SAFETY: plain auto-reset event, no name.
-        unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }
+        let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if ev.is_null() {
+            // SAFETY: just allocated with `layout`.
+            unsafe { std::alloc::dealloc(memory, layout) };
+            return E_OUTOFMEMORY;
+        }
+        ev
     } else {
         std::ptr::null_mut()
     };
@@ -340,14 +346,26 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
         for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-            (out[i], out[frames + i]) = (frame[0], frame[1]);
+            // SAFETY: the title's output buffer holds at least
+            // `frames * channels * 4` bytes; `write_unaligned` avoids UB when
+            // `output` is not 4-byte aligned.
+            unsafe {
+                output.add(i * 4).cast::<f32>().write_unaligned(frame[0]);
+                output
+                    .add((frames + i) * 4)
+                    .cast::<f32>()
+                    .write_unaligned(frame[1]);
+            }
         }
-    } else {
-        out.copy_from_slice(kept);
+    } else if !kept.is_empty() {
+        // SAFETY: `kept` is valid for `kept.len() * 4` bytes and `output`
+        // holds at least `frames * channels * 4` writable bytes; bytewise
+        // copy requires only 1-byte alignment.
+        unsafe {
+            std::ptr::copy_nonoverlapping(kept.as_ptr().cast::<u8>(), output, kept.len() * 4);
+        }
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -643,6 +661,49 @@ mod tests {
         // SAFETY: initialized by dequeue.
         let reset_err = unsafe { res.assume_init() }.error;
         assert_eq!(reset_err, S_OK);
+
+        // Unaligned (offset +1) output buffers must decode cleanly without UB
+        // for both deinterleaved stereo and interleaved mono output.
+        let unaligned_stereo = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 16,
+            input_length: n as u32,
+            input: base,
+            output_length: 16 * 8,
+            output: base.wrapping_add(0xC001),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const unaligned_stereo).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let ru = unsafe { res.assume_init() };
+        assert_eq!((ru.error, ru.frames, ru.output_length), (S_OK, 16, 16 * 8));
+
+        let unaligned_mono = Process {
+            id: id(PROCESS, 1),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 16,
+            input_length: mn as u32,
+            input: base,
+            output_length: 16 * 4,
+            output: base.wrapping_add(0xC203),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const unaligned_mono).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: initialized by dequeue.
+        let rum = unsafe { res.assume_init() };
+        assert_eq!((rum.error, rum.frames, rum.output_length), (S_OK, 16, 16 * 4));
 
         assert_eq!(XApuDisconnect(handle), S_OK);
     }

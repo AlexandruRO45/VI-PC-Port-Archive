@@ -46,6 +46,14 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
                 );
                 return None;
             }
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "cannot create VICTORY_CAPTURE folder"
+                );
+                return None;
+            }
             Some(path)
         })
         .as_ref()

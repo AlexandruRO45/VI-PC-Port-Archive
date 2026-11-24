@@ -971,3 +971,113 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cmp_f_and_tru_float_do_not_remove_warp() {
+    // VOP3 opcodes: v_cmp_f_f32 (0x000), v_cmp_tru_f32 (0x00f),
+    // v_cmp_f_f16 (0x0c8), v_cmp_tru_f16 (0x0ef).
+    for (name, op, want) in [
+        ("v_cmp_f_f32", 0x000_u16, 0u32),
+        ("v_cmp_tru_f32", 0x00f_u16, 1u32),
+        ("v_cmp_f_f16", 0x0c8_u16, 0u32),
+        ("v_cmp_tru_f16", 0x0ef_u16, 1u32),
+    ] {
+        let shader = build_valu_cs(&[
+            vop3(op, 6, vgpr(1), vgpr(2), 0)[0],
+            vop3(op, 6, vgpr(1), vgpr(2), 0)[1],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+            vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+        ]);
+        let inputs = [
+            [1.0f32.to_bits(), 2.0f32.to_bits(), 0, 0],
+            [0x7FC0_0000, 0x7FC0_0000, 0, 0], // qNaN
+            [0x7F80_0000, 0xFF80_0000, 0, 0], // +inf / -inf
+        ];
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name}({inp:?}) = {got}, want {want}");
+        });
+    }
+}
+
+#[test]
+fn v_cmp_class_f32_preserves_denormals_and_snans() {
+    // v_cmp_class_f32_e64 s6, v1, v2 (VOP3 opcode 0x088)
+    let cmp_plain = build_valu_cs(&[
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[0],
+        vop3(0x088, 6, vgpr(1), vgpr(2), 0)[1],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    // With abs + neg on src0 (w0 bit 8 = abs[0], w1 bit 29 = neg[0]): -|x|.
+    let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    w0 |= 1 << 8; // abs[0]
+    w1 |= 1 << 29; // neg[0]
+    let cmp_neg_abs = build_valu_cs(&[
+        w0,
+        w1,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // +sNaN -> class 0
+        ([0xFF80_0001, 1 << 0, 0, 0], 1), // -sNaN -> class 0
+        ([0x7FC0_0000, 1 << 1, 0, 0], 1), // +qNaN -> class 1
+        ([0x0000_0001, 1 << 7, 0, 0], 1), // +denormal -> class 7 (not flushed to +0)
+        ([0x8000_0001, 1 << 4, 0, 0], 1), // -denormal -> class 4 (not flushed to -0)
+        ([0x8000_0000, 1 << 5, 0, 0], 1), // -0.0 -> class 5
+        ([0x0000_0000, 1 << 6, 0, 0], 1), // +0.0 -> class 6
+        ([0x3F80_0000, 1 << 8, 0, 0], 1), // +1.0 -> class 8
+        ([0xBF80_0000, 1 << 3, 0, 0], 1), // -1.0 -> class 3
+        ([0x7F80_0000, 1 << 9, 0, 0], 1), // +inf -> class 9
+        ([0xFF80_0000, 1 << 2, 0, 0], 1), // -inf -> class 2
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_plain, &inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got, cases[i].1,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}",
+            inp[0], inp[1],
+        );
+    });
+
+    // -|+denormal| -> -denormal (class 4, NOT flushed to -0);
+    // -|+sNaN| -> still sNaN (class 0, NOT quieted to qNaN).
+    let mod_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 1 << 4, 0, 0], 1),
+        ([0x0000_0001, 1 << 5, 0, 0], 0),
+        ([0x7F80_0001, 1 << 0, 0, 0], 1),
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let mod_in: Vec<[u32; 4]> = mod_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg_abs, &mod_in, |backend, i, inp, got| {
+        assert_eq!(
+            got, mod_cases[i].1,
+            "{backend}: v_cmp_class_f32(-|{:#010x}|, {:#05x}) = {got}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn sdwa_word0_unused_sext_sign_extends_16bit_result() {
+    // v_add_f16_sdwa v0, v1, v2 dst_sel:WORD_0 dst_unused:UNUSED_SEXT src0_sel:WORD_0 src1_sel:WORD_0
+    let sdwa_ext = 1 | (4 << 8) | (1 << 11) | (4 << 16) | (4 << 24);
+    let shader = build_valu_cs(&[0x6400_04F9, sdwa_ext]);
+    let cases: &[([u32; 4], u32)] = &[
+        // -1.0f16 (0xBC00) + 0.0f16 -> 0xBC00, sign-extended to 0xFFFF_BC00
+        ([0xBC00, 0x0000, 0, 0], 0xFFFF_BC00),
+        // +1.0f16 (0x3C00) + 0.0f16 -> 0x3C00, sign-extended to 0x0000_3C00
+        ([0x3C00, 0x0000, 0, 0], 0x0000_3C00),
+        // -0.5f16 (0xB800) + -0.5f16 (0xB800) -> -1.0f16 (0xBC00) -> 0xFFFF_BC00
+        ([0xB800, 0xB800, 0, 0], 0xFFFF_BC00),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        assert_eq!(
+            got, cases[i].1,
+            "{backend}: v_add_f16_sdwa({:#06x}, {:#06x}) = {got:#010x}, want {:#010x}",
+            inp[0], inp[1], cases[i].1,
+        );
+    });
+}
