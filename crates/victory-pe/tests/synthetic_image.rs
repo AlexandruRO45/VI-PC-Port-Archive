@@ -2920,3 +2920,58 @@ fn an_iat_whose_last_slot_crosses_the_size_of_image_rejects_the_whole_image() {
         "{err:?}"
     );
 }
+
+#[test]
+fn a_module_without_entries_never_has_its_iat_checked() {
+    // The IAT is only checked slot by slot, so a module whose name table is
+    // empty keeps any IAT RVA, even one far outside the image.
+    let mut d = image();
+    d[at(NAME_TABLE)..at(NAME_TABLE) + 16].fill(0);
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, 0xFFFF_FFF8);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.imports[0].dll, "KERNEL32.dll");
+    assert!(info.imports[0].entries.is_empty());
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    put64(&mut d, at(DELAY_NAME_TABLE), 0);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 12, 0xFFFF_FFF8);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.delay_imports[0].dll, "USER32.dll");
+    assert!(info.delay_imports[0].entries.is_empty());
+}
+
+#[test]
+fn names_that_run_to_the_end_of_the_section_without_a_nul_are_malformed() {
+    // The last bytes of the section spell a name with no terminator after
+    // them; the read stops at the section's end instead of running into the
+    // file bytes that follow.
+    let end = SECTION_RVA + SECTION_SIZE;
+    let tail = end - 4;
+    let unterminated = |d: &mut Vec<u8>| {
+        put_bytes(d, tail, b"ABCD");
+        d.extend_from_slice(b"EF\0");
+    };
+
+    let mut d = image();
+    unterminated(&mut d);
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 12, tail);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    let mut d = image();
+    unterminated(&mut d);
+    put64(&mut d, at(NAME_TABLE), u64::from(tail - 2));
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    unterminated(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 4, tail);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // The same name with its NUL as the section's last byte is read.
+    let mut d = image();
+    put_bytes(&mut d, end - 4, b"ABC\0");
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 12, end - 4);
+    assert_eq!(ImageInfo::parse(&d).unwrap().imports[0].dll, "ABC");
+}
