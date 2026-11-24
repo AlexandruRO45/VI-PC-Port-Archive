@@ -1236,6 +1236,7 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::FALSE, Bool::TRUE))
         );
+        assert_eq!(s.bools.support(when), vec![Atom::Lane(cmp)]);
     }
 
     #[test]
