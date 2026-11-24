@@ -483,6 +483,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         if kind == 16 && register != u32::MAX && register >= RENDER_TARGETS {
             return Err(ShaderError::Malformed("render target past the 8 D3D12 has"));
         }
+        // An `SV_Target`'s semantic index names the render target in the
+        // emitted metadata, while the pipeline description and lowering take
+        // the register. Both are raw fields of the title's row: a target
+        // without a register went into format slot 0 and no export reached
+        // it, and one whose index disagreed with its register was refused by
+        // DXC's validator (`SM.PSTargetIndexMatchesRow`), losing the pipeline.
+        if kind == 16 && (register == u32::MAX || register != u32_at(part, at + 8)?) {
+            return Err(ShaderError::Malformed(
+                "render target index disagrees with its register",
+            ));
+        }
         // Each component of a register belongs to one element. Lowering
         // finds an element by its register and component, so a second one
         // over the same components was never read or written, and D3D12
@@ -728,7 +739,7 @@ mod tests {
     fn a_render_target_past_8_is_refused() {
         let part = |sv: u32, register: u32| {
             let mut p = Vec::new();
-            for w in [1, 8, 0, 40, 0, sv, 3, register, 0x0F, 0] {
+            for w in [1, 8, 0, 40, register, sv, 3, register, 0x0F, 0] {
                 p.extend_from_slice(&u32::to_le_bytes(w));
             }
             p.extend_from_slice(b"SV_Target\0");
@@ -747,6 +758,38 @@ mod tests {
             );
         }
         assert_eq!(signature(&part(0, 8)).unwrap()[0].row, Some(8));
+    }
+
+    /// An `SV_Target`'s semantic index and its register both name the
+    /// render target, so they must agree, and a target needs a register.
+    /// Other elements keep any index.
+    #[test]
+    fn a_render_target_index_matches_its_register() {
+        let part = |sv: u32, index: u32, register: u32| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, index, sv, 3, register, 0x0F, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(b"SV_Target\0");
+            p
+        };
+        for n in [0, 3, 7] {
+            let rows = signature(&part(64, n, n)).expect("a target named twice alike");
+            assert_eq!((rows[0].index, rows[0].row), (n, Some(n)));
+        }
+        let refused = ShaderError::Malformed("render target index disagrees with its register");
+        for (index, register) in [(1, 0), (0, 1), (7, 6), (8, 0), (u32::MAX, 0), (0, u32::MAX)] {
+            assert_eq!(
+                signature(&part(64, index, register))
+                    .unwrap_err()
+                    .to_string(),
+                refused.to_string(),
+                "index {index}, register {register}"
+            );
+        }
+        // Other elements keep their index whatever their register.
+        assert_eq!(signature(&part(0, 5, 2)).unwrap()[0].index, 5);
+        assert_eq!(signature(&part(0, 1, u32::MAX)).unwrap()[0].row, None);
     }
 
     /// A system value other than a target, clip or cull distance names one
