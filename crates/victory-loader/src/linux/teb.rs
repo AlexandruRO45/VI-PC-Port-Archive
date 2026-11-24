@@ -385,12 +385,18 @@ mod tests {
 }
 
 thread_local! {
-    // ponytail: until threads get a TEB, TLS slots live here; then they are gs:[0x1480].
-    static TLS_SLOTS: std::cell::UnsafeCell<[usize; 64]> = const { std::cell::UnsafeCell::new([0; 64]) };
+    /// TLS slots of a thread without a TEB.
+    static NO_TEB_SLOTS: std::cell::UnsafeCell<[usize; TLS_SLOTS]> =
+        const { std::cell::UnsafeCell::new([0; TLS_SLOTS]) };
 }
 
 /// The calling thread's `TlsSlots` (TEB +0x1480): the 64 values behind
 /// `TlsGetValue`, valid for as long as the thread lives.
 pub fn tls_slots() -> *mut usize {
-    TLS_SLOTS.with(|s| s.get().cast())
+    let teb = current();
+    if teb.is_null() {
+        return NO_TEB_SLOTS.with(|s| s.get().cast());
+    }
+    // SAFETY: the calling thread's own live TEB.
+    unsafe { (&raw mut (*teb).tls_slots).cast() }
 }
