@@ -216,6 +216,8 @@ pub fn writing(at: usize, len: usize) {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(windows)]
+    crate::host::forget_unreadable(at, len);
     let mut g = guards();
     let blocks: Vec<usize> = g
         .protected
