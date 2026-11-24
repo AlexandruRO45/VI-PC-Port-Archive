@@ -2426,6 +2426,98 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A TMPDIR reached through symlinks inside the checkout is judged by
+    /// the directory it leads to, not by the link's own name or by any
+    /// rule naming the link: `alias.txt` and `hop.txt` (a link to it) lead
+    /// to the ignored `ignored` and are taken there, while `named.txt`, a link the
+    /// top `.gitignore` ignores by name, leads to `visible` and is refused,
+    /// as is `seen.txt`, a plain link to it. The links stay links, and nothing
+    /// is made in `visible`.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_follow_links_within_the_checkout() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/ignored/\n/named.txt\n").unwrap();
+        let ignored = root.join("ignored");
+        let visible = root.join("visible");
+        std::fs::create_dir(&ignored).unwrap();
+        std::fs::create_dir(&visible).unwrap();
+        let link = |name: &str, to: &str| {
+            let path = root.join(name);
+            std::os::unix::fs::symlink(to, &path).unwrap();
+            path
+        };
+        let alias = link("alias.txt", "ignored");
+        let hop = link("hop.txt", "alias.txt");
+        let named = link("named.txt", "visible");
+        let seen = link("seen.txt", "visible");
+
+        let tmp = tempdir_in_first(root, [named.clone(), seen.clone(), alias.clone()]);
+        assert_eq!(tmp.path().parent(), Some(ignored.as_path()));
+        let tmp_hop = tempdir_in_first(root, [seen.clone(), hop.clone()]);
+        assert_eq!(tmp_hop.path().parent(), Some(ignored.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        for path in [&alias, &hop, &named, &seen] {
+            assert!(path.symlink_metadata().unwrap().is_symlink());
+        }
+        for dir in [tmp.path(), tmp_hop.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(visible.join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [
+                ".gitignore",
+                "alias.txt",
+                "hop.txt",
+                "seen.txt",
+                "visible/a.rs"
+            ]
+        );
+        super::run(root, false).unwrap();
+    }
+
+    /// Git lists an untracked repository nested in the checkout as the one
+    /// entry `inner/`, whatever it holds, so a TMPDIR there adds nothing to
+    /// the listing; it is still judged by the ignore rules as `check-ignore`
+    /// reads them. `inner/vis`, which no rule covers, is refused and left
+    /// empty; `inner/ign`, ignored by the outer `.gitignore`, and
+    /// `inner/own`, ignored only by the nested repository's own
+    /// `.gitignore`, are taken. The nested repository is refused either way,
+    /// fixtures or not.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_in_a_nested_repository_add_nothing_to_the_listing() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/inner/ign/\n").unwrap();
+        let inner = root.join("inner");
+        let vis = inner.join("vis");
+        let ign = inner.join("ign");
+        let own = inner.join("own");
+        for dir in [&vis, &ign, &own] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        git_str(&inner, &["init", "-q"]);
+        std::fs::write(inner.join(".gitignore"), "/own/\n").unwrap();
+        let before = names(root, false);
+        assert_eq!(before, [".gitignore", "inner/"]);
+
+        let tmp = tempdir_in_first(root, [vis.clone(), ign.clone()]);
+        assert_eq!(tmp.path().parent(), Some(ign.as_path()));
+        let tmp_own = tempdir_in_first(root, [vis.clone(), own.clone()]);
+        assert_eq!(tmp_own.path().parent(), Some(own.as_path()));
+        assert_eq!(std::fs::read_dir(&vis).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_own.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        assert_eq!(names(root, false), before);
+        assert!(super::run(root, false).is_err());
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
