@@ -413,4 +413,88 @@ mod tests {
         );
         assert_eq!(lib.other_members, 0);
     }
+
+    /// BSD archives keep a long member name in front of the member data
+    /// (`#1/<len>`); the import object starts after that name.
+    #[test]
+    fn reads_members_with_bsd_long_names() {
+        let member_name = b"a_long_bsd_member_name.obj\0\0";
+        let mut member = member_name.to_vec();
+        member.extend_from_slice(&short_import("a.dll", "Bsd", 0, CODE, BY_NAME));
+        let header = format!("#1/{}", member_name.len());
+        let lib = ImportLibrary::parse(&archive_named(&[(&header, &member)])).unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Bsd", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 0);
+
+        // A name length past the member is an error, not a panic.
+        let header = format!("#1/{}", member.len() + 1);
+        assert!(ImportLibrary::parse(&archive_named(&[(&header, &member)])).is_err());
+    }
+
+    /// The members of a thin archive live in other files, so the archive
+    /// holds no import objects; each member is counted, none is read.
+    #[test]
+    fn thin_archive_members_are_counted_not_read() {
+        // A thin archive's member headers are not followed by their data;
+        // each header carries the size of the outside file.
+        let mut out = b"!<thin>\n".to_vec();
+        for i in 0..2 {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("m{i}.obj/"),
+                0,
+                0,
+                0,
+                644,
+                100
+            );
+            out.extend_from_slice(header.as_bytes());
+        }
+        let lib = ImportLibrary::parse(&out).unwrap();
+        assert!(lib.imports.is_empty());
+        assert_eq!(lib.other_members, 2);
+    }
+
+    /// A long-format import member is an ordinary COFF object: it starts
+    /// with its machine, not the `0, 0xFFFF` signature, so it is counted.
+    #[test]
+    fn a_coff_object_member_is_another_member() {
+        let mut coff = Vec::new();
+        coff.extend_from_slice(&crate::MACHINE_AMD64.to_le_bytes());
+        coff.extend_from_slice(&0u16.to_le_bytes()); // NumberOfSections
+        coff.extend_from_slice(&[0u8; 16]); // the rest of IMAGE_FILE_HEADER
+        let lib = ImportLibrary::parse(&archive(&[
+            coff,
+            short_import("a.dll", "Kept", 0, CODE, BY_NAME),
+        ]))
+        .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "Kept", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 1);
+    }
+
+    /// GNU `ar` writes a `/SYM64/` symbol table for large archives. Like
+    /// the `/` linker members it is bookkeeping: neither an import nor an
+    /// other member.
+    #[test]
+    fn the_gnu_64_bit_symbol_table_is_skipped() {
+        let sym64 = 0u64.to_be_bytes();
+        let import = short_import("a.dll", "After", 0, CODE, BY_NAME);
+        let lib = ImportLibrary::parse(&archive_named(&[("/SYM64/", &sym64), ("a.obj/", &import)]))
+            .unwrap();
+        assert_eq!(lib.imports, [name("a.dll", "After", LibImportKind::Code)]);
+        assert_eq!(lib.other_members, 0);
+    }
+
+    /// The symbol and the DLL name must both end inside `SizeOfData`. An
+    /// object whose DLL name is cut before its NUL is not an import.
+    #[test]
+    fn a_dll_name_without_its_terminator_is_not_an_import() {
+        let mut member = short_import("a.dll", "Cut", 0, CODE, BY_NAME);
+        member.pop(); // drop the DLL name's NUL
+        let data_len = (member.len() - 20) as u32;
+        member[12..16].copy_from_slice(&data_len.to_le_bytes());
+        let lib = ImportLibrary::parse(&archive(&[member])).unwrap();
+        assert!(lib.imports.is_empty());
+        assert_eq!(lib.other_members, 1);
+    }
 }
