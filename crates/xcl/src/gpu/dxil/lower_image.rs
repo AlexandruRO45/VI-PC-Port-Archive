@@ -613,9 +613,6 @@ impl Lw {
             if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
                 return err(d, "image_get_lod outside PS");
             }
-            if self.static_samplers.contains_key(&d.pc) {
-                return err(d, "image_get_lod with a static sampler");
-            }
             let coords: Vec<Value> = (0..body as usize).map(|k| compf(self, i_body + k)).collect();
             let spatial: Vec<Value> = match dim {
                 3 => self.cube_dir(coords[0], coords[1], coords[2]).to_vec(),
@@ -623,8 +620,24 @@ impl Lw {
             };
             let s3 = self.sreg(ssamp + 3);
             let tex = self.s.heap_texture(tw0, kind, false, CompType::F32, 4, true);
-            let si = self.andc(s3, 0xFFF);
-            let smp = self.s.heap_sampler(si, false, true);
+            let smp: Sampler = match self.static_samplers.get(&d.pc).copied() {
+                Some(w) => match self.static_used.iter().find(|u| u.0 == w && !u.1) {
+                    Some(u) => u.2,
+                    None => {
+                        let k = self.static_used.len() as u32;
+                        let cur = self.cur();
+                        self.s.m.set_block(self.init.entry);
+                        let h = self.s.sampler(self.sampler_base + k, 1, false);
+                        self.s.m.set_block(cur);
+                        self.static_used.push((w, false, h));
+                        h
+                    }
+                },
+                None => {
+                    let si = self.andc(s3, 0xFFF);
+                    self.s.heap_sampler(si, false, true)
+                }
+            };
             let a = self.s.calculate_lod(tex, smp, &spatial, true);
             let b = self.s.calculate_lod(tex, smp, &spatial, false);
             let z = self.c(0);
