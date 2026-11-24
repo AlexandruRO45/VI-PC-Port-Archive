@@ -331,7 +331,15 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                // Skip UAV barriers on host textures whose ALLOW_UNORDERED_ACCESS
+                // flag was dropped (unsupported format), avoiding id=523 / E_INVALIDARG.
+                let res = crate::resource::host_resource(b.first)?;
+                // SAFETY: a live D3D12 resource.
+                let flags = unsafe { res.GetDesc() }.Flags.0 as u32;
+                if flags & 0x4 == 0 {
+                    return None;
+                }
+                res.as_raw().cast_const().cast()
             },
             ..*b
         }),
