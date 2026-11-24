@@ -848,7 +848,7 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+    if !VirtualAlloc(base as *mut c_void, len, MEM_COMMIT, PAGE_READWRITE).is_null() {
         return true;
     }
     let error = std::io::Error::last_os_error();
