@@ -346,6 +346,8 @@ pub(crate) struct HostList {
     /// or writes, and the pipeline that first wrote each (diagnostics).
     #[cfg(feature = "diagnostics")]
     targets: Mutex<Vec<(usize, String)>>,
+    #[cfg(feature = "diagnostics")]
+    show: Mutex<crate::capture::ShowNotes>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -576,6 +578,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                show: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -585,7 +589,11 @@ impl Host {
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.execute_locked(runs, submitted);
+    }
+
+    fn execute_locked(&self, runs: &[&HostList], mut submitted: std::sync::MutexGuard<'_, u64>) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
@@ -783,6 +791,13 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+            }
+        }
+        // Publish in host submission order while this submission holds the lock.
+        #[cfg(feature = "diagnostics")]
+        if crate::capture::show_enabled() {
+            for list in runs {
+                list.show.lock().unwrap_or_else(|e| e.into_inner()).submitted();
             }
         }
         // The submission has run and the next waits for our lock.
@@ -1101,6 +1116,10 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        {
+            *self.show.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1308,6 +1327,11 @@ impl HostList {
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_show_target(&self, resource: crate::object::This) {
+        self.show.lock().unwrap_or_else(|e| e.into_inner()).record(resource);
+    }
+
     #[cfg(feature = "diagnostics")]
     pub(crate) fn note_target(&self, resource: usize, by: &str) {
         let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
@@ -1883,6 +1907,8 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    #[cfg(feature = "diagnostics")]
+    blit: crate::capture::blit::Blit,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -2029,10 +2055,15 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows a host copy as `frame`, preserving source states. Returns its
+    /// original state for diagnostics and whether the shown image was black.
+    pub(crate) fn present(
+        &self,
+        title: &crate::resource::HostTexture,
+        frame: u64,
+        #[cfg(feature = "diagnostics")] shown_target: Option<&crate::resource::HostTexture>,
+    ) -> Option<(u32, bool)> {
+        let texture = &title.texture;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -2058,14 +2089,25 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    #[cfg(feature = "diagnostics")]
+                    if p.format != format
+                        && let Some(source) = crate::capture::requested_target_format()
+                    {
+                        p.blit.prepare(&self.device, source, format);
+                    }
+                    (p.width, p.height, p.format) = (width, height, format);
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
+        // Read both source states under the same lock as execution. A title
+        // submission on another queue cannot change them before our barriers.
+        let submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let state = D3D12_RESOURCE_STATES(legal_state(texture, title.state.load(Ordering::Relaxed)) as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
@@ -2074,33 +2116,37 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            #[cfg(feature = "diagnostics")]
+            let shown = shown_target.is_some_and(|target| {
+                p.blit.record(self, list, target, &back, crate::capture::blit::exposure())
+            });
+            #[cfg(not(feature = "diagnostics"))]
+            let shown = false;
+            let (read, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let (image, back_state) = if shown {
+                (&back, read)
+            } else {
+                if state != read {
+                    list.ResourceBarrier(&[transition(texture, state, read)]);
+                }
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_PRESENT, dest)]);
+                list.CopyResource(&back, texture);
+                (texture, dest)
+            };
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, image))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, image);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let _ = (frame, image);
+            if !shown && state != read {
+                list.ResourceBarrier(&[transition(texture, read, state)]);
+            }
+            list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
-            self.execute(&[&p.copy]);
+            self.execute_locked(&[&p.copy], submitted);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
@@ -2108,9 +2154,9 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            return Some((state.0 as u32, probe.is_some_and(|b| crate::capture::black(&b))));
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            Some((state.0 as u32, false))
         }
     }
 
@@ -2146,8 +2192,18 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            #[cfg(feature = "diagnostics")]
+            let blit = {
+                let mut blit = crate::capture::blit::Blit::default();
+                if let Some(source) = crate::capture::requested_target_format() {
+                    blit.prepare(&self.device, source, format);
+                }
+                blit
+            };
             Ok(Presenter {
                 swap_chain,
+                #[cfg(feature = "diagnostics")]
+                blit,
                 width,
                 height,
                 format,

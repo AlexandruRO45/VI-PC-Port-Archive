@@ -278,6 +278,8 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    let shown_target = crate::capture::take_show_target(frame);
     #[cfg(windows)]
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
@@ -286,16 +288,17 @@ extern "system" fn present(
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(texture) = crate::resource::host_copy(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        let shown = host.present(
+            &texture,
+            frame,
+            #[cfg(feature = "diagnostics")]
+            shown_target.as_deref(),
+        );
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
+        blinks(frame, resource, shown.map_or(0, |(state, _)| state), shown.map(|(_, black)| black));
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }

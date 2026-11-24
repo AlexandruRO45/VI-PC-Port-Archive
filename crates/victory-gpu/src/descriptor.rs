@@ -103,6 +103,17 @@ impl Heap {
             .as_ref()
     }
 
+    /// An aligned span wholly inside this one title heap.
+    #[cfg(windows)]
+    pub(crate) fn table_span(&self, base: u64, n: u32) -> Option<u32> {
+        let stride = u64::from(increment(self.desc.kind)?);
+        if n == 0 || !base.checked_sub(self.start)?.is_multiple_of(stride) {
+            return None;
+        }
+        let first = self.index(base)?;
+        (first.checked_add(n)? <= self.desc.count).then_some(first)
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -709,6 +720,20 @@ static FUNCTIONS: Table<24> = {
     f[10] = start as *const (); // 0x50 GPU
     Table(f)
 };
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_capped_view_heap(count: u32, mirrored: u32, dynamic: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc { kind: VIEWS_KIND, count, flags: SHADER_VISIBLE, nodes: 0 },
+        Placement { address: 0, size: 0 },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out), crate::object::S_OK);
+    assert!(heap(out).host.set(Some(host::HostHeap::test_capped(mirrored, dynamic).unwrap())).is_ok());
+    out
+}
 
 #[cfg(test)]
 mod tests {

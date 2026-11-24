@@ -273,6 +273,26 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether `format` heads a typeless family.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format != 0 && family(format) == format
+        && format.checked_add(1).is_some_and(|next| family(next) == format)
+}
+
+/// Typed defaults for textures with a typeless view description.
+pub(crate) fn typed_view_format(format: u32) -> Option<u32> {
+    Some(match format {
+        1 | 5 | 9 | 15 | 23 | 27 | 33 | 48 | 60 | 70 | 73 | 76 | 79 | 82 | 94 | 97 => format + 1,
+        19 => 21, // readable D32S8 plane
+        39 => 41, // R32_FLOAT
+        44 => 46, // readable D24S8 plane
+        53 => 56, // R16_UNORM
+        90 => 87,
+        92 => 88,
+        _ => return None,
+    })
+}
+
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
@@ -954,9 +974,8 @@ pub(crate) mod life {
     }
 }
 
-/// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
-#[cfg(windows)]
+/// Test access to the canonical host state, without recording a list.
+#[cfg(all(test, windows))]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
     let host = resource(this).host.as_ref()?;
@@ -1078,7 +1097,7 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
     };
     (1..=115)
         .filter(|&f| f != format && element(f) == Some(e) && !DEPTH_FAMILIES.contains(&f))
-        .filter(|&f| !(family(f) == f && family(f + 1) == f))
+        .filter(|&f| !is_typeless(f))
         .collect()
 }
 
