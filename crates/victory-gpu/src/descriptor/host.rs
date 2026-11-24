@@ -22,6 +22,10 @@ enum SlotState {
     TypedNull(u32, u32),
     /// Made from a view record `(index, generation)` (`generation >= 1`).
     View(u64),
+    /// View record `(index, generation)` the host could not make, holding a
+    /// null descriptor: `None` for the view's own-dimension null (`null_for`),
+    /// or `Some(props)` for a typed null made for DXIL `ResourceProperties`.
+    ViewNull(u64, Option<(u32, u32)>),
 }
 
 /// A null descriptor description derived from a shader's DXIL
@@ -413,51 +417,36 @@ impl HostHeap {
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-        let Some(view) = view else {
-            // Not a view of ours (never written, or of a resource the
-            // title released): a typed null when the shader annotates the slot,
-            // otherwise the default null descriptor.
-            if !self.sampler
-                && let Some(props) = null_props
-                && let Some(desc) = null_desc_for_props(props)
-            {
-                let want = SlotState::TypedNull(props.0, props.1);
-                if made[index as usize] != want {
-                    made[index as usize] = want;
-                    self.make_typed_null(index, &desc);
-                }
-                return None;
-            }
-            if made[index as usize] != SlotState::Null {
-                made[index as usize] = SlotState::Null;
-                self.make_null(index);
-            }
-            return None;
-        };
-        let want = SlotState::View(key);
-        if made[index as usize] != want {
-            let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { SlotState::Null } else { want };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
-            if kept.is_none() && !self.sampler {
-                match null_props.and_then(null_desc_for_props) {
-                    Some(desc) => write_null(&desc, self.cpu(index)),
-                    None => null_for(&view, self.cpu(index)),
+        let cpu = self.cpu(index);
+        let (view, write, keep) = mirror_slot_state(
+            &mut made[index as usize],
+            self.sampler,
+            handle,
+            for_draw,
+            null_props,
+            |view| make(view, cpu),
+        );
+        match write {
+            SlotWrite::None => {}
+            SlotWrite::DefaultNull => {
+                if self.sampler {
+                    self.null_sampler(index);
+                } else {
+                    null_view(cpu);
                 }
             }
-            self.keep(index, kept.flatten());
+            SlotWrite::TypedNull(desc) => write_null(&desc, cpu),
+            SlotWrite::ViewNull => {
+                if let Some(view) = &view {
+                    null_for(view, cpu);
+                }
+            }
         }
-        Some(view)
+        if let Some(resource) = keep {
+            self.keep(index, resource);
+        }
+        view
     }
 
     /// The view host slot `index` was made from, in a few words, with the
@@ -470,18 +459,124 @@ impl HostHeap {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(index as usize)?;
-        let key = match state {
-            SlotState::Null => return Some("null".into()),
-            SlotState::TypedNull(p0, p1) => return Some(format!("null ({p0:#x}, {p1:#x})")),
-            SlotState::View(key) => key,
-        };
-        let view = view_at(key as u32, (key >> 32) as u32)?;
-        let mut text: String = format!("{view:?}").chars().take(120).collect();
-        if let Some((address, len)) = buffer_range(&view) {
-            let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
-            text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+        describe_slot_state(state)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn describe_slot_state(state: SlotState) -> Option<String> {
+    let (key, null) = match state {
+        SlotState::Null => return Some("null".into()),
+        SlotState::TypedNull(p0, p1) => return Some(format!("null ({p0:#x}, {p1:#x})")),
+        SlotState::View(key) => (key, None),
+        SlotState::ViewNull(key, props) => (key, Some(props)),
+    };
+    let view = view_at(key as u32, (key >> 32) as u32)?;
+    let mut text: String = format!("{view:?}").chars().take(120).collect();
+    if let Some((address, len)) = buffer_range(&view) {
+        let host = crate::shadow::find(address, len.max(1)).map(|s| s.gpu(address));
+        text.push_str(&format!(" title {address:#x}+{len:#x} host {host:#x?}"));
+    }
+    match null {
+        Some(Some((p0, p1))) => text.push_str(&format!(" -> null ({p0:#x}, {p1:#x})")),
+        Some(None) => text.push_str(" -> null"),
+        None => {}
+    }
+    Some(text)
+}
+
+/// Descriptor write [`mirror_slot_state`] asks the caller to perform.
+#[derive(Debug)]
+enum SlotWrite {
+    /// Leave the slot untouched (or `try_make` already wrote it).
+    None,
+    /// Write the default null descriptor (`null_view` or `null_sampler`).
+    DefaultNull,
+    /// Write a typed null descriptor (`write_null`).
+    TypedNull(NullDesc),
+    /// Write the view's own-dimension null (`null_for`).
+    ViewNull,
+}
+
+/// Updates `state` for the title descriptor at `handle`, calling `try_make`
+/// only when a new view must be built on the host. Returns `(view, write,
+/// keep)`, where `keep` is `Some(resource)` when the slot's kept host
+/// resource must be updated.
+fn mirror_slot_state(
+    state: &mut SlotState,
+    sampler: bool,
+    handle: u64,
+    for_draw: bool,
+    null_props: Option<(u32, u32)>,
+    try_make: impl FnOnce(&View) -> Option<Kept>,
+) -> (Option<View>, SlotWrite, Option<Kept>) {
+    // SAFETY: the handle is a descriptor slot in title memory.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    // Generations start at 1, so a made slot's key is never 0.
+    let key = u64::from(generation) << 32 | u64::from(i);
+    let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+    let Some(view) = view else {
+        // Not a view of ours (never written, or of a resource the
+        // title released): a typed null when the shader annotates the slot,
+        // otherwise the default null descriptor.
+        if !sampler
+            && let Some(props) = null_props
+            && let Some(desc) = null_desc_for_props(props)
+        {
+            let want = SlotState::TypedNull(props.0, props.1);
+            if *state != want {
+                *state = want;
+                return (None, SlotWrite::TypedNull(desc), Some(None));
+            }
+            return (None, SlotWrite::None, None);
         }
-        Some(text)
+        if *state != SlotState::Null {
+            *state = SlotState::Null;
+            return (None, SlotWrite::DefaultNull, Some(None));
+        }
+        return (None, SlotWrite::None, None);
+    };
+    match *state {
+        SlotState::View(k) if k == key => (Some(view), SlotWrite::None, None),
+        SlotState::ViewNull(k, cur_props) if k == key => {
+            if for_draw
+                && !sampler
+                && let Some(props) = null_props
+                && cur_props != Some(props)
+                && let Some(desc) = null_desc_for_props(props)
+            {
+                *state = SlotState::ViewNull(key, Some(props));
+                return (Some(view), SlotWrite::TypedNull(desc), None);
+            }
+            (Some(view), SlotWrite::None, None)
+        }
+        _ => {
+            let later = !for_draw && view.is_buffer();
+            let kept = if later { None } else { try_make(&view) };
+            let write = if later {
+                *state = SlotState::Null;
+                if sampler {
+                    SlotWrite::None
+                } else {
+                    SlotWrite::ViewNull
+                }
+            } else if kept.is_some() || sampler {
+                *state = SlotState::View(key);
+                SlotWrite::None
+            } else {
+                match null_props.and_then(|p| null_desc_for_props(p).map(|d| (p, d))) {
+                    Some((props, desc)) => {
+                        *state = SlotState::ViewNull(key, Some(props));
+                        SlotWrite::TypedNull(desc)
+                    }
+                    None => {
+                        *state = SlotState::ViewNull(key, None);
+                        SlotWrite::ViewNull
+                    }
+                }
+            };
+            (Some(view), write, Some(kept.flatten()))
+        }
     }
 }
 
@@ -1583,12 +1678,154 @@ mod tests {
                 .is_none()
         );
 
-        // Writing a real view later still triggers `mirror` to make it.
+        // Writing a view later still leaves TypedNull (unshadowed here, so it
+        // falls back to ViewNull with the draw's CBV annotation).
         super::super::create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
         let view = heap.mirror_for_draw(0, handle, Some((13, 0x1_0000)));
         assert_eq!(view, Some(View::Constant(0x1000, 256)));
-        assert!(matches!(heap.made.lock().unwrap()[0], SlotState::View(_)));
+        assert!(matches!(
+            heap.made.lock().unwrap()[0],
+            SlotState::ViewNull(_, Some((13, 0x1_0000)))
+        ));
 
+        // SAFETY: live host device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn unmakeable_view_takes_typed_null_annotated_by_a_later_draw() {
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        // Explicit Texture1D SRV with a null resource: host `make` returns None.
+        let tex1d = [
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            D3D12_SRV_DIMENSION_TEXTURE1D.0 as u32,
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        super::super::create_srv(std::ptr::null(), std::ptr::null(), &tex1d, handle);
+
+        let tex2d_props = (2, 0x409);
+        let raw_uav_props = (11 | 0x1000, 0);
+        let mut state = SlotState::Null;
+
+        // 1. First mirror outside a draw gets the title's own-dimension null.
+        let (view, write, _) = mirror_slot_state(&mut state, false, handle, false, None, |_| None);
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(matches!(write, SlotWrite::ViewNull));
+        assert!(matches!(state, SlotState::ViewNull(_, None)));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            describe_slot_state(state)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null"))
+        );
+
+        // 2. A later draw annotating Texture2D SRV replaces that null with a
+        // Texture2D typed null.
+        let (view, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d_props), |_| None);
+        assert_eq!(view, Some(View::Shader(0, Some(tex1d))));
+        assert!(
+            matches!(
+                write,
+                SlotWrite::TypedNull(NullDesc::Srv(d))
+                    if d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D
+            ),
+            "expected Texture2D typed null write, got {write:?}"
+        );
+        assert!(matches!(state, SlotState::ViewNull(_, Some((2, 0x409)))));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            describe_slot_state(state)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null (0x2, 0x409)"))
+        );
+
+        // 3. Repeating the same draw annotation short-circuits with no write.
+        let (_, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(tex2d_props), |_| {
+                panic!("try_make must not run again on the hot path")
+            });
+        assert!(matches!(write, SlotWrite::None));
+
+        // 4. A different draw annotation updates the typed null.
+        let (_, write, _) =
+            mirror_slot_state(&mut state, false, handle, true, Some(raw_uav_props), |_| {
+                panic!("try_make must not run again for the same view key")
+            });
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Uav(_))));
+        assert!(matches!(state, SlotState::ViewNull(_, Some((0x100b, 0)))));
+
+        // 5. Same transition when the first draw has no annotation and a later
+        // draw annotates the slot.
+        let mut draw_state = SlotState::Null;
+        let (_, write, _) = mirror_slot_state(&mut draw_state, false, handle, true, None, |_| None);
+        assert!(matches!(write, SlotWrite::ViewNull));
+        assert!(matches!(draw_state, SlotState::ViewNull(_, None)));
+        let (_, write, _) = mirror_slot_state(
+            &mut draw_state,
+            false,
+            handle,
+            true,
+            Some(tex2d_props),
+            |_| None,
+        );
+        assert!(matches!(write, SlotWrite::TypedNull(NullDesc::Srv(_))));
+        assert!(matches!(
+            draw_state,
+            SlotState::ViewNull(_, Some((2, 0x409)))
+        ));
+
+        // 6. A view the host CAN make is never replaced by a null.
+        let mut live_state = SlotState::Null;
+        let (_, write, _) =
+            mirror_slot_state(&mut live_state, false, handle, false, None, |_| Some(None));
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(live_state, SlotState::View(_)));
+        let (_, write, _) = mirror_slot_state(
+            &mut live_state,
+            false,
+            handle,
+            true,
+            Some(tex2d_props),
+            |_| panic!("live view must short-circuit"),
+        );
+        assert!(matches!(write, SlotWrite::None));
+        assert!(matches!(live_state, SlotState::View(_)));
+
+        // 7. End-to-end on a host heap when a D3D12 device is available.
+        let (Some(heap), Some(host)) = (HostHeap::new(false, 4), host()) else {
+            return;
+        };
+        assert_eq!(
+            heap.mirror(0, handle, false),
+            Some(View::Shader(0, Some(tex1d)))
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[0],
+            SlotState::ViewNull(_, None)
+        ));
+        assert_eq!(
+            heap.mirror_for_draw(0, handle, Some(tex2d_props)),
+            Some(View::Shader(0, Some(tex1d)))
+        );
+        assert!(matches!(
+            heap.made.lock().unwrap()[0],
+            SlotState::ViewNull(_, Some((2, 0x409)))
+        ));
+        #[cfg(feature = "diagnostics")]
+        assert!(
+            heap.describe_slot(0)
+                .as_deref()
+                .is_some_and(|s| s.ends_with(" -> null (0x2, 0x409)"))
+        );
         // SAFETY: live host device.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
