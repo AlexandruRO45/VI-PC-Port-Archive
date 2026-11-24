@@ -235,9 +235,31 @@ fn lower(words: &[u32]) -> Result<HostShader, ShaderError> {
     emit(&c, &n, &p, &st, &io, &res)
 }
 
-fn host() -> Option<Host> {
+/// A test's device, held with the lock that lets one of these tests use the
+/// GPU at a time.
+struct OneAtATime {
+    host: Host,
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for OneAtATime {
+    type Target = Host;
+    fn deref(&self) -> &Host {
+        &self.host
+    }
+}
+
+/// The default adapter's device. One GPU test at a time, these and the VALU
+/// tests: with several of them on WARP at once (the default adapter of a
+/// machine without a GPU) the test process dies of an access violation,
+/// in every run with these tests alone in parallel; one after the other
+/// they pass there.
+fn host() -> Option<OneAtATime> {
+    let one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match Host::new(false) {
-        Ok(h) => Some(h),
+        Ok(host) => Some(OneAtATime { host, _one: one }),
         Err(e) => {
             eprintln!("no SM 6.6 device ({e}); skipped");
             None
