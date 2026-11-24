@@ -1076,27 +1076,50 @@ mod tests {
     /// directory is then made beside the test binary instead, which is
     /// ignored as build output; if that is not ignored either, the test says
     /// so rather than flaking.
+    ///
+    /// Nor is it made under a path holding `:`: git splits
+    /// `GIT_CEILING_DIRECTORIES` there, with no way to escape it, so the
+    /// ceiling `git_command` sets would not hold and git would look for a
+    /// repository above the temporary one.
     fn tempdir() -> tempfile::TempDir {
-        let checkout = crate::workspace_root();
-        let checkout = checkout.canonicalize().unwrap_or(checkout);
         let candidates = [
             Some(std::env::temp_dir()),
             std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf)),
         ];
-        for dir in candidates.into_iter().flatten() {
+        tempdir_in_first(candidates.into_iter().flatten())
+    }
+
+    fn tempdir_in_first(
+        candidates: impl IntoIterator<Item = std::path::PathBuf>,
+    ) -> tempfile::TempDir {
+        let checkout = crate::workspace_root();
+        let checkout = checkout.canonicalize().unwrap_or(checkout);
+        for dir in candidates {
             let Ok(dir) = dir.canonicalize() else {
                 continue;
             };
+            if cfg!(unix) && dir.as_os_str().as_encoded_bytes().contains(&b':') {
+                continue;
+            }
             if unseen_by_full_check(&checkout, &dir) {
                 return tempfile::tempdir_in(dir).unwrap();
             }
         }
         panic!(
-            "no temporary directory outside {} or ignored by it: set TMPDIR outside the checkout",
+            "no temporary directory without `:`, and outside {} or ignored by it: \
+             set TMPDIR outside the checkout",
             checkout.display()
         );
+    }
+
+    /// `path` quoted for `sh`, for the scripts tests write: a TMPDIR holding
+    /// `'` made the hook and filter commands built from it shell syntax
+    /// errors, and the git commands running them failed.
+    #[cfg(unix)]
+    fn sh_quote(path: &std::path::Path) -> String {
+        format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
     }
 
     /// Whether nothing under `dir` is listed by the full check of `checkout`:
@@ -2000,6 +2023,48 @@ mod tests {
         );
     }
 
+    /// Under a TMPDIR holding `:`, the ceiling put on a temporary directory
+    /// was split there and did not hold: git found the repository around it,
+    /// and the directory was taken for part of that repository instead of
+    /// being walked. Under one holding `'`, the hook and filter scripts the
+    /// tests write were shell syntax errors. Neither is made any more.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_survive_any_tmpdir_name() {
+        let outer = tempdir();
+        git_str(outer.path(), &["init", "-q"]);
+        let colon = outer.path().join("a:b");
+        let plain = outer.path().join("plain");
+        std::fs::create_dir(&colon).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+
+        // As before: inside `a:b`, the ceiling is split and git looks above.
+        let inner = colon.join("tmp");
+        std::fs::create_dir(&inner).unwrap();
+        let found = super::git_command(&inner)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(found.status.success(), "the ceiling held after all");
+
+        let tmp = tempdir_in_first([colon, plain.clone()]);
+        assert!(tmp.path().starts_with(plain.canonicalize().unwrap()));
+        let found = super::git_command(tmp.path())
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap();
+        assert!(!found.status.success(), "a repository above was found");
+
+        let tricky = outer.path().join("it's a $dir:`x` \\ \"q\"");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf %s {}", sh_quote(&tricky)))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, tricky.as_os_str().as_encoded_bytes());
+    }
+
     const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1\n\
         oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
         size 12345\n";
@@ -2050,7 +2115,7 @@ mod tests {
             let path = hooks_dir.join(hook);
             std::fs::write(
                 &path,
-                format!("#!/bin/sh\necho {hook} >> '{}'\n", ran.display()),
+                format!("#!/bin/sh\necho {hook} >> {}\n", sh_quote(&ran)),
             )
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2123,7 +2188,7 @@ mod tests {
         let tmp = tempdir();
         let root = tmp.path();
         git_str(root, &["init", "-q"]);
-        let clean = format!("cat '{}'", pointer.display());
+        let clean = format!("cat {}", sh_quote(&pointer));
         git_str(root, &["config", "filter.lfs.clean", &clean]);
         git_str(root, &["config", "filter.lfs.smudge", "cat"]);
         git_str(root, &["config", "filter.lfs.required", "true"]);
