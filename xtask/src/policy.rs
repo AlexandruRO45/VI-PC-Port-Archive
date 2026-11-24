@@ -1180,6 +1180,43 @@ mod tests {
         assert_eq!(status.code(), Some(1));
     }
 
+    /// A TMPDIR is judged by where it leads and by every ignore source the
+    /// full check reads: a symlink from outside into a visible directory of
+    /// the checkout is refused, while a directory ignored only by
+    /// `.git/info/exclude` or by a nested `.gitignore` is accepted, as
+    /// `ls-files --exclude-standard` lists nothing under either.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_follow_symlinks_and_every_ignore_source() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        let visible = root.join("visible");
+        let excluded = root.join("excluded");
+        let nested = root.join("sub/scratch");
+        for dir in [&visible, &excluded, &nested] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::create_dir_all(root.join(".git/info")).unwrap();
+        std::fs::write(root.join(".git/info/exclude"), "/excluded/\n").unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "/scratch/\n").unwrap();
+        let link = outside.path().join("link");
+        std::os::unix::fs::symlink(&visible, &link).unwrap();
+
+        let tmp = tempdir_in_first(root, [link.clone(), excluded.clone()]);
+        assert_eq!(tmp.path().parent(), Some(excluded.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        let tmp_nested = tempdir_in_first(root, [link, nested.clone()]);
+        assert_eq!(tmp_nested.path().parent(), Some(nested.as_path()));
+        assert_eq!(std::fs::read_dir(&visible).unwrap().count(), 0);
+        for dir in [tmp.path(), tmp_nested.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        assert_eq!(names(root, false), ["sub/.gitignore"]);
+        super::run(root, false).unwrap();
+    }
+
     /// Outside any repository, the walk is what lists files, so a TMPDIR is
     /// unseen only under a `target` or `.git` directory, at any depth, as
     /// the walk skips them; an ignore file there means nothing.
