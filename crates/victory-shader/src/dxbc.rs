@@ -403,4 +403,58 @@ mod tests {
         assert_eq!(c.parts.len(), 3);
         assert_eq!(c.part(own).unwrap().data, &[1; 4]);
     }
+
+    #[test]
+    fn empty_parts_and_a_part_ending_at_the_container_end_parse() {
+        let bytes = build(&[(FourCC::SFI0, &[]), (FourCC::HASH, &[7; 4])]);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(c.part(FourCC::SFI0).unwrap().data.is_empty());
+        // The empty part's header ends where the next one starts.
+        assert_eq!(c.parts[1].offset, c.parts[0].offset + 8);
+        let last = c.part(FourCC::HASH).unwrap();
+        assert_eq!(last.offset + 8 + last.data.len(), bytes.len());
+        // One byte less and the last part's data runs past the container.
+        let mut short = bytes.clone();
+        short[0x18..0x1C].copy_from_slice(&(bytes.len() as u32 - 1).to_le_bytes());
+        assert_eq!(malformed(&short), "part data out of bounds");
+    }
+
+    #[test]
+    fn a_part_header_cut_after_its_fourcc_is_truncated() {
+        let bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        // The FourCC fits; the size word after it does not.
+        for back in [4u32, 5, 7] {
+            let mut bad = bytes.clone();
+            bad[0x20..0x24].copy_from_slice(&(bytes.len() as u32 - back).to_le_bytes());
+            assert_eq!(malformed(&bad), "truncated", "{back} bytes from the end");
+        }
+        // Exactly a header, with a zero size, at the very end is a part.
+        let mut header = bytes.clone();
+        header[0x28..0x2C].copy_from_slice(&0u32.to_le_bytes());
+        header[0x20..0x24].copy_from_slice(&(bytes.len() as u32 - 8).to_le_bytes());
+        header[bytes.len() - 8..bytes.len() - 4].copy_from_slice(b"PRIV");
+        header[bytes.len() - 4..].copy_from_slice(&0u32.to_le_bytes());
+        let c = Container::parse(&header).unwrap();
+        assert_eq!(c.parts[0].fourcc, FourCC(*b"PRIV"));
+        assert!(c.parts[0].data.is_empty());
+    }
+
+    #[test]
+    fn exactly_the_maximum_part_count_parses() {
+        let own = FourCC(*b"PRIV");
+        let parts = vec![(own, &[][..]); MAX_PARTS];
+        let bytes = build(&parts);
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.parts.len(), MAX_PARTS);
+        assert_eq!(c.parts[0].offset, HEADER_SIZE + 4 * MAX_PARTS);
+        // An empty container lists no parts at all.
+        assert!(Container::parse(&build(&[])).unwrap().parts.is_empty());
+    }
+
+    #[test]
+    fn fourcc_display_masks_unprintable_bytes() {
+        assert_eq!(FourCC::DXIL.to_string(), "DXIL");
+        assert_eq!(FourCC(*b"A\0 \xFF").to_string(), "A...");
+        assert_eq!(format!("{:?}", FourCC(*b"\nPS\x7F")), ".PS.");
+    }
 }
