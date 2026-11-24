@@ -19,12 +19,12 @@ from %LOCALAPPDATA%\victory\launcher. The QML files are embedded in the Rust
 binary and extracted there at startup, so the desktop app does not depend on
 the checkout remaining beside victory.exe.
 
-The library screen uses Rockstar's [official Grand Theft Auto VI Jason and Lucia
-artwork](https://www.rockstargames.com/VI/media/artwork-wallpapers) as a
-3840 x 2160 landscape wallpaper. The launcher downloads it into
-%LOCALAPPDATA%\victory\launcher\assets on first run. If the download is not
-available, a locally bundled, synthetic Leonida skyline illustration is shown.
-The wallpaper is kept outside the repository in accordance with the
+The maximized library screen balances two different, 3840 x 2160 Rockstar
+artworks: a Vice City postcard as its translucent background and Jason and
+Lucia on the rooftop as its foreground feature. Both are downloaded into
+%LOCALAPPDATA%\victory\launcher\assets on first run. If either download is
+unavailable, the launcher falls back to its local wallpaper or synthetic
+Leonida skyline. Images remain outside the repository in accordance with the
 [asset policy](../../../docs/asset-policy.md).
 
 The desktop UI is a VIctory-branded Rockstar and GTA VI fan launcher. It uses

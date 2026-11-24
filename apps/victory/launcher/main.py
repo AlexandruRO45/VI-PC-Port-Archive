@@ -37,6 +37,8 @@ class Launcher(QObject):
         self._console_file = data_dir / "console-model.txt"
         self._log_file = data_dir / "launcher.log"
         self._wallpaper_path = data_dir / "assets" / "gta6-jason-lucia-landscape.jpg"
+        self._background_image_path = data_dir / "assets" / "gta6-background-vice-city.jpg"
+        self._foreground_image_path = data_dir / "assets" / "gta6-foreground-rooftop.jpg"
         self._selected_path = self._read_selection()
         self._console_model = self._read_console_model()
         self._running = False
@@ -53,8 +55,8 @@ class Launcher(QObject):
             self._append_output("Saved game location is missing. Choose its current location.")
         elif not self._selected_path:
             self._append_output("Launcher ready. Add a game executable to begin.")
-        if not self._wallpaper_path.is_file():
-            threading.Thread(target=self._download_wallpaper, daemon=True).start()
+        if not self._background_image_path.is_file() or not self._foreground_image_path.is_file():
+            threading.Thread(target=self._download_artwork, daemon=True).start()
 
     @Property(str, notify=selectedPathChanged)
     def selectedPath(self) -> str:
@@ -110,6 +112,18 @@ class Launcher(QObject):
             return QUrl.fromLocalFile(str(self._wallpaper_path)).toString()
         fallback = self._data_dir / "qml" / "hero.svg"
         return QUrl.fromLocalFile(str(fallback)).toString()
+
+    @Property(str, notify=wallpaperChanged)
+    def backgroundSource(self) -> str:
+        if self._background_image_path.is_file():
+            return QUrl.fromLocalFile(str(self._background_image_path)).toString()
+        return self.wallpaperSource
+
+    @Property(str, notify=wallpaperChanged)
+    def foregroundSource(self) -> str:
+        if self._foreground_image_path.is_file():
+            return QUrl.fromLocalFile(str(self._foreground_image_path)).toString()
+        return self.wallpaperSource
 
     @Slot()
     def browse(self) -> None:
@@ -206,26 +220,40 @@ class Launcher(QObject):
             pass
         self.logsChanged.emit()
 
-    def _download_wallpaper(self) -> None:
-        url = (
-            "https://media-rockstargames-com.akamaized.net/"
-            "rockstargames-newsite/img/global/downloads/wallpapers/games/vi/"
-            "Jason_and_Lucia_01/Jason_and_Lucia_01_landscape.jpg"
+    def _download_artwork(self) -> None:
+        images = (
+            (
+                self._background_image_path,
+                "https://www.rockstargames.com/VI/_next/static/media/"
+                "Vice_City_Postcard_landscape.0v2njmlk2n-qm.jpg"
+                "?akim=1&imdensity=1&imwidth=3840",
+            ),
+            (
+                self._foreground_image_path,
+                "https://www.rockstargames.com/VI/_next/static/media/"
+                "Jason_Lucia_Rooftop_landscape.0c6p5do~-8~7..jpg"
+                "?akim=1&imdensity=1&imwidth=3840",
+            ),
         )
-        try:
-            request = Request(url, headers={"User-Agent": "VIctory Launcher/1.0"})
-            with urlopen(request, timeout=20) as response:
-                content_type = response.headers.get_content_type()
-                image = response.read()
-            if content_type != "image/jpeg" or len(image) < 100_000:
-                raise ValueError("Rockstar returned an unexpected wallpaper response")
-            self._wallpaper_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self._wallpaper_path.with_suffix(".download")
-            temporary.write_bytes(image)
-            temporary.replace(self._wallpaper_path)
-            self.wallpaperDownloaded.emit(True)
-        except Exception:
-            self.wallpaperDownloaded.emit(False)
+        downloaded = False
+        for path, url in images:
+            if path.is_file():
+                continue
+            try:
+                request = Request(url, headers={"User-Agent": "VIctory Launcher/1.0"})
+                with urlopen(request, timeout=20) as response:
+                    content_type = response.headers.get_content_type()
+                    image = response.read()
+                if content_type != "image/jpeg" or len(image) < 100_000:
+                    raise ValueError("Rockstar returned an unexpected artwork response")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".download")
+                temporary.write_bytes(image)
+                temporary.replace(path)
+                downloaded = True
+            except Exception:
+                continue
+        self.wallpaperDownloaded.emit(downloaded)
 
     @Slot(bool)
     def _wallpaper_download_finished(self, succeeded: bool) -> None:

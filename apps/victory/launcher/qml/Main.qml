@@ -4,11 +4,12 @@ import QtQuick.Layouts
 
 ApplicationWindow {
     id: window
-    width: 1480
-    height: 920
+    width: 1920
+    height: 1080
     minimumWidth: 1120
     minimumHeight: 700
     visible: true
+    visibility: Window.Maximized
     title: "VIctory — Grand Theft Auto VI"
     color: "#0b0d10"
     font.family: "Segoe UI"
@@ -19,6 +20,37 @@ ApplicationWindow {
     readonly property color accent: "#d83b4f"
     readonly property color surface: "#c715171b"
     readonly property color edge: "#2a2d32"
+
+    Item {
+        anchors.fill: parent
+        z: -1
+        Image {
+            anchors.fill: parent
+            source: launcher.backgroundSource
+            fillMode: Image.PreserveAspectCrop
+            sourceSize.width: 3840
+            sourceSize.height: 2160
+            asynchronous: true
+            smooth: true
+            opacity: 0.72
+        }
+        Rectangle {
+            anchors.fill: parent
+            gradient: Gradient {
+                orientation: Gradient.Horizontal
+                GradientStop { position: 0.0; color: "#bf090b10" }
+                GradientStop { position: 0.48; color: "#8c090b10" }
+                GradientStop { position: 1.0; color: "#5d090b10" }
+            }
+        }
+        Rectangle {
+            anchors.fill: parent
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: "#20060910" }
+                GradientStop { position: 1.0; color: "#7a060910" }
+            }
+        }
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -33,7 +65,7 @@ ApplicationWindow {
             Rectangle {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 70
-                color: "#0f1114"
+                color: "#cc0f1114"
                 border.color: "#25282c"
                 border.width: 1
                 RowLayout {
@@ -168,33 +200,6 @@ ApplicationWindow {
                 Layout.fillHeight: true
                 clip: true
 
-                Image {
-                    anchors.fill: parent
-                    source: launcher.wallpaperSource
-                    fillMode: Image.PreserveAspectCrop
-                    sourceSize.width: 3840
-                    sourceSize.height: 2160
-                    asynchronous: true
-                    smooth: true
-                    opacity: 0.62
-                }
-                Rectangle {
-                    anchors.fill: parent
-                    gradient: Gradient {
-                        orientation: Gradient.Horizontal
-                        GradientStop { position: 0.0; color: "#bd0b0d12" }
-                        GradientStop { position: 0.52; color: "#990b0d12" }
-                        GradientStop { position: 1.0; color: "#650b0d12" }
-                    }
-                }
-                Rectangle {
-                    anchors.fill: parent
-                    gradient: Gradient {
-                        GradientStop { position: 0.0; color: "#2607090d" }
-                        GradientStop { position: 1.0; color: "#a007090d" }
-                    }
-                }
-
                 StackLayout {
                     id: pages
                     anchors.fill: parent
@@ -249,7 +254,7 @@ ApplicationWindow {
                             Rectangle {
                                 id: featureCard
                                 Layout.fillWidth: true
-                                Layout.preferredHeight: 420
+                                Layout.preferredHeight: 560
                                 radius: 12
                                 color: "#d917191d"
                                 border.color: "#33363a"
@@ -262,12 +267,12 @@ ApplicationWindow {
                                     Item {
                                         Layout.fillWidth: true
                                         Layout.fillHeight: true
-                                        Layout.preferredWidth: featureCard.width * 0.68
+                                        Layout.preferredWidth: featureCard.width * 0.5
                                         Layout.minimumWidth: 300
                                         clip: true
                                         Image {
                                             anchors.fill: parent
-                                            source: launcher.wallpaperSource
+                                            source: launcher.foregroundSource
                                             fillMode: Image.PreserveAspectCrop
                                             sourceSize.width: 3840
                                             sourceSize.height: 2160
@@ -332,15 +337,12 @@ ApplicationWindow {
                                     Rectangle {
                                         Layout.fillHeight: true
                                         Layout.fillWidth: true
-                                        Layout.preferredWidth: featureCard.width * 0.32
+                                        Layout.preferredWidth: featureCard.width * 0.5
                                         Layout.minimumWidth: 270
                                         color: "#d917191d"
                                         ColumnLayout {
-                                            anchors.fill: parent
-                                            anchors.leftMargin: 24
-                                            anchors.rightMargin: 24
-                                            anchors.topMargin: 23
-                                            anchors.bottomMargin: 22
+                                            width: Math.min(parent.width - 72, 560)
+                                            anchors.centerIn: parent
                                             spacing: 0
                                             RowLayout {
                                                 Layout.fillWidth: true
