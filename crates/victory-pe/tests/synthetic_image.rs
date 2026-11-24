@@ -1648,3 +1648,185 @@ fn an_export_past_the_raw_data_is_kept_as_its_rva() {
     );
     assert_eq!(info.rva_to_file_offset(BSS), None);
 }
+
+#[test]
+fn an_import_descriptor_with_any_field_set_is_not_the_terminator() {
+    // The descriptor after KERNEL32's ends the list only when all five
+    // fields are zero. A stray timestamp or forwarder chain makes it a
+    // descriptor of its own, whose missing DLL name is malformed.
+    for field in [4, 8] {
+        let mut d = image();
+        put32(&mut d, at(IMPORT_DESCRIPTORS) + 20 + field, 0x1234);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "terminator field at +{field}"
+        );
+    }
+    // The same fields on a real descriptor (a bound import's -1 markers)
+    // are not checked.
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 4, u32::MAX);
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 8, u32::MAX);
+    assert_eq!(ImageInfo::parse(&d).unwrap().import_count(), 2);
+}
+
+#[test]
+fn a_delay_descriptor_with_any_field_set_is_not_the_terminator() {
+    for field in [0, 8] {
+        let mut d = image();
+        add_delay_import(&mut d);
+        put32(&mut d, at(DELAY_DESCRIPTORS) + 32 + field, 1);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "terminator field at +{field}"
+        );
+    }
+}
+
+#[test]
+fn a_descriptor_without_a_dll_name_or_name_table_is_malformed() {
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 12, 0);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    // With both the name table and the IAT at 0 there is nothing to read.
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS), 0);
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, 0);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 4, 0);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 16, 0);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
+
+#[test]
+fn an_iat_at_rva_zero_is_taken_as_written() {
+    // Only the end of each slot is checked against SizeOfImage, so an IAT
+    // at RVA 0 is accepted and its slots overlap the headers. The loader
+    // that fills them must not trust these RVAs to be inside a section.
+    let mut d = image();
+    put32(&mut d, at(IMPORT_DESCRIPTORS) + 16, 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let slots: Vec<_> = info.imports[0]
+        .entries
+        .iter()
+        .map(|e| e.iat_slot_rva)
+        .collect();
+    assert_eq!(slots, [0, 8]);
+
+    let mut d = image();
+    add_delay_import(&mut d);
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 12, 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(info.delay_imports[0].entries[0].iat_slot_rva, 0);
+}
+
+#[test]
+fn a_hint_name_entry_without_room_for_the_name_is_malformed() {
+    // The hint fits in the last two bytes of the section; the name does not.
+    let mut d = image();
+    put64(
+        &mut d,
+        at(NAME_TABLE),
+        u64::from(SECTION_RVA + SECTION_SIZE - 2),
+    );
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+    // A hint of 0xFFFF is kept as it is.
+    let mut d = image();
+    put16(&mut d, at(HINT_NAME), 0xFFFF);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert_eq!(
+        info.imports[0].entries[0].symbol,
+        ImportSymbol::Name {
+            hint: 0xFFFF,
+            name: "ExitProcess".into()
+        }
+    );
+}
+
+#[test]
+fn a_name_ordinal_past_the_address_table_is_malformed() {
+    // Three functions, so name ordinal indexes 3 and up have no address.
+    for index in [3, 7, u16::MAX] {
+        let mut d = image();
+        add_exports(&mut d);
+        put16(&mut d, at(0x1390), index);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "name ordinal index {index}"
+        );
+    }
+}
+
+#[test]
+fn export_ordinals_must_fit_in_16_bits() {
+    let ed = at(EXPORT_DIRECTORY);
+    // Base 0 is allowed: the first export is ordinal 0.
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, ed + 16, 0);
+    let ordinals: Vec<_> = ImageInfo::parse(&d)
+        .unwrap()
+        .exports
+        .iter()
+        .map(|e| e.ordinal)
+        .collect();
+    assert_eq!(ordinals, [0, 1, 2]);
+    // A base past 0xFFFF, or one that pushes the last of the three
+    // functions past it, has no valid ordinals.
+    for base in [0xFFFE, 0xFFFF, 0x1_0000] {
+        let mut d = image();
+        add_exports(&mut d);
+        put32(&mut d, ed + 16, base);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "ordinal base {base:#x}"
+        );
+    }
+}
+
+#[test]
+fn export_tables_outside_the_sections_are_malformed() {
+    let ed = at(EXPORT_DIRECTORY);
+    let past = SECTION_RVA + SECTION_SIZE + 0x100;
+    for (what, at_field) in [
+        ("address table", ed + 28),
+        ("name pointer table", ed + 32),
+        ("a name", at(0x1384)),
+    ] {
+        let mut d = image();
+        add_exports(&mut d);
+        put32(&mut d, at_field, past);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "{what}"
+        );
+    }
+    // Counts too large for the section are caught the same way.
+    for at_field in [ed + 20, ed + 24] {
+        let mut d = image();
+        add_exports(&mut d);
+        put32(&mut d, at_field, 0x1000_0000);
+        assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+    }
+}
+
+#[test]
+fn the_export_directory_dll_name_is_not_read() {
+    // The image's own name in the export directory is not used, so a bad
+    // one does not stop the exports from being read.
+    for name in [0, SIZE_OF_IMAGE + 0x100] {
+        let mut d = image();
+        add_exports(&mut d);
+        put32(&mut d, at(EXPORT_DIRECTORY) + 12, name);
+        let info = ImageInfo::parse(&d).unwrap();
+        assert_eq!(info.exports.len(), 3, "DLL name at {name:#x}");
+    }
+}
