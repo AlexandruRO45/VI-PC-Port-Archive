@@ -540,12 +540,26 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
             (path, what, checking)
         }
     };
+    // The path with a trailing separator and interior `.` dropped, as in
+    // [`ensure_directory_path`]: the OS resolves `victory.toml/` as a
+    // folder, so a file named that way is only "Not a directory" and a link
+    // that leads nowhere is not seen as a link at all.
+    let plain: PathBuf = path.components().collect();
     let metadata = match std::fs::metadata(&path) {
         Ok(metadata) => metadata,
+        // `path` itself failed, so `plain` is only a file when the spelling
+        // differs (`Path` equality ignores a trailing slash).
+        Err(_) if std::fs::metadata(&plain).is_ok_and(|m| m.is_file()) => {
+            anyhow::bail!(
+                "{what}, a file named with a trailing slash or `/.`, which makes it a folder; \
+                 drop it: {}",
+                plain.display()
+            );
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // A link to a file that was moved or deleted: the link itself
             // is there, so say where it leads.
-            if let Ok(target) = std::fs::read_link(&path) {
+            if let Ok(target) = std::fs::read_link(&plain) {
                 anyhow::bail!(
                     "{what}, a link to {}, which does not exist",
                     target.display()
@@ -2542,6 +2556,75 @@ mod tests {
                 "{err}"
             );
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn victory_config_with_a_trailing_slash_names_the_file_or_the_link() {
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir = std::env::temp_dir().join(format!(
+            "victory-config-trailing-slash-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("victory.toml");
+        std::fs::write(&file, "").unwrap();
+        let gone = dir.join("moved-away.toml");
+        let dangling = dir.join("dangling.toml");
+        std::os::unix::fs::symlink(&gone, &dangling).unwrap();
+        let good = dir.join("good.toml");
+        std::os::unix::fs::symlink(&file, &good).unwrap();
+        let slash = |p: &Path| PathBuf::from(format!("{}/", p.display()));
+        let dot = |p: &Path| PathBuf::from(format!("{}/.", p.display()));
+
+        // A file (or a good link to one) spelled as a folder says what to
+        // drop, rather than "Not a directory (os error 20)".
+        for (named, spelled) in [
+            (&file, slash(&file)),
+            (&file, dot(&file)),
+            (&good, slash(&good)),
+        ] {
+            let err = config_file(Some(spelled.clone())).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!("VICTORY_CONFIG points at {}", spelled.display())),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("drop it: {}", named.display())),
+                "{err}"
+            );
+            assert!(!err.contains("os error"), "{err}");
+        }
+
+        // A link that leads nowhere, spelled with a trailing slash, still
+        // names its target.
+        for spelled in [slash(&dangling), dot(&dangling)] {
+            let err = config_file(Some(spelled)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "a link to {}, which does not exist",
+                    gone.display()
+                )),
+                "{err}"
+            );
+        }
+
+        // A folder spelled with a trailing slash is still a folder, with
+        // the hint; a file below a file is still the OS error, as before.
+        let err = config_file(Some(slash(&dir))).unwrap_err().to_string();
+        assert!(err.contains("is a folder, not a config file"), "{err}");
+        assert!(err.contains("did you mean"), "{err}");
+        let blocked = file.join("child.toml");
+        let err = config_file(Some(blocked)).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        // A path without the slash is read as before.
+        assert_eq!(config_file(Some(file.clone())).unwrap(), Some(file));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
