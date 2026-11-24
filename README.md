@@ -37,7 +37,7 @@ base's machine, and this tree has not reproduced them yet.
 | Stage | State | Produced by |
 |---|---|---|
 | Boot, first-boot screens, start screen, menus | works at the title's own 30 fps | this PC's card (AMD RX 6700 XT), upstream code, in the menus |
-| The opening cutscene window (frames 1,280–1,300) | the presented image is a moving, composed colour field; the 3840x2160 `f19` depth target reads **exactly zero** at all five captured frames | WARP, diagnostics build, keyed pad-A soak, offscreen — **not** a rendered 3D frame |
+| The opening cutscene window (frames 1,280–1,300) | the presented image changes frame to frame (24–144 distinct values in a 64x64 downscale, means 105,84,100 → 63,53,64 → 72,60,70 → 33,32,44 → 44,40,53, with 1,295 nearly flat); the 3840x2160 `f19` depth target reads **one unique value, zero**, at all five | WARP, diagnostics build, keyed pad-A soak, offscreen — **not** a rendered 3D frame |
 | The world, first frame | every run on this PC ends here: access violation at `victory-image-…+0x8f92a`, read of `0x17`, rax all-ones — a descriptor slot holding `-1` used as a pointer. Runs end between frames 1,250 and 1,650, or not at all | this PC's card, in the world's first frame |
 | The world, the base's claim | the opening cutscene plays start to finish and the prologue renders characters, textures, sky, HUD and pause menu at **2–4 fps** | fxceless/victory-gta6, RTX 4070 12 GB / i7-14700KF, Series X profile, in the world |
 | The world, this tree | **never rendered a frame** | — |
@@ -52,13 +52,19 @@ number nobody can reproduce, and this file does not carry those.
 
 Three statements this fork can stand behind today:
 
-- **The cutscene window draws something, and it is not geometry.** Captured
-  frames 1,280, 1,290, 1,292, 1,295 and 1,300 of a keyed WARP run have real
-  moving structure in colour (a 6x4 mean grid slides 100,80,97 → 70,58,68 →
-  61,52,62 over the window, 63–64 distinct colours in an 8x8 downscale) while
-  the same frames' `f19` depth target has one unique value, zero. Geometry that
-  writes colour and never depth does not exist in this title, so what is on
-  screen is composited by something else while nothing depth-tests.
+- **The cutscene window draws colour and no depth.** Five frames of a keyed
+  WARP run were dumped — 1,280, 1,290, 1,292, 1,295 and 1,300 — and every
+  texture each frame wrote is on disk as
+  `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`. The 3840x2160 `f19` depth
+  target has exactly one unique value, zero, in all five. The colour target the
+  present is copied from holds structure that changes from frame to frame: 24 to
+  144 distinct values in a 64x64 downscale, with the mean sliding
+  (105,84,100) → (63,53,64) → (72,60,70) → (33,32,44) → (44,40,53). Frame
+  1,295's present is the exception — nearly flat at 2 distinct values while that
+  frame's second colour target still holds 83, so it reads as a fade rather than
+  a drawn frame. Geometry that writes colour and never depth does not exist in
+  this title as far as anyone here has seen, so what is on screen is composited
+  or copied content, not a rendered 3D frame.
 - **No world frame has rendered in this tree.** The window above is the title's
   cutscene, and the run ends at the first world frame with the `-1` descriptor
   fault, every time, at a frame number that moves between 1,250 and 1,650.
