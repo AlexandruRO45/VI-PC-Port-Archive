@@ -294,6 +294,8 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Shadow buffers and their first/last states in this command list.
+    shadow_states: Mutex<ShadowStates>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
@@ -322,6 +324,10 @@ type Note = (String, Option<(u64, u64)>);
 type States = std::collections::HashMap<
     usize,
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+>;
+type ShadowStates = std::collections::HashMap<
+    usize,
+    (u32, u32, std::sync::Arc<crate::shadow::Shadow>),
 >;
 
 /// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
@@ -478,6 +484,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                shadow_states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
@@ -537,6 +544,13 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         WaitForSingleObject(self.event, INFINITE);
+                        if groups.len() > 1 {
+                            runs[i].decay_shadows();
+                        } else {
+                            for list in runs {
+                                list.decay_shadows();
+                            }
+                        }
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
@@ -882,6 +896,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -925,12 +940,41 @@ impl HostList {
         }
     }
 
+    /// Moves a shadow buffer to `wanted` in this list. Its real state is
+    /// tracked separately because D3D12 buffers decay to COMMON after each
+    /// ExecuteCommandLists operation.
+    pub(crate) fn transition_shadow(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        wanted: u32,
+    ) -> Option<(ID3D12Resource, u32)> {
+        let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, shadow.clone()));
+                None
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                (before != wanted).then(|| (shadow.buffer.clone(), before))
+            }
+        }
+    }
+
+    /// Buffers decay to COMMON after a completed ExecuteCommandLists call.
+    fn decay_shadows(&self) {
+        let states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, (_, _, shadow)) in states.iter() {
+            shadow.state.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
+        let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = states
             .values()
             .filter_map(|(first, last, copy)| {
                 let real = copy.state.swap(*last, Ordering::Relaxed);
@@ -943,6 +987,18 @@ impl HostList {
                 })
             })
             .collect();
+        drop(states);
+        let shadows = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+        barriers.extend(shadows.values().filter_map(|(first, last, shadow)| {
+            let real = shadow.state.swap(*last, Ordering::Relaxed);
+            (real != *first).then(|| {
+                transition(
+                    &shadow.buffer,
+                    D3D12_RESOURCE_STATES(real as i32),
+                    D3D12_RESOURCE_STATES(*first as i32),
+                )
+            })
+        }));
         if barriers.is_empty() {
             return None;
         }
