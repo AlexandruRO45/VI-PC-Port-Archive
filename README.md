@@ -27,7 +27,7 @@ histories merge rather than being grafted: this fork's commit log contains
 fxceless's own commits and upstream's, unsquashed. See
 [Sources and attribution](#sources-and-attribution) for what came from where.
 
-## Status, checked against `214f670`
+## Status, checked against `082a618`
 
 **Not playable.** The menus and the opening cutscene draw; a world frame has
 never been captured. The base this fork adopted reports a cutscene and a
@@ -36,8 +36,8 @@ adopted base now draws the cutscene too. Those are two different claims and the
 table keeps them apart.
 
 Every claim in this file carries one of three marks, and the file is re-checked
-whenever `main` moves. At **`214f670`** (2026-11-24), and re-run with the same
-verdicts after the move from `b3b8533`:
+whenever `main` moves. At **`082a618`** (2026-11-24), and re-checked at each move
+(`b3b8533` → `214f670` → `082a618`), with every verdict that changed saying so:
 
 - **verified** — read in the code at that sha, or measured by this fork and
   reproduced from the artefact it rests on;
@@ -241,19 +241,19 @@ tree. A row marked *carried by the base* kept its effect without our commit, and
 *unverified* means nobody has checked whether the base's own form does the same
 thing.
 
-| Change | Where | In `214f670`? | Measurement, with its conditions |
+| Change | Where | In `082a618`? | Measurement, with its conditions |
 |---|---|---|---|
-| An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc` → `keep_clear`) | **No** — `host_texture_desc` and `keep_clear` are absent; re-apply pending | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
-| A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `once_render`, `clears_render_target`), `list.rs` (both clears) | **No** — `once_render` and `clears_render_target` are absent, and the base's own `allows` is a different gate; re-apply pending | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
+| An optimized clear value only on a texture that can take one | `crates/victory-gpu/src/resource.rs` (`host_texture_desc`) | **Yes, since the re-apply** — `host_texture_desc(desc, clear)` at `resource.rs:1631` now takes the clear value and returns the one that survives the flag rules (`(ResourceDesc, Option<[u32; 5]>)`); it was absent at `b3b8533` | A WARP probe: D3D12 answers `E_INVALIDARG` (`0x80070057`) for a clear value on a resource whose render-target flag the format's rules removed. Before the fix, three `no host texture` failures a session for NV12 (format 86) at 1024x4096 and B4G4R4A4_UNORM (115) at 2560x1440 |
+| A view needs its resource's permission, and a clear it cannot serve is skipped | `crates/victory-gpu/src/host.rs` (`allows`, `clears_render_target`, `clears_depth`), `list.rs` (both clears) | **Yes, since the re-apply** — `clears_render_target` and `clears_depth` at `host.rs:45-54` both answer through `allows`; the once-only log helper `once_render` did not come back with them | The `op=clear_rtv` device removal at frame 1494, named by the breadcrumb ring (barrier, transition, resource_create, indirect, execute, dispatch, clear_rtv), is gone: a skipped clear records `b=1` instead of handing a null view to the runtime. Test: `a_depth_target_takes_no_unordered_view` |
 | Mesh shaders declare no wave size | `crates/victory-shader/src/emit/lower.rs`, `emit/shader.rs` (the `PSV0` header) | **Carried by the base** — our test `a_mesh_shader_declares_no_wave_size` is absent, and mesh pipelines were refused 1 of 755 on the card and 0 of 69 on WARP at `eb6d3a3`, so the effect holds without our commit | In the title, WARP, one keyed soak, one commit apart: mesh pipelines refused **545 → 0** with **338** mesh modules translated in both runs. Offline, `victory translate <slice> --validate` ([docs/emit-gaps.md](docs/emit-gaps.md)): chunk `d010` emits 448 of 450 mesh programs and every emitted one validates, where none validated before; `d011` emits 427 of 427 and all validate. The two that do not emit stop at a resource-layer refusal, not a validation failure |
 | Mesh output bounded by the program's declaration | `crates/victory-shader/src/emit/lower.rs` | **Carried by the base in its own form** — `max_vertices` is in `emit/container.rs`, `lower.rs`, `mod.rs` and `rect.rs`; our clamp and its test are not | The console's 10-bit `exp prim` indices reach 1023 while the program declares 128 vertices; a primitive naming a vertex past the declaration is culled, lanes past the declared outputs store nothing, and a group count past 65535 is clamped. Undefined behaviour on the card, so there is no failure count to quote |
 | A scalar a pixel program spills through a VGPR lane | `crates/victory-shader/src/emit/lower.rs` (`v_readlane_b32` before cross-lane work) | **Unverified** — `v_readlane_b32` is in the base's emitter, and whether it resolves a constant-lane read the same way has not been checked | A pixel program refused an SGPR moved through a VGPR lane and read back at a constant lane as "a cross-lane operation outside compute" with nothing crossing lanes. The resolution is constant-lane only, phi arms must agree, and the write stays under the instruction's guard |
-| Bindless pointer chasing, with its host half | `crates/victory-gpu/src/draw.rs`, `crates/victory-shader/src/emit/lower.rs`, `resource.rs` | **No** — `pointer_address` is absent from the tree; both halves were dropped and re-apply as one unit | The register encodes `((dword + 1) << 8) \| slot`, so the decode is `at >> 8` after `checked_sub(256)`; an address not on 16 bytes stays unbound rather than bound into an invalid call. Lane measurement (emitted DXIL validity, not a drawn frame): dump set A 13/24 → 19/29, set B 0/15 → 6/20 |
+| Bindless pointer chasing, with its host half | `crates/victory-gpu/src/draw.rs`, `crates/victory-shader/src/emit/lower.rs`, `resource.rs` | **No** — `pointer_address` and the `checked_sub(256)` decode are still absent. The base solves the same problem its own way: an `& 15` runtime bias on an unaligned address (`draw.rs:694`, `1150`, `1222`) rather than a refusal, so the two designs are not interchangeable | The register encodes `((dword + 1) << 8) \| slot`, so the decode is `at >> 8` after `checked_sub(256)`; an address not on 16 bytes stays unbound rather than bound into an invalid call. Lane measurement (emitted DXIL validity, not a drawn frame): dump set A 13/24 → 19/29, set B 0/15 → 6/20 |
 | A short DirectStorage stream fills its destination | `crates/victory-hle/src/modules/dstorage.rs` (`out[n..].fill(0)`, `window.bytes()[n..].fill(0)`, `short()`) | **No** — found by this audit and not earlier: the adopted tree's `inflate` returns the bytes written and leaves the rest as the title had it. The only true member of the `-1` family a host audit found: a stream shorter than its block left the tail holding `-1` and reported success. Re-apply pending, and it sits in the family the descriptor faults live in | A stream shorter than the block it is asked to fill, measured by reading the host copy back: tail `-1` and success before, zeroed after |
 | A descriptor dword nothing reads as a number keeps a stand-in | `crates/victory-shader/src/emit/lower.rs` (the dword walk before the program is refused) | **No** — the adopted tree refuses such programs instead (`a descriptor's address or format read as data`). That is a translation difference, not a behaviour one: our tree emitted programs the base refuses, so the base's 324 refusals over the corpus include this family | Programs whose only reader of a dword is a resource op that already holds a host handle translate here and are refused there |
 | Remembered buffer state on the shadow | `crates/victory-gpu/src/shadow.rs` (`state`), `indirect.rs`, `list.rs` | **No** — no `Shadow` state under that name, and `indirect.rs` names `INDIRECT_ARGUMENT` in comments only; re-apply pending | A barrier naming a before-state the buffer was not in. An explicit transition does not decay, so the indirect buffer's UNORDERED_ACCESS and the copy's COPY_DEST are states a later barrier must leave from. Found by review, pinned by `clamp_preserves_record_offsets_and_shared_budget`; no run measurement |
-| The instrument set | `host.rs` (`VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE`, the crumb ring, the frame log), `draw.rs` (`VICTORY_INDIRECT_RECORD`), `pipeline/host.rs` (retry diagnostics) | **Partly** — the crumb ring, the frame log and `VICTORY_INDIRECT_RECORD` are in; `VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE` and `VICTORY_SERIAL_PIPELINES` are not | What turned "the application made an invalid call" into `dispatch 1x1x1 [compute e30970f1727063fd]`, then into `submission=31371 list=0 of=1`, then into `op=resource_create a=0xb6456ee00 b=3 (invalid call, 0x887A0001)`. Each switch is in [Debugging](#debugging) with its cost |
-| The test gate | `host.rs` (`the_device_tests_have_a_device`), `shadow.rs` per-copy accounting, `frame.rs` (`waits_end_on_ticks_and_count_frames`) | **Partly** — `waits_end_on_ticks_and_count_frames` exists (the base has its own), `the_device_tests_have_a_device` does not | A green `victory-gpu` suite where every device test early-returned is a suite that asserted nothing. The other two measured the machine rather than the code: one flip per tick against a 1.67 ms clock (4 of 20 parallel runs failed on unmodified `main`), and a process-global registry every other test writes (1 of 20) |
+| The instrument set | `host.rs` (`VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE`, the crumb ring, the frame log), `draw.rs` (`VICTORY_INDIRECT_RECORD`), `pipeline/host.rs` (`VICTORY_SERIAL_PIPELINES`, retry diagnostics) | **Mostly, since the re-apply** — the crumb ring, the frame log, `VICTORY_INDIRECT_RECORD` and `VICTORY_SERIAL_PIPELINES` are in; `VICTORY_GPU_CHECK` and `VICTORY_D3D12_VALIDATE` are still absent, and they are the two that name a removal at the operation and at the submission | What turned "the application made an invalid call" into `dispatch 1x1x1 [compute e30970f1727063fd]`, then into `submission=31371 list=0 of=1`, then into `op=resource_create a=0xb6456ee00 b=3 (invalid call, 0x887A0001)`. Each switch is in [Debugging](#debugging) with its cost |
+| The test gate | `host.rs` (`the_device_tests_have_a_device`), `shadow.rs` per-copy accounting, `frame.rs` (`waits_end_on_ticks_and_count_frames`) | **Partly** — `waits_end_on_ticks_and_count_frames` exists (the base has its own) and the copy accounting came back as `kept_most()` in `shadow.rs`; `the_device_tests_have_a_device` does not exist, so a `victory-gpu` suite can still go green having asserted nothing on a machine with no device | A green `victory-gpu` suite where every device test early-returned is a suite that asserted nothing. The other two measured the machine rather than the code: one flip per tick against a 1.67 ms clock (4 of 20 parallel runs failed on unmodified `main`), and a process-global registry every other test writes (1 of 20) |
 
 Two more are written and measured but **not in this tree yet**, so no row above
 claims them:
@@ -359,11 +359,12 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 ```
 
 The switches are grouped by what you would reach for. Everything marked
-*diagnostics* exists only in that build. Three rows are marked **not in this
-tree**: `VICTORY_GPU_CHECK`, `VICTORY_D3D12_VALIDATE` and
-`VICTORY_SERIAL_PIPELINES` are this fork's own instruments, written and used,
-which the adoption merge dropped — they describe what the re-apply restores,
-not switches you can set against `214f670` today. The base carries about a
+*diagnostics* exists only in that build. Two rows are marked **not in this
+tree**: `VICTORY_GPU_CHECK` and `VICTORY_D3D12_VALIDATE` are this fork's own
+instruments, written and used, which the adoption merge has not restored —
+`VICTORY_SERIAL_PIPELINES` was in the same state at `214f670` and came back with
+the re-apply. They describe what the re-apply still owes, not switches you can
+set against `082a618` today. The base carries about a
 hundred more of its own, mostly experiments, each described in a comment where
 it is read; its README is the index for those.
 
@@ -397,7 +398,7 @@ it is read; its README is the index for those.
 |---|---|
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | *diagnostics.* Translated loops stop after `n` iterations per lane (decimal or `0x` hex, at least 1) instead of 2^20. The value is part of the translation, so it takes its own cache entries. If a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SKIP_PIPELINES=<hash>,…` | as above: omits work whose pipeline contains that shader |
-| `VICTORY_SERIAL_PIPELINES=1` | **Not in this tree** (re-apply pending). Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
+| `VICTORY_SERIAL_PIPELINES=1` | Creates compute pipelines one at a time, to tell a driver race from a description we build differently each run. A refusal that a later attempt at the same module survives is not a verdict on the module |
 
 ### What the process did
 
