@@ -16,7 +16,7 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,11 +28,51 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
-    /// What identifies it across runs (shader containers and state), and
-    /// whether a draw has used it yet.
+    compilation: Compilation<HostPipeline>,
+    /// What identifies it across runs (shader containers and state).
     key: String,
-    used: AtomicBool,
+}
+
+struct Compilation<T> {
+    made: OnceLock<Option<T>>,
+    /// Register once both a render request and a successful build have occurred.
+    events: AtomicU8,
+}
+
+impl<T> Compilation<T> {
+    const REQUESTED: u8 = 1;
+    const COMPILED: u8 = 2;
+
+    fn new() -> Self {
+        Self {
+            made: OnceLock::new(),
+            events: AtomicU8::new(0),
+        }
+    }
+
+    fn compile(&self, create: impl FnOnce() -> Option<T>, note_used: impl FnOnce()) {
+        if self.made.get_or_init(create).is_some() {
+            self.record(Self::COMPILED, note_used);
+        }
+    }
+
+    fn after_wait(&self, note_used: impl FnOnce()) -> Option<&T> {
+        self.record(Self::REQUESTED, note_used);
+        self.made.get()?.as_ref()
+    }
+
+    fn record(&self, event: u8, note_used: impl FnOnce()) {
+        // Repeated draws need only a load. The bits only accumulate, and
+        // only the fetch_or that adds the second distinct event registers.
+        // The OnceLock itself publishes the pipeline.
+        if self.events.load(Ordering::Relaxed) & event != 0 {
+            return;
+        }
+        let previous = self.events.fetch_or(event, Ordering::Relaxed);
+        if previous != 0 && previous & event == 0 {
+            note_used();
+        }
+    }
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -53,15 +93,16 @@ impl Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
-            made: OnceLock::new(),
+            compilation: Compilation::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
-            used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.compilation.compile(
+            || HostPipeline::new(&self.shaders, self.graphics.as_deref()),
+            || super::library::note_used(&self.key),
+        );
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -72,7 +113,7 @@ impl Pending {
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
-    match p.made.get() {
+    match p.compilation.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
         Some(None) => {
@@ -108,15 +149,12 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.made.get().is_none() {
+    if p.compilation.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.compilation
+        .after_wait(|| super::library::note_used(&p.key))
 }
 
 /// Queues `p` for the workers, once.
@@ -128,7 +166,7 @@ fn start(p: &Arc<Pending>) {
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// run requested it for rendering, so compilation can begin during loading.
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
@@ -147,7 +185,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.compilation.made.get().is_none() {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -222,6 +260,99 @@ fn drained() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn late_success_registers_demand_without_a_second_draw() {
+        let compilation = Compilation::new();
+        let registrations = std::cell::Cell::new(0);
+        let note = || registrations.set(registrations.get() + 1);
+
+        // The render thread exhausted its wait budget before publication.
+        assert_eq!(compilation.after_wait(note), None);
+        assert_eq!(registrations.get(), 0);
+        compilation.compile(|| Some(()), note);
+        assert_eq!(registrations.get(), 1);
+    }
+
+    #[test]
+    fn demand_and_compilation_on_separate_threads_register_once() {
+        use std::sync::Barrier;
+
+        enum Schedule {
+            DemandFirst,
+            CompileFirst,
+            Together,
+        }
+
+        for schedule in [
+            Schedule::DemandFirst,
+            Schedule::CompileFirst,
+            Schedule::Together,
+        ] {
+            let compilation = Compilation::new();
+            let registrations = AtomicU64::new(0);
+            let note = || {
+                registrations.fetch_add(1, Ordering::Relaxed);
+            };
+            let gate = Barrier::new(2);
+            let observed = std::thread::scope(|scope| {
+                let render = scope.spawn(|| {
+                    if !matches!(schedule, Schedule::DemandFirst) {
+                        gate.wait();
+                    }
+                    let result = compilation.after_wait(note).copied();
+                    if matches!(schedule, Schedule::DemandFirst) {
+                        gate.wait();
+                    }
+                    result
+                });
+                if !matches!(schedule, Schedule::CompileFirst) {
+                    gate.wait();
+                }
+                compilation.compile(|| Some(7), note);
+                if matches!(schedule, Schedule::CompileFirst) {
+                    gate.wait();
+                }
+                render.join().unwrap()
+            });
+
+            match schedule {
+                Schedule::DemandFirst => assert_eq!(observed, None),
+                Schedule::CompileFirst => assert_eq!(observed, Some(7)),
+                Schedule::Together => assert!(matches!(observed, None | Some(7))),
+            }
+            assert_eq!(registrations.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn warmup_registers_only_on_real_demand_and_only_once() {
+        let compilation = Compilation::new();
+        compilation.compile(|| Some(7), || panic!("warmup registered itself"));
+        let registrations = AtomicU64::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        compilation.after_wait(|| {
+                            registrations.fetch_add(1, Ordering::Relaxed);
+                        }),
+                        Some(&7)
+                    );
+                });
+            }
+        });
+        assert_eq!(registrations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_compilation_never_registers_demand() {
+        let compilation = Compilation::<()>::new();
+        let unexpected = || panic!("failed pipeline registered");
+        assert!(compilation.after_wait(unexpected).is_none());
+        compilation.compile(|| None, unexpected);
+        assert!(compilation.after_wait(unexpected).is_none());
+    }
+
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
     #[test]
@@ -230,9 +361,9 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
-        while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+        while p.compilation.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(p.compilation.made.get(), Some(None)));
     }
 }
