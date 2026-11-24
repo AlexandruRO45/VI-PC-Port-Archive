@@ -3962,22 +3962,26 @@ impl Host {
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
-        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        // (`VICTORY_ASK_ONCE`): the ranges themselves, never the span that
+        // covers them. A copy refreshed at two addresses far apart once had
+        // one span asked about, which walked every page between them for
+        // writes and found none there: the adopted tree's bill at world
+        // dispatch, 856 MB checked a frame to cover 236 MB of refreshes
+        // (DGR-7). `ask_once`'s own clustering merges ranges closer than
+        // `AHEAD_GAP`, which is a kernel call's worth of walking, so the
+        // asking stays one call per cluster without covering a range no
+        // refresh reads.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
                         && !shadow.unwatched()
                     {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                        ranges.push((*address, *address + *len));
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
