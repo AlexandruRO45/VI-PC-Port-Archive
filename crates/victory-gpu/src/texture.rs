@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::*;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -29,25 +28,6 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
-}
-
-/// Query the primary discrete GPU's dedicated video memory in bytes via DXGI.
-fn query_adapter_vram_bytes() -> Option<u64> {
-    // SAFETY: plain DXGI adapter queries to inspect video memory.
-    unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let mut max_vram = 0u64;
-        let mut i = 0u32;
-        while let Ok(adapter) = factory.EnumAdapters1(i) {
-            i += 1;
-            if let Ok(desc) = adapter.GetDesc1()
-                && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0)
-            {
-                max_vram = max_vram.max(desc.DedicatedVideoMemory as u64);
-            }
-        }
-        (max_vram > 0).then_some(max_vram)
-    }
 }
 
 /// The number of most detailed mips to drop for sampled host textures.
@@ -60,29 +40,22 @@ fn query_adapter_vram_bytes() -> Option<u64> {
 /// this automatically defaults to 1 on adapters with <= 8 GB dedicated VRAM
 /// to prevent host driver committed out-of-memory crashes on 6 GB and 8 GB GPUs.
 pub(crate) fn texture_mip_drop() -> u32 {
-    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *DROP.get_or_init(|| {
-        if let Some(v) = std::env::var("VICTORY_TEXTURE_MIP_DROP")
-            .ok()
-            .and_then(|val| val.parse::<u32>().ok())
-        {
-            return v.min(3);
-        }
-        // Auto-detect based on adapter DedicatedVideoMemory.
-        // Threshold: 8.5 GiB comfortably covers 4 GB, 6 GB, and 8 GB GPUs
-        // (which report up to ~8192 MiB), while leaving >= 10 GB GPUs at full resolution (0).
-        if let Some(vram) = query_adapter_vram_bytes() {
-            const EIGHT_GB_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
-            if vram <= EIGHT_GB_THRESHOLD {
-                tracing::info!(
-                    vram_mb = vram / (1024 * 1024),
-                    "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU"
-                );
-                return 1;
-            }
-        }
-        0
-    })
+    if let Some(v) = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+        .ok()
+        .and_then(|val| val.parse::<u32>().ok())
+    {
+        return v.min(3);
+    }
+    let own = crate::host::device_memory();
+    const EIGHT_GB_THRESHOLD: u64 = 8 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+    if own != 0 && own <= EIGHT_GB_THRESHOLD {
+        once!(
+            "auto-enabling VICTORY_TEXTURE_MIP_DROP=1 for <= 8 GB GPU (vram_mb={})",
+            own / (1024 * 1024)
+        );
+        return 1;
+    }
+    0
 }
 
 /// The minimum texture dimension (both width and height) eligible for mip-dropping.
@@ -422,10 +395,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapter_vram_query_does_not_panic() {
-        if let Some(bytes) = query_adapter_vram_bytes() {
-            assert!(bytes > 0);
-        }
+    fn texture_mip_drop_runs_without_panic() {
+        let _ = texture_mip_drop();
     }
 }
 

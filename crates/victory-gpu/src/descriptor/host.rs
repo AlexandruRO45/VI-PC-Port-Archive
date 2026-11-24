@@ -624,7 +624,9 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
 /// Adjusts the most detailed mip and mip count in a shader resource view
 pub fn adjust_mips(most_detailed: &mut u32, mip_levels: &mut u32, drop: u32, host_mips: u32) {
     let dropped_from_view = drop.saturating_sub(*most_detailed);
-    *most_detailed = most_detailed.saturating_sub(drop);
+    *most_detailed = most_detailed
+        .saturating_sub(drop)
+        .min(host_mips.saturating_sub(1));
     if *mip_levels != u32::MAX {
         let surviving_mips = mip_levels.saturating_sub(dropped_from_view);
         let max_mips = host_mips.saturating_sub(*most_detailed);
