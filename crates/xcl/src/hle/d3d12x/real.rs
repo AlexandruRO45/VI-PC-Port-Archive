@@ -4986,10 +4986,8 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     n
 }
 
-static ALLOC_CALLBACKS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
-
 /// command allocator #9 SetAllocationCallbackX(callback, context): PC manages command allocator
-/// memory internally, so track the registered callback/context and clean up on Release.
+/// memory internally, so log once and succeed without retaining unused callback state.
 unsafe extern "system" fn alloc_set_allocation_callback_x(this: *mut c_void, callback: usize, context: usize) -> HRESULT {
     if this.is_null() {
         return E_INVALIDARG;
@@ -4998,14 +4996,6 @@ unsafe extern "system" fn alloc_set_allocation_callback_x(this: *mut c_void, cal
     ONCE.call_once(|| {
         crate::xlog_info!("D3D12.X: ID3D12CommandAllocator::SetAllocationCallbackX (callback {callback:#x}, context {context:#x})");
     });
-    let mut g = ALLOC_CALLBACKS.lock().unwrap();
-    if callback == 0 {
-        if let Some(m) = g.as_mut() {
-            m.remove(&(this as usize));
-        }
-    } else {
-        g.get_or_insert_with(HashMap::new).insert(this as usize, (callback, context));
-    }
     S_OK
 }
 
@@ -5013,9 +5003,6 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        if let Some(m) = ALLOC_CALLBACKS.lock().unwrap().as_mut() {
-            m.remove(&(this as usize));
-        }
         super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
@@ -5841,8 +5828,9 @@ mod queue_tests {
             let mut pool_id = u32::MAX;
             assert_eq!(super::super::device_x::register_page_pool_x(std::ptr::null_mut(), pool_base, 8, &mut pool_id), S_OK);
             let hr = queue_dispatch(31, this, 1, &mapping as *const _ as usize, pool_base as usize, 8, 0);
-            assert_eq!(hr, 0);
-            assert_eq!(super::super::device_x::gpu_page_mapping_for_test(dest_base), Some(pool_base + 2 * 0x1_0000));
+            assert_eq!(hr as i32, S_OK);
+            let bad_hr = queue_dispatch(31, this, 1, 0, pool_base as usize, 8, 0);
+            assert_eq!(bad_hr as i32, E_INVALIDARG);
             assert_eq!(super::super::device_x::unregister_page_pool_x(std::ptr::null_mut(), pool_id as u64), S_OK);
         }
         QUEUE_SHIFTED.store(prev_shifted, Ordering::Release);
@@ -5850,15 +5838,14 @@ mod queue_tests {
     }
 
     #[test]
-    fn allocator_slot_9_registers_and_clears_callback() {
+    fn allocator_slot_9_validates_this_and_returns_s_ok() {
+        let slots = console_slots(Kind::CommandAllocator);
+        assert_eq!(slots, vec![(9, alloc_set_allocation_callback_x as usize)]);
         unsafe {
             assert_eq!(alloc_set_allocation_callback_x(std::ptr::null_mut(), 0x1234, 0x5678), E_INVALIDARG);
-            let key = 0xDEAD_BEEFusize;
-            let this = key as *mut c_void;
+            let this = 0xDEAD_BEEFusize as *mut c_void;
             assert_eq!(alloc_set_allocation_callback_x(this, 0x1234, 0x5678), S_OK);
-            assert_eq!(ALLOC_CALLBACKS.lock().unwrap().as_ref().and_then(|m| m.get(&key).copied()), Some((0x1234, 0x5678)));
             assert_eq!(alloc_set_allocation_callback_x(this, 0, 0), S_OK);
-            assert_eq!(ALLOC_CALLBACKS.lock().unwrap().as_ref().and_then(|m| m.get(&key).copied()), None);
         }
     }
 

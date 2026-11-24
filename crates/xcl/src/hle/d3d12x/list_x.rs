@@ -283,9 +283,6 @@ struct Bindings {
     rect_list: bool,
     shading_rate: Option<(u32, Option<[u32; 2]>)>,
     shading_rate_image: Option<usize>,
-    pipeline_flag: Option<bool>,
-    quad_sample_mask: Option<u64>,
-    clear_batch_hint: Option<(u32, bool)>,
 }
 
 /// Whether `list` draws rect lists now, and the title's vertex buffers (slot, (address, bytes, stride)).
@@ -2826,19 +2823,13 @@ pub(super) unsafe extern "system" fn rs_set_shading_rate_image_x(this: *mut c_vo
 }
 
 /// command list #73 (older) / #75 (newer) SetPipelineFlagX(enable): per-PSO flag bit
-pub(super) unsafe extern "system" fn set_pipeline_flag_x(this: *mut c_void, enable: u32) {
-    with_bindings(this, |b| b.pipeline_flag = Some(enable != 0));
-}
+pub(super) unsafe extern "system" fn set_pipeline_flag_x(_this: *mut c_void, _enable: u32) {}
 
 /// command list #140 (older) / #142 (newer) SetQuadSampleMaskX(mask): 2x2 quad AA sample mask
-pub(super) unsafe extern "system" fn set_quad_sample_mask_x(this: *mut c_void, mask: u64) {
-    with_bindings(this, |b| b.quad_sample_mask = Some(mask));
-}
+pub(super) unsafe extern "system" fn set_quad_sample_mask_x(_this: *mut c_void, _mask: u64) {}
 
 /// command list #99 (older) / #101 (newer) SetClearBatchHintX(mode, enable)
-pub(super) unsafe extern "system" fn set_clear_batch_hint_x(this: *mut c_void, mode: u32, enable: u32) {
-    with_bindings(this, |b| b.clear_batch_hint = Some((mode, enable != 0)));
-}
+pub(super) unsafe extern "system" fn set_clear_batch_hint_x(_this: *mut c_void, _mode: u32, _enable: u32) {}
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
 /// compression operations) there is nothing to do on PC
@@ -6338,13 +6329,7 @@ mod tests {
             set_pipeline_flag_x(list_ptr, 1);
             set_quad_sample_mask_x(list_ptr, 0xFFFF_0000_FFFF_0000);
             set_clear_batch_hint_x(list_ptr, 2, 1);
-            {
-                let g = LISTS.lock().unwrap();
-                let b = &g.as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings;
-                assert_eq!(b.pipeline_flag, Some(true));
-                assert_eq!(b.quad_sample_mask, Some(0xFFFF_0000_FFFF_0000));
-                assert_eq!(b.clear_batch_hint, Some((2, true)));
-            }
+            assert!(fake.barriers.lock().unwrap().is_empty());
 
             // Flush slots: zero size or zero flags emit no barrier; non-zero on DIRECT/COMPUTE emits 1 UAV barrier.
             flush_gpu_cache_range_x(list_ptr, 0, 0, 0, 0x1000);
@@ -6361,15 +6346,7 @@ mod tests {
             flush_shader_cache_range_x(list_ptr, 0x70_0000, 0, 0, 0xFFFF_FFFF_FF00);
             assert_eq!(fake.barriers.lock().unwrap().len(), 2);
 
-            // Reset clears tracked Bindings state.
             assert_eq!(reset_x(list_ptr, 0, 0), 0);
-            {
-                let g = LISTS.lock().unwrap();
-                let b = &g.as_ref().unwrap().get(&(list_ptr as usize)).unwrap().bindings;
-                assert_eq!(b.pipeline_flag, None);
-                assert_eq!(b.quad_sample_mask, None);
-                assert_eq!(b.clear_batch_hint, None);
-            }
             on_release(list_ptr as usize);
         }
     }
