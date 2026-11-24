@@ -1628,4 +1628,45 @@ mod tests {
             assert_eq!(found[1].unpack().as_deref(), Some(&b"second"[..]));
         }
     }
+
+    #[test]
+    fn size_shorter_than_its_own_header_is_not_a_record() {
+        // `n` counts the 12 bytes from the marker on, so 0 to 11 cannot be a
+        // record's, whatever follows (here a real stream of the stated
+        // size): no record, no underflow, and the record after is found.
+        let packed = miniz_oxide::deflate::compress_to_vec(b"short", 6);
+        for n in 0_u32..12 {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_s\0\x32");
+            for v in [n, 0x000D_DCE7, n, 5] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_after")], "n {n}");
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn longest_name_a_length_byte_states_is_read_whole() {
+        // A length byte of 0xFF: 254 characters and the NUL, the most one
+        // byte can state. Read whole, with no byte before it taken for part
+        // of the name, whether the record follows the magic or another
+        // record's packed bytes.
+        let name = format!("PS_{}", "n".repeat(251));
+        assert_eq!(name.len() + 1, 0xFF);
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes(&name, 0x32, b"long"));
+        file.extend(record_bytes(&name, 0x41, b"again"));
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 2);
+        for (r, kind, body) in [(&found[0], 0x32, &b"long"[..]), (&found[1], 0x41, b"again")] {
+            assert_eq!(r.name, Some(name.as_str()));
+            assert_eq!(r.kind, kind);
+            assert_eq!(r.unpack().as_deref(), Some(body));
+        }
+    }
 }
