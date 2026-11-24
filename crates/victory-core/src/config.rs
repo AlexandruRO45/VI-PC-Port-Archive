@@ -224,6 +224,7 @@ impl Config {
                     // `/a: /b` passes the check above as a whole.
                     for title in &titles {
                         ensure_trimmed("VICTORY_TEST_TITLES", title)?;
+                        ensure_one_title(title, cfg!(windows))?;
                     }
                     (
                         titles
@@ -953,6 +954,45 @@ fn ensure_native(what: &str, path: &Path, on_windows: bool) -> Result<()> {
              the share and set it to the folder under the mount point",
             path.display()
         );
+    }
+    Ok(())
+}
+
+/// Refuses a `VICTORY_TEST_TITLES` entry that is really several titles
+/// joined with the wrong separator: `/t/one;/t/two` or `/t/one,/t/two` off
+/// Windows (where the list is split on `:`), or `C:\t\one:D:\t\two` or
+/// `C:\t\one,D:\t\two` on Windows (split on `;`). A list copied from a
+/// Windows `.bat` or from a guide for the other host, or written the way
+/// most lists are, stays one entry, so it would be taken as a single title
+/// named `one;` under `/t`, reported later only as "does not exist", with
+/// both titles silently dropped. Only a separator directly followed (after
+/// any spaces) by the start of another absolute path counts: off Windows
+/// `/` or `~`, on Windows a drive path. A folder whose name merely holds a
+/// `;` or `,` (`/games/a,b`) is left alone. `on_windows` is `cfg!(windows)`,
+/// a parameter so the check can be tested anywhere.
+fn ensure_one_title(title: &Path, on_windows: bool) -> Result<()> {
+    let text = title.to_string_lossy();
+    let (right, wrong): (char, &[char]) = if on_windows {
+        (';', &[':', ','])
+    } else {
+        (':', &[';', ','])
+    };
+    for (i, c) in text.char_indices() {
+        if i == 0 || !wrong.contains(&c) {
+            continue;
+        }
+        let rest = text[i + c.len_utf8()..].trim_start();
+        let another = if on_windows {
+            is_drive_path(Path::new(rest))
+        } else {
+            rest.starts_with('/') || rest.starts_with('~')
+        };
+        if another {
+            anyhow::bail!(
+                "VICTORY_TEST_TITLES holds {text:?}, which looks like several titles joined \
+                 with {c:?}; on this host they are separated by {right:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -2260,6 +2300,67 @@ mod tests {
                 .to_string();
             assert!(err.contains(var), "{err}");
         }
+    }
+
+    #[test]
+    fn test_titles_joined_with_the_wrong_separator_are_refused() {
+        for (p, on_windows) in [
+            ("/t/one;/t/two", false),
+            ("/t/one; /t/two", false),
+            ("/t/one,~/t/two", false),
+            ("t;/x", false),
+            ("C:\\t\\one:D:\\t\\two", true),
+            ("C:\\t\\one,D:/t/two", true),
+        ] {
+            let err = ensure_one_title(Path::new(p), on_windows)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VICTORY_TEST_TITLES"), "{err}");
+            assert!(err.contains("several titles"), "{err}");
+            let right = if on_windows { "';'" } else { "':'" };
+            assert!(err.contains(right), "{err}");
+        }
+        for (p, on_windows) in [
+            ("/games/a,b", false),
+            ("/games/a;b", false),
+            ("/games/a, b", false),
+            ("C:\\t\\one", true),
+            ("C:\\games\\a,b", true),
+            ("/t/one;/t/two", true),
+            ("C:\\t\\one:D:\\t\\two", false),
+            ("", false),
+        ] {
+            assert!(ensure_one_title(Path::new(p), on_windows).is_ok(), "{p}");
+        }
+        // Through the variable, on this host.
+        let joined = if cfg!(windows) {
+            "C:\\victory\\a:C:\\victory\\b"
+        } else {
+            "/victory/a;/victory/b"
+        };
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(OsString::from(joined)),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("several titles"), "{err}");
+        // The right separator still gives two titles.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let titles = OsString::from(format!(
+            "{}{sep}{}",
+            abs("a").to_string_lossy(),
+            abs("b").to_string_lossy()
+        ));
+        let env = |k: &str| match k {
+            "VICTORY_TEST_TITLES" => Some(titles.clone()),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let cfg = Config::resolve(FilePaths::default(), None, env).unwrap();
+        assert_eq!(cfg.test_titles.len(), 2);
     }
 
     #[test]
