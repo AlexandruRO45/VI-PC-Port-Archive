@@ -2365,6 +2365,56 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A tracked `.gitignore` is read from disk, not from `HEAD` or the
+    /// index: rewritten there and left unstaged, its rule for `fresh` holds
+    /// and `fresh` is taken, while `stale`, named only in the commit, and
+    /// `indexed`, named only in the staged copy, are refused. Once a
+    /// `.gitignore` is outside a sparse checkout (`--skip-worktree`) and
+    /// gone from disk, git reads it from the index instead, so `sub/kept`,
+    /// named only there, is taken; it is still listed and read as tracked.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_the_ignore_files_git_has_at_hand() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::create_dir(root.join("sub")).unwrap();
+        std::fs::write(root.join(".gitignore"), "/stale/\n").unwrap();
+        std::fs::write(root.join("sub/.gitignore"), "/kept/\n").unwrap();
+        git_str(root, &["add", "--", ".gitignore", "sub/.gitignore"]);
+        git_str(root, &["commit", "-q", "--no-verify", "-m", "rules"]);
+        std::fs::write(root.join(".gitignore"), "/indexed/\n").unwrap();
+        git_str(root, &["add", "--", ".gitignore"]);
+        std::fs::write(root.join(".gitignore"), "/fresh/\n").unwrap();
+        git_str(root, &["update-index", "--skip-worktree", "sub/.gitignore"]);
+        std::fs::remove_file(root.join("sub/.gitignore")).unwrap();
+        let stale = root.join("stale");
+        let indexed = root.join("indexed");
+        let fresh = root.join("fresh");
+        let kept = root.join("sub/kept");
+        for dir in [&stale, &indexed, &fresh, &kept] {
+            std::fs::create_dir(dir).unwrap();
+        }
+
+        let tmp = tempdir_in_first(root, [stale.clone(), indexed.clone(), fresh.clone()]);
+        assert_eq!(tmp.path().parent(), Some(fresh.as_path()));
+        let tmp_kept = tempdir_in_first(root, [stale.clone(), kept.clone()]);
+        assert_eq!(tmp_kept.path().parent(), Some(kept.as_path()));
+        for dir in [&stale, &indexed] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for dir in [tmp.path(), tmp_kept.path()] {
+            std::fs::write(dir.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(stale.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(indexed.join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "indexed/b.rs", "stale/a.rs", "sub/.gitignore"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A rule is anchored as `.gitignore` syntax places it: `loose`, with
     /// no slash, ignores a directory of that name at any depth, so
     /// `a/b/loose` is taken; `mid/dle`, with a slash before its end, is
