@@ -510,8 +510,20 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
 /// end a run: `base64` wraps its output at 76 columns, PEM and
 /// `openssl base64` at 64, `xxd -p` at 60, so data encoded by any of them
 /// would otherwise pass as many short runs. The break itself is not counted.
+///
+/// Both base64 alphabets count, each on its own: the standard one (`+`, `/`)
+/// and the URL- and filename-safe one (`-`, `_`; RFC 4648 section 5) that
+/// JWTs, `basenc --base64url` and most web tooling write. Measured with the
+/// standard alphabet alone, base64url breaks at every `-` and `_`, one
+/// character in 32 on average, and a file of it passes as short runs.
 fn longest_encoded_run(content: &[u8]) -> usize {
-    let is_payload = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=');
+    longest_run(content, b"+/=").max(longest_run(content, b"-_="))
+}
+
+/// Longest run of alphanumerics and `extra` bytes, joined across single line
+/// breaks as `longest_encoded_run` describes.
+fn longest_run(content: &[u8], extra: &[u8]) -> usize {
+    let is_payload = |b: &u8| b.is_ascii_alphanumeric() || extra.contains(b);
     let (mut longest, mut run, mut i) = (0, 0, 0);
     while let Some(b) = content.get(i) {
         if is_payload(b) {
@@ -1385,6 +1397,44 @@ mod tests {
                 "width {width}, eol {eol:?}"
             );
         }
+    }
+
+    /// base64url (`-` and `_` for `+` and `/`) is as much a payload as base64,
+    /// wrapped or not; the two alphabets are not mixed into one run.
+    #[test]
+    fn rejects_base64url_data() {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let encoded: String = (0..MAX_ENCODED_RUN * 2)
+            .map(|i| alphabet[i * 7 % alphabet.len()] as char)
+            .collect();
+        assert!(
+            encoded.contains('-') && encoded.contains('_'),
+            "the test data uses the URL-safe characters"
+        );
+        assert!(
+            super::longest_run(encoded.as_bytes(), b"+/=") < 64,
+            "the standard alphabet alone sees only short runs"
+        );
+        for blob in [
+            format!("const TOKEN: &str = \"{encoded}\";\n"),
+            encoded
+                .as_bytes()
+                .chunks(76)
+                .map(|line| String::from_utf8_lossy(line) + "\n")
+                .collect(),
+        ] {
+            assert!(
+                check("strings.txt", blob.as_bytes())
+                    .iter()
+                    .any(|p| p.contains("hex/base64 run")),
+                "{blob:?}"
+            );
+        }
+        let run = super::longest_encoded_run;
+        assert_eq!(run(b"ab-cd_ef"), 8);
+        assert_eq!(run(b"ab+cd/ef"), 8);
+        assert_eq!(run(b"ab+cd-ef"), 5, "the alphabets do not mix");
+        assert_eq!(run(b"ab-cd\nef_gh"), 10, "wrapped like base64");
     }
 
     /// Only a single line break joins: prose, code, a blank line or
