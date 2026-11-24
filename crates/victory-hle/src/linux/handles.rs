@@ -298,6 +298,10 @@ fn key(object: &dyn Waitable) -> usize {
 pub(crate) fn update<R>(object: &dyn Waitable, change: impl FnOnce() -> R) -> R {
     let waits = lock(&WAITS);
     let r = change();
+    #[cfg(feature = "diagnostics")]
+    if lock(&LONG_WAITS).contains(&key(object)) {
+        tracing::warn!(object = key(object), thread = current_thread().id(), "a long-waited object changes");
+    }
     let mut wake = [0usize; 16];
     let mut n = 0;
     for &word in waits.get(&key(object)).into_iter().flatten() {
@@ -317,6 +321,35 @@ pub(crate) fn update<R>(object: &dyn Waitable, change: impl FnOnce() -> R) -> R 
         futex_wake(word as *const u32, 1);
     }
     r
+}
+
+/// Objects a wait has waited for over 10 s (diagnostics).
+#[cfg(feature = "diagnostics")]
+static LONG_WAITS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Logs a long wait's objects and watches them (`begin`), or stops.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn long_wait(list: &[Handle], objects: &[&dyn Waitable], begin: bool) {
+    let mut watched = lock(&LONG_WAITS);
+    for (&handle, &object) in list.iter().zip(objects) {
+        if begin {
+            let kind = if get::<Event>(handle).is_some() {
+                "event"
+            } else if get::<Semaphore>(handle).is_some() {
+                "semaphore"
+            } else if get::<KMutex>(handle).is_some() {
+                "mutex"
+            } else if get::<Thread>(handle).is_some() {
+                "thread"
+            } else {
+                "other"
+            };
+            tracing::warn!(handle, kind, object = key(object), signalled = object.signalled(), thread = current_thread().id(), "waiting over 10 s");
+            watched.push(key(object));
+        } else if let Some(i) = watched.iter().position(|&k| k == key(object)) {
+            watched.swap_remove(i);
+        }
+    }
 }
 
 /// `WaitForMultipleObjects` on objects the caller keeps alive:

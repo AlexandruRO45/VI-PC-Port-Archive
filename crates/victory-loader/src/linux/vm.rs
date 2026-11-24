@@ -33,7 +33,9 @@
 //! pool ([`phys_alloc`], [`phys_map`]) is one growing section of 64 KiB
 //! pages mapped into a reservation; [`alias`] shows whatever section backs
 //! one range at another as well, and `MEM_DECOMMIT` unmaps it again. On
-//! Linux xmem needs no placeholders: reserve, `phys_map`, decommit.
+//! Linux xmem needs no placeholders: reserve, `phys_map`, decommit. A
+//! placeholder the title reserves itself takes physical pages too: the
+//! mapped range becomes a reservation of its own, as a view would.
 //!
 //! Errors are Windows codes; the kernel32 layer sets the last error.
 //! Thread-safe: one leaf lock, never held across a read of `/proc`.
@@ -257,6 +259,16 @@ fn split(runs: &mut Runs, at: usize) {
         *offset += (at - start) as u64;
     }
     runs.insert(at, tail);
+}
+
+/// Gives `[base, end)` of the placeholder whose run starts at `start` an
+/// allocation of its own, `fill` setting each run there; what is left
+/// below and above stays placeholders of their own.
+fn carve(runs: &mut Runs, start: usize, base: usize, end: usize, fill: impl FnMut(usize, &mut Run)) {
+    let (first, limit) = (runs[&start].base, extent(runs, start));
+    each(runs, first, base, |_, r| r.base = first);
+    each(runs, base, end, fill);
+    each(runs, end, limit, |_, r| r.base = end);
 }
 
 fn joinable(a_start: usize, a: &Run, b_start: usize, b: &Run) -> bool {
@@ -563,18 +575,13 @@ pub fn alloc(
             if runs[&start].kind != Kind::Placeholder {
                 return Err(ERROR_INVALID_ADDRESS);
             }
-            let limit = extent(runs, start);
-            let first = runs[&start].base;
-            each(runs, first, base, |_, r| r.base = first);
-            each(runs, base, end, |_, r| {
+            carve(runs, start, base, end, |_, r| {
                 *r = Run {
                     end: r.end,
                     base,
                     ..new.clone()
                 }
             });
-            // What is left above is a placeholder of its own.
-            each(runs, end, limit, |_, r| r.base = end);
         } else {
             let len = if a != 0 { end - base } else { size };
             if page == LARGE_PAGE
@@ -1074,16 +1081,13 @@ pub fn map_view(
     };
     if replace_placeholder {
         let start = find(runs, base).expect("checked");
-        let (first, limit) = (runs[&start].base, extent(runs, start));
-        each(runs, first, base, |_, r| r.base = first);
-        each(runs, base, base + end_len, |s, r| {
+        carve(runs, start, base, base + end_len, |s, r| {
             *r = Run {
                 end: r.end,
                 view: Some((section.clone(), offset + (s - base) as u64)),
                 ..new.clone()
             }
         });
-        each(runs, base + end_len, limit, |_, r| r.base = base + end_len);
     } else {
         runs.insert(base, new);
     }
@@ -1237,7 +1241,7 @@ pub fn phys_free(pages: &[u64]) {
 }
 
 /// Maps `pages[i]` at `va + i * 64 KiB`, replacing what is there; the
-/// range must lie in one reservation of this table. A page can be mapped
+/// range must lie in one reservation or placeholder of this table. A page can be mapped
 /// at several addresses at once. `MEM_DECOMMIT` unmaps.
 pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
     let prot = native_protect(protect).ok_or(ERROR_INVALID_PARAMETER)?;
@@ -1253,12 +1257,29 @@ pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
     let pool_pages = state.pool_pages;
     let pool = state.pool.clone().ok_or(ERROR_INVALID_PARAMETER)?;
     let runs = &mut state.runs;
-    let start = whole(runs, va, va + n * PHYS_PAGE).ok_or(ERROR_INVALID_ADDRESS)?;
-    if runs[&start].kind != Kind::Private {
+    let end = va + n * PHYS_PAGE;
+    let start = whole(runs, va, end).ok_or(ERROR_INVALID_ADDRESS)?;
+    if !matches!(runs[&start].kind, Kind::Private | Kind::Placeholder) {
         return Err(ERROR_INVALID_ADDRESS);
     }
     if pages.iter().any(|&p| p >= pool_pages) {
         return Err(ERROR_INVALID_PARAMETER);
+    }
+    if runs[&start].kind == Kind::Placeholder {
+        // As `MapViewOfFile3` into a placeholder: the range becomes an
+        // allocation of its own, here a reservation the pages go into.
+        carve(runs, start, va, end, |_, r| {
+            *r = Run {
+                end: r.end,
+                base: va,
+                alloc_protect: protect,
+                protect: 0,
+                page: PHYS_PAGE,
+                committed: false,
+                kind: Kind::Private,
+                view: None,
+            }
+        });
     }
     let mut done = 0;
     while done < n {
@@ -1657,6 +1678,30 @@ mod tests {
         assert!(pages.contains(&again[0]));
         phys_free(&again);
         free(va, 0, MEM_RELEASE).unwrap();
+    }
+
+    #[test]
+    fn physical_pages_map_into_a_placeholder() {
+        let mut pages = [0u64; 2];
+        phys_alloc(&mut pages).unwrap();
+        let g = PHYS_PAGE;
+        let va = alloc(0, 4 * g, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, PAGE).unwrap();
+        phys_map(va + g, &pages, PAGE_READWRITE).unwrap();
+        // SAFETY: mapped read-write.
+        unsafe { ((va + g) as *mut u8).write(7) };
+        // The mapped range is an allocation of its own; the rest stay placeholders.
+        assert_eq!((q(va + g).allocation_base, q(va + g).state), (va + g, MEM_COMMIT));
+        assert_eq!(q(va).allocation_base, va);
+        assert_eq!(q(va + 3 * g).allocation_base, va + 3 * g);
+        // Mapped again in place, unmapped, then back to a placeholder.
+        phys_map(va + g, &[pages[1], pages[0]], PAGE_READWRITE).unwrap();
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { ((va + 2 * g) as *const u8).read() }, 7);
+        free(va + g, 2 * g, MEM_DECOMMIT).unwrap();
+        free(va + g, 2 * g, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER).unwrap();
+        free(va, 4 * g, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS).unwrap();
+        free(va, 0, MEM_RELEASE).unwrap();
+        phys_free(&pages);
     }
 
     #[test]

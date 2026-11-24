@@ -560,6 +560,13 @@ impl Host {
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            if timing() {
+                let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
+                let last: Vec<&String> = notes.iter().rev().take(8).map(|(n, _)| n).collect();
+                let pipelines = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                stuck::watch(format!("{} commands, pipelines {pipelines:?}, last {last:?}", notes.len()));
+            }
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -587,6 +594,8 @@ impl Host {
                     tracing::warn!("slow list command, {ms:.1} ms: {op}");
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            stuck::done();
             let _ = (i, started);
         }
         let _ = &firsts;
@@ -2341,5 +2350,39 @@ mod device_tests {
             assert!(host.present(&texture, state, frame).is_some(), "frame {frame}");
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
+    }
+}
+
+/// With `VICTORY_GPU_TIMING` (diagnostics): names a host list that has run
+/// for 5 s, while it still runs (one that never ends is never timed).
+#[cfg(feature = "diagnostics")]
+mod stuck {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    static RUNNING: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+
+    /// The list about to run, and what to say if it gets stuck.
+    pub(super) fn watch(what: String) {
+        static WATCHER: std::sync::Once = std::sync::Once::new();
+        WATCHER.call_once(|| {
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((at, what)) = running.as_mut()
+                        && at.elapsed() > Duration::from_secs(5)
+                        && let Some(what) = what.take()
+                    {
+                        tracing::warn!(what, "host list still running after 5 s");
+                    }
+                }
+            });
+        });
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Some(what)));
+    }
+
+    pub(super) fn done() {
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }

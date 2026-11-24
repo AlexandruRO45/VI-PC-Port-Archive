@@ -246,6 +246,16 @@ thread_local! {
     static REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(feature = "diagnostics")]
+static SAVE: std::sync::OnceLock<Vec<(usize, usize, std::path::PathBuf)>> = std::sync::OnceLock::new();
+
+/// Debugging aid: on a reported crash, also write each `[address, address
+/// + len)` to its file.
+#[cfg(feature = "diagnostics")]
+pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
+    let _ = SAVE.set(ranges);
+}
+
 /// Reports an exception nobody handles, as the Windows crash reporter
 /// does (`module+rva`, registers, the stack), to stderr and the crash log.
 ///
@@ -264,6 +274,17 @@ pub unsafe fn report_unhandled(info: *const ExceptionPointers) {
         report.line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     report.finish(true);
+    #[cfg(feature = "diagnostics")]
+    if super::stacks::ON_CRASH.load(Ordering::Relaxed) {
+        super::stacks::dump_stacks();
+    }
+    #[cfg(feature = "diagnostics")]
+    for (address, len, file) in SAVE.get().into_iter().flatten() {
+        // SAFETY: the caller of `save_on_crash` named readable memory.
+        let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *len) };
+        let saved = std::fs::write(file, bytes);
+        eprintln!("  saved {address:#x}+{len:#x} to {} ({saved:?})", file.display());
+    }
 }
 
 // ---- the dispatcher -------------------------------------------------------------------------
@@ -272,6 +293,19 @@ pub unsafe fn report_unhandled(info: *const ExceptionPointers) {
 /// then the top-level filter and the end of the process. Returns only by
 /// loading a context.
 pub(crate) fn dispatch(record: &mut ExceptionRecord, context: &mut Context) -> ! {
+    if tracing::enabled!(target: "victory_loader::seh", tracing::Level::DEBUG) {
+        let mut frames = [0u64; 12];
+        let n = unwind::walk(context, &mut frames);
+        let frames: Vec<String> = frames[..n].iter().map(|&pc| locate(pc as usize)).collect();
+        tracing::debug!(
+            target: "victory_loader::seh",
+            code = format_args!("{:#x}", record.code),
+            at = %locate(record.address),
+            parameters = format_args!("{:x?}", record.parameters()),
+            ?frames,
+            "first chance"
+        );
+    }
     if call_vectored(false, record, context) || call_frame_handlers(record, context) {
         call_vectored(true, record, context);
         restore_context(context, None);

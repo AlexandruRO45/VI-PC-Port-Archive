@@ -67,6 +67,22 @@ pub extern "win64" fn WaitForMultipleObjectsEx(
             return WAIT_FAILED;
         }
     }
+    // Diagnostics: an endless wait past 10 s names its objects, and their
+    // next change is logged.
+    #[cfg(feature = "diagnostics")]
+    if milliseconds == u32::MAX {
+        const WAIT_TIMEOUT: u32 = 258;
+        let started = std::time::Instant::now();
+        let result = handles::wait(&waitables, all, 10_000);
+        if result != WAIT_TIMEOUT {
+            return result;
+        }
+        handles::long_wait(list, &waitables, true);
+        let result = handles::wait(&waitables, all, milliseconds);
+        handles::long_wait(list, &waitables, false);
+        tracing::warn!(secs = started.elapsed().as_secs(), ?list, "long wait ended");
+        return result;
+    }
     handles::wait(&waitables, all, milliseconds)
 }
 
