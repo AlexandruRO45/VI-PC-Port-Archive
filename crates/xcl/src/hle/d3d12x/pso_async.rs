@@ -8,7 +8,7 @@
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
@@ -344,7 +344,10 @@ pub fn resolve(pso: usize) -> usize {
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_use();
+    let already = *p.done.lock().unwrap();
+    let started = std::time::Instant::now();
     let job = p.job.lock().unwrap().take();
+    let built_here = job.is_some();
     if let Some(job) = job {
         complete(&p, job());
     }
@@ -352,9 +355,58 @@ pub fn resolve_wait(pso: usize) -> usize {
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
+    drop(done);
+    if !already {
+        note_blocked(p.compute, built_here, started.elapsed());
+    }
     match p.real.load(Ordering::Acquire) {
         0 => pso,
         r => r,
+    }
+}
+
+/// What `resolve_wait` cost the threads that called it – a title's, as a rule: for graphics
+/// [0] and compute [1] pipelines, the waits, their total and longest µs, and those that built
+/// the pipeline themselves. A retail title's render thread spent most of its frames in the
+/// driver's compiler this way (on an NVIDIA GPU; its hang watchdog then ended it).
+static BLOCKED: [[AtomicU64; 4]; 2] = [const { [const { AtomicU64::new(0) }; 4] }; 2];
+const WAITS: usize = 0;
+const TOTAL_US: usize = 1;
+const LONGEST_US: usize = 2;
+const BUILT_HERE: usize = 3;
+
+/// (waits, total µs, longest µs, built by the caller) of `resolve_wait`, graphics then compute
+pub fn blocked() -> [[u64; 4]; 2] {
+    BLOCKED.each_ref().map(|k| k.each_ref().map(|c| c.load(Ordering::Relaxed)))
+}
+
+/// A `resolve_wait` that found its pipeline not built yet: counted; every power of two of them
+/// and each wait of a second or more (the first 32) is logged.
+fn note_blocked(compute: bool, built_here: bool, took: std::time::Duration) {
+    let us = took.as_micros() as u64;
+    let k = &BLOCKED[compute as usize];
+    let n = k[WAITS].fetch_add(1, Ordering::Relaxed) + 1;
+    k[TOTAL_US].fetch_add(us, Ordering::Relaxed);
+    k[LONGEST_US].fetch_max(us, Ordering::Relaxed);
+    if built_here {
+        k[BUILT_HERE].fetch_add(1, Ordering::Relaxed);
+    }
+    let kind = if compute { "compute" } else { "graphics" };
+    static LONG: AtomicUsize = AtomicUsize::new(0);
+    if us >= 1_000_000 && LONG.fetch_add(1, Ordering::Relaxed) < 32 {
+        crate::xlog_warn!(
+            "D3D12.X: a {kind} pipeline held up its caller for {} ms ({})",
+            us / 1000,
+            if built_here { "built in the call" } else { "waited for a worker" }
+        );
+    }
+    if n.is_power_of_two() {
+        let b = blocked();
+        crate::xlog_info!(
+            "D3D12.X: pipelines waited for at a bind so far: {} graphics ({} ms, longest {} ms, {} built in the call), {} compute ({} ms, longest {} ms, {} built in the call)",
+            b[0][WAITS], b[0][TOTAL_US] / 1000, b[0][LONGEST_US] / 1000, b[0][BUILT_HERE],
+            b[1][WAITS], b[1][TOTAL_US] / 1000, b[1][LONGEST_US] / 1000, b[1][BUILT_HERE],
+        );
     }
 }
 
@@ -391,4 +443,29 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bind that waits for a lazy pipeline nobody has started builds it itself, and the time
+    /// it was held up is counted under its kind (other tests wait too: increases are checked).
+    #[test]
+    fn a_wait_that_builds_the_pipeline_is_counted_with_its_time() {
+        let standin = 0x7E57_8001usize;
+        let before = blocked();
+        submit_lazy(standin, false, Box::new(|| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            0x4401
+        }), 0);
+        assert_eq!(resolve_wait(standin), 0x4401);
+        let after = blocked();
+        let (b, a) = (before[0], after[0]);
+        assert!(a[WAITS] > b[WAITS], "the graphics wait is counted");
+        assert!(a[BUILT_HERE] > b[BUILT_HERE], "built by the caller: nobody had started it");
+        assert!(a[TOTAL_US] - b[TOTAL_US] >= 50_000, "its 50 ms are in the total");
+        assert!(a[LONGEST_US] >= 50_000);
+        released(standin);
+    }
 }
