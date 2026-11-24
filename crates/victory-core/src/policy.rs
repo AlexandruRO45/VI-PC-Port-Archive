@@ -124,6 +124,35 @@ fn normalize(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A temporary directory outside every VIctory source tree.
+    ///
+    /// `tempfile::tempdir()` alone follows `TMPDIR`, and with `TMPDIR` inside
+    /// the checkout (a scratch directory there is common) every directory it
+    /// makes is inside the repository: the tests that need an outside
+    /// directory then fail, and the marker test passes without the marker
+    /// mattering. So `TMPDIR` is used only when it is outside; otherwise the
+    /// nearest writable ancestor of the checkout that is outside, and failing
+    /// that the test says what to do instead of failing on a misleading
+    /// `InsideRepo`.
+    fn outside_tempdir() -> tempfile::TempDir {
+        let root = std::fs::canonicalize(compiled_workspace_root()).unwrap();
+        let candidates = std::iter::once(std::env::temp_dir())
+            .chain(root.ancestors().skip(1).map(Path::to_path_buf));
+        for dir in candidates {
+            let Ok(tmp) = tempfile::tempdir_in(&dir) else {
+                continue;
+            };
+            if ensure_outside_repo(tmp.path()).is_ok() {
+                return tmp;
+            }
+        }
+        panic!(
+            "no writable temporary directory outside the source tree ({}); \
+             set TMPDIR to one",
+            root.display()
+        );
+    }
+
     #[test]
     fn rejects_paths_inside_this_repo() {
         let inside = compiled_workspace_root().join("cache").join("textures");
@@ -150,7 +179,7 @@ mod tests {
     fn resolves_dotdot_after_a_missing_directory() {
         // `Path::file_name` is `None` for a path ending in `..`, so the walk
         // up to an existing prefix has to keep that component too.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = outside_tempdir();
         let path = tmp.path().join("missing").join("..").join("cache");
         ensure_outside_repo(&path).unwrap();
 
@@ -166,14 +195,20 @@ mod tests {
 
     #[test]
     fn rejects_other_clones_via_marker() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = outside_tempdir();
+        // Accepted before the marker is written, so the marker is what
+        // makes the difference.
+        ensure_outside_repo(&tmp.path().join("cache")).unwrap();
         std::fs::write(tmp.path().join(ROOT_MARKER), "").unwrap();
-        assert!(ensure_outside_repo(&tmp.path().join("cache")).is_err());
+        assert!(matches!(
+            ensure_outside_repo(&tmp.path().join("cache")),
+            Err(PolicyError::InsideRepo { .. })
+        ));
     }
 
     #[test]
     fn accepts_unrelated_directories() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = outside_tempdir();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
     }
 }
