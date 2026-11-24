@@ -228,10 +228,16 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let mut failed = std::collections::HashSet::new();
+        self.meet_in(all.to_vec(), &mut budget, &mut failed)
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        failed: &mut std::collections::HashSet<Vec<(Bool, bool)>>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
@@ -240,10 +246,16 @@ impl Bools {
         if all.is_empty() || *budget == 0 {
             return true;
         }
+        // Shared sub-diagrams reach the same state by many paths.
+        all.sort_unstable();
+        all.dedup();
+        if failed.contains(&all) {
+            return false;
+        }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let found = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -251,8 +263,12 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, failed)
+        });
+        if !found {
+            failed.insert(all);
+        }
+        found
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1144,6 +1160,25 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    #[test]
+    fn meet_sees_a_contradiction_past_large_conditions() {
+        // Two parities over 20 atoms each: 2^40 paths, a few hundred
+        // distinct states. The conflict is on the last atom.
+        let mut b = Bools::new();
+        let mut parity = |b: &mut Bools, from: u64| {
+            let mut p = Bool::FALSE;
+            for k in 0..20 {
+                let a = b.atom(Atom::Constant(from + k), 0);
+                p = b.xor(p, a);
+            }
+            p
+        };
+        let (p, q) = (parity(&mut b, 1), parity(&mut b, 100));
+        let late = b.atom(Atom::Constant(1000), 0);
+        assert!(b.meet(&[(p, true), (q, true), (late, true)]));
+        assert!(!b.meet(&[(p, true), (q, true), (late, true), (late, false)]));
     }
 
     #[test]
