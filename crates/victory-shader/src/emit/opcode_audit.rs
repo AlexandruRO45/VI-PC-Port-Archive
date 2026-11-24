@@ -161,7 +161,7 @@ fn fixture(encoding: Encoding, op: u32, name: &str) -> Result<(NativeProgram, us
         Smem => {
             let base = if descriptor { 16 } else { 10 };
             let imm = if pc_load { 12 } else { 0 }; // after the load and s_endpgm
-            words.extend([0xF400_0000 | op << 18 | 24 << 6 | base / 2, 0xFA00_0000 | imm]);
+            words.extend([0xF400_0000 | op << 18 | 24 << 6 | (base / 2), 0xFA00_0000 | imm]);
         }
         Exp => words.extend([0xF800_080F, 0x0706_0504]), // MRT0.xyzw, done
         Mimg => return Err("image descriptors and coordinates"),

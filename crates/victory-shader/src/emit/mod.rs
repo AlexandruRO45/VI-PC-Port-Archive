@@ -84,6 +84,8 @@ pub mod host;
 mod lower;
 #[cfg(test)]
 mod opcode_audit;
+#[cfg(all(test, windows))]
+mod opcode_tests;
 mod sampler;
 mod shader;
 #[cfg(windows)]
