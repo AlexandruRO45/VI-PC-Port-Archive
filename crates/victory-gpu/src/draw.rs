@@ -544,6 +544,13 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.frame_op_why(
+                &format!("dispatch {x}x{y}x{z}"),
+                true,
+                false,
+                Some("a table it reads could not be made"),
+            );
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -1047,7 +1054,12 @@ impl State {
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(&format!("indirect kind {kind}"), kind == DISPATCH, false, Some("arguments outside title buffers"));
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("arguments outside title buffers"),
+            );
             return false;
         };
         let counter = match count {
@@ -1056,7 +1068,12 @@ impl State {
                 None => {
                     why("count outside title buffers");
                     #[cfg(feature = "diagnostics")]
-                    self.frame_op_why(&format!("indirect kind {kind}"), kind == DISPATCH, false, Some("count outside title buffers"));
+                    self.frame_op_why(
+                        &format!("indirect kind {kind}"),
+                        kind == DISPATCH,
+                        false,
+                        Some("count outside title buffers"),
+                    );
                     return false;
                 }
             },
@@ -1068,7 +1085,12 @@ impl State {
         else {
             why("no host signature");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(&format!("indirect kind {kind}"), kind == DISPATCH, false, Some("no host signature"));
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("no host signature"),
+            );
             return false;
         };
         args.refresh(list, arguments, len);
@@ -1079,7 +1101,12 @@ impl State {
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             #[cfg(feature = "diagnostics")]
-            self.frame_op_why(&format!("indirect kind {kind}"), kind == DISPATCH, false, Some("not bounded (no clamp, or arguments not 4-byte aligned)"));
+            self.frame_op_why(
+                &format!("indirect kind {kind}"),
+                kind == DISPATCH,
+                false,
+                Some("not bounded (no clamp, or arguments not 4-byte aligned)"),
+            );
             return false;
         }
         self.host_pipeline = 0;
