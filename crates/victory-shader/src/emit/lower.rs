@@ -2198,16 +2198,20 @@ impl<'a> Lower<'a> {
                     let x = self.s.m.bin(c, Bin::LShr, x, shift);
                     self.s.m.bin(c, Bin::And, x, mask)
                 };
-                if hi {
-                    let old = match inst.read(Reg::V(reg)) {
-                        Some(v) => self.i32_of(v)?,
-                        None => self.s.m.i32(0),
-                    };
-                    let m16 = self.s.m.i32(0xFFFF);
-                    let lo = self.s.m.bin(c, Bin::And, old, m16);
-                    let k16 = self.s.m.i32(16);
-                    let shifted = self.s.m.bin(c, Bin::Shl, r, k16);
-                    r = self.s.m.bin(c, Bin::Or, lo, shifted);
+                if d16 {
+                    if hi {
+                        let old = match inst.read(Reg::V(reg)) {
+                            Some(v) => self.i32_of(v)?,
+                            None => self.s.m.i32(0),
+                        };
+                        let m16 = self.s.m.i32(0xFFFF);
+                        let lo = self.s.m.bin(c, Bin::And, old, m16);
+                        let k16 = self.s.m.i32(16);
+                        let shifted = self.s.m.bin(c, Bin::Shl, r, k16);
+                        r = self.s.m.bin(c, Bin::Or, lo, shifted);
+                    } else {
+                        r = self.low_half(inst, reg, r);
+                    }
                 }
                 self.write(inst, Reg::V(reg), r, guard);
                 return Ok(());
@@ -5941,8 +5945,9 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
+            let first = usize::from(offset_word)
+                + usize::from(name.starts_with("image_sample_b"))
+                + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -6042,8 +6047,15 @@ impl<'a> Lower<'a> {
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
-                    let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = addr_val(self, usize::from(offset_word))?;
+                    let bias = if *a16 {
+                        // Under A16, bias occupies a full 32-bit VGPR with an f16 in the low half.
+                        let m16 = self.s.m.i32(0xFFFF);
+                        let lo = self.s.m.bin(c, Bin::And, bias, m16);
+                        to_float(self, lo)
+                    } else {
+                        self.as_float(bias)
+                    };
                     args.extend(&os);
                     args.extend([bias, fu]);
                     self.s.op(
