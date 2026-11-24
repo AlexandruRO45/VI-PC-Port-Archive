@@ -852,6 +852,8 @@ pub struct DeviceAssociationChange {
 struct AssociationCallState {
     stopped: bool,
     in_flight: usize,
+    // Each registration is notified once: registration and the sign-in transition are
+    // serialized by ASSOCIATIONS. This is independent of the queue's dispatch mode.
     owner: Option<std::thread::ThreadId>,
 }
 
