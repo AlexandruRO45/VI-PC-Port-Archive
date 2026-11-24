@@ -9,9 +9,9 @@ it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
 The Windows executable can also be launched under Proton on x86-64 Linux. See
-[Linux / Proton](#linux--proton) for the build, launcher, and verification scope.
+[Running with the Proton launcher](docs/proton-launcher.md).
 
-## Windows status (2026-11-23)
+## Status (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
@@ -47,42 +47,7 @@ What each part does today and what it still needs:
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
-## Linux / Proton
-
-Install `umu-run` and use an AVX2 CPU with a Vulkan driver that exposes
-Shader Model 6.6 through vkd3d-proton.
-[UMU installation](https://github.com/Open-Wine-Components/umu-launcher#installation)
-
-To build from source, install Rust with rustup and the x86-64 Linux UCRT
-distribution of LLVM-MinGW. Put LLVM-MinGW's `bin` directory first on `PATH`. The loader
-relies on native Windows thread-local storage when a title DLL calls back
-into Rust during thread startup. The `gnullvm` target provides that layout.
-[LLVM-MinGW releases](https://github.com/mstorsjo/llvm-mingw/releases)
-
-```sh
-rustup target add x86_64-pc-windows-gnullvm
-cargo build --locked --release -p victory --target x86_64-pc-windows-gnullvm
-./tests/proton-smoke.sh
-./scripts/victory-proton.sh "/path/to/game/title.exe" --execute
-```
-
-Supply the title's executable from your game directory outside the checkout.
-Omit `--execute` to check mapping and import binding first. The launcher
-accepts the remaining `victory run` options and forwards arguments after
-`--`. Set `VICTORY_EXE` to use an existing Windows build.
-
-On first launch UMU fetches its Proton build and Steam Linux Runtime.
-The default prefix is `${XDG_DATA_HOME:-$HOME/.local/share}/victory/proton`.
-Saves and converted data live under the prefix's Windows user profile.
-`WINEPREFIX` selects another prefix and `PROTONPATH` selects another Proton
-build. Use Windows paths in `victory.toml`.
-
-The smoke test loads a synthetic executable, calls both an Xbox runtime
-function and a host function, and checks the title's return value. The
-game's menu and world still need verification under Proton. The Windows
-status above describes the tests on Windows.
-
-## Getting started on Windows
+## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in

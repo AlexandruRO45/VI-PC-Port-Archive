@@ -1,5 +1,5 @@
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+    if std::env::var("CARGO_CFG_TARGET_ABI").as_deref() == Ok("llvm") {
         println!("cargo:rustc-link-arg-cdylib=-fuse-ld=lld");
         println!("cargo:rustc-link-arg-cdylib=-Wl,--delayload=victory-probe-delayed.dll");
     } else {
