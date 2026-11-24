@@ -314,6 +314,14 @@ pub(crate) fn stands_in(this: This) -> bool {
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Views and clears the host refused because the resource was not created
+/// with the flag they need — render targets, then depth. A view of such a
+/// resource is the invalid call that removes the device, so the host leaves
+/// a null view (or skips the clear) instead: the number is what the title
+/// asks for that the console allowed and PC does not.
+pub(crate) static REFUSED_TARGETS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
 pub(crate) fn depth_and_unordered(this: This) -> bool {
@@ -1614,20 +1622,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     hosted(this, true).map(|made| made.0)
 }
 
-/// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
-#[cfg(windows)]
-fn host_texture(
-    desc: &ResourceDesc,
-    state: u32,
-    clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
-    use windows::Win32::Graphics::Direct3D12::*;
+/// A title texture's description as the host's copy has it: the title's,
+/// without the console's layout, and with the flags and formats the host
+/// allows. Also the title's clear value in that description's format, or
+/// `None` when it cannot come along: the device refuses a clear value on a
+/// resource without a render target or depth flag, which costs the whole
+/// texture.
+fn host_texture_desc(desc: &ResourceDesc, clear: *const c_void) -> (ResourceDesc, Option<[u32; 5]>) {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
-    if desc.dimension == BUFFER {
-        return None;
-    }
-    let host = crate::host::host()?;
     let mut d = *desc;
     d.layout = 0;
     d.alignment = 0;
@@ -1661,8 +1663,10 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). A resource without either flag cannot take
+    // one: the creation is invalid and the texture never exists.
+    let takes_clear = d.flags & (TARGET | DEPTH) != 0;
+    let clear_value = (takes_clear && !clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = pc_format(value[0]);
@@ -1671,6 +1675,29 @@ fn host_texture(
         }
         value
     });
+    (d, clear_value)
+}
+
+/// A host texture like the title's: same description, in GPU memory,
+/// without the console's layout and flags.
+#[cfg(windows)]
+fn host_texture(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: *const c_void,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    if desc.dimension == BUFFER {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let (d, clear_value) = host_texture_desc(desc, clear);
+    if clear_value.is_none() && !clear.is_null() {
+        tracing::warn!(
+            desc = ?d,
+            "a clear value on a texture that cannot take one is dropped"
+        );
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2471,6 +2498,100 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    /// A clear value rides along only on a texture that can take one: the
+    /// device refuses a clear value on a resource without a render target or
+    /// depth flag, and the whole texture with it, which is how NV12 and
+    /// B4G4R4A4 targets used to go missing. The host's stand-in format keeps
+    /// their flags, so they keep the clear; a texture with no flag loses it.
+    #[test]
+    fn a_clear_value_comes_along_only_on_a_texture_that_can_take_one() {
+        const RENDER_TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const UNORDERED: u32 = 4;
+        let clear = [28u32, 0, 0, 0, 0];
+        let given = std::ptr::from_ref(&clear).cast::<c_void>();
+        let flagged = |format: u32, flags: u32| ResourceDesc {
+            flags,
+            ..texture(1024, 1024, format, 1)
+        };
+        // Nothing clears a texture the title gave no flag: the value cannot
+        // come along, and the host description has no flag to take one.
+        let (host, value) = host_texture_desc(&flagged(28, 0), given);
+        assert_eq!((host.flags, value), (0, None));
+        // A render target keeps the value.
+        let (host, value) = host_texture_desc(&flagged(28, RENDER_TARGET), given);
+        assert_eq!((host.flags, value), (RENDER_TARGET, Some([28, 0, 0, 0, 0])));
+        // A depth target loses the unordered access flag PC refuses and
+        // keeps the value, in the typeless format its copy has.
+        let (host, value) = host_texture_desc(&flagged(55, DEPTH | UNORDERED), given);
+        assert_eq!(host.flags, DEPTH);
+        assert_eq!(host.format, 53, "a depth target's copy is typeless");
+        assert!(value.is_some(), "a depth target keeps its clear value");
+        // The stand-in formats keep both flags, so their clear stays.
+        let (host, value) = host_texture_desc(&flagged(86, RENDER_TARGET | UNORDERED), given);
+        assert_eq!(host.flags, RENDER_TARGET | UNORDERED);
+        assert!(value.is_some(), "a stand-in target keeps its clear value");
+        // A texture that can take one but was given none.
+        let (_, value) = host_texture_desc(&flagged(28, RENDER_TARGET), std::ptr::null());
+        assert_eq!(value, None);
+    }
+
+    /// The device refuses a clear value on a resource without a render target
+    /// or depth flag, and the whole texture with it: a title texture the title
+    /// gave no flag still has to exist when it also gave a clear value.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_given_no_flag_still_exists_when_given_a_clear_value() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const COPY_DEST: u32 = 0x400;
+        let clear = [28u32, 0, 0, 0, 0];
+        let given = std::ptr::from_ref(&clear).cast::<c_void>();
+        let plain = ResourceDesc {
+            flags: 0,
+            ..texture(64, 64, 28, 1)
+        };
+        assert!(
+            host_texture(&plain, COPY_DEST, given).is_some(),
+            "a clear value the device refuses must not cost the whole texture"
+        );
+    }
+
+    /// A clear of a resource created without the flag it needs is the
+    /// invalid call the device is removed for, which is what the host's clear
+    /// sites consult before issuing one. The copies the host makes of a title
+    /// texture carry the title's flags, so the predicate answers on a
+    /// texture the host actually built.
+    #[cfg(windows)]
+    #[test]
+    fn a_clear_is_refused_where_the_texture_cannot_take_the_view() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const RENDER_TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const COPY_DEST: u32 = 0x400;
+        let copy = |flags: u32, format: u32| {
+            let title = ResourceDesc {
+                flags,
+                ..texture(64, 64, format, 1)
+            };
+            host_texture(&title, COPY_DEST, std::ptr::null()).expect("a host copy")
+        };
+        let plain = copy(0, 28);
+        let target = copy(RENDER_TARGET, 28);
+        let depth = copy(DEPTH, 55);
+        assert!(!crate::host::clears_render_target(&plain), "no flag: no clear");
+        assert!(crate::host::clears_render_target(&target));
+        assert!(!crate::host::clears_depth(&plain), "no flag: no clear");
+        assert!(crate::host::clears_depth(&depth));
+        assert!(
+            !crate::host::clears_depth(&target),
+            "a render target is not a depth target"
+        );
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

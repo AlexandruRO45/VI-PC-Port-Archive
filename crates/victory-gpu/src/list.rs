@@ -1221,6 +1221,12 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        // A clear through a view the resource cannot take is an invalid
+        // call, and the view is null: nothing to clear.
+        if !crate::host::clears_render_target(texture) {
+            crate::resource::REFUSED_TARGETS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -1268,6 +1274,12 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
+        // As `clear_rtv`: a clear through a depth view the resource cannot
+        // take is an invalid call, and the view is null.
+        if !crate::host::clears_depth(texture) {
+            crate::resource::REFUSED_TARGETS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         // A depth texture shaders also write: what they wrote, first (the
         // clear may be of one slice or of some rectangles).
         list.twin_use(record.resource, false, true);
