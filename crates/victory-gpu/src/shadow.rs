@@ -178,7 +178,6 @@ impl Shadow {
         self.gpu + (address - self.start)
     }
 
-    /// Bytes from a title address to the buffer's end.
     /// The words at `[address, address + len)` as the host copy holds them:
     /// the title's memory when the range was bound, for diagnostics that need
     /// the record without reading it back from the GPU.
@@ -190,6 +189,7 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(from).cast::<u32>(), words) }.to_vec()
     }
 
+    /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
     }

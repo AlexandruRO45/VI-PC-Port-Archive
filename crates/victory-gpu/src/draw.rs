@@ -1223,7 +1223,7 @@ impl State {
         });
         crumbs::record(crumbs::INDIRECT, arguments, kind);
         #[cfg(feature = "diagnostics")]
-        report_records(list, &args, arguments, (kind, stride, max));
+        report_records(&args, arguments, (kind, stride, max));
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
@@ -1253,7 +1253,6 @@ impl State {
 /// [`crate::indirect::bound`] holds its output to the same bounds.
 #[cfg(feature = "diagnostics")]
 fn report_records(
-    list: &HostList,
     args: &std::sync::Arc<crate::shadow::Shadow>,
     at: u64,
     (kind, stride, records): (u32, u32, u32),
@@ -1271,11 +1270,6 @@ fn report_records(
     }
     let len = u64::from(stride) * u64::from(records);
     let left = args.left(at);
-    // Declared for copy-back, so what the GPU really holds comes back into
-    // the mirror once this list has run: the next read of the same range is
-    // the GPU's own content, not a stale guess, and a zero that survives that
-    // round trip is a zero in the argument buffer itself.
-    args.gpu_writes(list, at, len);
     let words = args.words(at, len.min(64));
     let word = |i: usize| words.get(i).copied().unwrap_or_default();
     let (counts, threads) = match kind {
