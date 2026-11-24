@@ -924,3 +924,95 @@ fn section_names_that_are_not_utf8_are_read_lossily() {
     // The rest of the image is unaffected by the name.
     assert_eq!(info.rva_to_file_offset(ENTRY), Some(SECTION_FILE_OFFSET));
 }
+
+#[test]
+fn tls_vas_more_than_4_gib_above_the_image_base_are_malformed() {
+    // An RVA is 32 bits: a VA that far above the base names nothing in the
+    // image and must not be truncated to some low RVA inside it.
+    let far = IMAGE_BASE + (1 << 32);
+    for callback in [far + 0x1010, u64::MAX] {
+        let mut d = image();
+        put64(&mut d, at(TLS_CALLBACKS), callback);
+        assert!(
+            matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))),
+            "callback at {callback:#x}"
+        );
+    }
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        far + u64::from(TLS_CALLBACKS),
+    );
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+    // The last RVA that fits is still read as an RVA (and then found to be
+    // outside the sections), not rejected as a VA.
+    let mut d = image();
+    put64(
+        &mut d,
+        at(TLS_DIRECTORY) + layout::TLS64_ADDRESS_OF_CALLBACKS,
+        IMAGE_BASE + u64::from(u32::MAX),
+    );
+    match ImageInfo::parse(&d) {
+        Err(PeError::Malformed(message)) => assert!(
+            message.contains("outside of sections"),
+            "unexpected message: {message}"
+        ),
+        other => panic!("expected a malformed image, got {other:?}"),
+    }
+}
+
+#[test]
+fn export_ordinals_start_at_the_ordinal_base() {
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(EXPORT_DIRECTORY) + 16, 10);
+    let info = ImageInfo::parse(&d).unwrap();
+    let mut exports: Vec<_> = info
+        .exports
+        .iter()
+        .map(|e| (e.ordinal, e.name.as_deref()))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [
+            (10, Some("local")),
+            (11, Some("fwdname")),
+            (12, Some("fwdord"))
+        ]
+    );
+}
+
+#[test]
+fn unused_export_slots_are_left_out() {
+    // A zero address marks an ordinal the DLL does not export; it is gone
+    // even though the name table still points at it.
+    let mut d = image();
+    add_exports(&mut d);
+    put32(&mut d, at(0x1378), 0);
+    let info = ImageInfo::parse(&d).unwrap();
+    let mut exports: Vec<_> = info
+        .exports
+        .iter()
+        .map(|e| (e.ordinal, e.name.as_deref(), e.rva))
+        .collect();
+    exports.sort();
+    assert_eq!(
+        exports,
+        [(2, Some("fwdname"), None), (3, Some("fwdord"), None)]
+    );
+    assert!(info.exports.iter().all(|e| e.forward.is_some()));
+}
+
+#[test]
+fn a_directory_with_a_size_but_no_rva_is_absent() {
+    let mut d = image();
+    set_directory(&mut d, dir::BASERELOC, 0, 12);
+    set_directory(&mut d, dir::EXCEPTION, 0, 12);
+    set_directory(&mut d, dir::LOAD_CONFIG, 0, 0x40);
+    let info = ImageInfo::parse(&d).unwrap();
+    assert!(!info.has_relocations);
+    assert!(!info.has_exception_table);
+    assert!(!info.has_load_config);
+}

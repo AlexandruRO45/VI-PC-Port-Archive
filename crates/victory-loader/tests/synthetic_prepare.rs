@@ -844,3 +844,29 @@ fn only_the_relocation_of_the_callback_field_itself_is_cleared() {
     let patched = ImageInfo::parse(&prepared.bytes).unwrap();
     assert_eq!(patched.tls.unwrap().callbacks_va, 0);
 }
+
+#[test]
+fn a_tls_va_past_the_32_bit_rva_range_is_refused_not_truncated() {
+    // Truncating `IMAGE_BASE + 4 GiB + CALLBACKS` to 32 bits would land on
+    // the real callback array; the image is damaged and must not be prepared.
+    let far = IMAGE_BASE + (1 << 32);
+    let mut pointer = image();
+    put64(
+        &mut pointer,
+        file(callbacks_field()),
+        far + u64::from(CALLBACKS),
+    );
+    let mut callback = image();
+    put64(&mut callback, file(CALLBACKS), far + u64::from(CODE));
+    for (what, bytes) in [("callback array", pointer), ("callback", callback)] {
+        assert!(
+            matches!(
+                prepare(&bytes),
+                Err(victory_loader::PrepareError::Pe(
+                    victory_pe::PeError::Malformed(_)
+                ))
+            ),
+            "{what} more than 4 GiB above the image base"
+        );
+    }
+}
