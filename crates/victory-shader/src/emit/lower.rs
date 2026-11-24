@@ -3331,7 +3331,11 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+        // Local build: a constant buffer reached through a GPU-computed heap index is read as a
+        // raw buffer, like the same buffer's other reads (one host view serves both; on RDNA a
+        // CBV and a raw SRV are the same buffer descriptor).
+        let gpu_indexed = self.gpu_indexed_heap_buffer(src);
+        if gpu_indexed || matches!(kind, Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
             let props = if kind.is_some_and(|u| u.kind == ResourceType::Uav) {
                 0x100b
             } else {
@@ -4055,6 +4059,23 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Whether `src` is a buffer descriptor read from the resource heap at a GPU-computed index
+    /// (compute only): the case `handle` refuses to give both a CBV and a raw SRV.
+    fn gpu_indexed_heap_buffer(&self, src: &Source) -> bool {
+        if self.x.native.stage != crate::HwStage::Cs {
+            return false;
+        }
+        src.leaves().into_iter().any(|leaf| {
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = *leaf else {
+                return false;
+            };
+            let Some(a) = self.scalar.get(&load) else { return false };
+            let Some(rp) = self.x.native.layout.get(a.param) else { return false };
+            rp.root == RootType::ResourceHeap
+                && a.dynamic.is_some_and(|d| self.heap_index_from_buffer(d))
+        })
     }
 
     /// A handle for the descriptor `src` read at `site`.

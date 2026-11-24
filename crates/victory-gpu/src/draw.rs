@@ -1154,6 +1154,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.trace_dispatch(x, y, z);
         if split {
             // The host caps a dimension; run the range in pieces, the shader
             // adding each piece's first group to its group id.
@@ -1428,6 +1430,16 @@ impl State {
 
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
+    /// Local build: a dispatch of a listed frame, with what it reads and writes (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    fn trace_dispatch(&self, x: u32, y: u32, z: u32) {
+        if !tracing::enabled!(tracing::Level::DEBUG) || !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let name = crate::pipeline::host_pipeline(self.pipeline as This).map(|p| p.name.clone()).unwrap_or_default();
+        tracing::debug!("dispatch {x}x{y}x{z} pipeline {:#x} [{name}] reads {:?}", self.pipeline, self.reads(true));
+    }
+
     #[cfg(feature = "diagnostics")]
     fn trace(&self, kind: &str, count: u32, first: u32) {
         static TRACED: AtomicU64 = AtomicU64::new(0);
