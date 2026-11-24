@@ -168,6 +168,17 @@ impl Shadow {
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, bytes)) = &mut *before
+            && *at <= from
+            && to <= *at + bytes.len()
+        {
+            // Snapshot union already covers `[from, to)`; refresh only this
+            // newly declared range in place so a refresh since the surrounding
+            // snapshot was taken cannot leave a stale baseline, without
+            // reallocating or recopying the entire union.
+            bytes[from - *at..to - *at].copy_from_slice(host(from, to));
+            return;
+        }
         let (start, finish) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
             None => (from, to),
@@ -672,5 +683,33 @@ mod warp_tests {
         title[5] = 3;
         assert_eq!(copy.copy_back(start + 4, 8), 0);
         assert_eq!(title[5], 3);
+    }
+
+    #[test]
+    fn covered_subrange_refreshes_in_place_without_reallocating_snapshot() {
+        let Some(device) = warp() else { return };
+        let mut title = [1u8; 32];
+        let copy = shadow(device, &mut title);
+        let start = copy.start as usize;
+        assert_eq!(copy.update(start, title.len()), title.len());
+        // Establish a snapshot union covering [0, 32) while leaving [10, 14) undeclared.
+        copy.writing(start, 4);
+        copy.writing(start + 28, 4);
+        let ptr_before = {
+            let guard = copy.before.lock().unwrap();
+            guard.as_ref().unwrap().1.as_ptr()
+        };
+        // Update the gap inside the already-covered union and declare it.
+        title[10] = 7;
+        assert_eq!(copy.update(start + 10, 4), 4);
+        copy.writing(start + 10, 4);
+        assert_eq!(title[10], 7);
+        let (ptr_after, byte10) = {
+            let guard = copy.before.lock().unwrap();
+            let (_, bytes) = guard.as_ref().unwrap();
+            (bytes.as_ptr(), bytes[10])
+        };
+        assert_eq!(ptr_before, ptr_after, "covered subrange must not reallocate");
+        assert_eq!(byte10, 7, "newly declared subrange baseline must refresh");
     }
 }
