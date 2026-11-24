@@ -101,6 +101,9 @@ On an NVIDIA RTX GPU, point `VICTORY_DLSS_DIR` at `bin\x64` of NVIDIA's
 public [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline) (2.x)
 instead: the same calls are answered by DLSS. The title still asks for
 FSR's jitter sequence and render sizes, and gets FSR's answers.
+Add `VICTORY_DLSS_FG=1` for DLSS frame generation (2x; `2` and `3` for 3x
+and 4x on GPUs that offer them), on RTX 40 or newer with
+hardware-accelerated GPU scheduling. It runs on frames the title upscales.
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived

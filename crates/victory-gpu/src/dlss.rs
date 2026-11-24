@@ -19,6 +19,13 @@
 //! DLSS's to [-1, 1], so the scale is divided by the size the vectors are
 //! rendered at.
 //!
+//! With `VICTORY_DLSS_FG` set too, DLSS frame generation (DLSS-G) adds
+//! frames between the presented ones. The title asks for none, so the
+//! inputs are the upscale's: depth and motion vectors are tagged at each
+//! upscale for Streamline to copy, and the presenter's swap chain comes from
+//! Streamline's proxy factory, with Reflex and PCL markers around each
+//! present. Frames without an upscale (menus, videos) present without it.
+//!
 //! The title also asks FidelityFX for its jitter sequence and for render
 //! sizes. DLSS has no such calls, so they are answered with FSR's own
 //! formulas (`ffx_fsr3upscaler.cpp`): the title renders exactly as it does
@@ -108,6 +115,26 @@ impl WideNul for std::ffi::OsStr {
 /// set. It takes precedence over `VICTORY_FFX_DIR`.
 pub fn enabled() -> bool {
     std::env::var_os("VICTORY_DLSS_DIR").is_some()
+}
+
+/// Frames DLSS-G generates per rendered frame: `VICTORY_DLSS_FG` (1 for 2x,
+/// 2 for 3x, 3 for 4x), with `VICTORY_DLSS_DIR` set; 0 is off.
+pub(crate) fn frames_to_generate() -> u32 {
+    static FRAMES: OnceLock<u32> = OnceLock::new();
+    *FRAMES.get_or_init(|| {
+        if !enabled() {
+            return 0;
+        }
+        std::env::var("VICTORY_DLSS_FG")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map_or(0, |n| n.min(5))
+    })
+}
+
+/// Whether DLSS-G is on (see [`frames_to_generate`]).
+pub(crate) fn frame_generation() -> bool {
+    frames_to_generate() > 0
 }
 
 // FidelityFX (`ffx_upscale.h`).
@@ -348,6 +375,9 @@ const DLSS_OPTIONS: StructType = StructType(
 /// `sl::kSDKVersion` of the headers these structures follow (2.14.16).
 const SDK_VERSION: u64 = 2 << 48 | 14 << 32 | 16 << 16 | 0xfedc;
 const FEATURE_DLSS: u32 = 0;
+const FEATURE_REFLEX: u32 = 3;
+const FEATURE_PCL: u32 = 4;
+const FEATURE_DLSS_G: u32 = 1000;
 // `sl::PreferenceFlags`.
 const DISABLE_CL_STATE_TRACKING: u64 = 1 << 0;
 const USE_MANUAL_HOOKING: u64 = 1 << 2;
@@ -358,6 +388,8 @@ const BUFFER_MOTION_VECTORS: u32 = 1;
 const BUFFER_INPUT_COLOR: u32 = 3;
 const BUFFER_OUTPUT_COLOR: u32 = 4;
 const BUFFER_EXPOSURE: u32 = 13;
+/// `sl::ResourceLifecycle::eOnlyValidNow`: Streamline copies the resource.
+const ONLY_VALID_NOW: i32 = 0;
 /// `sl::ResourceLifecycle::eValidUntilEvaluate`.
 const VALID_UNTIL_EVALUATE: i32 = 2;
 // `sl::Boolean`.
@@ -545,6 +577,119 @@ const _: () = assert!(size_of::<Options>() == 88);
 const _: () = assert!(std::mem::offset_of!(Options, presets) == 60);
 const _: () = assert!(std::mem::offset_of!(Options, use_auto_exposure) == 84);
 
+const DLSSG_OPTIONS: StructType = StructType(
+    0xfac5_f1cb,
+    0x2dfd,
+    0x4f36,
+    [0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5],
+);
+const DLSSG_STATE: StructType = StructType(
+    0xcc8a_c8e1,
+    0xa179,
+    0x44f5,
+    [0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61],
+);
+const REFLEX_OPTIONS: StructType = StructType(
+    0xf03a_f81a,
+    0x6d0b,
+    0x4902,
+    [0xa6, 0x51, 0xc4, 0x96, 0x5e, 0x21, 0x54, 0x34],
+);
+
+/// `sl::DLSSGOptions` (version 5).
+#[repr(C)]
+struct DlssgOptions {
+    base: Base,
+    /// `sl::DLSSGMode`: 0 off, 1 on.
+    mode: u32,
+    frames_to_generate: u32,
+    flags: u32,
+    dynamic_res: [u32; 2],
+    back_buffers: u32,
+    mvec_depth_size: [u32; 2],
+    color_size: [u32; 2],
+    /// Color, motion vectors, depth, HUD-less and UI formats.
+    formats: [u32; 5],
+    on_error_callback: *const c_void,
+    reserved15: u8,
+    queue_parallelism_mode: u32,
+    user_interface_recomposition: u8,
+    dynamic_target_frame_rate: f32,
+}
+const _: () = assert!(size_of::<DlssgOptions>() == 120);
+const _: () = assert!(std::mem::offset_of!(DlssgOptions, on_error_callback) == 96);
+const _: () = assert!(std::mem::offset_of!(DlssgOptions, queue_parallelism_mode) == 108);
+const _: () = assert!(std::mem::offset_of!(DlssgOptions, dynamic_target_frame_rate) == 116);
+
+impl DlssgOptions {
+    fn new(on: bool, frames_to_generate: u32) -> Self {
+        DlssgOptions {
+            base: Base::new(DLSSG_OPTIONS, 5),
+            mode: u32::from(on),
+            frames_to_generate,
+            flags: 0,
+            dynamic_res: [0; 2],
+            back_buffers: 0,
+            mvec_depth_size: [0; 2],
+            color_size: [0; 2],
+            formats: [0; 5],
+            on_error_callback: std::ptr::null(),
+            // eInvalid, the header's default.
+            reserved15: 2,
+            queue_parallelism_mode: 0,
+            user_interface_recomposition: FALSE,
+            dynamic_target_frame_rate: 0.0,
+        }
+    }
+}
+
+/// `sl::DLSSGState` (version 4).
+#[repr(C)]
+struct DlssgState {
+    base: Base,
+    estimated_vram: u64,
+    /// `sl::DLSSGStatus`: 0 is fine, else failure bits.
+    status: u32,
+    min_width_or_height: u32,
+    frames_actually_presented: u32,
+    frames_to_generate_max: u32,
+    reserved4: u8,
+    vsync_support: u8,
+    inputs_processing_completion_fence: *mut c_void,
+    last_present_inputs_processing_completion_fence_value: u64,
+    dynamic_mfg_supported: u8,
+}
+const _: () = assert!(size_of::<DlssgState>() == 88);
+const _: () = assert!(std::mem::offset_of!(DlssgState, frames_actually_presented) == 48);
+const _: () = assert!(
+    std::mem::offset_of!(
+        DlssgState,
+        last_present_inputs_processing_completion_fence_value
+    ) == 72
+);
+
+/// `sl::ReflexOptions`.
+#[repr(C)]
+struct ReflexOptions {
+    base: Base,
+    /// `sl::ReflexMode`: 1 is low latency.
+    mode: u32,
+    frame_limit_us: u32,
+    use_markers_to_optimize: bool,
+    virtual_key: u16,
+    id_thread: u32,
+}
+const _: () = assert!(size_of::<ReflexOptions>() == 48);
+const _: () = assert!(std::mem::offset_of!(ReflexOptions, id_thread) == 44);
+
+// `sl::PCLMarker`.
+const SIMULATION_START: u32 = 0;
+const SIMULATION_END: u32 = 1;
+const RENDER_SUBMIT_START: u32 = 2;
+const RENDER_SUBMIT_END: u32 = 3;
+const PRESENT_START: u32 = 4;
+const PRESENT_END: u32 = 5;
+
 type SlResult = i32;
 type Init = unsafe extern "C" fn(*const Preferences, u64) -> SlResult;
 type SetD3dDevice = unsafe extern "C" fn(*mut c_void) -> SlResult;
@@ -564,6 +709,12 @@ type FreeResources = unsafe extern "C" fn(u32, *const Viewport) -> SlResult;
 type GetFeatureFunction = unsafe extern "C" fn(u32, *const c_char, *mut *mut c_void) -> SlResult;
 type SetOptions = unsafe extern "C" fn(*const Viewport, *const Options) -> SlResult;
 type UpgradeInterface = unsafe extern "C" fn(*mut *mut c_void) -> SlResult;
+type ReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> SlResult;
+type ReflexSleep = unsafe extern "C" fn(*const c_void) -> SlResult;
+type PclSetMarker = unsafe extern "C" fn(u32, *const c_void) -> SlResult;
+type DlssgSetOptions = unsafe extern "C" fn(*const Viewport, *const DlssgOptions) -> SlResult;
+type DlssgGetState =
+    unsafe extern "C" fn(*const Viewport, *mut DlssgState, *const DlssgOptions) -> SlResult;
 type Farproc = unsafe extern "system" fn() -> isize;
 
 struct Streamline {
@@ -574,6 +725,15 @@ struct Streamline {
     free_resources: FreeResources,
     set_options: SetOptions,
     upgrade_interface: UpgradeInterface,
+    frame_generation: Option<FrameGeneration>,
+}
+
+/// DLSS-G's calls and those it needs around each present.
+struct FrameGeneration {
+    reflex_sleep: ReflexSleep,
+    pcl_set_marker: PclSetMarker,
+    set_options: DlssgSetOptions,
+    get_state: DlssgGetState,
 }
 
 /// Streamline's warnings and errors in VIctory's log.
@@ -626,7 +786,8 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
         };
         let plugins = dir.as_os_str().encode_wide_nul();
         let paths = [plugins.as_ptr()];
-        let features = [FEATURE_DLSS];
+        let frame_generation = frame_generation();
+        let features = [FEATURE_DLSS, FEATURE_DLSS_G, FEATURE_REFLEX, FEATURE_PCL];
         let preferences = Preferences {
             base: Base::new(PREFERENCES, 1),
             show_console: false,
@@ -642,7 +803,7 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
                 | DISABLE_CL_STATE_TRACKING
                 | USE_FRAME_BASED_RESOURCE_TAGGING,
             features_to_load: features.as_ptr(),
-            num_features_to_load: 1,
+            num_features_to_load: if frame_generation { 4 } else { 1 },
             application_id: 0,
             // eCustom
             engine: 0,
@@ -663,15 +824,69 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
             tracing::error!(result = r, "dlss: slSetD3DDevice failed");
             return None;
         }
-        let feature = |name: &[u8]| {
+        let feature_of = |feature: u32, name: &[u8]| {
             let mut f = std::ptr::null_mut();
             // SAFETY: a nul-terminated name and an output pointer.
-            let r = unsafe { get_function(FEATURE_DLSS, name.as_ptr().cast(), &mut f) };
+            let r = unsafe { get_function(feature, name.as_ptr().cast(), &mut f) };
             (r == 0 && !f.is_null()).then_some(f)
         };
-        let Some(set_options) = feature(b"slDLSSSetOptions\0") else {
+        let Some(set_options) = feature_of(FEATURE_DLSS, b"slDLSSSetOptions\0") else {
             tracing::error!("dlss: DLSS is not available on this GPU or driver");
             return None;
+        };
+        let frame_generation = if frame_generation {
+            // SAFETY: Streamline's export and the features' functions, of
+            // these types (`sl_core_api.h`, `sl_reflex.h`, `sl_pcl.h`,
+            // `sl_dlss_g.h`).
+            let fg = unsafe {
+                (|| {
+                    Some(FrameGeneration {
+                        reflex_sleep: std::mem::transmute::<*mut c_void, ReflexSleep>(
+                            feature_of(FEATURE_REFLEX, b"slReflexSleep\0")?,
+                        ),
+                        pcl_set_marker: std::mem::transmute::<*mut c_void, PclSetMarker>(
+                            feature_of(FEATURE_PCL, b"slPCLSetMarker\0")?,
+                        ),
+                        set_options: std::mem::transmute::<*mut c_void, DlssgSetOptions>(
+                            feature_of(FEATURE_DLSS_G, b"slDLSSGSetOptions\0")?,
+                        ),
+                        get_state: std::mem::transmute::<*mut c_void, DlssgGetState>(
+                            feature_of(FEATURE_DLSS_G, b"slDLSSGGetState\0")?,
+                        ),
+                    })
+                })()
+            };
+            let reflex_options = feature_of(FEATURE_REFLEX, b"slReflexSetOptions\0");
+            match (fg, reflex_options) {
+                (Some(fg), Some(set_reflex)) => {
+                    // DLSS-G paces with Reflex: low latency mode.
+                    let options = ReflexOptions {
+                        base: Base::new(REFLEX_OPTIONS, 1),
+                        mode: 1,
+                        frame_limit_us: 0,
+                        use_markers_to_optimize: false,
+                        virtual_key: 0,
+                        id_thread: 0,
+                    };
+                    // SAFETY: Reflex's function, of this type, and options
+                    // that outlive the call.
+                    let r = unsafe {
+                        std::mem::transmute::<*mut c_void, ReflexSetOptions>(set_reflex)(&options)
+                    };
+                    if r != 0 {
+                        tracing::error!(result = r, "dlss: slReflexSetOptions failed");
+                    }
+                    Some(fg)
+                }
+                _ => {
+                    tracing::error!(
+                        "dlss: frame generation is not available (needs an RTX 40 or newer, hardware-accelerated GPU scheduling and Windows 10 2004 or newer)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
         // SAFETY: Streamline's exports and DLSS's function, of these types.
         let sl = unsafe {
@@ -695,9 +910,14 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
                 upgrade_interface: std::mem::transmute::<Farproc, UpgradeInterface>(get(
                     b"slUpgradeInterface\0",
                 )?),
+                frame_generation,
             }
         };
-        tracing::info!(?dir, "dlss: Streamline initialised on the host device");
+        tracing::info!(
+            ?dir,
+            frame_generation = sl.frame_generation.is_some(),
+            "dlss: Streamline initialised on the host device"
+        );
         Some(sl)
     })
     .as_ref()
@@ -707,7 +927,8 @@ fn streamline(device: *mut c_void) -> Option<&'static Streamline> {
 /// Streamline's proxy for `factory` (Streamline started for `device`, the
 /// host `ID3D12Device`), so that each present runs Streamline's
 /// `presentCommon`, which manual hooking otherwise never calls (its
-/// bookkeeping and the release of what upscales left); else `factory`.
+/// bookkeeping and the release of what upscales left), and DLSS-G can
+/// present generated frames; else `factory`.
 pub(crate) fn present_factory(device: *mut c_void, factory: IDXGIFactory2) -> IDXGIFactory2 {
     if !enabled() {
         return factory;
@@ -724,9 +945,19 @@ pub(crate) fn present_factory(device: *mut c_void, factory: IDXGIFactory2) -> ID
         return factory;
     }
     std::mem::forget(factory);
-    tracing::info!("dlss: presenting through Streamline");
     // SAFETY: Streamline's proxy, an IDXGIFactory2, with our reference.
-    unsafe { IDXGIFactory2::from_raw(raw) }
+    let proxy = unsafe { IDXGIFactory2::from_raw(raw) };
+    if let Some(fg) = &sl.frame_generation {
+        let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+        start_frame(fg, &mut frames);
+        tracing::info!(
+            frames_to_generate = frames_to_generate(),
+            "dlss: presenting through Streamline for frame generation"
+        );
+    } else {
+        tracing::info!("dlss: presenting through Streamline");
+    }
+    proxy
 }
 
 /// One upscale context of the title: a Streamline viewport.
@@ -935,15 +1166,25 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
     }
     let f = frame(ctx, d);
     let viewport = Viewport::new(ctx.viewport);
-    // One frame of Streamline's at a time, numbered by dispatch.
-    static FRAME: Mutex<u32> = Mutex::new(0);
-    let mut index = FRAME.lock().unwrap_or_else(|e| e.into_inner());
-    *index = index.wrapping_add(1);
+    // Frames are numbered by dispatch, or with DLSS-G by present: the
+    // dispatches of a presented frame share its token, and the first one
+    // gives the frame's constants and DLSS-G's inputs.
+    let fg = sl.frame_generation.is_some();
+    let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if !fg {
+        frames.index = frames.index.wrapping_add(1);
+    }
+    let first_of_frame = !frames.inputs;
+    if fg {
+        frames.inputs = true;
+        frames.viewport = ctx.viewport;
+    }
+    let index = frames.index;
     let mut token = std::ptr::null_mut();
     // SAFETY: Streamline's calls with structures that outlive them, on an
     // open host command list.
     let r = unsafe {
-        let r = (sl.get_new_frame_token)(&mut token, &*index);
+        let r = (sl.get_new_frame_token)(&mut token, &index);
         if r != 0 {
             return report("slGetNewFrameToken", r);
         }
@@ -951,9 +1192,11 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
         if r != 0 {
             return report("slDLSSSetOptions", r);
         }
-        let r = (sl.set_constants)(&f.constants, token, &viewport);
-        if r != 0 {
-            return report("slSetConstants", r);
+        if !fg || first_of_frame {
+            let r = (sl.set_constants)(&f.constants, token, &viewport);
+            if r != 0 {
+                return report("slSetConstants", r);
+            }
         }
         let mut resources: Vec<Resource> = f
             .tags
@@ -975,7 +1218,13 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
                 base: Base::new(RESOURCE_TAG, 1),
                 resource,
                 kind,
-                lifecycle: VALID_UNTIL_EVALUATE,
+                // DLSS-G reads depth and motion vectors at present, after
+                // the title may have reused them: Streamline keeps copies.
+                lifecycle: if fg && (kind == BUFFER_DEPTH || kind == BUFFER_MOTION_VECTORS) {
+                    ONLY_VALID_NOW
+                } else {
+                    VALID_UNTIL_EVALUATE
+                },
                 extent,
             })
             .collect();
@@ -1000,6 +1249,145 @@ fn upscale(context: *mut *mut c_void, d: &DispatchUpscale) -> ReturnCode {
         tracing::info!(render = ?d.render_size, upscale = ?d.upscale_size, mode = ?ctx.mode, "dlss: first upscale recorded on the host GPU");
     });
     OK
+}
+
+/// Streamline's frame numbering (see [`dispatch`]) and DLSS-G's state.
+struct Frames {
+    index: u32,
+    /// Whether an upscale tagged DLSS-G's inputs for this frame.
+    inputs: bool,
+    /// The viewport of this frame's upscale.
+    viewport: u32,
+    /// The viewport DLSS-G is on for.
+    on: Option<u32>,
+}
+
+static FRAMES: Mutex<Frames> = Mutex::new(Frames {
+    index: 1,
+    inputs: false,
+    viewport: 0,
+    on: None,
+});
+
+/// The frames DLSS-G reported for the last present, generated ones
+/// included (0 before any).
+static LAST_PRESENTED: AtomicU32 = AtomicU32::new(0);
+/// `sl::DLSSGStatus` of the last present (0 fine, else failure bits).
+static LAST_STATUS: AtomicU32 = AtomicU32::new(0);
+
+/// A frame's token, `None` (and logged) if Streamline refuses.
+fn token(index: u32) -> Option<*mut c_void> {
+    let sl = streamline(std::ptr::null_mut())?;
+    let mut token = std::ptr::null_mut();
+    // SAFETY: an output pointer and a frame index.
+    let r = unsafe { (sl.get_new_frame_token)(&mut token, &index) };
+    if r != 0 || token.is_null() {
+        report("slGetNewFrameToken", r);
+        return None;
+    }
+    Some(token)
+}
+
+fn marker(fg: &FrameGeneration, marker: u32, token: *mut c_void) {
+    // SAFETY: a PCL marker for a live frame token.
+    let r = unsafe { (fg.pcl_set_marker)(marker, token) };
+    if r != 0 {
+        report("slPCLSetMarker", r);
+    }
+}
+
+/// Starts a frame: Reflex's sleep, then the markers up to the title's
+/// rendering.
+fn start_frame(fg: &FrameGeneration, frames: &mut Frames) {
+    let Some(token) = token(frames.index) else {
+        return;
+    };
+    // SAFETY: a live frame token.
+    let r = unsafe { (fg.reflex_sleep)(token) };
+    if r != 0 {
+        report("slReflexSleep", r);
+    }
+    marker(fg, SIMULATION_START, token);
+    marker(fg, SIMULATION_END, token);
+    marker(fg, RENDER_SUBMIT_START, token);
+}
+
+/// Before the presenter's `Present`: DLSS-G on for a frame an upscale gave
+/// inputs to, off for others, and the markers up to the present.
+pub(crate) fn before_present() {
+    let Some(fg) = streamline(std::ptr::null_mut()).and_then(|sl| sl.frame_generation.as_ref())
+    else {
+        return;
+    };
+    let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(token) = token(frames.index) else {
+        return;
+    };
+    let wanted = frames.inputs.then_some(frames.viewport);
+    if wanted != frames.on {
+        let set = |viewport: u32, on: bool| {
+            let options = DlssgOptions::new(on, frames_to_generate());
+            // SAFETY: options that outlive the call.
+            let r = unsafe { (fg.set_options)(&Viewport::new(viewport), &options) };
+            if r != 0 {
+                report("slDLSSGSetOptions", r);
+            }
+        };
+        if let Some(viewport) = frames.on {
+            set(viewport, false);
+        }
+        if let Some(viewport) = wanted {
+            set(viewport, true);
+        }
+        tracing::info!(on = wanted.is_some(), viewport = ?wanted, "dlss: frame generation switched");
+        frames.on = wanted;
+    }
+    marker(fg, RENDER_SUBMIT_END, token);
+    marker(fg, PRESENT_START, token);
+}
+
+/// After the presenter's `Present`: the frames DLSS-G presented, then the
+/// next frame started.
+pub(crate) fn after_present() {
+    let Some(fg) = streamline(std::ptr::null_mut()).and_then(|sl| sl.frame_generation.as_ref())
+    else {
+        return;
+    };
+    let mut frames = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(token) = token(frames.index) {
+        marker(fg, PRESENT_END, token);
+    }
+    if let Some(viewport) = frames.on {
+        // SAFETY: an all-zero state is a valid output buffer.
+        let mut state: DlssgState = unsafe { std::mem::zeroed() };
+        state.base = Base::new(DLSSG_STATE, 4);
+        // SAFETY: an output that outlives the call.
+        let r = unsafe { (fg.get_state)(&Viewport::new(viewport), &mut state, std::ptr::null()) };
+        if r == 0 {
+            LAST_PRESENTED.store(state.frames_actually_presented, Ordering::Relaxed);
+            LAST_STATUS.store(state.status, Ordering::Relaxed);
+            static FIRST: std::sync::Once = std::sync::Once::new();
+            if state.frames_actually_presented > 1 || state.status != 0 {
+                FIRST.call_once(|| {
+                    tracing::info!(
+                        presented = state.frames_actually_presented,
+                        status = state.status,
+                        max = state.frames_to_generate_max,
+                        "dlss: frame generation presenting"
+                    );
+                });
+            }
+        }
+    }
+    frames.index = frames.index.wrapping_add(1);
+    frames.inputs = false;
+    start_frame(fg, &mut frames);
+}
+
+/// The frames DLSS-G reported for the last present (see [`after_present`]).
+#[cfg(test)]
+fn last_presented() -> u32 {
+    LAST_PRESENTED.load(Ordering::Relaxed)
 }
 
 /// Logs a failed Streamline call (once per call and result).
@@ -1152,7 +1540,27 @@ mod tests {
             eprintln!("VICTORY_DLSS_DIR unset; skipped");
             return;
         }
+        // Streamline starts once per process, on one device: with DLSS-G on,
+        // the frame generation test covers the upscale too.
+        if frame_generation() {
+            eprintln!("VICTORY_DLSS_FG set; covered by the frame generation test");
+            return;
+        }
         gpu::upscale_constant_colour();
+    }
+
+    /// DLSS-G: a swap chain from Streamline's proxy factory, an upscale per
+    /// frame giving the inputs, and DLSS-G reporting its generated frames
+    /// with the presented ones. Needs `VICTORY_DLSS_DIR` and
+    /// `VICTORY_DLSS_FG`, an RTX 40 or newer and hardware-accelerated GPU
+    /// scheduling; skipped without the two variables.
+    #[test]
+    fn frame_generation_presents_generated_frames() {
+        if !frame_generation() {
+            eprintln!("VICTORY_DLSS_DIR or VICTORY_DLSS_FG unset; skipped");
+            return;
+        }
+        gpu::frame_generation_presents();
     }
 
     mod gpu {
@@ -1417,6 +1825,180 @@ mod tests {
                 }
                 readback.Unmap(0, None);
             }
+            // SAFETY: the context made above.
+            assert_eq!(unsafe { destroy(&mut ctx) }, OK);
+        }
+
+        pub(super) fn frame_generation_presents() {
+            use windows::Win32::Graphics::Dxgi::{
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGISwapChain3,
+            };
+            const FRAMES: u32 = 120;
+            let mut presented = Vec::new();
+            let mut device: Option<ID3D12Device> = None;
+            // SAFETY: the default adapter.
+            unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) }
+                .expect("device");
+            let device = device.expect("device");
+            let (render, upscale) = ([640, 360], [1280, 720]);
+            let hwnd = crate::host::window(upscale[0], upscale[1]).expect("window");
+            // SAFETY: plain object creation.
+            let factory: IDXGIFactory2 =
+                unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.expect("factory");
+            let factory = present_factory(device.as_raw(), factory);
+            assert!(
+                streamline(std::ptr::null_mut())
+                    .and_then(|sl| sl.frame_generation.as_ref())
+                    .is_some(),
+                "DLSS-G is not available here"
+            );
+            let mut ctx = std::ptr::null_mut();
+            let create = CreateUpscale {
+                kind: 0x0001_0000,
+                next: std::ptr::null_mut(),
+                flags: 0,
+                max_render: render,
+                max_upscale: upscale,
+                message: std::ptr::null(),
+            };
+            assert_eq!(create_context(&mut ctx, device.as_raw(), &create), OK);
+            let rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            let inputs = [
+                (DXGI_FORMAT_R16G16B16A16_FLOAT, [0.5, 0.25, 0.75, 1.0]),
+                (DXGI_FORMAT_R32_FLOAT, [0.5, 0.0, 0.0, 0.0]),
+                (DXGI_FORMAT_R16G16_FLOAT, [0.0; 4]),
+            ]
+            .map(|(f, c)| (texture(&device, render, f, rt, target, Some(c)), c));
+            let output = texture(
+                &device,
+                upscale,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+            );
+            // SAFETY: D3D12 and DXGI calls with descriptions that outlive
+            // them; every frame is waited for before the next is recorded.
+            unsafe {
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default())
+                    .expect("queue");
+                let swap: IDXGISwapChain3 = factory
+                    .CreateSwapChainForHwnd(
+                        &queue,
+                        hwnd,
+                        &DXGI_SWAP_CHAIN_DESC1 {
+                            Width: upscale[0],
+                            Height: upscale[1],
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC {
+                                Count: 1,
+                                Quality: 0,
+                            },
+                            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                            BufferCount: 3,
+                            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                            ..Default::default()
+                        },
+                        None,
+                        None,
+                    )
+                    .expect("swap chain")
+                    .cast()
+                    .expect("swap chain 3");
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .expect("allocator");
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .expect("list");
+                list.Close().expect("close");
+                let rtvs: ID3D12DescriptorHeap = device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: 4,
+                        ..Default::default()
+                    })
+                    .expect("rtv heap");
+                let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
+                    as usize;
+                let rtv = |i: usize| {
+                    let mut at = rtvs.GetCPUDescriptorHandleForHeapStart();
+                    at.ptr += i * step;
+                    at
+                };
+                let fence: ID3D12Fence =
+                    device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+                let event: HANDLE = CreateEventW(None, false, false, None).expect("event");
+                for frame in 0..FRAMES {
+                    allocator.Reset().expect("reset");
+                    list.Reset(&allocator, None).expect("reset");
+                    if frame == 0 {
+                        for (i, (t, c)) in inputs.iter().enumerate() {
+                            device.CreateRenderTargetView(t, None, rtv(i));
+                            list.ClearRenderTargetView(rtv(i), c, None);
+                        }
+                        let barriers = inputs.each_ref().map(|(t, _)| {
+                            transition(t, target, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                        });
+                        list.ResourceBarrier(&barriers);
+                    }
+                    let mut d = dispatch_description();
+                    d.kind = 0x0001_0001;
+                    d.command_list = list.as_raw();
+                    for (slot, (t, _)) in inputs.iter().enumerate() {
+                        d.resources[slot].resource = t.as_raw();
+                    }
+                    d.resources[OUTPUT].resource = output.as_raw();
+                    d.motion_vector_scale = [1.0, 1.0];
+                    d.render_size = render;
+                    d.upscale_size = upscale;
+                    d.pre_exposure = 1.0;
+                    d.reset = frame == 0;
+                    d.camera = [0.1, 1000.0, 1.0, 1.0];
+                    assert_eq!(super::super::upscale(&mut ctx, &d), OK, "frame {frame}");
+                    let back: ID3D12Resource = swap
+                        .GetBuffer(swap.GetCurrentBackBufferIndex())
+                        .expect("back buffer");
+                    device.CreateRenderTargetView(&back, None, rtv(3));
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        target,
+                    )]);
+                    let t = (frame % 60) as f32 / 60.0;
+                    list.ClearRenderTargetView(rtv(3), &[t, 0.3, 1.0 - t, 1.0], None);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        target,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    )]);
+                    list.Close().expect("close");
+                    queue.ExecuteCommandLists(&[Some(list.cast().expect("list"))]);
+                    queue.Signal(&fence, u64::from(frame) + 1).expect("signal");
+                    fence
+                        .SetEventOnCompletion(u64::from(frame) + 1, event)
+                        .expect("event");
+                    WaitForSingleObject(event, 10_000);
+                    before_present();
+                    swap.Present(0, DXGI_PRESENT(0)).ok().expect("present");
+                    after_present();
+                    presented.push(last_presented());
+                }
+                device.GetDeviceRemovedReason().expect("device not removed");
+            }
+            // DLSS-G now and then presents a frame without generated ones
+            // (at 4x about one run in five ends on such a present), so the
+            // last presents are checked together.
+            let last = &presented[presented.len().saturating_sub(10)..];
+            assert!(
+                last.contains(&(frames_to_generate() + 1))
+                    && last.iter().all(|&n| n <= frames_to_generate() + 1),
+                "frames DLSS-G presented for the last presents: {last:?}, status {:#x}",
+                LAST_STATUS.load(Ordering::Relaxed)
+            );
             // SAFETY: the context made above.
             assert_eq!(unsafe { destroy(&mut ctx) }, OK);
         }

@@ -2534,7 +2534,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            let generate = crate::dlss::frame_generation();
+            if generate {
+                crate::dlss::before_present();
+            }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if generate {
+                crate::dlss::after_present();
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2830,7 +2837,7 @@ pub(crate) fn transition(
 }
 
 /// A window of the given client size, owned by its own message thread.
-fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
+pub(crate) fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("victory-window".into())
