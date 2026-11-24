@@ -1,7 +1,8 @@
 # Copy to `victory.toml` (git-ignored) and point it at YOUR files.
 # Every path must be OUTSIDE the repository; the tools refuse otherwise.
 # Environment variables (shown below) take precedence over this file.
-# VICTORY_CONFIG selects a different config file (the file, not its folder).
+# VICTORY_CONFIG selects a different config file (the file, not its folder;
+# a leading ~ is your home folder).
 # Relative paths here are relative to this file; a leading ~ is your home folder.
 # An empty variable counts as unset.
 

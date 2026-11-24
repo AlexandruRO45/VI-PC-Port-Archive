@@ -71,10 +71,9 @@ impl FileConfig {
 impl Config {
     /// Loads configuration from the environment and the config file.
     pub fn load() -> Result<Self> {
-        let explicit = std::env::var_os("VICTORY_CONFIG")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from);
-        let file = match config_file(explicit)? {
+        let env = |k: &str| std::env::var_os(k);
+        let home = home_dir(env);
+        let file = match config_file(explicit_config(env, home.as_deref()))? {
             Some(path) => {
                 let text = std::fs::read_to_string(&path)
                     .with_context(|| format!("reading {}", path.display()))?;
@@ -87,12 +86,11 @@ impl Config {
                 let parsed: FileConfig =
                     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
                 let dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
-                let home = home_dir(|k| std::env::var_os(k));
                 (Some(path), parsed.anchored_at(&dir, home.as_deref()))
             }
             None => (None, FilePaths::default()),
         };
-        Self::resolve(parsed, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, env)
     }
 
     fn resolve(
@@ -149,6 +147,19 @@ impl Config {
     pub fn data_subdir(&self, sub: &str) -> Result<PathBuf> {
         subdir(&self.data_dir, sub)
     }
+}
+
+/// `VICTORY_CONFIG`, empty counting as unset, with a leading `~` as the
+/// home directory like every other path variable: a quoted
+/// `VICTORY_CONFIG="~/victory.toml"` reaches us unexpanded and would
+/// otherwise be reported as not existing.
+fn explicit_config(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    env("VICTORY_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(|v| expand_home(PathBuf::from(v), home))
 }
 
 /// The config file to read: `explicit` (`VICTORY_CONFIG`), which must be a
@@ -475,6 +486,23 @@ mod tests {
         };
         assert_eq!(home_dir(env), Some(PathBuf::from(abs("profile"))));
         assert_eq!(home_dir(|_: &str| None), None);
+    }
+
+    #[test]
+    fn victory_config_expands_tilde_and_ignores_empty() {
+        let home = PathBuf::from(abs("home"));
+        let with = |v: &'static str| move |k: &str| (k == "VICTORY_CONFIG").then(|| v.into());
+        assert_eq!(
+            explicit_config(with("~/victory.toml"), Some(&home)),
+            Some(home.join("victory.toml"))
+        );
+        assert_eq!(explicit_config(with(""), Some(&home)), None);
+        assert_eq!(explicit_config(|_: &str| None, Some(&home)), None);
+        // Without a home directory the value is taken as written.
+        assert_eq!(
+            explicit_config(with("~/victory.toml"), None),
+            Some(PathBuf::from("~/victory.toml"))
+        );
     }
 
     #[test]
