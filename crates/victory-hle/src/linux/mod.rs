@@ -20,8 +20,10 @@ mod crypt32;
 mod dbghelp;
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod mfplat;
 mod mmdevapi;
 mod oleaut32;
+pub(crate) mod user32;
 mod winhttp;
 mod ws2_32;
 mod xaudio2;
@@ -34,7 +36,9 @@ fn modules() -> Vec<HleModule> {
         combase::module(),
         crypt32::module(),
         dbghelp::module(),
+        mfplat::module(),
         oleaut32::module(),
+        user32::module(),
         winhttp::module(),
         ws2_32::module(),
         xaudio2::module(),
