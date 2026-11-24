@@ -142,15 +142,23 @@ fn cached(
             } else {
                 (&HITS, "from the cache")
             };
-            counter.fetch_add(1, Ordering::Relaxed);
+            // The frame line counts shaders: a refusal, fresh or served
+            // from a `VSF2` entry, is logged with ok=false but is neither
+            // "translated" nor "from the cache".
+            if result.is_ok() {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::debug!(path = %path.display(), ok = result.is_ok(), "shader {what}");
             return result;
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
     }
-    MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    let result = (converter.translate)(container);
+    if result.is_ok() {
+        MISSES.fetch_add(1, Ordering::Relaxed);
+    }
+    result
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";
@@ -338,6 +346,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that call `cached`: the hit/miss counters are
+    /// process-wide, so two of them at once would race on the deltas.
+    static CACHE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
@@ -362,6 +374,7 @@ mod tests {
 
     #[test]
     fn translations_come_back_from_the_cache() {
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -391,6 +404,7 @@ mod tests {
 
     #[test]
     fn failures_come_back_from_the_cache_too() {
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -471,6 +485,7 @@ mod tests {
     #[test]
     fn a_cache_that_cannot_be_written_still_says_why() {
         use victory_pipeline::CacheKey;
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
@@ -496,6 +511,40 @@ mod tests {
             "the reason, not the OS error"
         );
         assert!(runs.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// The frame line reports "shaders from the cache and translated so
+    /// far": a refusal, whether fresh or served from a `VSF2` entry, is
+    /// neither, and must not move either counter.
+    #[test]
+    fn refusals_are_not_counted_as_translated() {
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [9u8; 32];
+        let container = b"yet another container that does not translate".as_slice();
+        let fail = |_: &[u8]| Err::<HostShader, _>("a scalar memory read as data".to_owned());
+        let error = Err("a scalar memory read as data".to_owned());
+
+        let (h0, m0) = counts();
+        assert_eq!(cached(&cache, &build, container, fail), error);
+        assert_eq!(cached(&cache, &build, container, fail), error, "from disk");
+        let (h1, m1) = counts();
+        assert_eq!(
+            (h1 - h0, m1 - m0),
+            (0, 0),
+            "a refusal, fresh or cached, is neither a hit nor a translation"
+        );
+
+        // A shader that does translate (another build, so the cached
+        // refusal is not in the way) is counted, once fresh, once cached.
+        let ok = |_: &[u8]| Ok(shader());
+        assert_eq!(cached(&cache, &[10u8; 32], container, ok), Ok(shader()));
+        let (h2, m2) = counts();
+        assert_eq!((h2 - h1, m2 - m1), (0, 1), "translated once");
+        assert_eq!(cached(&cache, &[10u8; 32], container, ok), Ok(shader()));
+        let (h3, m3) = counts();
+        assert_eq!((h3 - h2, m3 - m2), (1, 0), "then from the cache");
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
