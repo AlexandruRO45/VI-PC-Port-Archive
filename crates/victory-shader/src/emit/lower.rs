@@ -1204,6 +1204,72 @@ impl<'a> Lower<'a> {
         Val::I32(self.s.m.extract(entry, r, index % 4))
     }
 
+    /// The instruction that writes `v`, if one does.
+    fn def_inst(&self, v: Value) -> Option<&'a Inst> {
+        let &b = self.def_block.get(&v)?;
+        let p: &'a Program = self.x.p;
+        p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))
+    }
+
+    /// `v_and_b32` of a lane mask in an SGPR with `1 << lane` (from
+    /// `v_mbcnt_lo_u32_b32 -1, 0`, wave32): the lane tests its own bit of the
+    /// mask, which is the mask's boolean in the lane, so no ballot is needed
+    /// and the mask may hold lanes that do not run here (a loop's lanes still
+    /// traversing, joined at its header). That bit where it is set, else 0.
+    fn own_mask_bit(&mut self, inst: &Inst) -> Result<Option<V>, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            return Ok(None);
+        };
+        if inst.name() != "v_and_b32" || self.x.p.wave64 || v.src.len() != 2 {
+            return Ok(None);
+        }
+        let as_value = |op: &Operand| match *op {
+            Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)),
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            _ => None,
+        };
+        let (Some(a), Some(c)) = (as_value(&v.src[0]), as_value(&v.src[1])) else {
+            return Ok(None);
+        };
+        let is_mask = |x: Value| self.x.st.masks.contains_key(&x);
+        let (mask, bit) = match (is_mask(a), is_mask(c)) {
+            (true, false) => (a, c),
+            (false, true) => (c, a),
+            _ => return Ok(None),
+        };
+        let one_shifted = self.def_inst(bit).is_some_and(|d| {
+            let Fields::Valu(dv) = &d.fields else {
+                return false;
+            };
+            d.name() == "v_lshlrev_b32"
+                && matches!(dv.src.get(1), Some(Operand::Const(129)))
+                && dv.src.first().is_some_and(|s| match *s {
+                    Operand::Vector { reg, .. } => d
+                        .read(Reg::V(reg))
+                        .and_then(|l| self.def_inst(l))
+                        .is_some_and(|m| {
+                            let Fields::Valu(mv) = &m.fields else {
+                                return false;
+                            };
+                            m.name() == "v_mbcnt_lo_u32_b32"
+                                && matches!(mv.src[..], [Operand::Const(193), Operand::Const(128)])
+                        }),
+                    _ => false,
+                })
+        });
+        if !one_shifted {
+            return Ok(None);
+        }
+        let m = self.x.st.masks[&mask];
+        let set = self.boolean(m, self.cur)?;
+        let shifted = self.i32_of(bit)?;
+        let zero = self.s.m.i32(0);
+        Ok(Some(self.s.m.select(self.cur, set, shifted, zero)))
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3624,6 +3690,13 @@ impl<'a> Lower<'a> {
             return r;
         }
         let mut guard = self.guard(b, i)?;
+        if let Some(x) = self.own_mask_bit(inst)? {
+            let Some(Operand::Vector { reg, .. }) = v.dst else {
+                return Err("a lane's own mask bit");
+            };
+            self.write(inst, Reg::V(reg), x, guard);
+            return Ok(());
+        }
         if let Some(d) = v.dpp {
             let (x, enable) = self.dpp(inst, d)?;
             guard = match (guard, enable) {
@@ -6933,6 +7006,8 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        // Ballots below go at the end of the block writing the mask.
+        self.cur_ir = usize::MAX;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6941,7 +7016,26 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                // A number joined with a lane mask (a traversal keeps lane
+                // masks as numbers on its stack): in compute the mask as a
+                // number is its ballot, bit for bit.
+                let val = match self.vals.get(&arg).copied() {
+                    Some(Val::I32(x)) => Some(Val::I32(x)),
+                    other
+                        if !bit
+                            && self.mask_data == MaskData::Console
+                            && self.read_phis.contains(&phi.value)
+                            && (self.x.st.masks.contains_key(&arg)
+                                || self.x.st.highs.contains_key(&arg)) =>
+                    {
+                        match self.mask_dword(arg) {
+                            Ok(x) => Some(Val::I32(x)),
+                            Err(_) => other,
+                        }
+                    }
+                    other => other,
+                };
+                let x = match (val, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
@@ -6969,11 +7063,19 @@ impl<'a> Lower<'a> {
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-                let m =
-                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
-                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+                let arg = phi.args[n];
+                let untracked = || unsupported(offset, "a lane-mask join of an untracked mask");
+                let x = match self.x.st.masks.get(&arg) {
+                    Some(&m) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                    // A mask that arrives as a number (popped from a
+                    // traversal's stack): with console lanes it is the
+                    // console's, and the lane takes its own bit.
+                    None if self.console_lanes && !p.wave64 => match self.vals.get(&arg) {
+                        Some(&Val::I32(word)) => self.lane_bit(qb, word, None),
+                        _ => return Err(untracked()),
+                    },
+                    None => return Err(untracked()),
+                };
                 incoming.push((x, qb));
             }
             self.s.m.set_phi(v, incoming);

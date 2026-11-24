@@ -404,15 +404,9 @@ mod gpu {
             0x0002_0E01,
             0xBF81_0000, // s_endpgm
         ]);
-        let names: Vec<_> =
-            crate::gfx10::decode(&w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
-                .expect("decode")
-                .iter()
-                .map(|i| i.name().unwrap_or("?"))
-                .collect();
-        assert_eq!(
-            names,
-            [
+        assert_names(
+            &w,
+            &[
                 "v_mul_u32_u24",
                 "global_load_dwordx4",
                 "global_load_dwordx4",
@@ -420,13 +414,29 @@ mod gpu {
                 "image_bvh_intersect_ray",
                 "v_lshlrev_b32",
                 "global_store_dwordx4",
-                "s_endpgm"
-            ]
+                "s_endpgm",
+            ],
         );
         w
     }
 
+    fn assert_names(words: &[u32], names: &[&str]) {
+        let code: Vec<u8> = words.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let decoded: Vec<_> = crate::gfx10::decode(&code)
+            .expect("decode")
+            .iter()
+            .map(|i| i.name().unwrap_or("?"))
+            .collect();
+        assert_eq!(decoded, names);
+    }
+
     fn build() -> HostShader {
+        build_with(&program(), 8)
+    }
+
+    /// A wave32 compute program of 32 threads with `sgprs` dwords of root
+    /// constants from `s0`, lowered and validated.
+    fn build_with(words: &[u32], sgprs: u32) -> HostShader {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
@@ -434,17 +444,17 @@ mod gpu {
             layout: vec![RootParam {
                 root: RootType::Constants,
                 table_offset_dwords: 0,
-                sgprs: 8,
+                sgprs,
                 base_register: 0,
                 user_data: 0,
                 slot: 0,
             }],
             used: Vec::new(),
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 8 << 1,
+                rsrc2: sgprs << 1,
                 threads: [32, 1, 1],
             }),
-            code: program().iter().flat_map(|w| w.to_le_bytes()).collect(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
@@ -603,6 +613,106 @@ mod gpu {
                     }
                 }
             }
+        }
+    }
+
+    /// A traversal's loop over lanes: the mask of lanes still walking (8
+    /// at first) is carried around the loop, each pass drops its lowest
+    /// lane as a number (`s_ff1`, `s_bitset0`), and each lane tests its
+    /// own bit (`v_and_b32` with `1 << lane`) to count the passes it was
+    /// still in. Lane n counts n + 1 passes, lanes from 8 on none.
+    #[test]
+    fn a_loop_carried_lane_mask_is_tested_per_lane() {
+        let w = [
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBE84_036A, // s_mov_b32 s4, vcc_lo
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            // loop:
+            0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+            0x0001_00C1,
+            0xD51A_0002, // v_lshlrev_b32 v2, v1, 1
+            0x0001_0301,
+            0x3606_0404, // v_and_b32 v3, s4, v2
+            0x7D8A_0680, // v_cmp_ne_u32 vcc_lo, 0, v3
+            0xD501_0006, // v_cndmask_b32 v6, 0, 1, vcc_lo
+            0x01A9_0280,
+            0x4A0A_0D05, // v_add_nc_u32 v5, v5, v6
+            0xBE85_1304, // s_ff1_i32_b32 s5, s4
+            0xBE84_1B05, // s_bitset0_b32 s4, s5
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF85_FFF3, // s_cbranch_scc1 loop
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xDC70_8000, // global_store_dword v7, v5, s[2:3]
+            0x0002_0507,
+            0xBF81_0000, // s_endpgm
+        ];
+        assert_names(
+            &w,
+            &[
+                "v_cmp_gt_u32",
+                "s_mov_b32",
+                "v_mov_b32",
+                "v_mbcnt_lo_u32_b32",
+                "v_lshlrev_b32",
+                "v_and_b32",
+                "v_cmp_ne_u32",
+                "v_cndmask_b32",
+                "v_add_nc_u32",
+                "s_ff1_i32_b32",
+                "s_bitset0_b32",
+                "s_cmp_lg_u32",
+                "s_cbranch_scc1",
+                "v_lshlrev_b32",
+                "global_store_dword",
+                "s_endpgm",
+            ],
+        );
+        let shader = build_with(&w, 4);
+        let map = address_map::encode(&[address_map::Range {
+            start: OUT,
+            len: 32 * 4,
+            view: 0,
+            view_offset: 0,
+        }]);
+        let consts = [0, 0, OUT as u32, (OUT >> 32) as u32];
+        let _one = super::super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = consts[u.dword as usize];
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: map.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let want: Vec<u32> = (0..32).map(|n| if n < 8 { n + 1 } else { 0 }).collect();
+            assert_eq!(out[0], want, "{label}");
         }
     }
 }
