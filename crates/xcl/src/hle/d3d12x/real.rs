@@ -4641,6 +4641,15 @@ unsafe fn translated_mesh_stream_once(this: *mut c_void, desc: *const c_void, ri
     Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
 }
 
+/// Write target formats in the host's DXGI encoding for a translated geometry pipeline.
+fn put_geometry_target_formats(out: &mut StreamOut, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
+    rt.RTFormats = d.RTVFormats.map(|f| DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32));
+    let depth = DXGI_FORMAT(super::device_x::pc_view_format(d.DSVFormat.0 as u32) as i32);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &depth);
+}
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
 /// with the description's state.
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -4700,10 +4709,8 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &d.SampleMask);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &d.RasterizerState);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, &d.DepthStencilState);
-    let mut rt = D3D12_RT_FORMAT_ARRAY { NumRenderTargets: d.NumRenderTargets, ..Default::default() };
-    rt.RTFormats = d.RTVFormats;
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
-    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &d.DSVFormat);
+    put_geometry_target_formats(&mut out, d);
+
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &d.SampleDesc);
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, &d.NodeMask);
     if d.Flags.0 != 0 {
@@ -5571,6 +5578,29 @@ pub fn stop_if_device_removed() {
 #[cfg(test)]
 mod rect_list_pso_tests {
     use super::*;
+
+    #[test]
+    fn geometry_stream_maps_console_target_formats() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        desc.NumRenderTargets = 2;
+        desc.RTVFormats[0] = DXGI_FORMAT(86);
+        desc.RTVFormats[1] = DXGI_FORMAT(28);
+        desc.DSVFormat = DXGI_FORMAT(118);
+        let mut stream = StreamOut::default();
+        put_geometry_target_formats(&mut stream, &desc);
+        let subs = stream_subobjects(&stream.0).unwrap();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].0, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS.0 as u32);
+        let read = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        assert_eq!(read(subs[0].1, 0), 28);
+        assert_eq!(read(subs[0].1, 4), 28);
+        assert_eq!(read(subs[0].1, 32), 2);
+        assert_eq!(subs[1].0, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT.0 as u32);
+        assert_eq!(read(subs[1].1, 0), 45);
+        assert_eq!(desc.RTVFormats[0].0, 86);
+        assert_eq!(desc.DSVFormat.0, 118);
+    }
 
     const REFUSED: HRESULT = 0x8007_0057u32 as i32;
 
