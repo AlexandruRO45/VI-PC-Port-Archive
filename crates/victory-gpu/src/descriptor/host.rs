@@ -142,7 +142,13 @@ impl HostHeap {
                     // shortcut: descriptors past the host's limit are left
                     // out; a title that reaches them needs remapping.
                     tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                    // Two slots stay free for the null views, which sit at
+                    // `HEAP_VIEWS - 2` and `HEAP_VIEWS - 1` (#1760).
+                    (
+                        make(PORTABLE_VIEWS).ok()?,
+                        PORTABLE_VIEWS - MIN_DYNAMIC - 2,
+                        MIN_DYNAMIC,
+                    )
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
@@ -203,7 +209,12 @@ impl HostHeap {
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
         let null = victory_shader::emit::NULL_BUFFER_VIEW;
-        if !sampler && null > count + extra && null < total {
+        // The null slots have to be past the slots the title and the dynamic
+        // tables use, and inside the heap: `>=` rather than `>` because a
+        // capped heap ends exactly where its dynamic slots do, and the null
+        // slots are then the first two past them (they are below
+        // `HEAP_VIEWS`, which a capped heap now holds — #1760).
+        if !sampler && null >= count + extra && null < total {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
         } else if !sampler {

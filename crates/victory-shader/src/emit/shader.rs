@@ -22,7 +22,16 @@ pub const MEMORY_SPACE: u32 = 2;
 /// Heap indices are clamped below these (views, samplers): the host's heaps
 /// are at least this large, the slots past their own null (`emit`, "Heap
 /// indices").
-pub const HEAP_VIEWS: u32 = 1 << 21;
+///
+/// A driver may cap a shader-visible view heap, and the cap is not ours to
+/// choose: NVIDIA refuses more than 1,000,000 descriptors (measured on an
+/// RTX 4090 and reported in #1760), and the host heap is capped there rather
+/// than lost. So this bound — which the emitted clamp uses, and where the
+/// null buffer views live — has to fit *inside* such a heap: at 2^21 the
+/// clamp and the null slots sat above a capped heap, and a computed index in
+/// between read a descriptor that was not there. 1,000,000 is the smallest
+/// cap the host meets in practice.
+pub const HEAP_VIEWS: u32 = 1_000_000;
 pub const HEAP_SAMPLERS: u32 = 2048;
 /// The heap index of the host's null raw buffer view (the null raw
 /// unordered access view at the index below), read instead of a slot that
