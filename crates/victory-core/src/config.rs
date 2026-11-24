@@ -880,6 +880,29 @@ fn on_disk(path: &Path) -> PathBuf {
     lexical(path)
 }
 
+/// Whether `path` is inside (or the same as) `parent`, for the folder
+/// checks that keep a dump apart from the cache and data folders: `Some("")`
+/// when it is as written ([`is_within`], lexically), and otherwise, when
+/// it is only once links are followed ([`on_disk`]), `Some` of a note
+/// naming where each one is, to put after the folders in the error. A
+/// `VICTORY_GAME_DIR=~/gta` that is a link into the cache, or a cache under
+/// a link into the dump, passes the lexical check but is the same mistake:
+/// clearing the cache deletes the dump, or derived files land inside it.
+/// `None` when they are apart either way.
+fn inside(path: &Path, parent: &Path) -> Option<String> {
+    if is_within(path, parent, FOLD_CASE) {
+        return Some(String::new());
+    }
+    let (real_path, real_parent) = (on_disk(path), on_disk(parent));
+    is_within(&real_path, &real_parent, FOLD_CASE).then(|| {
+        format!(
+            " once links are followed ({} is inside {})",
+            real_path.display(),
+            real_parent.display()
+        )
+    })
+}
+
 /// [`ensure_data_outside_cache`] for the user's whole cache, not only
 /// Victory's: `$XDG_CACHE_HOME` (else `~/.cache`) is what desktop cleaners
 /// and users empty, so data under it is lost with it even when it is not
@@ -1006,13 +1029,15 @@ fn ensure_not_user_base(
 /// easy slip with one parent folder for everything, e.g.
 /// `VICTORY_CACHE_DIR=~/gta` with `VICTORY_GAME_DIR=~/gta/game`, or
 /// `[paths].cache_dir = "cache"` in a `victory.toml` kept inside the dump.
-/// Compared like [`ensure_data_outside_cache`]: lexically, without the disk.
+/// Compared like [`ensure_data_outside_cache`]: lexically first, then where
+/// the folders are on disk as far as they exist (see [`inside`]), so a game
+/// folder that is a link into the cache is refused too.
 fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) -> Result<()> {
-    if is_within(game, cache, FOLD_CASE) {
+    if let Some(links) = inside(game, cache) {
         anyhow::bail!(
-            "the game folder {} (from {}) is inside the cache folder {} (from {}), which may \
-             be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a folder \
-             outside the game folder",
+            "the game folder {} (from {}) is inside the cache folder {} (from {}){links}, \
+             which may be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to \
+             a folder outside the game folder",
             game.display(),
             origins.game_dir,
             cache.display(),
@@ -1033,10 +1058,11 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
             "VICTORY_DATA_DIR or [paths].data_dir",
         ),
     ] {
-        if is_within(dir, game, FOLD_CASE) {
+        if let Some(links) = inside(dir, game) {
             anyhow::bail!(
-                "the {name} folder {} (from {origin}) is inside the game folder {} (from {}), \
-                 which holds your dump and is only read; set {setting} to a folder outside it",
+                "the {name} folder {} (from {origin}) is inside the game folder {} (from \
+                 {}){links}, which holds your dump and is only read; set {setting} to a folder \
+                 outside it",
                 dir.display(),
                 game.display(),
                 origins.game_dir
@@ -1053,7 +1079,8 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
 /// into that dump. The easy slip is one parent folder for everything, e.g.
 /// `VICTORY_CACHE_DIR=~/xbox` with `VICTORY_TEST_TITLES=~/xbox/title-a`.
 /// The error names the title, so it is clear which entry of the list is
-/// meant. Compared lexically, without the disk.
+/// meant. Compared like [`ensure_game_apart`]: lexically, then once links
+/// are followed.
 fn ensure_titles_apart(
     titles: &[PathBuf],
     cache: &Path,
@@ -1061,11 +1088,11 @@ fn ensure_titles_apart(
     origins: &Origins,
 ) -> Result<()> {
     for title in titles {
-        if is_within(title, cache, FOLD_CASE) {
+        if let Some(links) = inside(title, cache) {
             anyhow::bail!(
-                "the test title {} (from {}) is inside the cache folder {} (from {}), which \
-                 may be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a \
-                 folder outside the test titles",
+                "the test title {} (from {}) is inside the cache folder {} (from {}){links}, \
+                 which may be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir \
+                 to a folder outside the test titles",
                 title.display(),
                 origins.test_titles,
                 cache.display(),
@@ -1086,10 +1113,10 @@ fn ensure_titles_apart(
                 "VICTORY_DATA_DIR or [paths].data_dir",
             ),
         ] {
-            if is_within(dir, title, FOLD_CASE) {
+            if let Some(links) = inside(dir, title) {
                 anyhow::bail!(
                     "the {name} folder {} (from {origin}) is inside the test title {} (from \
-                     {}), which is a dump that is only read; set {setting} to a folder \
+                     {}){links}, which is a dump that is only read; set {setting} to a folder \
                      outside it",
                     dir.display(),
                     title.display(),
@@ -5557,6 +5584,136 @@ mod tests {
         };
         let e = Config::resolve(file, None, env).unwrap_err().to_string();
         assert!(e.contains("(from config file)"), "{e}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_dump_apart_from_the_cache_only_as_written_is_refused_through_a_link() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-dump-linked-into-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let cache = scratch.join("cache");
+        std::fs::create_dir_all(cache.join("gta")).unwrap();
+        std::fs::create_dir_all(scratch.join("dumps").join("gta")).unwrap();
+        // `gta` is a dump kept inside the cache, reached through a link;
+        // `work` is a link into a dump, so a cache under it writes there.
+        std::os::unix::fs::symlink("cache/gta", scratch.join("gta")).unwrap();
+        std::os::unix::fs::symlink("dumps/gta", scratch.join("work")).unwrap();
+        let data = scratch.join("data");
+        let with = |game: Option<PathBuf>, titles: Vec<PathBuf>, cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_GAME_DIR" => game.clone().map(PathBuf::into_os_string),
+                "VICTORY_TEST_TITLES" if !titles.is_empty() => {
+                    Some(std::env::join_paths(&titles).unwrap())
+                }
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let err = |env| {
+            Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string()
+        };
+        let real = std::fs::canonicalize(&scratch).unwrap();
+
+        // The game folder is a link into the cache: named with both
+        // settings and where each one is on disk.
+        let game = scratch.join("gta");
+        let e = err(with(
+            Some(game.clone()),
+            vec![],
+            cache.clone(),
+            data.clone(),
+        ));
+        assert_eq!(
+            e,
+            format!(
+                "the game folder {} (from VICTORY_GAME_DIR) is inside the cache folder {} (from \
+                 VICTORY_CACHE_DIR) once links are followed ({} is inside {}), which may be \
+                 deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a folder \
+                 outside the game folder",
+                game.display(),
+                cache.display(),
+                real.join("cache").join("gta").display(),
+                real.join("cache").display()
+            )
+        );
+        // The same dump as a test title, second in the list.
+        let e = err(with(
+            None,
+            vec![scratch.join("dumps"), game.clone()],
+            cache.clone(),
+            data.clone(),
+        ));
+        assert!(
+            e.starts_with(&format!("the test title {}", game.display())),
+            "{e}"
+        );
+        assert!(e.contains("inside the cache folder"), "{e}");
+        assert!(e.contains("once links are followed"), "{e}");
+
+        // A cache or data folder under a link into the dump, not made yet.
+        let dump = scratch.join("dumps").join("gta");
+        let e = err(with(
+            Some(dump.clone()),
+            vec![],
+            scratch.join("work").join("cache"),
+            data.clone(),
+        ));
+        assert!(e.starts_with("the cache folder"), "{e}");
+        assert!(e.contains("inside the game folder"), "{e}");
+        assert!(
+            e.contains(&format!(
+                "once links are followed ({} is inside {})",
+                real.join("dumps").join("gta").join("cache").display(),
+                real.join("dumps").join("gta").display()
+            )),
+            "{e}"
+        );
+        let e = err(with(
+            None,
+            vec![dump.clone()],
+            cache.clone(),
+            scratch.join("work").join("saves"),
+        ));
+        assert!(e.starts_with("the data folder"), "{e}");
+        assert!(e.contains("inside the test title"), "{e}");
+        assert!(e.contains("once links are followed"), "{e}");
+
+        // As written the lexical message is unchanged, with no note.
+        let e = err(with(
+            Some(cache.join("gta")),
+            vec![],
+            cache.clone(),
+            data.clone(),
+        ));
+        assert!(e.contains("(from VICTORY_CACHE_DIR), which may"), "{e}");
+
+        // Apart on disk is still fine, through a link or not; nothing was
+        // made on the way.
+        let ok = with(
+            Some(dump.clone()),
+            vec![game.clone()],
+            scratch.join("cache2"),
+            data.clone(),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        let ok = with(
+            Some(scratch.join("work")),
+            vec![],
+            scratch.join("cache2"),
+            data.clone(),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        assert!(!dump.join("cache").exists());
+        assert!(!dump.join("saves").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
