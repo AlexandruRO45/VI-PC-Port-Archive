@@ -1296,6 +1296,7 @@ fn transition(
 
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
+#[derive(Clone, Copy)]
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
@@ -1318,6 +1319,11 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// An RGBA32F 2D-array UAV (width, height, slices), zeroed; read back
+    /// slice by slice.
+    TextureArrayUav(u32, u32, u32),
+    /// An R32_UINT 2D-array UAV (width, height, slices), zeroed.
+    UintTextureArrayUav(u32, u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
@@ -1369,6 +1375,13 @@ pub fn view_strides(views: &[View]) -> Vec<u32> {
         .collect()
 }
 
+/// Bytes of one slice of a readback of `w` x `h` texels of `words` dwords:
+/// rows 256-byte aligned, slices 512-byte aligned.
+#[cfg(test)]
+fn slice_bytes(w: u32, h: u32, words: u32) -> u32 {
+    ((w * 4 * words).next_multiple_of(256) * h).next_multiple_of(512)
+}
+
 /// How [`View::Buffer`] is viewed.
 #[cfg(test)]
 #[derive(Clone, Copy)]
@@ -1395,7 +1408,7 @@ pub struct Dispatch<'a> {
 #[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
-    /// order (texels as float bits, row by row).
+    /// order (texels as float bits, row by row, slice by slice).
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
@@ -1725,41 +1738,77 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
-                    View::TextureUav(w, h) => {
-                        let t = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), 4)?);
-                        let pitch = (w * 16).next_multiple_of(256);
-                        let rb = make(
-                            D3D12_HEAP_TYPE_READBACK,
-                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        uavs.push((t, Some((w, h)), 4, rb));
-                    }
-                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
-                        let (format, words) = match *v {
-                            View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
-                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                    View::TextureUav(..)
+                    | View::UintTextureUav(..)
+                    | View::Uint2TextureUav(..)
+                    | View::TextureArrayUav(..)
+                    | View::UintTextureArrayUav(..) => {
+                        // (width, height, slices, words per texel)
+                        let (w, h, slices, words) = match *v {
+                            View::TextureUav(w, h) => (w, h, 1, 4),
+                            View::UintTextureUav(w, h) => (w, h, 1, 1),
+                            View::Uint2TextureUav(w, h) => (w, h, 1, 2),
+                            View::TextureArrayUav(w, h, n) => (w, h, n, 4),
+                            View::UintTextureArrayUav(w, h, n) => (w, h, n, 1),
+                            _ => unreachable!(),
                         };
+                        let format = match words {
+                            1 => DXGI_FORMAT_R32_UINT,
+                            2 => DXGI_FORMAT_R32G32_UINT,
+                            _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
+                        };
+                        let mut desc =
+                            texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format);
+                        desc.DepthOrArraySize = slices as u16;
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
+                            &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), words)?);
+                        // Zeroed, every slice (a new committed resource is not
+                        // always zero: WARP reuses a freed buffer's memory).
                         let pitch = (w * 4 * words).next_multiple_of(256);
+                        let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
+                        let from = footprint_as(&zeros, w, h, words);
+                        for slice in 0..slices {
+                            let to = D3D12_TEXTURE_COPY_LOCATION {
+                                pResource: std::mem::transmute_copy(&t),
+                                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: slice },
+                            };
+                            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &t,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )]);
+                        keep.push(zeros);
+                        let array = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+                            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                                    ArraySize: slices,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let array = matches!(
+                            *v,
+                            View::TextureArrayUav(..) | View::UintTextureArrayUav(..)
+                        )
+                        .then_some(&array as *const _);
+                        dev.CreateUnorderedAccessView(&t, None, array, at);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
-                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            &buffer(
+                                u64::from(slice_bytes(w, h, words) * slices),
+                                D3D12_RESOURCE_FLAG_NONE,
+                            ),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), words, rb));
+                        uavs.push((t, Some((w, h, slices)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -1972,14 +2021,17 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 match size {
-                    Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
-                        0,
-                        0,
-                        0,
-                        &subresource(r),
-                        None,
-                    ),
+                    Some((w, h, slices)) => {
+                        // Slice by slice, each at its own aligned offset.
+                        for slice in 0..*slices {
+                            let mut to = footprint_as(rb, *w, *h, *n);
+                            to.Anonymous.PlacedFootprint.Offset =
+                                u64::from(slice * slice_bytes(*w, *h, *n));
+                            let mut from = subresource(r);
+                            from.Anonymous.SubresourceIndex = slice;
+                            list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                        }
+                    }
                     None => list.CopyBufferRegion(rb, 0, r, 0, u64::from(*n) * 4),
                 }
             }
@@ -1998,13 +2050,15 @@ impl Host {
                 let mut p = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).map_err(err)?;
                 let words = match size {
-                    Some((w, h)) => {
+                    Some((w, h, slices)) => {
                         let words = *n as usize;
                         let pitch = (*w as usize * 4 * words).next_multiple_of(256);
-                        (0..*h as usize)
-                            .flat_map(|y| {
+                        let slice = slice_bytes(*w, *h, *n) as usize;
+                        (0..*slices as usize * *h as usize)
+                            .flat_map(|row| {
+                                let at = row / *h as usize * slice + row % *h as usize * pitch;
                                 std::slice::from_raw_parts(
-                                    p.cast::<u8>().add(y * pitch).cast::<u32>(),
+                                    p.cast::<u8>().add(at).cast::<u32>(),
                                     *w as usize * words,
                                 )
                                 .to_vec()
