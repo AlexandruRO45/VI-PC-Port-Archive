@@ -168,6 +168,11 @@ const BUDGET: Duration = Duration::from_millis(500);
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
+/// Whether `p` was made already (or refused): its lookups are cache hits.
+pub(crate) fn is_made(p: &Pending) -> bool {
+    p.made.get().is_some()
+}
+
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)

@@ -252,7 +252,15 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
         return None;
     }
-    make::ready(&pipeline(this).host)
+    let p = pipeline(this);
+    if victory_profile::on() {
+        if make::is_made(&p.host) {
+            victory_profile::cache!("gpu", "host pipelines", Hit);
+        } else {
+            victory_profile::cache!("gpu", "host pipelines", Miss);
+        }
+    }
+    make::ready(&p.host)
 }
 
 /// Host pipelines queued and not made yet.

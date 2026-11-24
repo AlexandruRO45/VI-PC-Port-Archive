@@ -1940,6 +1940,8 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// The profiler's panel, when `VICTORY_PROFILE_OVERLAY` asks for it.
+    overlay: crate::overlay::Overlay,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -2135,6 +2137,10 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            if victory_profile::overlay::enabled() {
+                let size = (p.width, p.height, p.format);
+                p.overlay.record(self, list, &back, size, p.hwnd);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -2218,6 +2224,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                overlay: Default::default(),
             })
         }
     }
