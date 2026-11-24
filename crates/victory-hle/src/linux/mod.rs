@@ -13,9 +13,34 @@ use crate::HleModule;
 
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod ucrt_convert;
+mod ucrt_environment;
+mod ucrt_filesystem;
+mod ucrt_format;
+mod ucrt_heap;
+mod ucrt_locale;
+mod ucrt_math;
+mod ucrt_runtime;
+mod ucrt_scan;
+mod ucrt_stdio;
+mod ucrt_string;
+mod ucrt_time;
+mod ucrt_utility;
 
 fn modules() -> Vec<HleModule> {
-    vec![]
+    vec![
+        ucrt_convert::module(),
+        ucrt_environment::module(),
+        ucrt_filesystem::module(),
+        ucrt_heap::module(),
+        ucrt_locale::module(),
+        ucrt_math::module(),
+        ucrt_runtime::module(),
+        ucrt_stdio::module(),
+        ucrt_string::module(),
+        ucrt_time::module(),
+        ucrt_utility::module(),
+    ]
 }
 
 static MODULES: LazyLock<Vec<HleModule>> = LazyLock::new(modules);

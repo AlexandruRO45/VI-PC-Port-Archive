@@ -81,7 +81,7 @@ calling convention; check before you bind.
 | PE mapper, TEB, guest threads, TLS, entry | not started |
 | SEH, signals, unwinding | not started |
 | kernel32/ntdll: handles, sync, threads, memory, heap, time, system | not started |
-| UCRT | not started |
+| UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | not started |
 | Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
