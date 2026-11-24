@@ -9,7 +9,8 @@
   Optional. Passed unchanged to VICTORY_SKIP_PIPELINES when given.
 
 .PARAMETER NoTunedSettings
-  Optional. Does not set the tuned variables below (only VICTORY_GAME_DIR is set).
+  Optional. Does not set the tuned variables below (only VICTORY_GAME_DIR is set), and clears those an earlier
+  launch left in this PowerShell session.
 
 .PARAMETER Dred
   Optional. Turns on device-removed data (VICTORY_D3D12_DRED) to diagnose a device loss.
@@ -78,30 +79,42 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)."
 
 # No victory.toml is needed: VIctory reads the game folder from VICTORY_GAME_DIR.
 $env:VICTORY_GAME_DIR = $GameDir
-if (-not $NoTunedSettings) {
-    $tuned = [ordered]@{
-        # Translated shader loops stop after 256 iterations (32 cuts the hair strand loops short).
-        VICTORY_SHADER_LOOP_LIMIT       = '256'
-        # Host pipeline wait setting from the fork's pull request #1.
-        VICTORY_LATE_WAIT               = '3'
-        # Wide back-end option of the fork, on in the measured run.
-        VICTORY_WIDE_BACK               = '1'
-        # No relay mode on purpose: the run judged best had it off, and the fork's issue #89 reports that it makes
-        # the characters' skin disappear and overlaps the subtitles. Set the relay variable by hand to try it.
-        # Card buffer sizing: minimum and total, in MB.
-        VICTORY_CARD_BUFFERS_MIN_MB     = '1'
-        VICTORY_CARD_BUFFERS_MB         = '1024'
-        # DirectStorage writes into physical pages are reported to the GPU side (fork commits e49864a and
-        # bf870de by Yorivel): the first room's walls no longer read stale copies.
-        VICTORY_DSTORAGE_NOTIFY         = '1'
-    }
-    foreach ($name in $tuned.Keys) {
+$tuned = [ordered]@{
+    # Translated shader loops stop after 256 iterations (32 cuts the hair strand loops short).
+    VICTORY_SHADER_LOOP_LIMIT       = '256'
+    # Host pipeline wait setting from the fork's pull request #1.
+    VICTORY_LATE_WAIT               = '3'
+    # Wide back-end option of the fork, on in the measured run.
+    VICTORY_WIDE_BACK               = '1'
+    # No relay mode on purpose: the run judged best had it off, and the fork's issue #89 reports that it makes
+    # the characters' skin disappear and overlaps the subtitles. Set the relay variable by hand to try it.
+    # Card buffer sizing: minimum and total, in MB.
+    VICTORY_CARD_BUFFERS_MIN_MB     = '1'
+    VICTORY_CARD_BUFFERS_MB         = '1024'
+    # DirectStorage writes into physical pages are reported to the GPU side (fork commits e49864a and
+    # bf870de by Yorivel): the first room's walls no longer read stale copies.
+    VICTORY_DSTORAGE_NOTIFY         = '1'
+}
+# The values stay in this PowerShell session after the script ends: -NoTunedSettings clears those of an earlier
+# launch instead of leaving them on.
+foreach ($name in $tuned.Keys) {
+    if ($NoTunedSettings) {
+        Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+    } else {
         Set-Item -Path "Env:$name" -Value $tuned[$name]
     }
 }
-# VIctory turns DRED on when the variable exists, whatever its value: only set it when asked.
+# VIctory turns DRED on when the variable exists, whatever its value: only set it when asked. The variables set
+# here outlive the script in this PowerShell session, so a DRED left by an earlier launch (with -Dred, or by the
+# launcher that set it by default) is cleared first: it would otherwise keep slowing every frame.
+Remove-Item -Path Env:VICTORY_D3D12_DRED -ErrorAction SilentlyContinue
 if ($Dred) {
     $env:VICTORY_D3D12_DRED = '1'
+}
+# The relay is left to the user (see above), so it is not cleared; but the launcher before the fork's issue #89
+# set it, and a value left in this session would bring that issue back unnoticed.
+if ($env:VICTORY_RELAY) {
+    Write-Warning "VICTORY_RELAY=$($env:VICTORY_RELAY) is set in this session (by hand, or left by an earlier launch): the fork's issue #89 reports missing skin and overlapping subtitles with it. Remove it with: Remove-Item Env:VICTORY_RELAY"
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines
