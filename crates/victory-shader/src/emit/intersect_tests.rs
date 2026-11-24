@@ -586,6 +586,57 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
 }
 
 #[test]
+fn absent_child_sorted_box_gpu_matches_reference() {
+    let ids = [bvh::NONE, 8, bvh::NONE, bvh::NONE];
+    let boxes = [
+        [-1.0, -1.0, 1.0, 1.0, 1.0, 2.0],
+        [-1.0, -1.0, 3.0, 1.0, 1.0, 4.0],
+        [0.0; 6],
+        [0.0; 6],
+    ];
+    let mut scene = Scene::new();
+    let node = scene.add(nodes::box32(ids, boxes), 32);
+    let case = Some((node, 5, Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0)));
+    let want = expected(&scene, &case, true);
+    assert_eq!(want, [8, bvh::NONE, bvh::NONE, bvh::NONE]);
+    let (shader, _) = build(true, Descriptor::Table).unwrap();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data = buffer(&scene, &[case], u64::from(NODES));
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(vec![0; 5]))],
+                    views: &[
+                        View::Buffer {
+                            data: &data,
+                            stride: Stride::Raw,
+                        },
+                        View::RawUav(4 * THREADS),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        eprintln!("{label} BVH sorted output: {:?}", &out[0][..4]);
+        assert_eq!(&out[0][..4], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
 fn the_64_bit_node_test_in_a_host_buffer_matches_the_reference_on_the_card() {
     // Pointers count from the buffer's start.
     run(true, Descriptor::Table, u64::from(NODES), true);
