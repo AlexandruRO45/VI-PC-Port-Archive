@@ -14,9 +14,8 @@
 //! Pipelines a draw waits for go ahead of those started early (at the
 //! title's creation, because an earlier run drew them).
 //!
-//! shortcut: the budget (half a second of waiting per title frame) is a
-//! guess; a pass the title runs only once and whose pipeline takes longer
-//! is lost.
+//! The default budget is half a second per title frame. A one-shot pass
+//! whose pipeline takes longer may still be lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,25 +67,29 @@ impl Pending {
         }
     }
 
-    fn make(&self) {
-        self.made.get_or_init(|| {
-            let (started, cpu) = (Instant::now(), super::thread_cpu());
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            #[cfg(feature = "diagnostics")]
-            log_built(&self.key);
-            let (user, kernel) = super::thread_cpu_since(cpu);
-            tracing::debug!(
-                shaders = ?self.shaders,
-                ms = started.elapsed().as_millis() as u64,
-                user_ms = user,
-                kernel_ms = kernel,
-                "pipeline made"
-            );
-            made
-        });
+    // The queue grants one worker exclusive ownership of this attempt.
+    fn make(&self, mode: CompileMode) -> Option<Lane> {
+        let (started, cpu) = (Instant::now(), super::thread_cpu());
+        let mut compile = Compile::new(mode);
+        let made = HostPipeline::build(&self.shaders, self.graphics.as_deref(), &mut compile);
+        if let Some(lane) = compile.deferred {
+            return Some(lane);
+        }
+        #[cfg(feature = "diagnostics")]
+        log_built(&self.key);
+        let (user, kernel) = super::thread_cpu_since(cpu);
+        tracing::debug!(
+            shaders = ?self.shaders,
+            ms = started.elapsed().as_millis() as u64,
+            user_ms = user,
+            kernel_ms = kernel,
+            "pipeline made"
+        );
+        let _ = self.made.set(made);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+        None
     }
 }
 
@@ -161,13 +164,52 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+const DEFAULT_WAIT_MS: u64 = 500;
+const MAX_WAIT_MS: u64 = 5000;
 
-/// Pipelines queued and not made yet.
+fn parse_wait_ms(value: &str) -> Option<u64> {
+    value.trim().parse().ok().filter(|&ms| ms <= MAX_WAIT_MS)
+}
+
+fn wait_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ms = setting("VICTORY_PIPELINE_WAIT_MS", DEFAULT_WAIT_MS, parse_wait_ms);
+        tracing::info!(ms, "host pipeline wait budget per frame");
+        Duration::from_millis(ms)
+    })
+}
+
+#[derive(Default)]
+struct WaitBudget {
+    frame: u64,
+    spent: Duration,
+}
+
+impl WaitBudget {
+    fn reserve(&mut self, frame: u64, budget: Duration) -> Duration {
+        if frame < self.frame {
+            return Duration::ZERO;
+        }
+        if frame != self.frame {
+            *self = Self { frame, spent: Duration::ZERO };
+        }
+        let remaining = budget.saturating_sub(self.spent);
+        self.spent += remaining;
+        remaining
+    }
+
+    fn refund(&mut self, frame: u64, reserved: Duration, elapsed: Duration) {
+        if frame == self.frame {
+            self.spent -= reserved.saturating_sub(elapsed);
+        }
+    }
+}
+
+/// Outstanding pipelines (queued, deferred, or in progress).
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
-/// Pipelines queued and not made yet (for the frame line).
+/// Outstanding pipelines, for the frame line and worker priority.
 pub(crate) fn waiting() -> u64 {
     WAITING.load(Ordering::Relaxed)
 }
@@ -177,7 +219,7 @@ pub(crate) fn waiting() -> u64 {
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // Listed for an early start in later runs from its first use, made or
     // not: one a run never got made is the one it should start early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
         #[cfg(feature = "diagnostics")]
         log("used", &p.key, String::new);
@@ -203,8 +245,8 @@ fn enqueue(p: &Pending, now: bool) -> Option<bool> {
     if first {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
-    let ahead = now && !p.now.swap(true, Ordering::Relaxed);
-    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
+    let ahead = now && !p.now.load(Ordering::Relaxed) && !p.now.swap(true, Ordering::Relaxed);
+    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(now)
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier
@@ -219,13 +261,21 @@ pub(crate) fn early(p: &Arc<Pending>) {
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
-    static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
-    static WAITED_US: AtomicU64 = AtomicU64::new(0);
-    if FRAME.swap(frame, Ordering::Relaxed) != frame {
-        WAITED_US.store(0, Ordering::Relaxed);
+    static SPENT: Mutex<WaitBudget> = Mutex::new(WaitBudget { frame: 0, spent: Duration::ZERO });
+    let budget = wait_budget();
+    if budget.is_zero() || p.made.get().is_some() {
+        return;
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = SPENT.lock().unwrap_or_else(|e| e.into_inner()).reserve(frame, budget);
+    if left.is_zero() {
+        return;
+    }
     let started = Instant::now();
+    wait_pending(p, started, left);
+    SPENT.lock().unwrap_or_else(|e| e.into_inner()).refund(frame, left, started.elapsed());
+}
+
+fn wait_pending(p: &Pending, started: Instant, left: Duration) {
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -235,25 +285,202 @@ fn wait(p: &Pending, frame: u64) {
         }
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
-    WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lane {
+    Large,
+    Huge,
+}
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+impl Lane {
+    const ALL: [Self; 2] = [Self::Large, Self::Huge];
+
+    fn for_bytes(bytes: usize) -> Option<Self> {
+        if bytes >= 4 * 1024 * 1024 {
+            Some(Self::Huge)
+        } else if bytes >= 256 * 1024 {
+            Some(Self::Large)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum CompileMode {
+    Sync,
+    Worker,
+}
+
+/// One build attempt. A busy lane is neither a D3D12 error nor a refusal.
+pub(super) struct Compile {
+    mode: CompileMode,
+    deferred: Option<Lane>,
+}
+
+impl Compile {
+    pub(super) fn new(mode: CompileMode) -> Self {
+        Self { mode, deferred: None }
+    }
+
+    pub(super) fn cold<T>(
+        &mut self,
+        name: &str,
+        bytes: usize,
+        create: impl FnOnce() -> windows::core::Result<T>,
+    ) -> windows::core::Result<Option<T>> {
+        let Some(lane) = Lane::for_bytes(bytes).filter(|_| matches!(self.mode, CompileMode::Worker)) else {
+            return create().map(Some);
+        };
+        let Some(permit) = Permit::acquire(lane) else {
+            self.deferred = Some(lane);
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let result = create();
+        drop(permit);
+        tracing::debug!(name, ?lane, bytes, ms = started.elapsed().as_millis() as u64, "cold host pipeline compile");
+        result.map(Some)
+    }
+}
+
+struct Permit(Lane);
+
+impl Permit {
+    fn acquire(lane: Lane) -> Option<Self> {
+        let available = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner()).take_lane(lane);
+        if available { Some(Self(lane)) } else { None }
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut queues = QUEUES.0.lock().unwrap_or_else(|e| e.into_inner());
+        queues.busy[self.0 as usize] = false;
+        QUEUES.1.notify_all();
+    }
+}
+
+struct Queues {
+    fresh: [VecDeque<Arc<Pending>>; 2],
+    deferred: [VecDeque<Arc<Pending>>; 2],
+    busy: [bool; 2],
+}
+
+impl Queues {
+    const fn new() -> Self {
+        Self {
+            fresh: [VecDeque::new(), VecDeque::new()],
+            deferred: [VecDeque::new(), VecDeque::new()],
+            busy: [false; 2],
+        }
+    }
+
+    fn take_lane(&mut self, lane: Lane) -> bool {
+        !std::mem::replace(&mut self.busy[lane as usize], true)
+    }
+
+    fn retry(&mut self, urgent: bool) -> Option<Arc<Pending>> {
+        for lane in Lane::ALL {
+            let i = lane as usize;
+            if self.busy[i] {
+                continue;
+            }
+            if let Some(at) = self.deferred[i].iter().position(|p| p.now.load(Ordering::Relaxed) == urgent) {
+                return self.deferred[i].remove(at);
+            }
+        }
+        None
+    }
+
+    fn claim(&mut self, index: usize) -> Option<Arc<Pending>> {
+        while let Some(p) = self.fresh[index].pop_front() {
+            if !p.taken.swap(true, Ordering::Relaxed) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    fn next(&mut self) -> Option<Arc<Pending>> {
+        self.retry(true)
+            .or_else(|| self.claim(0))
+            .or_else(|| self.retry(false))
+            .or_else(|| self.claim(1))
+    }
+}
+
+static QUEUES: (Mutex<Queues>, Condvar) = (Mutex::new(Queues::new()), Condvar::new());
+
+const BOOST_ABOVE: u64 = 64;
+const LOWER_AT: u64 = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Priority {
+    Auto,
+    Normal,
+    BelowNormal,
+}
+
+impl Priority {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "normal" => Some(Self::Normal),
+            "below-normal" | "below_normal" => Some(Self::BelowNormal),
+            _ => None,
+        }
+    }
+
+    fn normal(self, outstanding: u64, was_normal: bool) -> bool {
+        match self {
+            Self::Auto => outstanding > BOOST_ABOVE || (was_normal && outstanding > LOWER_AT),
+            Self::Normal => true,
+            Self::BelowNormal => false,
+        }
+    }
+}
+
+fn setting<T: Copy>(key: &str, default: T, parse: impl FnOnce(&str) -> Option<T>) -> T {
+    std::env::var(key).ok().map_or(default, |value| {
+        parse(&value).unwrap_or_else(|| {
+            tracing::warn!(key, %value, "invalid pipeline setting; using default");
+            default
+        })
+    })
+}
+
+fn set_priority(previous: &mut Option<bool>, normal: bool) {
+    if *previous == Some(normal) {
+        return;
+    }
+    *previous = Some(normal);
+    use windows::Win32::System::Threading::*;
+    let priority = if normal { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_BELOW_NORMAL };
+    // SAFETY: change only the current worker's priority.
+    if let Err(error) = unsafe { SetThreadPriority(GetCurrentThread(), priority) } {
+        tracing::warn!(%error, normal, "could not set pipeline worker priority");
+    } else {
+        tracing::debug!(normal, pending = waiting(), "set pipeline worker priority");
+    }
+}
+
+/// Hands `p` to the workers, started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let default = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = setting("VICTORY_PIPELINE_WORKERS", default, |value| {
+            value.trim().parse::<usize>().ok().filter(|n| (1..=16).contains(n))
+        });
+        let priority = setting("VICTORY_PIPELINE_PRIORITY", Priority::Auto, Priority::parse);
+        tracing::info!(workers = n, ?priority, "host pipeline worker configuration");
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
                     .name(format!("victory-pipelines-{i}"))
-                    .spawn(work);
+                    .spawn(move || work(priority));
                 if let Err(e) = &spawned {
                     tracing::warn!(error = %e, "no pipeline worker");
                 }
@@ -264,31 +491,27 @@ fn queue(p: Arc<Pending>, now: bool) {
     if workers == 0 {
         // No worker: made here instead.
         if !p.taken.swap(true, Ordering::Relaxed) {
-            p.make();
+            let _ = p.make(CompileMode::Sync);
             WAITING.fetch_sub(1, Ordering::Relaxed);
         }
         return;
     }
     let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    lock.lock().unwrap_or_else(|e| e.into_inner()).fresh[usize::from(!now)].push_back(p);
     work.notify_one();
 }
 
 /// A worker: makes queued pipelines, those draws wait for first, and saves
 /// the cache when idle (first uses of pipelines made before).
-fn work() {
-    // Below the title's own threads (loading, recording).
-    // SAFETY: a plain call on our own thread.
-    unsafe {
-        use windows::Win32::System::Threading::*;
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    }
+fn work(priority: Priority) {
+    let mut normal = None;
+    set_priority(&mut normal, priority.normal(0, false));
     let (lock, work) = &QUEUES;
     loop {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                if let Some(p) = queues.next() {
                     break p;
                 }
                 let (held, waited) = work
@@ -302,11 +525,19 @@ fn work() {
                 }
             }
         };
-        if p.taken.swap(true, Ordering::Relaxed) {
-            continue; // its other queue entry
+        let next_priority = priority.normal(waiting(), normal == Some(true));
+        set_priority(&mut normal, next_priority);
+        if let Some(lane) = p.make(CompileMode::Worker) {
+            let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+            queues.deferred[lane as usize].push_back(p);
+            work.notify_one();
+            continue;
         }
-        p.make();
-        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        let remaining = WAITING.fetch_sub(1, Ordering::Relaxed) - 1;
+        if priority == Priority::Auto && remaining <= LOWER_AT {
+            set_priority(&mut normal, false);
+        }
+        if remaining == 0 {
             drained();
         } else {
             super::library::save(false);
@@ -335,6 +566,73 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_budget_is_shared_and_refunds_only_the_current_frame() {
+        let mut spent = WaitBudget::default();
+        let ms = Duration::from_millis;
+        assert_eq!(parse_wait_ms("0"), Some(0));
+        assert_eq!(parse_wait_ms(" 24 "), Some(24));
+        assert_eq!(parse_wait_ms("5001"), None);
+        let budget = ms(DEFAULT_WAIT_MS);
+        assert_eq!(spent.reserve(1, budget), budget);
+        assert!(spent.reserve(1, budget).is_zero());
+        spent.refund(1, budget, ms(24));
+        let remainder = spent.reserve(1, budget);
+        assert_eq!(remainder, budget - ms(24));
+        assert_eq!(spent.reserve(2, budget), budget);
+        spent.refund(1, remainder, Duration::ZERO);
+        assert!(spent.reserve(2, budget).is_zero());
+        assert!(spent.reserve(1, budget).is_zero());
+    }
+
+    #[test]
+    fn auto_priority_tracks_backlog_with_hysteresis() {
+        let p = Priority::Auto;
+        assert!(!p.normal(64, false));
+        assert!(p.normal(65, false));
+        assert!(p.normal(33, true));
+        assert!(!p.normal(32, true));
+        assert!(Priority::Normal.normal(0, false));
+        assert!(!Priority::BelowNormal.normal(65, true));
+    }
+
+    #[test]
+    fn worker_defers_busy_lanes_but_sync_and_small_compiles_continue() {
+        let large = 256 * 1024;
+        let huge = 4 * 1024 * 1024;
+        let permit = Permit::acquire(Lane::Large).unwrap();
+        assert!(Permit::acquire(Lane::Large).is_none());
+        let mut worker = Compile::new(CompileMode::Worker);
+        assert_eq!(worker.cold("large", large, || panic!("compile ran")).unwrap(), None::<()>);
+        assert_eq!(worker.deferred, Some(Lane::Large));
+        let mut sync = Compile::new(CompileMode::Sync);
+        assert_eq!(sync.cold("prebuild", large, || Ok(1)).unwrap(), Some(1));
+        let mut worker = Compile::new(CompileMode::Worker);
+        assert_eq!(worker.cold("small", large - 1, || Ok(2)).unwrap(), Some(2));
+        assert_eq!(worker.cold("huge", huge, || Ok(3)).unwrap(), Some(3));
+        assert_eq!(worker.deferred, None);
+        drop(permit);
+        assert_eq!(worker.cold("retry", large, || Ok(4)).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn deferred_work_keeps_urgency_without_blocking_other_jobs() {
+        let mut queues = Queues::new();
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let ready = Arc::new(Pending::new(Vec::new(), None));
+        queues.deferred[Lane::Large as usize].push_back(early.clone());
+        queues.deferred[Lane::Large as usize].push_back(p.clone());
+        queues.fresh[0].push_back(ready.clone());
+        assert!(queues.take_lane(Lane::Large));
+        p.now.store(true, Ordering::Relaxed);
+        assert!(Arc::ptr_eq(&queues.next().unwrap(), &ready));
+        assert!(queues.next().is_none());
+        queues.busy[Lane::Large as usize] = false;
+        assert!(Arc::ptr_eq(&queues.next().unwrap(), &p));
+        assert!(Arc::ptr_eq(&queues.next().unwrap(), &early));
+    }
 
     /// An early start is queued once; a draw waiting for it puts it ahead,
     /// once, unless a worker has taken it.

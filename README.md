@@ -81,7 +81,21 @@ it then makes every pipeline in the title's shader pack (inside
 some 20 minutes on 16 threads, most of it the 2,700 compute ones), so a run
 compiles none of those either; the library belongs to the GPU and driver it
 was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made.
+early, it keeps what it made. On a 4-core/8-thread PC with 16 GiB RAM, start
+with `--jobs 2` to limit offline memory and CPU contention. With the game
+closed, use the same executable, configuration, GPU and driver as the run:
+
+```powershell
+$game = 'D:\GTA 6\GTA6.Xbox.v1.0.2.1'
+$env:VICTORY_CONFIG = 'D:\GTA 6\wt\victory-data\victory.toml'
+& .\target\diag\victory.exe translate --cache --pipelines --jobs 2 `
+    "$game\shaders.rpf" "$game\game_scarlett_master.exe" `
+    "$game\XboxBvhBuilder.dll" "$game\amd_fidelityfx_upscaler_xbox.dll"
+```
+
+Use `target\release` instead if that is the build you run. Check the
+summary for skipped pack entries: unsupported stages or GPU features,
+unnamed state, or different runtime descriptions still need handling.
 
 Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
 it with the PC build on your GPU instead of the console build, get the
@@ -123,6 +137,19 @@ victory config
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
+
+Runtime pipeline settings (all builds):
+
+| Variable | Effect |
+|----------|--------|
+| `VICTORY_PIPELINE_WORKERS=<n>` | 1–16 runtime workers; default is half the logical processors, clamped to 2–8 |
+| `VICTORY_PIPELINE_PRIORITY=auto\|normal\|below-normal` | Auto boosts above 64 outstanding PSOs and lowers at 32 or fewer; the other values set fixed priorities |
+| `VICTORY_PIPELINE_WAIT_MS=<n>` | Shared wait budget per frame (0–5000 ms, default 500); use 24 for a shorter wait or 0 to queue without waiting |
+
+On a library miss, a runtime worker defers cold compiles when the relevant
+one-wide lane is busy: one for 256 KiB to under 4 MiB of host shader bytecode,
+one for 4 MiB and over. Cache hits, smaller compiles, and the offline
+pre-build do not need a lane. Draws can still be dropped while PSOs are pending.
 
 ## Debugging
 

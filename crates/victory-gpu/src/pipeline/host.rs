@@ -303,6 +303,16 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        let mut compile = super::make::Compile::new(super::make::CompileMode::Sync);
+        Self::build(shaders, g, &mut compile)
+    }
+
+    /// The same descriptor and cache path for synchronous prebuild and workers.
+    pub(super) fn build(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        compile: &mut super::make::Compile,
+    ) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -489,13 +499,15 @@ impl HostPipeline {
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
+                desc.CS.BytecodeLength,
+                compile,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
             let pso = match made {
-                Ok(pso) => pso,
+                Ok(pso) => pso?,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -527,8 +539,8 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
-                Ok(pso) => pso,
+            let pso = match mesh_pipeline(&host.device, &root, [code(0), code(1)], g, &name, compile) {
+                Ok(pso) => pso?,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
@@ -597,13 +609,15 @@ impl HostPipeline {
         let started = std::time::Instant::now();
         let made = super::library::pipeline(
             &name,
+            desc.VS.BytecodeLength.saturating_add(desc.PS.BytecodeLength).saturating_add(desc.GS.BytecodeLength),
+            compile,
             // SAFETY: the description points at live data.
             |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
             // SAFETY: as above.
             || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
         );
         let pso = match made {
-            Ok(pso) => pso,
+            Ok(pso) => pso?,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
@@ -649,11 +663,11 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
-    ms: D3D12_SHADER_BYTECODE,
-    ps: D3D12_SHADER_BYTECODE,
+    [ms, ps]: [D3D12_SHADER_BYTECODE; 2],
     g: &GraphicsState,
     name: &str,
-) -> windows::core::Result<ID3D12PipelineState> {
+    compile: &mut super::make::Compile,
+) -> windows::core::Result<Option<ID3D12PipelineState>> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
     #[repr(C, align(8))]
@@ -695,6 +709,8 @@ fn mesh_pipeline(
     let device = device.cast::<ID3D12Device2>()?;
     super::library::pipeline(
         name,
+        ms.BytecodeLength.saturating_add(ps.BytecodeLength),
+        compile,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.

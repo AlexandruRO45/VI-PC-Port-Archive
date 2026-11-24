@@ -207,42 +207,43 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
-/// The pipeline named `name`: loaded from the library by `load` if it is
-/// there with the same description, else made by `create` and stored.
-pub(crate) fn pipeline(
+/// Load by description first; on a miss a worker can defer cold creation.
+pub(super) fn pipeline(
     name: &str,
+    bytes: usize,
+    compile: &mut super::make::Compile,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
-) -> windows::core::Result<ID3D12PipelineState> {
+) -> windows::core::Result<Option<ID3D12PipelineState>> {
     let wide = HSTRING::from(name);
     #[cfg(feature = "diagnostics")]
-    LAST.set(Some((name.to_owned(), true)));
-    let Some(library) = library() else {
-        MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
-    };
-    {
+    LAST.set(None);
+    let library = library();
+    if let Some(library) = library {
         let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
         let loaded = load(&l.library, PCWSTR(wide.as_ptr()));
         l.touch();
         if let Ok(pso) = loaded {
+            #[cfg(feature = "diagnostics")]
+            LAST.set(Some((name.to_owned(), true)));
             LOADED.fetch_add(1, Ordering::Relaxed);
-            return Ok(pso);
+            return Ok(Some(pso));
         }
     }
-    // Compiled outside the lock: compiles take up to seconds.
+    // Neither admission nor driver compilation holds the library mutex.
+    let Some(pso) = compile.cold(name, bytes, create)? else { return Ok(None) };
     #[cfg(feature = "diagnostics")]
     LAST.set(Some((name.to_owned(), false)));
-    let pso = create()?;
     MADE.fetch_add(1, Ordering::Relaxed);
-    let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: a live pipeline; a name already stored (a description that
-    // differs) is refused, which leaves the library as it was.
-    if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
-        l.added += 1;
+    if let Some(library) = library {
+        let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live PSO. StorePipeline refuses a name already stored.
+        if unsafe { l.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+            l.added += 1;
+        }
+        l.touch();
     }
-    l.touch();
-    Ok(pso)
+    Ok(Some(pso))
 }
 
 #[cfg(feature = "diagnostics")]
@@ -288,17 +289,24 @@ pub(crate) fn trim_idle() {
 /// Save the early list independently from the driver's cache blob. Keep
 /// the AOT manifest tagged with the exact bytes successfully published.
 pub(crate) fn save(now: bool) {
-    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
-    const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    use std::sync::TryLockError;
+    static SAVE: Mutex<Option<Instant>> = Mutex::new(None);
     let Some(dir) = DIR.get() else { return };
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
-            return;
+    // Hold across publication so multiple saves cannot race on the temp files.
+    let mut last = if now {
+        SAVE.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match SAVE.try_lock() {
+            Ok(last) => last,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
         }
-        *last = Some(std::time::Instant::now());
+    };
+    if !now && last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
+        return;
     }
-    let early = save_early(dir);
+    *last = Some(Instant::now());
+    save_early(dir);
     let Some(library) = library() else { return };
     let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
     if l.added == 0 && !l.prebuilt_changed {
@@ -335,7 +343,6 @@ pub(crate) fn save(now: bool) {
     match written {
         Ok(bytes) => tracing::info!(
             bytes,
-            early,
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
@@ -347,22 +354,6 @@ pub(crate) fn save(now: bool) {
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
     }
-}
-
-fn save_early(dir: &std::path::Path) -> usize {
-    let used = USED.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(used) = used.as_ref() else { return 0 };
-    if !USED_CHANGED.load(Ordering::Relaxed) {
-        return 0;
-    }
-    let keys = used.list();
-    match std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes()))
-    {
-        Ok(()) => USED_CHANGED.store(false, Ordering::Relaxed),
-        Err(e) => tracing::warn!(error = %e, "early pipelines not saved"),
-    }
-    keys.len()
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -438,6 +429,22 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 pub(crate) fn note_used(key: &str) {
     if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+fn save_early(dir: &std::path::Path) {
+    if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let keys = used().as_ref().map(Used::list).unwrap_or_default();
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), keys.join("\n").as_bytes()));
+    match written {
+        Ok(()) => tracing::info!(early = keys.len(), "early pipeline list saved"),
+        Err(error) => {
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(%error, "early pipeline list not saved");
+        }
     }
 }
 
