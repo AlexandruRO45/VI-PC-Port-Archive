@@ -197,11 +197,9 @@ mod tests {
                 p
             }));
         }
-        let path = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .next()
-            .unwrap();
+        let paths: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let path = &paths[0];
+        assert!(paths.iter().all(|p| p == path));
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
