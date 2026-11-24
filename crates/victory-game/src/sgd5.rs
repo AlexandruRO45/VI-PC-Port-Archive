@@ -14,6 +14,9 @@ const MAX_UNPACKED: usize = 64 << 20;
 /// Bytes a record's packed stream may hold beyond what deflate needs (see
 /// [`max_packed`]): the stream's end is not checked, so allow some padding.
 const PACKED_SLACK: usize = 4096;
+/// Packed bytes read, and unpacked bytes made, to tell whether a record's
+/// bytes are a deflate stream (see [`starts_stream`]).
+const PROBE: usize = 4096;
 
 /// The most packed bytes a container of `unpacked` bytes can take. Deflate
 /// never spends more than 9 bits a byte (fixed codes), and stored blocks only
@@ -235,11 +238,23 @@ impl Streams {
 /// Whether `bytes` are the start of a deflate stream of `unpacked` bytes:
 /// they run out before the stream ends, or the stream ends having produced
 /// exactly that many bytes.
+///
+/// Only the first [`PROBE`] bytes are read, and at most [`PROBE`] bytes
+/// inflated: [`records`] asks this of every marker that might be a record,
+/// and in bytes that only look like records each such marker's bytes may run
+/// on through all the ones after it (stored blocks that each end where the
+/// next marker's begin), so reading them all makes a file of `n` markers
+/// take `n²` work. Real records are told from noise long before that.
 fn starts_stream(bytes: &[u8], unpacked: usize) -> bool {
     use miniz_oxide::inflate::{TINFLStatus, decompress_to_vec_with_limit};
-    match decompress_to_vec_with_limit(bytes, unpacked) {
+    let limit = unpacked.min(PROBE);
+    match decompress_to_vec_with_limit(&bytes[..bytes.len().min(PROBE)], limit) {
         Ok(out) => out.len() == unpacked,
-        Err(e) => e.status == TINFLStatus::FailedCannotMakeProgress,
+        Err(e) => {
+            e.status == TINFLStatus::FailedCannotMakeProgress
+                // Inflated as far as the probe goes, with more to come.
+                || (e.status == TINFLStatus::HasMoreOutput && limit < unpacked)
+        }
     }
 }
 
@@ -817,5 +832,64 @@ mod tests {
         file[31] = 0xFF; // first packed byte: reserved block type
         let r = records(&file).next().unwrap();
         assert_eq!(r.unpack(), None);
+    }
+
+    /// `count` markers between the magic and a real record, each followed by
+    /// a stored block that ends where the next marker's stored block starts,
+    /// so the deflate stream after every marker runs through all the ones
+    /// after it, to a reserved block (no deflate stream) just before the
+    /// real record. `n(at)` is each marker's `n`, given its offset.
+    fn chained_markers(count: usize, n: impl Fn(usize) -> u32, real: &[u8]) -> Vec<u8> {
+        const PAD: usize = 41;
+        let len = (PAD + 18) as u16;
+        let mut file = MAGIC.to_vec();
+        for _ in 0..count {
+            file.extend_from_slice(&[0, 0x32]);
+            let n = n(file.len() + 4);
+            for v in [n, 0x000D_DCE7, n, n] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.push(0x00); // stored, not final
+            file.extend_from_slice(&len.to_le_bytes());
+            file.extend_from_slice(&(!len).to_le_bytes());
+            file.extend_from_slice(&[0x5A; PAD]);
+        }
+        file.extend_from_slice(&[0x5A; 18]);
+        file.push(0x07); // reserved block type
+        file.extend_from_slice(real);
+        file
+    }
+
+    #[test]
+    fn chained_markers_past_the_end_take_linear_work() {
+        // Each marker's packed size runs past the end of the file, so its
+        // bytes are checked for the start of a deflate stream. Before, each
+        // check inflated the rest of the chain: these 32000 (2 MB) took 9 s
+        // in a test build. The chain is a valid deflate stream for far more
+        // than the probe reads, so the first marker is now taken for a
+        // truncated record, as a cut-off file's last record would be.
+        let real = record_bytes("PS_real", 0x32, b"real");
+        let file = chained_markers(32_000, |_| MAX_UNPACKED as u32, &real);
+        let started = std::time::Instant::now();
+        assert_eq!(records(&file).count(), 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn chained_markers_inside_the_file_take_linear_work() {
+        // Each marker's packed bytes end at the end of the file, so the
+        // first covers all the others and each of them is checked for a
+        // deflate stream. Before, each check inflated the rest of the chain
+        // (9 s for these 32000 in a test build). The first is yielded as a
+        // corrupt record whose span is all of them.
+        let count = 32_000;
+        let end = chained_markers(count, |_| 0, &[]).len();
+        let file = chained_markers(count, |at| (end - at) as u32, &[]);
+        let started = std::time::Instant::now();
+        let found: Vec<_> = records(&file).collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span(), MAGIC.len() + 6..file.len());
+        assert_eq!(found[0].unpack(), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }
