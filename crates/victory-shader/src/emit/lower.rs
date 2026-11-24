@@ -4085,12 +4085,13 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
-            "v_permlanex16_b32" => {
-                // Each lane reads src0 of a lane of the *other* row of 16 in
-                // its 32-lane half; lane i's pick is nibble i of the {src2,
-                // src1} selector (v_permlane16_b32 reads the same row). Both
-                // stay inside a 32-lane half, so the lane math is unchanged
-                // when a console wave64 program runs as two wave32 halves.
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads src0 of a lane in its own row of 16
+                // (permlane16) or the other (permlanex16) of its 32-lane
+                // half; lane i's pick is nibble i of the {src2, src1}
+                // selector. Both stay inside a 32-lane half, so the lane
+                // math is unchanged when a console wave64 program runs as
+                // two wave32 halves.
                 if v.opsel != 0 {
                     return Err("op_sel on v_permlanex16_b32");
                 }
@@ -4114,7 +4115,11 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::And, pick, k15);
                 let half = self.s.m.bin(c, Bin::And, lane, n31);
                 let row = self.s.m.bin(c, Bin::And, lane, k16);
-                let row = self.s.m.bin(c, Bin::Xor, row, k16);
+                let row = if name == "v_permlanex16_b32" {
+                    self.s.m.bin(c, Bin::Xor, row, k16)
+                } else {
+                    row
+                };
                 let base = self.s.m.bin(c, Bin::Or, half, row);
                 let idx = self.s.m.bin(c, Bin::Or, base, pick);
                 let val = self.read_lane(a, idx);
@@ -6761,9 +6766,10 @@ mod tests {
     }
 
     /// `v_permlanex16_b32` reads a lane of the *other* row of 16 in the
-    /// lane's 32-lane half, the pick from nibble i of {src2, src1}. Before
-    /// the rule its write was missing and the LDS store consuming it failed
-    /// the whole translation.
+    /// lane's 32-lane half (`v_permlane16_b32` reads its own), the pick
+    /// from nibble i of {src2, src1}. Before the rule their write was
+    /// missing and the LDS store consuming it failed the whole
+    /// translation.
     #[test]
     fn permlanex16_reads_a_lane_of_the_other_row() {
         let words = [
@@ -6781,6 +6787,20 @@ mod tests {
             S_ENDPGM,
         ];
         lowers_lds(&words).unwrap();
+        // v_permlane16_b32 picks from the lane's *own* row instead.
+        let same_row = [
+            0xBE80_03FF,
+            0x7654_3210, // s_mov_b32 s0, 0x76543210
+            0xBE81_03FF,
+            0xFEDC_BA98, // s_mov_b32 s1, 0xfedcba98
+            0xD777_0001,
+            0x0004_0100, // v_permlane16_b32 v1, v0, s0, s1
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xD834_0000,
+            0x0000_0102, // ds_write_b32 v2, v1
+            S_ENDPGM,
+        ];
+        lowers_lds(&same_row).unwrap();
     }
 
     /// `v_movrelsd_2_b32` and `v_swaprel_b32` index the VGPR file through
