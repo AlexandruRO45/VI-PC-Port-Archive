@@ -594,10 +594,34 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        // The ranges are independent - different buffers, or disjoint ranges
+        // of one - so the copy-back is spread over threads: it is kernel
+        // reads and writes of title memory, and one thread is a fifth of the
+        // machine. `VICTORY_COPY_THREADS=1` puts it back on one thread, for
+        // an A/B of the frame line.
+        let threads = copy_threads().min(back.len().max(1));
+        if threads > 1 {
+            let per = back.len().div_ceil(threads);
+            let written: usize = std::thread::scope(|s| {
+                let handles: Vec<_> = back
+                    .chunks(per)
+                    .map(|part| {
+                        s.spawn(move || {
+                            part.iter()
+                                .map(|(shadow, address, len)| shadow.copy_back(*address, *len))
+                                .sum::<usize>()
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap_or(0)).sum()
+            });
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        } else {
+            for (shadow, address, len) in &back {
+                let (address, len) = (*address, *len);
+                let written = shadow.copy_back(address, len);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1283,6 +1307,19 @@ impl Batch {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Threads the copy-back of a submission is spread over: the machine's, at
+/// most eight, or `VICTORY_COPY_THREADS`.
+fn copy_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_COPY_THREADS").ok().and_then(|v| v.parse::<usize>().ok());
+        asked.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+        })
+        .clamp(1, 64)
+    })
 }
 
 /// Copies title memory at submission. The ranges were checked against their
