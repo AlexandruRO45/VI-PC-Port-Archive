@@ -191,6 +191,8 @@ fn attach_block() -> *mut Teb {
         tls::thread_attached(teb);
     }
     teb::set_current(teb);
+    // Room to report a fault, even a stack overflow, on this thread.
+    super::signals::attach_thread();
     teb
 }
 

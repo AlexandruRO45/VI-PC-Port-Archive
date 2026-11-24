@@ -52,6 +52,7 @@ pub fn install() {
             }
         }
     });
+    set_guard_page_hook(super::vm::take_guard);
     attach_thread();
 }
 

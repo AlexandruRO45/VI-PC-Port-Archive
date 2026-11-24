@@ -180,6 +180,9 @@ pub fn load(original: &[u8], path: &Path) -> Result<LoadedImage> {
     vm::adopt(base, size, PAGE_EXECUTE_WRITECOPY);
     loaded.protect(headers);
     seh::register_image(base, size);
+    if let Some(file) = path.file_name() {
+        seh::name_image(base, &file.to_string_lossy());
+    }
     // The exe: `GetModuleHandle(NULL)` and new threads' default stack.
     if !loaded.info.is_dll() {
         teb::set_image_base(base);
