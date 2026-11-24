@@ -188,6 +188,13 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_for_wave(container, 64)
+}
+
+/// Translates a console shader container targeting a host with maximum
+/// supported wave lane count `max_wave` (emulating wave64 compute shaders
+/// when `max_wave < 64` where possible).
+pub fn translate_for_wave(container: &[u8], max_wave: u32) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -211,7 +218,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_for_wave(&c, &native, &p, &st, &io, &res, max_wave)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -222,6 +229,19 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_for_wave(c, native, p, st, io, res, 64)
+}
+
+/// Emits a program whose earlier stages already ran, targeting `max_wave`.
+pub fn emit_for_wave(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    max_wave: u32,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -288,6 +308,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
+        max_wave,
     })?;
     Ok(HostShader {
         stage: native.stage,
