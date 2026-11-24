@@ -5199,8 +5199,16 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        let reading = batch.reading();
-                        staging.refresh_holding(reading);
+                        if lock_each() {
+                            // The old one-acquisition-a-texture path, kept as
+                            // the control the hoist is measured against
+                            // (`VICTORY_TEXTURE_LOCK_EACH=1`).
+                            batch.reading = None;
+                            staging.refresh();
+                        } else {
+                            let reading = batch.reading();
+                            staging.refresh_holding(reading);
+                        }
                     }
                     continue;
                 }
@@ -5209,6 +5217,14 @@ impl HostList {
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
+}
+
+/// Whether each texture refresh takes the title-memory read lock for itself
+/// (`VICTORY_TEXTURE_LOCK_EACH=1`): the control that measures what holding it
+/// once a submission is worth, with nothing else changed.
+fn lock_each() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOCK_EACH").is_some_and(|v| v == "1"))
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
