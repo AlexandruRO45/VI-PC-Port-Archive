@@ -1329,24 +1329,37 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         // SAFETY: inside the destination, which is mapped.
         unsafe { to.write_bytes(0, n) };
     };
-    let mut unreadable = UNREADABLE.lock().unwrap_or_else(|e| e.into_inner());
+    // The map is locked only to look up and note pages, never across a
+    // read: the runtime's remapping (`forget_unreadable`, on the title's
+    // page-mapping threads) waits on it.
+    let unreadable = || UNREADABLE.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
-    let known = |page: usize, map: &std::collections::BTreeMap<usize, std::time::Instant>| {
+    let known = |map: &std::collections::BTreeMap<usize, std::time::Instant>, page: usize| {
         map.get(&page)
             .is_some_and(|&seen| now.duration_since(seen) < UNREADABLE_FOR)
     };
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
-        let any_known = (at / PAGE..(at + n).div_ceil(PAGE)).any(|p| known(p, &unreadable));
+        let any_known = {
+            let map = unreadable();
+            (at / PAGE..(at + n).div_ceil(PAGE)).any(|p| known(&map, p))
+        };
         if !any_known && read(at as *const u8, to, n) {
             return;
         }
         for_pieces(at, n, PAGE, |at, n| {
             let to = dst.wrapping_add(at - src as usize);
-            if known(at / PAGE, &unreadable) {
+            if known(&unreadable(), at / PAGE) {
                 zero(to, n);
             } else if !read(at as *const u8, to, n) {
-                unreadable.insert(at / PAGE, now);
+                let mut map = unreadable();
+                // Expired entries go when the map has grown, not on every
+                // remap: the title remaps pages thousands of times a frame.
+                if map.len() >= UNREADABLE_PRUNE_AT {
+                    map.retain(|_, seen| now.duration_since(*seen) < UNREADABLE_FOR);
+                }
+                map.insert(at / PAGE, now);
+                drop(map);
                 zero(to, n);
             }
         });
@@ -1360,6 +1373,8 @@ const PAGE: usize = 4 << 10;
 /// ([`forget_unreadable`]); after that it is asked again, for memory that
 /// is mapped another way.
 const UNREADABLE_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+/// Entries [`UNREADABLE`] holds before a new one drops the expired.
+const UNREADABLE_PRUNE_AT: usize = 1 << 14;
 /// Pages [`copy_mapped`] found unreadable, by page number, and when.
 static UNREADABLE: Mutex<std::collections::BTreeMap<usize, std::time::Instant>> =
     Mutex::new(std::collections::BTreeMap::new());
@@ -1367,7 +1382,13 @@ static UNREADABLE: Mutex<std::collections::BTreeMap<usize, std::time::Instant>> 
 /// The runtime mapped or unmapped `[at, at + len)`: its pages are asked
 /// again.
 pub(crate) fn forget_unreadable(at: usize, len: usize) {
+    // Called for every page the title maps or unmaps: only the range is
+    // looked at (pruning the whole map here held up the title's mapping
+    // threads, seen in stall dumps of the world).
     let mut unreadable = UNREADABLE.lock().unwrap_or_else(|e| e.into_inner());
+    if unreadable.is_empty() {
+        return;
+    }
     let pages: Vec<usize> = unreadable
         .range(at / PAGE..(at + len).div_ceil(PAGE))
         .map(|(&p, _)| p)
@@ -1375,9 +1396,6 @@ pub(crate) fn forget_unreadable(at: usize, len: usize) {
     for page in pages {
         unreadable.remove(&page);
     }
-    // Entries past their time are dropped here too, so the map stays small.
-    let now = std::time::Instant::now();
-    unreadable.retain(|_, seen| now.duration_since(*seen) < UNREADABLE_FOR);
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
