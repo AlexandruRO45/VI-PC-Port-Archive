@@ -134,9 +134,10 @@ pub(crate) fn dispatched() -> u64 {
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
+/// `read` is the host state a read of the host copy promotes it to.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, srv: bool, read: D3D12_RESOURCE_STATES) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -144,6 +145,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.read_buffer(&shadow.buffer, read.0 as u32);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -371,6 +373,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.read_buffer(&shadow.buffer, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -389,6 +392,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.read_buffer(&shadow.buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER.0 as u32);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -491,14 +495,26 @@ impl State {
                     }
                 }
             }
+            // The state a root view's read promotes its buffer to: a shader
+            // resource read by the stage's kind of shader.
+            let shader_read = if stage.shader.stage == "pixel" {
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            } else {
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            };
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+                let read = if srv {
+                    shader_read
+                } else {
+                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER
+                };
                 for &(slot, param) in views {
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         continue;
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = root_view(list, *address, srv, read) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -1035,6 +1051,11 @@ impl State {
                 Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;
+        }
+        // The count is read as an argument too (nothing if it lies in the
+        // arguments' own buffer, which the list holds).
+        if let Some((s, _)) = &counter {
+            list.read_buffer(&s.buffer, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0 as u32);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {

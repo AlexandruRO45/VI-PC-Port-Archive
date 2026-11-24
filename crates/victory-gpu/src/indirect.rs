@@ -144,6 +144,13 @@ fn make() -> windows::core::Result<Clamp> {
 /// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
 /// the list's compute root signature and pipeline (callers bind theirs
 /// after). False if the clamp is not available.
+///
+/// The buffer is a title buffer's host copy, so it may be in the common
+/// state or in the read states the list's bindings promoted it to
+/// (`promotion`). From there it goes to unordered access for the clamp,
+/// then to every read state until `done`. The execution's own bindings may
+/// read the same buffer as vertices, indices or shader resources while it
+/// is held there.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
@@ -158,11 +165,21 @@ pub(crate) fn bound(
     }
     let l = &list.list;
     let constants = [kind, stride, records, 0];
+    let reads = list.hold_buffer(buffer);
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
+        // Earlier shader writes (the title's argument passes) first. From
+        // the common state, the clamp's write promotes the buffer to
+        // unordered access by itself; from read states it cannot.
+        if reads == D3D12_RESOURCE_STATE_COMMON {
+            l.ResourceBarrier(&[uav_barrier()]);
+        } else {
+            l.ResourceBarrier(&[
+                uav_barrier(),
+                transition(buffer, reads, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ]);
+        }
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
@@ -174,7 +191,7 @@ pub(crate) fn bound(
             transition(
                 buffer,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
             ),
         ]);
     }
@@ -191,10 +208,11 @@ pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     unsafe {
         list.list.ResourceBarrier(&[transition(
             buffer,
-            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+    list.release_buffer(buffer);
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {

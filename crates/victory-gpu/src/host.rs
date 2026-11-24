@@ -296,6 +296,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    /// The read states the list's bindings promoted title buffers' host
+    /// copies to (`promotion`). `close` returns each one to the common state.
+    promoted: Mutex<crate::promotion::Promotions<ID3D12Resource>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions may still do (`indirect`): a
@@ -479,6 +482,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
+                promoted: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
@@ -859,7 +863,59 @@ impl HostList {
         times
     }
 
+    /// A binding of this list reads title buffer copy `buffer` in host
+    /// state `state`, a read state the common state promotes it to.
+    pub(crate) fn read_buffer(&self, buffer: &ID3D12Resource, state: u32) {
+        self.promoted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read(buffer.as_raw() as usize, state, || buffer.clone());
+    }
+
+    /// The list moves title buffer copy `buffer` out of implicit promotion
+    /// into explicit states. Returns the state it is in now: the read
+    /// states its bindings promoted it to, or the common state. Until
+    /// `release_buffer`, bindings that read it promote nothing.
+    pub(crate) fn hold_buffer(&self, buffer: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
+        let reads = self
+            .promoted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hold(buffer.as_raw() as usize, || buffer.clone());
+        D3D12_RESOURCE_STATES(reads as i32)
+    }
+
+    /// The list returned title buffer copy `buffer` to the common state.
+    pub(crate) fn release_buffer(&self, buffer: &ID3D12Resource) {
+        self.promoted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(buffer.as_raw() as usize);
+    }
+
     pub(crate) fn close(&self) {
+        // Title buffers back to the common state, so that the next list of
+        // the submission can promote them to any state, a write included.
+        let ended = {
+            let mut promoted = self.promoted.lock().unwrap_or_else(|e| e.into_inner());
+            if promoted.holds_any() {
+                tracing::warn!("a host list ends with a title buffer in an explicit state");
+            }
+            promoted.drain()
+        };
+        if !ended.is_empty() {
+            let barriers: Vec<D3D12_RESOURCE_BARRIER> = ended
+                .iter()
+                .map(|(buffer, reads)| {
+                    transition(buffer, D3D12_RESOURCE_STATES(*reads as i32), D3D12_RESOURCE_STATE_COMMON)
+                })
+                .collect();
+            // SAFETY: an open list and live buffers, which `ended` holds
+            // through the call.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+            // Until the list is reset, as the barriers name them.
+            ended.iter().for_each(|(buffer, _)| self.keep(buffer));
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -882,6 +938,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        *self.promoted.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
