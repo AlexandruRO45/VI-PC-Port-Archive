@@ -1,5 +1,5 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3; on Linux SDL3's, through `victory_gpu::linux`); while none is connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -517,17 +517,7 @@ fn host() -> Box<dyn Source> {
 
 #[cfg(not(windows))]
 fn host() -> Box<dyn Source> {
-    struct Nothing;
-    impl Source for Nothing {
-        fn pad(&mut self, _: usize) -> Option<PadState> {
-            None
-        }
-        fn keys(&mut self) -> Vec<KeyState> {
-            Vec::new()
-        }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
-    }
-    Box::new(Nothing)
+    Box::new(sdl::Host)
 }
 
 static HUB: LazyLock<&'static Hub> = LazyLock::new(|| Hub::start(host()));
@@ -1253,6 +1243,140 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+}
+
+/// Host input on Linux: SDL3's gamepads and keyboard (our window's focus),
+/// from the window's SDL thread in `victory-gpu`.
+#[cfg(not(windows))]
+mod sdl {
+    use victory_gpu::linux;
+
+    use super::*;
+
+    /// `SDL_GamepadButton` (the bit `linux::Pad` sets) and ours.
+    const BUTTONS: [(u32, u32); 14] = [
+        (6, MENU),            // start
+        (4, VIEW),            // back
+        (0, A),               // south
+        (1, B),               // east
+        (2, X),               // west
+        (3, Y),               // north
+        (11, UP),             // d-pad
+        (12, DOWN),
+        (13, LEFT),
+        (14, RIGHT),
+        (9, LEFT_SHOULDER),
+        (10, RIGHT_SHOULDER),
+        (7, LEFT_STICK),
+        (8, RIGHT_STICK),
+    ];
+
+    /// Raw values, no dead zone: titles apply their own. SDL's sticks
+    /// are down positive, the console's up positive.
+    pub(super) fn convert(pad: &linux::Pad) -> PadState {
+        let stick = |v: i16| (f32::from(v) / 32767.0).clamp(-1.0, 1.0);
+        let trigger = |v: i16| (f32::from(v) / 32767.0).clamp(0.0, 1.0);
+        PadState {
+            buttons: BUTTONS
+                .iter()
+                .filter(|(host, _)| pad.buttons & 1 << host != 0)
+                .fold(0, |all, (_, bit)| all | bit),
+            left_trigger: trigger(pad.axes[4]),
+            right_trigger: trigger(pad.axes[5]),
+            left_x: stick(pad.axes[0]),
+            left_y: -stick(pad.axes[1]),
+            right_x: stick(pad.axes[2]),
+            right_y: -stick(pad.axes[3]),
+        }
+    }
+
+    /// SDL scan code (USB usage) → virtual key and scan code (0xE0xx when
+    /// extended), for the keys a pad stand-in and menus use.
+    pub(super) fn key(usage: u16) -> Option<(u8, u32)> {
+        /// Set-1 scan codes of A to Z.
+        const LETTERS: [u32; 26] = [
+            0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
+            0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+        ];
+        Some(match usage {
+            4..=29 => (b'A' + (usage - 4) as u8, LETTERS[usize::from(usage - 4)]),
+            30..=38 => (b'1' + (usage - 30) as u8, 2 + u32::from(usage - 30)),
+            39 => (b'0', 0x0B),
+            40 => (0x0D, 0x1C), // Enter
+            41 => (0x1B, 0x01), // Esc
+            42 => (0x08, 0x0E), // Backspace
+            43 => (0x09, 0x0F), // Tab
+            44 => (0x20, 0x39), // Space
+            58..=67 => (0x70 + (usage - 58) as u8, 0x3B + u32::from(usage - 58)), // F1-F10
+            68 => (0x7A, 0x57),
+            69 => (0x7B, 0x58),
+            79 => (0x27, 0xE04D), // Right
+            80 => (0x25, 0xE04B), // Left
+            81 => (0x28, 0xE050), // Down
+            82 => (0x26, 0xE048), // Up
+            224 => (0xA2, 0x1D),   // left Ctrl
+            225 => (0xA0, 0x2A),   // left Shift
+            226 => (0xA4, 0x38),   // left Alt
+            228 => (0xA3, 0xE01D), // right Ctrl
+            229 => (0xA1, 0x36),   // right Shift
+            230 => (0xA5, 0xE038), // right Alt
+            _ => return None,
+        })
+    }
+
+    pub(super) struct Host;
+
+    impl Source for Host {
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            linux::pad(slot).map(|p| convert(&p))
+        }
+
+        fn keys(&mut self) -> Vec<KeyState> {
+            linux::keys()
+                .into_iter()
+                .filter_map(key)
+                .map(|(virtual_key, scan_code)| KeyState {
+                    scan_code,
+                    virtual_key,
+                    // shortcut: no characters, as on Windows.
+                    ..Default::default()
+                })
+                .collect()
+        }
+
+        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            linux::rumble(slot, low, high);
+        }
+    }
+
+    #[test]
+    fn host_pads_convert_to_console_pads() {
+        let pad = linux::Pad {
+            buttons: 1 << 0 | 1 << 6 | 1 << 13,
+            axes: [-32768, -32767, 0, 0, 32767, 0],
+        };
+        let state = convert(&pad);
+        assert_eq!(state.buttons, A | MENU | LEFT);
+        assert_eq!(
+            (state.left_trigger, state.left_x, state.left_y, state.right_x),
+            (1.0, -1.0, 1.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn keys_map_to_the_stand_in_pads_keys() {
+        assert_eq!(key(26), Some((b'W', 0x11)));
+        assert_eq!(key(4), Some((b'A', 0x1E)));
+        assert_eq!(key(30), Some((b'1', 0x02)));
+        assert_eq!(key(82), Some((0x26, 0xE048)));
+        // Every key of the stand-in pad is reachable.
+        for (vk, _) in FALLBACK_BUTTONS {
+            assert!((0..512).filter_map(key).any(|(k, _)| k == vk), "{vk:#x}");
+        }
+        for vk in *b"WASDIJKLZC" {
+            assert!((0..512).filter_map(key).any(|(k, _)| k == vk), "{vk:#x}");
+        }
     }
 }
 

@@ -107,6 +107,17 @@ extern "win64" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     put(out, request)
 }
 
+/// On Linux the display stays on while our window is up: SDL turns the
+/// screen saver off with its video (`SDL_HINT_VIDEO_ALLOW_SCREENSAVER`
+/// unset), so a deferral is a token.
+#[cfg(not(windows))]
+extern "win64" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    put(out, std::ptr::dangling_mut())
+}
+
+#[cfg(not(windows))]
+extern "win64" fn close_deferral(_: This, _: *mut c_void) {}
+
 #[cfg(windows)]
 extern "win64" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
@@ -144,7 +155,6 @@ static HDR_VTABLE: Methods<5> = Methods([
     try_enable_hdr as *const (), // 0x20
 ]);
 
-#[cfg(windows)]
 static SHELL_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
@@ -152,13 +162,6 @@ static SHELL_VTABLE: Methods<6> = Methods([
     launch_uri as *const (),       // 0x18
     acquire_deferral as *const (), // 0x20
     close_deferral as *const (),   // 0x28
-]);
-#[cfg(not(windows))]
-static SHELL_VTABLE: Methods<4> = Methods([
-    missing::<0> as *const (),
-    add_ref as *const (),
-    add_ref as *const (),
-    launch_uri as *const (),
 ]);
 
 static CAPTURE_VTABLE: Methods<6> = Methods([
@@ -170,7 +173,7 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     take_screenshot as *const (), // 0x28
 ]);
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
