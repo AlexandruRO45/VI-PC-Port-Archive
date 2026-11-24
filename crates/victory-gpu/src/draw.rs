@@ -811,7 +811,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let ran =
+            self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first, 1));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -839,9 +840,10 @@ impl State {
     /// fewest that any buffer the pipeline reads per vertex holds, in whole
     /// rectangles (2^24 if it reads none: vertex ids only). None if a buffer
     /// it reads is not bound or holds no rectangle.
-    /// shortcut: at most 4 MiB of expanded vertices per buffer, as the
-    /// expansion copies the bound buffers whole on the CPU at submission;
-    /// records past that draw nothing.
+    /// shortcut: at most 4 MiB of expanded vertices per buffer (three
+    /// expansions, see [`State::rectangles`]), as the expansion copies the
+    /// bound buffers whole on the CPU at submission; records past that draw
+    /// nothing.
     fn rectangle_vertices(&self) -> Option<u32> {
         const EXPANDED: u32 = 4 << 20;
         let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -852,15 +854,18 @@ impl State {
                 return None;
             }
             vertices = (v.size / v.stride)
-                .min(EXPANDED / 2 / v.stride)
+                .min(EXPANDED / 6 / v.stride)
                 .min(vertices);
         }
         (vertices >= 3).then_some(vertices / 3 * 3)
     }
 
-    /// Binds vertex buffers holding the rectangles of vertices `first..first
-    /// + count` as triangles, made when the list is submitted.
-    fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
+    /// Binds vertex buffers holding the rectangles of vertices from `first`
+    /// on (`count` of them) as triangles, made when the list is submitted;
+    /// with `phases` above 1, those from `first + 1` on follow, and so on,
+    /// each `count / 3 * 6` vertices after the last (for draws whose
+    /// rectangles start at any vertex).
+    fn rectangles(&self, list: &HostList, count: u32, first: u32, phases: u32) -> bool {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return false;
         };
@@ -886,25 +891,37 @@ impl State {
                 once!(slot, "rectangle vertices outside their buffer");
                 return false;
             }
-            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+            let span = rects * 6 * stride;
+            let Some((gpu, to)) = list.scratch(u64::from(phases) * span) else {
                 return false;
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
-            let n = rects as usize;
+            let (span, phases) = (span as usize, phases as usize);
+            let rects = rects as usize;
             list.defer_host(move || {
-                // SAFETY: the vertices lie in a title buffer (checked when
-                // recorded) and the scratch memory is the list's.
-                let (src, dst) = unsafe {
-                    (
-                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
-                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
-                    )
-                };
-                crate::primitive::expand_rects(src, dst, stride, &elements);
+                for phase in 0..phases {
+                    // Phases past the first lack the last rectangle.
+                    let n = rects - phase.min(1);
+                    // SAFETY: the vertices lie in a title buffer (checked
+                    // when recorded) and the scratch memory is the list's.
+                    let (src, dst) = unsafe {
+                        (
+                            std::slice::from_raw_parts(
+                                (from + phase * stride) as *const u8,
+                                n * 3 * stride,
+                            ),
+                            std::slice::from_raw_parts_mut(
+                                (to + phase * span) as *mut u8,
+                                n * 6 * stride,
+                            ),
+                        )
+                    };
+                    crate::primitive::expand_rects(src, dst, stride, &elements);
+                }
             });
             let view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                SizeInBytes: (phases * span) as u32,
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
@@ -1033,7 +1050,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW if rects => self.prepare(list, false) && self.rectangles(list, expanded, 0),
+            DRAW if rects => self.prepare(list, false) && self.rectangles(list, expanded, 0, 3),
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {

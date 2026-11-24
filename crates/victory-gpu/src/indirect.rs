@@ -71,9 +71,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 /// Rectangle-list draws, rewritten as the triangle-list draws of their
 /// expanded vertices (`draw::State::rectangles`: six per rectangle, from
-/// the first vertex of the bound buffers on) into records of our own, so
-/// the title's records stay as they are. A record must start on a
-/// rectangle and stay within the `vertices` expanded; others draw nothing.
+/// each of the first three vertices of the bound buffers on, one after the
+/// other: `2 * vertices` apart) into records of our own, so the title's
+/// records stay as they are. A record's rectangles are grouped from its
+/// first vertex on, which must stay within the `vertices` expanded
+/// (a multiple of 3), as must the rectangles; others draw nothing.
 /// The clamp's bound of 2^24 vertices holds for the triangles too.
 /// shortcut: the budget is charged the title's count, half the vertices
 /// the triangles run.
@@ -89,8 +91,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     // Vertex count, instances, first vertex, first instance.
     uint4 a = args.Load4(id.x * stride);
     uint rects = min(a.x / 3, (1u << 24) / 6);
-    bool whole = a.z % 3 == 0 && a.z <= vertices && rects * 3 <= vertices - a.z;
-    triangles.Store4(id.x * 16, whole ? uint4(rects * 6, a.y, a.z / 3 * 6, a.w) : uint4(0, 0, 0, 0));
+    bool whole = a.z <= vertices && rects * 3 <= vertices - a.z;
+    uint first = a.z % 3 * vertices * 2 + a.z / 3 * 6;
+    triangles.Store4(id.x * 16, whole ? uint4(rects * 6, a.y, first, a.w) : uint4(0, 0, 0, 0));
 }
 "#;
 
@@ -308,21 +311,23 @@ mod tests {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
-        // 20-byte records (4 bytes past the draw), 9 expanded vertices.
-        let records: [[u32; 5]; 4] = [
+        // 20-byte records (4 bytes past the draw), 9 vertices expanded from
+        // each of the first three on: 18 triangle vertices apart.
+        let records: [[u32; 5]; 5] = [
             [6, 2, 0, 1, 0xdead],
             [7, 1, 3, 0, 0],
             [3, 1, 1, 0, 0],
+            [3, 1, 5, 0, 0],
             [3, 1, 9, 0, 0],
         ];
-        let (input, data) = host.shared_buffer(80).unwrap();
-        // SAFETY: the buffer's mapping holds 80 bytes.
-        unsafe { data.cast::<[[u32; 5]; 4]>().write(records) };
+        let (input, data) = host.shared_buffer(100).unwrap();
+        // SAFETY: the buffer's mapping holds 100 bytes.
+        unsafe { data.cast::<[[u32; 5]; 5]>().write(records) };
         let list = host.new_list().unwrap();
         // SAFETY: a live buffer.
         let gpu = unsafe { input.GetGPUVirtualAddress() };
-        assert!(super::bound(&list, &input, gpu, (0, 20, 4)));
-        let (out, offset) = super::rectangles(&list, &input, gpu, (20, 4, 9)).unwrap();
+        assert!(super::bound(&list, &input, gpu, (0, 20, 5)));
+        let (out, offset) = super::rectangles(&list, &input, gpu, (20, 5, 9)).unwrap();
         super::done(&list, &out);
         super::done(&list, &input);
         list.close();
@@ -335,7 +340,7 @@ mod tests {
                 let v = p
                     .cast::<u8>()
                     .add(at as usize)
-                    .cast::<[[u32; 4]; 4]>()
+                    .cast::<[[u32; 4]; 5]>()
                     .read_unaligned();
                 buffer.Unmap(0, None);
                 v
@@ -343,9 +348,15 @@ mod tests {
         };
         assert_eq!(
             read(&out, offset),
-            [[12, 2, 0, 1], [12, 1, 6, 0], [0; 4], [0; 4]]
+            [
+                [12, 2, 0, 1],
+                [12, 1, 6, 0],
+                [6, 1, 18, 0],
+                [6, 1, 42, 0],
+                [0; 4]
+            ]
         );
         // SAFETY: as above.
-        assert_eq!(unsafe { data.cast::<[[u32; 5]; 4]>().read() }, records);
+        assert_eq!(unsafe { data.cast::<[[u32; 5]; 5]>().read() }, records);
     }
 }
