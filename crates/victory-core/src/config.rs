@@ -2679,6 +2679,75 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_config_file_that_cannot_be_checked_is_refused_not_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        // A scratch folder under the system temp folder, never the
+        // repository or the working directory; removed at the end.
+        let dir =
+            std::env::temp_dir().join(format!("victory-config-locked-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let default = locked.join("victory.toml");
+        std::fs::write(&default, "").unwrap();
+        let real = dir.join("real.toml");
+        std::fs::write(&real, "").unwrap();
+
+        // A folder without search permission: whether victory.toml is in
+        // it cannot be told, so it is neither "no config file" nor "does
+        // not exist", but the permission error with what was being checked.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (or a CAP_DAC_OVERRIDE container) reads through the mode
+        // bits, leaving nothing to check.
+        let enforced = std::fs::symlink_metadata(&default).is_err();
+        if enforced {
+            let err = config_file_or(None, &default).unwrap_err();
+            let io = err.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied, "{err:#}");
+            let text = err.to_string();
+            assert_eq!(
+                text,
+                format!("checking the config file {}", default.display())
+            );
+
+            // The same through VICTORY_CONFIG, naming the variable.
+            let err = config_file(Some(default.clone())).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("checking VICTORY_CONFIG at {}", default.display())
+            );
+
+            // A trailing slash changes nothing: still unreadable, never
+            // taken for a file named with a slash.
+            let slashed = PathBuf::from(format!("{}/", default.display()));
+            let err = config_file(Some(slashed)).unwrap_err();
+            assert_eq!(
+                err.downcast_ref::<std::io::Error>().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+
+            // VICTORY_CONFIG naming a readable file is used without
+            // looking at the default that cannot be checked.
+            assert_eq!(
+                config_file_or(Some(real.clone()), &default).unwrap(),
+                Some(real.clone())
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Search permission back: the same file is found as before.
+        assert_eq!(
+            config_file_or(None, &default).unwrap(),
+            Some(default.clone())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_folder_setting_blocked_by_a_file_is_refused() {
         // A scratch folder under the system temp folder, never the
