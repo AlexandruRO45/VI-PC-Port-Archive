@@ -114,6 +114,12 @@ pub struct Report {
     pub early_asked: usize,
     /// Of those, the ones the library already held.
     pub early_loaded: usize,
+    /// Lines whose name is on a boot's own asked list
+    /// (`VICTORY_ASKED_NAMES=<file>`, one name per line): the names a real
+    /// session tried to load, so the replay can be measured against demand
+    /// instead of against itself.
+    pub asked_hit: usize,
+    pub asked_made: usize,
     /// Bytes the library held when the run started and ended.
     pub before: u64,
     pub after: u64,
@@ -184,6 +190,8 @@ pub fn precompile(
         report.refused += one.refused;
         report.early_asked += one.early_asked;
         report.early_loaded += one.early_loaded;
+        report.asked_hit += one.asked_hit;
+        report.asked_made += one.asked_made;
     }
     Ok(report)
 }
@@ -210,6 +218,24 @@ fn replay_all(jobs: usize, lines: usize, work: impl Fn(usize) + Sync) {
 fn claim(next: &std::sync::atomic::AtomicUsize, len: usize) -> Option<usize> {
     let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     (at < len).then_some(at)
+}
+
+/// The names a real session asked the library for
+/// (`VICTORY_ASKED_NAMES`), read once, or nothing when the switch is unset.
+pub(crate) fn asked() -> &'static Option<std::collections::HashSet<String>> {
+    static ASKED: std::sync::OnceLock<Option<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    ASKED.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_ASKED_NAMES")?;
+        let text = std::fs::read_to_string(std::path::PathBuf::from(path)).ok()?;
+        Some(
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
+    })
 }
 
 /// Replays one dump line into the library, counting what became of it.
@@ -258,7 +284,8 @@ fn replay(line: &str, shaders: &Path, report: &mut Report) {
             // Coverage is asked of the title's own list, not of a count of
             // makes: whether a name the next boot asks for is in there is the
             // only thing that decides if that boot has to compile.
-            let early = library::wanted_early(&pipeline.name);
+            let early = library::wanted_early(&pipeline.key);
+            let asked = asked().as_ref().is_some_and(|set| set.contains(&pipeline.key));
             if early {
                 report.early_asked += 1;
             }
@@ -267,8 +294,14 @@ fn replay(line: &str, shaders: &Path, report: &mut Report) {
                 if early {
                     report.early_loaded += 1;
                 }
+                if asked {
+                    report.asked_hit += 1;
+                }
             } else if library::MADE.load(std::sync::atomic::Ordering::Relaxed) > made {
                 report.made += 1;
+                if asked {
+                    report.asked_made += 1;
+                }
             }
         }
         None => report.refused += 1,
