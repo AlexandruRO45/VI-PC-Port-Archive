@@ -85,4 +85,5 @@ calling convention; check before you bind.
 | UCRT | every import the title and its DLLs take (`ucrt_*.rs`); C locale only |
 | GPU, window, input | not started |
 | Audio, network (offline), crypto, COM and the other host DLLs | done: every import of these DLLs resolves. Sound through PulseAudio/PipeWire (`libpulse-simple`, loaded at run time): the game's Spatial Audio stream (`mmdevapi.rs`) and Bink's XAudio2 (`xaudio2.rs`); loopback-only Winsock, WinHTTP that cannot connect, Media Foundation without sources, an empty registry |
-| Windows-only `victory-hle` modules (files, xmem, lifecycle, ...) | not started |
+| xmem, virtual drives (`files`), persistent local storage | done: xmem on the region table (reservations inside the console's address limits, the physical pool, `alias` for the GPU's page mappings, `MEM_DECOMMIT` to unmap; no placeholders); `G:`/`T:`/storage drives rewritten to Linux folders, names found whatever their case; the title's own `msvcp140` reaches them through its imports |
+| Other Windows-only `victory-hle` modules (lifecycle, dstorage, ...) | not started |

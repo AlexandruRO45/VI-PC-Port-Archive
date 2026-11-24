@@ -66,12 +66,8 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    // ponytail: on Linux the files module is not ported yet, so nothing is mounted.
-    #[cfg(windows)]
     victory_hle::modules::files::mount_at('G', title_dir);
-    #[cfg_attr(not(windows), allow(unused_variables))]
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
-    #[cfg(windows)]
     victory_hle::modules::files::mount_at('T', &temp);
     #[cfg(target_os = "linux")]
     {

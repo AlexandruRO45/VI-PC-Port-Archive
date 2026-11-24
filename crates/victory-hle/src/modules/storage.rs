@@ -50,10 +50,7 @@ fn folder() -> Option<String> {
     if storage.as_os_str().is_empty() {
         return None;
     }
-    #[cfg(windows)]
-    return super::files::mount(&storage).map(|letter| format!("{letter}:\\"));
-    #[cfg(not(windows))]
-    None
+    super::files::mount(&storage).map(|letter| format!("{letter}:\\"))
 }
 
 extern "win64" fn path_size(_: This, out: *mut usize) -> HRESULT {
@@ -117,6 +114,19 @@ pub(crate) fn disk_free(dir: &Path) -> u64 {
             return free;
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+            return u64::MAX;
+        };
+        // SAFETY: plain data; zero is a valid value.
+        let mut info: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a writable result.
+        if unsafe { libc::statvfs(path.as_ptr(), &mut info) } == 0 {
+            return (info.f_bavail as u64).saturating_mul(info.f_frsize as u64);
+        }
+    }
     let _ = dir;
     u64::MAX
 }
@@ -173,7 +183,6 @@ mod tests {
     use crate::modules::xgameruntime::method;
 
     #[test]
-    #[cfg_attr(not(windows), ignore = "the title's file calls are Windows-only")]
     fn serves_a_drive_over_the_title_folder_and_its_quota() {
         type Size = extern "win64" fn(This, *mut usize) -> HRESULT;
         type Get = extern "win64" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
@@ -200,17 +209,16 @@ mod tests {
         let drive = std::str::from_utf8(&buffer[..3]).unwrap();
         assert!(drive.ends_with(":\\"), "{drive}");
         // Title file calls on it reach the folder.
-        #[cfg(windows)]
-        {
-            let path = format!("{drive}save.dat\0");
-            let mut attributes = [0u8; 36];
-            let get_attributes = super::super::files::GetFileAttributesExW;
-            let wide: Vec<u16> = path.encode_utf16().collect();
-            assert_ne!(
-                get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
-                0
-            );
-        }
+        let path = format!("{drive}save.dat\0");
+        let mut attributes = [0u8; 36];
+        let get_attributes = super::super::files::GetFileAttributesExW;
+        let wide: Vec<u16> = path.encode_utf16().collect();
+        assert_ne!(
+            get_attributes(wide.as_ptr(), 0, attributes.as_mut_ptr().cast()),
+            0
+        );
+        // What the host disk has free is known.
+        assert!(disk_free(dir.path()) < u64::MAX);
 
         let mut info = SpaceInfo {
             available_free: 0,
