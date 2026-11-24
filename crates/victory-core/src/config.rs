@@ -1116,7 +1116,8 @@ fn ensure_titles_distinct(
 /// with "File exists", naming neither the setting nor the fix; the same goes
 /// for a link (the folder or one above it) whose target was moved or deleted,
 /// or that loops, so it is refused too, as is a folder under a folder without
-/// search permission or with a name longer than the file system allows. A path that
+/// search permission, with a name longer than the file system allows or
+/// longer as a whole than the system takes for one path. A path that
 /// does not exist yet is fine: the cache and data folders are created when
 /// needed. `what` is the folder ("game folder", "cache folder", "data
 /// folder", "test title") and `setting` the variable and key that set it.
@@ -1140,12 +1141,20 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
     // The same for a name longer than the file system there allows
     // (ENAMETOOLONG): it passed as a folder still to create, and failed
     // with "File name too long" on first use.
+    //
+    // Also keep whether any name on the way was turned down as too long:
+    // a path whose names are each short but that is longer as a whole than
+    // the system takes (PATH_MAX) fails that way only on its deeper
+    // ancestors, the shorter ones above are simply missing, so `below`
+    // alone would let it pass and fail with "File name too long" on first use.
     let walk: PathBuf = dir.components().collect();
     let mut below = None;
+    let mut too_long = false;
     let existing = walk.ancestors().find_map(|p| match std::fs::metadata(p) {
         Ok(m) => Some(Ok((p, m))),
         Err(e) => {
             below = Some(e.kind());
+            too_long |= e.kind() == std::io::ErrorKind::InvalidFilename;
             std::fs::symlink_metadata(p)
                 .is_ok_and(|m| m.file_type().is_symlink())
                 .then_some(Err(p))
@@ -1196,6 +1205,17 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
                  is {name} bytes long, more than the file system there allows for one name, \
                  so it can never be found or made; shorten it, or set {setting} elsewhere",
                 dir.display(),
+                path.display()
+            );
+        }
+        if too_long {
+            anyhow::bail!(
+                "the {what} {} (from {origin}) cannot be a folder because the path is {} bytes \
+                 long, more than the system allows for a whole path, although each name in it \
+                 is short enough, so it can never be found or made under {}; use fewer or \
+                 shorter names, or set {setting} elsewhere",
+                dir.display(),
+                walk.as_os_str().len(),
                 path.display()
             );
         }
@@ -4232,6 +4252,100 @@ mod tests {
         let cfg = resolve(edge.clone(), scratch.join("data")).unwrap();
         assert_eq!(cfg.cache_dir, edge);
         assert!(!edge.exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_longer_as_a_whole_than_the_system_takes_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch =
+            std::env::temp_dir().join(format!("victory-config-long-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            })
+        };
+        // 100 names of 100 bytes: each well under the 255 a name may have,
+        // the whole past the 4096 (Linux) or 1024 (macOS) a path may have.
+        let mut deep = scratch.clone();
+        for _ in 0..100 {
+            deep.push("n".repeat(100));
+        }
+        // Only when the system says so: one that takes long paths leaves
+        // nothing to check.
+        let refused = std::fs::metadata(&deep)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidFilename);
+        if refused {
+            // As the folder, and with a trailing slash or `.`: the length
+            // counted without them, and the deepest folder that is there.
+            for cache in [
+                deep.clone(),
+                PathBuf::from(format!("{}/", deep.display())),
+                PathBuf::from(format!("{}/.", deep.display())),
+            ] {
+                let err = resolve(cache.clone(), scratch.join("data"))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!(
+                        "the cache folder {} (from VICTORY_CACHE_DIR) cannot be a folder because \
+                         the path is {} bytes long, more than the system allows for a whole \
+                         path, although each name in it is short enough, so it can never be \
+                         found or made under {}; use fewer or shorter names, or set \
+                         VICTORY_CACHE_DIR or [paths].cache_dir elsewhere",
+                        cache.display(),
+                        deep.as_os_str().len(),
+                        scratch.display()
+                    )
+                );
+            }
+            // With some of the names already made, the deepest made one.
+            let made = scratch.join("n".repeat(100)).join("n".repeat(100));
+            std::fs::create_dir_all(&made).unwrap();
+            let err = resolve(scratch.join("cache"), deep.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because the \
+                     path is {} bytes long",
+                    deep.display(),
+                    deep.as_os_str().len()
+                )) && err.contains(&format!(" under {}; ", made.display())),
+                "{err}"
+            );
+            // A single name too long is still named as that name.
+            let long = scratch.join("c".repeat(300));
+            let err = resolve(long.clone(), scratch.join("data"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("is 300 bytes long, more than the file system"),
+                "{err}"
+            );
+        }
+        // A deep path within the limit is a folder still to create, and
+        // nothing is made.
+        let mut fine = scratch.clone();
+        for _ in 0..5 {
+            fine.push("n".repeat(100));
+        }
+        let cfg = resolve(fine.clone(), scratch.join("data")).unwrap();
+        assert_eq!(cfg.cache_dir, fine);
+        assert!(
+            !scratch
+                .join("n".repeat(100))
+                .join("n".repeat(100))
+                .join("n".repeat(100))
+                .exists()
+        );
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
