@@ -271,6 +271,7 @@ impl Config {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
         }
         ensure_titles_apart(&test_titles, &cache_dir, &data_dir, &origins)?;
+        ensure_titles_distinct(game_dir.as_deref(), &test_titles, &origins)?;
         for (name, dir, origin, setting) in [
             (
                 "game",
@@ -690,6 +691,47 @@ fn ensure_titles_apart(
                     origins.test_titles
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a test title listed twice, or one that is the game folder.
+/// `victory census`, `translate` and `shader` take the game folder followed
+/// by the test titles when given no paths, so a repeated dump was scanned
+/// and translated twice, doubling the time and the report for nothing. The
+/// easy slips are a title added both to `[paths].test_titles` and, later,
+/// to a copied `VICTORY_TEST_TITLES` line, the same folder written two ways
+/// (`/x/a` and `/x/a/`, or `C:\Xbox\A` and `c:\xbox\a` on Windows), or
+/// the game folder pasted into the list of other titles. Compared like the
+/// other folder checks: lexically, without the disk. A title inside another
+/// title or inside the game folder is left alone: it is a different folder.
+fn ensure_titles_distinct(
+    game: Option<&Path>,
+    titles: &[PathBuf],
+    origins: &Origins,
+) -> Result<()> {
+    let same = |a: &Path, b: &Path| is_within(a, b, FOLD_CASE) && is_within(b, a, FOLD_CASE);
+    for (i, title) in titles.iter().enumerate() {
+        if let Some(game) = game.filter(|game| same(title, game)) {
+            anyhow::bail!(
+                "the test title {} (from {}) is the game folder {} (from {}); the test titles \
+                 are other dumps, and the game folder is already used, so remove it from \
+                 VICTORY_TEST_TITLES or [paths].test_titles",
+                title.display(),
+                origins.test_titles,
+                game.display(),
+                origins.game_dir
+            );
+        }
+        if let Some(first) = titles[..i].iter().find(|earlier| same(title, earlier)) {
+            anyhow::bail!(
+                "the test title {} (from {}) is listed twice (also as {}); remove one from \
+                 VICTORY_TEST_TITLES or [paths].test_titles",
+                title.display(),
+                origins.test_titles,
+                first.display()
+            );
         }
     }
     Ok(())
@@ -2028,7 +2070,7 @@ mod tests {
             "{err}"
         );
         let titles = FilePaths {
-            test_titles: vec![parent.clone(), exe.clone()],
+            test_titles: vec![scratch.join("other"), exe.clone()],
             ..FilePaths::default()
         };
         let err = Config::resolve(titles, None, with("VICTORY_GAME_DIR", parent.clone()))
@@ -2364,6 +2406,66 @@ mod tests {
         };
         let e = Config::resolve(file, None, env).unwrap_err().to_string();
         assert!(e.contains("(from config file)"), "{e}");
+    }
+
+    #[test]
+    fn test_titles_must_be_distinct_and_not_the_game_folder() {
+        let x = PathBuf::from(abs("x"));
+        let with = |titles: Vec<PathBuf>, game: Option<PathBuf>| {
+            move |k: &str| match k {
+                "VICTORY_TEST_TITLES" => Some(std::env::join_paths(&titles).unwrap()),
+                "VICTORY_GAME_DIR" => game.clone().map(PathBuf::into_os_string),
+                "VICTORY_CACHE_DIR" => Some(abs("c")),
+                "VICTORY_DATA_DIR" => Some(abs("d")),
+                _ => None,
+            }
+        };
+        let err = |env| {
+            Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string()
+        };
+
+        // The same title twice, also written with `.`/`..`; the later
+        // entry is named, with the earlier spelling.
+        let a = x.join("a");
+        let e = err(with(vec![a.clone(), x.join("b"), a.clone()], None));
+        assert!(e.contains("is listed twice"), "{e}");
+        assert!(e.contains("(from VICTORY_TEST_TITLES)"), "{e}");
+        let e = err(with(
+            vec![a.clone(), x.join("b").join("..").join("a")],
+            None,
+        ));
+        assert!(e.contains("is listed twice"), "{e}");
+        assert!(e.contains(&format!("(also as {})", a.display())), "{e}");
+
+        // The game folder pasted into the list.
+        let e = err(with(vec![x.join("b"), a.join(".")], Some(a.clone())));
+        assert!(e.contains("is the game folder"), "{e}");
+        assert!(e.contains("(from VICTORY_GAME_DIR)"), "{e}");
+
+        // Different folders are fine, nested ones included.
+        let ok = with(vec![a.join("dlc"), x.join("b"), x.join("ab")], Some(a));
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+
+        // From the file, named as such; case counts only where it is folded.
+        let file = FilePaths {
+            test_titles: vec![x.join("Title"), x.join("title")],
+            ..FilePaths::default()
+        };
+        let env = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("c")),
+            "VICTORY_DATA_DIR" => Some(abs("d")),
+            _ => None,
+        };
+        let got = Config::resolve(file, None, env);
+        if FOLD_CASE {
+            let e = got.unwrap_err().to_string();
+            assert!(e.contains("is listed twice"), "{e}");
+            assert!(e.contains("(from config file)"), "{e}");
+        } else {
+            assert!(got.is_ok());
+        }
     }
 
     #[test]
