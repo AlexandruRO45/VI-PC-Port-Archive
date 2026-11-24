@@ -3738,6 +3738,9 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_exe_worker_alive_original>"
         "$<TARGET_FILE:cpu_exe_worker_alive_returning>"
         "$<TARGET_FILE:cpu_exe_worker_alive_no_worker>")
+    # The probe waits at most 2 s for a launch and 0.5 s for end of input, so it must not share the
+    # machine with other tests when CTest runs tests in parallel.
+    set_tests_properties(cpu_native_worker_alive PROPERTIES RUN_SERIAL TRUE)
     # Two CRT-free DLLs and an EXE: A has no imports, B imports A, the EXE imports both.
     foreach(dll IN ITEMS a a_alt b b_noinit)
         string(REGEX REPLACE "_(noinit|alt)$" "" source "${dll}")
