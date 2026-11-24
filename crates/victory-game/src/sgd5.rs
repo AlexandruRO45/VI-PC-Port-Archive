@@ -2024,4 +2024,67 @@ mod tests {
         let again: Vec<_> = records(&container).map(|r| (r.offset, r.name)).collect();
         assert_eq!(again, inside);
     }
+
+    #[test]
+    fn each_record_is_yielded_before_the_bytes_after_it_are_read() {
+        // Two real records, then 32000 chained markers whose stated sizes
+        // run past the end. The search is lazy: the first record is yielded
+        // having checked no stream beyond its own span's end, and the second
+        // likewise, however much of the file is left; only asking for a
+        // third walks the chain.
+        let mut head = MAGIC.to_vec();
+        head.extend(record_bytes("PS_first", 0x32, b"first"));
+        head.extend(record_bytes("PS_second", 0x41, &[3; 500]));
+        let chain = chained_markers(32_000, |_| MAX_UNPACKED as u32, &[]);
+        let mut file = head.clone();
+        file.extend_from_slice(&chain[MAGIC.len()..]);
+
+        WORK.with(|w| w.set((0, 0)));
+        let mut it = records(&file);
+        let first = it.next().expect("PS_first");
+        assert_eq!(first.name, Some("PS_first"));
+        let second = it.next().expect("PS_second");
+        assert_eq!(second.name, Some("PS_second"));
+        assert_eq!(second.span().end, head.len());
+        let (checks, read) = WORK.with(Cell::get);
+        assert!(checks <= 4, "{checks} stream checks for two records");
+        assert!(read <= 4 * PROBE, "{read} bytes read for two records");
+        assert_eq!(first.unpack().as_deref(), Some(&b"first"[..]));
+        assert_eq!(second.unpack(), Some(vec![3; 500]));
+
+        // The chain itself is a truncated record: the search ends there,
+        // having now checked its first marker for a stream.
+        assert_eq!(it.next(), None);
+        let (after, _) = WORK.with(Cell::get);
+        assert!(after > checks, "the chain was looked at");
+    }
+
+    #[test]
+    fn zlib_wrapped_container_is_a_record_that_does_not_unpack() {
+        // Packed bytes are raw deflate. The same container with a zlib
+        // header and checksum around it is not a stream of the stated size;
+        // covering no other record, it is still yielded (with its name and
+        // span over all its bytes) and does not unpack, and the raw record
+        // after it is found and unpacks.
+        let container = b"DXBC wrapped in zlib".repeat(8);
+        let wrapped = miniz_oxide::deflate::compress_to_vec_zlib(&container, 6);
+        assert_eq!(wrapped[0], 0x78, "zlib header");
+        let n = (wrapped.len() + 12) as u32;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(b"\x08PS_zlib\0\x32");
+        let marker = file.len() + 4;
+        for v in [n, 0x000D_DCE7, n, container.len() as u32] {
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file.extend_from_slice(&wrapped);
+        let raw = file.len();
+        file.extend(record_bytes("PS_raw", 0x32, &container));
+
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_zlib"), Some("PS_raw")]);
+        assert_eq!(found[0].span(), marker..raw);
+        assert_eq!(found[0].unpack(), None);
+        assert_eq!(found[1].unpack(), Some(container));
+    }
 }
