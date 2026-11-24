@@ -2608,6 +2608,152 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_config_that_is_a_named_pipe_is_refused_without_blocking() {
+        // A pipe where victory.toml should be (`mkfifo victory.toml`, or a
+        // process substitution's `/dev/fd/N` kept in VICTORY_CONFIG): reading
+        // it would wait for a writer that never comes, so the kind is checked
+        // first. Each check runs on its own thread and must answer promptly,
+        // so a regression fails instead of hanging the test run. Scratch
+        // folder under the system temp folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let pipe = dir.path().join("victory.toml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&pipe)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            // No `mkfifo` on this host; nothing to check.
+            return;
+        }
+        let check = |explicit: Option<PathBuf>, default: PathBuf| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(config_file_or(explicit, &default).map_err(|e| e.to_string()));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the config check blocked on a named pipe")
+        };
+
+        // As the default and through VICTORY_CONFIG: not a regular file,
+        // named as written.
+        let err = check(None, pipe.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, which is not a regular file",
+                pipe.display()
+            )
+        );
+        let unused = dir.path().join("unused.toml");
+        let err = check(Some(pipe.clone()), unused.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "VICTORY_CONFIG points at {}, which is not a regular file",
+                pipe.display()
+            )
+        );
+
+        // A link to it, with a relative target resolved from the link's
+        // folder rather than the working directory, names the link.
+        let link = dir.path().join("linked.toml");
+        std::os::unix::fs::symlink("victory.toml", &link).unwrap();
+        let err = check(None, link.clone()).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, which is not a regular file",
+                link.display()
+            )
+        );
+
+        // With a trailing slash the OS says "Not a directory", reported
+        // with the path; never "does not exist", never the drop-the-slash
+        // hint meant for a regular file.
+        let slashed = PathBuf::from(format!("{}/", pipe.display()));
+        let err = check(Some(slashed), unused.clone()).unwrap_err();
+        assert!(
+            err.starts_with(&format!("checking VICTORY_CONFIG at {}/", pipe.display())),
+            "{err}"
+        );
+        assert!(
+            !err.contains("drop it") && !err.contains("does not exist"),
+            "{err}"
+        );
+
+        // The pipe is not consumed: a real VICTORY_CONFIG beside it is read
+        // as usual while the pipe stays the (unchecked) default.
+        let real = dir.path().join("real.toml");
+        std::fs::write(&real, "").unwrap();
+        assert_eq!(check(Some(real.clone()), pipe.clone()), Ok(Some(real)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_link_with_a_relative_target_is_followed_from_its_folder() {
+        // `ln -s ../shared/victory.toml victory.toml`: the target is read
+        // from the link's folder, not the working directory (which is the
+        // crate folder under `cargo test`), and when it is gone the error
+        // names the target as written so it matches what `ls -l` shows.
+        // Scratch folder under the system temp folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let real = shared.join("victory.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = nested.join("victory.toml");
+        std::os::unix::fs::symlink("../shared/victory.toml", &link).unwrap();
+        assert_ne!(std::env::current_dir().unwrap(), nested);
+
+        // Found, and kept as the link's path so relative settings in it
+        // stay anchored beside the link.
+        assert_eq!(config_file_or(None, &link).unwrap(), Some(link.clone()));
+        assert_eq!(config_file(Some(link.clone())).unwrap(), Some(link.clone()));
+
+        // Moved away: the relative target, as written, and nothing else.
+        std::fs::remove_file(&real).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, a link to ../shared/victory.toml, which does not exist",
+                link.display()
+            )
+        );
+
+        // Replaced by a folder at the same place: a folder, not a file, and
+        // the hint points inside it through the link.
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("victory.toml"), "").unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(err.contains("is a folder, not a config file"), "{err}");
+        assert!(
+            err.ends_with(&format!(
+                "did you mean {}?",
+                link.join("victory.toml").display()
+            )),
+            "{err}"
+        );
+
+        // The target's parent replaced by a file: the OS's "Not a
+        // directory", which is not the same as the file being gone.
+        std::fs::remove_dir_all(&shared).unwrap();
+        std::fs::write(&shared, "").unwrap();
+        let err = config_file_or(None, &link).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("checking the config file {}", link.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn victory_config_with_a_trailing_slash_names_the_file_or_the_link() {
         // A scratch folder under the system temp folder, never the
         // repository or the working directory; removed at the end.
