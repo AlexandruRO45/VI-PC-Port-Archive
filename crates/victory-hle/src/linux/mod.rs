@@ -88,3 +88,33 @@ pub(crate) fn lookup(dll: &str, name: &str) -> Option<usize> {
 pub(crate) fn lookup_ordinal(dll: &str, ordinal: u16) -> Option<usize> {
     lookup(dll, &format!("#{ordinal}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two modules that serve one DLL must not both export a name: the
+    /// first listed would hide the other.
+    #[test]
+    fn no_export_is_served_twice() {
+        let modules = modules();
+        let mut clashes = Vec::new();
+        for (i, a) in modules.iter().enumerate() {
+            for b in &modules[i + 1..] {
+                let overlap = a.dlls.iter().chain(b.dlls).any(|pattern| {
+                    let dll = pattern.replace('*', "x");
+                    a.serves(&dll) && b.serves(&dll)
+                });
+                if !overlap {
+                    continue;
+                }
+                for e in &a.exports {
+                    if b.exports.iter().any(|f| f.name == e.name) {
+                        clashes.push(format!("{} in {} and {}", e.name, a.name, b.name));
+                    }
+                }
+            }
+        }
+        assert!(clashes.is_empty(), "{clashes:#?}");
+    }
+}

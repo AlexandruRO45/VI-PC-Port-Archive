@@ -4,7 +4,6 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
-use std::ffi::c_void;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{LazyLock, Mutex};
 
@@ -15,7 +14,6 @@ use super::kernel32_wait::ERROR_INVALID_HANDLE;
 use crate::{HleModule, hle_export};
 
 const ERROR_ENVVAR_NOT_FOUND: u32 = 203;
-const ERROR_MR_MID_NOT_FOUND: u32 = 317;
 
 /// A null or NUL-terminated UTF-16 string, lossily.
 ///
@@ -112,35 +110,6 @@ pub extern "win64" fn EncodePointer(p: usize) -> usize {
 
 pub extern "win64" fn DecodePointer(p: usize) -> usize {
     p
-}
-
-/// No message tables: every message is "not found", which callers (the
-/// STL's `system_category().message()`) handle.
-// ponytail: no texts at all; a few common system messages if a log needs them.
-pub extern "win64" fn FormatMessageW(
-    _flags: u32,
-    _source: *const c_void,
-    _id: u32,
-    _language: u32,
-    _buffer: *mut u16,
-    _size: u32,
-    _args: *const c_void,
-) -> u32 {
-    teb::set_last_error(ERROR_MR_MID_NOT_FOUND);
-    0
-}
-
-pub extern "win64" fn FormatMessageA(
-    _flags: u32,
-    _source: *const c_void,
-    _id: u32,
-    _language: u32,
-    _buffer: *mut u8,
-    _size: u32,
-    _args: *const c_void,
-) -> u32 {
-    teb::set_last_error(ERROR_MR_MID_NOT_FOUND);
-    0
 }
 
 // ---- command line, environment, start-up information ----
@@ -284,8 +253,6 @@ pub(crate) fn module() -> HleModule {
             hle_export!(DebugBreak),
             hle_export!(EncodePointer),
             hle_export!(DecodePointer),
-            hle_export!(FormatMessageW),
-            hle_export!(FormatMessageA),
             hle_export!(GetCommandLineA),
             hle_export!(GetEnvironmentVariableW),
             hle_export!(GetEnvironmentVariableA),
