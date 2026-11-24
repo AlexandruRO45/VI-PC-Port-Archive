@@ -141,6 +141,12 @@ std::vector<unsigned char> make_fixed_deflate_zlib(unsigned char val, size_t cou
 struct Object {
     void** vtable;
 };
+struct FileObject {
+    void** vtable;
+    unsigned kind;
+    LONG refs;
+    HANDLE handle;
+};
 
 using DStorageGetFactoryFn = long(__stdcall*)(const void*, void**);
 using CreateStatusArrayFn = long(__stdcall*)(void*, unsigned, const char*, const void*, void**);
@@ -281,8 +287,9 @@ bool dstorage_checks() {
         wchar_t temp_file[MAX_PATH];
         if (!GetTempFileNameW(temp_dir, L"x2w", 0, temp_file)) return false;
 
-        // Padded to 600 KiB so offset 500 KiB can read zeroes from file and test zlib continuation bounds
-        std::vector<unsigned char> file_bytes(600 * 1024, 0);
+        // Padded so the later independent request can still read source_size bytes
+        // from the same live synchronous file handle after the chunked reads.
+        std::vector<unsigned char> file_bytes(16 * 1024 * 1024, 0);
         std::memcpy(file_bytes.data(), full_comp.data(), full_comp.size());
 
         HANDLE h = CreateFileW(temp_file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -400,16 +407,64 @@ bool dstorage_checks() {
         }
         long hr1 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 0);
         long hr2 = reinterpret_cast<GetHResultFn>(neg_status->vtable[4])(neg_status, 1);
-        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
-        DeleteFileW(temp_file);
-
-        if (hr1 == 0 || hr2 == 0) return false;
+        if (hr1 == 0 || hr2 == 0) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
         for (unsigned char b : dest1) {
             if (b != 0xEE) return false;
         }
         for (unsigned char b : dest2) {
             if (b != 0xDD) return false;
         }
+
+        // Separate Submit: a zlib-marked request at the exact matching continuation offset,
+        // but not one of the requests identified as continuations. It must not receive the
+        // cached stream; the file bytes at that offset have no zlib header.
+        void* independent_status_ptr = nullptr;
+        if (reinterpret_cast<CreateStatusArrayFn>(factory->vtable[5])(factory, 1, "IndependentStatus", nullptr, &independent_status_ptr) != 0 || !independent_status_ptr) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        auto* independent_status = static_cast<Object*>(independent_status_ptr);
+        std::vector<unsigned char> independent_dest(64 * 1024, 0xCC);
+        unsigned char independent_req[0x48] = {};
+        LARGE_INTEGER independent_offset{};
+        independent_offset.QuadPart = static_cast<LONGLONG>(chunk_dest_size);
+        if (!SetFilePointerEx(reinterpret_cast<FileObject*>(file_obj)->handle, independent_offset, nullptr, FILE_BEGIN)) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        *reinterpret_cast<u64*>(independent_req + 0x00) = 1;
+        *reinterpret_cast<void**>(independent_req + 0x08) = independent_dest.data();
+        *reinterpret_cast<unsigned*>(independent_req + 0x18) = 64 * 1024;
+        *reinterpret_cast<void**>(independent_req + 0x20) = file_obj;
+        *reinterpret_cast<u64*>(independent_req + 0x28) = chunk_dest_size;
+        *reinterpret_cast<unsigned*>(independent_req + 0x30) = static_cast<unsigned>(full_comp.size());
+        *reinterpret_cast<unsigned*>(independent_req + 0x38) = static_cast<unsigned>(total_plain_size);
+        reinterpret_cast<EnqueueRequestFn>(queue->vtable[3])(queue, independent_req);
+        reinterpret_cast<EnqueueStatusFn>(queue->vtable[4])(queue, independent_status, 0);
+        reinterpret_cast<SubmitFn>(queue->vtable[6])(queue);
+        for (int i = 0; i < 200; ++i) {
+            if (reinterpret_cast<IsCompleteFn>(independent_status->vtable[3])(independent_status, 0)) break;
+            Sleep(10);
+        }
+        const bool independent_complete = reinterpret_cast<IsCompleteFn>(independent_status->vtable[3])(independent_status, 0);
+        const long independent_hr = independent_complete ? reinterpret_cast<GetHResultFn>(independent_status->vtable[4])(independent_status, 0) : 0;
+        bool independent_ok = independent_complete && independent_hr != 0;
+        for (unsigned char b : independent_dest) {
+            if (b != 0xCC) independent_ok = false;
+        }
+        if (!independent_ok) {
+            reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+            DeleteFileW(temp_file);
+            return false;
+        }
+        reinterpret_cast<CloseFileFn>(file_obj->vtable[3])(file_obj);
+        DeleteFileW(temp_file);
     }
 
     // Control: standalone valid stream sharing cache-key fields decodes its own bytes (Refs #1214)
