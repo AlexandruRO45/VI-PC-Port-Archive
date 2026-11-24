@@ -510,8 +510,10 @@ impl State {
                     // pointer lives as `((dword + 1) << 8) | slot`: the root
                     // view is the buffer the pointer holds, not a root the
                     // title set.
+                    let mut chased = false;
                     let address = match reg.checked_sub(256) {
                         Some(at) => {
+                            chased = true;
                             // Subtracting 256 removed the encoder's + 1, so
                             // the high half already is the dword.
                             let (slot, dword) = ((reg & 0xFF) as u8, (at >> 8) as u32);
@@ -528,10 +530,12 @@ impl State {
                             }
                         },
                     };
-                    // A root view of a console address that is not on 16
-                    // bytes is the invalid call the README records: leave it
-                    // unbound, as the root UAV path does.
-                    if address % 16 != 0 {
+                    // A chased pointer holds a console value the title can
+                    // set to anything, and a root view of an address that is
+                    // not on 16 bytes is the invalid call the README records:
+                    // leave that one unbound, as the root UAV path does. A
+                    // root view the title set itself is bound as it was.
+                    if chased && address % 16 != 0 {
                         once!(
                             address = format_args!("{address:#x}"),
                             "a chased pointer not on 16 bytes is left unbound"
