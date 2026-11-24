@@ -4,5 +4,8 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKVersion,DATA");
         println!("cargo:rustc-link-arg-bins=/EXPORT:D3D12SDKPath,DATA");
+
+        // Reserve enough default thread stack for graphics drivers compiling large shaders.
+        println!("cargo:rustc-link-arg-bins=/STACK:16777216");
     }
 }
