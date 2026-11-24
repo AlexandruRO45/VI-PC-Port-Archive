@@ -677,6 +677,18 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     if !distinct(inputs.iter().map(|i| i.attr)) {
         return Err(Malformed("pixel inputs share an attribute"));
     }
+    // Inputs packed into one signature row (disjoint channels) are fine, but
+    // lowering finds a row's 16-bit layout as the first fp16 input naming
+    // it: a second input on that row read as 32-bit, or packed differently,
+    // would be decoded with the first's layout.
+    let packing = |i: &PsInput| i.fp16.then_some((i.pack2, i.row2));
+    if inputs.iter().enumerate().any(|(k, a)| {
+        inputs[..k]
+            .iter()
+            .any(|b| b.row == a.row && packing(b) != packing(a))
+    }) {
+        return Err(Malformed("pixel inputs read a row two ways"));
+    }
     let size = u32_at(data, PS_PATCH_SIZE)? as usize;
     if size > PATCH_SLOT_DWORDS {
         return Err(Malformed("implausible export patch size"));
@@ -1658,6 +1670,49 @@ mod tests {
             inputs(0),
             Err(Malformed("pixel inputs share an attribute"))
         ));
+    }
+
+    #[test]
+    fn refuses_pixel_inputs_reading_a_row_two_ways() {
+        // Two inputs, attr0 and attr1, with these (row, row2, flags): flag
+        // bit 3 is fp16, bit 4 two values per dword.
+        let ps = fssm(&[(HwStage::Ps, &PS_CODE)]);
+        let e = stage_data_at(&ps, HwStage::Ps);
+        let inputs = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+            let mut blob = ps.clone();
+            blob[e + PS_INPUT_COUNT..][..4].copy_from_slice(&2u32.to_le_bytes());
+            blob[e + PS_INPUTS..][..16].copy_from_slice(&[
+                6, a.0, 0x3, 0, 0, a.1, 0, a.2, 6, b.0, 0xc, 1, 0, b.1, 1, b.2,
+            ]);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (fp16, pack2) = (0x8, 0x18);
+        // Different rows may differ; one row packed the same way (or 32-bit
+        // in both, or a 32-bit input's unused row2 differing) is fine.
+        for (a, b) in [
+            ((0, 0, 0), (1, 1, fp16)),
+            ((0, 0, 0), (0, 0, 0)),
+            ((0, 0, 0), (0, 5, 0)),
+            ((2, 2, fp16), (2, 2, fp16)),
+            ((2, 3, pack2), (2, 3, pack2)),
+            ((0, 0, 0x1), (0, 0, 0x1)),
+        ] {
+            assert!(inputs(a, b).is_ok(), "{a:?} {b:?}");
+        }
+        for (a, b, what) in [
+            ((0, 0, 0), (0, 0, fp16), "32-bit then fp16"),
+            ((0, 0, fp16), (0, 0, 0), "fp16 then 32-bit"),
+            ((2, 2, fp16), (2, 2, pack2), "one packed, one not"),
+            ((2, 3, pack2), (2, 4, pack2), "different second rows"),
+        ] {
+            assert!(
+                matches!(
+                    inputs(a, b),
+                    Err(Malformed("pixel inputs read a row two ways"))
+                ),
+                "{what}"
+            );
+        }
     }
 
     #[test]
