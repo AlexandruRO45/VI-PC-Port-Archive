@@ -16,6 +16,11 @@
 //! before it is written again. A mask write whose destination is not whole-live needs no
 //! exchange.
 //!
+//! A mask that is read whole can still skip the exchange where it is only combined first: when
+//! two or more compares or carries feed, in one basic block and nowhere else, a tree of
+//! lane-wise 64-bit bitwise ops whose result is read whole, the compares stay in their halves
+//! and the tree's last op exchanges its result once (`xcl_x_sync_mask`).
+//!
 //! After a mask stays in its half the two halves hold different values in its registers, so a
 //! whole read that is missed here – or a write taken for a full overwrite that is not one –
 //! lets them diverge. The rules follow what the emitter does, not only the ISA tables:
@@ -31,7 +36,7 @@
 //! (`LOOP_GUARD`) is checked: what is live after a loop, or at the end, is live before each of
 //! its instructions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::emit::ext_encoding;
 use crate::gpu::rdna2::{self, Decoded, Variant, F_CONDITIONAL, F_INDIRECT, F_TERMINATOR};
@@ -371,9 +376,22 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
     (whole, written)
 }
 
+/// The liveness solution: per instruction, its successors (None: unknown), its flow, the SGPRs
+/// whole-live after it and whether `scc` is live after it.
+struct Solved {
+    succ: Vec<Option<Vec<usize>>>,
+    flows: Vec<InstFlow>,
+    live_out: Vec<Regs>,
+    scc_out: Vec<bool>,
+}
+
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    solve(insts, end_reads_all).live_out
+}
+
+fn solve(insts: &[Decoded], end_reads_all: bool) -> Solved {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
     let at_end = if end_reads_all { ALL } else { 0 };
     // successors; None = unknown (indirect): everything is live
@@ -459,14 +477,157 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             }
         }
         if !changed {
-            return live_out;
+            return Solved { succ, flows, live_out, scc_out };
         }
     }
 }
 
-/// pc → SGPRs whole-live after that instruction, for the emitter.
-pub fn by_pc(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
-    insts.iter().map(|d| d.pc).zip(whole_live_out(insts, end_reads_all)).collect()
+/// What the emitter needs for split wave64.
+pub struct Plan {
+    /// pc → SGPRs whole-live after that instruction (not the mask of a compare a tree exchanges)
+    pub whole_live: BTreeMap<u64, Regs>,
+    /// pc of the bitwise ops that exchange their result once (`xcl_x_sync_mask`)
+    pub sync: BTreeSet<u64>,
+}
+
+/// Compares and carries: their mask is written with `write_mask`, which can leave it local.
+fn mask_producer(name: &str) -> bool {
+    name.starts_with("V_CMP_") || matches!(name, "V_ADD_CO_U32" | "V_SUB_CO_U32" | "V_SUBREV_CO_U32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
+}
+
+fn bits(mut m: Regs) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (m != 0).then(|| {
+            let r = m.trailing_zeros() as usize;
+            m &= m - 1;
+            r
+        })
+    })
+}
+
+/// The mask trees open in one basic block. A tree is named by its last instruction (a compare
+/// or a bitwise op) and is the register pair holding its value plus the compares it combines.
+struct Trees {
+    owner: [Option<usize>; 128],
+    open: BTreeMap<usize, (Regs, Vec<usize>)>,
+}
+
+impl Trees {
+    fn bind(&mut self, node: usize, pair: Regs, leaves: Vec<usize>) {
+        for r in bits(pair) {
+            self.owner[r] = Some(node);
+        }
+        self.open.insert(node, (pair, leaves));
+    }
+
+    fn take(&mut self, node: usize) -> Vec<usize> {
+        let Some((pair, leaves)) = self.open.remove(&node) else { return Vec::new() };
+        for r in bits(pair) {
+            if self.owner[r] == Some(node) {
+                self.owner[r] = None;
+            }
+        }
+        leaves
+    }
+
+    /// Ends the trees holding any of `regs`: read whole there (`whole`), or overwritten.
+    fn end(&mut self, regs: Regs, whole: bool, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+        for r in bits(regs) {
+            if let Some(node) = self.owner[r] {
+                let leaves = self.take(node);
+                if whole {
+                    exchange_at(node, leaves, insts, plan, live_out);
+                }
+            }
+        }
+    }
+
+    fn end_all(&mut self, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+        for (node, (_, leaves)) in std::mem::take(&mut self.open) {
+            exchange_at(node, leaves, insts, plan, live_out);
+        }
+        self.owner = [None; 128];
+    }
+}
+
+/// A tree read whole after `node`: with two or more compares, they stay in their halves and
+/// `node` exchanges its result instead.
+fn exchange_at(node: usize, leaves: Vec<usize>, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+    if leaves.len() < 2 {
+        return;
+    }
+    plan.sync.insert(insts[node].pc);
+    for l in leaves {
+        live_out[l] &= !uses(&insts[l]).1;
+    }
+}
+
+/// Liveness, then the mask trees of each basic block.
+pub fn analyze(insts: &[Decoded], end_reads_all: bool) -> Plan {
+    let Solved { succ, flows, mut live_out, scc_out } = solve(insts, end_reads_all);
+    let live = live_out.clone();
+    let mut plan = Plan { whole_live: BTreeMap::new(), sync: BTreeSet::new() };
+    // a block goes on only into an instruction it falls into and nothing else jumps to (every
+    // branch, conditional or not, ends one; `LOOP_GUARD` runs at block starts only)
+    let falls = |i: usize| succ[i].as_deref() == Some(&[i + 1][..]);
+    let mut joined = vec![false; insts.len()];
+    for (i, s) in succ.iter().enumerate() {
+        if !falls(i) {
+            for &j in s.iter().flatten() {
+                joined[j] = true;
+            }
+        }
+    }
+    let mut trees = Trees { owner: [None; 128], open: BTreeMap::new() };
+    for (i, d) in insts.iter().enumerate() {
+        if i > 0 && (!falls(i - 1) || joined[i]) {
+            trees.end_all(insts, &mut plan, &mut live_out);
+        }
+        let (read, written) = uses(d);
+        let name = d.inst.name;
+        // a compare whose mask is read whole starts a tree
+        if mask_producer(name) && written != 0 && written & EXEC == 0 && live[i] & written != 0 {
+            trees.end(read, true, insts, &mut plan, &mut live_out);
+            trees.end(written, false, insts, &mut plan, &mut live_out);
+            trees.bind(i, written, vec![i]);
+            continue;
+        }
+        let tree_op = flows[i].lane_op.filter(|_| !matches!(name, "S_CMOV_B64" | "S_CSELECT_B64"));
+        if let Some((dst, srcs, sets_scc)) = tree_op {
+            // sources that are whole trees whose value goes nowhere else after this op
+            let mut leaves = Vec::new();
+            for r in bits(srcs).filter(|r| r % 2 == 0) {
+                let pair = range(r as u64, 2);
+                let Some(node) = trees.owner[r] else { continue };
+                if trees.open[&node].0 == pair && live[i] & !dst & pair == 0 {
+                    for l in trees.take(node) {
+                        if !leaves.contains(&l) {
+                            leaves.push(l);
+                        }
+                    }
+                }
+            }
+            trees.end(read | flows[i].whole, true, insts, &mut plan, &mut live_out);
+            trees.end(dst, false, insts, &mut plan, &mut live_out);
+            if dst == 0 || dst & EXEC != 0 || (sets_scc && scc_out[i]) {
+                exchange_at(i, leaves, insts, &mut plan, &mut live_out);
+            } else if !leaves.is_empty() && live[i] & dst != 0 {
+                trees.bind(i, dst, leaves);
+            }
+            continue;
+        }
+        trees.end(read, true, insts, &mut plan, &mut live_out);
+        // a write of one word of a tree's pair leaves the other read whole
+        for r in bits(written) {
+            if let Some(node) = trees.owner[r] {
+                let whole = trees.open[&node].0 & !written != 0;
+                trees.end(range(r as u64, 1), whole, insts, &mut plan, &mut live_out);
+            }
+        }
+    }
+    trees.end_all(insts, &mut plan, &mut live_out);
+    plan.whole_live = insts.iter().map(|d| d.pc).zip(live_out).collect();
+    plan
 }
 
 #[cfg(test)]
@@ -624,6 +785,53 @@ mod tests {
     const BCNT_S20: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)]);
     const BCNT_VCC: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
     const CBRANCH_EXECZ: I = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)]);
+
+    const AND_S20_VCC: I = ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 106)]);
+
+    fn exchanged(plan: &Plan, d: &Decoded, pair: u64) -> bool {
+        plan.whole_live[&d.pc] & range(pair, 2) != 0
+    }
+
+    #[test]
+    fn a_bitwise_tree_read_whole_exchanges_once_at_its_end() {
+        let p = asm(&[CMP, CMP_S20, AND_S20_VCC, BCNT_S20, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106) && mask_needed(&whole_live_out(&p, false), 1, 20));
+        let plan = analyze(&p, false);
+        assert!(!exchanged(&plan, &p[0], 106) && !exchanged(&plan, &p[1], 20));
+        assert_eq!(plan.sync.iter().copied().collect::<Vec<_>>(), vec![p[2].pc]);
+        // through an s_mov_b64: the copy is the tree's end
+        let p = asm(&[CMP, CMP_S20, AND_S20_VCC, ("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 20)]), ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 30)]), ENDPGM]);
+        let plan = analyze(&p, false);
+        assert!(!exchanged(&plan, &p[0], 106) && !exchanged(&plan, &p[1], 20));
+        assert_eq!(plan.sync.iter().copied().collect::<Vec<_>>(), vec![p[3].pc]);
+    }
+
+    #[test]
+    fn a_compare_read_whole_outside_the_tree_keeps_its_exchange() {
+        // VCC read whole after the tree
+        let p = asm(&[CMP, CMP_S20, AND_S20_VCC, BCNT_S20, BCNT_VCC, ENDPGM]);
+        let plan = analyze(&p, false);
+        assert!(exchanged(&plan, &p[0], 106) && exchanged(&plan, &p[1], 20) && plan.sync.is_empty());
+        // VCC copied to a pair that is read whole
+        let p = asm(&[CMP, CMP_S20, ("S_MOV_B64", "ENC_SOP1", &[("SDST", 30), ("SSRC0", 106)]), AND_S20_VCC, BCNT_S20, ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 2), ("SSRC0", 30)]), ENDPGM]);
+        let plan = analyze(&p, false);
+        assert!(exchanged(&plan, &p[0], 106) && plan.sync.is_empty());
+        // VCC read whole on the taken side of a branch between the compares and the tree:
+        // v_cmp vcc; v_cmp s[20:21]; s_cbranch_scc0 → L; s_and s[20:21]; s_bcnt1 s[20:21];
+        // s_branch → end; L: s_bcnt1 vcc; end
+        let p = asm(&[
+            CMP,
+            CMP_S20,
+            ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 3)]),
+            AND_S20_VCC,
+            BCNT_S20,
+            ("S_BRANCH", "ENC_SOPP", &[("SIMM16", 1)]),
+            BCNT_VCC,
+            ENDPGM,
+        ]);
+        let plan = analyze(&p, false);
+        assert!(exchanged(&plan, &p[0], 106) && plan.sync.is_empty());
+    }
 
     // review findings: writes that are not full overwrites, reads the operand tables miss
 

@@ -5818,7 +5818,7 @@ fn gpu_split_wave64_lane_local_masks() {
 /// Bitwise 64-bit SALU ops (`s_and_b64`, `s_or_b64`, `s_not_b64`, `s_andn2_b64`, `s_mov_b64`,
 /// `s_cselect_b64`) over lane-local masks stay in each 32-lane half when neither their
 /// destination nor `scc` is whole-live afterward; when `scc` IS read (e.g. only upper-half
-/// lanes match and `s_cselect_b32` reads `scc`), the inputs stay exchanged so both halves
+/// lanes match and `s_cselect_b32` reads `scc`), the result is exchanged so both halves
 /// observe the same `scc`.
 #[test]
 fn gpu_split_wave64_bitwise_lane_masks() {
@@ -5872,7 +5872,7 @@ fn gpu_split_wave64_bitwise_lane_masks() {
     }
 
     // Part 2: only upper-half lanes (40..49) match; s_and_b64's SCC is read by s_cselect_b32 ->
-    // both compares must stay exchanged so half 0 and half 1 agree on SCC == 1.
+    // its result is exchanged (once, for both compares) so half 0 and half 1 agree on SCC == 1.
     let scc_code = prog(&[
         ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 255)], Some(40)),
         ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 255)], Some(50)),
@@ -5884,7 +5884,8 @@ fn gpu_split_wave64_bitwise_lane_masks() {
     ]);
     if runner::split_wave64() {
         let t = translate(&scc_code, &runner::options(Mode::Kernel)).unwrap();
-        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 2, "live SCC keeps both exchanges");
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0, "the compares stay local");
+        assert_eq!(t.hlsl.matches("= xcl_x_sync_mask(").count(), 1, "live SCC: s_and_b64 exchanges its result");
     }
     let r = runner::run_code(&scc_code, &st, &[]).unwrap();
     assert_eq!(r.sgpr[1], 77, "both halves must see SCC == 1 from upper-half match");
@@ -5939,6 +5940,97 @@ fn gpu_split_wave64_predicated_exec_masks() {
         let v = &r.vgpr[l as usize];
         assert_eq!(v[4], 1000 + l + if l < 50 { 100 } else { 0 }, "lane {l}: v_cmpx region");
         assert_eq!(v[5], 2000 + l + if l >= 20 { 50 } else { 0 }, "lane {l}: s_and_saveexec region");
+    }
+}
+
+/// Split wave64 (`x64_masks`): two compares combined by `s_and_b64` and read whole
+/// (`s_bcnt1`, and `scc` of a match in the upper half only) stay in their halves; the
+/// `s_and_b64` exchanges its result once, and both halves see the whole-wave value.
+#[test]
+fn gpu_split_wave64_bitwise_mask_tree_exchanges_once() {
+    if !gpu_ready() {
+        return;
+    }
+    const V: u64 = 256;
+    let code = prog(&[
+        // vcc = lanes 5..63, s[24:25] = lanes 0..41, s0 = bcnt1(s[24:25] & vcc) = 37
+        ("V_CMP_GE_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 7)], None), // v7 = 5
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V), ("SRC1", 255)], Some(42)),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 24), ("SSRC1", 106)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 24)], None),
+        // lanes 41..63 & lanes 0..49 = 41..49, all in the upper half: scc = 1 in both halves
+        ("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V), ("SRC1", 255)], Some(40)),
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 28), ("SRC0", V), ("SRC1", 255)], Some(50)),
+        ("S_AND_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 26), ("SSRC1", 28)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 1), ("SSRC0", 255), ("SSRC1", 139)], Some(77)),
+        // the kernel runner reads every SGPR and SCC back: clear the masks, overwrite SCC
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 106), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 26), ("SSRC0", 128)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 28), ("SSRC0", 128)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "the four compares stay local\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 0);
+        assert_eq!(t.hlsl.matches("= xcl_x_sync_mask(").count(), 2, "each s_and_b64 exchanges once");
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+        r[7] = 5;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[0], 37, "bcnt1 of lanes 5..41");
+    assert_eq!(r.sgpr[1], 77, "scc of a match in the upper half only, in both halves");
+}
+
+/// Split wave64 (`x64_masks`): a wave64 group of 32 threads has no upper half to exchange
+/// with. The absent lanes' compare bits are 0, so `s_nor_b64` of two compares sets the whole
+/// upper word; the tree's exchange must keep the word the lower half computed, for
+/// `s_bcnt1` and for `scc`.
+#[test]
+fn gpu_split_wave64_bitwise_mask_tree_in_a_partial_wave() {
+    if !gpu_ready() {
+        return;
+    }
+    use super::{dxc, CsInterface};
+    let p = prog(&[
+        // ~(lanes 0..7 | lanes 24..31) = lanes 8..23 and 32..63: s10 = 48
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", 136)], None),
+        ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 152)], None),
+        ("S_NOR_B64", "ENC_SOP2", &[("SDST", 24), ("SSRC0", 20), ("SSRC1", 22)], None),
+        ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 24)], None),
+        // ~(lanes 0..15 | lanes 16..31) = lanes 32..63, none present: scc = 1, s11 = 77
+        ("V_CMP_LT_U32", "ENC_VOP3", &[("VDST", 26), ("SRC0", V), ("SRC1", 144)], None),
+        ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 28), ("SRC0", V), ("SRC1", 144)], None),
+        ("S_NOR_B64", "ENC_SOP2", &[("SDST", 26), ("SSRC0", 26), ("SSRC1", 28)], None),
+        ("S_CSELECT_B32", "ENC_SOP2", &[("SDST", 11), ("SSRC0", 255), ("SSRC1", 139)], Some(77)),
+        // each thread stores (s10, s11) at s0 + 8 · thread
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 10)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 6), ("SRC0", 11)], None),
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 131), ("VSRC1", 0)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", 0), ("VSRC1", 7)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORDX2", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
+    ]);
+    let cs = CsInterface { threads: [32, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let t = translate(&p, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    if runner::split_wave64() {
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 4, "the four compares stay local\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("= xcl_x_sync_mask(").count(), 2, "each s_nor_b64 exchanges once");
+    }
+    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}"));
+    let base = 0x100usize;
+    let mut io = vec![0u32; 128];
+    io[0] = base as u32;
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 32 * 8) / 4]).unwrap();
+    for tid in 0..32 {
+        let at = (base + tid * 8) / 4;
+        assert_eq!(out[at], 48, "thread {tid}: s_bcnt1 of an s_nor_b64 with no upper half");
+        assert_eq!(out[at + 1], 77, "thread {tid}: scc of an s_nor_b64 set in the absent half only");
     }
 }
 
