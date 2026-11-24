@@ -42,6 +42,7 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            "oleaut32.dll",
             "advapi32.dll",
             "rpcrt4.dll",
             "iphlpapi.dll",
@@ -145,5 +146,23 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_allows_oleaut32() {
+        let policy = HostPolicy::default();
+        assert!(policy.allows("oleaut32.dll"));
+        assert!(policy.allows("OLEAUT32.DLL"));
+        #[cfg(windows)]
+        {
+            // SysAllocStringLen (#4) and SysFreeString (#6) used by vccorlib140.dll.
+            assert!(policy.resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(4)).is_some());
+            assert!(policy.resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(6)).is_some());
+        }
     }
 }

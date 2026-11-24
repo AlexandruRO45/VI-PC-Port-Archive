@@ -467,6 +467,34 @@ impl State {
     /// A descriptor a shader reads through a table: its host slot made if
     /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
+    /// Ensures the shader-visible host view heap for `view_heap` is currently
+    /// bound on `list` (required by `ClearUnorderedAccessView*`), keeping
+    /// `host_heaps` and `host_roots` in sync for subsequent draws/dispatches.
+    pub(crate) fn ensure_view_heap(&mut self, list: &HostList, view_heap: usize) {
+        let wanted = if self.heaps[0] == view_heap {
+            self.heaps
+        } else {
+            [view_heap, self.heaps[1]]
+        };
+        if self.host_heaps == wanted {
+            return;
+        }
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = wanted
+            .iter()
+            .filter(|&&h| h != 0)
+            .filter_map(|&h| crate::descriptor::heap(h as This).host())
+            .map(|h| Some(h.heap.clone()))
+            .collect();
+        if heaps.is_empty() {
+            return;
+        }
+        heaps.iter().flatten().for_each(|h| list.keep(h));
+        // SAFETY: an open list and shader-visible heaps.
+        unsafe { list.list.SetDescriptorHeaps(&heaps) };
+        self.host_heaps = wanted;
+        self.host_roots = [0; 2];
+    }
+
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold. Returns `Some(uav_buffers)` with
     /// shadow-buffer pointers bound as UAVs by this operation so callers do
@@ -884,30 +912,28 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
-            // The table and what its entries hold (record words).
+            let (base, n) = fresh_table_span(&entries, host.count());
+            // The table slice and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
+                base.hash(&mut h);
+                n.hash(&mut h);
+                for offset in 0..n {
+                    let at = table + u64::from(base + offset) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
                 (table, h.finish())
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            if let Some(&table_base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u, &view, uav_buffers);
                     }
                 }
-                made.push((slot, first * 32));
+                made.push((slot, table_base * 32));
                 continue;
             }
             let heap_ptr = std::ptr::from_ref(heap) as usize;
@@ -934,12 +960,17 @@ impl State {
                 });
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            // `first >= host.count() >= base`, so `first - base` never underflows
+            // and shifting the shader's base back by `base` lands `base + offset`
+            // directly on dynamic slot `first + offset`.
+            let table_base = first - base;
+            self.fresh_tables.insert(key, table_base);
             list.record_dynamic(heap_ptr, first, n);
-            // The whole range: a shader may index past the entries its
-            // used-resource list names (descriptor arrays).
-            for k in 0..n {
-                let index = first + k;
+            // The whole range from the first used entry to the last: a shader may
+            // index across intermediate entries (descriptor arrays).
+            for offset in 0..n {
+                let k = base + offset;
+                let index = first + offset;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
@@ -966,7 +997,7 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            made.push((slot, table_base * 32));
         }
         made
     }
@@ -1444,6 +1475,25 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Computes `(base, count)` for a fresh dynamic table covering `entries`,
+/// trimming leading unused descriptor slots so tables starting deep in a
+/// descriptor table do not waste dynamic heap slots (#747). `max_trim` is
+/// `host.count()`, ensuring `first - base` never underflows.
+fn fresh_table_span(entries: &[&UsedResource], max_trim: u32) -> (u32, u32) {
+    let mut start = u32::MAX;
+    let mut end = 0u32;
+    for u in entries {
+        let entry = u.table_offset_dwords / 8;
+        start = start.min(entry);
+        end = end.max(entry + 1);
+    }
+    if start == u32::MAX {
+        return (0, 1);
+    }
+    let base = start.min(max_trim);
+    (base, end - base)
+}
+
 /// Validates and computes `(from_address, src_bytes, dst_bytes)` for expanding
 /// `count / 3` console rectangles starting at vertex `first` into triangles.
 fn rect_vertex_range(
@@ -1470,7 +1520,41 @@ fn rect_vertex_range(
 
 #[cfg(test)]
 mod tests {
-    use super::rect_vertex_range;
+    use super::{fresh_table_span, rect_vertex_range};
+    use victory_shader::{ResourceType, RootType, UsedResource};
+
+    fn used_table_entry(offset_dwords: u32) -> UsedResource {
+        UsedResource {
+            root: RootType::Table,
+            slot: 0,
+            user_data: 0,
+            table_offset_dwords: offset_dwords,
+            kind: ResourceType::Cbv,
+            dwords: 4,
+            stride: 0,
+            lower_bound: 0,
+        }
+    }
+
+    #[test]
+    fn fresh_table_span_trims_leading_unused_entries() {
+        // Empty entry list falls back to 1 slot at base 0.
+        assert_eq!(fresh_table_span(&[], 1000), (0, 1));
+
+        // Single entry deep in the table allocates 1 slot instead of 101.
+        let deep = used_table_entry(100 * 8);
+        assert_eq!(fresh_table_span(&[&deep], 737_856), (100, 1));
+
+        // Multiple entries span [min..=max] inclusively.
+        let a = used_table_entry(40 * 8);
+        let b = used_table_entry(45 * 8 + 4);
+        assert_eq!(fresh_table_span(&[&a, &b], 737_856), (40, 6));
+
+        // `base` is clamped to `max_trim` (`host.count()`) so `first - base`
+        // can never underflow even on a tiny heap.
+        let huge = used_table_entry(500 * 8);
+        assert_eq!(fresh_table_span(&[&huge], 128), (128, 373));
+    }
 
     #[test]
     fn rect_vertex_range_rejects_overflow_and_out_of_bounds() {

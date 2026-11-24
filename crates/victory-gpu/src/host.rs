@@ -153,6 +153,10 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A CPU-only ring of UAV descriptors for `ClearUnorderedAccessView*`.
+    uavs: ID3D12DescriptorHeap,
+    uav_size: u32,
+    next_uav: AtomicU32,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
@@ -311,6 +315,14 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let uavs: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: RTV_RING,
+                ..Default::default()
+            })?;
+        let uav_size =
+            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -323,6 +335,9 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            uavs,
+            uav_size,
+            next_uav: AtomicU32::new(0),
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
@@ -1130,6 +1145,73 @@ impl Host {
             handle
         }
     }
+
+    /// A non-shader-visible CPU UAV descriptor of `resource` for
+    /// `ClearUnorderedAccessView*`, valid until recorded.
+    pub(crate) fn uav_cpu(
+        &self,
+        resource: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+    ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next_uav.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        // SAFETY: a slot of our CPU-only heap and a live resource.
+        unsafe {
+            let mut handle = self.uavs.GetCPUDescriptorHandleForHeapStart();
+            handle.ptr += (slot * self.uav_size) as usize;
+            self.device.CreateUnorderedAccessView(
+                resource,
+                None::<&ID3D12Resource>,
+                desc.map(std::ptr::from_ref),
+                handle,
+            );
+            handle
+        }
+    }
+
+    /// A GPU-only default-heap buffer of `size` bytes starting in `state`
+    /// (used for rebasing unaligned placed-buffer copy offsets on the GPU).
+    pub(crate) fn default_buffer(
+        &self,
+        size: u64,
+        state: D3D12_RESOURCE_STATES,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed default-heap buffer creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                state,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no default buffer");
+                None
+            }
+        }
+    }
 }
 
 impl HostList {
@@ -1464,6 +1546,58 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
+    /// If tracked GPU writes earlier in this same command list (not
+    /// superseded by a later CPU copy/run) cover all of `[address, address +
+    /// len)` inside one host shadow buffer, returns that shadow so a same-list
+    /// consumer (such as placed buffer-to-texture `CopyTextureRegion`) reads
+    /// the GPU-written bytes directly instead of stale CPU memory (#785).
+    pub(crate) fn latest_gpu_write_shadow(
+        &self,
+        address: usize,
+        len: usize,
+    ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        let end = address.checked_add(len)?;
+        if len == 0 {
+            return None;
+        }
+        let deferred = self.deferred();
+        let mut target: Option<std::sync::Arc<crate::shadow::Shadow>> = None;
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for step in deferred.copies.iter().rev() {
+            match step {
+                Step::GpuWrite(shadow, w_start, w_len) => {
+                    let w_end = w_start.saturating_add(*w_len);
+                    if *w_start >= end || w_end <= address {
+                        continue;
+                    }
+                    let same = match &target {
+                        Some(t) => std::sync::Arc::ptr_eq(t, shadow),
+                        None => {
+                            target = Some(shadow.clone());
+                            true
+                        }
+                    };
+                    if !same {
+                        continue;
+                    }
+                    ranges.push((*w_start, w_end));
+                    if gpu_writes_cover(&ranges, address, end) {
+                        return target;
+                    }
+                }
+                Step::Copy(dst, _, copy_len) => {
+                    let c_end = dst.saturating_add(*copy_len);
+                    if *dst < end && address < c_end {
+                        return None;
+                    }
+                }
+                Step::Run(_) => return None,
+                Step::Fill(..) | Step::Refresh(..) | Step::Host(_) | Step::Texture(_) => {}
+            }
+        }
+        None
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -1757,20 +1891,29 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // Something is unmapped: scan virtual memory regions once with
+    // `VirtualQuery`, reading committed readable regions in a single call and
+    // zeroing unmapped/inaccessible gaps directly without probing them page by
+    // page (#783).
+    for_virtual_regions(src as usize, len, |at, n, state, protect| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+        if is_readable_region(state, protect) {
+            if !read(at as *const u8, to, n) {
+                for_pieces(at, n, 4 << 10, |at, n| {
+                    let to = dst.wrapping_add(at - src as usize);
+                    if !read(at as *const u8, to, n) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                        // SAFETY: inside the destination, which is mapped.
+                        unsafe { to.write_bytes(0, n) };
+                    }
+                });
+            }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: inside the destination, which is mapped.
+            unsafe { to.write_bytes(0, n) };
         }
     });
 }
@@ -1807,13 +1950,100 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+    for_virtual_regions(dst as usize, len, |at, n, state, protect| {
+        if is_writable_region(state, protect) && !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 write(at, n);
             });
         }
     });
+}
+
+fn is_readable_region(state: u32, protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    const READABLE: u32 = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    state == MEM_COMMIT
+        && (protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+        && (protect & READABLE) != 0
+}
+
+fn is_writable_region(state: u32, protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS,
+        PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    const WRITABLE: u32 =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    state == MEM_COMMIT
+        && (protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0
+        && (protect & WRITABLE) != 0
+}
+
+/// Walks `[start, start + len)` region by region via `VirtualQuery`, calling
+/// `f(region_start, region_len, state, protect)` for every slice.
+fn for_virtual_regions(start: usize, len: usize, mut f: impl FnMut(usize, usize, u32, u32)) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = start.saturating_add(len);
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain out-buffer filled by `VirtualQuery`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid pointer and exact struct size.
+        let queried = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if queried == 0 || info.RegionSize == 0 {
+            f(at, end - at, 0, 0);
+            break;
+        }
+        let region_end = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .min(end);
+        let n = region_end.saturating_sub(at);
+        if n == 0 {
+            f(at, end - at, 0, 0);
+            break;
+        }
+        f(at, n, info.State, info.Protect);
+        at = region_end;
+    }
+}
+
+/// Returns whether the union of `[start, end)` intervals in `writes` covers
+/// every byte of `[address, end)`.
+fn gpu_writes_cover(writes: &[(usize, usize)], address: usize, end: usize) -> bool {
+    if address >= end {
+        return true;
+    }
+    let mut clipped: Vec<(usize, usize)> = writes
+        .iter()
+        .filter_map(|&(a, b)| {
+            let lo = a.max(address);
+            let hi = b.min(end);
+            (lo < hi).then_some((lo, hi))
+        })
+        .collect();
+    if clipped.is_empty() {
+        return false;
+    }
+    clipped.sort_unstable_by_key(|&(lo, _)| lo);
+    let mut covered = address;
+    for (lo, hi) in clipped {
+        if lo > covered {
+            return false;
+        }
+        covered = covered.max(hi);
+        if covered >= end {
+            return true;
+        }
+    }
+    covered >= end
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -2932,5 +3162,92 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }]);
         t.join().unwrap();
         assert_eq!(cell.load(std::sync::atomic::Ordering::Acquire), 42);
+    }
+
+    #[test]
+    fn region_protection_checks() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_FREE, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+        };
+        assert!(super::is_readable_region(MEM_COMMIT, PAGE_READONLY));
+        assert!(super::is_readable_region(MEM_COMMIT, PAGE_READWRITE));
+        assert!(super::is_readable_region(MEM_COMMIT, PAGE_EXECUTE_READ));
+        assert!(!super::is_readable_region(MEM_RESERVE, PAGE_READWRITE));
+        assert!(!super::is_readable_region(MEM_FREE, PAGE_READWRITE));
+        assert!(!super::is_readable_region(MEM_COMMIT, PAGE_NOACCESS));
+        assert!(!super::is_readable_region(
+            MEM_COMMIT,
+            PAGE_READWRITE | PAGE_GUARD
+        ));
+
+        assert!(!super::is_writable_region(MEM_COMMIT, PAGE_READONLY));
+        assert!(!super::is_writable_region(MEM_COMMIT, PAGE_EXECUTE_READ));
+        assert!(super::is_writable_region(MEM_COMMIT, PAGE_READWRITE));
+        assert!(super::is_writable_region(MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+        assert!(!super::is_writable_region(MEM_RESERVE, PAGE_READWRITE));
+        assert!(!super::is_writable_region(
+            MEM_COMMIT,
+            PAGE_READWRITE | PAGE_GUARD
+        ));
+    }
+
+    #[test]
+    fn copy_mapped_and_write_mapped_skip_uncommitted_gaps() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const CHUNK: usize = 64 << 10;
+        const TOTAL: usize = 3 * CHUNK;
+        // Reserve 192 KiB and commit only the first and last 64 KiB, leaving an
+        // uncommitted 64 KiB hole in the middle.
+        // SAFETY: balanced VirtualAlloc / VirtualFree of our private test block.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), TOTAL, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        unsafe {
+            let a = VirtualAlloc(base, CHUNK, MEM_COMMIT, PAGE_READWRITE);
+            let b = VirtualAlloc(base.cast::<u8>().add(2 * CHUNK).cast(), CHUNK, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!a.is_null() && !b.is_null());
+            std::slice::from_raw_parts_mut(base.cast::<u8>(), CHUNK).fill(0xA5);
+            std::slice::from_raw_parts_mut(base.cast::<u8>().add(2 * CHUNK), CHUNK).fill(0x5A);
+        }
+
+        // `copy_mapped` copies both committed regions and zeroes the hole.
+        let mut dst = vec![0xFFu8; TOTAL];
+        super::copy_mapped(dst.as_mut_ptr(), base.cast::<u8>(), TOTAL, false);
+        assert!(dst[..CHUNK].iter().all(|&b| b == 0xA5));
+        assert!(dst[CHUNK..2 * CHUNK].iter().all(|&b| b == 0));
+        assert!(dst[2 * CHUNK..].iter().all(|&b| b == 0x5A));
+
+        // `write_mapped` updates both committed regions and ignores the hole.
+        let mut src = vec![0x33u8; TOTAL];
+        src[2 * CHUNK..].fill(0xCC);
+        super::write_mapped(base.cast::<u8>(), src.as_ptr(), TOTAL);
+        unsafe {
+            assert!(std::slice::from_raw_parts(base.cast::<u8>(), CHUNK)
+                .iter()
+                .all(|&b| b == 0x33));
+            assert!(
+                std::slice::from_raw_parts(base.cast::<u8>().add(2 * CHUNK), CHUNK)
+                    .iter()
+                    .all(|&b| b == 0xCC)
+            );
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn gpu_writes_cover_handles_single_merged_and_gapped_ranges() {
+        assert!(super::gpu_writes_cover(&[(100, 300)], 100, 300));
+        assert!(super::gpu_writes_cover(&[(50, 400)], 100, 300));
+        assert!(super::gpu_writes_cover(&[(200, 300), (100, 200)], 100, 300));
+        assert!(super::gpu_writes_cover(
+            &[(100, 180), (160, 240), (240, 320)],
+            100,
+            300
+        ));
+        assert!(!super::gpu_writes_cover(&[(100, 199), (200, 300)], 100, 300));
+        assert!(!super::gpu_writes_cover(&[(101, 300)], 100, 300));
+        assert!(!super::gpu_writes_cover(&[], 100, 300));
     }
 }

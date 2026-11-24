@@ -172,8 +172,43 @@ impl GraphicsState {
         }
     }
 
-    /// Everything the state holds, as text: part of a pipeline's name in
-    /// the library and of the key a title pipeline is started early by.
+    /// Everything the host pipeline description holds, as text: part of a
+    /// pipeline's name in the host library so cached PSOs always match the
+    /// exact state passed to D3D12.
+    fn host_describe(&self, use_depth_bounds: bool) -> String {
+        let inputs: Vec<String> = self
+            .inputs
+            .iter()
+            .zip(&self.names)
+            .map(|(e, name)| {
+                format!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex,
+                    e.Format.0,
+                    e.InputSlot,
+                    e.AlignedByteOffset,
+                    e.InputSlotClass.0,
+                    e.InstanceDataStepRate
+                )
+            })
+            .collect();
+        format!(
+            "{:?} {} {:?} {:?} {} {inputs:?} {} {} {:?} {} {:?}",
+            host_blend(self),
+            self.sample_mask,
+            self.rasterizer,
+            self.depth,
+            use_depth_bounds,
+            self.strip_cut.0,
+            host_topology(self.topology).0,
+            self.targets,
+            self.depth_format.0,
+            self.samples
+        )
+    }
+
+    /// Everything the state holds, as text: part of the key a title pipeline
+    /// is started early by.
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -578,8 +613,8 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
-        let state = g.describe();
         let use_depth_bounds = g.depth_bounds && host.depth_bounds();
+        let state = g.host_describe(use_depth_bounds);
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -631,7 +666,7 @@ impl HostPipeline {
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
                 VS: code(0),
                 PS: code(1),
-                BlendState: g.blend,
+                BlendState: host_blend(g),
                 SampleMask: g.sample_mask,
                 RasterizerState: g.rasterizer,
                 DepthStencilState: g.depth,
@@ -642,10 +677,7 @@ impl HostPipeline {
                 IBStripCutValue: g.strip_cut,
                 // The console's rectangle and quad types draw as triangles on
                 // the host (see `draw`).
-                PrimitiveTopologyType: match g.topology.0 {
-                    RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                    _ => g.topology,
-                },
+                PrimitiveTopologyType: host_topology(g.topology),
                 NumRenderTargets: g.targets.NumRenderTargets,
                 RTVFormats: g.targets.RTFormats,
                 DSVFormat: g.depth_format,
@@ -689,6 +721,56 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
         })
+    }
+}
+
+/// Whether `format` is an integer (`*_UINT` or `*_SINT`) color format that
+/// D3D12 forbids blending on.
+fn is_integer_format(format: DXGI_FORMAT) -> bool {
+    matches!(
+        format.0,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59
+            | 62 | 64
+    )
+}
+
+/// Host blend state for `g`: D3D12 rejects pipelines with `BlendEnable` set on
+/// an integer render target, even when the console ignores blending on them.
+/// When any active integer target would blend, expand target 0 into all eight
+/// targets if `IndependentBlendEnable` is off and turn `BlendEnable` off on
+/// each active integer target.
+fn host_blend(g: &GraphicsState) -> D3D12_BLEND_DESC {
+    let count = g.targets.NumRenderTargets.min(8) as usize;
+    let independent = g.blend.IndependentBlendEnable.as_bool();
+    let needs_fix = (0..count).any(|i| {
+        is_integer_format(g.targets.RTFormats[i])
+            && g.blend.RenderTarget[if independent { i } else { 0 }]
+                .BlendEnable
+                .as_bool()
+    });
+    if !needs_fix {
+        return g.blend;
+    }
+    let mut blend = g.blend;
+    if !independent {
+        blend.RenderTarget = [blend.RenderTarget[0]; 8];
+        blend.IndependentBlendEnable = true.into();
+    }
+    for (target, &format) in blend.RenderTarget[..count]
+        .iter_mut()
+        .zip(&g.targets.RTFormats[..count])
+    {
+        if is_integer_format(format) {
+            target.BlendEnable = false.into();
+        }
+    }
+    blend
+}
+
+fn host_topology(topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+    match topology.0 {
+        RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        _ => topology,
     }
 }
 
@@ -736,15 +818,12 @@ fn graphics_pipeline_depth_bounds(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
-    let topology = match g.topology.0 {
-        RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-        _ => g.topology,
-    };
+    let topology = host_topology(g.topology);
     let mut stream = Stream {
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, vs),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(
@@ -809,7 +888,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(
@@ -849,7 +928,7 @@ fn mesh_pipeline(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(g)),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
@@ -1008,5 +1087,68 @@ mod tests {
         let elems = g.elements();
         assert_eq!(elems[0].offset, u32::MAX - 2);
         assert_eq!(elems[1].offset, u32::MAX);
+    }
+
+    #[test]
+    fn integer_targets_do_not_blend() {
+        // Non-independent blend with target 0 enabled, mixed UNORM + UINT + SINT targets:
+        // target 0 must expand across targets, IndependentBlendEnable turns on,
+        // and only active integer targets lose BlendEnable.
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0x7;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R32_UINT;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R16G16_SINT;
+
+        let fixed = host_blend(&g);
+        assert!(fixed.IndependentBlendEnable.as_bool());
+        assert!(fixed.RenderTarget[0].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!fixed.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(fixed.RenderTarget[1].RenderTargetWriteMask, 0x7);
+        assert_eq!(fixed.RenderTarget[2].RenderTargetWriteMask, 0x7);
+
+        // Independent blend enabled: only integer active targets lose BlendEnable.
+        let mut g2 = GraphicsState::default();
+        g2.blend.IndependentBlendEnable = true.into();
+        g2.blend.RenderTarget[0].BlendEnable = true.into();
+        g2.blend.RenderTarget[1].BlendEnable = true.into();
+        g2.targets.NumRenderTargets = 2;
+        g2.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
+        g2.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+        let fixed2 = host_blend(&g2);
+        assert!(fixed2.IndependentBlendEnable.as_bool());
+        assert!(!fixed2.RenderTarget[0].BlendEnable.as_bool());
+        assert!(fixed2.RenderTarget[1].BlendEnable.as_bool());
+    }
+
+    #[test]
+    fn blend_states_without_integer_blending_are_kept() {
+        let mut g = GraphicsState::default();
+        g.blend.IndependentBlendEnable = false.into();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.targets.NumRenderTargets = 1;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // Inactive slot holds an integer format — must not alter the blend state.
+        g.targets.RTFormats[1] = DXGI_FORMAT_R32_UINT;
+
+        let kept = host_blend(&g);
+        assert!(!kept.IndependentBlendEnable.as_bool());
+        assert!(kept.RenderTarget[0].BlendEnable.as_bool());
+
+        // Active integer target with blending already off is left untouched.
+        let mut g2 = GraphicsState::default();
+        g2.blend.IndependentBlendEnable = false.into();
+        g2.blend.RenderTarget[0].BlendEnable = false.into();
+        g2.targets.NumRenderTargets = 1;
+        g2.targets.RTFormats[0] = DXGI_FORMAT_R32_SINT;
+
+        let kept2 = host_blend(&g2);
+        assert!(!kept2.IndependentBlendEnable.as_bool());
+        assert!(!kept2.RenderTarget[0].BlendEnable.as_bool());
     }
 }
