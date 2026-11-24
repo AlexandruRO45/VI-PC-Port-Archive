@@ -2028,4 +2028,102 @@ mod tests {
             }
         }
     }
+
+    /// `scale_factors` reads a channel's first set as a 2-bit step and one
+    /// delta per band from 45 / step; later subframes either keep the last
+    /// set (a 0 bit) or send run-level changes to it (a 1 bit). Kept sets are
+    /// carried to the new block size through `sf_offsets`.
+    #[test]
+        fn scale_factors_read_deltas_then_run_level_changes() {
+        /// The bits of `sym` in `vlc`.
+        fn code(vlc: &Vlc, sym: i32) -> String {
+            let &(c, len, _) = vlc.codes.iter().find(|c| c.2 == sym).unwrap();
+            format!("{:032b}", c)[..len as usize].to_string()
+        }
+        fn read(d: &mut Decoder, bits: &str) -> (Result<(), Error>, usize) {
+            let mut data = vec![0u8; bits.len() / 8 + 8];
+            for (i, c) in bits.bytes().enumerate() {
+                data[i / 8] |= u8::from(c == b'1') << (7 - i % 8);
+            }
+            let mut b = Bits {
+                data: &data,
+                pos: 0,
+                end: bits.len(),
+            };
+            (d.scale_factors(&mut b), b.consumed())
+        }
+        let c = codes();
+        let (scale, rl) = (&c.scale, &c.scale_rl);
+        // Run-level symbols: 1 ends, 2 is run 0 level 1, 4 is run 1 level 2.
+        assert_eq!((SCALE_RL_RUN[2], SCALE_RL_LEVEL[2]), (0, 1));
+        assert_eq!((SCALE_RL_RUN[4], SCALE_RL_LEVEL[4]), (1, 2));
+
+        let mut d = Decoder::new(1, 44_100);
+        d.channels_for_cur_subframe = 1;
+        d.num_bands = 3;
+        let sf = |d: &Decoder| d.ch[0].saved_scale_factors[d.ch[0].scale_factors][..3].to_vec();
+
+        // First subframe: no flag bit; step 2 starts at 22.
+        let bits = format!("01{}{}{}", code(scale, 1), code(scale, -2), code(scale, 0));
+        assert_eq!(read(&mut d, &bits), (Ok(()), bits.len()));
+        assert_eq!(sf(&d), [23, 21, 21]);
+        assert_eq!(d.ch[0].scale_factor_step, 2);
+        assert_eq!(d.ch[0].max_scale_factor, 23);
+        assert!(d.ch[0].reuse_sf);
+
+        // A 0 bit keeps the set.
+        d.ch[0].cur_subframe = 1;
+        assert_eq!(read(&mut d, "0"), (Ok(()), 1));
+        assert_eq!(sf(&d), [23, 21, 21]);
+
+        // Skip band 0, band 1 -= 2, then end.
+        let bits = format!("1{}0{}", code(rl, 4), code(rl, 1));
+        assert_eq!(read(&mut d, &bits), (Ok(()), bits.len()));
+        assert_eq!(sf(&d), [23, 19, 21]);
+
+        // Escape: 14 bits of level << 6 | skip << 1 | positive; band 0 += 5,
+        // then +1 on bands 1 and 2, which ends the bands without symbol 1.
+        let bits = format!(
+            "1{}{:014b}{}1{}1",
+            code(rl, 0),
+            5 << 6 | 1,
+            code(rl, 2),
+            code(rl, 2)
+        );
+        assert_eq!(read(&mut d, &bits), (Ok(()), bits.len()));
+        assert_eq!(sf(&d), [28, 20, 22]);
+        assert_eq!(d.ch[0].max_scale_factor, 28);
+        // The step is read only for the first set.
+        assert_eq!(d.ch[0].scale_factor_step, 2);
+
+        // A run past the last band is an error.
+        let bits = format!("1{}{:014b}", code(rl, 0), 3 << 1);
+        assert_eq!(read(&mut d, &bits).0, Err(Error("scale factor run")));
+
+        // Kept at a half-length block, each band takes the full-frame band
+        // that covers its middle.
+        let mut d = Decoder::new(1, 44_100);
+        d.channels_for_cur_subframe = 1;
+        d.num_bands = d.num_sfb[0];
+        let bits = format!("00{}", code(scale, 1).repeat(d.num_bands));
+        assert_eq!(read(&mut d, &bits), (Ok(()), bits.len()));
+        let full: Vec<i32> = (1..=d.num_bands as i32).map(|v| 45 + v).collect();
+        assert_eq!(
+            d.ch[0].saved_scale_factors[d.ch[0].scale_factors][..d.num_bands],
+            full[..]
+        );
+        d.ch[0].cur_subframe = 1;
+        d.table_idx = 1;
+        d.num_bands = d.num_sfb[1];
+        assert_eq!(read(&mut d, "0"), (Ok(()), 1));
+        let kept = &d.ch[0].saved_scale_factors[d.ch[0].scale_factors];
+        for b in 0..d.num_bands {
+            assert_eq!(kept[b], full[d.sf_offsets[1][0][b]], "band {b}");
+        }
+        assert_eq!(d.ch[0].table_idx, 0);
+        assert_eq!(
+            d.ch[0].max_scale_factor,
+            full[d.sf_offsets[1][0][d.num_bands - 1]]
+        );
+    }
 }
