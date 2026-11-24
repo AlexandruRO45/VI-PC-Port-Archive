@@ -1364,6 +1364,95 @@ mod tests {
         assert!(Tables::parse(&no_tiling).is_err());
     }
 
+    /// `Tables::parse` takes exactly `TABLES_SIZE` bytes, and every model's
+    /// used buckets must be non-empty and tile 65536 exactly, in the first,
+    /// a middle and the last model of each width group. Buckets past a
+    /// model's used ones are never read.
+    #[test]
+    fn tables_parse_checks_size_and_every_model() {
+        let base = tables();
+        let wrong = Some(Error("table file has the wrong size"));
+        assert_eq!(Tables::parse(&base[..TABLES_SIZE - 1]).err(), wrong);
+        assert_eq!(
+            Tables::parse(&[base.as_slice(), &[0]].concat()).err(),
+            wrong
+        );
+        assert_eq!(Tables::parse(&[]).err(), wrong);
+        assert_eq!(
+            Error("table file has the wrong size").to_string(),
+            "BCPack: table file has the wrong size"
+        );
+        let freq_at = |m: usize, b: usize| (m * BUCKETS + b) * 2;
+        let with = |edits: &[(usize, usize, u16)]| {
+            let mut t = base.clone();
+            for &(m, b, f) in edits {
+                t[freq_at(m, b)..][..2].copy_from_slice(&f.to_le_bytes());
+            }
+            Tables::parse(&t).err()
+        };
+        for group in 0..MODELS / 16 {
+            let used = group + 2;
+            let f = 1u16 << (15 - group);
+            for m in [16 * group, 16 * group + 7, 16 * group + 15] {
+                for b in 0..used {
+                    assert_eq!(
+                        with(&[(m, b, 0)]),
+                        Some(Error("a model has an empty bucket")),
+                        "model {m} bucket {b}"
+                    );
+                }
+                // One unit more or less in bucket 0 breaks the tiling.
+                for f0 in [f - 1, f + 1] {
+                    assert_eq!(
+                        with(&[(m, 0, f0)]),
+                        Some(Error("a model does not tile 65536")),
+                        "model {m}"
+                    );
+                }
+                // Moving weight between buckets keeps it: the last bucket
+                // holds 2^(used - 2) symbols per unit of frequency.
+                let wide = 1u16 << (used - 2);
+                assert_eq!(
+                    with(&[(m, 0, f + wide), (m, used - 1, f - 1)]),
+                    None,
+                    "model {m}"
+                );
+                // Unused buckets are free.
+                for b in used..BUCKETS {
+                    assert_eq!(with(&[(m, b, 0xffff)]), None, "model {m} bucket {b}");
+                }
+            }
+        }
+    }
+
+    /// The stream carries no length: bytes after the ones the lanes need
+    /// change nothing, and asking for fewer blocks than were coded gives
+    /// the first ones unchanged.
+    #[test]
+    fn trailing_bytes_and_fewer_blocks_are_ignored() {
+        let t = Tables::parse(&tables()).unwrap();
+        let records: Vec<Vec<u8>> = (0..48u8)
+            .map(|i| {
+                let mut r = vec![0, u8::from(i > 0), i.wrapping_mul(3), i ^ 0x15];
+                r.extend((0..8).map(|k| (i + k) % 64));
+                r
+            })
+            .collect();
+        let src = stream(&t, &BC4_LANES, 1, &records);
+        let mut want = vec![0u8; records.len() * 8];
+        decode(4, &src, &mut want, &t).unwrap();
+        for tail in [&[0u8][..], &[0xff; 3], &[0x5a; 1000]] {
+            let mut got = vec![0u8; want.len()];
+            decode(4, &[src.as_slice(), tail].concat(), &mut got, &t).unwrap();
+            assert_eq!(got, want, "tail of {} bytes", tail.len());
+        }
+        for blocks in [1, 2, 17, 47] {
+            let mut got = vec![0u8; blocks * 8];
+            decode(4, &src, &mut got, &t).unwrap();
+            assert_eq!(got, want[..blocks * 8], "{blocks} blocks");
+        }
+    }
+
     #[test]
     fn noise_never_panics() {
         let t = Tables::parse(&tables()).unwrap();
