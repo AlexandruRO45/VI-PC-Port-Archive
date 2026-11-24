@@ -516,6 +516,19 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         }) {
             return Err(Malformed("root parameter outside the SGPRs"));
         }
+        // A table or heap parameter is one 32-bit address. Resource tracking
+        // maps each SGPR it states to the parameter (`resource::param_of`),
+        // and the host fills every dword of a table with that address
+        // (`draw::user_value`; lowering reads a heap's as 0), so an SGPR past
+        // the first would silently read the address too.
+        if layout.iter().any(|p| {
+            matches!(
+                p.root,
+                RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+            ) && p.sgprs > 1
+        }) {
+            return Err(Malformed("root address wider than one SGPR"));
+        }
         // Resource tracking maps an SGPR to the first parameter covering it
         // (`resource::param_of`), so a second parameter over the same SGPR
         // would have its reads attributed to the first. The ranges of one
@@ -1175,10 +1188,13 @@ mod tests {
 
         // Parameters must sit in SGPRs the program can address: s9 plus 97
         // dwords ends at s105, one more is past it, and so is a user-data
-        // byte past the SGPR file.
+        // byte past the SGPR file. (Constants: a table takes one SGPR, and
+        // the read is then not a table's.)
         let entry = FSSM_HEADER + tables as usize;
         let layout = |blob: &[u8]| native_programs(&part(&[(KIND_NATIVE, &xbch(blob))]));
         let mut wide = blob.clone();
+        wide[entry..entry + 4].copy_from_slice(&0u32.to_le_bytes());
+        wide[entry + ENTRY_SIZE as usize + 1] = 0;
         wide[entry + 8..entry + 12].copy_from_slice(&97u32.to_le_bytes());
         assert_eq!(layout(&wide).unwrap()[0].layout[0].sgprs, 97);
         wide[entry + 8..entry + 12].copy_from_slice(&98u32.to_le_bytes());
@@ -1265,6 +1281,8 @@ mod tests {
         for kind in [0u32, 3] {
             let mut other = root.clone();
             other[entry..entry + 4].copy_from_slice(&kind.to_le_bytes());
+            // A table takes one SGPR.
+            other[entry + 8..entry + 12].copy_from_slice(&1u32.to_le_bytes());
             assert_eq!(
                 refused_blob(&xbch(&other)),
                 "used descriptor names no root descriptor",
@@ -2093,6 +2111,27 @@ mod tests {
                 "{what}"
             );
         }
+
+        // A table or heap is one 32-bit address: it may state one SGPR (or
+        // none, as a further range of a table), never two.
+        let (resource_heap, sampler_heap) = (5, 6);
+        for root in [table, resource_heap, sampler_heap] {
+            for sgprs in [0, 1] {
+                assert!(program(&[(root, sgprs, 4, 2)]).is_ok(), "{root}/{sgprs}");
+            }
+            for sgprs in [2, 8] {
+                assert_eq!(
+                    match program(&[(root, sgprs, 4, 2)]) {
+                        Err(Malformed(why)) => why,
+                        other => panic!("{root}/{sgprs}: expected a refusal, got {other:?}"),
+                    },
+                    "root address wider than one SGPR",
+                    "{root}/{sgprs}"
+                );
+            }
+        }
+        // Constants and a root descriptor still take what they state.
+        assert!(program(&[(constants, 8, 0, 0), (descriptor, 2, 8, 1)]).is_ok());
     }
 
     /// A pixel program with a table in s4 (slot 2), a root descriptor in
@@ -2101,8 +2140,8 @@ mod tests {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
         let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
         let tables = (blob.len() - FSSM_HEADER) as u64;
-        for (root, user_data, slot) in [(3u32, 4u8, 2u8), (1, 6, 3)] {
-            for v in [root, 0, 2, 0] {
+        for (root, sgprs, user_data, slot) in [(3u32, 1u32, 4u8, 2u8), (1, 2, 6, 3)] {
+            for v in [root, 0, sgprs, 0] {
                 blob.extend_from_slice(&v.to_le_bytes());
             }
             blob.extend_from_slice(&[user_data, slot, 0, 0]);
