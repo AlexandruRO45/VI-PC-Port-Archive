@@ -382,3 +382,17 @@ mod tests {
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
     }
 }
+
+
+/// Release the reference retained by a queued operation.
+/// The object is alive and its IUnknown table is valid.
+pub(crate) fn release_retained(this: This) -> u32 {
+    let release: extern "system" fn(This) -> u32 =
+        unsafe {
+            std::mem::transmute(
+                *(*this).functions.add(2)
+            )
+        };
+
+    release(this)
+}
