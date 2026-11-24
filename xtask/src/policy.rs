@@ -2922,6 +2922,45 @@ mod tests {
         assert!(super::run(root, false).is_err());
     }
 
+    /// Git reads no ignore rule from above the checkout: a repository
+    /// holding it, though its `.gitignore` and `info/exclude` name the
+    /// checkout's directories, hides none of them, so `above` and `excluded`
+    /// are refused and left empty, and only `own`, ignored by the checkout's
+    /// own `.gitignore`, is taken. A fixture in a refused directory is
+    /// listed and fails the check.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_no_rule_above_the_checkout() {
+        let outer = tempdir();
+        let parent = outer.path();
+        git_str(parent, &["init", "-q"]);
+        std::fs::write(parent.join(".gitignore"), "/repo/above/\nabove/\n*.bin\n").unwrap();
+        std::fs::create_dir_all(parent.join(".git/info")).unwrap();
+        std::fs::write(parent.join(".git/info/exclude"), "/repo/excluded/\n").unwrap();
+        let root = parent.join("repo");
+        let above = root.join("above");
+        let excluded = root.join("excluded");
+        let own = root.join("own");
+        for dir in [&above, &excluded, &own] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        git_str(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/own/\n").unwrap();
+
+        let tmp = tempdir_in_first(&root, [above.clone(), excluded.clone(), own.clone()]);
+        assert_eq!(tmp.path().parent(), Some(own.as_path()));
+        for dir in [&above, &excluded] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(&root, false), [".gitignore"]);
+        super::run(&root, false).unwrap();
+
+        std::fs::write(above.join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        assert_eq!(names(&root, false), [".gitignore", "above/game.bin"]);
+        assert!(super::run(&root, false).is_err());
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
