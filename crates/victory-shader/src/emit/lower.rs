@@ -3542,6 +3542,7 @@ impl<'a> Lower<'a> {
             || un.contains("atomic")
             || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
+        let mut raw_stride = 0u32;
         let (props, image) = match &ui.fields {
             Fields::Image { dim, .. } => {
                 let kind = match dim {
@@ -3561,7 +3562,10 @@ impl<'a> Lower<'a> {
                 {
                     (10 | u, 0x409)
                 } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                    // Local build: structured views are raw (see `structured_byte`); the
+                    // byte count is divided by the stride below.
+                    raw_stride = stride;
+                    (11 | u, 0)
                 } else {
                     (11 | u, 0)
                 };
@@ -3629,6 +3633,11 @@ impl<'a> Lower<'a> {
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+            }
+            None if raw_stride > 0 => {
+                let bytes = field(self, 0);
+                let k = self.s.m.i32(raw_stride);
+                vec![(2, self.s.m.bin(c, Bin::UDiv, bytes, k))]
             }
             None => vec![(2, field(self, 0))],
         };
@@ -4059,6 +4068,17 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Local build: the byte offset of element `index` (+ `off` bytes in it) of a structured
+    /// buffer of `stride` bytes, for raw access. D3D12 places a structured view's first element at
+    /// a multiple of its stride, and Grand Theft Auto VI places 32-byte structures at 16-byte
+    /// addresses: as raw views (16-byte alignment) those views can be made.
+    fn structured_byte(&mut self, index: V, stride: u32, off: V) -> V {
+        let c = self.cur;
+        let s = self.s.m.i32(stride);
+        let base = self.s.m.bin(c, Bin::Mul, index, s);
+        self.s.m.bin(c, Bin::Add, base, off)
     }
 
     /// Whether `src` is a buffer descriptor read from the resource heap at a GPU-computed index
@@ -7591,8 +7611,11 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    // Local build: structured buffers are read and written raw (see
+                    // `structured_byte`), so a view at any 16-byte-aligned address works.
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let byte = self.structured_byte(index, stride, off);
+                    (h, [byte, iu, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
@@ -7684,8 +7707,9 @@ impl<'a> Lower<'a> {
                         if stride < 4 || !stride.is_multiple_of(4) {
                             return Err("a structured buffer of unknown stride");
                         }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
+                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+                        let byte = self.structured_byte(index, stride, off);
+                        args.extend([byte, iu]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -7745,14 +7769,15 @@ impl<'a> Lower<'a> {
                     if stride < 4 || !stride.is_multiple_of(4) {
                         return Err("a structured buffer of unknown stride");
                     }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    let byte = self.structured_byte(index, stride, off);
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
                         139,
-                        &[h, index, off, mask, align],
+                        &[h, byte, iu, mask, align],
                     )
                 }
                 None => {
@@ -8854,12 +8879,12 @@ mod tests {
                 super::DescriptorBinding {
                     table: Some(0),
                     byte_offset: 0,
-                    properties: (12, 4)
+                    properties: (11, 0)
                 },
                 super::DescriptorBinding {
                     table: Some(0),
                     byte_offset: 16,
-                    properties: (12, 4)
+                    properties: (11, 0)
                 },
             ]
         );

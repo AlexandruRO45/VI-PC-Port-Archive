@@ -584,7 +584,24 @@ impl HostHeap {
                     View::Unordered(..) => "host view not made: unordered access",
                     View::Placed(true, r, _) if r[0] != 1 => "host view not made: placed UAV texture (not mirrored)",
                     View::Placed(true, _, _) => "host view not made: placed UAV buffer",
-                    View::Placed(false, r, _) if r[0] == 1 => "host view not made: placed buffer",
+                    View::Placed(false, r, desc) if r[0] == 1 => {
+                        let len = u64::from(r[4]) | u64::from(r[5]) << 32;
+                        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                        if address == 0 {
+                            "host view not made: placed buffer (null address)"
+                        } else if crate::shadow::find(address, len).is_none() {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+                                    tracing::info!(address = format_args!("{address:#x}"), len, words = ?&desc[..10], "placed buffer without a title copy");
+                                }
+                            }
+                            "host view not made: placed buffer (no title copy covers it)"
+                        } else {
+                            "host view not made: placed buffer (view range or flags refused)"
+                        }
+                    }
                     View::Placed(false, r, desc) => {
                         #[cfg(feature = "diagnostics")]
                         placed_detail(r, desc);
@@ -1073,6 +1090,21 @@ fn buffer_srv(
         return None;
     }
     let shadow = crate::shadow::find(address, len)?;
+    // Local build: a structured view is made raw over the same bytes (the translator reads
+    // structured buffers raw): D3D12 starts a structured view at a multiple of its stride, a raw
+    // one at any 16-byte address.
+    {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_SRV_FLAG_NONE {
+            let stride = u64::from(b.StructureByteStride);
+            b.FirstElement = b.FirstElement * stride / 4;
+            b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -1122,6 +1154,19 @@ fn buffer_uav(
         return None;
     }
     let shadow = crate::shadow::find(address, len)?;
+    // Local build: structured views are made raw over the same bytes (see `buffer_srv`).
+    {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { &mut desc.Anonymous.Buffer };
+        if b.StructureByteStride > 0 && b.StructureByteStride.is_multiple_of(4) && b.Flags == D3D12_BUFFER_UAV_FLAG_NONE && b.CounterOffsetInBytes == 0 {
+            let stride = u64::from(b.StructureByteStride);
+            b.FirstElement = b.FirstElement * stride / 4;
+            b.NumElements = (u64::from(b.NumElements) * stride / 4) as u32;
+            b.StructureByteStride = 0;
+            b.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        }
+    }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -1176,6 +1221,13 @@ fn buffer_view_start(
     kind: u32,
     writable: bool,
 ) -> Option<u64> {
+    #[cfg(feature = "diagnostics")]
+    if title != 0 && (element == 0 || kind == 0 || count == 0 || count > 1 << D3D12_REQ_BUFFER_RESOURCE_TEXEL_COUNT_2_TO_EXP || kind == 12 && (!element.is_multiple_of(4) || element > 2048) || first.saturating_add(u64::from(count)) > len / element.max(1)) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+            tracing::info!(kind, element, first, count, len, title = format_args!("{title:#x}"), "buffer view refused: shape or count");
+        }
+    }
     if title == 0
         || element == 0
         || kind == 0
@@ -1208,6 +1260,26 @@ fn buffer_view_start(
     }
     let base = shadow.offset(title);
     let offset = base.checked_add(first.checked_mul(element)?)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        let why = if !offset.is_multiple_of(element) {
+            Some("offset not a multiple of the element")
+        } else if offset.saturating_add(u64::from(count) * element) > desc.Width {
+            Some("past the copy")
+        } else if !crate::mirror::view_fits(offset, u64::from(count) * element) {
+            Some("past 4 GiB of the copy")
+        } else if kind == 11 && !gpu.wrapping_add(offset).is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+            Some("raw view not 16-byte aligned")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                tracing::info!(why, kind, element, first, count, len, offset = format_args!("{offset:#x}"), title = format_args!("{title:#x}"), width = desc.Width, "buffer view refused");
+            }
+        }
+    }
     if !offset.is_multiple_of(element)
         || offset.checked_add(u64::from(count).checked_mul(element)?)? > desc.Width
         || !crate::mirror::view_fits(offset, u64::from(count) * element)
