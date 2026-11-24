@@ -13,6 +13,9 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to full commit SHAs (tag in the trailing comment): a tag
+# can be moved to other code, a commit cannot. Bump both together.
+
 # A newer push to a PR cancels its older run. Runs on main are never
 # cancelled: only main saves the rust-cache, so a cancelled main run would
 # leave PRs restoring a stale cache.
@@ -23,6 +26,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # A failing test or build script prints where it panicked.
+  RUST_BACKTRACE: 1
   # Crates (plus xtask) that build, test and are clippy-clean on Linux today.
   LINUX_CRATES: >-
     -p victory-core -p victory-pe -p victory-formats -p victory-pipeline
@@ -38,7 +43,7 @@ jobs:
     timeout-minutes: 30
     steps:
       # Nothing here pushes; keep the token out of .git/config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -49,7 +54,7 @@ jobs:
 
       # Save the cache only from main: PR runs restore it but do not write
       # their own entries, which would evict main's from the 10 GB quota.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -99,7 +104,7 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       # Nothing here pushes; keep the token out of .git/config.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -107,7 +112,7 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: windows-target
           save-if: ${{ github.ref == 'refs/heads/main' }}
