@@ -143,13 +143,19 @@ impl Tally {
 /// Emitted shaders by label, shared between threads.
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
+struct PipelineChecks {
+    host: Host,
+    stub_ps: emit::HostShader,
+    warp_lock: Option<Mutex<()>>,
+}
+
 /// The optional checks after emission, one set per thread.
-struct Checks {
+struct Checks<'a> {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
-    host: Option<(Host, emit::HostShader)>,
+    pipelines: Option<&'a PipelineChecks>,
 }
 
 pub fn run(
@@ -173,9 +179,6 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    if pipelines {
-        Host::new(false).map_err(anyhow::Error::msg)?;
-    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -187,56 +190,36 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    let started = std::time::Instant::now();
-    for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
-            let Ok(data) = std::fs::read(entry.path()) else {
-                continue;
+    let pipeline_checks = scan(
+        &paths,
+        threads,
+        pipelines.then_some(|| {
+            let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+            Ok(PipelineChecks {
+                host: Host::new(warp).map_err(anyhow::Error::msg)?,
+                stub_ps: host::stub_ps(),
+                // Concurrent WARP calls can crash (VIctory #181, #244).
+                warp_lock: warp.then(Mutex::default),
+            })
+        }),
+        |path, jobs, next, pipelines| {
+            let mut t = Tally {
+                list,
+                ..Tally::default()
             };
-            let jobs = sources(&data);
-            let next = AtomicUsize::new(0);
-            std::thread::scope(|s| {
-                let workers: Vec<_> = (0..threads.min(jobs.len()))
-                    .map(|_| {
-                        s.spawn(|| {
-                            let mut t = Tally {
-                                list,
-                                ..Tally::default()
-                            };
-                            let mut checks = Checks {
-                                keep: (!pairs.is_empty()).then(|| kept.clone()),
-                                validator: validate
-                                    .then(|| Validator::load(dll.as_deref()).ok())
-                                    .flatten(),
-                                host: pipelines
-                                    .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
-                                    .flatten(),
-                            };
-                            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                                translate(job, entry.path(), &seen, &mut t, &mut checks);
-                            }
-                            lock(&total).merge(t);
-                        })
-                    })
-                    .collect();
-                report(
-                    entry.path(),
-                    jobs.len(),
-                    "containers",
-                    &next,
-                    started,
-                    &workers,
-                    String::new,
-                );
-            });
-        }
-    }
+            let mut checks = Checks {
+                keep: (!pairs.is_empty()).then(|| kept.clone()),
+                validator: validate
+                    .then(|| Validator::load(dll.as_deref()).ok())
+                    .flatten(),
+                pipelines,
+            };
+            while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                translate(job, path, &seen, &mut t, &mut checks);
+            }
+            lock(&total).merge(t);
+        },
+    )?;
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     println!(
         "containers   {} ({} duplicates skipped)",
@@ -287,7 +270,14 @@ pub fn run(
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
     if !pairs.is_empty() {
-        let host = Host::new(false).map_err(anyhow::Error::msg)?;
+        let pair_host;
+        let host = match &pipeline_checks {
+            Some(checks) => &checks.host,
+            None => {
+                pair_host = Host::new(false).map_err(anyhow::Error::msg)?;
+                &pair_host
+            }
+        };
         let kept = lock(&kept);
         let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
@@ -476,12 +466,54 @@ pub(crate) fn report<T>(
     eprintln!("{}{}", if terminal { "\r" } else { "" }, line());
 }
 
+/// Walks `paths` and runs `worker` on `threads` threads per file. The pipeline
+/// checks are made once, before the walk, and shared by every worker.
+fn scan<P: Sync>(
+    paths: &[PathBuf],
+    threads: usize,
+    make_pipeline_checks: Option<impl FnOnce() -> Result<P>>,
+    worker: impl Fn(&Path, &[Source<'_>], &AtomicUsize, Option<&P>) + Sync,
+) -> Result<Option<P>> {
+    let pipelines = make_pipeline_checks.map(|make| make()).transpose()?;
+    let started = std::time::Instant::now();
+    for root in paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                let workers: Vec<_> = (0..threads.min(jobs.len()))
+                    .map(|_| s.spawn(|| worker(entry.path(), &jobs, &next, pipelines.as_ref())))
+                    .collect();
+                report(
+                    entry.path(),
+                    jobs.len(),
+                    "containers",
+                    &next,
+                    started,
+                    &workers,
+                    String::new,
+                );
+            });
+        }
+    }
+    Ok(pipelines)
+}
+
 fn translate(
     source: &Source,
     path: &Path,
     seen: &Mutex<HashSet<blake3::Hash>>,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
 ) {
     let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
@@ -597,7 +629,7 @@ fn translate(
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
-    checks: &mut Checks,
+    checks: &mut Checks<'_>,
     label: impl Fn() -> String,
 ) {
     if let Some(keep) = &checks.keep {
@@ -616,7 +648,9 @@ fn check(
             &shader.dxil,
         );
     }
-    if let Some((h, stub_ps)) = &checks.host {
+    if let Some(pipelines) = checks.pipelines {
+        let _guard = pipelines.warp_lock.as_ref().map(lock);
+        let (h, stub_ps) = (&pipelines.host, &pipelines.stub_ps);
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
@@ -634,7 +668,7 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
-        if t.list && checks.host.is_none() {
+        if t.list && checks.pipelines.is_none() {
             t.lines.push(format!("{}  emitted", label()));
         }
         return;
@@ -870,5 +904,42 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// The pipeline checks (one D3D12 host) are made once and shared by every
+    /// worker of every file.
+    #[test]
+    fn shares_pipeline_checks_across_files_and_workers() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("victory-translate-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let paths = [dir.join("first"), dir.join("second")];
+        // Two empty synthetic DXBC containers per file, with no shader parts.
+        let mut header = [0; 32];
+        header[..4].copy_from_slice(b"DXBC");
+        header[24..28].copy_from_slice(&32u32.to_le_bytes());
+        for path in &paths {
+            std::fs::write(path, header.repeat(2)).unwrap();
+        }
+        let created = AtomicUsize::new(0);
+        let visits = Mutex::new(Vec::new());
+        let checks = scan(
+            &paths,
+            2,
+            Some(|| Ok(created.fetch_add(1, Ordering::Relaxed))),
+            |path, _, _, checks| lock(&visits).push((path.to_owned(), checks.copied())),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(created.into_inner(), 1);
+        assert_eq!(checks, Some(0));
+        let mut visits = visits.into_inner().unwrap();
+        visits.sort_unstable();
+        let expected: Vec<_> = paths
+            .into_iter()
+            .flat_map(|p| [(p.clone(), checks), (p, checks)])
+            .collect();
+        assert_eq!(visits, expected);
     }
 }
