@@ -8410,8 +8410,20 @@ impl<'a> Lower<'a> {
             3 => (5, 3),
             4 => (6, 2),
             5 => (7, 3),
-            _ => return Err("an image dimension (MSAA)"),
+            // Multisampled: x, y (and slice), then the sample; see the
+            // load below.
+            6 => (3, 2),
+            7 => (8, 3),
+            _ => return Err("an image dimension"),
         };
+        let msaa = matches!(kind, 3 | 8);
+        if msaa && !matches!(name, "image_load" | "image_get_resinfo") {
+            // image_msaa_load returns one channel of four samples (four
+            // data dwords, where the decoder gives one per dmask bit), and
+            // which four is not established here; multisampled stores and
+            // atomics need writable multisampled UAVs (SM 6.7).
+            return Err("a multisampled image access other than a load or size");
+        }
         // Address VGPRs in order.
         let mut regs = Vec::new();
         for a in addr {
@@ -8462,6 +8474,9 @@ impl<'a> Lower<'a> {
             // access as the 2D array it is, faces as slices, which is how
             // the console addresses it too.
             kind = 7;
+        }
+        if msaa && uav {
+            return Err("an unordered multisampled image");
         }
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
@@ -8659,8 +8674,15 @@ impl<'a> Lower<'a> {
             // Width, height, depth or layers, levels (per dmask) of the level
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
+            if msaa && dmask & 8 != 0 {
+                // DXIL gives the sample count there; what the console's
+                // image unit returns for a multisampled view is not
+                // established here.
+                return Err("the levels of a multisampled image");
+            }
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            // Multisampled views have one level and take none.
+            let mip = if uav || msaa {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -8674,7 +8696,7 @@ impl<'a> Lower<'a> {
             let present = match kind {
                 1 => [true, false, false, true],
                 _ if cube => [true, true, false, true],
-                2 | 6 => [true, true, false, true],
+                2 | 3 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
             let Operand::Vector { reg, .. } = *data else {
@@ -8997,6 +9019,13 @@ impl<'a> Lower<'a> {
                 *slot = addr_val(self, k)?;
             }
             let mip = if name == "image_load_mip" {
+                addr_val(self, coords)?
+            } else if msaa {
+                // DXIL takes the sample where the level would be.
+                // shortcut: the console's last address is a fragment,
+                // the sample itself unless the view's FMASK remaps it (a
+                // shader reading FMASK first passes the fragment it found,
+                // taken here as a sample).
                 addr_val(self, coords)?
             } else if uav {
                 // Our declarations have four channels.

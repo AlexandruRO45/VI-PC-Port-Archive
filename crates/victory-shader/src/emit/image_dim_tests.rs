@@ -1,8 +1,8 @@
 //! End-to-end tests of image accesses by dimension: synthetic GFX10
-//! programs that load texels of cube faces and samples of multisampled
-//! textures, lowered to DXIL, validated by `dxil.dll` when present, and run
-//! on the default hardware adapter and WARP; each thread stores what it
-//! read to a raw UAV.
+//! programs that load, store and update texels of cube faces and load
+//! samples of multisampled textures, lowered to DXIL, validated by
+//! `dxil.dll` when present, and run on the default hardware adapter and
+//! WARP; each thread stores what it read to a raw UAV.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::sampler::StaticSampler;
@@ -22,9 +22,12 @@ const WAIT_VECTOR: u32 = 0xBF8C_3F70;
 const IMAGE_LOAD: u32 = 0x00;
 const IMAGE_LOAD_MIP: u32 = 0x01;
 const IMAGE_STORE: u32 = 0x08;
+const IMAGE_GET_RESINFO: u32 = 0x0E;
 const IMAGE_ATOMIC_ADD: u32 = 0x11;
-/// MIMG dimension: a cube.
+/// MIMG dimensions.
 const CUBE: u32 = 3;
+const MSAA: u32 = 6;
+const MSAA_ARRAY: u32 = 7;
 
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
@@ -346,5 +349,109 @@ fn cube_atomics_update_each_faces_texels() {
     for (label, uavs) in run(&shader, View::UintTextureArrayUav(4, 4, 6), 96) {
         assert_eq!(uavs[0], (1..=96).collect::<Vec<u32>>(), "{label}: the cube");
         assert_eq!(uavs[1], vec![0; 384], "{label}: the old values");
+    }
+}
+
+/// Sample s of pixel (x, y) of slice z of a 4x4 four-sample texture:
+/// (1 + its index) / 256, exact as a depth.
+fn sample_value(z: u32, x: u32, y: u32, s: u32) -> f32 {
+    (1 + ((z * 4 + y) * 4 + x) * 4 + s) as f32 / 256.0
+}
+
+fn msaa_values(slices: u32) -> Vec<f32> {
+    (0..slices * 64)
+        .map(|i| sample_value(i / 64, i / 4 % 4, i / 16 % 4, i % 4))
+        .collect()
+}
+
+/// Thread t loads sample t >> 4 of pixel (t & 3, t >> 2 & 3) of a 4x4
+/// four-sample texture: all 64.
+#[test]
+fn multisampled_loads_read_the_sample_asked_for() {
+    let shader = build(
+        &program(&CUBE_ADDRESS, &mimg(IMAGE_LOAD, MSAA, 0xF, 4, 1)),
+        64,
+        false,
+    );
+    let values = msaa_values(1);
+    let view = View::MsaaDepth {
+        width: 4,
+        height: 4,
+        samples: 4,
+        slices: 1,
+        array: false,
+        values: &values,
+    };
+    let want: Vec<[f32; 4]> = (0..64)
+        .map(|t| [sample_value(0, t & 3, t >> 2 & 3, t >> 4), 0.0, 0.0, 1.0])
+        .collect();
+    for (label, uavs) in run(&shader, view, 64) {
+        assert_eq!(uavs[0], bits(&want), "{label}");
+    }
+}
+
+/// Thread t loads sample t >> 5 of pixel (t & 3, t >> 2 & 3) of slice
+/// t >> 4 & 1 of a two-slice 4x4 four-sample array, red only.
+#[test]
+fn multisampled_array_loads_read_the_slice_and_sample_asked_for() {
+    let body = [
+        vop2(V_AND_B32, 12, k(3), 0),
+        vop2(V_LSHRREV_B32, 13, k(2), 0),
+        vop2(V_AND_B32, 13, k(3), 13),
+        vop2(V_LSHRREV_B32, 14, k(4), 0),
+        vop2(V_AND_B32, 14, k(1), 14),
+        vop2(V_LSHRREV_B32, 15, k(5), 0),
+        // Channels not loaded stay as set here.
+        vop1(V_MOV_B32, 5, k(7)),
+        vop1(V_MOV_B32, 6, k(7)),
+        vop1(V_MOV_B32, 7, k(7)),
+    ];
+    let shader = build(
+        &program(&body, &mimg(IMAGE_LOAD, MSAA_ARRAY, 0x1, 4, 12)),
+        128,
+        false,
+    );
+    let values = msaa_values(2);
+    let view = View::MsaaDepth {
+        width: 4,
+        height: 4,
+        samples: 4,
+        slices: 2,
+        array: true,
+        values: &values,
+    };
+    let want: Vec<u32> = (0..128)
+        .flat_map(|t| {
+            let red = sample_value(t >> 4 & 1, t & 3, t >> 2 & 3, t >> 5);
+            [red.to_bits(), 7, 7, 7]
+        })
+        .collect();
+    for (label, uavs) in run(&shader, view, 128) {
+        assert_eq!(uavs[0], want, "{label}");
+    }
+}
+
+/// The width, height and layers of a multisampled 2D texture and array.
+#[test]
+fn multisampled_sizes() {
+    let body = [vop1(V_MOV_B32, 1, k(0)), vop1(V_MOV_B32, 7, k(7))];
+    let values = msaa_values(2);
+    for (dim, array, layers) in [(MSAA, false, 1), (MSAA_ARRAY, true, 2)] {
+        let shader = build(
+            &program(&body, &mimg(IMAGE_GET_RESINFO, dim, 0x7, 4, 1)),
+            1,
+            false,
+        );
+        let view = View::MsaaDepth {
+            width: 4,
+            height: 4,
+            samples: 4,
+            slices: 2,
+            array,
+            values: &values,
+        };
+        for (label, uavs) in run(&shader, view, 1) {
+            assert_eq!(uavs[0], [4, 4, layers, 7], "{label}, dim {dim}");
+        }
     }
 }
