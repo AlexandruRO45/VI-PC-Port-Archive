@@ -3861,4 +3861,68 @@ mod tests {
         assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
         assert_eq!(found[1].span().end, file.len());
     }
+
+    #[test]
+    fn zero_run_crossing_into_the_distance_codes_is_a_stream() {
+        // Runs of zeros (17: 3 to 10, 18: 11 to 138) may carry on from the
+        // last literal/length codes into the distance codes, as a run of
+        // the previous length (16) may. A header stating more literal/length
+        // codes than the block uses, its unused ones and all distance codes
+        // but the last sent as one run of zeros, is a stream. The same run
+        // two longer (one longer only ends the header early) runs past the
+        // codes the header states and breaks it. Either way the record
+        // covers no other, so it is yielded, unpacking only if it is a
+        // stream, and the record after it is found.
+        let a = u32::from(b'A');
+        // Code-length code: 0, 1, 17 and 18 in 2 bits each (complete).
+        let mut clen = [0; 19];
+        (clen[0], clen[1], clen[17], clen[18]) = (2, 2, 2, 2);
+        let data = [a, a, a, a, 256];
+        let want = b"AAAA".to_vec();
+        // `A` and the end of the block in 1 bit each; the last distance
+        // code, unused, in 1 bit (a lone distance code).
+        let block = |hlit: u32, hdist: u32, run: u32| {
+            let mut lit = vec![0; hlit as usize];
+            (lit[a as usize], lit[256]) = (1, 1);
+            let mut seq = length_symbols(&lit[..257]);
+            assert!(seq.iter().all(|&(sym, _)| matches!(sym, 1 | 18)));
+            seq.push(match run {
+                3..=10 => (17, run - 3),
+                _ => (18, run - 11),
+            });
+            seq.push((1, 0));
+            dynamic_block_of(hlit, hdist, &clen, &seq, &lit, &data)
+        };
+        // (literal/length codes, distance codes): the zeros between the
+        // end of the block and the last distance code fill a 17 run (6),
+        // the longest a 17 still breaks with (8), and an 18 run (58, the
+        // most the header can state).
+        for (hlit, hdist) in [(260, 4), (261, 5), (286, 30)] {
+            let zeros = (hlit - 257) + (hdist - 1);
+            assert!(hlit > 257 && hdist > 1, "the run crosses");
+            for (run, valid) in [(zeros, true), (zeros + 2, false)] {
+                let what = format!("{hlit}/{hdist} codes, run of {run} zeros");
+                let packed = block(hlit, hdist, run);
+                assert_eq!(
+                    miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                    valid.then(|| want.clone()),
+                    "{what}"
+                );
+                assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+                let (file, marker) = outer_then_after(&packed, want.len());
+                let found: Vec<_> = records(&file).collect();
+                let names: Vec<_> = found.iter().map(|r| r.name).collect();
+                assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+                assert_eq!(
+                    found[0].span(),
+                    marker..marker + 12 + packed.len(),
+                    "{what}"
+                );
+                assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+                assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+                assert_eq!(found[1].span().end, file.len(), "{what}");
+            }
+        }
+    }
 }
