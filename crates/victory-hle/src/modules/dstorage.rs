@@ -1717,18 +1717,30 @@ mod tests {
 
         let queue_fn: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
             call(factory(), 0x50);
+        // The scheduler is shared by every test of this module, which create
+        // and close queues at the same time, so a count of all lanes before
+        // and after would be flaky; a lane of a capacity no other test uses
+        // is not.
+        const CAPACITY: u16 = 0x5EED;
         let desc = QueueDesc {
             source_type: 0,
-            capacity: 4,
+            capacity: CAPACITY,
             priority: 0,
             name: c"null".as_ptr(),
             unknown: 1,
         };
-        let lanes_before = scheduler().unwrap().lock().lanes.len();
         assert_eq!(
             queue_fn(factory(), &desc, std::ptr::null(), std::ptr::null_mut()),
             E_INVALIDARG
         );
-        assert_eq!(scheduler().unwrap().lock().lanes.len(), lanes_before);
+        assert!(
+            !scheduler()
+                .unwrap()
+                .lock()
+                .lanes
+                .values()
+                .any(|l| l.capacity == usize::from(CAPACITY)),
+            "a lane was created for a call with no out pointer"
+        );
     }
 }
