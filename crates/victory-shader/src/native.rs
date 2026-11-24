@@ -3971,6 +3971,82 @@ mod tests {
     }
 
     #[test]
+    fn heap_and_fixed_sampler_reads_keep_none_of_the_table_rules() {
+        let (srv, sampler, cbv, uav) = (0u8, 1u8, 2u8, 3u8);
+        let (table, fixed, resource_heap, sampler_heap) = (3u8, 4u8, 5u8, 6u8);
+        // A table in s4 (slot 2), a root descriptor in s6-s7 (slot 3), the
+        // resource heap in s8 (slot 4) and the sampler heap in s9 (slot 5).
+        let params = [(3, 1, 4, 2), (1, 2, 6, 3), (5, 1, 8, 4), (6, 1, 9, 5)];
+        // A heap or fixed-sampler read is neither found by its SGPR nor bound
+        // by its slot, and names no descriptor of a table: each read below
+        // is kept as stated, even where the same read of the table is
+        // refused for the reason beside it.
+        for (kind, root, offset, user_data, slot) in [
+            (srv, resource_heap, 0, 8, 4),
+            (sampler, sampler_heap, 0, 9, 5),
+            (sampler, fixed, 0, 30, 7),
+        ] {
+            let p = &reading_with(&params, &[(kind, root, offset, user_data, slot)]).unwrap()[0];
+            assert_eq!(
+                (p.used[0].kind, p.used[0].table_offset_dwords),
+                (
+                    [
+                        ResourceType::Srv,
+                        ResourceType::Sampler,
+                        ResourceType::Cbv,
+                        ResourceType::Uav
+                    ][usize::from(kind)],
+                    offset
+                )
+            );
+            assert_eq!((p.used[0].user_data, p.used[0].slot), (user_data, slot));
+        }
+        for (reads, table_refusal) in [
+            (vec![(srv, 20, 9)], "used descriptor names no root table"),
+            (
+                vec![(srv, 8, 4), (uav, 8, 4)],
+                "used descriptors read one descriptor two ways",
+            ),
+            (
+                vec![(sampler, 0, 4), (cbv, 8, 4)],
+                "root table mixes samplers and views",
+            ),
+            (
+                vec![(cbv, MAX_TABLE_DWORDS, 4)],
+                "used descriptor past any heap",
+            ),
+            (vec![(cbv, u32::MAX, 4)], "used descriptor past any heap"),
+        ] {
+            // Through each heap (its own SGPR and slot, or another's).
+            for root in [resource_heap, sampler_heap, fixed] {
+                let heap_reads = reads
+                    .iter()
+                    .map(|&(kind, offset, user_data)| {
+                        (kind, root, offset, user_data, user_data / 2)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    reading_with(&params, &heap_reads).is_ok(),
+                    "root {root}: {heap_reads:?}"
+                );
+            }
+            // Through the table in s4 (slot 2) unless the read names another.
+            let table_reads = reads
+                .iter()
+                .map(|&(kind, offset, user_data)| {
+                    let slot = if user_data == 4 { 2 } else { user_data / 2 };
+                    (kind, table, offset, user_data, slot)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                why_refused(reading_with(&params, &table_reads)),
+                table_refusal,
+                "{table_reads:?}"
+            );
+        }
+    }
+
+    #[test]
     fn refuses_a_descriptor_read_of_unknown_kind() {
         let (descriptor, table) = (1u8, 3u8);
         // SRV, sampler, CBV and UAV are the kinds there are.
