@@ -3733,4 +3733,66 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn incomplete_code_length_or_distance_code_is_noise() {
+        // Every code a dynamic block sends must be complete, the code-length
+        // code and a distance code of two codes or more included: lengths
+        // leaving some codes unassigned break the stream, though every
+        // symbol the block sends has a code (the lone 1-bit distance code is
+        // the one exception; see
+        // `lone_distance_code_is_a_stream_and_its_missing_half_is_noise`).
+        // Such a broken record covers no other, so it is yielded and does
+        // not unpack, and the record after it is found either way.
+        let a = u32::from(b'A');
+        // Literal/length codes: `A` in 1 bit, the end of the block and
+        // length code 257 (3 bytes) in 2; two distance codes (distances 1
+        // and 2) of `dist` bits each.
+        let block = |clen: &[u32; 19], dist: u32| {
+            let mut lengths = vec![0; 258 + 2];
+            (lengths[a as usize], lengths[256], lengths[257]) = (1, 2, 2);
+            (lengths[258], lengths[259]) = (dist, dist);
+            let lit = &lengths[..258];
+            let lit_codes = canonical(lit);
+            let dist_codes = canonical(&lengths[258..]);
+            let mut bits = dynamic_header(258, 2, clen, &length_symbols(&lengths));
+            bits.code(lit_codes[a as usize], 1);
+            bits.code(lit_codes[257], 2);
+            bits.code(dist_codes[0], dist);
+            bits.code(lit_codes[256], 2);
+            bits.out
+        };
+        // Code-length code: 18 in 1 bit, 0 in 2, 1 and 2 in 3 (complete).
+        let mut clen = [0; 19];
+        (clen[18], clen[0], clen[1], clen[2]) = (1, 2, 3, 3);
+        // The same with 2 in 4 bits: one 4-bit code left unassigned.
+        let mut short = clen;
+        short[2] = 4;
+        let want = b"AAAA".to_vec();
+        for (what, packed, valid) in [
+            ("complete codes", block(&clen, 1), true),
+            ("incomplete code-length code", block(&short, 1), false),
+            ("two distance codes of 2 bits", block(&clen, 2), false),
+        ] {
+            assert_eq!(
+                miniz_oxide::inflate::decompress_to_vec(&packed).ok(),
+                valid.then(|| want.clone()),
+                "{what}"
+            );
+            assert_eq!(starts_stream(&packed, want.len()), valid, "{what}");
+
+            let (file, marker) = outer_then_after(&packed, want.len());
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_outer"), Some("PS_after")], "{what}");
+            assert_eq!(
+                found[0].span(),
+                marker..marker + 12 + packed.len(),
+                "{what}"
+            );
+            assert_eq!(found[0].unpack(), valid.then(|| want.clone()), "{what}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "{what}");
+        }
+    }
 }
