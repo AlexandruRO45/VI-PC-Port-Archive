@@ -2197,6 +2197,104 @@ mod tests {
         assert_eq!(names(root, false), ["relative/c.rs", "rules"]);
     }
 
+    /// A `core.excludesFile` set by a conditional include holds only while
+    /// its condition does, as the full check reads it: `gitdir:` naming this
+    /// `.git` matches, and so does `gitdir/i:` naming it in upper case,
+    /// while `gitdir:` naming another directory does not; `onbranch:` holds
+    /// for the branch `HEAD` names, even unborn. Each include names its own
+    /// excludes file for the one key, so only the last include that holds
+    /// counts: `branch`, then, with the branch includes gone, `folded`, then
+    /// `exact`, is taken, while the rest stay visible and are refused, left
+    /// empty. Once `HEAD` names `other`, its rule is last and holds instead,
+    /// and `branch` is seen again.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_may_be_ignored_by_a_conditionally_included_excludes_file() {
+        let repo = tempdir();
+        let outside = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        git_str(root, &["symbolic-ref", "HEAD", "refs/heads/scratch"]);
+        let git_dir = format!("{}/.git", root.to_str().unwrap());
+        let mut config = String::new();
+        for (name, condition) in [
+            ("exact", format!("gitdir:{git_dir}")),
+            ("folded", format!("gitdir/i:{}", git_dir.to_uppercase())),
+            ("elsewhere", format!("gitdir:{git_dir}-elsewhere/")),
+            ("branch", "onbranch:scratch".to_owned()),
+            ("other", "onbranch:other".to_owned()),
+        ] {
+            let rules = outside.path().join(format!("{name}.rules"));
+            std::fs::write(&rules, format!("/{name}/\n")).unwrap();
+            let include = outside.path().join(format!("{name}.config"));
+            std::fs::write(
+                &include,
+                format!("[core]\n\texcludesFile = {}\n", rules.to_str().unwrap()),
+            )
+            .unwrap();
+            config.push_str(&format!(
+                "[includeIf \"{condition}\"]\n\tpath = {}\n",
+                include.to_str().unwrap()
+            ));
+        }
+        let mut local = std::fs::read_to_string(root.join(".git/config")).unwrap();
+        local.push_str(&config);
+        std::fs::write(root.join(".git/config"), local).unwrap();
+        let dir = |name: &str| root.join(name);
+        for name in ["exact", "folded", "elsewhere", "branch", "other"] {
+            std::fs::create_dir(dir(name)).unwrap();
+        }
+        let taken = |first: &[&str], last: &str| {
+            let tmp = tempdir_in_first(root, first.iter().map(|name| dir(name)).chain([dir(last)]));
+            assert_eq!(tmp.path().parent(), Some(dir(last).as_path()));
+            for name in first {
+                assert_eq!(std::fs::read_dir(dir(name)).unwrap().count(), 0);
+            }
+            tmp
+        };
+        // Only `branch` is ignored: the later `onbranch:other` does not hold.
+        let tmp = taken(&["elsewhere", "other", "exact", "folded"], "branch");
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(dir("exact").join("a.rs"), b"fn a() {}\n").unwrap();
+        assert_eq!(names(root, false), ["exact/a.rs"]);
+        std::fs::remove_file(dir("exact").join("a.rs")).unwrap();
+
+        // With the branch includes gone, `folded`, the last to hold, wins.
+        let only_gitdir: String = std::fs::read_to_string(root.join(".git/config"))
+            .unwrap()
+            .split("[includeIf")
+            .filter(|section| !section.contains("onbranch:"))
+            .collect::<Vec<_>>()
+            .join("[includeIf");
+        std::fs::write(root.join(".git/config"), &only_gitdir).unwrap();
+        drop(tmp);
+        let tmp = taken(&["elsewhere", "other", "branch", "exact"], "folded");
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        drop(tmp);
+
+        // And with `folded`'s gone too, `exact`, the first, is all that holds.
+        let only_exact: String = only_gitdir
+            .split("[includeIf")
+            .filter(|section| !section.contains("gitdir/i:"))
+            .collect::<Vec<_>>()
+            .join("[includeIf");
+        std::fs::write(root.join(".git/config"), &only_exact).unwrap();
+        let tmp = taken(&["elsewhere", "other", "branch", "folded"], "exact");
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        drop(tmp);
+
+        // Restored, and on `other`, its rule is last and `branch` is seen.
+        let mut restored = only_exact.split("[includeIf").next().unwrap().to_owned();
+        restored.push_str(&config);
+        std::fs::write(root.join(".git/config"), restored).unwrap();
+        git_str(root, &["symbolic-ref", "HEAD", "refs/heads/other"]);
+        let tmp = taken(&["elsewhere", "branch", "exact", "folded"], "other");
+        std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        std::fs::write(dir("branch").join("b.rs"), b"fn b() {}\n").unwrap();
+        assert_eq!(names(root, false), ["branch/b.rs"]);
+        super::run(root, false).unwrap();
+    }
+
     /// A TMPDIR is unseen when any directory above it is ignored, however
     /// deep: `/outer/` covers `outer/deep/er`, and a negation under it
     /// (`!/outer/deep/`) re-includes nothing, since git never looks inside
