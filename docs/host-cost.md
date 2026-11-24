@@ -167,3 +167,46 @@ Both are in this crate and both red the suite at random, so a green
   concurrent copy can only add to the evidence, never withdraw it).
 
 Both were found by DGR-6, not by me; the numbers above are its measurements.
+
+## Prepared: declare a shader's write ranges once per frame
+
+Not landed, deliberately: it lives in the copy-back path that has already
+corrupted title memory once (`title+0x4e9b54a`, a fence list read as -1), and
+no run can contradict it today. Written out here so it lands in one piece when
+one can. Verify the counters above first.
+
+**The invariant.** For every byte of a declared range, the bytes kept before a
+submission equal the copy as it stood at the start of *that* submission. Then
+`copy_back` sees only what the GPU changed, and the per-submission memcpy of
+the same ranges disappears.
+
+**Three changes in `shadow.rs`.**
+
+1. `Shadow::writing` keeps its parts across submissions: `copy_back` stops
+   calling `forget` when `pending` empties. Parts still go on `Drop` and when
+   the runtime remaps title memory (`watch::title_memory_remapped`).
+2. `Shadow::copy`, the refresh from title memory, writes the bytes it copies
+   into the parts covering them as well. Without this, a title write between
+   two submissions is read as the GPU's and copied back.
+3. `copy_back` writes the bytes it leaves in the copy (`*h = *t`) into the
+   covering parts too, so the kept copy follows the copy instead of going stale.
+
+**What it costs.** One extra memcpy of the refreshed bytes: 107 MB/frame in
+the `hardware2` world window, about 15 ms. What it saves is the whole snapshot
+half, which `copies per frame` now reports as `MB kept before shaders write in
+N ms`. The compare half survives — see the note above.
+
+**Tests it needs, in `shadow/snapshot_tests.rs`** (they already have two
+copies, `Shadow::kept`, and a host device):
+
+- two submissions over the same range where the GPU changed nothing: the
+  second copies back 0 bytes;
+- the same, with one byte written by the shader: exactly that byte goes back;
+- a title write between the two submissions and no GPU write: 0 bytes go back,
+  so a title write is never attributed to the GPU.
+
+**The A/B when a world frame survives.**
+`powershell -File D:\victory-scratch\runs\world.ps1 -Name ranges -Seconds 120 -Set 'VICTORY_GPU_TIMING=1'`,
+then read `MB kept before shaders write in N ms` on the `copies per frame`
+line: it should fall to near zero after the first frame, and `ms/frame`
+should fall by that amount.
