@@ -1121,22 +1121,43 @@ fn readable(
     // brings it up to date from title memory (which the last submission's
     // copy-back already wrote), and what shaders write in it goes back from
     // it.
-    // shortcut: such a copy is brought up to date from title memory when the
-    // submission is prepared, so it does not see what a shader of the same
-    // submission wrote in that range through another view, nor do they see
-    // its writes until the next one. Getting that right needs every host
-    // buffer's state tracked across the submission (PR #334), so that the
-    // bytes can be copied on the GPU inside the list instead.
+    // Brought up to date from title memory when the submission is prepared,
+    // such a copy would not see what this submission's shaders wrote in its
+    // range in the buffer's copy before the read. Where they do write there
+    // (`Shadow::fed_from`, found by that copy's copy-back), a shader view
+    // reads what a view on an element of the same bytes reads instead: the
+    // buffer's copy, copied in on the GPU right before the read.
+    // shortcut: unordered views with their own copy still write it apart,
+    // so within a submission other views of those bytes do not see their
+    // writes until the copy-back.
     if let Some(copy) = copy
         && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
     {
-        copy.refresh(list, address, len);
-        if u.kind == ResourceType::Uav {
-            copy.gpu_writes(list, address, len);
-            list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
-        } else {
+        let fed = (u.kind == ResourceType::Srv)
+            .then(|| copy.fed_from())
+            .flatten();
+        if let Some(from) = fed {
+            from.refresh(list, address, len);
+            let len = len.min(from.left(address));
+            list.buffer_state(&from.buffer, crate::host::BUFFER_READ);
+            list.buffer_state(&copy.buffer, crate::host::BUFFER_COPY_DEST);
+            // SAFETY: an open list; both buffers are host copies the slot and
+            // the buffer registry keep alive, and `len` bytes lie in each
+            // (the view's copy holds its whole range).
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&copy.buffer, 0, &from.buffer, from.offset(address), len)
+            };
             list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+        } else {
+            copy.refresh(list, address, len);
+            if u.kind == ResourceType::Uav {
+                copy.gpu_writes(list, address, len);
+                list.buffer_state(&copy.buffer, crate::host::BUFFER_WRITE);
+            } else {
+                list.buffer_state(&copy.buffer, crate::host::BUFFER_READ);
+            }
         }
     }
     match (view, u.kind) {

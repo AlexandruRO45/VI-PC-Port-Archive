@@ -690,6 +690,8 @@ type States = std::collections::HashMap<
 pub(crate) const BUFFER_READ: u32 = D3D12_RESOURCE_STATE_GENERIC_READ.0 as u32;
 /// Shader writes to a host copy of title memory.
 pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32;
+/// A host copy of title memory that a copy on the GPU writes.
+pub(crate) const BUFFER_COPY_DEST: u32 = D3D12_RESOURCE_STATE_COPY_DEST.0 as u32;
 
 /// The states of the host copies of title memory (buffers) one list uses,
 /// by copy: the state it starts in and the one it is in now. A buffer is in

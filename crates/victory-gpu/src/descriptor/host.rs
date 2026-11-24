@@ -595,7 +595,7 @@ fn view_copy(
     match plan(bytes, element, buffer.offset(from)) {
         Copy::Element { first } => Ok((buffer, first, false)),
         Copy::OwnBytes => {
-            let copy = crate::shadow::aligned(from, bytes).ok_or("no copy of the view")?;
+            let copy = crate::shadow::aligned(from, bytes, &buffer).ok_or("no copy of the view")?;
             Ok((copy, 0, true))
         }
         Copy::None { why } => Err(why),
