@@ -309,6 +309,13 @@ mod root_view_tests {
     }
 }
 
+/// Local build: `VICTORY_ROOT_UAV_BACK=0` keeps what shaders write through root UAVs on the
+/// host (not copied back into title memory), to tell whether those writes break the title.
+fn root_uav_copy_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ROOT_UAV_BACK").map_or(true, |v| v.trim() != "0"))
+}
+
 fn root_address(root: Option<&Root>, kind: RootBuffer) -> Result<u64, &'static str> {
     match root {
         Some(&Root::View(actual, address)) if actual == kind => Ok(address),
@@ -1000,7 +1007,7 @@ impl State {
                     match copy {
                         RootCopy::Shadow(shadow, address, len) => {
                             shadow.refresh(list, address, len);
-                            if kind == RootBuffer::Uav {
+                            if kind == RootBuffer::Uav && root_uav_copy_back() {
                                 shadow.gpu_writes(list, address, len);
                             }
                         }
