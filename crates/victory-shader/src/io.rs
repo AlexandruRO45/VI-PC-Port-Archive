@@ -992,6 +992,37 @@ mod tests {
         assert!(mesh_io(&[0xE030_2000, 0x8002_0500, S_ENDPGM]).is_ok());
     }
 
+    /// Atomics send their data whether or not they return the old value,
+    /// global accesses read their address and stored data, and an image
+    /// store reads its data while an image load writes it: each names v5 by
+    /// that role.
+    #[test]
+    fn atomic_global_and_image_operands_read_the_mesh_group_by_their_role() {
+        let per_lane = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "the mesh group input read per lane",
+        });
+        let io = |w: [u32; 2]| mesh_io(&[w[0], w[1], S_ENDPGM]);
+        // buffer_atomic_add v5, v0, s[8:11], 0 idxen: the data it adds.
+        assert_eq!(io([0xE0C8_2000, 0x8002_0500]), per_lane);
+        // The same with glc: the old value returns into v5, but the data
+        // was read first.
+        assert_eq!(io([0xE0C8_6000, 0x8002_0500]), per_lane);
+        // global_store_dword v[0:1], v5, null: stored data.
+        assert_eq!(io([0xDC70_8000, 0x007D_0500]), per_lane);
+        // global_store_dword v[4:5], v1, null: v5 as the address's high
+        // dword.
+        assert_eq!(io([0xDC70_8000, 0x007D_0104]), per_lane);
+        // global_load_dword v5, v[0:1], null: the load replaces v5.
+        assert!(io([0xDC30_8000, 0x057D_0000]).is_ok());
+        // image_store v5, v0, s[8:15] dim:1D unorm: stored data.
+        assert_eq!(io([0xF020_1100, 0x0002_0500]), per_lane);
+        // image_load v5, v0, s[8:15] dim:1D unorm: the load replaces v5.
+        assert!(io([0xF000_1100, 0x0002_0500]).is_ok());
+        // image_load v1, v5, s[8:15] dim:1D unorm: the coordinate.
+        assert_eq!(io([0xF000_1100, 0x0002_0105]), per_lane);
+    }
+
     fn vertex(inputs: Vec<crate::native::VsInput>) -> NativeProgram {
         NativeProgram {
             stage: HwStage::Vs,
