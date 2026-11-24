@@ -49,6 +49,9 @@ O que cada parte faz hoje e o que ainda falta:
 
 ## Primeiros passos
 
+Nunca compilou um programa? Siga o
+[guia de instalação para iniciantes](docs/pt-BR/instalacao.md).
+
 Requisitos: Windows 10/11 x64, CPU com AVX2, GPU Direct3D 12 com shader model
 6.6 (e mesh shaders para o mundo), Rust (versão fixada em
 `rust-toolchain.toml`).
