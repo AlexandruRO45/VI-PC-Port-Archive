@@ -18,6 +18,7 @@ pub(super) enum Flow {
 
 pub(super) struct Em {
     opt: Options,
+    pub regions: Option<super::regions::Regions>,
     out: String,
     pub indent: usize,
     sgprs: BTreeSet<u64>,
@@ -466,6 +467,7 @@ impl Em {
     pub fn new(opt: Options) -> Self {
         Em {
             opt,
+            regions: None,
             out: String::new(),
             indent: 1,
             sgprs: BTreeSet::new(),
@@ -1700,6 +1702,8 @@ impl Em {
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_index = {index} + select(({d3} & 0x800000u) != 0u, lane_id & 63u, 0u);"));
+        let index = format!("{t}_index");
         let is_store = small.map_or(matches!(kind, BufKind::Store | BufKind::FormatStore), |(_, _, s)| s);
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         if self.opt.mem_windows > 1 {
@@ -1718,25 +1722,19 @@ impl Em {
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         }
         let act = self.act();
-        let multi = self.opt.mem_windows > 1;
-        let in_range = |bytes: String| {
-            if multi {
-                format!("select({t}_stride == 0u, {t}_off + (uint64_t)({bytes}) <= (uint64_t){d2}, {index} < {d2})")
-            } else {
-                format!("select({t}_stride == 0u, {t}_off + {bytes} <= {d2}, {index} < {d2})")
-            }
-        };
+        let in_range = |bytes: String| format!("xcl_buf_in_range({d1}, {d2}, {d3}, {index}, (uint64_t){t}_off, {bytes}, {soff})");
         if let Some((n, signed, store)) = small {
             let ok = in_range(format!("{n}u"));
             let v = self.vreg(vdata);
             if store {
                 self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({v}, 0u, 0u, 0u), {n}u);"));
             } else {
+                self.line(&format!("uint {t}_safe_a = select(and({act}, {ok}), {t}_a, 0u);"));
                 let bits = 8 * n;
                 let val = if signed {
-                    format!("(uint)(((int)(ld_raw({t}_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
+                    format!("(uint)(((int)(ld_raw({t}_safe_a).x << {}u)) >> {}u)", 32 - bits, 32 - bits)
                 } else {
-                    format!("(ld_raw({t}_a).x & {}u)", (1u64 << bits) - 1)
+                    format!("(ld_raw({t}_safe_a).x & {}u)", (1u64 << bits) - 1)
                 };
                 self.line(&format!("if ({act}) {v} = {ok} ? {val} : 0u;"));
             }
@@ -1780,9 +1778,20 @@ impl Em {
                 self.line(&format!("uint {t}_info = FMT_INFO[min({fmt}, 77u)];"));
                 self.line(&format!("bool {t}_int = ((({t}_info >> 3) & 7u) == 4u) || ((({t}_info >> 3) & 7u) == 5u);"));
                 self.line(&format!("bool {t}_ok = and(({t}_info & 7u) != 0u, {});", in_range(format!("fmt_bytes({t}_info)"))));
-                self.line(&format!("uint4 {t}_r = ld_raw({t}_a);"));
+                if d16_format.map_or(count, |(_, components, _)| components) == 1 {
+                    let v = self.vreg(vdata);
+                    let value = if let Some((_, _, high)) = d16_format {
+                        let half = format!("select({t}_int, {t}_v & 0xFFFFu, f32tof16(asfloat({t}_v)))");
+                        if high { format!("({v} & 0xFFFFu) | ({half} << 16)") } else { half }
+                    } else {
+                        format!("{t}_v")
+                    };
+                    self.line(&format!("if ({act}) {{ uint {t}_v = fmt_load_selected({t}_a, {t}_info, {d3} & 7u, {t}_ok); {v} = {value}; }}"));
+                    return Ok(());
+                }
+                self.line(&format!("uint4 {t}_r = ld_raw(select(and({act}, {t}_ok), {t}_a, 0u));"));
                 self.line(&format!(
-                    "uint4 {t}_c = uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u));"
+                    "uint4 {t}_c = select({t}_ok, uint4(fmt_comp({t}_r, {t}_info, 0u), fmt_comp({t}_r, {t}_info, 1u), fmt_comp({t}_r, {t}_info, 2u), fmt_comp({t}_r, {t}_info, 3u)), uint4(0u, 0u, 0u, 0u));"
                 ));
                 if let Some((_, components, high)) = d16_format {
                     let half = |component: u64| {
@@ -1792,13 +1801,13 @@ impl Em {
                     let mut assigns = Vec::new();
                     if high {
                         let v = self.vreg(vdata);
-                        assigns.push(format!("{v} = ({v} & 0xFFFFu) | ({t}_ok ? ({} << 16) : 0u);", half(0)));
+                        assigns.push(format!("{v} = ({v} & 0xFFFFu) | ({} << 16);", half(0)));
                     } else {
                         for i in 0..count {
                             let lo = half(2 * i);
                             let hi = if 2 * i + 1 < components { half(2 * i + 1) } else { "0u".into() };
                             let v = self.vreg(vdata + i);
-                            assigns.push(format!("{v} = {t}_ok ? ({lo} | ({hi} << 16)) : 0u;"));
+                            assigns.push(format!("{v} = {lo} | ({hi} << 16);"));
                         }
                     }
                     self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
@@ -1807,7 +1816,7 @@ impl Em {
                 let mut assigns = Vec::new();
                 for i in 0..count {
                     let v = self.vreg(vdata + i);
-                    assigns.push(format!("{v} = select({t}_ok, dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int), 0u);", 3 * i));
+                    assigns.push(format!("{v} = dst_sel({t}_c, ({d3} >> {}u) & 7u, {t}_int);", 3 * i));
                 }
                 self.line(&format!("if ({act}) {{ {} }}", assigns.join(" ")));
             }
@@ -3684,10 +3693,12 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_index = {index} + select(({d3} & 0x800000u) != 0u, lane_id & 63u, 0u);"));
+        let index = format!("{t}_index");
         let x2 = op.ends_with("_x2");
         let op = op.trim_end_matches("_x2");
         let bytes = if x2 { 8 } else { 4 };
@@ -3699,11 +3710,11 @@ impl Em {
             ));
             self.window_write(&format!("(uint)({t}_ea >> 32)"));
             self.line(&format!("uint {t}_a = (uint){t}_ea & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + (uint64_t){bytes}u <= (uint64_t){d2}, {index} < {d2});"));
+            self.line(&format!("bool {t}_ok = xcl_buf_in_range({d1}, {d2}, {d3}, {index}, {t}_off, {bytes}u, {soff});"));
         } else {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = ({d0} + {soff} + {t}_off + {t}_stride * {index}) & ~{}u;", bytes - 1));
-            self.line(&format!("bool {t}_ok = select({t}_stride == 0u, {t}_off + {bytes}u <= {d2}, {index} < {d2});"));
+            self.line(&format!("bool {t}_ok = xcl_buf_in_range({d1}, {d2}, {d3}, {index}, (uint64_t){t}_off, {bytes}u, {soff});"));
         }
         let act = self.act();
         if x2 {
@@ -3742,10 +3753,12 @@ impl Em {
         let (vdata, vaddr, srsrc) = (f("VDATA"), f("VADDR"), Self::field(d, "SRSRC"));
         let soff = self.code32(f("SOFFSET"), None, false).ok_or("op")?;
         let (offen, idxen) = (f("OFFEN") != 0, f("IDXEN") != 0);
-        let (d0, d1, d2) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2));
+        let (d0, d1, d2, d3) = (self.sreg(srsrc), self.sreg(srsrc + 1), self.sreg(srsrc + 2), self.sreg(srsrc + 3));
         let index = if idxen { self.vreg(vaddr) } else { "0u".into() };
         let voff = if offen { self.vreg(vaddr + idxen as u64) } else { "0u".into() };
         let t = self.t();
+        self.line(&format!("uint {t}_index = {index} + select(({d3} & 0x800000u) != 0u, lane_id & 63u, 0u);"));
+        let index = format!("{t}_index");
         self.line(&format!("uint {t}_stride = ({d1} >> 16) & 0x3FFFu;"));
         if self.opt.mem_windows > 1 {
             self.line(&format!("uint64_t {t}_off = (uint64_t){voff} + (uint64_t){}u;", f("OFFSET")));
@@ -3762,17 +3775,13 @@ impl Em {
             self.line(&format!("uint {t}_off = {voff} + {}u;", f("OFFSET")));
             self.line(&format!("uint {t}_a = {d0} + {soff} + {t}_off + {t}_stride * {index};"));
         }
-        let ok = if self.opt.mem_windows > 1 {
-            format!("select({t}_stride == 0u, {t}_off + (uint64_t){n}u <= (uint64_t){d2}, {index} < {d2})")
-        } else {
-            format!("select({t}_stride == 0u, {t}_off + {n}u <= {d2}, {index} < {d2})")
-        };
+        let ok = format!("xcl_buf_in_range({d1}, {d2}, {d3}, {index}, (uint64_t){t}_off, {n}u, {soff})");
         let act = self.act();
         let v = self.vreg(vdata);
         if store {
             self.line(&format!("if (and({act}, {ok})) st_bytes({t}_a, uint4({}, 0u, 0u, 0u), {n}u);", d16_data(&v, half)));
         } else {
-            let raw = format!("select({ok}, ld_raw({t}_a).x, 0u)");
+            let raw = format!("select({ok}, ld_raw(select(and({act}, {ok}), {t}_a, 0u)).x, 0u)");
             self.line(&format!("if ({act}) {v} = {};", d16_merge(&v, &raw, n, signed, half)));
         }
         Ok(())
@@ -4185,7 +4194,7 @@ impl Em {
     }
 
     /// Storage and functions of the split wave64 form (`PRELUDE_X64`).
-    fn x64_prelude(&self, h: &mut String) {
+    fn x64_prelude(&self, h: &mut String, outline: bool) {
         let threads = self.x64_threads();
         let waves = threads.div_ceil(64).max(1) as usize;
         let slot = self.x64_words;
@@ -4206,7 +4215,7 @@ impl Em {
             let _ = writeln!(h, "groupshared uint xcl_xs[{slots}];\ngroupshared uint xcl_xc[{counters}];\ngroupshared uint xcl_xw;");
             h.push_str("#define XCL_XS(i) xcl_xs[(i)]\n#define XCL_XC(i) xcl_xc[(i)]\n#define XCL_XW xcl_xw\n");
         }
-        h.push_str(PRELUDE_X64);
+        h.push_str(&PRELUDE_X64.replace("XCL_EXCHANGE_FN ", if outline { "[noinline] " } else { "" }));
     }
 
     /// Storage and functions for early-exit-safe, bounded `s_barrier` (`PRELUDE_SAFE_BARRIER`).
@@ -4231,7 +4240,10 @@ impl Em {
         h.push_str("    xcl_xn = XCL_X_THREADS > ((xcl_tid & ~31u) ^ 32u) ? min(32u, XCL_X_THREADS - ((xcl_tid & ~31u) ^ 32u)) : 0u;\n");
     }
 
-    pub fn finish(&self, body: &str) -> String {
+    pub fn finish(&self, body: &str, instructions: usize) -> String {
+        // DXC otherwise copies each window switch and split-wave rendezvous to every call
+        // site. Keep short programs inline so the compiler can specialize their accesses.
+        let outline = instructions >= 1024 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_));
         let mut h = String::new();
         h.push_str("// generated by XCL (RDNA2 -> HLSL), do not edit\n");
         if matches!(self.opt.mode, Mode::Pixel(_)) {
@@ -4259,9 +4271,16 @@ impl Em {
             let ty = if *cmp { "SamplerComparisonState" } else { "SamplerState" };
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
-        h.push_str(PRELUDE);
+        if instructions >= 4096 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_)) {
+            // Each VALU instruction tests EXEC. Sharing this bit test saves a large program
+            // tens of thousands of copies while retaining the current EXEC at every call.
+            h.push_str(&PRELUDE.replacen("bool lanebit(uint lo, uint hi)", "[noinline] bool lanebit(uint lo, uint hi)", 1));
+        } else {
+            h.push_str(PRELUDE);
+        }
+        h.push_str(&PRELUDE_BUFFER_BOUNDS.replace("XCL_OUTLINE", if outline { "[noinline] " } else { "" }));
         if self.x64() {
-            self.x64_prelude(&mut h);
+            self.x64_prelude(&mut h, outline);
         }
         if let Some(u) = &self.upper {
             // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
@@ -4272,7 +4291,16 @@ impl Em {
         }
         let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
         let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
-        h.push_str(PRELUDE_MEM);
+        // A channel in an unaligned element can cross a 4 GiB window boundary. Select
+        // each word's window independently and leave the instruction's base window intact.
+        if windows > 1 {
+            h.push_str("uint fmt_word(uint base, uint offset) { uint at = base + offset; uint saved = xcl_w; xcl_w += uint(at < base); uint word = mem.Load(at); xcl_w = saved; return word; }\n");
+        } else {
+            h.push_str("uint fmt_word(uint base, uint offset) { return mem.Load(base + offset); }\n");
+        }
+        // Typed buffer conversions are large and often repeated hundreds or thousands of
+        // times in one program. Keep their scalar implementations shared in larger CSs.
+        h.push_str(&format_mem_prelude(instructions >= 256 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_))));
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -4299,6 +4327,7 @@ impl Em {
                 }
                 // split wave64: 64 threads (the console wave) in two hardware wave32s
                 let hw_lanes = if self.x64() { 32 } else { lanes };
+                if let Some(regions) = &self.regions { regions.emit(&mut h); }
                 let _ = writeln!(h, "[WaveSize({hw_lanes})]\n[numthreads({lanes}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
                 if split {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
@@ -4397,6 +4426,7 @@ impl Em {
                     }
                 }
                 self.safe_barrier_prelude(&mut h);
+                if let Some(regions) = &self.regions { regions.emit(&mut h); }
                 let _ = writeln!(
                     h,
                     "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
@@ -4704,7 +4734,7 @@ impl Em {
         }
         if windows > 1 {
             let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
-            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent));
+            h = windowed(&h, windows, self.opt.heap_windows.then_some(coherent), outline);
         }
         h
     }
@@ -4839,8 +4869,13 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(fill, "        o.p{k} = {v};");
     }
     let tri_base = MESH_HEADER + mv as usize * vd;
+    // The declaration is chosen by the vertex budget, the dispatch group count separately:
+    // a record over the budget in whole vertices can still fit one compact group (its few
+    // triangles' own copies fit) – declaring verts[mv] there is refused by DXC (80 vertices
+    // with 22 float4 rows are accounted as 96: 33792 B > 32768).
+    let cap = passthrough_max_vertices(16 * (1 + elems.len() as u32));
     let split = passthrough_split(ms, elems.len());
-    if split == 1 {
+    if mv <= cap {
         let _ = writeln!(
             h,
             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
@@ -4886,15 +4921,26 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
 /// D3D12's limit on what one mesh shader group outputs (vertex + primitive attributes).
 const MESH_OUTPUT_BYTES: u32 = 32768;
 
-/// Mesh groups the pass-through spends on one record: 1 when the record's vertices fit the
-/// mesh output limit as they are, else the triangles are split into runs whose own vertex
-/// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
+/// Vertices the pass-through puts in one mesh group: the vertex output budget divided by the
+/// stride, and DXC accounts whole chunks of 32 vertices even when fewer are declared (78
+/// vertices with 22 rows are accounted as 96). Measured with dxc 1.8.2502 (ms_6_6): every
+/// boundary from 9 to 26 float4 rows agrees.
+fn passthrough_max_vertices(vbytes: u32) -> u32 {
+    (MESH_OUTPUT_BYTES / vbytes).min(256) / 32 * 32
+}
+
+/// Mesh groups the pass-through spends on one record: the record's vertices fit the mesh
+/// output limit as they are, or the triangles go out in runs whose own vertex copies (3 per
+/// triangle) fit. The layout choice in `mesh_passthrough_for` is by the vertex budget alone;
+/// this count is the dispatch's, and one compact group can carry a record whose whole
+/// declaration would be refused. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
     let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
+    let cap = passthrough_max_vertices(vbytes);
+    if ms.max_vertices <= cap {
         return 1;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
+    let ppg = (cap / 3).max(1);
     ms.max_primitives.max(1).div_ceil(ppg)
 }
 
@@ -5095,7 +5141,8 @@ const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Lo
 /// definitions replace the placeholder.
 /// `heap`: Some(storage class) – the accessors take window k from the descriptor heap
 /// (`Options::heap_windows`) instead of switching over the root UAVs.
-fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
+fn windowed(h: &str, windows: u32, heap: Option<&str>, outline: bool) -> String {
+    let outline = outline && heap.is_none();
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem.") {
@@ -5107,13 +5154,95 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
             out.push_str("xcl_m");
             out.push_str(&tail[..name_len]);
             rest = &tail[name_len..];
+            if outline && scalar_window_method(&tail[..name_len]) {
+                out.push_str("(xcl_w, ");
+                rest = &rest[1..];
+            }
         } else {
             out.push_str(&rest[..i + 4]);
             rest = tail;
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, outline), 1)
+}
+
+// SM 6.6 DXIL retains scalar calls. Vector accessors use scalar out parameters below
+// so the driver sees one copy of the memory-window switch instead of one per use.
+fn scalar_window_method(name: &str) -> bool {
+    matches!(name, "Load" | "Store") || name.starts_with("Interlocked")
+}
+
+fn vector_window_accessor(windows: u32, name: &str, components: usize, store: bool, separate_addresses: bool) -> String {
+    let lanes = &['x', 'y', 'z', 'w'][..components];
+    let ty = format!("uint{components}");
+    let method = if separate_addresses { "Load".to_string() } else { name.trim_start_matches("xcl_m").to_string() };
+    let mut s = String::new();
+    let input = if separate_addresses {
+        lanes.iter().map(|c| format!("uint a{c}")).collect::<Vec<_>>().join(", ")
+    } else {
+        "uint a".into()
+    };
+    let extra = lanes.iter().map(|c| format!("{}uint {}{c}", if store { "" } else { "out " }, if store { 'v' } else { 'o' })).collect::<Vec<_>>().join(", ");
+    let _ = write!(s, "[noinline] void {name}_shared(uint window, {input}, {extra}) {{ ");
+    if store {
+        let values = lanes.iter().map(|c| format!("v{c}")).collect::<Vec<_>>().join(", ");
+        let _ = write!(s, "{ty} v = {ty}({values}); ");
+    } else {
+        let _ = write!(s, "{ty} v; ");
+    }
+    s.push_str("[branch] switch (window) { ");
+    for k in 0..windows {
+        let mem = if k == 0 { "mem".to_string() } else { format!("mem{k}") };
+        let _ = write!(s, "case {k}u: ");
+        if store {
+            let _ = write!(s, "{mem}.{method}(a, v); ");
+        } else if separate_addresses {
+            let values = lanes.iter().map(|c| format!("{mem}.Load(a{c})")).collect::<Vec<_>>().join(", ");
+            let _ = write!(s, "v = {ty}({values}); ");
+        } else {
+            let _ = write!(s, "v = {mem}.{method}(a); ");
+        }
+        s.push_str("break; ");
+    }
+    if !store {
+        let zeros = vec!["0u"; components].join(", ");
+        let _ = write!(s, "default: v = {ty}({zeros}); break; }} ");
+        for c in lanes {
+            let _ = write!(s, "o{c} = v.{c}; ");
+        }
+    } else {
+        s.push_str("default: break; } ");
+    }
+    s.push_str("}\n");
+    let wrapper_input = if separate_addresses { format!("{ty} a") } else if store { format!("uint a, {ty} v") } else { "uint a".into() };
+    let _ = write!(s, "{} {name}({wrapper_input}) {{ ", if store { "void" } else { &ty });
+    if !store {
+        for c in lanes {
+            let _ = write!(s, "uint o{c}; ");
+        }
+    }
+    let source = if separate_addresses {
+        lanes.iter().map(|c| format!("a.{c}")).collect::<Vec<_>>().join(", ")
+    } else if store {
+        let values = lanes.iter().map(|c| format!("v.{c}")).collect::<Vec<_>>().join(", ");
+        format!("a, {values}")
+    } else {
+        "a".into()
+    };
+    let _ = write!(s, "{name}_shared(xcl_w, {source}");
+    if !store {
+        for c in lanes {
+            let _ = write!(s, ", o{c}");
+        }
+    }
+    s.push_str("); ");
+    if !store {
+        let values = lanes.iter().map(|c| format!("o{c}")).collect::<Vec<_>>().join(", ");
+        let _ = write!(s, "return {ty}({values}); ");
+    }
+    s.push_str("}\n");
+    s
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
@@ -5122,7 +5251,8 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
 /// out-of-UMA pointers can never wrap onto live memory windows.
 /// `heap`: Some(storage class) – window k is taken from the descriptor heap
 /// (`Options::heap_windows`) and the same rule is one comparison before the access.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+fn mem_accessors(windows: u32, heap: Option<&str>, outline: bool) -> String {
+    let outline = outline && heap.is_none();
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5160,14 +5290,27 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    if outline {
+        s.push_str(&vector_window_accessor(windows, "xcl_loadx4", 4, false, true));
+    } else {
+        let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+        }
+        let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     for (ret, name, params, args, def) in sigs {
-        let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
+        if outline && matches!(name.as_str(), "Load2" | "Load3" | "Load4" | "Store2" | "Store3" | "Store4") {
+            let components = name.chars().last().unwrap().to_digit(10).unwrap() as usize;
+            s.push_str(&vector_window_accessor(windows, &format!("xcl_m{name}"), components, name.starts_with("Store"), false));
+            continue;
+        }
+        if outline && scalar_window_method(&name) {
+            let _ = write!(s, "[noinline] {ret} xcl_m{name}(uint window, {params}) {{ [branch] switch (window) {{ ");
+        } else {
+            let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
+        }
         if ret == "void" {
             let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
             for k in 1..windows {
@@ -5250,6 +5393,23 @@ fn d16_merge(v: &str, raw: &str, n: u32, signed: bool, half: u32) -> String {
     }
 }
 
+/// RDNA2 V# word 3 [29:28] selects the bounds rule. Mode 3 subtracts the
+/// scalar offset from the raw byte extent. Formatted accesses pass their
+/// entire payload, while unformatted vector accesses check each component.
+const PRELUDE_BUFFER_BOUNDS: &str = r#"
+XCL_OUTLINEbool xcl_buf_in_range(uint word1, uint records, uint word3, uint index, uint64_t offset, uint bytes, uint sgpr_offset) {
+    uint mode = (word3 >> 28) & 3u;
+    uint stride = (word1 >> 16) & 0x3FFFu;
+    uint64_t end = offset + (uint64_t)bytes;
+    if (mode == 0u) return index < records && offset < (uint64_t)stride;
+    if (mode == 1u) return index < records;
+    if (mode == 2u) return records != 0u;
+    if ((word1 & 0x80000000u) != 0u && stride != 0u)
+        return index < records && end <= (uint64_t)stride;
+    return end + (uint64_t)sgpr_offset <= (uint64_t)records;
+}
+"#;
+
 /// Per-lane private memory of scratch_* (static = thread-private in HLSL; 4 KB per lane).
 const PRELUDE_SCRATCH: &str = r#"
 static uint xcl_scratch[1024];
@@ -5260,6 +5420,11 @@ void scr_st(uint a, uint v, uint n) {
     if (s != 0u && s + 8u * n > 32u) { uint b2 = (b + 1u) & 1023u; xcl_scratch[b2] = (xcl_scratch[b2] & ~(m >> (32u - s))) | ((v & m) >> (32u - s)); }
 }
 "#;
+
+fn format_mem_prelude(outline: bool) -> String {
+    // Retained DXIL calls require scalar parameters and results on the supported profiles.
+    PRELUDE_MEM.replace("XCL_FORMAT_FN ", if outline { "[noinline] " } else { "" })
+}
 
 const PRELUDE_MEM: &str = r#"
 uint4 ld_raw(uint a) {
@@ -5290,12 +5455,10 @@ float uf_small(uint v, uint mb) {
     return select(e == 31u, special, select(e == 0u, fm * exp2(-14.0f), exp2((float)e - 15.0f) * (1.0f + fm)));
 }
 uint fmt_bytes(uint info) { return (((info >> 8) & 63u) + ((info >> 14) & 63u) + ((info >> 20) & 63u) + ((info >> 26) & 63u)) / 8u; }
-uint fmt_comp(uint4 r, uint info, uint c) {
-    uint n = info & 7u; uint ty = (info >> 3) & 7u;
-    bool isint = or(ty == 4u, ty == 5u);
-    uint off = select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
-    uint w = (info >> ((8u + 6u * c) & 31u)) & 63u;
-    uint v = bits_at(r, off, w);
+uint fmt_offset(uint info, uint c) {
+    return select(c > 0u, (info >> 8) & 63u, 0u) + select(c > 1u, (info >> 14) & 63u, 0u) + select(c > 2u, (info >> 20) & 63u, 0u);
+}
+XCL_FORMAT_FN uint fmt_value(uint v, uint w, uint ty) {
     uint sh = (32u - w) & 31u;
     int sv = select(w >= 32u, (int)v, ((int)(v << sh)) >> sh);
     float maxu = select(w >= 32u, 4294967295.0f, (float)((1u << (w & 31u)) - 1u));
@@ -5305,8 +5468,26 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint f_un = asuint(select(v == 0u, 0.0f, select(fv >= maxu, 1.0f, fv / maxu)));
     uint f_sn = asuint(select(sv == 0, 0.0f, select(fsv >= maxs, 1.0f, max(fsv / maxs, -1.0f))));
     uint flt = select(w == 32u, v, select(w == 16u, asuint(f16tof32(v)), asuint(uf_small(v, select(w == 11u, 6u, 5u)))));
-    uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
-    return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
+    return select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
+}
+uint fmt_one(uint ty) { return select(or(ty == 4u, ty == 5u), 1u, 0x3F800000u); }
+uint fmt_comp(uint4 r, uint info, uint c) {
+    uint ty = (info >> 3) & 7u, w = (info >> (8u + 6u * c)) & 63u;
+    return select(c >= (info & 7u), select(c == 3u, fmt_one(ty), 0u), fmt_value(bits_at(r, fmt_offset(info, c), w), w, ty));
+}
+// BUFFER_LOAD_FORMAT_X needs one swizzled channel. Check the whole record but fetch
+// just its selected bits. Constants and out-of-range reads do not touch the UAV.
+XCL_FORMAT_FN uint fmt_load_selected(uint a, uint info, uint sel, bool ok) {
+    uint ty = (info >> 3) & 7u, c = (sel - 4u) & 3u;
+    if (sel == 1u) return fmt_one(ty);
+    if (sel == 0u || !ok) return 0u;
+    if (c >= (info & 7u)) return c == 3u ? fmt_one(ty) : 0u;
+    uint w = (info >> (8u + 6u * c)) & 63u;
+    uint bit = (a & 3u) * 8u + fmt_offset(info, c);
+    uint offset = (bit >> 5) * 4u, shift = bit & 31u;
+    uint value = fmt_word(a & ~3u, offset) >> shift;
+    if (shift + w > 32u) value |= fmt_word(a & ~3u, offset + 4u) << (32u - shift);
+    return fmt_value(w == 32u ? value : value & ((1u << w) - 1u), w, ty);
 }
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
@@ -5381,19 +5562,38 @@ uint fmt_encode(uint x, uint info, uint c) {
     uint h = f32tof16(f);
     return w == 11u ? ((h >> 4) & 0x7FFu) : ((h >> 5) & 0x3FFu);
 }
-uint4 fmt_pack(uint4 v, uint info) {
+XCL_FORMAT_FN void fmt_pack_shared(uint v0, uint v1, uint v2, uint v3, uint info, out uint o0, out uint o1, out uint o2, out uint o3) {
+    uint4 v = uint4(v0, v1, v2, v3);
     uint4 r = uint4(0u, 0u, 0u, 0u); uint n = info & 7u; uint off = 0u;
     [unroll] for (uint c = 0u; c < 4u; c++) { if (c < n) { uint w = (info >> (8u + 6u * c)) & 63u; put_bits(r, off, w, fmt_encode(v[c], info, c)); off += w; } }
-    return r;
+    o0 = r.x; o1 = r.y; o2 = r.z; o3 = r.w;
 }
-void st_part(uint b, uint m, uint v) { mem.InterlockedAnd(b, ~m); mem.InterlockedOr(b, v & m); }
-void st_bytes(uint a, uint4 r, uint n) {
+uint4 fmt_pack(uint4 v, uint info) { uint o0, o1, o2, o3; fmt_pack_shared(v.x, v.y, v.z, v.w, info, o0, o1, o2, o3); return uint4(o0, o1, o2, o3); }
+void st_part(uint b, uint m, uint v) {
+    // Update this mask in one atomic step, including when another writer overlaps it.
+    uint old = mem.Load(b), seen;
+    for (;;) {
+        mem.InterlockedCompareExchange(b, old, (old & ~m) | (v & m), seen);
+        if (seen == old) break;
+        old = seen;
+    }
+}
+XCL_FORMAT_FN void st_bytes_shared(uint a, uint r0, uint r1, uint r2, uint r3, uint n) {
+    uint4 r = uint4(r0, r1, r2, r3);
     uint s = (a & 3u) * 8u; uint b = a & ~3u;
     if (s == 0u && (n & 3u) == 0u) { [unroll] for (uint k = 0u; k < 4u; k++) if (k * 4u < n) mem.Store(b + 4u * k, r[k]); return; }
-    uint m = n >= 4u ? 0xFFFFFFFFu : ((1u << (8u * n)) - 1u);
-    st_part(b, m << s, r.x << s);
-    if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
+    // An unaligned 8- or 16-byte format spans up to five dwords. Write every affected
+    // dword, preserving bytes outside the formatted value, including adjacent lanes' data.
+    uint end = s + 8u * min(n, 16u);
+    [loop] for (uint k = 0u; k < 5u; k++) {
+        uint low = 32u * k, first = max(s, low), last = min(end, low + 32u);
+        if (first >= last) continue;
+        uint width = last - first, shift = first - low;
+        uint mask = (width == 32u ? 0xFFFFFFFFu : ((1u << width) - 1u)) << shift;
+        st_part(b + 4u * k, mask, bits_at(r, first - s, width) << shift);
+    }
 }
+void st_bytes(uint a, uint4 r, uint n) { st_bytes_shared(a, r.x, r.y, r.z, r.w, n); }
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), pick4(c, (sel - 4u) & 3u))); }
 "#;
 
@@ -5432,7 +5632,7 @@ uint xcl_x_at(uint half, uint k) { return ((xcl_cw * 2u + half) * 2u + (k & 1u))
 void xcl_x_put(uint i, uint v) { XCL_XS(xcl_x_at(xcl_half, xcl_xk) + i) = v; }
 uint xcl_x_get(uint i) { return XCL_XS(xcl_x_at(xcl_half ^ 1u, xcl_xk - 1u) + i); }
 // meet the other half after `xcl_x_put`: true = its words are readable (`xcl_x_get`)
-bool xcl_x_meet() {
+XCL_EXCHANGE_FN bool xcl_x_meet() {
     uint k = xcl_xk;
     xcl_xk = k + 1u;
     if (xcl_xn == 0u) return false;
@@ -5466,21 +5666,23 @@ bool xcl_x_meet() {
 #endif
     return true;
 }
-uint2 xcl_x_ballot(bool b) {
+XCL_EXCHANGE_FN void xcl_x_ballot_shared(bool b, out uint lo, out uint hi) {
     uint m = WaveActiveBallot(b).x;
     xcl_x_put(0u, m);
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
-    return xcl_half != 0u ? uint2(o, m) : uint2(m, o);
+    lo = xcl_half != 0u ? o : m;
+    hi = xcl_half != 0u ? m : o;
 }
+uint2 xcl_x_ballot(bool b) { uint lo, hi; xcl_x_ballot_shared(b, lo, hi); return uint2(lo, hi); }
 // v_readlane / v_readfirstlane: the same lane index in both halves; the owner half's value
-uint xcl_x_rla_uniform(uint v, uint l) {
+XCL_EXCHANGE_FN uint xcl_x_rla_uniform(uint v, uint l) {
     uint m = WaveReadLaneAt(v, l & 31u);
     xcl_x_put(0u, m);
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
     return (l >> 5) == xcl_half ? m : o;
 }
 // ds_bpermute: any lane of the wave
-uint xcl_x_rla_any(uint v, uint l) {
+XCL_EXCHANGE_FN uint xcl_x_rla_any(uint v, uint l) {
     xcl_x_put(WaveGetLaneIndex(), v);
     uint o = xcl_x_meet() ? xcl_x_get(l & 31u) : 0u;
     uint m = WaveReadLaneAt(v, l & 31u);

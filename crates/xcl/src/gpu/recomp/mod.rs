@@ -57,6 +57,7 @@ pub mod lane_masks;
 pub mod lower;
 pub mod lower_dxil;
 pub(crate) mod emit;
+mod regions;
 pub mod mesh_dispatch;
 pub mod mesh_wave;
 pub mod x64_masks;
@@ -1058,10 +1059,19 @@ fn emit_structured(
                     _ => "false".into(),
                 };
                 body.push_str(&format!("{ipad}if (!({cond})) {{\n"));
+                let arm = body.len();
                 let mut r = emit_structured(c, em, body, end, t, u, nest + 1, cont, &none, d + 1, blocks, flags);
+                if let Some(regions) = &mut em.regions {
+                    if r.is_empty() { regions.outline(body, arm, d + 1); }
+                }
                 if let Some(u) = u {
                     body.push_str(&format!("{ipad}}} else {{\n"));
-                    r.extend(emit_structured(c, em, body, t, u, None, nest + 1, cont, &none, d + 1, blocks, flags));
+                    let arm = body.len();
+                    let other = emit_structured(c, em, body, t, u, None, nest + 1, cont, &none, d + 1, blocks, flags);
+                    if let Some(regions) = &mut em.regions {
+                        if other.is_empty() { regions.outline(body, arm, d + 1); }
+                    }
+                    r.extend(other);
                 }
                 body.push_str(&format!("{ipad}}}\n"));
                 r
@@ -1389,6 +1399,10 @@ pub(crate) fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> B
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    translate_program(code, opt, true)
+}
+
+fn translate_program(code: &[u8], opt: &Options, share_regions: bool) -> Result<Translation, String> {
     let program = code;
     let normalized;
     let opt = if opt.mem_windows & HEAP_WINDOWS != 0 {
@@ -1493,9 +1507,12 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&sctx, 0, u64::MAX).is_some() {
             // structured control flow: plain if / loops, no block dispatch on `pc` (much
             // smaller for DXC and the driver on big programs)
+            if share_regions && matches!(opt.mode, Mode::Compute(_) | Mode::Kernel) && regions::worthwhile(&sctx, program) {
+                em.regions = Some(Default::default());
+            }
             emit_structured(&sctx, &mut em, &mut code, 0, u64::MAX, None, 0, &Conts::default(), &BTreeSet::new(), 1, &mut blocks, &mut flags);
             if code.len() > STRUCTURED_BYTES_PER_CODE_BYTE * program.len() {
-                return translate(program, &Options { structured: false, ..opt.clone() });
+                return translate_program(program, &Options { structured: false, ..opt.clone() }, share_regions);
             }
         } else {
             if gs_jump.is_some() && opt.split_wave64 && opt.wave64 {
@@ -1510,7 +1527,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         }
         body.push_str(&code);
     }
-    let hlsl = em.finish(&body);
+    let hlsl = em.finish(&body, insts.len());
     let static_samplers = em.static_used.clone();
     Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
 }
