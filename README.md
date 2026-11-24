@@ -351,6 +351,15 @@ victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
 victory config
 ```
 
+**`precompile` is not offline.** `victory precompile <dump>` creates a device and compiles on it, so
+it is a GPU session and is bound by the same one-at-a-time rule as a run. It replays a pipeline dump
+(`VICTORY_PIPELINE_DUMP`) and the shader containers saved beside it (`VICTORY_SHADER_SAVE`) through the
+runtime's own creation path, so the library it writes is the one the title would have written, and it
+writes the cache's adapter-named library — it cannot leave a software adapter's blob in the card's.
+`--shaders <dir>`, `--cache <path>`, `--save-every <n>` (default 50), `--jobs <n>` (default half the
+logical cores, 2 to 8; each driver compile is seconds long, so a serial replay of the world's ~1,950
+takes hours), `--dry-run`.
+
 ## Debugging
 
 A release build has no debugging aids. Build them in with
@@ -441,6 +450,8 @@ submission instead of once per texture is the fix under test.
 | `VICTORY_PIPELINE_WAIT_MS=<n>` | The per-frame budget, over all threads, for waiting on a background pipeline. Default 500 ms, shared across the threads of a frame; a draw is omitted until its pipeline is ready, and a budget of 0 never waits |
 | `VICTORY_PIPELINE_WAIT_BY_DURATION=1` | *diagnostics.* Off by default. On, a frame also gives up on a wait whose making is known to take longer than what is left of the budget — and **the draw it gives up on is the picture**: this is what turned a whole cutscene black on 2026-11-24. The measurement behind it stands (every world frame spent its 500 ms on stages that take 2.7 s and completed no pipeline), so it measures that, and it is never a setting |
 | `VICTORY_PIPELINE_TIMING=1` | *diagnostics.* Prints, once a second, where a pipeline's time goes — queued, translated, waiting on another thread's translation, root signature, library load, driver compile, stored back — with the rate they add up to, what draining the queue would take at that rate, and how much of the time the workers were busy rather than waiting for a processor |
+| `VICTORY_PIPELINE_DUMP=<file>` | Writes every host pipeline, as the title wrote it, for `victory precompile` to replay into a warm library. `VICTORY_SHADER_SAVE=<dir>` writes the shader containers beside it, which is what the replay needs to rebuild each one |
+| `VICTORY_PIPELINE_ARGS=1` | *diagnostics.* Logs what a compute create was handed — root signature, shader bytes, descriptor tables — **before** the call, because a fault inside the vendor compiler leaves no line of its own. A description whose root signature or shader bytes are empty is the shape a null inside the compiler would explain |
 | `VICTORY_LATE_WAIT=1\|2\|3` | Sends a queue's submissions without waiting for each, and settles them at the next point a title buffer, a fence or a present is observed. Off unless the value is exactly 1, 2 or 3, and forced off by `VICTORY_GPU_TIMING`, which has to wait for each list to time it |
 | `VICTORY_RELAY=<1\|2>` | A thread of its own lands finished flights as the card runs them, so the submitting thread never waits and copies back itself. `2` also waits only for the flights that declared a range, not for everything in the air |
 | `VICTORY_WIDE_BACK=1` | Takes a submission's shader-written snapshots together and compares everything declared after the card, cut into ~1 MiB pieces over a few threads, instead of range by range on one |
