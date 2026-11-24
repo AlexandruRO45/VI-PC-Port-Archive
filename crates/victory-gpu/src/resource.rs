@@ -814,11 +814,11 @@ const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
 #[cfg(windows)]
 const WRITABLE_FLAGS: u32 = 0x7; // render target, depth, UAV
 #[cfg(windows)]
-const DEPTH_FLAG: u32 = 0x2;
+const DEPTH: u32 = 0x2;
 #[cfg(windows)]
-const UNORDERED_FLAG: u32 = 0x4;
+const UNORDERED: u32 = 0x4;
 #[cfg(windows)]
-const DENY_SHADER_RESOURCE_FLAG: u32 = 0x8;
+const DENY_SHADER_RESOURCE: u32 = 0x8;
 
 #[cfg(windows)]
 fn host_flags(flags: u32) -> u32 {
@@ -827,8 +827,8 @@ fn host_flags(flags: u32) -> u32 {
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
-    if f & DEPTH_FLAG != 0 {
-        f &= !UNORDERED_FLAG;
+    if f & DEPTH != 0 {
+        f &= !UNORDERED;
     }
     f
 }
@@ -915,12 +915,10 @@ fn find_live_texture(addr: u64, desc: &ResourceDesc) -> Option<std::sync::Arc<Ho
         if (entry.host_flags & (want_flags & WRITABLE_FLAGS)) != (want_flags & WRITABLE_FLAGS) {
             return false;
         }
-        if want_flags & DENY_SHADER_RESOURCE_FLAG == 0
-            && entry.host_flags & DENY_SHADER_RESOURCE_FLAG != 0
-        {
+        if want_flags & DENY_SHADER_RESOURCE == 0 && entry.host_flags & DENY_SHADER_RESOURCE != 0 {
             return false;
         }
-        if want_flags & DENY_SHADER_RESOURCE_FLAG == 0
+        if want_flags & DENY_SHADER_RESOURCE == 0
             && DEPTH_FORMATS
                 .iter()
                 .any(|&(typed, _)| typed == entry.host_format)
@@ -995,14 +993,14 @@ fn host_texture(
     d.alignment = 0;
     d.flags = host_flags(d.flags);
     d.format = pc_format(d.format);
-    if d.flags & DENY_SHADER_RESOURCE_FLAG == 0
+    if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
     {
         d.format = typeless;
     }
     // The host has no sRGB unordered access: such textures are typeless,
     // their unordered access views plain UNORM.
-    if d.flags & UNORDERED_FLAG != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+    if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
@@ -1413,8 +1411,12 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    if resource(out).host.is_none() {
+        resource_release(out);
+        return None;
+    }
     map.insert((address, desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    Some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -2460,7 +2462,7 @@ mod tests {
 
         // DENY_SHADER_RESOURCE depth texture must NOT be reused for shader-readable alias.
         let depth_deny_desc = ResourceDesc {
-            flags: DEPTH_FLAG | DENY_SHADER_RESOURCE_FLAG,
+            flags: DEPTH | DENY_SHADER_RESOURCE,
             ..texture(16, 16, 40, 1) // D32_FLOAT
         };
         let float_srv_desc = texture(16, 16, 41, 1); // R32_FLOAT
