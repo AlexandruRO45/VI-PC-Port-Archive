@@ -120,94 +120,116 @@ pub struct Report {
 /// (`host-pipelines.bin` on the card, `host-pipelines-warp.bin` on the software
 /// adapter), so a run under `VICTORY_D3D12_WARP` can never write a blob the card
 /// would reject with `0x887E0001`.
-pub fn precompile(dump: &Path, shaders: &Path, cache: &Path, save_every: usize) -> std::io::Result<Report> {
+pub fn precompile(
+    dump: &Path,
+    shaders: &Path,
+    cache: &Path,
+    save_every: usize,
+    jobs: usize,
+) -> std::io::Result<Report> {
     let text = std::fs::read_to_string(dump)?;
     super::use_pipeline_cache(cache.to_path_buf());
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let before = library::BLOB.load(std::sync::atomic::Ordering::Relaxed);
+    // Workers pull lines off one cursor: a line's driver compile is seconds
+    // long, and the runtime itself makes pipelines on several threads, so one
+    // line at a time would take two hours over the world's ~1,950.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let jobs = jobs.clamp(1, 16);
+    let reports = std::sync::Mutex::new(Vec::with_capacity(jobs));
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| {
+                let mut report = Report::default();
+                let mut since_save = 0usize;
+                while let Some(at) = (next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                    .lt(&lines.len())
+                    .then(|| next.load(std::sync::atomic::Ordering::Relaxed) - 1)
+                {
+                    replay(lines[at], shaders, &mut report);
+                    since_save += 1;
+                    if since_save >= save_every {
+                        // Saved as it goes: 1,950 pipelines are more than one
+                        // session's worth of driver time, and a run that is
+                        // killed must keep what it stored.
+                        library::save(true);
+                        since_save = 0;
+                    }
+                }
+                reports.lock().unwrap_or_else(|e| e.into_inner()).push(report);
+            });
+        }
+    });
+    library::save(true);
     let mut report = Report {
-        before: library::BLOB.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        after: library::BLOB.load(std::sync::atomic::Ordering::Relaxed),
         ..Report::default()
     };
-    let mut since_save = 0usize;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        report.lines += 1;
-        let Some((_, stages, state)) = parse(line) else {
-            report.unreadable += 1;
-            continue;
-        };
-        let Some(stages) = stages else {
-            report.unreadable += 1;
-            continue;
-        };
-        let state = match state {
-            Some(text) => match GraphicsState::from_fields(text) {
-                Some(state) => Some(Box::new(state)),
-                None => {
-                    report.unreadable += 1;
-                    continue;
-                }
-            },
-            None => None,
-        };
-        let mut shaders_of = Vec::with_capacity(stages.len());
-        let mut ok = true;
-        for (stage, hash) in &stages {
-            let Some(stage) = static_stage(stage) else {
-                report.unsupported += 1;
-                ok = false;
-                break;
-            };
-            let path = shaders.join(format!("{hash}.{stage}.cdxil"));
-            match std::fs::read(&path) {
-                Ok(container) => shaders_of.push(Arc::new(Shader::of_container(
-                    stage,
-                    hash.clone(),
-                    container,
-                ))),
-                Err(_) => {
-                    report.missing += 1;
-                    ok = false;
-                    break;
-                }
+    for one in reports.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        report.lines += one.lines;
+        report.unreadable += one.unreadable;
+        report.missing += one.missing;
+        report.unsupported += one.unsupported;
+        report.untranslated += one.untranslated;
+        report.loaded += one.loaded;
+        report.made += one.made;
+        report.refused += one.refused;
+    }
+    Ok(report)
+}
+
+/// Replays one dump line into the library, counting what became of it.
+fn replay(line: &str, shaders: &Path, report: &mut Report) {
+    report.lines += 1;
+    let Some((_, stages, state)) = parse(line) else {
+        report.unreadable += 1;
+        return;
+    };
+    let Some(stages) = stages else {
+        report.unreadable += 1;
+        return;
+    };
+    let state = match state {
+        Some(text) => match GraphicsState::from_fields(text) {
+            Some(state) => Some(Box::new(state)),
+            None => {
+                report.unreadable += 1;
+                return;
             }
-        }
-        if !ok {
-            continue;
-        }
-        if shaders_of.iter().any(|s| s.translated().is_none()) {
-            report.untranslated += 1;
-            continue;
-        }
-        let loaded = library::LOADED.load(std::sync::atomic::Ordering::Relaxed);
-        let made = library::MADE.load(std::sync::atomic::Ordering::Relaxed);
-        match HostPipeline::new(&shaders_of, state.as_deref()) {
-            Some(_) => {
-                if library::LOADED.load(std::sync::atomic::Ordering::Relaxed) > loaded {
-                    report.loaded += 1;
-                } else if library::MADE.load(std::sync::atomic::Ordering::Relaxed) > made {
-                    report.made += 1;
-                }
+        },
+        None => None,
+    };
+    let mut built = Vec::with_capacity(stages.len());
+    for (stage, hash) in &stages {
+        let Some(stage) = static_stage(stage) else {
+            report.unsupported += 1;
+            return;
+        };
+        match std::fs::read(shaders.join(format!("{hash}.{stage}.cdxil"))) {
+            Ok(container) => built.push(Arc::new(Shader::of_container(stage, hash.clone(), container))),
+            Err(_) => {
+                report.missing += 1;
+                return;
             }
-            None => report.refused += 1,
-        }
-        since_save += 1;
-        if since_save >= save_every {
-            library::save(true);
-            since_save = 0;
-            tracing::info!(
-                lines = report.lines,
-                loaded = report.loaded,
-                made = report.made,
-                "precompile: library saved"
-            );
         }
     }
-    library::save(true);
-    report.after = library::BLOB.load(std::sync::atomic::Ordering::Relaxed);
-    Ok(report)
+    if built.iter().any(|s| s.translated().is_none()) {
+        report.untranslated += 1;
+        return;
+    }
+    let loaded = library::LOADED.load(std::sync::atomic::Ordering::Relaxed);
+    let made = library::MADE.load(std::sync::atomic::Ordering::Relaxed);
+    match HostPipeline::new(&built, state.as_deref()) {
+        Some(_) => {
+            if library::LOADED.load(std::sync::atomic::Ordering::Relaxed) > loaded {
+                report.loaded += 1;
+            } else if library::MADE.load(std::sync::atomic::Ordering::Relaxed) > made {
+                report.made += 1;
+            }
+        }
+        None => report.refused += 1,
+    }
 }
 
 /// The stage names a host pipeline is made from, as the statics `Shader` holds.
