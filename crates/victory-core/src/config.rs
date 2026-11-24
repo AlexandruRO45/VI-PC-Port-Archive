@@ -215,6 +215,30 @@ impl Config {
         if let Some(game) = &game_dir {
             ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
         }
+        for (name, dir, origin, setting) in [
+            (
+                "game",
+                game_dir.as_deref(),
+                origins.game_dir,
+                "VICTORY_GAME_DIR or [paths].game_dir",
+            ),
+            (
+                "cache",
+                Some(&*cache_dir),
+                origins.cache_dir,
+                "VICTORY_CACHE_DIR or [paths].cache_dir",
+            ),
+            (
+                "data",
+                Some(&*data_dir),
+                origins.data_dir,
+                "VICTORY_DATA_DIR or [paths].data_dir",
+            ),
+        ] {
+            if let Some(dir) = dir {
+                ensure_not_a_file(name, dir, origin, setting)?;
+            }
+        }
         Ok(Config {
             game_dir,
             cache_dir,
@@ -408,6 +432,34 @@ fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) 
         }
     }
     Ok(())
+}
+
+/// Refuses a folder setting that names an existing file. The easy slip is
+/// the game's executable or a file in the dump rather than its folder
+/// (`VICTORY_GAME_DIR=~/games/gta/default.xex`, picked in a file dialog or
+/// pasted from a launcher's target); it was accepted and only failed later,
+/// per file, with "Not a directory". For the cache or data folder
+/// `create_dir_all` would fail on first use with "File exists", naming
+/// neither the setting nor the fix. A path that does not exist yet is fine:
+/// the cache and data folders are created when needed. `name` is the
+/// folder ("game", "cache", "data") and `setting` the variable and key that
+/// set it.
+fn ensure_not_a_file(name: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
+    if !dir.is_file() {
+        return Ok(());
+    }
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    let hint = match (name, parent) {
+        ("game", Some(parent)) => format!(
+            "set {setting} to the folder holding the dump, perhaps {}",
+            parent.display()
+        ),
+        _ => format!("set {setting} to a folder, or move the file away"),
+    };
+    anyhow::bail!(
+        "the {name} folder {} (from {origin}) is a file, not a folder; {hint}",
+        dir.display()
+    );
 }
 
 /// Whether folder names differ only by case on the usual file systems of
@@ -1255,6 +1307,88 @@ mod tests {
         let err = config_file(Some(missing)).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_folder_setting_naming_a_file_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-file-not-folder-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(scratch.join("gta")).unwrap();
+        let exe = scratch.join("gta").join("default.xex");
+        std::fs::write(&exe, b"").unwrap();
+        let with = |k: &'static str, v: PathBuf| {
+            let cache = scratch.join("cache");
+            let data = scratch.join("data");
+            move |key: &str| match key {
+                _ if key == k => Some(v.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+
+        let err = Config::resolve(
+            FilePaths::default(),
+            None,
+            with("VICTORY_GAME_DIR", exe.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("game folder"), "{err}");
+        assert!(err.contains("(from VICTORY_GAME_DIR) is a file"), "{err}");
+        let parent = scratch.join("gta");
+        assert!(err.contains(&parent.display().to_string()), "{err}");
+
+        // The same file as the cache or data folder, from the file.
+        for (key, file) in [
+            (
+                "cache",
+                FilePaths {
+                    cache_dir: Some(exe.clone()),
+                    ..FilePaths::default()
+                },
+            ),
+            (
+                "data",
+                FilePaths {
+                    data_dir: Some(exe.clone()),
+                    ..FilePaths::default()
+                },
+            ),
+        ] {
+            let env = |k: &str| match k {
+                "VICTORY_CACHE_DIR" if key == "data" => {
+                    Some(scratch.join("cache").into_os_string())
+                }
+                "VICTORY_DATA_DIR" if key == "cache" => Some(scratch.join("data").into_os_string()),
+                _ => None,
+            };
+            let err = Config::resolve(file, None, env).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("the {key} folder")) && err.contains("(from config file)"),
+                "{err}"
+            );
+            assert!(err.contains(&format!("[paths].{key}_dir")), "{err}");
+        }
+
+        // The folder itself, and a folder that does not exist yet, are fine.
+        assert!(
+            Config::resolve(FilePaths::default(), None, with("VICTORY_GAME_DIR", parent)).is_ok()
+        );
+        assert!(
+            Config::resolve(
+                FilePaths::default(),
+                None,
+                with("VICTORY_GAME_DIR", scratch.join("missing"))
+            )
+            .is_ok()
+        );
+
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
