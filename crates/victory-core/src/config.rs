@@ -518,15 +518,79 @@ fn lexical(path: &Path) -> PathBuf {
 /// The checks every configured path goes through before it is used: no
 /// control characters ([`ensure_no_control`]), no surrounding quotes
 /// ([`ensure_unquoted`]), no surrounding whitespace ([`ensure_trimmed`]),
-/// no unexpanded variable ([`ensure_no_variable`]) and no Windows drive
-/// path off Windows ([`ensure_native`]). `what` names the setting for the
-/// error.
+/// no `file:` URI ([`ensure_not_uri`]), no unexpanded variable
+/// ([`ensure_no_variable`]) and no Windows drive path off Windows
+/// ([`ensure_native`]). `what` names the setting for the error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
     ensure_unquoted(what, path)?;
     ensure_trimmed(what, path)?;
+    ensure_not_uri(what, path)?;
     ensure_no_variable(what, path)?;
     ensure_native(what, path, cfg!(windows))
+}
+
+/// Refuses a `file:` URI (`file:///home/me/Games/gta`) instead of a path.
+/// Copying a folder in a Linux file manager (Nautilus, Dolphin's "Copy
+/// Location" in some setups), dragging one into a browser or launcher, or
+/// taking it from a `.desktop` file or a Steam/Lutris/Heroic config gives
+/// the URI, often percent-encoded (`My%20Games`). Nothing here decodes it:
+/// the value is relative, so it would be taken as a folder named `file:`
+/// under the config file's folder or the working directory (often the
+/// repository), and `%20` would stay three characters. The error suggests
+/// the decoded path when the URI names a local file. A folder that merely
+/// starts with `file` (`/files`, `filed:`) is left alone; the scheme is
+/// matched case-insensitively, as URI schemes are.
+fn ensure_not_uri(what: &str, path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    let is_uri = text
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
+    if !is_uri {
+        return Ok(());
+    }
+    let hint = match uri_path(&text[5..]) {
+        Some(p) => format!("; write the path instead, perhaps {p}"),
+        None => "; write the path instead".to_owned(),
+    };
+    anyhow::bail!("{what} is {text}, a file: URI rather than a path{hint}");
+}
+
+/// The local path a `file:` URI names, from what follows `file:`:
+/// `///home/me` or `//localhost/home/me` (the empty or `localhost` host),
+/// with `%XX` decoded; `/C:/games` becomes `C:/games`. `None` for another
+/// host (`//server/share`, which is a network share, not a local path), a
+/// bad escape, or a result that is not UTF-8.
+fn uri_path(rest: &str) -> Option<String> {
+    let path = match rest.strip_prefix("//") {
+        Some(after) => {
+            let slash = after.find('/')?;
+            let host = &after[..slash];
+            if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+                return None;
+            }
+            &after[slash..]
+        }
+        None if rest.starts_with('/') => rest,
+        None => return None,
+    };
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hex = [bytes.next()?, bytes.next()?];
+            let hex = std::str::from_utf8(&hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    // `/C:/games`: a Windows drive keeps its own root.
+    Some(match decoded.strip_prefix('/') {
+        Some(drive) if is_drive_path(Path::new(drive)) => drive.to_owned(),
+        _ => decoded,
+    })
 }
 
 /// Refuses a path that names an environment variable instead of its value:
@@ -1261,6 +1325,71 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[paths].data_dir"), "{err}");
+    }
+
+    #[test]
+    fn file_uris_are_refused() {
+        // A folder copied from a file manager, percent-encoded.
+        let err = ensure_not_uri(
+            "VICTORY_GAME_DIR",
+            Path::new("file:///games/My%20Games/gta"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        assert!(err.contains("file: URI"), "{err}");
+        assert!(err.contains("perhaps /games/My Games/gta"), "{err}");
+        assert_eq!(uri_path("//localhost/a/b").as_deref(), Some("/a/b"));
+        assert_eq!(uri_path("/a/%C3%A9").as_deref(), Some("/a/é"));
+        assert_eq!(uri_path("///C:/games").as_deref(), Some("C:/games"));
+        // Another host, a bad escape or no path: no suggestion.
+        for bad in [
+            "//server/share",
+            "///a%2",
+            "///a%zz",
+            "///a%FF",
+            "games",
+            "//host",
+        ] {
+            assert_eq!(uri_path(bad), None, "{bad}");
+        }
+        let err = ensure_not_uri("x", Path::new("FILE://server/share"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.ends_with("write the path instead"), "{err}");
+        for ok in ["/files/gta", "files", "filed", "file", "/games/file:x", ""] {
+            assert!(ensure_not_uri("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+
+        // Every way in: each path variable, VICTORY_CONFIG and the file.
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("file:///victory/x")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("file: URI"), "{err}");
+        }
+        let env =
+            |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("file:///c/victory.toml"));
+        let err = explicit_config(env, None).unwrap_err().to_string();
+        assert!(err.contains("VICTORY_CONFIG"), "{err}");
+        let parsed: FileConfig =
+            toml::from_str("[paths]\ngame_dir = 'file:///games/gta'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].game_dir"), "{err}");
     }
 
     #[test]
