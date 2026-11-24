@@ -2407,9 +2407,9 @@ impl Host {
                 false
             };
             #[cfg(feature = "diagnostics")]
-            let mut capture = None;
+            let capture;
             #[cfg(feature = "diagnostics")]
-            let mut probe = None;
+            let probe;
             if !used_blit {
                 list.ResourceBarrier(&[
                     transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
