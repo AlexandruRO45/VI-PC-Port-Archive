@@ -253,17 +253,18 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
         let mut g = q.0.lock().unwrap();
         let first = g.ingest(&mut file);
         // the HLSL (and so the cache keys) of the run's memory windows
-        crate::gpu::recomp::pso::set_mem_windows(g.windows as u32);
+        crate::gpu::recomp::pso::set_mem_windows(pso_journal::mem_windows_of(g.windows));
         (g.taken.len(), first)
     };
     {
         let g = q.0.lock().unwrap();
         println!(
-            "{}: {first} pipelines to make ({} the title used), {already} done before, {} shaders; {} memory windows; {threads} threads, {gpu_most} driver compiles at once{}",
+            "{}: {first} pipelines to make ({} the title used), {already} done before, {} shaders; {} memory windows{}; {threads} threads, {gpu_most} driver compiles at once{}",
             journal.display(),
             g.used.len(),
             g.shaders.len(),
-            g.windows,
+            g.windows & 0x7F,
+            if g.windows & 0x80 != 0 { " (from the descriptor heap)" } else { "" },
             if watch { "; following the journal (Ctrl+C stops)" } else { "" }
         );
     }
@@ -285,7 +286,7 @@ pub fn run(target: &Path, args: &[String]) -> i32 {
                 }
                 let new = g.ingest(&mut file);
                 // (a journal that was empty when the tool started)
-                crate::gpu::recomp::pso::set_mem_windows(g.windows as u32);
+                crate::gpu::recomp::pso::set_mem_windows(pso_journal::mem_windows_of(g.windows));
                 if new > 0 || !g.used.is_empty() {
                     q.1.notify_all();
                 }

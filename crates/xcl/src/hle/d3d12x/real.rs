@@ -4351,8 +4351,20 @@ unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
 /// `xcl pipelines`: a journal's pipeline made on `dev` (a plain device of this process) as
 /// `translated_graphics_pso` / `translated_compute_pso` make it, which fills the DXIL cache
 /// and the driver's, and released. `driver` is held around the driver's compile only (few of
-/// those at once; translation and DXC run freely). Err: what kept it from being made.
-pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, driver: impl FnOnce() -> G) -> Result<(), String> {
+/// those at once; translation and DXC run freely). Err: what kept it from being made. One the
+/// driver refuses with heap windows is made again in the switch form, as the title does.
+pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, driver: impl Fn() -> G) -> Result<(), String> {
+    with_switch_fallback(|| warm_once(dev, r, &driver))
+}
+
+/// A driver refusal of `warm_once` noted as the title's `driver_pso` notes it.
+fn note_heap_window_oom(hr: HRESULT) {
+    if hr == E_OUTOFMEMORY && crate::gpu::recomp::pso::mem_windows() & crate::gpu::recomp::HEAP_WINDOWS != 0 {
+        HEAP_WINDOW_OOM.with(|o| o.set(true));
+    }
+}
+
+unsafe fn warm_once<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, driver: &impl Fn() -> G) -> Result<(), String> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     use windows::core::Interface;
     let this = dev.as_raw();
@@ -4370,7 +4382,10 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
                     made = Some(p);
                     S_OK
                 }
-                Err(e) => e.code().0,
+                Err(e) => {
+                    note_heap_window_oom(e.code().0);
+                    e.code().0
+                }
             });
             made.ok_or_else(|| windows::core::Error::from_hresult(windows::core::HRESULT(hr)))
         }
@@ -4393,6 +4408,9 @@ pub(crate) unsafe fn warm<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay,
             let _slot = driver();
             let started = std::time::Instant::now();
             let made = dev.CreateComputePipelineState::<ID3D12PipelineState>(&copy);
+            if let Err(e) = &made {
+                note_heap_window_oom(e.code().0);
+            }
             if let (Ok(p), Some(path)) = (&made, &disk) {
                 if let Ok(b) = p.GetCachedBlob() {
                     driver_cache::keep(path, std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()), started.elapsed());
