@@ -113,3 +113,12 @@ fn bc7_dictionary_indices_line_up() {
         assert!(ok, "entry {k}: {:?}", ix.ix);
     }
 }
+
+#[test]
+fn oversized_output_returns_allocation_error() {
+    // This aligned size cannot fit in a Vec on any supported platform.
+    let size = usize::MAX & !15;
+    for mode in [1, 3, 4, 5, 6, 7] {
+        assert_eq!(decode(mode, &[], size), Err(Error::Allocation), "mode {mode}");
+    }
+}
