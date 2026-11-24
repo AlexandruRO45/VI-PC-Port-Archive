@@ -319,9 +319,11 @@ impl ComputeIo {
         (ids, take(10))
     }
 
-    /// Thread id components in v0, v1, v2 (1 to 3).
+    /// Thread id components in v0, v1, v2 (1 to 3). `TIDIG_COMP_CNT` is a
+    /// 2-bit field, but a group id has only three components: 3 loads x, y
+    /// and z like 2 does.
     pub fn thread_id_vgprs(&self) -> u8 {
-        (self.rsrc2 >> 11 & 3) as u8 + 1
+        (self.rsrc2 >> 11 & 3).min(2) as u8 + 1
     }
 
     /// LDS bytes per thread group (512-byte granules).
@@ -946,6 +948,17 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    #[test]
+    fn thread_id_count_three_is_still_three_components() {
+        // TIDIG_COMP_CNT (bits 11-12) of 3: still x, y and z in v0-v2,
+        // never a fourth component in v3.
+        let cs = ComputeIo {
+            rsrc2: 3 << 11,
+            threads: [4, 4, 4],
+        };
+        assert_eq!(cs.thread_id_vgprs(), 3);
     }
 
     #[test]
