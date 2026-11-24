@@ -439,11 +439,40 @@ fn lexical(path: &Path) -> PathBuf {
 }
 
 /// The checks every configured path goes through before it is used: no
-/// control characters ([`ensure_no_control`]) and no Windows drive path off
-/// Windows ([`ensure_native`]). `what` names the setting for the error.
+/// control characters ([`ensure_no_control`]), no surrounding quotes
+/// ([`ensure_unquoted`]) and no Windows drive path off Windows
+/// ([`ensure_native`]). `what` names the setting for the error.
 fn check_setting(what: &str, path: &Path) -> Result<()> {
     ensure_no_control(what, path)?;
+    ensure_unquoted(what, path)?;
     ensure_native(what, path, cfg!(windows))
+}
+
+/// Refuses a path wrapped in a matching pair of quotes (`"/games/gta"` or
+/// `'/games/gta'`, quotes included). Only a shell removes them: an env file
+/// read by `docker run --env-file`, systemd's `EnvironmentFile=` (single
+/// quotes on older versions), an IDE run configuration or a Windows
+/// `set VICTORY_GAME_DIR="D:\games"` keeps them as part of the value. The
+/// path then starts with a quote, so it is not absolute and would be taken
+/// as a folder named `"` under the working directory (often the
+/// repository), reported later as "does not exist" or "inside the
+/// repository". No real folder name starts and ends with the same quote,
+/// and `"` cannot appear in a Windows path at all; a quote elsewhere in
+/// the name (`/games/Rockstar's`) is left alone.
+fn ensure_unquoted(what: &str, path: &Path) -> Result<()> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let quoted = match bytes {
+        [first, .., last] => first == last && matches!(first, b'"' | b'\''),
+        _ => false,
+    };
+    if !quoted {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{what} is {}, quotes included; the quotes are not removed when the value comes \
+         from an env file or a launcher rather than a shell, so remove them",
+        path.display()
+    );
 }
 
 /// Refuses a path holding a control character (a carriage return, newline,
@@ -863,6 +892,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("[paths].cache_dir"), "{err}");
+    }
+
+    #[test]
+    fn quoted_paths_are_refused() {
+        // `docker run --env-file` keeps the quotes of `VICTORY_GAME_DIR="/games/gta"`.
+        let err = ensure_unquoted("VICTORY_GAME_DIR", Path::new("\"/games/gta\""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("VICTORY_GAME_DIR"), "{err}");
+        assert!(err.contains("\"/games/gta\""), "{err}");
+        assert!(err.contains("quotes included"), "{err}");
+        assert!(ensure_unquoted("x", Path::new("'~/gta'")).is_err());
+        for ok in [
+            "/games/gta",
+            "/games/Rockstar's",
+            "'/games/gta\"",
+            "\"",
+            "'",
+            "",
+            "games with spaces",
+        ] {
+            assert!(ensure_unquoted("x", Path::new(ok)).is_ok(), "{ok}");
+        }
+
+        // Every way in: each path variable, VICTORY_CONFIG and the file.
+        for var in [
+            "VICTORY_GAME_DIR",
+            "VICTORY_CACHE_DIR",
+            "VICTORY_DATA_DIR",
+            "VICTORY_TEST_TITLES",
+        ] {
+            let env = |k: &str| match k {
+                k if k == var => Some(OsString::from("\"/victory/x\"")),
+                "HOME" => Some(abs("home")),
+                _ => None,
+            };
+            let err = Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(var), "{err}");
+            assert!(err.contains("quotes included"), "{err}");
+        }
+        let env = |k: &str| (k == "VICTORY_CONFIG").then(|| OsString::from("'victory.toml'"));
+        let err = explicit_config(env, None).unwrap_err().to_string();
+        assert!(err.contains("VICTORY_CONFIG"), "{err}");
+        let parsed: FileConfig = toml::from_str("[paths]\ngame_dir = '\"/games/gta\"'\n").unwrap();
+        let err = parsed
+            .anchored_at(Path::new("/configs"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[paths].game_dir"), "{err}");
     }
 
     #[test]
