@@ -17,9 +17,9 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host};
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
@@ -158,95 +158,151 @@ fn make() -> windows::core::Result<Clamp> {
 
 const THREADS_PER_GROUP: u32 = 64;
 
-/// Full record span, limited by the validator's dispatch size and 32-bit
-/// byte offsets. Native signatures also require a whole argument per record.
+fn argument_size(kind: u32) -> Option<u32> {
+    match kind {
+        0 => Some(16),
+        1 => Some(20),
+        2 | 10 => Some(12),
+        _ => None,
+    }
+}
+
+/// Span through the last argument, subject to the validator's dispatch
+/// size and 32-bit byte offsets.
 pub(crate) fn byte_len(kind: u32, stride: u32, records: u32) -> Option<u64> {
-    let minimum = match kind {
-        0 => 16,
-        1 => 20,
-        2 | 10 => 12,
-        _ => return None,
-    };
+    let minimum = argument_size(kind)?;
     if stride < minimum
         || !stride.is_multiple_of(4)
         || records.div_ceil(THREADS_PER_GROUP) > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION
     {
         return None;
     }
-    let stride = u64::from(stride);
-    let last = u64::from(records.saturating_sub(1)) * stride;
-    if last + u64::from(minimum) > (1 << 32) {
-        return None;
+    if records == 0 {
+        return Some(0);
     }
-    Some(stride * u64::from(records))
+    let end = u64::from(records - 1) * u64::from(stride) + u64::from(minimum);
+    (end <= 1 << 32).then_some(end)
 }
 
-/// Records, in `list`, the clamp of `records` records of `kind` (PC
-/// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffers ready to be read as arguments. `count`
-/// is the count buffer if it is distinct from `buffer`. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+fn enhanced_barriers() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(host) = host() else { return false };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: the feature query writes the matching options structure.
+        let supported = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS12,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        }
+        .is_ok()
+            && options.EnhancedBarriersSupported.as_bool();
+        if !supported {
+            tracing::warn!("indirect execution requires enhanced buffer barriers");
+        }
+        supported
+    })
+}
+
+/// Validates the arguments in place and makes the native inputs readable.
+/// Replaces the list's compute root signature and pipeline.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
-    gpu: u64,
+    offset: u64,
     count: Option<&ID3D12Resource>,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
-    if !gpu.is_multiple_of(4) {
-        return false;
-    }
-    let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
+    let Some(len) = byte_len(kind, stride, records) else {
         return false;
     };
-    let l = &list.list;
+    if len == 0 || !offset.is_multiple_of(4) || !enhanced_barriers() {
+        return false;
+    }
+    // SAFETY: buffer is a live host resource.
+    let (width, gpu) = unsafe { (buffer.GetDesc().Width, buffer.GetGPUVirtualAddress()) };
+    if offset.checked_add(len).is_none_or(|end| end > width) {
+        return false;
+    }
+    let Some(gpu) = gpu.checked_add(offset) else {
+        return false;
+    };
+    let (Some(c), Some(budget), Ok(l)) = (
+        clamp(),
+        list.budget(),
+        list.list.cast::<ID3D12GraphicsCommandList7>(),
+    ) else {
+        return false;
+    };
+    list.use_indirect_buffers([Some(buffer), count, Some(budget)].into_iter().flatten());
+    let written = [buffer, budget];
+    let all = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
+    let uav = (
+        D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+    );
+    buffer_barriers(&l, written, all, uav);
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
-        // Earlier shader writes (the title's argument passes) first.
-        l.ResourceBarrier(&[uav_barrier()]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget.GetGPUVirtualAddress());
         l.Dispatch(records.div_ceil(THREADS_PER_GROUP), 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
-        for buffer in [Some(buffer), count].into_iter().flatten() {
-            l.ResourceBarrier(&[transition(
-                buffer,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-            )]);
-        }
     }
+    buffer_barriers(&l, written, uav, all);
+    // A count in the source allocation was already synchronized above.
+    buffer_barriers(&l, count.filter(|&count| count != buffer), all, all);
     true
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource, count: Option<&ID3D12Resource>) {
-    for buffer in [Some(buffer), count].into_iter().flatten() {
-        // SAFETY: an open list and a live buffer.
-        unsafe {
-            list.list.ResourceBarrier(&[transition(
-                buffer,
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-            )]);
-        }
-    }
+/// Finish indirect reads before later passes reuse the buffers. COMMON
+/// access leaves them available to shaders, vertex fetch, or another call.
+pub(crate) fn done(list: &HostList, args: &ID3D12Resource, count: Option<&ID3D12Resource>) {
+    let l = list
+        .list
+        .cast::<ID3D12GraphicsCommandList7>()
+        .expect("validated list");
+    let buffers = [Some(args), count.filter(|&count| count != args)];
+    let all = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON);
+    buffer_barriers(&l, buffers.into_iter().flatten(), all, all);
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-        },
+pub(crate) fn buffer_barriers<'a>(
+    list: &ID3D12GraphicsCommandList7,
+    buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
+    (sync_before, access_before): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+    (sync_after, access_after): (D3D12_BARRIER_SYNC, D3D12_BARRIER_ACCESS),
+) {
+    let barriers: Vec<_> = buffers
+        .into_iter()
+        .map(|buffer| D3D12_BUFFER_BARRIER {
+            SyncBefore: sync_before,
+            SyncAfter: sync_after,
+            AccessBefore: access_before,
+            AccessAfter: access_after,
+            // SAFETY: borrow the interface for the duration of the call.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Offset: 0,
+            Size: u64::MAX,
+        })
+        .collect();
+    if !barriers.is_empty() {
+        // SAFETY: the barriers name live whole buffers on an open list.
+        unsafe {
+            list.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: barriers.len() as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: barriers.as_ptr(),
+                },
+            }])
+        };
     }
 }
 
@@ -261,20 +317,34 @@ mod tests {
     const EMPTY_DISPATCH: [u32; 3] = [0, 1024, 1];
 
     #[test]
+    fn record_span_stops_at_the_last_argument() {
+        assert_eq!(byte_len(COMPUTE, 16, 2), Some(28));
+        assert_eq!(byte_len(COMPUTE, 16, 1), Some(12));
+        assert_eq!(byte_len(COMPUTE, 16, 0), Some(0));
+        for (kind, size) in [(0, 16), (1, 20), (COMPUTE, 12), (10, 12)] {
+            assert_eq!(byte_len(kind, 32, 1), Some(size));
+            assert_eq!(byte_len(kind, 32, 2), Some(32 + size));
+        }
+    }
+
+    #[test]
     fn record_span_bounds() {
         let max = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION * THREADS_PER_GROUP;
         assert_eq!(byte_len(2, 12, max), Some(u64::from(12 * max)));
         assert_eq!(byte_len(2, 12, max + 1), None);
         assert_eq!(byte_len(2, 12, 0), Some(0));
-        assert_eq!(byte_len(2, 1 << 30, 4), Some(1 << 32));
+        assert_eq!(byte_len(2, 1 << 30, 4), Some((3 << 30) + 12));
         assert_eq!(byte_len(2, 1 << 30, 5), None);
+        assert_eq!(byte_len(2, u32::MAX - 11, 2), Some(1 << 32));
+        assert_eq!(byte_len(2, u32::MAX - 7, 2), None);
+        assert_eq!(byte_len(2, u32::MAX - 3, 1), Some(12));
         assert_eq!(byte_len(2, 12, u32::MAX), None);
         assert_eq!(byte_len(0, 12, 1), None);
         assert_eq!(byte_len(1, 16, 1), None);
         assert_eq!(byte_len(10, 0, 1), None);
         assert_eq!(byte_len(2, 13, 1), None);
         assert_eq!(byte_len(3, 12, 1), None);
-        assert_eq!(byte_len(1, 24, 2), Some(48));
+        assert_eq!(byte_len(1, 24, 2), Some(44));
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -313,6 +383,8 @@ mod tests {
     }
 
     impl<const N: usize> Arguments<N> {
+        const OFFSET: u64 = 4;
+
         fn new(host: &Host, input: &[[u32; N]]) -> Self {
             let (buffer, mapped) = host.shared_buffer(size_of_val(input) as u64 + 4).unwrap();
             let mapped = mapped.cast::<u32>();
@@ -333,7 +405,7 @@ mod tests {
 
         fn gpu(&self) -> u64 {
             // SAFETY: the resource is live and starts with a guard word.
-            unsafe { self.buffer.GetGPUVirtualAddress() + 4 }
+            unsafe { self.buffer.GetGPUVirtualAddress() + Self::OFFSET }
         }
 
         fn record(host: &Host, list: &HostList, kind: u32, input: &[[u32; N]]) -> Self {
@@ -341,11 +413,10 @@ mod tests {
             assert!(bound(
                 list,
                 &args.buffer,
-                args.gpu(),
+                Self::OFFSET,
                 None,
                 (kind, (4 * N) as u32, input.len() as u32)
             ));
-            done(list, &args.buffer, None);
             args
         }
 
@@ -356,6 +427,15 @@ mod tests {
                 std::slice::from_raw_parts(self.mapped.add(1).cast(), self.records).to_vec()
             }
         }
+    }
+
+    fn gpu_host() -> Option<&'static Host> {
+        let host = host()?;
+        if !enhanced_barriers() {
+            eprintln!("skipped indirect GPU test: enhanced barriers unavailable");
+            return None;
+        }
+        Some(host)
     }
 
     fn used(list: &HostList) -> u32 {
@@ -378,7 +458,7 @@ mod tests {
 
     #[test]
     fn compute_dimensions_and_resubmission() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(
             host,
@@ -419,7 +499,7 @@ mod tests {
 
     #[test]
     fn compute_work_above_the_record_limit_runs_empty() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(host, &list, COMPUTE, &[[1025, 1024, 1]]);
         list.close();
@@ -430,7 +510,7 @@ mod tests {
 
     #[test]
     fn rejected_reservations_cannot_wrap_the_budget() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 4]);
         let rejected = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 128]);
@@ -446,7 +526,7 @@ mod tests {
 
     #[test]
     fn rejected_reservation_leaves_room_for_smaller_dispatch() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let _full = Arguments::record(host, &list, COMPUTE, &[FULL_DISPATCH; 3]);
         let _almost = Arguments::record(host, &list, COMPUTE, &[[32767, 32, 1]]);
@@ -461,7 +541,7 @@ mod tests {
 
     #[test]
     fn concurrent_reservations_stay_within_budget() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let args = Arguments::record(host, &list, COMPUTE, &[[128, 128, 1]; 1024]);
         list.close();
@@ -480,7 +560,7 @@ mod tests {
 
     #[test]
     fn draw_and_mesh_limits_are_preserved() {
-        let Some(host) = host() else { return };
+        let Some(host) = gpu_host() else { return };
         let list = host.new_list().unwrap();
         let draw = Arguments::record(host, &list, 0, &[[3, 2, 5, 7], [u32::MAX, u32::MAX, 9, 11]]);
         let indexed = Arguments::record(host, &list, 1, &[[6, 2, 1, u32::MAX, 2]]);
@@ -493,13 +573,7 @@ mod tests {
         assert_eq!(used(&list), 6 + (1 << 26) + 12 + (17 + 65535) * 128);
     }
 
-    #[test]
-    fn validated_arguments_run_with_a_separate_count_buffer() {
-        let Some(host) = host() else { return };
-        let list = host.new_list().unwrap();
-        let args = Arguments::new(host, &[[1, 1, 1]; 2]);
-        let count = Arguments::new(host, &[[1]]);
-        let work = Arguments::new(host, &[[6, 2, 3]]);
+    fn dispatch_signature(host: &Host, stride: u32) -> ID3D12CommandSignature {
         let mut signature: Option<ID3D12CommandSignature> = None;
         let argument = D3D12_INDIRECT_ARGUMENT_DESC {
             Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
@@ -510,7 +584,7 @@ mod tests {
             host.device
                 .CreateCommandSignature(
                     &D3D12_COMMAND_SIGNATURE_DESC {
-                        ByteStride: 12,
+                        ByteStride: stride,
                         NumArgumentDescs: 1,
                         pArgumentDescs: &argument,
                         NodeMask: 0,
@@ -520,29 +594,181 @@ mod tests {
                 )
                 .unwrap();
         }
-        let signature = signature.unwrap();
-        assert!(bound(
-            &list,
-            &args.buffer,
-            args.gpu(),
-            Some(&count.buffer),
-            (COMPUTE, 12, 2)
-        ));
-        // Use the bound pipeline as the workload and redirect it to its own
-        // buffer. Its budget contribution records how many dispatches ran.
+        signature.unwrap()
+    }
+
+    fn dispatch(
+        list: &HostList,
+        args: (&ID3D12Resource, u64),
+        signature: &ID3D12CommandSignature,
+        max: u32,
+        count: Option<(&ID3D12Resource, u64)>,
+        work: u64,
+    ) {
+        // Reuse the sanitizer as the executed workload. Each dispatch
+        // increments the budget by a known amount.
         let constants = [COMPUTE, 12, 1, 0];
-        // SAFETY: all resources and the signature are live. Both input
-        // buffers are in indirect-argument state, with records at byte 4.
+        // SAFETY: inputs are synchronized and live, and the sanitizer
+        // pipeline is still bound with the list's budget UAV.
         unsafe {
             list.list
                 .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-            list.list.SetComputeRootUnorderedAccessView(1, work.gpu());
-            list.list
-                .ExecuteIndirect(&signature, 2, &args.buffer, 4, &count.buffer, 4);
+            list.list.SetComputeRootUnorderedAccessView(1, work);
+            list.list.ExecuteIndirect(
+                signature,
+                max,
+                args.0,
+                args.1,
+                count.map(|(buffer, _)| buffer),
+                count.map_or(0, |(_, offset)| offset),
+            );
         }
-        done(&list, &args.buffer, Some(&count.buffer));
+        done(list, args.0, count.map(|(buffer, _)| buffer));
+    }
+
+    #[test]
+    fn native_dispatch_reads_the_last_record_at_the_end_of_the_buffer() {
+        let Some(host) = gpu_host() else { return };
+        let list = host.new_list().unwrap();
+        // Two dispatches with a 16-byte stride. From offset 4 the last
+        // argument ends exactly at byte 32 of the native resource.
+        let args = Arguments::new(host, &[[1, 1, 1, u32::MAX, 1, 1, 1]]);
+        let work = Arguments::new(host, &[[6, 2, 3]]);
+        let signature = dispatch_signature(host, 16);
+        let (short, _) = host.shared_buffer(31).unwrap();
+        assert!(!bound(&list, &short, 4, None, (COMPUTE, 16, 2)));
+        assert!(bound(&list, &args.buffer, 4, None, (COMPUTE, 16, 2)));
+        dispatch(&list, (&args.buffer, 20), &signature, 1, None, work.gpu());
         list.close();
         host.execute(&[&list]);
         assert_eq!(used(&list), (2 + 36) * 64);
+        assert_eq!(args.read(), [[1, 1, 1, u32::MAX, 1, 1, 1]]);
+    }
+
+    #[test]
+    fn cpu_count_is_reused_with_separate_and_shared_buffers() {
+        let Some(host) = gpu_host() else { return };
+        let list = host.new_list().unwrap();
+        let args = Arguments::new(host, &[[1, 1, 1, 1, 1, 1, 1]]);
+        let count = Arguments::new(host, &[[1]]);
+        let work = Arguments::new(host, &[[6, 2, 3]]);
+        let signature = dispatch_signature(host, 12);
+        for (buffer, offset) in [(&count.buffer, 4), (&args.buffer, 28)] {
+            assert!(bound(
+                &list,
+                &args.buffer,
+                4,
+                Some(buffer),
+                (COMPUTE, 12, 2)
+            ));
+            dispatch(
+                &list,
+                (&args.buffer, 4),
+                &signature,
+                2,
+                Some((buffer, offset)),
+                work.gpu(),
+            );
+        }
+        list.close();
+        for _ in 0..2 {
+            host.execute(&[&list]);
+            assert_eq!(used(&list), 2 * (2 + 36) * 64);
+        }
+    }
+
+    #[test]
+    fn gpu_count_producer_in_another_list_and_submission() {
+        let Some(host) = gpu_host() else { return };
+        let writer = host.new_list().unwrap();
+        let reader = host.new_list().unwrap();
+        let args = Arguments::new(host, &[[1, 1, 1]; 2]);
+        let count = Arguments::new(host, &[[0, 2, 1]]);
+        let work = Arguments::new(host, &[[6, 2, 3]]);
+        let signature = dispatch_signature(host, 12);
+        let c = clamp().unwrap();
+        let constants = [10u32, 12, 1, 0];
+        let writer_budget = writer.budget().unwrap();
+        // SAFETY: the writer uses the mesh clamp to store Y=1 at byte 8
+        // of the count buffer. Its UAV use precedes indirect consumption.
+        unsafe {
+            writer.list.SetComputeRootSignature(&c.root);
+            writer.list.SetPipelineState(&c.pso);
+            writer
+                .list
+                .SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+            writer
+                .list
+                .SetComputeRootUnorderedAccessView(1, count.gpu());
+            writer
+                .list
+                .SetComputeRootUnorderedAccessView(2, writer_budget.GetGPUVirtualAddress());
+            writer.list.Dispatch(1, 1, 1);
+        }
+        assert!(bound(
+            &reader,
+            &args.buffer,
+            4,
+            Some(&count.buffer),
+            (COMPUTE, 12, 2)
+        ));
+        dispatch(
+            &reader,
+            (&args.buffer, 4),
+            &signature,
+            2,
+            Some((&count.buffer, 8)),
+            work.gpu(),
+        );
+        writer.close();
+        reader.close();
+        host.execute(&[&writer, &reader]);
+        assert_eq!(count.read(), [[0, 1, 1]]);
+        assert_eq!(used(&reader), (2 + 36) * 64);
+        host.execute(&[&reader]);
+        assert_eq!(used(&reader), (2 + 36) * 64);
+    }
+
+    #[test]
+    fn count_can_be_a_copy_destination_before_indirect_and_a_source_after() {
+        let Some(host) = gpu_host() else { return };
+        let list = host.new_list().unwrap();
+        let args = Arguments::new(host, &[[1, 1, 1]; 2]);
+        let count = Arguments::new(host, &[[0]]);
+        let input = Arguments::new(host, &[[1]]);
+        let result = Arguments::new(host, &[[0]]);
+        let work = Arguments::new(host, &[[6, 2, 3]]);
+        let signature = dispatch_signature(host, 12);
+        // SAFETY: live buffers. The prelude selects enhanced barriers for
+        // count, allowing the initial copy-destination access.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&count.buffer, 4, &input.buffer, 4, 4)
+        };
+        assert!(bound(
+            &list,
+            &args.buffer,
+            4,
+            Some(&count.buffer),
+            (COMPUTE, 12, 2)
+        ));
+        dispatch(
+            &list,
+            (&args.buffer, 4),
+            &signature,
+            2,
+            Some((&count.buffer, 4)),
+            work.gpu(),
+        );
+        // SAFETY: the indirect read has finished and the count buffer is
+        // available for the next access, here as a copy source.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&result.buffer, 4, &count.buffer, 4, 4)
+        };
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(used(&list), (2 + 36) * 64);
+        assert_eq!(result.read(), [[1]]);
     }
 }

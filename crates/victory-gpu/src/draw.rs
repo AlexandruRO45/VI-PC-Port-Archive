@@ -954,16 +954,13 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        let separate_counter = counter
-            .as_ref()
-            .map(|(s, _)| &s.buffer)
-            .filter(|&buffer| buffer != &args.buffer);
+        let count_buffer = counter.as_ref().map(|(s, _)| &s.buffer);
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(
             list,
             &args.buffer,
-            args.gpu(arguments),
-            separate_counter,
+            args.offset(arguments),
+            count_buffer,
             (kind, stride, max),
         ) {
             return false;
@@ -983,7 +980,6 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer, separate_counter);
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -998,11 +994,11 @@ impl State {
                 max,
                 &args.buffer,
                 args.offset(arguments),
-                counter.as_ref().map(|(s, _)| &s.buffer),
+                count_buffer,
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer, separate_counter);
+        crate::indirect::done(list, &args.buffer, count_buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

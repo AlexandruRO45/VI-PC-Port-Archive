@@ -1150,8 +1150,15 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
+    let arguments = crate::resource::buffer_bytes(arguments);
+    #[cfg(windows)]
+    let address = match args {
+        [[kind, ..]] => indirect_arguments(arguments, offset, (*kind, stride, max)),
+        _ => None,
+    };
+    #[cfg(not(windows))]
     let address = indirect_address(arguments, offset, u64::from(stride) * u64::from(max));
-    let counter = indirect_address(count, count_offset, 4);
+    let counter = indirect_address(crate::resource::buffer_bytes(count), count_offset, 4);
     let mut ran = false;
     // shortcut: off unless `VICTORY_INDIRECT` is set (diagnostics builds):
     // with it the world presented no frame for 30 s and the title's own
@@ -1189,10 +1196,23 @@ extern "system" fn execute_indirect(
     }
 }
 
+#[cfg(windows)]
+fn indirect_arguments(
+    buffer: Option<(*mut u8, u64)>,
+    offset: u64,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<u64> {
+    indirect_address(
+        buffer,
+        offset,
+        crate::indirect::byte_len(kind, stride, records)?,
+    )
+}
+
 /// Check against the title buffer before resolving its host copy, which
 /// may include other memory or padding beyond the title's buffer.
-fn indirect_address(buffer: This, offset: u64, len: u64) -> Option<u64> {
-    let (base, size) = crate::resource::buffer_bytes(buffer)?;
+fn indirect_address(buffer: Option<(*mut u8, u64)>, offset: u64, len: u64) -> Option<u64> {
+    let (base, size) = buffer?;
     if !offset.is_multiple_of(4) || offset.checked_add(len)? > size {
         return None;
     }
@@ -1401,6 +1421,37 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    #[test]
+    fn indirect_arguments_fit_the_title_buffer_without_trailing_padding() {
+        let mut data = [0u8; 32];
+        let base = data.as_mut_ptr();
+        let records = (2, 16, 2);
+        assert_eq!(
+            indirect_arguments(Some((base, 28)), 0, records),
+            Some(base as u64)
+        );
+        assert_eq!(indirect_arguments(Some((base, 27)), 0, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 4, records),
+            Some(base as u64 + 4)
+        );
+        assert_eq!(indirect_arguments(Some((base, 31)), 4, records), None);
+        assert_eq!(indirect_arguments(Some((base, 32)), 2, records), None);
+        assert_eq!(
+            indirect_arguments(Some((base, 12)), 0, (2, 16, 1)),
+            Some(base as u64)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, 32)), 32, (2, 16, 0)),
+            Some(base as u64 + 32)
+        );
+        assert_eq!(
+            indirect_arguments(Some((base, u64::MAX)), u64::MAX - 3, records),
+            None
+        );
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

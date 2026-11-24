@@ -34,6 +34,7 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
+type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
@@ -41,6 +42,7 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    indirect_prelude: OnceLock<windows::core::Result<Prelude>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -214,6 +216,7 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            indirect_prelude: OnceLock::new(),
             event,
             rtvs,
             rtv_size,
@@ -244,7 +247,7 @@ pub(crate) struct HostList {
     /// resource first.
     states: Mutex<States>,
     /// The list that runs those transitions just before this one.
-    prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
+    prelude: Prelude,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
     /// The work its indirect executions have reserved (`indirect`): a
@@ -330,6 +333,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Whole buffers whose indirect uses need enhanced barriers.
+    indirect_buffers: std::collections::HashMap<usize, ID3D12Resource>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -389,29 +394,64 @@ impl Host {
                 &allocator,
                 None,
             )?;
-            let prelude_allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let prelude: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &prelude_allocator,
-                None,
-            )?;
-            prelude.Close()?;
             Ok(HostList {
                 allocator,
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
-                prelude: (prelude_allocator, prelude),
+                prelude: self.new_prelude()?,
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
             })
         }
+    }
+
+    fn new_prelude(&self) -> windows::core::Result<Prelude> {
+        // SAFETY: a direct allocator and a list created against it.
+        unsafe {
+            let allocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
+            list.Close()?;
+            Ok((allocator, list))
+        }
+    }
+
+    /// Selects enhanced barriers for all indirect buffers before any list
+    /// in this submission can implicitly promote them to a legacy state.
+    /// The submission lock prevents reuse while a prior prelude is running.
+    fn indirect_prelude(
+        &self,
+        buffers: &std::collections::HashMap<usize, ID3D12Resource>,
+    ) -> windows::core::Result<ID3D12CommandList> {
+        let (allocator, list) = self
+            .indirect_prelude
+            .get_or_init(|| self.new_prelude())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        // SAFETY: the preceding submission finished, and buffers live
+        // through this submission. A new submission starts them in COMMON.
+        unsafe {
+            allocator.Reset()?;
+            list.Reset(allocator, None)?;
+            crate::indirect::buffer_barriers(
+                &list.cast::<ID3D12GraphicsCommandList7>()?,
+                buffers.values(),
+                (D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS),
+                (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_COMMON),
+            );
+            list.Close()?;
+        }
+        list.cast()
     }
 
     /// Runs closed lists and waits for them.
@@ -423,19 +463,37 @@ impl Host {
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            lists.push(list.list.cast().ok());
         }
         batch.flush();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buffers = std::collections::HashMap::new();
         for list in runs {
+            buffers.extend(
+                list.deferred()
+                    .indirect_buffers
+                    .iter()
+                    .map(|(&key, buffer)| (key, buffer.clone())),
+            );
             if let Some(Some((_, data))) = list.budget.get() {
                 // SAFETY: the list's mapped budget word. The submission lock
                 // keeps the CPU reset from racing a previous GPU submission.
                 unsafe { (*data as *mut u32).write_volatile(0) };
             }
+        }
+        // A buffer decays at the submission boundary, not between lists
+        // submitted together. Select enhanced barriers while all these
+        // buffers are still COMMON, before even the first list uses them.
+        if !buffers.is_empty() {
+            match self.indirect_prelude(&buffers) {
+                Ok(prelude) => lists.push(Some(prelude)),
+                Err(e) => fail(format_args!("indirect buffer prelude did not record ({e})")),
+            }
+        }
+        for list in runs {
+            if let Some(prelude) = list.prelude() {
+                lists.push(Some(prelude));
+            }
+            lists.push(list.list.cast().ok());
         }
         *submitted += 1;
         let prepared = std::time::Instant::now();
@@ -925,6 +983,19 @@ impl HostList {
             })
             .as_ref()
             .map(|(buffer, _)| buffer)
+    }
+
+    pub(crate) fn use_indirect_buffers<'a>(
+        &self,
+        buffers: impl IntoIterator<Item = &'a ID3D12Resource>,
+    ) {
+        let mut deferred = self.deferred();
+        for buffer in buffers {
+            deferred
+                .indirect_buffers
+                .entry(buffer.as_raw() as usize)
+                .or_insert_with(|| buffer.clone());
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
