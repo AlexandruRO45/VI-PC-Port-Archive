@@ -1231,6 +1231,19 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// GFX10 puts an inline f16 constant in the low half of the operand.
+    fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
+        match *op {
+            Operand::Const(c @ 240..=248) => {
+                let h = [
+                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                ][usize::from(c - 240)];
+                Ok(self.s.m.i32(h))
+            }
+            _ => self.operand(inst, op),
+        }
+    }
+
     fn as_float(&mut self, x: V) -> V {
         self.s.m.cast(self.cur, Cast::Bitcast, x, self.s.t.f32)
     }
@@ -4147,15 +4160,9 @@ impl<'a> Lower<'a> {
                 _ => return Err("a byte select on a 16-bit operation"),
             }
         }
-        let x = match (op, self.src0) {
-            (_, Some(x)) if k == 0 => x,
-            (Operand::Const(c @ 240..=248), _) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                self.s.m.i32(h)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = match self.src0 {
+            Some(x) if k == 0 => x,
+            _ => self.f16_operand(inst, &op)?,
         };
         let c = self.cur;
         let x = if high {
@@ -4574,22 +4581,18 @@ impl<'a> Lower<'a> {
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
     /// 16 bits: op_sel picks the half the low result reads, op_sel_hi the
-    /// half the high result reads. Inline float constants are f16 values.
-    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool) -> Result<V, Why> {
+    /// half the high result reads. Packed integer instructions see the f32
+    /// bits of an inline float constant.
+    fn packed_src(&mut self, inst: &Inst, k: usize, high: bool, float: bool) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let sel = if high { v.opsel_hi } else { v.opsel } >> k & 1 != 0;
-        let x = match op {
-            Operand::Const(c @ 240..=248) => {
-                let h = [
-                    0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
-                ][usize::from(c - 240)];
-                // shortcut: taken to fill both halves.
-                self.s.m.i32(h | h << 16)
-            }
-            _ => self.operand(inst, &op)?,
+        let x = if float {
+            self.f16_operand(inst, &op)?
+        } else {
+            self.operand(inst, &op)?
         };
         let c = self.cur;
         let x = if sel {
@@ -4625,7 +4628,7 @@ impl<'a> Lower<'a> {
         for high in [false, true] {
             let mut xs = Vec::new();
             for k in 0..n {
-                let h = self.packed_src(inst, k, high)?;
+                let h = self.packed_src(inst, k, high, float)?;
                 if float {
                     let mut f = self
                         .s
@@ -5602,7 +5605,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" => (60, true),
+            "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -5747,6 +5750,25 @@ impl<'a> Lower<'a> {
             args.extend(&cs);
             match op {
                 60 => {
+                    if offset_word {
+                        // DXIL takes immediate offsets in -8..=7; the
+                        // console's are 6-bit and may be computed.
+                        let w = addr_val(self, 0)?;
+                        let w = self
+                            .s
+                            .m
+                            .int_value(w)
+                            .ok_or("a sample offset that is not constant")?
+                            as u32;
+                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            let x = if x >= 32 { x - 64 } else { x };
+                            if !(-8..=7).contains(&x) {
+                                return Err("a sample offset past -8..7");
+                            }
+                            *o = self.s.m.i32(x as u32);
+                        }
+                    }
                     args.extend(&os);
                     args.push(fu);
                     self.s
@@ -6685,6 +6707,20 @@ impl<'a> Lower<'a> {
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
+        // A phi that only another read phi consumes is live too. Without this, a value with no DXIL form that
+        // reaches a read through two joins is taken for dead at the first join and replaced by zero below, and the
+        // lowering accepts what it refuses when the same value is read directly.
+        let mut work: Vec<Value> = self.read_phis.iter().copied().collect();
+        while let Some(v) = work.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            for &arg in &p.blocks[b].phis[i].args {
+                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                    work.push(arg);
+                }
+            }
+        }
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
@@ -6742,8 +6778,8 @@ mod tests {
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Whether a synthetic compute program translates with these input registers.
+    fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6752,7 +6788,7 @@ mod tests {
             layout: vec![],
             used: vec![],
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 0,
+                rsrc2,
                 threads: [1, 1, 1],
             }),
             code,
@@ -6803,7 +6839,7 @@ mod tests {
             S_ENDPGM,
         ];
         for words in [add, sub] {
-            lowers(&words).unwrap();
+            lowers(&words, 0).unwrap();
         }
     }
 
@@ -6917,6 +6953,35 @@ mod tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words).unwrap();
         }
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a direct read so future timestamp support works in both cases.
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]
