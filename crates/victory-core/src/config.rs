@@ -1132,12 +1132,20 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
     // `dangling/` or `loop/` would never be seen as a link, and
     // `Path::ancestors` goes straight from `default.xex/` to its parent, so
     // a file named with a trailing slash would pass as a folder to create.
+    //
+    // Keep why the last name below the found folder could not be looked
+    // at: a folder without search permission hides what is under it, so
+    // create_dir_all would fail there on first use, not create anything.
     let walk: PathBuf = dir.components().collect();
+    let mut below = None;
     let existing = walk.ancestors().find_map(|p| match std::fs::metadata(p) {
         Ok(m) => Some(Ok((p, m))),
-        Err(_) => std::fs::symlink_metadata(p)
-            .is_ok_and(|m| m.file_type().is_symlink())
-            .then_some(Err(p)),
+        Err(e) => {
+            below = Some(e.kind());
+            std::fs::symlink_metadata(p)
+                .is_ok_and(|m| m.file_type().is_symlink())
+                .then_some(Err(p))
+        }
     });
     let (path, metadata) = match existing {
         None => return Ok(()),
@@ -1160,6 +1168,15 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
         }
     };
     if metadata.is_dir() {
+        if below == Some(std::io::ErrorKind::PermissionDenied) {
+            anyhow::bail!(
+                "the {what} {} (from {origin}) cannot be checked because {} has no search \
+                 permission for this user, so nothing under it can be found or made; \
+                 give it search permission, or set {setting} elsewhere",
+                dir.display(),
+                path.display()
+            );
+        }
         return Ok(());
     }
     if path != walk {
@@ -4043,6 +4060,84 @@ mod tests {
         }
         assert!(!scratch.join("cache").exists());
 
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_under_a_folder_without_search_permission_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-unsearchable-folder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let locked = scratch.join("locked");
+        std::fs::create_dir_all(locked.join("inner")).unwrap();
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            })
+        };
+        let deep = locked.join("inner").join("cache");
+        let near = locked.join("data");
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root (or a CAP_DAC_OVERRIDE container) searches through the
+        // mode bits, leaving nothing to check.
+        let enforced = std::fs::metadata(locked.join("inner")).is_err();
+        if enforced {
+            // Whether the folder is there, or could be made, cannot be
+            // told: named with the folder that hides it and the setting,
+            // not passed as a folder still to create.
+            let err = resolve(deep.clone(), scratch.join("data"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "the cache folder {} (from VICTORY_CACHE_DIR) cannot be checked because {} \
+                     has no search permission for this user, so nothing under it can be found \
+                     or made; give it search permission, or set VICTORY_CACHE_DIR or [paths].cache_dir \
+                     elsewhere",
+                    deep.display(),
+                    locked.display()
+                )
+            );
+            // The same one level down, and with a trailing slash or `.`.
+            for data in [
+                near.clone(),
+                PathBuf::from(format!("{}/", near.display())),
+                PathBuf::from(format!("{}/.", near.display())),
+            ] {
+                let err = resolve(scratch.join("cache"), data.clone())
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.starts_with(&format!(
+                        "the data folder {} (from VICTORY_DATA_DIR) cannot be checked because {} \
+                         has no search permission",
+                        data.display(),
+                        locked.display()
+                    )),
+                    "{err}"
+                );
+            }
+            // The folder without search permission is itself a folder
+            // that is there: nothing under it is looked for.
+            let cfg = resolve(locked.clone(), scratch.join("data")).unwrap();
+            assert_eq!(cfg.cache_dir, locked);
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Search permission back: the same settings resolve, nothing made.
+        let cfg = resolve(deep.clone(), near.clone()).unwrap();
+        assert_eq!(cfg.cache_dir, deep);
+        assert_eq!(cfg.data_dir, near);
+        assert!(!deep.exists() && !near.exists());
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
