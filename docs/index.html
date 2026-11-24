@@ -4,11 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>GTA6 PC Port Archive</title>
-<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
+<meta name="description" content="Archive of the open-source projects trying to run GTA VI on PC: Leonida (old and new), xcl, VIctory, victory-gta6, Xbox2Windows and TuxBox. Code, branches, pull requests, issues and comments, synced hourly. Projects removed from GitHub stay here.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <script>
   // old links pointed issues at index.html#project/number; they live on browse.html now ("leonida" is now "leonida-old")
-  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox)(\/\d+)?$/.test(location.hash))
+  if (/^#(leonida|leonida-old|leonida-new|xcl|victory|xbox2windows|tuxbox|victory-gta6)(\/\d+)?$/.test(location.hash))
     location.replace("browse.html" + location.hash.replace(/^#leonida(?=\/|$)/, "#leonida-old"));
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -162,7 +162,7 @@
 </main>
 
 <footer><div class="wrap">
-  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0</span>
+  <span>Licenses: Leonida (old and new) GPL-3.0 · xcl GPL-2.0 · VIctory GPL-3.0 · Xbox2Windows MIT · TuxBox Apache-2.0 · victory-gta6 GPL-3.0</span>
   <a href="https://github.com/Guernica4u/GTA6-PC-Port-Archive">GitHub repository</a>
 </div></footer>
 
@@ -190,6 +190,9 @@ const PROJECTS = {
   tuxbox: { repo: "brcly/TuxBox", saved: "24 Nov 2026", name: "TuxBox", lic: "Apache-2.0", branch: "tuxbox", up: "https://github.com/brcly/TuxBox",
     desc: "Runs Xbox Series games on Linux (through Proton) and Windows.", reached: 2,
     note: "On Linux it starts and shows the player selection screen in 4K. What comes after that isn't checked yet.", src: "https://github.com/brcly/TuxBox/blob/main/docs/PROGRESS.md#games" },
+  "victory-gta6": { repo: "fxceless/victory-gta6", saved: "24 Nov 2026", name: "victory-gta6", lic: "GPL-3.0", branch: "victory-gta6", up: "https://github.com/fxceless/victory-gta6",
+    desc: "A fork of VIctory focused on getting GTA VI's world to render and run on a Windows PC.", reached: 4,
+    note: "Plays the opening cutscene and renders the first gameplay scene with working input, but at 2-4 fps and with everything in shadow black.", src: "https://github.com/fxceless/victory-gta6#status-of-this-fork-2026-11-25" },
 };
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));

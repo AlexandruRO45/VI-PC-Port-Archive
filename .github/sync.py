@@ -17,6 +17,7 @@ PROJECTS = {
     "victory": ("Marvisak/VIctory", r"## Status"),
     "xbox2windows": ("R0Y00/Xbox2Windows", r"> \*\*Current status\.\*\*"),
     "tuxbox": ("brcly/TuxBox", r"\*\*GTA VI \(ProjectScarlett\)\*\*"),
+    "victory-gta6": ("fxceless/victory-gta6", r"## Status of this fork"),
 }
 TODAY = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
