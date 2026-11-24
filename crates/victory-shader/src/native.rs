@@ -3844,7 +3844,19 @@ mod tests {
         reads: &[Read],
     ) -> Result<Vec<NativeProgram>, ShaderError> {
         let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
-        let record = FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
+        set_stage_reads(&mut blob, HwStage::Ps, params, reads);
+        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+    }
+
+    /// Sets `stage`'s record in `blob` to these (root type, SGPRs, user
+    /// data, slot) parameters and these reads, appended to the payload.
+    fn set_stage_reads(
+        blob: &mut Vec<u8>,
+        stage: HwStage,
+        params: &[(u32, u32, u8, u8)],
+        reads: &[Read],
+    ) {
+        let record = FSSM_HEADER + u64_at(blob, FSSM_HEADER + slot(stage)).unwrap() as usize;
         let tables = (blob.len() - FSSM_HEADER) as u64;
         for &(root, sgprs, user_data, slot) in params {
             for v in [root, 0, sgprs, 0] {
@@ -3867,9 +3879,83 @@ mod tests {
         blob[record + RECORD_COUNTS..][..4].copy_from_slice(&(params.len() as u32).to_le_bytes());
         blob[record + RECORD_COUNTS + 4..][..4]
             .copy_from_slice(&(reads.len() as u32).to_le_bytes());
-        native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
     }
 
+    #[test]
+    fn reads_name_only_their_own_records_parameters() {
+        let (srv, sampler, uav) = (0u8, 1u8, 3u8);
+        let (descriptor, table) = (1u8, 3u8);
+        let (vs, ps) = (HwStage::Vs, HwStage::Ps);
+        // A vertex and a pixel program, each with these parameters and reads.
+        type Params<'a> = &'a [(u32, u32, u8, u8)];
+        let parse = |vs_side: (Params, &[Read]), ps_side: (Params, &[Read])| {
+            let mut blob = fssm(&[(vs, &VS_CODE), (ps, &PS_CODE)]);
+            set_stage_reads(&mut blob, vs, vs_side.0, vs_side.1);
+            set_stage_reads(&mut blob, ps, ps_side.0, ps_side.1);
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        // A table in s4 (slot 2) and a root descriptor in s6-s7 (slot 3).
+        let both = &[(3, 1, 4, 2), (1, 2, 6, 3)][..];
+        let srv_in_table = &[(srv, table, 0, 4, 2)][..];
+        let srv_in_descriptor = &[(srv, descriptor, 0, 6, 3)][..];
+
+        // Each program reading its own parameters is fine, in either one.
+        let p = parse((both, srv_in_table), (both, srv_in_descriptor)).unwrap();
+        assert_eq!((p[0].stage, p[0].used.len()), (vs, 1));
+        assert_eq!((p[1].stage, p[1].used.len()), (ps, 1));
+
+        // A read naming a parameter only the other program has names none:
+        // the host binds a stage's reads from that stage's root parameters.
+        for (vs_side, ps_side, why) in [
+            (
+                (both, &[][..]),
+                (&[][..], srv_in_table),
+                "used descriptor names no root table",
+            ),
+            (
+                (&[][..], srv_in_table),
+                (both, &[][..]),
+                "used descriptor names no root table",
+            ),
+            (
+                (both, &[][..]),
+                (&[][..], srv_in_descriptor),
+                "used descriptor names no root descriptor",
+            ),
+            (
+                (&[][..], srv_in_descriptor),
+                (both, &[][..]),
+                "used descriptor names no root descriptor",
+            ),
+        ] {
+            assert_eq!(
+                why_refused(parse(vs_side, ps_side)),
+                why,
+                "{vs_side:?} {ps_side:?}"
+            );
+        }
+
+        // One table's descriptor read as an SRV by one program and a UAV by
+        // the other, or its table holding samplers in one and views in the
+        // other, breaks neither rule: each program binds its own tables.
+        let as_uav = &[(uav, table, 0, 4, 2)][..];
+        let as_sampler = &[(sampler, table, 0, 4, 2)][..];
+        assert!(parse((both, srv_in_table), (both, as_uav)).is_ok());
+        assert!(parse((both, as_sampler), (both, srv_in_table)).is_ok());
+        // Within one program they are still refused.
+        let mut two_ways = srv_in_table.to_vec();
+        two_ways.extend_from_slice(as_uav);
+        assert_eq!(
+            why_refused(parse((both, &two_ways), (both, srv_in_table))),
+            "used descriptors read one descriptor two ways"
+        );
+        let mut mixed = srv_in_table.to_vec();
+        mixed.push((sampler, table, 8, 4, 2));
+        assert_eq!(
+            why_refused(parse((both, srv_in_table), (both, &mixed))),
+            "root table mixes samplers and views"
+        );
+    }
     #[test]
     fn refuses_a_descriptor_read_two_ways() {
         let (srv, cbv, uav) = (0u8, 2u8, 3u8);
