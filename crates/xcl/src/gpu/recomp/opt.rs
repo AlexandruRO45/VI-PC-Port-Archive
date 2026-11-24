@@ -30,11 +30,25 @@
 //!    only, `max_end - min_off <= 1_048_576` (and `max_span == 0` in `Mode::Kernel`), disjoint
 //!    from `HoistedSbufGroup`, splitting epochs on any memory hazard, `GLC`/`DLC` SMEM op, or
 //!    write to `sbase..sbase+3`; never uses `[loop]` or wrap-fallback switch duplication.
-//! 4. **Lane-local `bool` masks (`lane_local_*`)**: disabled in `Mode::Kernel` and `split_wave64`;
-//!    scalarizes `V_CMP_*` (non-`CMPX`), `V_ADD/SUB*_CO*_U32`, and dead-`scc` bitwise SALU chains
-//!    only when every consumer is strictly per-lane (`V_CNDMASK_B32` / `V_ADD/SUB*_CO_CI_U32` in
-//!    mask slot only, or another valid lane-local bitwise op) and the mask register is dead after
-//!    the chain; sets `needs_exec_mask = true` whenever any `EXEC`-widening op intervenes.
+//! 4. **Lane-local `bool` masks (`lane_local_*`) — Convergence & Hazard Model**:
+//!    - **Strictly intra-block (zero ballot motion)**: never moves, hoists, sinks, or deduplicates
+//!      any `WaveActiveBallot` across basic-block boundaries, branches, merges, or loops; every
+//!      scalarized def-use DAG is contained inside one basic block and must be dead at block exit
+//!      (`!live_out_s[bi]`).
+//!    - **Zero cross-lane observation (convergence-free replacement)**: disabled in `Mode::Kernel`
+//!      and `split_wave64`; scalarizes `V_CMP_*` (non-`CMPX`), `V_ADD/SUB*_CO*_U32`, and dead-`scc`
+//!      bitwise SALU chains (`S_AND/OR/XOR/NOT/ANDN2/ORN2/NAND/NOR/XNOR/MOV`) only when every
+//!      consumer reads solely its own lane bit (`V_CNDMASK_B32` mask slot, `V_ADD/SUB*_CO_CI_U32`
+//!      carry-in slot, or another valid lane-local bitwise op). Any whole-mask consumer
+//!      (`S_CBRANCH_VCC*`, `S_BCNT*`, `S_FF*`, `EXEC` updates, scalar ALU data operands, memory
+//!      operands, or unknown/indirect ops) rejects the entire chain. Because lane `i` only ever
+//!      reads bit `i` of its own lane's ballot, `lanebit(WaveActiveBallot(and(act, cond)))` is
+//!      identically `and(act, cond)` per lane with zero cross-lane convergence semantics to preserve.
+//!    - **Divergent `EXEC` & widening guard (`needs_exec_mask`)**: if any `EXEC`-widening op
+//!      (`is_exec_widening`, e.g., `s_mov`/`s_or`/`s_xor`/`s_not`/`s_nand`/`s_nor`/`s_xnor` to
+//!      `exec`, `s_wqm`, `s_andn2_saveexec`) executes between a def and its last consumer in the
+//!      block, `needs_exec_mask = true` captures `and(act, cond)` at the def site so lanes disabled
+//!      at def remain `false` after `EXEC` is later restored.
 //! 5. **Dead `vcc`/carry `sdst`**: for `wave64`, both `n` and `n+1` must be dead; for wave32,
 //!    only `n` must be dead; `Null` (`125` or `> 127`) is always dead. Carry-in reads on
 //!    `v_add_co_ci*`/`v_sub*_co_ci*` are always preserved.
@@ -3764,6 +3778,18 @@ struct LaneLocalResult {
 }
 
 /// Weapon 3: Wave32 & native-Wave64 lane-local `bool` mask scalarization.
+///
+/// **Convergence & hazard model**:
+/// - Strictly **intra-block**: never moves, reorders, or deduplicates `WaveActiveBallot` across
+///   branches, merges, or loops; every chain must die before block exit (`!live_out_s[bi]`).
+/// - **Zero cross-lane observation**: every consumer must be a per-lane mask reader
+///   (`V_CNDMASK_B32`, `V_ADD/SUB*_CO_CI_U32` carry-in, or a dead-`scc` bitwise mask op whose own
+///   consumers are also lane-local). Any whole-mask read (`S_CBRANCH_VCC*`, `S_BCNT*`, `S_FF*`,
+///   `EXEC` writes, scalar data operands, memory operands, indirect/unknown ops) aborts the chain.
+/// - **Divergent `EXEC` restore safety**: if any `EXEC`-widening instruction executes between a
+///   def and its last use in the block, `needs_exec_mask = true` forces `and(act, cond)` at the
+///   def site so inactive lanes stay `0` even if `EXEC` is widened before the consumer.
+/// - Disabled in `Mode::Kernel` (epilogue dumps SGPR masks) and `split_wave64` (`x64_masks.rs`).
 #[allow(clippy::too_many_arguments)]
 fn analyze_lane_local_masks(
     insts: &[Decoded],
