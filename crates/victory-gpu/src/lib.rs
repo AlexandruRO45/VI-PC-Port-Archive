@@ -49,6 +49,8 @@ mod compose;
 #[cfg(windows)]
 mod direct;
 #[cfg(windows)]
+mod mirror;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]

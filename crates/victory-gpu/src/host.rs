@@ -514,6 +514,34 @@ impl Host {
         }
     }
 
+    /// Local build: maps one tile of buffer `buffer` per entry of `tiles` (tile index in the
+    /// buffer) to tile `heap_tiles[k]` of `heap` (see `crate::mirror`).
+    pub(crate) fn map_tiles(&self, buffer: &ID3D12Resource, tiles: &[u32], heap: &ID3D12Heap, heap_tiles: &[u32]) {
+        if tiles.is_empty() {
+            return;
+        }
+        let coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> =
+            tiles.iter().map(|&x| D3D12_TILED_RESOURCE_COORDINATE { X: x, Y: 0, Z: 0, Subresource: 0 }).collect();
+        let sizes = vec![D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), ..Default::default() }; tiles.len()];
+        let flags = vec![D3D12_TILE_RANGE_FLAG_NONE; tiles.len()];
+        let counts = vec![1u32; tiles.len()];
+        // SAFETY: our queue; the arrays have one entry per region and range.
+        unsafe {
+            self.queue.UpdateTileMappings(
+                buffer,
+                tiles.len() as u32,
+                Some(coords.as_ptr()),
+                Some(sizes.as_ptr()),
+                heap,
+                tiles.len() as u32,
+                Some(flags.as_ptr()),
+                Some(heap_tiles.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+    }
+
     pub(crate) fn execute(&self, runs: &[&HostList]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.

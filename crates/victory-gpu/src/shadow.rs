@@ -45,6 +45,9 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
     /// Local build: the buffer is title memory itself (`crate::direct`): nothing to copy.
     direct: bool,
+    /// Local build: the copy lives in the mirror (`crate::mirror`): the CPU address of each
+    /// 64 KiB title page from `start`'s on (empty otherwise: one block at `data`).
+    pages: Vec<usize>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -96,9 +99,51 @@ impl Shadow {
         (self.start + self.len).saturating_sub(address)
     }
 
-    /// Offset of a title address from the buffer's start.
+    /// Offset of a title address in `buffer` (the mirror's: the address itself).
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start
+        if self.pages.is_empty() { address - self.start } else { address }
+    }
+
+    /// CPU address of byte `off` of the copy; valid up to the end of its 64 KiB title page.
+    fn ptr(&self, off: usize) -> *mut u8 {
+        if self.pages.is_empty() {
+            // SAFETY: inside the copy.
+            return unsafe { self.data.add(off) };
+        }
+        const TILE: usize = crate::mirror::TILE as usize;
+        let a = self.start as usize + off;
+        (self.pages[a / TILE - self.start as usize / TILE] + a % TILE) as *mut u8
+    }
+
+    /// Calls `f(offset, cpu address, length)` for each piece of `[from, to)` (offsets in the
+    /// copy) that lies in one 64 KiB title page.
+    fn pieces(&self, from: usize, to: usize, mut f: impl FnMut(usize, *mut u8, usize)) {
+        const TILE: usize = crate::mirror::TILE as usize;
+        let mut at = from;
+        while at < to {
+            let n = if self.pages.is_empty() { to - at } else { (TILE - (self.start as usize + at) % TILE).min(to - at) };
+            f(at, self.ptr(at), n);
+            at += n;
+        }
+    }
+
+    /// Appends the copy's bytes `[from, to)` to `out`.
+    fn gather(&self, from: usize, to: usize, out: &mut Vec<u8>) {
+        // SAFETY: each piece lies in one page of the copy.
+        self.pieces(from, to, |_, p, n| out.extend_from_slice(unsafe { std::slice::from_raw_parts(p, n) }));
+    }
+
+    /// A copy in the mirror (`crate::mirror`) of `[start, start + len)`.
+    fn mirrored(m: &crate::mirror::Mirror, start: u64, len: u64) -> Option<Shadow> {
+        use crate::mirror::TILE;
+        if !m.covers(start, len) {
+            return None;
+        }
+        let first = start / TILE;
+        let pages = m.pages(first, (start + len.max(1)).div_ceil(TILE) - first)?;
+        let mut s = Shadow::new(m.buffer.clone(), std::ptr::null_mut(), m.va + start, start, len);
+        s.pages = pages;
+        Some(s)
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -126,6 +171,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             direct: false,
+            pages: Vec::new(),
         }
     }
 
@@ -175,8 +221,6 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
@@ -191,12 +235,12 @@ impl Shadow {
         let mut grown = pooled(end - start);
         match before.take() {
             Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
+                self.gather(start, at, &mut grown);
                 grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
+                self.gather(at + bytes.len(), end, &mut grown);
                 give_back(bytes);
             }
-            None => grown.extend_from_slice(host(start, end)),
+            None => self.gather(start, end, &mut grown),
         }
         *before = Some((start, grown));
     }
@@ -229,7 +273,7 @@ impl Shadow {
             let mut synced = Vec::new();
             // Local build: which pieces the GPU changed, compared on several threads (one core
             // compared ~100 MB per submission, 27 submissions a frame: ~170 ms).
-            let changed = changed_pieces(self.data as usize, before.as_ptr() as usize, start, from, to);
+            let changed = changed_pieces(self, before.as_ptr() as usize, start, from, to);
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -239,7 +283,7 @@ impl Shadow {
                 }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                let host = unsafe { std::slice::from_raw_parts_mut(self.ptr(at), n) };
                 let old = &before[at - from..at - from + n];
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
@@ -392,16 +436,17 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // pieces within one page of the copy each
+        self.pieces(from - start, to - start, |off, p, n| {
+            crate::host::copy_mapped(p, (start + off) as *const u8, n, false);
+        });
         to - from
     }
 }
 
 /// Offsets (from the copy's start) of the 64 KiB pieces of `[from, to)` whose bytes in the copy
 /// at `data` differ from `before` (the snapshot of `[from, to)`), compared on several threads.
-fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usize) -> std::collections::HashSet<usize> {
+fn changed_pieces(shadow: &Shadow, before: usize, start: usize, from: usize, to: usize) -> std::collections::HashSet<usize> {
     const PIECE: usize = 64 << 10;
     let mut pieces = Vec::new();
     let mut at = from;
@@ -410,9 +455,10 @@ fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usi
         pieces.push((at, n));
         at += n;
     }
-    let differs = |&(at, n): &(usize, usize)| {
-        // SAFETY: inside the copy and the snapshot.
-        let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+    let pieces: Vec<(usize, usize, usize)> = pieces.iter().map(|&(at, n)| (at, n, shadow.ptr(at) as usize)).collect();
+    let differs = |&(at, n, host): &(usize, usize, usize)| {
+        // SAFETY: inside the copy (one page) and the snapshot.
+        let host = unsafe { std::slice::from_raw_parts(host as *const u8, n) };
         let old = unsafe { std::slice::from_raw_parts((before + at - from) as *const u8, n) };
         host != old
     };
@@ -491,6 +537,10 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         if let Some((buffer, gpu)) = crate::direct::buffer(&host()?.device, key.0, len) {
             entry.shadow = Some(Arc::new(Shadow::direct(buffer, gpu, key.0, len)));
+            return entry.shadow.clone();
+        }
+        if let Some(s) = crate::mirror::get().and_then(|m| Shadow::mirrored(m, key.0, len)) {
+            entry.shadow = Some(Arc::new(s));
             return entry.shadow.clone();
         }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
@@ -580,6 +630,11 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     // (no direct heap here: a run of loose memory takes in the title's CPU structures, and
     // reading those in place made it crash at start)
+    if let Some(s) = crate::mirror::get().and_then(|m| Shadow::mirrored(m, start, len)) {
+        let shadow = Arc::new(s);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
     // Local build: a whole window more past the end: shaders read across a window's end (a GPU
     // page fault 1.1 MB past one removed the device)
     let (buffer, data) = host()?.shared_buffer(len + WINDOW)?;
