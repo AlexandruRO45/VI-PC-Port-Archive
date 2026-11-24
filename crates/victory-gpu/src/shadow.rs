@@ -580,8 +580,9 @@ pub(crate) fn next_submission() {
 /// Local build: title memory mapped anew: its pages are stale for every copy.
 pub(crate) fn mirror_pages_remapped(at: usize, len: usize) {
     let (first, last) = (at / PAGE, (at + len.max(1) - 1) / PAGE);
-    let mut copied = lock_map(&MIRROR_COPIED);
+    // (always CHECKED before COPIED, as `update_run` takes them)
     let mut checked = lock_map(&MIRROR_CHECKED);
+    let mut copied = lock_map(&MIRROR_COPIED);
     for page in first..=last {
         copied.remove(&page);
         checked.remove(&page);
