@@ -808,6 +808,11 @@ impl<'a> Lower<'a> {
         let h = self.pointer_handle(&a)?;
         let c = self.cur;
         let mut addr = self.s.m.i32(a.bias.wrapping_add(offset as u32));
+        if let Some(RelOffset { value, base, .. }) = a.rel {
+            let mut local = HashMap::new();
+            let d = self.rel_offset(value, base, &mut local)?;
+            addr = self.s.m.bin(c, Bin::Add, addr, d);
+        }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, &soffset)?;
             addr = self.s.m.bin(c, Bin::Add, addr, so);
@@ -902,13 +907,23 @@ impl<'a> Lower<'a> {
             let Fields::Flat { addr, offset, .. } = &inst.fields else {
                 unreachable!()
             };
-            let addr = addr.as_ref().ok_or("a global address not in VGPRs")?;
-            if !matches!(addr, Operand::Vector { .. }) {
-                return Err("a global address not in VGPRs");
-            }
             let base = self.s.m.i32((*offset as i32 as u32).wrapping_add(a.bias));
-            let v = self.operand(inst, addr)?;
-            self.s.m.bin(c, Bin::Add, base, v)
+            let rel = match a.rel {
+                // The program added its own terms to the pointer: they are
+                // what the address has beyond it, not the pointer itself.
+                Some(RelOffset { value, base: at, .. }) => {
+                    let mut local = HashMap::new();
+                    self.rel_offset(value, at, &mut local)?
+                }
+                None => {
+                    let addr = addr.as_ref().ok_or("a global address not in VGPRs")?;
+                    if !matches!(addr, Operand::Vector { .. }) {
+                        return Err("a global address not in VGPRs");
+                    }
+                    self.operand(inst, addr)?
+                }
+            };
+            self.s.m.bin(c, Bin::Add, base, rel)
         } else {
             self.address_offset(a)?
         };
@@ -2529,6 +2544,24 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads the source of the lane its address names (a
+            // byte per lane), and an address with bit 0 set reads 0.
+            self.cross_lane(false)?;
+            let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let reg = dst_reg.ok_or("a permute result")?;
+            let two = self.s.m.i32(2);
+            let lane = self.s.m.bin(c, Bin::LShr, a, two);
+            let r = self.read_lane(x, lane);
+            let one = self.s.m.i32(1);
+            let odd = self.s.m.bin(c, Bin::And, a, one);
+            let zero = self.s.m.i32(0);
+            let is_odd = self.s.m.cmp(c, pred::NE, odd, zero);
+            let r = self.s.m.select(c, is_odd, zero, r);
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -3612,8 +3645,17 @@ impl<'a> Lower<'a> {
                             )
                     });
                     if number {
+                        // Name the field the code wanted: an address word has
+                        // no host value at all, a size or format one is what a
+                        // host view's dimensions do not carry.
+                        let why: Why = match rel {
+                            0 => "a descriptor's base address read as data",
+                            1 => "a descriptor's high address read as data",
+                            3 => "a descriptor's format read as data",
+                            _ => OTHER,
+                        };
                         if let Some(v) = inst.write(reg) {
-                            self.vals.insert(v, Val::Missing(OTHER));
+                            self.vals.insert(v, Val::Missing(why));
                         }
                     } else {
                         let zero = self.s.m.i32(0);
@@ -4547,7 +4589,12 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Uav), 0x100b) => {
                         Ok(self.s.root_uav_handle(rp.slot))
                     }
-                    _ => Err("a typed root view"),
+                    _ => {
+                        if std::env::var_os("VICTORY_TRACE_ADDR").is_some() {
+                            eprintln!("BUILT {:?} {:?} props {props:?}", rp.root, address);
+                        }
+                        Err("a typed root view")
+                    }
                 }
             }
             Source::Phi { block, args } => {
@@ -4693,6 +4740,40 @@ impl<'a> Lower<'a> {
     /// shortcut: the console reads zeros (and drops writes) where `off` and
     /// the access pass the element's end; here they reach the next element,
     /// as the statically known strides' structured accesses may.
+    /// The handle and coordinates of a per-element buffer access: a heap
+    /// descriptor whose structure the hardware scales, or, for a descriptor
+    /// the program built, a raw host view whose element byte offset is
+    /// computed here (a root view has no structure to scale by).
+    fn element_view(
+        &mut self,
+        site: Site,
+        src: &Source,
+        stride: Option<u32>,
+        u: u32,
+        index: V,
+        off: V,
+    ) -> Result<(V, [V; 3]), Why> {
+        let iu = self.s.m.undef(self.s.t.i32);
+        let stride = stride.unwrap_or(0);
+        if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
+            return Err("a structured buffer of unknown stride");
+        }
+        if stride < 4 {
+            let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
+            return Ok((h, [byte, iu, iu]));
+        }
+        if matches!(src, Source::Built { .. }) {
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let c = self.cur;
+            let k = self.s.m.i32(stride);
+            let element = self.s.m.bin(c, Bin::Mul, index, k);
+            let byte = self.s.m.bin(c, Bin::Add, element, off);
+            return Ok((h, [byte, iu, iu]));
+        }
+        let h = self.handle(site, src, false, (12 | u, stride))?;
+        Ok((h, [index, off, iu]))
+    }
+
     fn runtime_view(&mut self, src: &Source, index: V, off: V, props: u32) -> Result<(V, V), Why> {
         let [raw, stride, bias] = self.stride_entry(src)?;
         let c = self.cur;
@@ -7741,21 +7822,7 @@ impl<'a> Lower<'a> {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    if stride >= 4 && stride.is_multiple_of(4) {
-                        (
-                            self.handle(site, src, false, (12 | u, stride))?,
-                            [index, off, iu],
-                        )
-                    } else {
-                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
-                        (h, [byte, iu, iu])
-                    }
-                }
+                Some(index) => self.element_view(site, src, used.map(|u| u.stride), u, index, off)?,
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
             };
             let Operand::Vector { reg, .. } = *d else {
@@ -7884,15 +7951,9 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride >= 4 && stride.is_multiple_of(4) {
-                            args.push(self.handle(site, src, false, (12 | u, stride))?);
-                            args.extend([index, off]);
-                        } else {
-                            let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
-                            args.push(h);
-                            args.extend([byte, iu]);
-                        }
+                        let (h, [at, b, _]) = self.element_view(site, src, used.map(|u| u.stride), u, index, off)?;
+                        args.push(h);
+                        args.extend([at, b]);
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
@@ -7997,31 +8058,15 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride != 0 && (stride < 4 || !stride.is_multiple_of(4)) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    if stride >= 4 && stride.is_multiple_of(4) {
-                        let h = self.handle(site, src, false, (12 | u, stride))?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, index, off, mask, align],
-                        )
-                    } else {
-                        let (h, byte) = self.runtime_view(src, index, off, 11 | u)?;
-                        self.s.op(
-                            c,
-                            "rawBufferLoad.f32",
-                            Attr::ReadOnly,
-                            self.s.t.res_ret,
-                            139,
-                            &[h, byte, iu, mask, align],
-                        )
-                    }
+                    let (h, [at, b, _]) = self.element_view(site, src, used.map(|u| u.stride), u, index, off)?;
+                    self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, at, b, mask, align],
+                    )
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;

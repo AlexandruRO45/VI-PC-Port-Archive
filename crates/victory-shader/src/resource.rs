@@ -1172,14 +1172,14 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra, depth)
+                Ok(self.global(self.address(lo, hi, extra, depth)?))
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
-                self.address(
+                let a = self.address(
                     lo,
                     hi,
                     Sum {
@@ -1189,8 +1189,19 @@ impl<'a> Tracer<'a> {
                         multi: false,
                     },
                     depth,
-                )
+                )?;
+                Ok(self.global(a))
             }
+        }
+    }
+
+    /// A global access reads a GPU address, which a root argument never is:
+    /// an address over a `Constants` parameter is the pointer the title
+    /// stored in its first qword.
+    fn global(&self, a: Address) -> Address {
+        match self.layout.get(a.param) {
+            Some(p) if !a.deref && p.root == RootType::Constants => self.pointed(a),
+            _ => a,
         }
     }
 
@@ -1212,6 +1223,15 @@ impl<'a> Tracer<'a> {
                     // itself: the instruction's own offset and any constants
                     // in the VGPR address are applied again by the lowering,
                     // which reads them back from the instruction.
+                    return Ok(Address {
+                        bias: s.offset,
+                        ..at
+                    });
+                }
+                if let Some(v) = s.dynamic
+                    && !s.multi
+                    && let Some(at) = self.constants_pointer(v, hi)
+                {
                     return Ok(Address {
                         bias: s.offset,
                         ..at
@@ -1362,13 +1382,81 @@ impl<'a> Tracer<'a> {
         }))
     }
 
+    /// The pointer a [`RootType::Constants`] parameter's first qword holds,
+    /// for an address the program computes on top of it: root arguments
+    /// live in user SGPRs, so a value the code adds them to as an address
+    /// is a GPU address the title stored there. What the program added
+    /// travels in [`Address::rel`], never counted into the pointer's
+    /// place; the load's own offset is applied by the lowering.
+    fn constants_pointer(&self, v: Value, hi: Term) -> Option<Address> {
+        let mut found: Option<(Value, usize, u32)> = None;
+        for leaf in self.leaves(v) {
+            let Some(reg) = self.inputs[leaf.0 as usize] else {
+                continue;
+            };
+            let Some((param, dword)) = self.param_of(reg) else {
+                continue;
+            };
+            if self.layout[param].root != RootType::Constants
+                || !dword.is_multiple_of(2)
+                || found.is_some()
+            {
+                return None;
+            }
+            found = Some((leaf, param, dword));
+        }
+        let (lo, param, dword) = found?;
+        let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8 + 1);
+        let high = self.p.inputs.iter().find(|i| i.0 == high)?.1;
+        if !self.high_half(hi, Some(high))
+            && !self.carried(hi, Term::Value(high), &mut Vec::new())
+        {
+            return None;
+        }
+        Some(Address {
+            param,
+            offset: 4 * dword,
+            dynamic: None,
+            rel: Some(RelOffset {
+                value: v,
+                base: lo,
+                extra_dynamic: None,
+            }),
+            deref: true,
+            bias: 0,
+        })
+    }
+
+    /// `a` as the read of what a [`RootType::Constants`] parameter's first
+    /// qword points at. Root arguments arrive in user SGPRs and have no
+    /// memory behind them, so an access that cannot be one of their dwords
+    /// can only be reaching through a pointer the title stored there.
+    fn pointed(&self, a: Address) -> Address {
+        Address {
+            param: a.param,
+            offset: 0,
+            dynamic: None,
+            rel: a.rel,
+            deref: true,
+            bias: a.offset,
+        }
+    }
+
+    /// Whether `a` reaches past the dwords of the `Constants` parameter it
+    /// is over: a read of `size` bytes at its offset leaves the parameter.
+    fn leaves_parameter(&self, a: Address, size: u32) -> bool {
+        let Some(p) = self.layout.get(a.param) else {
+            return false;
+        };
+        p.root == RootType::Constants && u32::from(p.sgprs).saturating_mul(4) < a.offset.saturating_add(size)
+    }
+
     /// The qword address a [`RootType::Constants`] parameter holds: `lo`
     /// is the block's first dword as the program reads it, `hi` its
     /// second, and the byte offset comes from the load. The console's
     /// first dword there is an offset, never an address, so only the
     /// qwords past it are taken (the pointers the title places).
-    fn constants_address(&self, s: Sum, hi: Term, extra: Sum) -> Option<Address> {
-        if s.multi || s.offset != 0 || extra.dynamic.is_some() || extra.offset == 0 {
+    fn constants_address(&self, s: Sum, hi: Term, extra: Sum) -> Option<Address> {        if s.multi || s.offset != 0 || extra.dynamic.is_some() || extra.offset == 0 {
             return None;
         }
         let Some(v) = s.dynamic else {
@@ -1558,8 +1646,12 @@ impl<'a> Tracer<'a> {
 
     /// The terms of the additions that compute `v`.
     fn leaves(&self, v: Value) -> Box<dyn Iterator<Item = Value> + '_> {
-        match self.sop2(v, &["s_add_u32", "s_add_i32"]) {
-            Some((_, terms)) => Box::new(terms.into_iter().flat_map(move |t| match t {
+        let terms = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.valu_bin(v, &["v_add_co_u32", "v_add_nc_u32", "v_add_nc_i32"]));
+        match terms {
+            Some(terms) => Box::new(terms.into_iter().flat_map(move |t| match t {
                 Term::Value(x) => self.leaves(x),
                 Term::Const(_) => Box::new(std::iter::empty()),
             })),
@@ -1590,7 +1682,32 @@ impl<'a> Tracer<'a> {
             return Err("an offset from a root parameter");
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
-        self.address(lo, hi, extra, depth)
+        let a = self.address(lo, hi, extra, depth)?;
+        // A scalar load whose address is the parameter's own first qword,
+        // with nothing added, reads the root arguments themselves rather
+        // than what that qword points at.
+        let a = match a.rel {
+            Some(RelOffset { value, base, .. })
+                if a.deref && value == base && extra.dynamic.is_none() =>
+            {
+                Address {
+                    param: a.param,
+                    offset: a.offset.wrapping_add(extra.offset),
+                    dynamic: None,
+                    rel: None,
+                    deref: false,
+                    bias: 0,
+                }
+            }
+            _ => a,
+        };
+        // Root arguments have no memory behind them, so a read that reaches
+        // past the parameter's own dwords is reaching through the pointer
+        // its first qword holds.
+        Ok(match scalar_size(inst.name()) {
+            Some(size) if !a.deref && self.leaves_parameter(a, size) => self.pointed(a),
+            _ => a,
+        })
     }
 
     /// The source of the descriptor operand `op` of `inst`, in block `at`.
@@ -2511,6 +2628,27 @@ fn lane_of(op: Operand) -> Option<u32> {
         Operand::Literal(x) => Some(x),
         _ => None,
     }
+}
+
+/// Bytes a scalar memory access reads or writes, from its name (4 unless it
+/// is an `x2`, `x4`, `x8` or `x16` form).
+fn scalar_size(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix("s_load_dword")
+        .or_else(|| name.strip_prefix("s_buffer_load_dword"))
+        .or_else(|| name.strip_prefix("s_store_dword"))
+        .or_else(|| name.strip_prefix("s_buffer_store_dword"))
+        .or_else(|| name.strip_prefix("s_atomic_"))
+        .or_else(|| name.strip_prefix("s_buffer_atomic_"))?;
+    let count = match rest {
+        "" | "b32" => 1,
+        "x2" | "b64" => 2,
+        "x4" | "b128" => 4,
+        "x8" | "b256" => 8,
+        "x16" | "b512" => 16,
+        _ => return None,
+    };
+    Some(4 * count)
 }
 
 /// What dword `k` of a move's result copies.
