@@ -329,6 +329,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
+        // A row has four components, and an element fills a run of them.
+        // The mask is a raw byte of the title's part: one with bits past w
+        // counted up to eight columns (`1u8 << 8` panicked building the
+        // container's mask in debug builds, and reads spilled into the next
+        // row), and a gap (x and z) was taken for the run x and y.
+        let run = mask >> mask.trailing_zeros().min(7);
+        if mask > 0xF || run & run.wrapping_add(1) != 0 {
+            return Err(ShaderError::Malformed(
+                "signature mask is not a run of a row's four components",
+            ));
+        }
         if u32_at(part, at + 28)? != 0 {
             return Err(ShaderError::Unsupported {
                 offset: 0,
@@ -495,6 +506,43 @@ mod tests {
                 signature(&part(register)).unwrap_err().to_string(),
                 refused.to_string(),
                 "register {register:#x}"
+            );
+        }
+    }
+
+    /// A signature mask is a raw byte of the title's part. One with bits
+    /// past w, or with a gap, is refused: `0xFF` counted eight columns and
+    /// building the container's mask shifted a `u8` by eight.
+    #[test]
+    fn a_signature_mask_outside_one_row_is_refused() {
+        let part = |mask: u32| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, 0, 3, 1, mask, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(b"TEXCOORD\0");
+            p
+        };
+        for (mask, col, cols) in [
+            (0x1, 0, 1),
+            (0x8, 3, 1),
+            (0x6, 1, 2),
+            (0xE, 1, 3),
+            (0xF, 0, 4),
+            // The read-write mask in the next byte is not the element's.
+            (0x0F03, 0, 2),
+        ] {
+            let rows = signature(&part(mask)).expect("a run inside the row");
+            assert_eq!((rows[0].col, rows[0].cols), (col, cols), "mask {mask:#x}");
+            assert!(rows[0].col + rows[0].cols <= 4, "mask {mask:#x}");
+        }
+        let refused =
+            ShaderError::Malformed("signature mask is not a run of a row's four components");
+        for mask in [0x10, 0x1F, 0x80, 0xFF, 0x5, 0x9, 0xB, 0xD] {
+            assert_eq!(
+                signature(&part(mask)).unwrap_err().to_string(),
+                refused.to_string(),
+                "mask {mask:#x}"
             );
         }
     }
