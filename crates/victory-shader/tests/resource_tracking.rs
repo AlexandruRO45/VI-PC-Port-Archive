@@ -2,8 +2,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use victory_shader::ir::{self, Program, Reg};
-use victory_shader::resource::{Address, track};
-use victory_shader::{HwStage, RootParam, RootType, ShaderError};
+use victory_shader::resource::{Address, MEMORY, track};
+use victory_shader::{HwStage, RootParam, RootType};
 
 const TABLE: RootParam = RootParam {
     root: RootType::Table,
@@ -134,12 +134,15 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
             ),
         ]
     );
+    // Not from a root parameter: title memory.
+    let memory = Address {
+        param: MEMORY,
+        offset: 0,
+        dynamic: None,
+    };
     assert_eq!(
-        track(&program, &[], HwStage::Ps, None).unwrap_err(),
-        ShaderError::Unsupported {
-            offset: 12,
-            what: "an address not from a root parameter",
-        }
+        track(&program, &[], HwStage::Ps, None).unwrap().scalar,
+        [((0, 3), memory), ((0, 4), memory)]
     );
 }
 
