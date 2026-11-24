@@ -130,6 +130,19 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// A shader from the container bytes a pipeline dump names, for
+    /// `victory precompile`: no title run made it, and its translation comes
+    /// from those bytes exactly as a title's does.
+    #[cfg(windows)]
+    pub(crate) fn of_container(stage: &'static str, hash: String, container: Vec<u8>) -> Shader {
+        Shader {
+            stage,
+            hash,
+            container,
+            translated: OnceLock::new(),
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -746,6 +759,10 @@ mod dump;
 mod library;
 #[cfg(windows)]
 mod make;
+/// `victory precompile`: a pipeline library built from a dump instead of a
+/// title run.
+#[cfg(windows)]
+pub mod precompile;
 /// `VICTORY_PIPELINE_TIMING=1`: where a host pipeline's time goes, a line a
 /// second (`timing`).
 #[cfg(all(windows, feature = "diagnostics"))]

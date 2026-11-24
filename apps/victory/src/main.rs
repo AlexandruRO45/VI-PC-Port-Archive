@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod precompile;
 mod run;
 mod session;
 mod shader;
@@ -86,6 +88,32 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Build the pipeline library from a pipeline dump (`VICTORY_PIPELINE_DUMP`)
+    /// and the shader containers saved beside it (`VICTORY_SHADER_SAVE`), so a
+    /// first session starts with warm pipelines instead of compiling ~1,050.
+    ///
+    /// This creates a D3D12 device and compiles on it: it is a GPU session, and
+    /// it writes the cache's adapter-named library, so it can never leave the
+    /// card a software adapter's blob.
+    Precompile {
+        /// One line per host pipeline, as the title wrote it.
+        dump: PathBuf,
+        /// Where the `<hash>.<stage>.cdxil` containers are (default: the dump's
+        /// directory).
+        #[arg(long)]
+        shaders: Option<PathBuf>,
+        /// The pipeline cache to write (default: the configured cache's
+        /// `pipelines`).
+        #[arg(long)]
+        cache: Option<PathBuf>,
+        /// Save the library every N pipelines, so an interrupted run keeps what
+        /// it stored (default 50).
+        #[arg(long)]
+        save_every: Option<usize>,
+        /// Read the dump and say what could be replayed: no device, no library.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -163,6 +191,23 @@ fn main() -> Result<()> {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, pipelines, list, jobs)
+        }
+        Command::Precompile {
+            dump,
+            shaders,
+            cache,
+            save_every,
+            dry_run,
+        } => {
+            #[cfg(windows)]
+            {
+                precompile::run(dump, shaders, cache, save_every, dry_run)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = (dump, shaders, cache, save_every, dry_run);
+                anyhow::bail!("precompile needs a D3D12 host: it is a Windows command")
+            }
         }
         Command::Run {
             exe,
