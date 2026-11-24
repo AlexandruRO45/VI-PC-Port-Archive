@@ -193,6 +193,8 @@ struct RootView {
 enum RootCopy {
     Shadow(std::sync::Arc<crate::shadow::Shadow>, u64, u64),
     Upload { to: *mut u8, address: u64, len: u64 },
+    /// Local build: a null root view (`null_root_view`), nothing to copy.
+    None,
 }
 
 enum RootArgument {
@@ -210,6 +212,33 @@ fn valid_or_null(index: u32, host: &crate::descriptor::host::HostHeap) -> bool {
     }
     host.make_null(index);
     true
+}
+
+/// Local build: `VICTORY_STRICT_ROOTS=1` drops draws and dispatches whose root constants or
+/// views the host cannot make (unset by the title, no host copy) instead of binding zeros
+/// and a null view, and those reading and writing the title memory mirror together.
+fn strict_roots() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_ROOTS").is_some())
+}
+
+/// Local build: a root view at the mirror's unmapped first page (see
+/// [`crate::mirror::null_va`]).
+fn null_root_view() -> Option<RootView> {
+    let gpu = crate::mirror::null_va()?;
+    Some(RootView {
+        gpu,
+        copy: RootCopy::None,
+    })
+}
+
+/// Why `p`'s draw or dispatch cannot bind, counted by reason (diagnostics); false.
+fn refuse(p: &HostPipeline, why: &str) -> bool {
+    #[cfg(feature = "diagnostics")]
+    crate::pipeline::note_why(format!("{} bind: {why}", p.name));
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (p, why);
+    false
 }
 
 fn strict_tables() -> bool {
@@ -737,7 +766,7 @@ impl State {
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return refuse(p, "a draw or mesh dispatch with another kind of pipeline");
         }
         if !self.bind(list, p, false, groups) {
             return false;
@@ -773,7 +802,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return refuse(p, "index buffer outside title buffers");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -813,7 +842,7 @@ impl State {
         groups: Option<[u32; 3]>,
     ) -> bool {
         if p.compute != compute {
-            return false;
+            return refuse(p, "a compute pipeline for a draw, or a graphics one for a dispatch");
         }
         let l = &list.list;
         let title_heaps = self.heaps.map(|h| {
@@ -824,7 +853,7 @@ impl State {
         for (i, (indexed, heap)) in p.indexed_heaps.into_iter().zip(title_heaps).enumerate() {
             if indexed && heap.is_none() {
                 once!(pipeline = %p.name, heap = i, "draw or dispatch dropped: missing indexed heap");
-                return false;
+                return refuse(p, "missing indexed heap");
             }
         }
         let has_root = |kind| {
@@ -866,7 +895,7 @@ impl State {
             };
             if title_memory.is_none() {
                 once!(pipeline = %p.name, "dispatch dropped: no valid title memory SRV table");
-                return false;
+                return refuse(p, "no valid title memory SRV table");
             }
         }
         let image_data = if has_root(RootBinding::DescriptorData) {
@@ -876,7 +905,7 @@ impl State {
             });
             if data.is_none() {
                 once!(pipeline = %p.name, "draw or dispatch dropped: no valid image descriptor data table");
-                return false;
+                return refuse(p, "no valid image descriptor data table");
             }
             data
         } else {
@@ -899,7 +928,7 @@ impl State {
                     || gpu.ptr == 0
                 {
                     once!(pipeline = %p.name, heap = i, "draw or dispatch dropped: invalid host heap");
-                    return false;
+                    return refuse(p, "invalid host heap");
                 }
             }
         }
@@ -925,10 +954,31 @@ impl State {
                     RootBinding::Constants(dwords) => {
                         let mut values = vec![0u32; dwords as usize];
                         for u in &t.host.user_data {
-                            let Some(value) = self.user_word(&made, compute, u) else {
-                                once!(pipeline = %p.name, slot = u.slot, ?u.root, u.dword,
-                                    "draw or dispatch dropped: missing or invalid root data");
-                                return false;
+                            let value = match self.user_word(&made, compute, u) {
+                                Some(value) => value,
+                                // Local build: a root constant the title left unset reads
+                                // zero (the console reads whatever its user data holds);
+                                // `VICTORY_STRICT_ROOTS=1` drops the draw or dispatch.
+                                None if u.root != RootType::Table && !strict_roots() => {
+                                    #[cfg(feature = "diagnostics")]
+                                    crate::pipeline::note_why(format!(
+                                        "{} bind (lenient): unset root constant {}.{} read as zero",
+                                        p.name, u.slot, u.dword
+                                    ));
+                                    0
+                                }
+                                None => {
+                                    once!(pipeline = %p.name, slot = u.slot, ?u.root, u.dword,
+                                        "draw or dispatch dropped: missing or invalid root data");
+                                    return refuse(
+                                        p,
+                                        if u.root == RootType::Table {
+                                            "unset title table for a user-data dword"
+                                        } else {
+                                            "unset root constant"
+                                        },
+                                    );
+                                }
                             };
                             values[u.index as usize] = value;
                         }
@@ -945,7 +995,7 @@ impl State {
                             let Some(value) = value else {
                                 once!(pipeline = %p.name, slot = a.table,
                                     "draw or dispatch dropped: invalid buffer address constant");
-                                return false;
+                                return refuse(p, "invalid buffer address constant");
                             };
                             values[a.index as usize] = value;
                         }
@@ -969,10 +1019,25 @@ impl State {
                                 .and_then(|address| root_view(list, address, kind, extent));
                         let view = match view {
                             Ok(view) => view,
+                            // Local build: a root view the host cannot make (unset by the
+                            // title, or an address no host copy holds) points at the
+                            // mirror's unmapped first page instead of dropping the draw or
+                            // dispatch: reads give zeros, writes go nowhere (tiled resources
+                            // tier 2). `VICTORY_STRICT_ROOTS=1` drops it.
+                            Err(reason) if !strict_roots() && let Some(view) = null_root_view() => {
+                                #[cfg(feature = "diagnostics")]
+                                crate::pipeline::note_why(format!(
+                                    "{} bind (lenient): root {kind:?} {slot} null: {reason}",
+                                    p.name
+                                ));
+                                #[cfg(not(feature = "diagnostics"))]
+                                let _ = reason;
+                                view
+                            }
                             Err(reason) => {
                                 once!(pipeline = %p.name, slot, ?kind, reason,
                                     "draw or dispatch dropped: invalid root view");
-                                return false;
+                                return refuse(p, &format!("invalid root {kind:?} {slot}: {reason}"));
                             }
                         };
                         if matches!(&view.copy, RootCopy::Shadow(shadow, ..) if shadow.is_mirrored())
@@ -984,13 +1049,13 @@ impl State {
                     }
                     RootBinding::TitleMemory => {
                         let Some(handle) = title_memory else {
-                            return false;
+                            return refuse(p, "no title memory table");
                         };
                         RootArgument::Table(handle)
                     }
                     RootBinding::DescriptorData => {
                         let Some((_, handle)) = &image_data else {
-                            return false;
+                            return refuse(p, "no image descriptor data table");
                         };
                         RootArgument::Table(*handle)
                     }
@@ -998,9 +1063,13 @@ impl State {
                 arguments.push((param, arg));
             }
         }
-        if mirror_reads && mirror_writes {
+        // Local build: the title memory table reads the mirror through resources of
+        // their own (`Mirror::read_views`), and a buffer has no layout a read and a
+        // write in one dispatch could disagree on (as on the console, which binds both):
+        // only `VICTORY_STRICT_ROOTS=1` drops reads and writes of the mirror together.
+        if mirror_reads && mirror_writes && strict_roots() {
             once!(pipeline = %p.name, "draw or dispatch dropped: conflicting root access to the title memory mirror");
-            return false;
+            return refuse(p, "conflicting root access to the title memory mirror");
         }
         if let Some((buffer, _)) = image_data {
             if list.first_use(buffer.as_raw() as usize) {
@@ -1086,6 +1155,7 @@ impl State {
                         RootCopy::Upload { to, address, len } => {
                             list.defer_fill(to, address as *const u8, len as usize);
                         }
+                        RootCopy::None => {}
                     }
                     // SAFETY: preflight checked the GPU address and binding kind.
                     unsafe {
@@ -1689,7 +1759,11 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED if self.topology == RECTANGLES => {
+                why("rectangles");
+                false
+            }
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true, None),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
                 Some(p) if p.compute => self.bind(list, p, true, None),
@@ -1702,7 +1776,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                // The reason is counted as "<pipeline> bind: ...".
+                Some(p) => why(&format!("prepare failed (compute {}, mesh {}) {}", p.compute, p.mesh, p.name)),
             }
             return false;
         }
