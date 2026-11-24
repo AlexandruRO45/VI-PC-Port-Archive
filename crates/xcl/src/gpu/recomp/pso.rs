@@ -517,7 +517,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, image_atomic64: image_atomic64(), ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -545,7 +545,7 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, image_atomic64: image_atomic64(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -627,6 +627,35 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     }
     .ok()
     .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// Whether the device supports 64-bit atomics on typed resources: a console image atomic with
+/// DMASK 0x3 (0xf for cmpswap) works on 64 bits, which a PC does with SM 6.6 int64 atomics on a
+/// typed resource (`D3D12_OPTIONS9::AtomicInt64OnTypedResourceSupported`) *and* on a descriptor
+/// heap resource (`D3D12_OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`): the views
+/// come from `ResourceDescriptorHeap`.
+pub fn image_atomic64_for_device(device: &ID3D12Device) -> bool {
+    let (mut o9, mut o11) = (D3D12_FEATURE_DATA_D3D12_OPTIONS9::default(), D3D12_FEATURE_DATA_D3D12_OPTIONS11::default());
+    let asked = unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &mut o9 as *mut _ as _, std::mem::size_of_val(&o9) as u32)
+            .is_ok()
+            && device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as _, std::mem::size_of_val(&o11) as u32)
+                .is_ok()
+    };
+    asked && o9.AtomicInt64OnTypedResourceSupported.as_bool() && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+}
+
+/// `Options::image_atomic64` for the device XCL runs on: set once, when the device is created.
+static IMAGE_ATOMIC64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_image_atomic64(supported: bool) {
+    IMAGE_ATOMIC64.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn image_atomic64() -> bool {
+    IMAGE_ATOMIC64.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {

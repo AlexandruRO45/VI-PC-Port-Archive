@@ -2482,6 +2482,59 @@ impl Em {
                     uav("float")
                 ));
             }
+            // DMASK 0x3 (0xf for cmpswap) is the 64-bit form: VDATA[0:1] against the texel's
+            // two dwords (LLVM's SIISelLowering: `DMask = Is64Bit ? 0x3 : 0x1`, cmpswap
+            // `0xf : 0x3`). A PC does it with SM 6.6 int64 atomics on the R32G32_UINT view;
+            // where the adapter has none the program is refused, never run on the low dword.
+            _ if base.starts_with("atomic_")
+                && dmask == (if &base[7..] == "cmpswap" { 0xFu64 } else { 0x3u64 }) =>
+            {
+                let op = &base[7..];
+                // no 64-bit float atomics on a typed resource (fmin / fmax / fcmpswap)
+                if !self.opt.image_atomic64 || matches!(op, "fmin" | "fmax" | "fcmpswap") {
+                    return Err("image_atomic_64");
+                }
+                let (r0, r1) = (self.vreg(vdata), self.vreg(vdata + 1));
+                self.line(&format!(
+                    "RWTexture{rty}<uint64_t> {t}_U = ResourceDescriptorHeap[NonUniformResourceIndex({tw0} + 1u)];"
+                ));
+                self.line(&format!("uint64_t {t}_v = (uint64_t){r0} | ((uint64_t){r1} << 32); uint64_t {t}_old = 0;"));
+                let u = format!("{t}_U[{icoord}]");
+                let body = match op {
+                    "add" => format!("InterlockedAdd({u}, {t}_v, {t}_old);"),
+                    "sub" => format!("InterlockedAdd({u}, (uint64_t)0 - {t}_v, {t}_old);"),
+                    "and" => format!("InterlockedAnd({u}, {t}_v, {t}_old);"),
+                    "or" => format!("InterlockedOr({u}, {t}_v, {t}_old);"),
+                    "xor" => format!("InterlockedXor({u}, {t}_v, {t}_old);"),
+                    "swap" => format!("InterlockedExchange({u}, {t}_v, {t}_old);"),
+                    "umin" => format!("InterlockedMin({u}, {t}_v, {t}_old);"),
+                    "umax" => format!("InterlockedMax({u}, {t}_v, {t}_old);"),
+                    "cmpswap" => {
+                        let (c0, c1) = (self.vreg(vdata + 2), self.vreg(vdata + 3));
+                        format!(
+                            "uint64_t {t}_cmp = (uint64_t){c0} | ((uint64_t){c1} << 32); InterlockedCompareExchange({u}, {t}_cmp, {t}_v, {t}_old);"
+                        )
+                    }
+                    // the hardware has no 64-bit increment / decrement: the CAS loop of the
+                    // 32-bit form (rmw32), on 64 bits
+                    "inc" | "dec" => {
+                        let new = if op == "inc" {
+                            format!("({t}_c >= {t}_v) ? (uint64_t)0 : {t}_c + (uint64_t)1")
+                        } else {
+                            format!("({t}_c == (uint64_t)0 || {t}_c > {t}_v) ? {t}_v : {t}_c - (uint64_t)1")
+                        };
+                        format!(
+                            "uint64_t {t}_c = {u}; [allow_uav_condition] for (uint {t}_i = 0u; {t}_i < 4096u; {t}_i++) {{ uint64_t {t}_n = {new}; uint64_t {t}_p = 0; InterlockedCompareExchange({u}, {t}_c, {t}_n, {t}_p); if ({t}_p == {t}_c) break; {t}_c = {t}_p; }} {t}_old = {t}_c;"
+                        )
+                    }
+                    _ => return Err("image_atomic_64"),
+                };
+                self.line(&format!("if ({act}) {{ {body} }}"));
+                if f("GLC") == 1 {
+                    // the old value comes back in VDATA[0:1]
+                    self.line(&format!("if ({act}) {{ {r0} = (uint){t}_old; {r1} = (uint)({t}_old >> 32); }}"));
+                }
+            }
             _ if base.starts_with("atomic_") && matches!(&base[7..], "cmpswap" | "sub" | "inc" | "dec" | "fcmpswap" | "fmin" | "fmax") => {
                 // the operations without an int view: on the uint texel (CAS loops where needed)
                 let (v, cmp) = (self.vreg(vdata), self.vreg(vdata + 1));
