@@ -2021,6 +2021,47 @@ mod tests {
     }
 
     #[test]
+    fn initialized_sgprs_count_only_enabled_registers() {
+        let cs = |rsrc2: u32| ComputeIo {
+            rsrc2,
+            threads: [1, 1, 1],
+        };
+        // Nothing enabled initializes nothing; scratch alone puts its wave
+        // offset in s0.
+        assert_eq!(cs(0).initialized_sgprs(), 0);
+        assert_eq!(cs(1).initialized_sgprs(), 1);
+        // User SGPRs alone end where they do.
+        assert_eq!(cs(16 << 1).initialized_sgprs(), 16);
+        // Group id z alone takes the SGPR right after the user ones: a
+        // disabled x and y leave no gap.
+        assert_eq!(cs(3 << 1 | 1 << 9).initialized_sgprs(), 4);
+        // The info alone, then with scratch after it.
+        assert_eq!(cs(2 << 1 | 1 << 10).initialized_sgprs(), 3);
+        assert_eq!(cs(2 << 1 | 1 << 10 | 1).initialized_sgprs(), 4);
+        // The thread-id count and LDS size are VGPR and memory settings:
+        // they leave the SGPR count alone.
+        let base = 5 << 1 | 1 << 7;
+        assert_eq!(cs(base).initialized_sgprs(), 6);
+        assert_eq!(cs(base | 3 << 11 | 0x80 << 15).initialized_sgprs(), 6);
+    }
+
+    #[test]
+    fn a_parsed_compute_program_initializes_its_root_parameters() {
+        // 4 user SGPRs, group id x and the info, scratch: s0..=s6.
+        let rsrc2: u32 = 4 << 1 | 1 << 7 | 1 << 10 | 1;
+        let p = compute_program(rsrc2, 0, 4, 0).unwrap();
+        let StageIo::Cs(cs) = p[0].io else {
+            panic!("{:?}", p[0].io)
+        };
+        assert_eq!(cs.rsrc2, rsrc2);
+        assert_eq!(cs.initialized_sgprs(), 7);
+        // Every SGPR the root parameter covers is below the initialized
+        // count, so none of them reads as zero.
+        let (first, span) = sgpr_span(HwStage::Cs, &p[0].layout[0]);
+        assert!(first + span <= u32::from(cs.initialized_sgprs()));
+    }
+
+    #[test]
     fn reads_every_native_blob() {
         let es = xbch(&fssm(&[(HwStage::Es, &VS_CODE)]));
         let vs = xbch(&fssm(&[(HwStage::Vs, &VS_CODE)]));
