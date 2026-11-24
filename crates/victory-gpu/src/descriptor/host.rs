@@ -574,9 +574,7 @@ fn buffer_srv(
         return None;
     }
     let total = shadow.len / element;
-    let Some(first) = buffer.FirstElement.checked_add(offset / element) else {
-        return None;
-    };
+    let first = buffer.FirstElement.checked_add(offset / element)?;
     if first >= total || buffer.NumElements == 0 {
         once!(
             first,
@@ -632,9 +630,7 @@ fn buffer_uav(
         return None;
     }
     let total = shadow.len / element;
-    let Some(first) = buffer.FirstElement.checked_add(offset / element) else {
-        return None;
-    };
+    let first = buffer.FirstElement.checked_add(offset / element)?;
     if first >= total || buffer.NumElements == 0 {
         once!(
             first,

@@ -27,9 +27,10 @@ static RETIRED_RESOURCES: Mutex<Vec<(u64, u64, ID3D12Resource)>> = Mutex::new(Ve
 /// Dynamic descriptor-slot allocations belonging to lists that have already
 /// finished executing on the host GPU, kept reclaimable if a descriptor heap
 /// runs short before those lists are reset.
-type DynamicSlotList = std::sync::Arc<Mutex<Vec<(usize, u32, u32)>>>;
-static EXECUTED_DYNAMIC: Mutex<Vec<std::sync::Weak<Mutex<Vec<(usize, u32, u32)>>>>> =
-    Mutex::new(Vec::new());
+type DynamicSlots = Mutex<Vec<(usize, u32, u32)>>;
+type DynamicSlotList = std::sync::Arc<DynamicSlots>;
+type WeakDynamicSlotList = std::sync::Weak<DynamicSlots>;
+static EXECUTED_DYNAMIC: Mutex<Vec<WeakDynamicSlotList>> = Mutex::new(Vec::new());
 
 /// Reclaims dynamic descriptor slots for `target_heap` held by command lists
 /// that have already completed execution, returning the total slots freed.
@@ -539,7 +540,7 @@ fn wait_for_memory(waits: &[MemoryWait]) {
     }
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
     let read_u64 = |addr: usize| -> u64 {
-        let val = if addr.is_multiple_of(8) {
+        if addr.is_multiple_of(8) {
             // SAFETY: title memory address recorded by the command list.
             unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Acquire) }
         } else {
@@ -547,8 +548,7 @@ fn wait_for_memory(waits: &[MemoryWait]) {
             let v = unsafe { (addr as *const u64).read_unaligned() };
             std::sync::atomic::fence(Ordering::Acquire);
             v
-        };
-        val
+        }
     };
     let satisfied = |w: &MemoryWait| memory_wait_satisfied(read_u64(w.address), w.comparison, w.reference);
     if waits.iter().all(satisfied) {
