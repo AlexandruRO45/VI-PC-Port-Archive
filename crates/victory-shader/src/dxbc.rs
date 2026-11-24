@@ -726,4 +726,39 @@ mod tests {
             }
         }
     }
+
+    /// The stated size bounds a part's header as it bounds its data: a size
+    /// word the stated size cuts is truncated though the buffer holds it,
+    /// and bytes inside the stated size that no part claims are allowed.
+    #[test]
+    fn the_stated_size_cuts_a_part_header_whatever_the_buffer_holds() {
+        let bytes = build(&[(FourCC::SFI0, &[])]);
+        let total = bytes.len() as u32;
+        assert_eq!(total as usize, HEADER_SIZE + 4 + 8);
+        // One to four bytes off the end leave the FourCC and cut the size
+        // word; the buffer still has every byte of it.
+        for cut in 1..=4u32 {
+            let mut bad = bytes.clone();
+            bad[0x18..0x1C].copy_from_slice(&(total - cut).to_le_bytes());
+            assert_eq!(malformed(&bad), "truncated", "{cut} bytes cut");
+        }
+        // Five cut the FourCC itself.
+        let mut bad = bytes.clone();
+        bad[0x18..0x1C].copy_from_slice(&(total - 5).to_le_bytes());
+        assert_eq!(malformed(&bad), "part header out of bounds");
+        // No parts, and a stated size covering bytes past the header: the
+        // bytes are the container's but no part's.
+        let mut loose = build(&[]);
+        loose.extend_from_slice(b"PRIV\0\0\0\0");
+        loose[0x18..0x1C].copy_from_slice(&(HEADER_SIZE as u32 + 8).to_le_bytes());
+        assert!(Container::parse(&loose).unwrap().parts.is_empty());
+        // A part followed by unclaimed bytes up to the stated size parses
+        // with its own data only.
+        let mut tail = build(&[(FourCC::SFI0, &[1; 4])]);
+        tail.extend_from_slice(&[0xCC; 8]);
+        let len = tail.len() as u32;
+        tail[0x18..0x1C].copy_from_slice(&len.to_le_bytes());
+        let c = Container::parse(&tail).unwrap();
+        assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1; 4]);
+    }
 }

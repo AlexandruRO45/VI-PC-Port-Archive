@@ -686,4 +686,26 @@ mod tests {
         set_u32(&mut bytes, 20, u32::MAX);
         assert_eq!(malformed(&bytes), "bitcode out of bounds");
     }
+
+    /// The model nibbles run to 15 each and nothing past 6 is refused; the
+    /// DXIL version check looks at every bit above the minor byte, so a
+    /// version with only high bits set is no zero major and is kept whole.
+    #[test]
+    fn model_nibbles_and_dxil_version_bits_reach_their_tops() {
+        for sm in [(6, 15), (15, 0), (15, 15)] {
+            let bytes = build_standard(0, sm, 0x100, &fake_bitcode());
+            assert_eq!(DxilProgram::parse(&bytes).unwrap().shader_model, sm);
+        }
+        for v in [0x0001_0000, 0x8000_0000, u32::MAX] {
+            let bytes = build_standard(0, (6, 0), v, &fake_bitcode());
+            assert_eq!(
+                DxilProgram::parse(&bytes).unwrap().dxil_version,
+                v,
+                "{v:#x}"
+            );
+        }
+        // The minor byte alone, at its top, is still below 1.0.
+        let bytes = build_standard(0, (6, 0), 0xFF, &fake_bitcode());
+        assert_eq!(malformed(&bytes), "DXIL version below 1.0");
+    }
 }
