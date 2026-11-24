@@ -2128,6 +2128,64 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// Within one ignore file the last matching rule wins, as git reads it:
+    /// `!/scratch/` after `/scr*/` re-includes `scratch`, which is refused,
+    /// while `scrap` stays ignored and is taken; `/late/` after `!/late/`
+    /// ignores `late` again, and that is taken. `/box/*` ignores what is in
+    /// `box` but not `box` itself, so, unlike a negation under an ignored
+    /// directory, `!/box/keep/` does re-include `box/keep`: it is refused,
+    /// and `box/other` taken. Leading whitespace is part of a pattern, not
+    /// trimmed: ` lead/` ignores a directory named ` lead`, which is taken,
+    /// and leaves `lead` visible, so that is refused.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_judged_by_the_last_matching_rule() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(
+            root.join(".gitignore"),
+            "/scr*/\n!/scratch/\n!/late/\n/late/\n/box/*\n!/box/keep/\n lead/\n",
+        )
+        .unwrap();
+        let scratch = root.join("scratch");
+        let scrap = root.join("scrap");
+        let late = root.join("late");
+        let keep = root.join("box/keep");
+        let other = root.join("box/other");
+        let lead = root.join("lead");
+        let spaced = root.join(" lead");
+        for dir in [&scratch, &scrap, &late, &keep, &other, &lead, &spaced] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let taken: Vec<_> = [&scrap, &late, &other, &spaced]
+            .into_iter()
+            .map(|dir| {
+                let tmp = tempdir_in_first(
+                    root,
+                    [scratch.clone(), keep.clone(), lead.clone(), dir.clone()],
+                );
+                assert_eq!(tmp.path().parent(), Some(dir.as_path()));
+                tmp
+            })
+            .collect();
+        for dir in [&scratch, &keep, &lead] {
+            assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
+        }
+        for tmp in &taken {
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+        }
+        std::fs::write(scratch.join("a.rs"), b"fn a() {}\n").unwrap();
+        std::fs::write(keep.join("b.rs"), b"fn b() {}\n").unwrap();
+        std::fs::write(lead.join("c.rs"), b"fn c() {}\n").unwrap();
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "box/keep/b.rs", "lead/c.rs", "scratch/a.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A TMPDIR is judged by where it leads, from inside the checkout as
     /// well as from outside: a symlink in the checkout to a directory
     /// elsewhere is taken, since git lists the link and never what it
