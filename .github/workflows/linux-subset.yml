@@ -48,6 +48,14 @@ env:
   RUSTDOC_CRATES: >-
     -p victory-core -p victory-pe -p victory-pipeline -p victory-game
     -p victory-shader -p xtask
+  # Crates whose rustdoc builds with no warnings for the Windows target, where
+  # cfg(windows) items (all of victory-hle, apps/victory's host) exist and the
+  # Linux rustdoc step never sees them. victory-shader (a Windows-only module
+  # links a private item), victory-gpu, victory-formats and victory-loader are
+  # not clean yet; add each one once it is.
+  WINDOWS_RUSTDOC_CRATES: >-
+    -p victory-core -p victory-pe -p victory-pipeline -p victory-game
+    -p victory-hle -p victory
 
 jobs:
   linux:
@@ -192,5 +200,15 @@ jobs:
       # The fixture is outside the workspace, so `cargo fmt --all` never reaches
       # it. It is rustfmt-clean today; keep it that way. (The workspace itself
       # is not rustfmt-clean on main yet, so it is not checked here.)
+      # Same rustdoc lints as the Linux job, but for the Windows-only code it
+      # never compiles. Nothing is linked; RUSTFLAGS above is unchanged, so the
+      # dependency builds are shared with the steps above.
+      - name: rustdoc (Windows target, clean crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps --locked --target x86_64-pc-windows-msvc $WINDOWS_RUSTDOC_CRATES
+          cargo doc --no-deps --locked --target x86_64-pc-windows-msvc --manifest-path tests/fixtures/hle-probe/Cargo.toml
+
       - name: rustfmt (hle-probe fixture)
         run: cargo fmt --check --manifest-path tests/fixtures/hle-probe/Cargo.toml
