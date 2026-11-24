@@ -7482,8 +7482,15 @@ mod tests {
     fn v_cvt_f32_f64_lowers_with_double_flag() {
         let words = [
             0x7E00_1F00, // v_cvt_f32_f64 v0, v[0:1]
+            0xD834_0000, // ds_write_b32 v0, v0 keeps the conversion live
+            0,
             S_ENDPGM,
         ];
-        lowers(&words, 0).expect("v_cvt_f32_f64 should lower");
+        let emitted = lower_with(&words, vec![], vec![]).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let features = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(features & 1, 1, "SFI0 double-precision feature");
+        assert_eq!(super::flags::DOUBLE, 1 << 2, "DXIL double-precision flag");
     }
 }
