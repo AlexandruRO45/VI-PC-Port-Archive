@@ -63,6 +63,13 @@ pub(crate) trait Object: Any + Send + Sync {
     fn as_waitable(&self) -> Option<&dyn Waitable> {
         None
     }
+
+    /// `SetEvent` (true) or `ResetEvent` (false) of an event, waking its
+    /// waiters; false for objects that are not events. The file layer
+    /// signals an `OVERLAPPED`'s event through it.
+    fn set_signal(&self, _signalled: bool) -> bool {
+        false
+    }
 }
 
 /// An object a thread can wait for. Both methods run under the wait lock
