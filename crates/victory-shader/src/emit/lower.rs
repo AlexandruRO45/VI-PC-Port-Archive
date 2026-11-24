@@ -1109,6 +1109,23 @@ pub(super) fn with_local_waves<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// The refusal of a descriptor load that no instruction uses.
+pub(super) const ONLY_DATA: &str = "a descriptor read only as data";
+
+thread_local! {
+    static MEASURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with eight-dword loads no instruction uses taken for 2D images. Only for
+/// programs refused otherwise: a refused load is harmless where nothing needs its dwords,
+/// and those programs must keep translating as they did.
+pub(super) fn with_measured_descriptors<R>(f: impl FnOnce() -> R) -> R {
+    let was = MEASURED.replace(true);
+    let r = f();
+    MEASURED.set(was);
+    r
+}
+
 /// `VICTORY_F16_NEAREST=1`: the results of 16-bit float operations (`v_add_f16`,
 /// `v_mul_f16`, `v_cvt_f16_f32` ...) are rounded to nearest as the console rounds them
 /// ([`Lower::f16_nearest`]) instead of as the host's `f32tof16` does (toward zero on NVIDIA:
@@ -5757,8 +5774,9 @@ impl<'a> Lower<'a> {
                 first: 0,
             };
             let used = self.used_kind(&src);
-            if count != 8 || used.is_some_and(|u| u.kind != ResourceType::Srv) {
-                return Err("a descriptor read only as data");
+            if !MEASURED.get() || count != 8 || used.is_some_and(|u| u.kind != ResourceType::Srv)
+            {
+                return Err(ONLY_DATA);
             }
             (0, src, (2, 0x409), Some(2), false, used)
         };
