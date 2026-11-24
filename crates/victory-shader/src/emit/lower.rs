@@ -217,6 +217,18 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+/// The highest byte offset a raw buffer access through a view uses.
+/// The console's buffer loads bound an offset by the descriptor's record
+/// count, so data-computed offsets that wrap to near 2^32 (an index of 0
+/// minus 1, times a stride) read 0 there (and writes are dropped). On the RTX 5090 (NVIDIA 620.73,
+/// vkd3d-proton) such a load through a robust raw access chain faulted
+/// the GPU (Xid 13, "MMU Fault"), and the submission never finished: the
+/// title's world load stalled until its watchdog ended the run. Offsets
+/// up to this limit, plus a 16-byte access, stay below 2^31.
+// shortcut: a view of more than 2 GiB reads its last bytes at the limit;
+// none is known.
+pub(super) const RAW_OFFSET_MAX: u32 = 0x7FFF_FFF0;
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -610,17 +622,7 @@ impl<'a> Lower<'a> {
             match h {
                 None => l.code_dword(byte),
                 Some(h) => {
-                    let c = l.cur;
-                    let (u, mask, al) = (l.s.m.undef(l.s.t.i32), l.s.m.i8(1), l.s.m.i32(4));
-                    let r = l.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        l.s.t.res_ret,
-                        139,
-                        &[h, byte, u, mask, al],
-                    );
-                    let x = l.s.m.extract(c, r, 0);
+                    let x = l.raw_load(h, byte, 1)[0];
                     Ok(l.as_int(x))
                 }
             }
@@ -1132,6 +1134,11 @@ impl<'a> Lower<'a> {
                 dword,
             },
         );
+        Val::I32(self.user_dword(index))
+    }
+
+    /// Dword `index` of the user data, read in the entry block.
+    fn user_dword(&mut self, index: u32) -> V {
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,
@@ -1151,7 +1158,7 @@ impl<'a> Lower<'a> {
             59,
             &[h, row],
         );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+        self.s.m.extract(entry, r, index % 4)
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -2774,17 +2781,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
+                let x = self.raw_load(h, a, 1)[0];
                 let x = self.as_int(x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
@@ -3041,6 +3038,91 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// The first `n` channels (f32) of `rawBufferLoad` at byte `at` of raw
+    /// buffer `h`. Through a view, an offset past [`RAW_OFFSET_MAX`] reads
+    /// at that limit instead: still past the view, so 0. A root SRV is a
+    /// bare address on the host, which nothing bounds, while the console's
+    /// descriptors built around one have no record limit (Grand Theft Auto
+    /// VI's mesh programs fetch vertices that way, at indices from data).
+    /// So through a root SRV, a load whose dwords are not all within the
+    /// length the host passes ([`Self::root_srv_len`]) reads offset 0 and
+    /// returns 0, as a view's bounds would.
+    fn raw_load(&mut self, h: V, at: V, n: u32) -> Vec<V> {
+        let c = self.cur;
+        let slot = self.s.root_srvs.iter().find(|r| r.1 == h).map(|r| r.0);
+        let (at, ok) = match slot {
+            Some(slot) => {
+                let len = self.root_srv_len(slot);
+                let need = self.s.m.i32(4 * n);
+                // at + 4n <= len, without wrapping.
+                let room = self.s.m.bin(c, Bin::Sub, len, need);
+                let fits = self.s.m.cmp(c, pred::IUGE, len, need);
+                let within = self.s.m.cmp(c, pred::IULE, at, room);
+                let ok = self.s.m.bin(c, Bin::And, fits, within);
+                let z = self.s.m.i32(0);
+                (self.s.m.select(c, ok, at, z), Some(ok))
+            }
+            None => (self.raw_offset(at), None),
+        };
+        let (u, mask, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8((1u8 << n) - 1),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, at, u, mask, align],
+        );
+        let zero = self.s.m.f32(0);
+        (0..n)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, k);
+                match ok {
+                    Some(ok) => self.s.m.select(c, ok, x, zero),
+                    None => x,
+                }
+            })
+            .collect()
+    }
+
+    /// `at`, a byte offset into a raw view, bounded by [`RAW_OFFSET_MAX`].
+    fn raw_offset(&mut self, at: V) -> V {
+        let c = self.cur;
+        let k = self.s.m.i32(RAW_OFFSET_MAX);
+        let big = self.s.m.cmp(c, pred::IUGT, at, k);
+        self.s.m.select(c, big, k, at)
+    }
+
+    /// The bytes the host's root SRV of root parameter `slot` holds from
+    /// its address on: a user-data dword at the parameter's own index (a
+    /// root descriptor's dwords hold no constants), as [`UserData`] with
+    /// [`RootType::Descriptor`] lists it.
+    fn root_srv_len(&mut self, slot: u8) -> V {
+        let param = self
+            .x
+            .native
+            .layout
+            .iter()
+            .position(|rp| rp.root == RootType::Descriptor && rp.slot == slot)
+            .expect("a root SRV's parameter");
+        let rp = self.x.native.layout[param];
+        let index = u32::from(rp.user_data);
+        self.user_reads.insert(
+            index,
+            UserData {
+                index,
+                slot,
+                root: RootType::Descriptor,
+                dword: 0,
+            },
+        );
+        self.user_dword(index)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -3055,23 +3137,8 @@ impl<'a> Lower<'a> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
         let total: u32 = bits.iter().sum();
-        let (u, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         let load = |l: &mut Self, at: V, n: u32| -> Vec<V> {
-            let mask = l.s.m.i8((1u8 << n) - 1);
-            let r = l.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                l.s.t.res_ret,
-                139,
-                &[h, at, u, mask, align],
-            );
-            (0..n)
-                .map(|k| {
-                    let x = l.s.m.extract(c, r, k);
-                    l.as_int(x)
-                })
-                .collect()
+            l.raw_load(h, at, n).into_iter().map(|x| l.as_int(x)).collect()
         };
         let words = if total < 32 {
             // A byte or half inside the dword that holds it.
@@ -5918,7 +5985,10 @@ impl<'a> Lower<'a> {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    (h, [self.raw_offset(off), iu, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -6003,7 +6073,7 @@ impl<'a> Lower<'a> {
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
+                        args.extend([self.raw_offset(off), iu]);
                     }
                 }
                 args.extend(&vals);
@@ -6071,18 +6141,29 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
+                    let _ = (iu, mask, align);
+                    let chans = self.raw_load(h, off, count);
+                    return self.write_loaded(inst, *data, d16, chans, guard);
                 }
             }
         };
-        let Some(Operand::Vector { reg, .. }) = *data else {
+        let chans: Vec<V> = (0..count).map(|k| self.s.m.extract(c, r, k)).collect();
+        self.write_loaded(inst, *data, d16, chans, guard)
+    }
+
+    /// Writes a buffer load's channels (f32 values) to its result VGPRs,
+    /// two f16 channels per VGPR with `d16`.
+    fn write_loaded(
+        &mut self,
+        inst: &Inst,
+        data: Option<Operand>,
+        d16: bool,
+        chans: Vec<V>,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let c = self.cur;
+        let count = chans.len() as u32;
+        let Some(Operand::Vector { reg, .. }) = data else {
             return Err("a buffer result");
         };
         if d16 {
@@ -6092,7 +6173,7 @@ impl<'a> Lower<'a> {
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
-                    let f = self.s.m.extract(c, r, ch);
+                    let f = chans[ch as usize];
                     let h = self
                         .s
                         .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
@@ -6108,8 +6189,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        for k in 0..count {
-            let x = self.s.m.extract(c, r, k);
+        for (k, x) in chans.into_iter().enumerate() {
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }

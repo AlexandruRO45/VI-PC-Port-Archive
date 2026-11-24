@@ -380,6 +380,60 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// With `VICTORY_GPU_TIMING` (diagnostics): a read-back dword each noted
+/// command's predecessors set, once they finish, to its index, so a list
+/// that never ends names the command it is stuck on. Lists run one at a
+/// time with timing on, so one dword serves them all.
+#[cfg(feature = "diagnostics")]
+fn crumb() -> Option<&'static (ID3D12Resource, usize)> {
+    static CRUMB: OnceLock<Option<(ID3D12Resource, usize)>> = OnceLock::new();
+    CRUMB
+        .get_or_init(|| {
+            let device = &host()?.device;
+            let mut back: Option<ID3D12Resource> = None;
+            let readback = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut data = std::ptr::null_mut();
+            // SAFETY: plain object creation; a read-back buffer may stay
+            // mapped while the GPU writes it.
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &readback,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut back,
+                    )
+                    .ok()?;
+                let back = back?;
+                back.Map(0, None, Some(&mut data)).ok()?;
+                Some((back, data as usize))
+            }
+        })
+        .as_ref()
+}
+
+/// The last index a list's commands wrote to [`crumb`].
+#[cfg(feature = "diagnostics")]
+fn crumb_value() -> Option<u32> {
+    // SAFETY: the mapped dword of `crumb`; the GPU writes it whole.
+    crumb().map(|&(_, at)| unsafe { std::ptr::read_volatile(at as *const u32) })
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -570,7 +624,10 @@ impl Host {
                 let notes = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner());
                 let last: Vec<&String> = notes.iter().rev().take(8).map(|(n, _)| n).collect();
                 let pipelines = runs[i].pipelines.lock().unwrap_or_else(|e| e.into_inner());
-                stuck::watch(format!("{} commands, pipelines {pipelines:?}, last {last:?}", notes.len()));
+                stuck::watch(
+                    format!("{} commands, pipelines {pipelines:?}, last {last:?}", notes.len()),
+                    notes.iter().map(|(n, _)| n.clone()).collect(),
+                );
             }
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
@@ -909,7 +966,41 @@ impl HostList {
         times
     }
 
+    /// Has the commands before this point set [`crumb`] to `at` once they
+    /// finish.
+    #[cfg(feature = "diagnostics")]
+    fn write_crumb(&self, at: u32) {
+        let list = self.list.cast::<ID3D12GraphicsCommandList2>();
+        let (Some((back, _)), Ok(list)) = (crumb(), list) else {
+            return;
+        };
+        // SAFETY: an open list; our read-back buffer, always a copy destination.
+        unsafe {
+            // Each command runs alone, so the crumb names the one that hangs.
+            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+            let param = D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: back.GetGPUVirtualAddress(),
+                Value: at,
+            };
+            let mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+            list.WriteBufferImmediate(1, &param, Some(&mode));
+        }
+    }
+
     pub(crate) fn close(&self) {
+        #[cfg(feature = "diagnostics")]
+        if timing() {
+            let count = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            self.write_crumb(count);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -1035,6 +1126,9 @@ impl HostList {
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            }
+            if timing() {
+                self.write_crumb(at);
             }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
@@ -2365,26 +2459,40 @@ mod stuck {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    static RUNNING: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+    type Running = (Instant, Option<String>, Vec<String>);
+    static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 
-    /// The list about to run, and what to say if it gets stuck.
-    pub(super) fn watch(what: String) {
+    /// The list about to run, what to say if it gets stuck, and its noted
+    /// commands (the one [`super::crumb`] reaches is named).
+    pub(super) fn watch(what: String, notes: Vec<String>) {
         static WATCHER: std::sync::Once = std::sync::Once::new();
         WATCHER.call_once(|| {
             std::thread::spawn(|| {
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some((at, what)) = running.as_mut()
+                    if let Some((at, what, notes)) = running.as_mut()
                         && at.elapsed() > Duration::from_secs(5)
                         && let Some(what) = what.take()
                     {
                         tracing::warn!(what, "host list still running after 5 s");
+                        let reached = super::crumb_value();
+                        let command = reached.and_then(|n| notes.get(n as usize));
+                        tracing::warn!(
+                            ?reached,
+                            ?command,
+                            "the stuck list's first unfinished command"
+                        );
+                        for (i, n) in notes.iter().enumerate() {
+                            let short: String = n.chars().take(110).collect();
+                            tracing::warn!("stuck list command {i}: {short}");
+                        }
                     }
                 }
             });
         });
-        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Some(what)));
+        let watched = (Instant::now(), Some(what), notes);
+        *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(watched);
     }
 
     pub(super) fn done() {

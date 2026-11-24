@@ -103,6 +103,13 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                #[cfg(feature = "diagnostics")]
+                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+                    let _ = std::fs::write(
+                        std::path::Path::new(&dir).join(format!("{}.{}", self.hash, self.stage)),
+                        &self.container,
+                    );
+                }
                 let done = translate(&self.container);
                 match &done {
                     Ok(t) => tracing::info!(
