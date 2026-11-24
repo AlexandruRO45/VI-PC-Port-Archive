@@ -1453,11 +1453,10 @@ mod tests {
 
     #[test]
     fn extents_cover_exact_subresource_bytes() {
-        let mut d = desc(64, 64, 1, 4, Swizzle::SW_64KB_S);
+        let mut d = desc(64, 64, 2, 4, Swizzle::SW_64KB_S);
         d.mips = 4;
-        d.slices = 2;
         let l = Layout::new(&d).unwrap();
-        for slice in 0..d.slices {
+        for slice in 0..d.depth {
             for mip in 0..d.mips {
                 let (lo, hi) = l.extents(mip, slice).unwrap();
                 assert!(lo < hi && hi <= l.size);
