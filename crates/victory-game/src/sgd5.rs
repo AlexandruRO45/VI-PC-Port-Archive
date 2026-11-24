@@ -159,7 +159,9 @@ fn starts_stream(bytes: &[u8], unpacked: usize) -> bool {
     }
 }
 
-/// The printable name that ends at `nul` and follows its length byte.
+/// The printable name that ends at `nul` and follows its length byte. A
+/// length byte of 1 (no characters) is not a name: any `01 00` before the
+/// kind would read as one.
 fn name_before(file: &[u8], nul: usize) -> Option<&str> {
     let run = file[..nul]
         .iter()
@@ -169,6 +171,7 @@ fn name_before(file: &[u8], nul: usize) -> Option<&str> {
     (run.saturating_sub(1)..nul)
         .find(|&l| usize::from(file[l]) == nul - l)
         .and_then(|l| std::str::from_utf8(&file[l + 1..nul]).ok())
+        .filter(|name| !name.is_empty())
 }
 
 #[cfg(test)]
@@ -553,6 +556,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn empty_name_is_no_name() {
+        // A record whose name would be empty: `01 00` before the kind.
+        let mut file = MAGIC.to_vec();
+        file.extend(record_bytes("", 0x32, b"nameless"));
+        file.extend(record_bytes("PS_named", 0x32, b"named"));
+        let found: Vec<_> = records(&file).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [None, Some("PS_named")]);
+        assert_eq!(found[0].unpack().as_deref(), Some(&b"nameless"[..]));
+    }
+
+    #[test]
+    fn archive_with_two_sgd5_files_yields_both() {
+        // Two SGD5 files one after the other in an archive, with another
+        // file's bytes between them: the second magic sits in a gap.
+        let mut archive = b"other file".to_vec();
+        archive.extend_from_slice(MAGIC);
+        archive.extend(record_bytes("PS_one", 0x32, b"first file"));
+        archive.extend_from_slice(b"another file between");
+        archive.extend_from_slice(MAGIC);
+        archive.extend(record_bytes("PS_two", 0x41, b"second file"));
+        let found: Vec<_> = records(&archive).collect();
+        let names: Vec<_> = found.iter().map(|r| r.name).collect();
+        assert_eq!(names, [Some("PS_one"), Some("PS_two")]);
+        assert_eq!(found[1].kind, 0x41);
+        assert_eq!(found[1].unpack().as_deref(), Some(&b"second file"[..]));
     }
 
     #[test]
