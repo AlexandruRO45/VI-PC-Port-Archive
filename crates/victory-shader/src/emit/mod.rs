@@ -488,6 +488,7 @@ pub fn debug_ps(targets: u32) -> HostShader {
         .collect();
     s.m.terminate(b, Term::Ret);
     HostShader {
+        stride_table: false,
         stage: HwStage::Ps,
         dxil: s.finish(),
         user_data: Vec::new(),
