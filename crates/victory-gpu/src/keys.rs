@@ -67,56 +67,97 @@ fn held() -> MutexGuard<'static, BTreeSet<u8>> {
 /// pressed in another application is not the title's input, and a hook that
 /// collected it would be reading the person's typing.
 #[cfg(windows)]
-pub(crate) mod hook {
+pub mod hook {
     use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, GetForegroundWindow, GetWindowThreadProcessId, KBDLLHOOKSTRUCT,
-        SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+        KBDLLHOOKSTRUCT, MSG, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+        UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN,
         WM_SYSKEYUP,
     };
 
     /// Whether a key event belongs to this process: the foreground window's
     /// process is ours, and a foreground nobody owns is nobody's.
-    pub(crate) fn ours(foreground_pid: u32, this_pid: u32) -> bool {
+    pub fn ours(foreground_pid: u32, this_pid: u32) -> bool {
         foreground_pid != 0 && foreground_pid == this_pid
     }
 
-    /// The installed hook. Dropping it removes it: a low-level hook that
-    /// outlives its owner keeps the machine paying for every key press.
-    pub(crate) struct Installed(*mut core::ffi::c_void);
+    /// The installed hook and the thread whose message loop serves it.
+    ///
+    /// The hook must live on a thread that pumps, and the window thread is not
+    /// always ours: the console's own `sgaWindowClass` takes the keyboard, and
+    /// a build that never creates a host window never installed the hook at
+    /// all (measured: no install line in a 17-second run with four presses).
+    /// So it gets a thread of its own for the life of the process.
+    pub struct Installed {
+        hook: *mut core::ffi::c_void,
+        thread: u32,
+    }
+
+    // SAFETY: the handle is a Windows hook, owned by the thread that made it,
+    // and neither is tied to any other thread's stack.
+    unsafe impl Send for Installed {}
+    // SAFETY: the handle is read only to remove it and to post its loop a
+    // quit, both of which are thread-safe calls on a hook.
+    unsafe impl Sync for Installed {}
 
     impl Drop for Installed {
         fn drop(&mut self) {
-            // SAFETY: a hook this value installed and no one removed.
-            unsafe { UnhookWindowsHookEx(self.0) };
+            // SAFETY: a hook this value installed, and a quit for its loop.
+            unsafe {
+                UnhookWindowsHookEx(self.hook);
+                PostThreadMessageW(self.thread, WM_QUIT, 0, 0);
+            }
         }
     }
 
-    /// Installs the hook on this thread, which must have the message loop the
-    /// hook is served by.
-    pub(crate) fn install() -> Installed {
-        // SAFETY: our own thread, a callback that outlives the hook, and no
-        // module handle because the callback is ours.
-        let installed = unsafe {
-            SetWindowsHookExW(
-                WH_KEYBOARD_LL as i32,
-                Some(callback),
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        // A hook that failed to install is the whole reason a run can press
-        // into a window and see nothing, so the outcome is recorded rather
-        // than assumed.
-        #[cfg(feature = "diagnostics")]
-        tracing::debug!(
-            target: "victory_gpu::keys",
-            installed = !installed.is_null(),
-            last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() },
-            "keyboard hook"
-        );
-        Installed(installed)
+    /// Installs the hook on a thread of its own, which then pumps for the
+    /// rest of the process's life.
+    pub fn install() -> Installed {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("victory-keys".into())
+            .spawn(move || {
+                // SAFETY: our own thread, a callback that outlives the hook,
+                // and no module handle because the callback is ours.
+                let hook = unsafe {
+                    SetWindowsHookExW(WH_KEYBOARD_LL as i32, Some(callback), std::ptr::null_mut(), 0)
+                };
+                let thread = unsafe { GetCurrentThreadId() };
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(
+                    target: "victory_gpu::keys",
+                    installed = !hook.is_null(),
+                    last_error = unsafe { windows_sys::Win32::Foundation::GetLastError() },
+                    "keyboard hook"
+                );
+                let _ = sender.send((hook as usize, thread));
+                if hook.is_null() {
+                    return;
+                }
+                let mut message = zeroed_message();
+                // SAFETY: a message loop of our own, ended by the quit the
+                // handle posts.
+                unsafe {
+                    while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+                        let _ = TranslateMessage(&message);
+                        DispatchMessageW(&message);
+                    }
+                }
+            })
+            .expect("a thread for the keyboard hook");
+        let (hook, thread) = receiver.recv().unwrap_or((0, 0));
+        Installed {
+            hook: hook as *mut core::ffi::c_void,
+            thread,
+        }
+    }
+
+    fn zeroed_message() -> MSG {
+        // SAFETY: an all-zero MSG is the value the API fills in.
+        unsafe { std::mem::zeroed() }
     }
 
     /// SAFETY: called by the system with a `KBDLLHOOKSTRUCT` in `lparam` when
@@ -130,7 +171,17 @@ pub(crate) mod hook {
             let ours_now = ours(pid, unsafe { GetCurrentProcessId() });
             if ours_now {
                 // SAFETY: the system's own structure for this event.
-                let key = unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode } as u8;
+                let event = unsafe { &*(lparam as *const KBDLLHOOKSTRUCT) };
+                let key = event.vkCode as u8;
+                #[cfg(feature = "diagnostics")]
+                tracing::debug!(
+                    target: "victory_gpu::keys",
+                    vk = event.vkCode,
+                    scan = event.scanCode,
+                    flags = event.flags,
+                    wparam = wparam as u32,
+                    "hook event"
+                );
                 match wparam as u32 {
                     WM_KEYDOWN | WM_SYSKEYDOWN => super::down(key),
                     WM_KEYUP | WM_SYSKEYUP => super::up(key),

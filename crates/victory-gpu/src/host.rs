@@ -6509,10 +6509,6 @@ fn window(width: u32, height: u32) -> windows::core::Result<HWND> {
             let ok = made.is_ok();
             let _ = sender.send(made.map(|h| h.0 as usize));
             if ok {
-                // The console's own window takes the keyboard (`sgaWindowClass`,
-                // with our caption on it), so the keys this process must see are
-                // taken ahead of any window procedure, on this thread's loop.
-                let _hook = crate::keys::hook::install();
                 pump();
             }
         })
