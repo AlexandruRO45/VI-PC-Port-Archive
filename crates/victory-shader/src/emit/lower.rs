@@ -5578,6 +5578,16 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
             "v_readlane_b32" => {
+                // A scalar the program spilled through a VGPR lane with
+                // `v_writelane_b32` (the console compiler's way of moving an
+                // SGPR through a VGPR) is that scalar, at a constant lane, in
+                // any stage: no lane read at all.
+                if let (Some(op0), Some(op1)) = (v.src.first(), v.src.get(1))
+                    && let Some(sv) = self.spilled_value(inst, op0, op1)
+                {
+                    let x = self.i32_of(sv)?;
+                    return int(self, x);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
@@ -8783,6 +8793,60 @@ mod tests {
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
         }
+    }
+
+    /// Lowers a synthetic pixel program.
+    fn lowers_pixel(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_pixel_shader_reads_a_scalar_it_spilled_through_a_lane() {
+        // The console compiler moves an SGPR through a VGPR lane
+        // (`pixel-ee41ebc3eb3fbbdc` does this to feed a descriptor offset):
+        // the lane write and the constant-lane read back are one scalar, in
+        // a pixel program too, with no wave read at all.
+        let read_at_a_lane = [
+            0xBE8E_0385, // s_mov_b32 s14, 5
+            0xD761_009E,
+            0x0001_000E, // v_writelane_b32 v158, s14, lane 0
+            0xD760_0000,
+            0x0001_019E, // v_readlane_b32 s0, v158, lane 0
+            0xBF07_8000, // s_cmp_lg_u32 s0, 0
+            0xBF85_0000, // s_cbranch_scc1 -> s_endpgm
+            S_ENDPGM,
+        ];
+        lowers_pixel(&read_at_a_lane).unwrap();
     }
 
     fn perm_features(selector: u32) -> u64 {
