@@ -980,8 +980,9 @@ fn user_data_cs32(shader: &HostShader, k: u32) -> Vec<u32> {
 /// of 16-bit coordinates whose f16 bias is the root constant's low half.
 /// Program 2: a gather with an offset of 16-bit and of 32-bit coordinates
 /// (equal results), and a sample with gradients and the root constant as
-/// clamp. The samples read a 32x32 texture whose level `n` holds `n`, at
-/// level 1 by the derivatives, with a point sampler.
+/// clamp. The samples read a 32x32 texture whose level `n` holds `n`, with
+/// a point sampler. Compute approximates the implicit base level as zero;
+/// the explicit gradients of program 2 still choose level one.
 #[test]
 fn image_addresses_of_16_bits_and_clamps() {
     use windows::Win32::Graphics::Direct3D12::*;
@@ -1029,9 +1030,7 @@ fn image_addresses_of_16_bits_and_clamps() {
     biased.extend([0xF094_0F08, 1 | 5 << 8 | 2 << 16 | 4 << 21 | 1 << 30]);
     biased.extend(buffer_store_dword(5, 20, 0));
     biased.push(S_ENDPGM);
-    // The 1.6 validator refuses implicit derivatives in compute (1.8 takes
-    // them); the host runs them.
-    let biased = lower_cs32(&biased, &used, false);
+    let biased = lower_cs32(&biased, &used, true);
 
     let mut gathers = prefix;
     // Offset (1, 0); coordinates (0.375, 0.625) as f16 in v2 and as f32 in
@@ -1077,11 +1076,11 @@ fn image_addresses_of_16_bits_and_clamps() {
     // Texels (2, 3), (3, 3), (3, 2), (2, 2) twice, then the level.
     let gathered = |level| [14.0, 15.0, 11.0, 10.0, 14.0, 15.0, 11.0, 10.0, level];
     let cases: [(&HostShader, u32, &[f32]); 9] = [
-        (&biased, 0x3C00, &[2.0]),      // bias 1
+        (&biased, 0x3C00, &[1.0]),      // bias 1
         (&biased, 0xABCD_BC00, &[0.0]), // bias -1, high half ignored
-        (&biased, 0x4000, &[3.0]),      // bias 2
-        (&biased, 0, &[1.0]),           // bias 0
-        (&biased, f(2.0), &[1.0]),      // low half 0
+        (&biased, 0x4000, &[2.0]),      // bias 2
+        (&biased, 0, &[0.0]),           // bias 0
+        (&biased, f(2.0), &[0.0]),      // low half 0
         (&gathers, 0, &gathered(1.0)),  // clamp 0
         (&gathers, f(2.0), &gathered(2.0)),
         (&gathers, f(3.0), &gathered(3.0)),

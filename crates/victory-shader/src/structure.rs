@@ -49,14 +49,14 @@ pub enum Atom {
     Lane(Value),
     /// An SCC value, the same in every lane.
     Uniform(Value),
-    /// A lane mask joined at a block entry, by its low dword's phi.
-    Phi(Value),
+    /// A lane mask joined at a block entry, by its exact SSA dword pair.
+    Phi(Value, Value),
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the lane's bit of the exact SSA
+    /// dword pair (the same value twice in wave32).
+    Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -386,6 +386,8 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Incoming mask of a dynamic join, in predecessor order.
+    mask_edges: Map<Key, Vec<Bool>>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -401,6 +403,10 @@ pub struct Structured {
 }
 
 impl Structured {
+    pub(crate) fn mask_edges(&self, low: Value, high: Value) -> Option<&[Bool]> {
+        self.mask_edges.get(&(low, high)).map(Vec::as_slice)
+    }
+
     pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
         match high {
             Some(high) => self.paired_masks.get(&(low, high)),
@@ -431,7 +437,7 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
-        let wrong = l.wrong_joins(&cond);
+        let wrong = l.finish_mask_edges(&cond);
         if wrong.is_empty() {
             return l.finish(&execs, &cond);
         }
@@ -456,7 +462,7 @@ struct Lanes<'a> {
     /// Block and index of each phi value.
     phis: Map<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
-    unresolved: HashSet<Value>,
+    unresolved: HashSet<Key>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
     masks: Map<Key, Bool>,
@@ -467,6 +473,9 @@ struct Lanes<'a> {
     scc_lane: Map<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
+    /// Dynamic joins with exact pairs on every edge, including loop backs.
+    mask_args: Map<Key, Vec<Key>>,
+    mask_edges: Map<Key, Vec<Bool>>,
     /// Per block: what a lane knows on entry, over forward edges only.
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
@@ -484,8 +493,7 @@ struct Lanes<'a> {
 /// incoming mask held (or failed) on its edge.
 struct Join {
     block: usize,
-    /// The phi value naming the join.
-    id: Value,
+    key: Key,
     value: bool,
     args: Vec<Key>,
 }
@@ -538,6 +546,8 @@ impl<'a> Lanes<'a> {
             other: Map::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
+            mask_args: Map::default(),
+            mask_edges: Map::default(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
@@ -616,6 +626,8 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.scc_lane.clear();
         self.joins.clear();
+        self.mask_args.clear();
+        self.mask_edges.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
@@ -718,13 +730,20 @@ impl<'a> Lanes<'a> {
         }
     }
 
-    /// Joins whose constant fails on some edge, given what lanes know.
-    fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
+    /// Resolve exact incoming masks for dynamic joins and verify the joins
+    /// tentatively resolved as constants. Either lookup can discover more joins.
+    fn finish_mask_edges(&mut self, cond: &[Bool]) -> Vec<Key> {
         let mut wrong = Vec::new();
         let mut j = 0;
-        // Checking an argument can resolve another join; it is checked too.
-        while j < self.joins.len() {
-            let (block, id, value) = (self.joins[j].block, self.joins[j].id, self.joins[j].value);
+        while j < self.joins.len() || !self.mask_args.is_empty() {
+            for (key, args) in std::mem::take(&mut self.mask_args) {
+                let edges = args.into_iter().map(|arg| self.mask(arg).0).collect();
+                self.mask_edges.insert(key, edges);
+            }
+            if j == self.joins.len() {
+                continue;
+            }
+            let (block, key, value) = (self.joins[j].block, self.joins[j].key, self.joins[j].value);
             for (n, a) in self.joins[j].args.clone().into_iter().enumerate() {
                 let (q, taken) = self.incoming[block][n];
                 let e = self.edge(cond[q], q, taken);
@@ -733,7 +752,7 @@ impl<'a> Lanes<'a> {
                     m = self.b.not(m);
                 }
                 if !self.b.implies(e, m) {
-                    wrong.push(id);
+                    wrong.push(key);
                     break;
                 }
             }
@@ -794,6 +813,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            mask_edges: self.mask_edges,
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -868,8 +888,8 @@ impl<'a> Lanes<'a> {
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b.atom(Atom::Opaque(k.0, k.1), born)
                 });
                 (m, derived)
             }
@@ -902,7 +922,6 @@ impl<'a> Lanes<'a> {
         let args: Vec<Key> = (0..target.preds.len())
             .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
             .collect();
-        let id = lo.map_or(k.1, |_| k.0);
         let mut derived = false;
         // (edge condition, mask) per forward edge; back edges come later.
         let mut forward = Vec::new();
@@ -921,7 +940,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.unresolved.contains(&k) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -931,7 +950,7 @@ impl<'a> Lanes<'a> {
                 if holds {
                     self.joins.push(Join {
                         block,
-                        id,
+                        key: k,
                         value,
                         args,
                     });
@@ -941,7 +960,8 @@ impl<'a> Lanes<'a> {
             }
         }
         let born = self.index[block];
-        Some((self.b.atom(Atom::Phi(id), born), derived))
+        self.mask_args.insert(k, args);
+        Some((self.b.atom(Atom::Phi(k.0, k.1), born), derived))
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
@@ -1138,8 +1158,13 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
+                        // The restore itself is a VALU instruction; its pair
+                        // may not have been looked up as a mask yet. Follow
+                        // it here so a scalar copy carries the mask forward.
+                        let restored =
+                            self.restored.contains_key(&k.0) && self.restored.contains_key(&k.1);
                         takes_mask |= self.masks.contains_key(&k)
-                            || phi && !self.joins_loaded(k) && self.mask(k).1;
+                            || (restored || phi && !self.joins_loaded(k)) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1454,6 +1479,75 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
+    }
+
+    #[test]
+    fn scalar_copy_keeps_a_restored_wave64_mask() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xD761_0001,
+                0x0001_066A, // v_writelane_b32 v1, vcc_lo, 3
+                0xD761_0001,
+                0x0001_086B, // v_writelane_b32 v1, vcc_hi, 4
+                0xD760_0006,
+                0x0001_0701, // v_readlane_b32 s6, v1, 3
+                0x7E04_0280, // v_mov_b32 v2, 0 (between the restores)
+                0xD760_0007,
+                0x0001_0901, // v_readlane_b32 s7, v1, 4
+                0xBE8C_0406, // s_mov_b64 s[12:13], s[6:7]
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        let cmp = insts[0].write(Reg::S(VCC)).unwrap();
+        let copy = &insts[6];
+        let lo = copy.write(Reg::S(12)).unwrap();
+        let hi = copy.write(Reg::S(13)).unwrap();
+        let mask = s.mask_bits(lo, Some(hi)).expect("mask of the copied pair");
+        assert_eq!(s.bools.support(mask), vec![Atom::Lane(cmp)]);
+    }
+
+    #[test]
+    fn wave64_mask_join_retains_the_exact_numeric_pair_on_the_other_edge() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0xBE87_0381, // s_mov_b32 s7, 1
+                0xD761_0001,
+                0x0001_066A, // v_writelane_b32 v1, vcc_lo, 3
+                0xD761_0001,
+                0x0001_086B, // v_writelane_b32 v1, vcc_hi, 4
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0004, // s_cbranch_scc1 -> join
+                0xD760_0006,
+                0x0001_0701, // v_readlane_b32 s6, v1, 3
+                0xD760_0007,
+                0x0001_0901, // v_readlane_b32 s7, v1, 4
+                0x87FE_7E06, // join: s_and_b64 exec, s[6:7], exec
+                0xBF88_0001, // s_cbranch_execz -> end
+                0x7E04_0280, // v_mov_b32 v2, 0
+                S_ENDPGM,
+            ],
+            true,
+        );
+        let s = structure(&p).unwrap();
+        let entry = &p.blocks[0].insts;
+        let cmp = entry[0].write(Reg::S(VCC)).unwrap();
+        let lo = entry[1].write(Reg::S(6)).unwrap();
+        let hi = entry[2].write(Reg::S(7)).unwrap();
+        let join = p.blocks.iter().find(|b| b.offset == 13 * 4).unwrap();
+        let inst = &join.insts[0];
+        let edges = s
+            .mask_edges(inst.read(Reg::S(6)).unwrap(), inst.read(Reg::S(7)).unwrap())
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+        let atoms: Vec<_> = edges.iter().flat_map(|&m| s.bools.support(m)).collect();
+        assert!(atoms.contains(&Atom::Opaque(lo, hi)), "{atoms:?}");
+        assert!(atoms.contains(&Atom::Lane(cmp)), "{atoms:?}");
     }
 
     #[test]
