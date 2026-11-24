@@ -512,6 +512,14 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         }) {
             return Err(Malformed("root parameter outside the SGPRs"));
         }
+        // Resource tracking maps an SGPR to the first parameter covering it
+        // (`resource::param_of`), so a second parameter over the same SGPR
+        // would have its reads attributed to the first. The ranges of one
+        // table share its SGPR (and its address), so only different slots
+        // are refused.
+        if !params_apart(stage, &layout) {
+            return Err(Malformed("root parameters share an SGPR"));
+        }
         let used = table(RECORD_USED, RECORD_COUNTS + 4)?
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
@@ -596,6 +604,25 @@ fn sgpr_span(stage: HwStage, p: &RootParam) -> (u32, u32) {
         _ => p.sgprs.max(1),
     };
     (first, span)
+}
+
+/// Whether no SGPR holds two root parameters: each covers its stated
+/// SGPRs (none for, say, a fixed sampler), a root descriptor also the high
+/// half resource tracking reads after its first.
+fn params_apart(stage: HwStage, layout: &[RootParam]) -> bool {
+    // The layout was checked first, so every covered SGPR is below `SGPRS`.
+    let mut owner = [None; SGPRS as usize];
+    layout.iter().all(|p| {
+        let (first, _) = sgpr_span(stage, p);
+        let span = match p.root {
+            RootType::Descriptor => p.sgprs.max(2),
+            _ => p.sgprs,
+        };
+        (first..first + span).all(|s| {
+            let held = owner[s as usize].get_or_insert(p.slot);
+            *held == p.slot
+        })
+    })
 }
 
 /// A compute program's thread-group size. Lowering multiplies the
@@ -1617,5 +1644,58 @@ mod tests {
             inputs(0),
             Err(Malformed("pixel inputs share an attribute"))
         ));
+    }
+
+    #[test]
+    fn refuses_root_parameters_sharing_an_sgpr() {
+        // A pixel program with these (root type, SGPRs, user data, slot)
+        // parameters.
+        let program = |params: &[(u32, u32, u8, u8)]| {
+            let mut blob = fssm(&[(HwStage::Ps, &PS_CODE)]);
+            let record =
+                FSSM_HEADER + u64_at(&blob, FSSM_HEADER + slot(HwStage::Ps)).unwrap() as usize;
+            let table = (blob.len() - FSSM_HEADER) as u64;
+            for &(root, sgprs, user_data, slot) in params {
+                for v in [root, 0, sgprs, 0] {
+                    blob.extend_from_slice(&v.to_le_bytes());
+                }
+                blob.extend_from_slice(&[user_data, slot, 0, 0]);
+            }
+            let payload = (blob.len() - FSSM_HEADER) as u64;
+            blob[8..16].copy_from_slice(&payload.to_le_bytes());
+            blob[record + RECORD_LAYOUT..][..8].copy_from_slice(&table.to_le_bytes());
+            let count = params.len() as u64;
+            blob[record + RECORD_COUNTS..][..8].copy_from_slice(&count.to_le_bytes());
+            native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))]))
+        };
+        let (constants, descriptor, table, sampler) = (0, 1, 3, 4);
+        // Side by side, two ranges of one table, and a fixed sampler (no
+        // SGPRs) at a taken user-data dword are all fine.
+        assert!(program(&[(constants, 2, 0, 0), (descriptor, 2, 2, 1)]).is_ok());
+        assert!(program(&[(table, 1, 4, 2), (table, 1, 4, 2)]).is_ok());
+        assert!(program(&[(constants, 2, 0, 0), (sampler, 0, 0, 3)]).is_ok());
+        for (params, what) in [
+            (
+                [(constants, 2, 0, 0), (table, 1, 1, 1)],
+                "a table in the constants' second dword",
+            ),
+            (
+                [(table, 1, 3, 0), (table, 1, 3, 1)],
+                "two tables in one SGPR",
+            ),
+            (
+                [(descriptor, 1, 0, 0), (constants, 1, 1, 1)],
+                "constants in a descriptor's high half",
+            ),
+        ] {
+            assert_eq!(
+                match program(&params) {
+                    Err(Malformed(why)) => why,
+                    other => panic!("{what}: expected a refusal, got {other:?}"),
+                },
+                "root parameters share an SGPR",
+                "{what}"
+            );
+        }
     }
 }
