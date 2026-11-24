@@ -564,12 +564,15 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             // A link to a file that was moved or deleted: the link itself
-            // is there, so say where it leads.
-            if let Ok(target) = std::fs::read_link(&plain) {
-                anyhow::bail!(
-                    "{what}, a link to {}, which does not exist",
-                    target.display()
-                );
+            // is there, so say where it leads, hop by hop through a chain
+            // of links, so the missing name at the end is the one shown.
+            let hops = link_hops(&plain);
+            if !hops.is_empty() {
+                let hops: Vec<String> = hops
+                    .iter()
+                    .map(|target| format!("a link to {}", target.display()))
+                    .collect();
+                anyhow::bail!("{what}, {}, which does not exist", hops.join(", "));
             }
             anyhow::bail!("{what}, which does not exist");
         }
@@ -591,6 +594,24 @@ fn config_file_or(explicit: Option<PathBuf>, default: &Path) -> Result<Option<Pa
         anyhow::bail!("{what}, which is a folder, not a config file{hint}");
     }
     anyhow::bail!("{what}, which is not a regular file");
+}
+
+/// The targets of the chain of links starting at `path`, each as written
+/// in its link (what `ls -l` shows), followed from the folder of the link
+/// that holds it. Empty when `path` is not a link. Stops at the first name
+/// that is not a link and, so that a loop cannot hold it, after as many hops
+/// as Linux follows (40).
+fn link_hops(path: &Path) -> Vec<PathBuf> {
+    let mut hops = Vec::new();
+    let mut at = path.to_path_buf();
+    while hops.len() < 40 {
+        let Ok(target) = std::fs::read_link(&at) else {
+            break;
+        };
+        at = at.parent().unwrap_or(Path::new("")).join(&target);
+        hops.push(target);
+    }
+    hops
 }
 
 /// Refuses a cache or data folder that is the root of a drive, the home
@@ -2750,6 +2771,72 @@ mod tests {
             err.to_string(),
             format!("checking the config file {}", link.display())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chain_of_config_links_is_followed_and_names_the_missing_end() {
+        // `victory.toml -> current.toml -> ../profiles/main.toml`, the
+        // second hop written relative to its own folder. Scratch folder
+        // under the system temp folder, removed when dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&profiles).unwrap();
+        let real = profiles.join("main.toml");
+        std::fs::write(&real, "").unwrap();
+        let current = nested.join("current.toml");
+        std::os::unix::fs::symlink("../profiles/main.toml", &current).unwrap();
+        let link = nested.join("victory.toml");
+        std::os::unix::fs::symlink("current.toml", &link).unwrap();
+
+        // Whole: found under the first link's own name.
+        assert_eq!(config_file_or(None, &link).unwrap(), Some(link.clone()));
+        assert_eq!(config_file(Some(link.clone())).unwrap(), Some(link.clone()));
+        assert_eq!(
+            link_hops(&link),
+            [
+                PathBuf::from("current.toml"),
+                PathBuf::from("../profiles/main.toml")
+            ]
+        );
+
+        // The end moved away: every hop as written, so the name that is
+        // missing is the last one shown, not the link in the middle.
+        std::fs::remove_file(&real).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "the config file {}, a link to current.toml, a link to \
+                 ../profiles/main.toml, which does not exist",
+                link.display()
+            )
+        );
+        let err = config_file(Some(link.clone())).unwrap_err().to_string();
+        assert!(err.starts_with("VICTORY_CONFIG points at"), "{err}");
+        assert!(
+            err.ends_with("a link to ../profiles/main.toml, which does not exist"),
+            "{err}"
+        );
+
+        // The middle link removed instead: the chain stops where the name
+        // is missing.
+        std::fs::write(&real, "").unwrap();
+        std::fs::remove_file(&current).unwrap();
+        let err = config_file_or(None, &link).unwrap_err().to_string();
+        assert!(
+            err.ends_with(", a link to current.toml, which does not exist"),
+            "{err}"
+        );
+
+        // Not a link, or not there: no hops.
+        assert!(link_hops(&real).is_empty());
+        assert!(link_hops(&current).is_empty());
+        // A link to itself stops after Linux's limit instead of spinning.
+        std::os::unix::fs::symlink("current.toml", &current).unwrap();
+        assert_eq!(link_hops(&current).len(), 40);
     }
 
     #[cfg(unix)]
