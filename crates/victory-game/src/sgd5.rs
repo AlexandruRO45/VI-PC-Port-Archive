@@ -947,6 +947,58 @@ mod tests {
     }
 
     #[test]
+    fn stream_of_another_size_does_not_unpack() {
+        // A record whose stream makes one byte more, or one fewer, than its
+        // stated size covers no other record: it is yielded, does not
+        // unpack, and the record after it is found.
+        let packed = miniz_oxide::deflate::compress_to_vec(b"twelve bytes", 6);
+        let n = (packed.len() + 12) as u32;
+        for stated in [11_u32, 13] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_a\0\x32");
+            for v in [n, 0x000D_DCE7, n, stated] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [Some("PS_a"), Some("PS_after")], "stated {stated}");
+            assert_eq!(found[0].unpack(), None, "stated {stated}");
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+        }
+    }
+
+    #[test]
+    fn marker_stating_more_than_the_cap_is_not_a_record() {
+        // A record stored as is (level 0) inside bytes whose marker states
+        // an unpacked size: up to the cap they are a record, which holds
+        // the stored one; past it they are not, and the stored record is
+        // found in their place. Enough packed bytes that the cap's lower
+        // bound on them is met.
+        let inner = record_bytes("PS_inner", 0x32, b"inner");
+        let mut payload = vec![0x5A; 100];
+        payload.extend_from_slice(&inner);
+        payload.resize(min_packed(MAX_UNPACKED + 1) + 64, 0x5A);
+        let packed = miniz_oxide::deflate::compress_to_vec(&payload, 0);
+        let n = (packed.len() + 12) as u32;
+        for (stated, want) in [
+            (MAX_UNPACKED, Some("PS_outer")),
+            (MAX_UNPACKED + 1, Some("PS_inner")),
+        ] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x09PS_outer\0\x32");
+            for v in [n, 0x000D_DCE7, n, stated as u32] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            assert_eq!(names, [want], "stated {stated}");
+        }
+    }
+
+    #[test]
     fn nested_markers_without_streams_take_linear_work() {
         // Bytes that each read as a marker whose span runs to the end of the
         // file and covers every one after it, then a real record: each is
