@@ -1,8 +1,7 @@
 # GTA6 PC Port Archive
 
 Archived copies of four open-source projects that worked on running GTA VI on PC, saved on 2026-11-23 and 2026-11-24.
-No game files are included: each project kept game data out of its repository.
-
+ZERO of Rockstars game assets, files, or leaked info is on this repo, NOTHING HERE IS BREAKING ANY LAW OR ANYONE'S TOS
 ## Important links
 
 - [portwatch-vi.xyz](https://portwatch-vi.xyz)
