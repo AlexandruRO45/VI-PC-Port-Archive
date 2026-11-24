@@ -222,7 +222,7 @@ static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 pub(crate) fn remapped(at: usize, len: usize) {
     if enabled() {
-        REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((at as u64, (at + len) as u64));
+        REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((at as u64, at.saturating_add(len) as u64));
     }
 }
 

@@ -18,7 +18,7 @@
 //! hashed, not guarded. A system call writing into a guarded block fails
 //! (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -55,11 +55,33 @@ struct Cover {
     ranges: Vec<(usize, usize)>,
 }
 static COVER: Mutex<Cover> = Mutex::new(Cover { submission: 0, ranges: Vec::new() });
-static EXTENTS: Mutex<Option<std::collections::HashMap<usize, (usize, usize, bool)>>> = Mutex::new(None);
+/// Allocations seen by base: (end, private).
+static EXTENTS: Mutex<BTreeMap<usize, (usize, bool)>> = Mutex::new(BTreeMap::new());
 
-/// The allocation holding `at`: (base, end, private), cached by base.
+/// `VICTORY_EXTENT_CACHE=0`: every asking queries the allocation of its range anew (a
+/// `VirtualQuery`, which walks page tables to the region's end: ~2 ms in the title's big pools).
+fn extent_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXTENT_CACHE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Memory at `[at, at + len)` was mapped or unmapped: the allocations there are unknown again.
+fn forget_extents(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&base, &mut (top, _)| !(base < end && top > at));
+}
+
+/// The allocation holding `at`: (base, end, private), cached by base; with the extent cache,
+/// found without a system call when `at` lies inside one seen before.
 fn allocation(at: usize) -> Option<(usize, usize, bool)> {
     use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if extent_cache()
+        && let Some((&base, &(top, private))) =
+            EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).range(..=at).next_back()
+        && at < top
+    {
+        return Some((base, top, private));
+    }
     let n = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
     // SAFETY: queries only.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -70,8 +92,8 @@ fn allocation(at: usize) -> Option<(usize, usize, bool)> {
     if base == 0 {
         return None;
     }
-    if let Some(&e) = EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&base) {
-        return Some(e);
+    if let Some(&(top, private)) = EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).get(&base) {
+        return Some((base, top, private));
     }
     let private = info.Type == MEM_PRIVATE;
     let mut end = base;
@@ -82,9 +104,8 @@ fn allocation(at: usize) -> Option<(usize, usize, bool)> {
         }
         end = info.BaseAddress as usize + info.RegionSize;
     }
-    let e = (base, end, private);
-    EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(base, e);
-    Some(e)
+    EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).insert(base, (end, private));
+    Some((base, end, private))
 }
 
 /// Local build: [`writes_kernel`], asked once per submission for what it covers: a private
@@ -106,11 +127,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
     }
     // a private allocation of at most 2 GiB is asked whole
-    let (qa, qb) = match allocation(a) {
+    let (qa, qb) = match if known_view(a) { None } else { allocation(a) } {
         Some((base, top, true)) if top - base <= (2 << 30) && base <= a && b <= top => (base, top),
         _ => (a, b),
     };
-    let (now, _) = writes_kernel(qa, qb, guarded)?;
+    let (now, _) = match writes_kernel(qa, qb, guarded) {
+        Some(r) => r,
+        // (a cached extent gone stale: ask for the range itself)
+        None if (qa, qb) != (a, b) => {
+            forget_extents(qa, qb - qa);
+            writes_kernel(a, b, guarded)?
+        }
+        None => return None,
+    };
     COVER.lock().unwrap_or_else(|e| e.into_inner()).ranges.push((qa / PAGE * PAGE, qb.div_ceil(PAGE) * PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
@@ -127,8 +156,10 @@ fn writes_kernel(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // Local build: memory known to be guarded view memory is not write-watched: no asking.
+    let view = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = view || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -171,23 +202,103 @@ fn writes_kernel(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(u
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
-struct Guards {
-    /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
-    /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
-    /// Local build: blocks found entirely unmapped (holes of the tile heap: 132 MB of them). A
-    /// copy reads them as zeros, once; they are not asked about again until the runtime maps or
-    /// unmaps memory there (`title_memory_remapped`). Before, every asking called them written,
-    /// and each refresh read them anew (a failing read, region queries, zero fill).
-    holes: BTreeSet<usize>,
+/// Per 64 KiB block of view memory, what we know of it (see [`Flags`]).
+const PROTECTED: u8 = 1;
+const CLEAN: u8 = 2;
+const HOLE: u8 = 4;
+/// Blocks per chunk of the flag table (256 MB of title memory).
+const CHUNK: usize = 4096;
+
+/// Local build: the block flags as a chunked flat table (they were three `BTreeSet`s: the
+/// world's askings walked its 2,800-block heap with a few thousand tree lookups each).
+#[derive(Default)]
+struct Flags {
+    chunks: std::collections::HashMap<usize, Box<[u8; CHUNK]>>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-    holes: BTreeSet::new(),
-});
+impl Flags {
+    fn get(&self, block: usize) -> u8 {
+        self.chunks.get(&(block / CHUNK)).map_or(0, |c| c[block % CHUNK])
+    }
+    fn set(&mut self, block: usize, bits: u8) {
+        self.chunk(block)[block % CHUNK] |= bits;
+    }
+    fn clear(&mut self, block: usize, bits: u8) {
+        if let Some(c) = self.chunks.get_mut(&(block / CHUNK)) {
+            c[block % CHUNK] &= !bits;
+        }
+    }
+    fn chunk(&mut self, block: usize) -> &mut [u8; CHUNK] {
+        self.chunks.entry(block / CHUNK).or_insert_with(|| Box::new([0; CHUNK]))
+    }
+    /// Calls `f(block, flags)` for each block of `[from, to)` with any of `mask` set (in order
+    /// within a chunk; a range wider than the table walks the chunks that exist).
+    fn each(&self, from: usize, to: usize, mask: u8, mut f: impl FnMut(usize, u8)) {
+        if from >= to {
+            return;
+        }
+        let (lo, hi) = (from / CHUNK, (to - 1) / CHUNK);
+        let mut keys: Vec<usize> = if hi - lo < self.chunks.len() {
+            (lo..=hi).filter(|k| self.chunks.contains_key(k)).collect()
+        } else {
+            self.chunks.keys().copied().filter(|k| (lo..=hi).contains(k)).collect()
+        };
+        keys.sort_unstable();
+        for k in keys {
+            let c = &self.chunks[&k];
+            for block in (k * CHUNK).max(from)..((k + 1) * CHUNK).min(to) {
+                let v = c[block % CHUNK];
+                if v & mask != 0 {
+                    f(block, v);
+                }
+            }
+        }
+    }
+    /// Whether every block of `[from, to)` is clean or a hole; and how many are holes.
+    fn settled(&self, from: usize, to: usize) -> Option<usize> {
+        let mut at = from;
+        let mut holes = 0;
+        while at < to {
+            let end = ((at / CHUNK + 1) * CHUNK).min(to);
+            let c = self.chunks.get(&(at / CHUNK))?;
+            for block in at..end {
+                let v = c[block % CHUNK];
+                if v & (CLEAN | HOLE) == 0 {
+                    return None;
+                }
+                holes += usize::from(v & HOLE != 0);
+            }
+            at = end;
+        }
+        Some(holes)
+    }
+}
+
+struct Guards {
+    /// Blocks we made read-only (`PROTECTED`), of those the ones not written since a copy took
+    /// them (`CLEAN`), and, local build, blocks found entirely unmapped (`HOLE`: holes of the
+    /// tile heap, 132 MB of them). A copy reads holes as zeros, once; they are not asked about
+    /// again until the runtime maps or unmaps memory there (`title_memory_remapped`). Before,
+    /// every asking called them written, and each refresh read them anew (a failing read,
+    /// region queries, zero fill).
+    flags: Flags,
+}
+
+static GUARDS: Mutex<Option<Guards>> = Mutex::new(None);
+
+#[cfg(test)]
+static FORCE_SLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `VICTORY_FAST_GUARD=0` turns off the shortcuts that skip system calls and walks for memory
+/// already known to be guarded (the flag table itself stays).
+fn fast_guard() -> bool {
+    #[cfg(test)]
+    if FORCE_SLOW.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FAST_GUARD").map_or(true, |v| v.trim() != "0"))
+}
 
 /// `VICTORY_HOLE_MEMO=0` turns the memory of holes off.
 fn remember_holes() -> bool {
@@ -206,8 +317,29 @@ fn is_hole(block: usize) -> bool {
     n != 0 && info.State != MEM_COMMIT && info.BaseAddress as usize + info.RegionSize >= at + BLOCK
 }
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+struct GuardsLock(std::sync::MutexGuard<'static, Option<Guards>>);
+impl std::ops::Deref for GuardsLock {
+    type Target = Guards;
+    fn deref(&self) -> &Guards {
+        self.0.as_ref().expect("made")
+    }
+}
+impl std::ops::DerefMut for GuardsLock {
+    fn deref_mut(&mut self) -> &mut Guards {
+        self.0.as_mut().expect("made")
+    }
+}
+
+fn guards() -> GuardsLock {
+    let mut g = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(|| Guards { flags: Flags::default() });
+    GuardsLock(g)
+}
+
+/// Whether the block at `at` is known to be guarded view memory (or a hole in one): then no
+/// system call is needed to tell it from write-watched or plain memory.
+fn known_view(at: usize) -> bool {
+    fast_guard() && guards().flags.get(at / BLOCK) & (PROTECTED | HOLE) != 0
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -215,30 +347,41 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
-        return None;
+    if !known_view(start) {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.Type != MEM_MAPPED {
+            return None;
+        }
     }
     install();
     let mut g = guards();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Local build: all clean (or holes) is the usual answer for a heap nobody wrote: no walk.
+    if fast_guard()
+        && let Some(_holes) = g.flags.settled(first, last)
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HoleSkips, _holes as u64);
+        return Some(Vec::new());
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
-        let hole = block < last && g.holes.contains(&block);
+        let flags = if block < last { g.flags.get(block) } else { 0 };
+        let hole = flags & HOLE != 0;
         #[cfg(feature = "diagnostics")]
         if hole {
             crate::copystat::add(crate::copystat::C::HoleSkips, 1);
         }
-        let open = block < last && !hole && !g.clean.contains(&block);
+        let open = block < last && !hole && flags & CLEAN == 0;
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if flags & PROTECTED != 0 {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                g.flags.set(block, CLEAN);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -268,8 +411,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        for block in from..to {
+            g.flags.set(block, PROTECTED | CLEAN);
+        }
     };
     if set(from, to) {
         note(g, from, to);
@@ -279,7 +423,7 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if remember_holes() && is_hole(block) {
-            g.holes.insert(block);
+            g.flags.set(block, HOLE);
         }
     }
 }
@@ -288,14 +432,10 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let mut blocks: Vec<usize> = Vec::new();
+    g.flags.each(start / BLOCK, end.div_ceil(BLOCK), PROTECTED, |block, _| blocks.push(block));
     for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.flags.clear(block, PROTECTED | CLEAN);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -317,19 +457,12 @@ pub fn writing(at: usize, len: usize) {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::direct::remapped(at, len);
     crate::shadow::mirror_pages_remapped(at, len);
+    forget_extents(at, len);
     let mut g = guards();
-    let blocks: Vec<usize> = g
-        .protected
-        .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let mut blocks: Vec<usize> = Vec::new();
+    g.flags.each(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK), PROTECTED | HOLE, |block, _| blocks.push(block));
     for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
-    let holes: Vec<usize> = g.holes.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
-    for block in holes {
-        g.holes.remove(&block);
+        g.flags.clear(block, PROTECTED | CLEAN | HOLE);
     }
 }
 
@@ -411,9 +544,11 @@ mod tests {
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
+        crate::shadow::next_submission(); // (within one, a covered range is answered from the journal)
         let (now, after) = writes(start, end, false).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
+        crate::shadow::next_submission();
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
@@ -471,6 +606,38 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// Timing of the world's askings: 444 per frame over a 174 MB view heap nobody wrote.
+    /// `cargo test -p victory-gpu --lib guarded_asking_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn guarded_asking_cost() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        const LEN: usize = 174 << 20;
+        // SAFETY: a pagefile section mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, LEN as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value as usize
+        };
+        assert_ne!(view, 0);
+        let run = |slow: bool| {
+            FORCE_SLOW.store(slow, std::sync::atomic::Ordering::Relaxed);
+            let t = std::time::Instant::now();
+            for i in 0..444 {
+                crate::shadow::next_submission();
+                // pieces of the heap as the world asks them, and the whole of it
+                let (a, b) = if i % 4 == 0 { (view, view + LEN) } else { (view + (i % 40) * PAGE * 8, view + (i % 40) * PAGE * 8 + 20 * PAGE * 8) };
+                assert!(writes(a, b, true).is_some());
+            }
+            t.elapsed()
+        };
+        let first = run(true); // also guards everything
+        let slow = run(true);
+        let fast = run(false);
+        eprintln!("guarded askings: first {first:?}; 444 slow walks {slow:?}; 444 with the shortcuts {fast:?}");
+        title_memory_remapped(view, LEN);
     }
 
     /// A write or mapping that runs past the end of the address space (a
