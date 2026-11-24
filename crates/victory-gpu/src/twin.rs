@@ -271,6 +271,9 @@ pub(crate) fn uav(
             _ => 62,
         }
     };
+    if !crate::descriptor::host::typed_store(format) {
+        return None;
+    }
     once(console, words[0], plane as u32, "an unordered view of a depth texture, made on its writable twin");
     words[0] = format;
     words[plane_word] = 0;
