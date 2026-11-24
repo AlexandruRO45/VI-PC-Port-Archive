@@ -3336,3 +3336,68 @@ fn an_export_name_ordinal_table_at_rva_zero_is_malformed_even_without_names() {
         );
     }
 }
+
+#[test]
+fn an_empty_codeview_path_is_an_empty_string_and_bytes_after_its_nul_are_ignored() {
+    // A record whose path is just its terminator names no PDB file.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    put_bytes(&mut d, CODEVIEW + 24, b"\0pdb\0\0");
+    let cv = ImageInfo::parse(&d).unwrap().codeview.unwrap();
+    assert_eq!((cv.pdb_path.as_str(), cv.age), ("", 0x2A));
+
+    // The path stops at its first NUL even when the record runs on past it.
+    let mut d = image();
+    add_codeview(&mut d, b"RSDS");
+    put_bytes(&mut d, CODEVIEW + 24, b"a\0junk");
+    assert_eq!(
+        ImageInfo::parse(&d).unwrap().codeview.unwrap().pdb_path,
+        "a"
+    );
+}
+
+#[test]
+fn descriptors_sharing_one_name_table_and_iat_report_the_same_slots() {
+    // A second descriptor for another DLL that reuses the first one's name
+    // table and IAT: nothing de-duplicates or checks the overlap, so both
+    // modules list the same symbols in the same slots.
+    const SECOND_DESCRIPTOR: u32 = IMPORT_DESCRIPTORS + 20;
+    const SECOND_NAME: u32 = 0x1140;
+    let mut d = image();
+    set_directory(&mut d, dir::IMPORT, IMPORT_DESCRIPTORS, 60);
+    let desc = at(SECOND_DESCRIPTOR);
+    put32(&mut d, desc, NAME_TABLE);
+    put32(&mut d, desc + 12, SECOND_NAME);
+    put32(&mut d, desc + 16, IAT);
+    put_bytes(&mut d, SECOND_NAME, b"KERNELBASE.dll\0");
+    let info = ImageInfo::parse(&d).unwrap();
+    let module = |i: usize| -> (String, Vec<(String, u32)>) {
+        let m = &info.imports[i];
+        (
+            m.dll.clone(),
+            m.entries
+                .iter()
+                .map(|e| (e.symbol.to_string(), e.iat_slot_rva))
+                .collect(),
+        )
+    };
+    let slots = vec![
+        ("ExitProcess".to_string(), IAT),
+        ("#5".to_string(), IAT + 8),
+    ];
+    assert_eq!(module(0), ("KERNEL32.dll".to_string(), slots.clone()));
+    assert_eq!(module(1), ("KERNELBASE.dll".to_string(), slots));
+    assert_eq!(info.import_count(), 4);
+}
+
+#[test]
+fn a_delay_descriptor_without_a_name_table_does_not_fall_back_to_its_iat() {
+    // Regular imports read names from the IAT when the name table RVA is 0;
+    // delay imports have no such fallback, even with a valid thunk in the
+    // IAT.
+    let mut d = image();
+    add_delay_import(&mut d);
+    put64(&mut d, at(DELAY_IAT), u64::from(DELAY_HINT_NAME));
+    put32(&mut d, at(DELAY_DESCRIPTORS) + 16, 0);
+    assert!(matches!(ImageInfo::parse(&d), Err(PeError::Malformed(_))));
+}
