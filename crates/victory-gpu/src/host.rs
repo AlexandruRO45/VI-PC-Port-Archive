@@ -545,6 +545,11 @@ void main() {
         // SAFETY: destination remains mapped and contains a four-byte result.
         let result = unsafe { destination.data.cast::<u32>().read_volatile() };
         assert_eq!(result, INPUT ^ MASK);
+
+        // The 174 MiB allocation leaves less than 82 MiB after the two
+        // alignment slots, so exhaustion must preserve the caller's fallback.
+        assert!(host.unified_buffer(82 << 20).is_none());
+        assert!(host.unified_buffer(u64::MAX).is_none());
     }
 
     #[test]
