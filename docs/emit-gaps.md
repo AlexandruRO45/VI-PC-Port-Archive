@@ -144,11 +144,30 @@ attribute at channels x, y and z, each in both halves (`v_interp_p1ll_f16` and
 `v_interp_p2_f16 … high`) — six halves. Our element for row 3 declares
 `cols 4` halves, so half 4 has no element and the refusal fires. The console
 reads halves the row carries and we do not name: this is a **declaration**
-bug, not a source we lack. For a packed 16-bit element the console's column
-count is in dwords (4 dwords = 8 halves) and `packed_half`'s `extent` treats it
-as a half count. What the fix must keep: a pixel input never silently reads
-zero, and a width that decodes a neighbour's dword is the black-scene class
-rather than a clean refusal.
+bug, not a source we lack.
+
+The program's own behaviour settles what the console's column count means. A
+compiler does not read past the signature it declared, and this one reads six
+halves of a `cols 4` pixel element, so four columns cannot be four halves: for
+a 16-bit element the console counts **32-bit registers**, four of them, eight
+halves. The same file shows the convention on its 32-bit rows — `TEXCOORD4` at
+row 4 `col 0, cols 2` and `TEXCOORD5` at `col 2, cols 2`, two elements filling
+one row's four registers by column. `packed_half`'s `extent` reads that
+register count as a half count, so halves 4-7 of a packed row are invisible.
+
+So the fix is not a width in `packed_half`; it is the signature model. A host
+element carries at most four components per register row, so a packed
+attribute of `cols` registers is `2 * cols` halves spread over `ceil(cols/2)`
+register rows, every later row of the signature shifts by the difference, and
+the vertex or mesh stage that writes the attribute has to declare the same
+shape or the two signatures do not link. That is a change to
+`emit::mod`'s signature assembly on both sides of the pair, not a patch inside
+one lowering, and it needs a real run to verify against the title's own data —
+which is why it is written down here rather than half-done.
+
+The rule any version of it must keep: a pixel input never silently reads zero,
+and a width that decodes a neighbour's dword is the black-scene class rather
+than a clean refusal.
 
 **An interpolation with computed barycentrics (167 pixel programs).**
 Diagnosed, and it is not a phi the io pass merely failed to follow. On
