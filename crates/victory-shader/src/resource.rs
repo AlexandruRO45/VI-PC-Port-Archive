@@ -1389,21 +1389,24 @@ impl<'a> Tracer<'a> {
     /// travels in [`Address::rel`], never counted into the pointer's
     /// place; the load's own offset is applied by the lowering.
     fn constants_pointer(&self, v: Value, hi: Term) -> Option<Address> {
-        let mut found: Option<(Value, usize)> = None;
+        let mut found: Option<(Value, usize, u32)> = None;
         for leaf in self.leaves(v) {
             let Some(reg) = self.inputs[leaf.0 as usize] else {
                 continue;
             };
-            let Some((param, 0)) = self.param_of(reg) else {
+            let Some((param, dword)) = self.param_of(reg) else {
                 continue;
             };
-            if self.layout[param].root != RootType::Constants || found.is_some() {
+            if self.layout[param].root != RootType::Constants
+                || !dword.is_multiple_of(2)
+                || found.is_some()
+            {
                 return None;
             }
-            found = Some((leaf, param));
+            found = Some((leaf, param, dword));
         }
-        let (lo, param) = found?;
-        let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+        let (lo, param, dword) = found?;
+        let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + dword as u8 + 1);
         let high = self.p.inputs.iter().find(|i| i.0 == high)?.1;
         if !self.high_half(hi, Some(high))
             && !self.carried(hi, Term::Value(high), &mut Vec::new())
@@ -1412,7 +1415,7 @@ impl<'a> Tracer<'a> {
         }
         Some(Address {
             param,
-            offset: 0,
+            offset: 4 * dword,
             dynamic: None,
             rel: Some(RelOffset {
                 value: v,
@@ -1689,7 +1692,7 @@ impl<'a> Tracer<'a> {
             {
                 Address {
                     param: a.param,
-                    offset: extra.offset,
+                    offset: a.offset.wrapping_add(extra.offset),
                     dynamic: None,
                     rel: None,
                     deref: false,
