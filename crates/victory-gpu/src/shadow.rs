@@ -470,7 +470,7 @@ impl Shadow {
     fn update_ready(&self, mut ranges: &[(usize, usize)]) -> usize {
         let mut copied = 0;
         let mut allocation: Option<crate::watch::Allocation> = None;
-        let mut unreadable_watch: Option<crate::watch::Allocation> = None;
+        let mut failed_private_watch: Option<crate::watch::Allocation> = None;
         while let Some((&(from, to), remaining)) = ranges.split_first() {
             if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
                 return copied
@@ -479,8 +479,8 @@ impl Shadow {
                         .map(|&(from, to)| self.update_unwatched(from, to))
                         .sum::<usize>();
             }
-            if unreadable_watch.is_some_and(|a| a.is_private_span(from, to)) {
-                copied += self.update_unwatched(from, to);
+            if let Some(verified) = failed_private_watch.filter(|a| a.is_private_span(from, to)) {
+                copied += self.update_private_fallback(from, to, verified);
                 ranges = remaining;
                 continue;
             }
@@ -519,11 +519,13 @@ impl Shadow {
                     written = &written[written.partition_point(|&(page, _)| page < from / PAGE)..];
                     copied += self.update_watched(from, to, now, written);
                 }
-            } else if count > 1 && allocation.is_some_and(|a| a.is_private_span(from, end)) {
+            } else if count > 1
+                && let Some(verified) = allocation.filter(|a| a.is_private_span(from, end))
+            {
                 // A failed query inside one verified private reservation need
                 // not be retried for every view. Copy only requested bytes,
                 // with the usual sparse fallback, for this preparation pass.
-                unreadable_watch = allocation;
+                failed_private_watch = Some(verified);
                 let start = self.start as usize;
                 if self.watched.load(Ordering::Relaxed) == WATCH_UNKNOWN
                     && crate::watch::private_region_covers(start, start + self.len as usize, None)
@@ -532,7 +534,7 @@ impl Shadow {
                 }
                 copied += group
                     .iter()
-                    .map(|&(from, to)| self.update_unwatched(from, to))
+                    .map(|&(from, to)| self.update_private_fallback(from, to, verified))
                     .sum::<usize>();
             } else {
                 copied += group
@@ -604,10 +606,25 @@ impl Shadow {
             {
                 self.watched.store(NOT_WATCHED, Ordering::Relaxed);
             } else {
-                return self.update_regions(from, to, region);
+                return self.update_regions(from, to, region, true);
             }
         }
         self.update_unwatched(from, to)
+    }
+
+    fn update_private_fallback(
+        &self,
+        from: usize,
+        to: usize,
+        allocation: crate::watch::Allocation,
+    ) -> usize {
+        if allocation.fully_committed() {
+            self.update_unwatched(from, to)
+        } else {
+            // Query live extents before reading a partial reservation;
+            // there is no reason to attempt a bulk read across known holes.
+            self.update_regions(from, to, None, false)
+        }
     }
 
     /// A title buffer can span adjacent Windows reservations. EricPlayZ
@@ -619,6 +636,7 @@ impl Shadow {
         mut from: usize,
         to: usize,
         mut observed: Option<crate::watch::MemoryRegion>,
+        try_watch: bool,
     ) -> usize {
         let first = from;
         let mut copied = 0;
@@ -633,7 +651,8 @@ impl Shadow {
             let end = to.min(region.end);
             if region.reserved {
                 copied += self.zero_reserved(from, end);
-            } else if region.committed_private
+            } else if try_watch
+                && region.committed_private
                 && (from != first || end < to)
                 && let Some((now, written)) =
                     crate::watch::grouped_writes(from, end, self.watch_floor(from, end), None)
