@@ -164,12 +164,14 @@ Le script règle les variables ci-dessous (sauf avec `-NoTunedSettings`, qui ne 
 | `VICTORY_SHADER_LOOP_LIMIT` | `256` | Les boucles des shaders traduits étaient quasi infinies, elles sont donc coupées. À 32 (l'ancienne valeur), les cheveux s'affichent en mèches lumineuses et la scène est plus sombre ; à 1024 le périphérique a été perdu sur une RTX 3060 Ti avec le délai par défaut de 2 secondes ; 256 a tenu (issue #18 du fork, et observé sous Linux aux lancements 3 et 4 ci-dessous). |
 | `VICTORY_LATE_WAIT` | `3` | Réglage d'attente des pipelines côté hôte, de la pull request n°1 du fork. |
 | `VICTORY_WIDE_BACK` | `1` | Option du fork, active dans l'essai mesuré. |
-| `VICTORY_RELAY` | non posé | Option du fork, plus posée par défaut (issue n°89 du fork : la peau disparaît, les sous-titres se superposent) ; `2` était actif dans les essais mesurés de `7b0f736` et du lot 4. |
+| `VICTORY_RELAY` | non posé (`2` avec `-Relay`) | Option du fork, plus posée par défaut (issue n°89 du fork : la peau disparaît, les sous-titres se superposent) ; `2` était actif dans les essais mesurés de `7b0f736` et du lot 4. |
 | `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Dimensionnement des tampons de carte, en Mo. |
 
 Les anciennes valeurs par défaut `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_WAVE32_CROSSLANE`, `VICTORY_SKIP_BVH_BUILDER` et `VICTORY_CAPPED_DYNAMIC` sont retirées : aucun fichier du commit épinglé ne les lit (le constructeur BVH est coupé sauf avec `VICTORY_BVH_BUILDER=1`). `tests/test_lanceur_victory.py` vérifie maintenant que VIctory lit chaque variable posée par le lanceur.
 
 `-Dred` pose `VICTORY_D3D12_DRED=1` (données de périphérique perdu) pour diagnostiquer une perte du périphérique. Il est coupé par défaut : VIctory l'active dès que la variable existe, et il note chaque opération des listes de commandes, ce qui ralentit chaque image.
+
+`-Relay` pose `VICTORY_RELAY=2`, le second étage du relais du fork, que le commit épinglé lit (`crates/victory-gpu/src/host.rs`). Il était actif dans les essais mesurés de `7b0f736` (18,1 min dans le monde à environ 5,1 i/s, [configurations-mesurees.md](configurations-mesurees.md)) et du lot 4 (6,6 i/s). Il reste coupé par défaut à cause de l'issue n°89 du fork ; avec l'épinglage actuel `fd021bf`, il n'est pas encore mesuré.
 
 Le premier lancement à froid peut planter pendant la compilation des pipelines : relancez une fois le cache rempli.
 

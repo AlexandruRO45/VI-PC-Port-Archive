@@ -4,7 +4,7 @@ Tester setups for launching the title under VIctory, with the settings actually 
 
 ## RTX 4070 Ti SUPER, VIctory `7b0f736` with `VICTORY_RELAY=2` (minecraftafk072, 24 November)
 
-This is the setup of `main` at `b547bb2` (after #172), before #178 moved the pin to `fd021bf` and dropped `VICTORY_RELAY` from the launcher. It held more than 18 minutes in the world without a device loss.
+This is the setup of `main` at `b547bb2` (after #172), before #178 moved the pin to `fd021bf` and dropped `VICTORY_RELAY` from the launcher. It held more than 18 minutes in the world without a device loss. On today's `main`, `-Relay` sets the same `VICTORY_RELAY=2`, but with the newer pin `fd021bf`: the figures below hold for `7b0f736` only.
 
 ### Machine
 
@@ -73,3 +73,5 @@ cargo build --profile diag -p victory --features diagnostics --manifest-path thi
 ```
 
 Open a new terminal first: the launcher leaves its variables in the PowerShell session, and a `VICTORY_D3D12_DRED` left by an earlier launch keeps DRED on.
+
+On the current `main`, the closest launch is `.\tools\lancer_victory.ps1 -GameDir <game folder> -Relay`: the same settings with the pinned VIctory `fd021bf`, not measured on this machine yet. Rebuild VIctory after the submodule moves, as above.

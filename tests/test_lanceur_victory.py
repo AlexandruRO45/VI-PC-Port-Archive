@@ -52,9 +52,15 @@ def test_launcher_sets_the_tuned_settings_and_can_turn_them_off():
     assert "$NoTunedSettings" in texte and "-not $NoTunedSettings" in texte
 
 
-def test_launcher_does_not_set_the_relay():
-    # Fork issue #89: the relay hides the characters' skin and overlaps the subtitles.
-    assert "VICTORY_RELAY" not in _variables_posees(_lanceur())
+def test_launcher_sets_the_relay_only_when_asked():
+    # Fork issue #89: the relay hides the characters' skin and overlaps the subtitles, so it stays off by default;
+    # -Relay sets its second stage, the value of the measured runs (docs/measured-setups.md).
+    texte = _lanceur()
+    assert "[switch]$Relay" in texte
+    table = texte[texte.index("$tuned = [ordered]@{"):texte.index("foreach ($name in $tuned.Keys)")]
+    assert "VICTORY_RELAY" not in table
+    assert len(re.findall(r"\$env:VICTORY_RELAY\s*=", texte)) == 1
+    assert re.search(r"if \(\$Relay\) \{\s*\$env:VICTORY_RELAY = '2'\s*\}", texte)
 
 
 def test_launcher_leaves_out_variables_victory_does_not_read():

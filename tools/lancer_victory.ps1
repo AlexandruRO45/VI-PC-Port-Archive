@@ -15,6 +15,10 @@
   Optional. Turns on device-removed data (VICTORY_D3D12_DRED) to diagnose a device loss.
   Off by default: it notes every command list operation and slows each frame.
 
+.PARAMETER Relay
+  Optional. Turns on the fork's relay at its second stage (VICTORY_RELAY=2), the value of the measured runs in
+  docs/measured-setups.md. Off by default: the fork's issue #89 reports missing skin and overlapping subtitles with it.
+
 .NOTES
   The first cold launch may crash while the pipelines compile; launch again once the cache is filled.
   Settings measured on 2026-11-24 with the submodule's pinned commit (fxceless/victory-gta6).
@@ -27,7 +31,8 @@ param(
     [Parameter(Mandatory = $true)][string]$GameDir,
     [string]$SkipPipelines,
     [switch]$NoTunedSettings,
-    [switch]$Dred
+    [switch]$Dred,
+    [switch]$Relay
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +87,10 @@ if ($Dred) {
 }
 if ($PSBoundParameters.ContainsKey('SkipPipelines') -and $SkipPipelines) {
     $env:VICTORY_SKIP_PIPELINES = $SkipPipelines
+}
+# The relay stays out of the tuned values (fork issue #89, see above): -Relay sets its second stage, as measured.
+if ($Relay) {
+    $env:VICTORY_RELAY = '2'
 }
 
 & $exe run $gameExe --execute

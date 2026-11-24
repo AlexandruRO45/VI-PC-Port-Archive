@@ -4,7 +4,7 @@ Configurations de testeurs pour lancer le titre sous VIctory, avec les réglages
 
 ## RTX 4070 Ti SUPER, VIctory `7b0f736` avec `VICTORY_RELAY=2` (minecraftafk072, 24 novembre)
 
-C'est la configuration de `main` à `b547bb2` (après #172), avant que #178 déplace l'épinglage sur `fd021bf` et retire `VICTORY_RELAY` du lanceur. Elle a tenu plus de 18 minutes dans le monde sans perte du périphérique.
+C'est la configuration de `main` à `b547bb2` (après #172), avant que #178 déplace l'épinglage sur `fd021bf` et retire `VICTORY_RELAY` du lanceur. Elle a tenu plus de 18 minutes dans le monde sans perte du périphérique. Sur le `main` d'aujourd'hui, `-Relay` pose le même `VICTORY_RELAY=2`, mais avec l'épinglage plus récent `fd021bf` : les chiffres ci-dessous ne valent que pour `7b0f736`.
 
 ### Machine
 
@@ -73,3 +73,5 @@ cargo build --profile diag -p victory --features diagnostics --manifest-path thi
 ```
 
 Ouvrez d'abord un nouveau terminal : le lanceur laisse ses variables dans la session PowerShell, et un `VICTORY_D3D12_DRED` laissé par un lancement précédent garde DRED actif.
+
+Sur le `main` actuel, le lancement le plus proche est `.\tools\lancer_victory.ps1 -GameDir <dossier du jeu> -Relay` : les mêmes réglages avec le VIctory épinglé `fd021bf`, pas encore mesuré sur cette machine. Recompilez VIctory après le déplacement du sous-module, comme ci-dessus.

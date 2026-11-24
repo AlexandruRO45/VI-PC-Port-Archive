@@ -164,12 +164,14 @@ The script sets the variables below (unless you pass `-NoTunedSettings`, which k
 | `VICTORY_SHADER_LOOP_LIMIT` | `256` | Translated shader loops were almost endless, so they are cut. At 32 (the former value) hair is drawn as glowing strands and the scene is darker; at 1024 the device was lost on an RTX 3060 Ti with the default 2-second timeout; 256 held (fork issue #18, and observed on Linux in runs 3 and 4 below). |
 | `VICTORY_LATE_WAIT` | `3` | Host pipeline wait setting of the fork's pull request #1. |
 | `VICTORY_WIDE_BACK` | `1` | Fork option, on in the measured run. |
-| `VICTORY_RELAY` | not set | Fork option, no longer set by default (fork issue #89: skin disappears, subtitles overlap); `2` was on in the measured runs of `7b0f736` and batch 4. |
+| `VICTORY_RELAY` | not set (`2` with `-Relay`) | Fork option, no longer set by default (fork issue #89: skin disappears, subtitles overlap); `2` was on in the measured runs of `7b0f736` and batch 4. |
 | `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` | `1`, `1024` | Card buffer sizing, in MB. |
 
 The former defaults `VICTORY_RT_MISS`, `VICTORY_WAVE32_READFIRSTLANE`, `VICTORY_WAVE32_CROSSLANE`, `VICTORY_SKIP_BVH_BUILDER` and `VICTORY_CAPPED_DYNAMIC` are gone: no file of the pinned commit reads them (the BVH builder is off unless `VICTORY_BVH_BUILDER=1`). `tests/test_lanceur_victory.py` now checks that VIctory reads every variable the launcher sets.
 
 `-Dred` sets `VICTORY_D3D12_DRED=1` (device-removed data) to diagnose a device loss. It is off by default: VIctory turns it on whenever the variable exists, and it notes every command list operation, which slows each frame.
+
+`-Relay` sets `VICTORY_RELAY=2`, the second stage of the fork's relay, which the pinned commit reads (`crates/victory-gpu/src/host.rs`). It was on in the measured runs of `7b0f736` (18.1 min in the world at about 5.1 fps, [measured-setups.md](measured-setups.md)) and of batch 4 (6.6 fps). It stays off by default because of the fork's issue #89; with the current pin `fd021bf` it is not measured yet.
 
 The first cold launch may crash while the pipelines compile: launch again once the cache is filled.
 
