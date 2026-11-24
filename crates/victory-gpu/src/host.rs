@@ -735,6 +735,58 @@ mod tests {
         }
     }
 
+    /// The direct copy ends where a page is not there, cannot be written or
+    /// is a guard page, with what lay before it copied, and the thread goes
+    /// on; eight threads faulting at once all come back.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn direct_copy_ends_at_missing_unwritable_and_guard_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: private test allocations freed before returning; every
+        // copy names their pages, some missing or protected on purpose.
+        unsafe {
+            // Page 0 and 2 committed, 1 missing.
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            let p2 = base.add(2 * PAGE);
+            assert_eq!(VirtualAlloc(p2.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), p2.cast());
+            base.write_bytes(0x11, PAGE);
+            p2.write_bytes(0x33, PAGE);
+            // A missing source page.
+            let mut dst = vec![0u8; 3 * PAGE];
+            assert!(!super::direct_copy::try_copy(dst.as_mut_ptr(), base, 3 * PAGE));
+            assert!(dst[..PAGE].iter().all(|&b| b == 0x11), "what lay before the hole was copied");
+            let mut again = vec![0u8; PAGE];
+            assert!(super::direct_copy::try_copy(again.as_mut_ptr(), p2, PAGE));
+            assert!(again.iter().all(|&b| b == 0x33));
+            // A destination that cannot be written (read-only, no guard of ours).
+            let mut old = 0;
+            assert_ne!(VirtualProtect(base.cast(), PAGE, PAGE_READONLY, &mut old), 0);
+            let src = vec![0x5au8; 16];
+            assert!(!super::direct_copy::try_copy(base, src.as_ptr(), 16));
+            assert_eq!(*base, 0x11, "the read-only page kept what it had");
+            assert_ne!(VirtualProtect(base.cast(), PAGE, PAGE_READWRITE, &mut old), 0);
+            // A guard page as the source: the copy ends, the process goes on.
+            assert_ne!(VirtualProtect(p2.cast(), PAGE, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            assert!(!super::direct_copy::try_copy(again.as_mut_ptr(), p2, PAGE));
+            // Eight threads faulting at once.
+            let at = base as usize;
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(move || {
+                        let mut dst = vec![0u8; 3 * PAGE];
+                        for _ in 0..200 {
+                            assert!(!super::direct_copy::try_copy(dst.as_mut_ptr(), at as *const u8, 3 * PAGE));
+                        }
+                    });
+                }
+            });
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "benchmark"]
@@ -6099,7 +6151,7 @@ mod direct_copy {
     use std::sync::Once;
 
     use windows_sys::Win32::Foundation::{
-        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
+        EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR, NTSTATUS,
     };
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -6147,8 +6199,12 @@ mod direct_copy {
         // SAFETY: Windows passes valid exception pointers during VEH dispatch.
         let record = unsafe { &*(*info).ExceptionRecord };
         let code = record.ExceptionCode;
+        // A guard page too (`PAGE_GUARD`, one-shot): the kernel's copy this
+        // replaces reported it as a page it could not read, and left alone
+        // it would end the process.
         if code != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && code != EXCEPTION_IN_PAGE_ERROR as NTSTATUS
+            && code != EXCEPTION_GUARD_PAGE as NTSTATUS
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
