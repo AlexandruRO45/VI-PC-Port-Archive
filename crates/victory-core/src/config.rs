@@ -1115,7 +1115,8 @@ fn ensure_titles_distinct(
 /// For the cache or data folder `create_dir_all` would fail on first use
 /// with "File exists", naming neither the setting nor the fix; the same goes
 /// for a link (the folder or one above it) whose target was moved or deleted,
-/// or that loops, so it is refused too. A path that
+/// or that loops, so it is refused too, as is a folder under a folder without
+/// search permission or with a name longer than the file system allows. A path that
 /// does not exist yet is fine: the cache and data folders are created when
 /// needed. `what` is the folder ("game folder", "cache folder", "data
 /// folder", "test title") and `setting` the variable and key that set it.
@@ -1136,6 +1137,9 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
     // Keep why the last name below the found folder could not be looked
     // at: a folder without search permission hides what is under it, so
     // create_dir_all would fail there on first use, not create anything.
+    // The same for a name longer than the file system there allows
+    // (ENAMETOOLONG): it passed as a folder still to create, and failed
+    // with "File name too long" on first use.
     let walk: PathBuf = dir.components().collect();
     let mut below = None;
     let existing = walk.ancestors().find_map(|p| match std::fs::metadata(p) {
@@ -1173,6 +1177,24 @@ fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) 
                 "the {what} {} (from {origin}) cannot be checked because {} has no search \
                  permission for this user, so nothing under it can be found or made; \
                  give it search permission, or set {setting} elsewhere",
+                dir.display(),
+                path.display()
+            );
+        }
+        if below == Some(std::io::ErrorKind::InvalidFilename) {
+            // The name right under the found folder is the one the file
+            // system turned down: `walk` holds no `.` or trailing slash, so
+            // its next component is that name.
+            let name = walk
+                .strip_prefix(path)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .map(|c| c.as_os_str().len())
+                .unwrap_or_default();
+            anyhow::bail!(
+                "the {what} {} (from {origin}) cannot be a folder because the name under {} \
+                 is {name} bytes long, more than the file system there allows for one name, \
+                 so it can never be found or made; shorten it, or set {setting} elsewhere",
                 dir.display(),
                 path.display()
             );
@@ -4138,6 +4160,78 @@ mod tests {
         assert_eq!(cfg.cache_dir, deep);
         assert_eq!(cfg.data_dir, near);
         assert!(!deep.exists() && !near.exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_with_a_name_too_long_for_the_file_system_is_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch =
+            std::env::temp_dir().join(format!("victory-config-long-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let resolve = |cache: PathBuf, data: PathBuf| {
+            Config::resolve(FilePaths::default(), None, move |key: &str| match key {
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            })
+        };
+        // 300 bytes is past the 255 of every usual Unix file system.
+        let long = "c".repeat(300);
+        // Only when the file system says so: one that takes long names
+        // leaves nothing to check.
+        let refused = std::fs::metadata(scratch.join(&long))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::InvalidFilename);
+        if refused {
+            // The long name as the folder, as a folder above it, and with a
+            // trailing slash or `.`: named with its length and the folder it
+            // would be made in, not passed as a folder still to create.
+            for cache in [
+                scratch.join(&long),
+                scratch.join(&long).join("shaders"),
+                PathBuf::from(format!("{}/", scratch.join(&long).display())),
+                PathBuf::from(format!("{}/.", scratch.join(&long).display())),
+            ] {
+                let err = resolve(cache.clone(), scratch.join("data"))
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    err,
+                    format!(
+                        "the cache folder {} (from VICTORY_CACHE_DIR) cannot be a folder because \
+                         the name under {} is 300 bytes long, more than the file system there \
+                         allows for one name, so it can never be found or made; shorten it, or \
+                         set VICTORY_CACHE_DIR or [paths].cache_dir elsewhere",
+                        cache.display(),
+                        scratch.display()
+                    )
+                );
+            }
+            // Under a folder still to create, the name under the deepest
+            // folder that is there.
+            let data = scratch.join("saves").join(&long);
+            std::fs::create_dir(scratch.join("saves")).unwrap();
+            let err = resolve(scratch.join("cache"), data.clone())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "the data folder {} (from VICTORY_DATA_DIR) cannot be a folder because the \
+                     name under {} is 300 bytes long",
+                    data.display(),
+                    scratch.join("saves").display()
+                )),
+                "{err}"
+            );
+        }
+        // A name at the limit is a folder still to create, and nothing is made.
+        let edge = scratch.join("d".repeat(255));
+        let cfg = resolve(edge.clone(), scratch.join("data")).unwrap();
+        assert_eq!(cfg.cache_dir, edge);
+        assert!(!edge.exists());
         std::fs::remove_dir_all(&scratch).unwrap();
     }
 
