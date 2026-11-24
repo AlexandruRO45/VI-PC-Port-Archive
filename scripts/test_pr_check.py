@@ -136,5 +136,38 @@ class TemplatePlaceholderTests(unittest.TestCase):
         self.assertEqual(3, len(problems))
 
 
+class HeadingFormTests(unittest.TestCase):
+    """Markdown headings and other cases of the section names count as the template's bold ones."""
+
+    def problems(self, body):
+        return check(body, HEAD, [changed("README.md")], lambda _: True)
+
+    def test_markdown_headings_and_any_case_pass(self):
+        for tested, not_tested, ai in (("## Tested", "## Not Tested", "## AI Use"),
+                                       ("### **Tested**", "# not tested #", "###### AI use"),
+                                       ("**TESTED**", "**Not Tested**", "**AI Use**")):
+            with self.subTest(heading=tested):
+                body = f"## What is in it\n- x\n{tested}\nSynthetic fixtures\n{not_tested}\nRetail titles\n{ai}\nNone\n"
+                self.assertEqual([], self.problems(body))
+
+    def test_empty_markdown_sections_still_fail(self):
+        body = "## Tested\n-\n## Not tested\n<!-- todo -->\n## AI use\n"
+        self.assertEqual(3, len(self.problems(body)))
+
+    def test_markdown_heading_ends_the_section_before_it(self):
+        body = "## Tested\n\n## Not tested\nRetail titles\n## AI use\nNone\n"
+        self.assertEqual(["the **Tested** section is missing or empty"], self.problems(body))
+
+    def test_heading_words_in_a_sentence_are_not_headings(self):
+        body = "## Tested things\nok\n## Not tested\nRetail titles\n## AI use\nNone\n"
+        self.assertEqual(["the **Tested** section is missing or empty"], self.problems(body))
+
+    def test_banned_model_under_a_markdown_heading_is_refused(self):
+        body = "## Tested\nSynthetic fixtures\n## Not tested\nRetail titles\n## AI Use\n- Qwen 3\n"
+        problems = self.problems(body)
+        self.assertEqual(1, len(problems), problems)
+        self.assertIn("does not accept", problems[0])
+
+
 if __name__ == "__main__":
     unittest.main()

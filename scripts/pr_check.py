@@ -82,14 +82,17 @@ def builds_runtime(path):
     return path.startswith("crates/xcl/data/") or path in RUNTIME_BUILD
 
 
+def heading(names):
+    """A heading of one of `names`, in either case: `**Tested**` as in the template, or a markdown
+    heading on a line of its own (`## Tested`, `### **Tested**`)."""
+    alt = "|".join(re.escape(n) for n in names)
+    return (r"(?im:\*\*(?:" + alt + r")\*\*|^[ \t]*#{1,6}[ \t]+(?:\*\*)?(?:" + alt
+            + r")(?:\*\*)?[ \t]*#*[ \t]*$)")
+
+
 def section_has_content(body, section):
-    """True when `**section**` exists and has at least one non-placeholder line."""
-    next_heading = "|".join(re.escape(h) for h in HEADINGS)
-    m = re.search(
-        r"\*\*" + re.escape(section) + r"\*\*[ \t]*\n(.*?)(?=\n\*\*(?:" + next_heading + r")\*\*|\Z)",
-        body,
-        re.S,
-    )
+    """True when the `**section**` heading exists and has at least one non-placeholder line."""
+    m = re.search(heading([section]) + r"[ \t]*\n(.*?)(?=\n" + heading(HEADINGS) + r"|\Z)", body, re.S)
     if not m:
         return False
     text = re.sub(r"<!--.*?-->", "", m.group(1), flags=re.S)
@@ -110,7 +113,7 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if not section_has_content(body, section):
             problems.append(f"the **{section}** section is missing or empty")
 
-    ai = re.search(r"\*\*AI use\*\*(.*?)(\n\*\*|\Z)", body, re.S)
+    ai = re.search(heading(["AI use"]) + r"(.*?)(\n\*\*|\n#{1,6}[ \t]|\Z)", body, re.S)
     banned = re.findall(BANNED_MODELS, ai.group(1), re.I) if ai else []
     if banned:
         problems.append("**AI use** names a model this repository does not accept for code ("
