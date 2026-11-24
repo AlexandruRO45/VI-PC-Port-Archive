@@ -84,16 +84,18 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
         // edited after a `--no-verify` commit, or hidden from `git status`
         // by `--assume-unchanged` or `--skip-worktree`, still has its
         // committed content in the index. Checked as well when it differs.
-        if let Source::Worktree {
-            index: Some(oid), ..
-        } = &file.source
-        {
-            match indexed.get(oid) {
-                Some(Some(blob)) if *blob != content => {
-                    check_content(path, &format!("{path} (as indexed)"), blob, &mut violations);
+        // A conflicted path has an entry per stage (base, ours, theirs),
+        // and each is checked: `git checkout --ours` or `--theirs` puts any
+        // one of them in the next commit.
+        if let Source::Worktree { index, .. } = &file.source {
+            for oid in index {
+                match indexed.get(oid) {
+                    Some(Some(blob)) if *blob != content => {
+                        check_content(path, &format!("{path} (as indexed)"), blob, &mut violations);
+                    }
+                    Some(Some(_)) => {}
+                    _ => violations.push(format!("{path}: cannot read the indexed content")),
                 }
-                Some(Some(_)) => {}
-                _ => violations.push(format!("{path}: cannot read the indexed content")),
             }
         }
     }
@@ -135,11 +137,10 @@ fn indexed_blobs(
     let mut oids: Vec<&str> = files
         .iter()
         .filter_map(|file| match &file.source {
-            Source::Worktree {
-                index: Some(oid), ..
-            } => Some(oid.as_str()),
-            _ => None,
+            Source::Worktree { index, .. } => Some(index.iter().map(String::as_str)),
+            Source::Index { .. } => None,
         })
+        .flatten()
         .collect();
     oids.sort_unstable();
     oids.dedup();
@@ -199,13 +200,11 @@ struct File {
 }
 
 enum Source {
-    /// On disk, at `path`. `index` is the object id of the blob the index
-    /// holds for it, if any: the content that stays in the repository, and
-    /// in the next commit, while the file is missing from disk.
-    Worktree {
-        path: PathBuf,
-        index: Option<String>,
-    },
+    /// On disk, at `path`. `index` is the object ids of the blobs the index
+    /// holds for it, one per stage, none if untracked: the content that
+    /// stays in the repository, and in the next commit, while the file is
+    /// missing from disk.
+    Worktree { path: PathBuf, index: Vec<String> },
     /// Staged: the index entry's mode and object id.
     Index { mode: String, oid: String },
 }
@@ -229,7 +228,8 @@ fn read(root: &Path, file: &File) -> Result<Option<Vec<u8>>, String> {
                 // `git commit` keeps it. Committed with `--no-verify` and
                 // then removed, it used to pass the full check unread.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return index.as_deref().map(|oid| read_blob(root, oid)).transpose();
+                    // `run` checks the other stages against this one.
+                    return index.first().map(|oid| read_blob(root, oid)).transpose();
                 }
                 Err(e) => return Err(format!("cannot read: {e}")),
             };
@@ -477,31 +477,38 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
         // only the index says what it is. Each entry is
         // `<mode> <oid> <stage>\t<path>`; a conflicted path has several,
         // and any one of them is content the check must see.
-        let index: std::collections::HashMap<Vec<u8>, (String, String)> =
-            git_z(root, &["ls-files", "-z", "--stage"])?
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|entry| {
-                    let tab = entry.iter().position(|&b| b == b'\t')?;
-                    let header = std::str::from_utf8(&entry[..tab]).ok()?;
-                    let mut parts = header.split(' ');
-                    let (mode, oid) = (parts.next()?.to_owned(), parts.next()?.to_owned());
-                    Some((entry[tab + 1..].to_vec(), (mode, oid)))
-                })
-                .collect();
+        let mut index: std::collections::HashMap<Vec<u8>, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for entry in git_z(root, &["ls-files", "-z", "--stage"])?.unwrap_or_default() {
+            let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let Ok(header) = std::str::from_utf8(&entry[..tab]) else {
+                continue;
+            };
+            let mut parts = header.split(' ');
+            if let (Some(mode), Some(oid)) = (parts.next(), parts.next()) {
+                index
+                    .entry(entry[tab + 1..].to_vec())
+                    .or_default()
+                    .push((mode.to_owned(), oid.to_owned()));
+            }
+        }
         let mut files: Vec<File> = fields
             .iter()
             .map(|raw| {
                 let (name, utf8_name, on_disk) = decode(root, raw);
-                let source = match index.get(raw) {
-                    Some((mode, _)) if mode == "160000" => Source::Index {
-                        mode: mode.clone(),
+                let stages = index.get(raw).map(Vec::as_slice).unwrap_or_default();
+                let source = if stages.iter().any(|(mode, _)| mode == "160000") {
+                    Source::Index {
+                        mode: "160000".to_owned(),
                         oid: String::new(),
-                    },
-                    entry => Source::Worktree {
+                    }
+                } else {
+                    Source::Worktree {
                         path: on_disk,
-                        index: entry.map(|(_, oid)| oid.clone()),
-                    },
+                        index: stages.iter().map(|(_, oid)| oid.clone()).collect(),
+                    }
                 };
                 File {
                     name,
@@ -527,7 +534,7 @@ fn list_files(root: &Path, staged: bool) -> Result<Vec<File>> {
                 utf8_name: relative.to_str().is_some(),
                 source: Source::Worktree {
                     path: e.path().to_owned(),
-                    index: None,
+                    index: Vec::new(),
                 },
             })
         })
@@ -1260,6 +1267,62 @@ mod tests {
 
         // Text on disk over text in the index is read once.
         std::fs::write(root.join("a.rs"), b"fn a() { 1 }\n").unwrap();
+        super::run(root, false).unwrap();
+    }
+
+    /// A conflicted path has one index entry per stage, and the full check
+    /// reads every one of them, not only the last: `git checkout --ours`
+    /// puts stage 2 back in the next commit whatever the working copy and
+    /// stage 3 hold.
+    #[cfg(unix)]
+    #[test]
+    fn every_stage_of_a_conflicted_path_is_read() {
+        let tmp = tempdir();
+        let root = tmp.path();
+        git_str(root, &["init", "-q"]);
+        let blob = |content: &[u8]| {
+            std::fs::write(root.join("blob"), content).unwrap();
+            let oid = git_str(root, &["hash-object", "-w", "blob"]);
+            std::fs::remove_file(root.join("blob")).unwrap();
+            String::from_utf8(oid).unwrap().trim().to_owned()
+        };
+        let clean = blob(b"fn game() {}\n");
+        let game = blob(b"MZ\x90\0binary");
+        let conflict = |stages: [&str; 3]| {
+            let info: String = stages
+                .iter()
+                .enumerate()
+                .map(|(n, oid)| format!("100644 {oid} {}\tgame.rs\n", n + 1))
+                .collect();
+            std::fs::write(root.join("info"), info).unwrap();
+            let out = super::git_command(root)
+                .args(["update-index", "--index-info"])
+                .stdin(std::fs::File::open(root.join("info")).unwrap())
+                .output()
+                .unwrap();
+            std::fs::remove_file(root.join("info")).unwrap();
+            assert!(out.status.success());
+        };
+        std::fs::write(root.join("game.rs"), b"fn game() {}\n").unwrap();
+
+        for stage in 0..3 {
+            let mut stages = [clean.as_str(); 3];
+            stages[stage] = &game;
+            conflict(stages);
+            assert_eq!(names(root, false), ["game.rs"]);
+            assert!(super::run(root, false).is_err(), "stage {}", stage + 1);
+
+            // Gone from disk, the other stages are read as well.
+            std::fs::rename(root.join("game.rs"), root.join("moved")).unwrap();
+            assert!(
+                super::run(root, false).is_err(),
+                "stage {}, deleted",
+                stage + 1
+            );
+            std::fs::rename(root.join("moved"), root.join("game.rs")).unwrap();
+        }
+
+        conflict([clean.as_str(); 3]);
         super::run(root, false).unwrap();
     }
 
