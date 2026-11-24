@@ -7,6 +7,218 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+// ---------------------------------------------------------------------------
+// Persistent thread pool
+// ---------------------------------------------------------------------------
+//
+// `std::thread::scope` creates and joins OS threads on every call, costing
+// ~100–200 µs per spawn. With 27 submissions/frame, each calling
+// `read_parallel` and/or `changed_pieces` (shadow.rs) on big buffers, that
+// is 50–500 ms per frame of pure thread-management overhead. A persistent
+// pool eliminates that by keeping worker threads alive between calls.
+//
+// API: `Pool::scope(items, f)` fans `f` over each item on the pool's
+// workers and waits for all to finish before returning, analogous to
+// `std::thread::scope`. Items must be `Sync`; the closure is `Fn(&T) -> R`
+// where `R: Send + Default`.
+//
+// Safety invariant: `Pool::scope` joins all workers via condvar before
+// returning, so `items`, `results`, and any references captured in `f` are
+// valid for the entire duration of worker execution. We transmute `f` to
+// `'static` inside the unsafe impl to satisfy the `Thunk` type, then
+// restore soundness with the join guarantee.
+
+use std::sync::{Arc, Condvar};
+
+// A boxed work item. Callers guarantee the referenced data outlives the scope.
+type Thunk = Box<dyn FnOnce() + Send + 'static>;
+
+struct PoolInner {
+    queue: Mutex<std::collections::VecDeque<(Thunk, Arc<(Mutex<usize>, Condvar)>)>>,
+    work_ready: Condvar,
+}
+
+thread_local! {
+    static IN_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A fixed-size persistent thread pool.
+pub(crate) struct Pool {
+    inner: Arc<PoolInner>,
+    threads: usize,
+}
+
+// SAFETY: Pool contains an Arc<PoolInner> which is Sync, and `threads` is
+// Copy. The `PoolInner`'s fields are protected by the Mutex.
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {}
+
+impl Pool {
+    fn run_job(job: (Thunk, Arc<(Mutex<usize>, Condvar)>)) {
+        let (thunk, done) = job;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            struct WorkerGuard(bool);
+            impl Drop for WorkerGuard {
+                fn drop(&mut self) {
+                    IN_WORKER.with(|w| w.set(self.0));
+                }
+            }
+            let prev = IN_WORKER.with(|w| {
+                let p = w.get();
+                w.set(true);
+                p
+            });
+            let _guard = WorkerGuard(prev);
+            thunk();
+        }));
+        let (lock, cv) = &*done;
+        let mut rem = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *rem -= 1;
+        if *rem == 0 {
+            cv.notify_all();
+        }
+    }
+
+    pub(crate) fn new(threads: usize) -> Self {
+        let inner = Arc::new(PoolInner {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            work_ready: Condvar::new(),
+        });
+        for i in 0..threads {
+            let inner2 = inner.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("victory-pool-{i}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let mut q = inner2.queue.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = q.pop_front() {
+                                    break job;
+                                }
+                                q = inner2.work_ready.wait(q).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        Self::run_job(job);
+                    }
+                });
+        }
+        Pool { inner, threads }
+    }
+
+    /// Fans `f` over each item in `items` on the pool workers, returning one
+    /// `R` per item in order. Waits for all workers to finish before
+    /// returning (scope-like).
+    ///
+    /// For item counts ≤ 1, thread count < 2, or nested calls from within a
+    /// pool worker, the work runs inline on the calling thread to avoid lock
+    /// overhead, recursion, and deadlock.
+    ///
+    /// # Safety contract (enforced internally)
+    /// All workers complete before this function returns (condvar join / work helping),
+    /// so `items`, `f`, and any data `f` captures are valid for the entire
+    /// duration of worker execution. Callers need not be `unsafe`; this invariant
+    /// is upheld here.
+    pub(crate) fn scope<T, R, F>(&self, items: &[T], f: F) -> Vec<R>
+    where
+        T: Sync,
+        R: Send + Default,
+        F: Fn(&T) -> R + Send + Sync,
+    {
+        let n = items.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 || self.threads < 2 || IN_WORKER.with(|w| w.get()) {
+            return items.iter().map(f).collect();
+        }
+
+        // Allocate results; each worker writes one index via raw ptr.
+        // SAFETY: workers finish before we read results (completion join below),
+        // so there is no data race.
+        let mut results: Vec<R> = (0..n).map(|_| R::default()).collect();
+        let results_ptr = results.as_mut_ptr() as usize;
+        let items_ptr = items.as_ptr() as usize;
+        let f_ptr = &f as *const F as usize;
+
+        let done = Arc::new((Mutex::new(n), Condvar::new()));
+
+        {
+            let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+            for index in 0..n {
+                let thunk: Thunk = Box::new(move || {
+                    let item: &T = unsafe { &*(items_ptr as *const T).add(index) };
+                    let r: R = unsafe { (*(f_ptr as *const F))(item) };
+                    unsafe {
+                        *(results_ptr as *mut R).add(index) = r;
+                    }
+                });
+                q.push_back((thunk, done.clone()));
+            }
+            self.inner.work_ready.notify_all();
+        }
+
+        // Help run queued jobs while waiting for this scope's jobs to complete.
+        // This prevents deadlock and keeps the waiting thread productive.
+        let (lock, cv) = &*done;
+        let mut rem = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while *rem > 0 {
+            let job = {
+                let mut q = self.inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+                q.pop_front()
+            };
+            if let Some(job) = job {
+                drop(rem);
+                Self::run_job(job);
+                rem = lock.lock().unwrap_or_else(|e| e.into_inner());
+            } else {
+                rem = cv.wait(rem).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        drop(rem);
+
+        results
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn foreach<T, R, F>(&self, items: &[T], f: F) -> Vec<R>
+    where
+        T: Sync,
+        R: Send + Default,
+        F: Fn(&T) -> R + Send + Sync,
+    {
+        self.scope(items, f)
+    }
+}
+
+/// The global persistent thread pool, sized at first use.
+pub(crate) fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = pool_threads();
+        tracing::info!(threads, "victory persistent thread pool started");
+        Pool::new(threads)
+    })
+}
+
+/// Number of threads in the persistent pool (for chunk sizing).
+pub(crate) fn pool_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(2, 12)
+}
+
+/// Runs `f` on each `item` in parallel on the persistent pool, returning one
+/// `bool` per item. Callable from sibling modules (e.g. `shadow.rs`).
+pub(crate) fn pool_foreach_bool<T, F>(items: &[T], f: F) -> Vec<bool>
+where
+    T: Sync,
+    F: Fn(&T) -> bool + Send + Sync,
+{
+    pool().scope(items, f)
+}
+
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -275,6 +487,50 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn nested_scope_more_items_than_threads() {
+        let pool = Pool::new(2);
+        let outer_items: Vec<usize> = (0..8).collect();
+        let results = pool.scope(&outer_items, |&x| {
+            let inner_items: Vec<usize> = (0..8).collect();
+            let sub = pool.scope(&inner_items, move |&y| x * 100 + y);
+            sub.into_iter().sum::<usize>()
+        });
+        let expected: Vec<usize> = (0..8)
+            .map(|x| (0..8).map(|y| x * 100 + y).sum())
+            .collect();
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn global_pool_nested_scope() {
+        let threads = pool_threads();
+        let n = threads * 2 + 1;
+        let outer_items: Vec<usize> = (0..n).collect();
+        let results = pool().scope(&outer_items, |&x| {
+            let inner_items: Vec<usize> = (0..n).collect();
+            let sub = pool().scope(&inner_items, move |&y| x * 100 + y);
+            sub.into_iter().sum::<usize>()
+        });
+        let expected: Vec<usize> = (0..n)
+            .map(|x| (0..n).map(|y| x * 100 + y).sum())
+            .collect();
+        assert_eq!(results, expected);
+    }
+
+    #[test]
+    fn pool_scope_panic_does_not_hang() {
+        let pool = Pool::new(2);
+        let items = vec![1, 2, 3, 4];
+        let results = pool.scope(&items, |&x| {
+            if x == 2 {
+                panic!("intentional panic to verify pool does not hang");
+            }
+            x * 10
+        });
+        assert_eq!(results, vec![10, 0, 30, 40]);
     }
 }
 
@@ -616,9 +872,13 @@ impl Host {
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        // Parallel copy-back: each (shadow, address, len) triple is independent
+        // (different shadow buffers, different title memory ranges). Run them on
+        // the persistent pool so we avoid per-call thread spawn overhead.
+        let written_per_back = pool().scope(&back, |(shadow, address, len)| -> usize {
+            shadow.copy_back(*address, *len)
+        });
+        for written in written_per_back {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1295,14 +1555,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        // Each entry in `refreshes` is a distinct shadow (deduped in `add`),
+        // so the updates are independent and safe to run concurrently on the
+        // persistent pool. For small counts (≤ 1) the pool fast-paths to the
+        // calling thread to avoid lock overhead.
+        let refreshes: Vec<_> = self.refreshes.drain(..).collect();
+        let results = pool().scope(&refreshes, |(shadow, from, to)| -> (u64, u64) {
             let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
+            let copied = shadow.update(*from, to - from);
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
+            crate::copystat::range(*from, to - from, us, 0);
+            (us, copied as u64)
+        });
+        for (us, copied) in results {
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            PREPARING[1].fetch_add(copied, Ordering::Relaxed);
         }
     }
 }
@@ -1374,39 +1642,34 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
-/// Local build: [`read`] of a big range in 2 MiB pieces on several threads (the copies of title
-/// memory took one core of twenty: ~0.5 GB/s in the world). True if every piece was whole.
+/// Local build: [`read`] of a big range in 2 MiB pieces on the persistent thread pool (the copies
+/// of title memory took one core of twenty: ~0.5 GB/s in the world; thread spawning overhead was
+/// 50–200 ms/frame). True if every piece was whole.
 fn read_parallel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     const PIECE: usize = 2 << 20;
-    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let threads = *THREADS.get_or_init(|| {
-        std::env::var("VICTORY_COPY_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or_else(|| {
-            std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 12)
-        })
-    });
+    let threads = pool_threads();
     if len < 2 * PIECE || threads < 2 {
         return read(src, dst, len);
     }
-    let pieces = len.div_ceil(PIECE);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let whole = std::sync::atomic::AtomicBool::new(true);
-    let (src, dst) = (src as usize, dst as usize);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.min(pieces) {
-            scope.spawn(|| loop {
-                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if k >= pieces {
-                    break;
-                }
-                let at = k * PIECE;
-                let n = PIECE.min(len - at);
-                if !read((src + at) as *const u8, (dst + at) as *mut u8, n) {
-                    whole.store(false, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
+    // Build a list of (offset, size) pieces to read in parallel.
+    let pieces: Vec<(usize, usize)> = {
+        let mut v = Vec::new();
+        let mut at = 0;
+        while at < len {
+            let n = PIECE.min(len - at);
+            v.push((at, n));
+            at += n;
         }
+        v
+    };
+    let (src_u, dst_u) = (src as usize, dst as usize);
+    // SAFETY: `src` and `dst` are valid for `len` bytes and outlive the pool
+    // call; pieces are non-overlapping so writes do not alias. `move` copies
+    // only usize values (Copy).
+    let results = pool().scope(&pieces, move |&(at, n)| -> bool {
+        read((src_u + at) as *const u8, (dst_u + at) as *mut u8, n)
     });
-    whole.into_inner()
+    results.iter().all(|&ok| ok)
 }
 
 /// [`copy_mapped`]'s fallback by memory regions; false if the kernel does not answer.

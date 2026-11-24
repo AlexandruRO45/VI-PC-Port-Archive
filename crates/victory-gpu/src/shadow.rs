@@ -400,7 +400,8 @@ impl Shadow {
 }
 
 /// Offsets (from the copy's start) of the 64 KiB pieces of `[from, to)` whose bytes in the copy
-/// at `data` differ from `before` (the snapshot of `[from, to)`), compared on several threads.
+/// at `data` differ from `before` (the snapshot of `[from, to)`), compared on the persistent
+/// thread pool instead of spawning fresh OS threads.
 fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usize) -> std::collections::HashSet<usize> {
     const PIECE: usize = 64 << 10;
     let mut pieces = Vec::new();
@@ -410,7 +411,8 @@ fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usi
         pieces.push((at, n));
         at += n;
     }
-    let differs = |&(at, n): &(usize, usize)| {
+    // All captured values are `usize` (Copy), so `move` does not borrow.
+    let differs = move |&(at, n): &(usize, usize)| -> bool {
         // SAFETY: inside the copy and the snapshot.
         let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
         let old = unsafe { std::slice::from_raw_parts((before + at - from) as *const u8, n) };
@@ -420,14 +422,9 @@ fn changed_pieces(data: usize, before: usize, start: usize, from: usize, to: usi
     if pieces.len() < 128 || threads < 2 {
         return pieces.iter().filter(|p| differs(p)).map(|p| p.0).collect();
     }
-    let chunk = pieces.len().div_ceil(threads);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = pieces
-            .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().filter(|p| differs(p)).map(|p| p.0).collect::<Vec<_>>()))
-            .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-    })
+    // Use the persistent pool to avoid OS thread spawn overhead.
+    let results = crate::host::pool_foreach_bool(&pieces, differs);
+    pieces.iter().zip(results).filter_map(|(p, diff)| diff.then_some(p.0)).collect()
 }
 
 struct Entry {
