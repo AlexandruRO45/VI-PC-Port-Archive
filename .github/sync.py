@@ -109,8 +109,12 @@ def push(p, repo, default):
         msg = f"GitHub export of {repo} issues, PRs and comments ({TODAY})"
         commit = git("commit-tree", tree, *(["-p", parent] if parent else []), "-m", msg).stdout.strip()
         refs.append(f"{commit}:refs/heads/{p}/github-export")
-    out = git("push", "--no-tags", "--porcelain", "origin", *refs, check=False).stdout
-    return [line for line in out.splitlines() if line.startswith("!")]
+    rejected = lambda *specs: [l for l in git("push", "--no-tags", "--porcelain", "origin", *specs, check=False).stdout.splitlines() if l.startswith("!")]
+    refused = []
+    for line in rejected(*refs):
+        # GitHub's workflow-file check can time out on a big push; one branch at a time it usually answers
+        refused += rejected("+" + line.split("\t")[1]) if "timeout" in line else [line]
+    return refused
 
 
 def flag(p, repo):
@@ -138,7 +142,7 @@ def check_merge():
 if __name__ == "__main__":
     check_merge()
     pushing = "--push" in sys.argv[1:]
-    synced, problems = [], []
+    synced, problems, skipped = [], [], []
     for p, (repo, start) in PROJECTS.items():
         try:
             default = fetch(p, repo)
@@ -152,7 +156,9 @@ if __name__ == "__main__":
             synced.append(p)
             export(p)
             if pushing:
-                problems += [f"{p}: GitHub refused {line}" for line in push(p, repo, default)]
+                for line in push(p, repo, default):
+                    # the workflow's token may not touch .github/workflows files; those few branches wait for a manual push
+                    (skipped if "workflow" in line else problems).append(f"{p}: GitHub refused {line}")
                 if status_part(old, start) != status_part(new, start):
                     flag(p, repo)
             print(f"{p}: synced", flush=True)
@@ -160,6 +166,8 @@ if __name__ == "__main__":
             problems.append(f"{p}: {e}")
     if synced:
         subprocess.run([sys.executable, "-I", os.path.join(ROOT, "docs", "build_site.py"), *synced], check=True)
+    for line in skipped:
+        print("::warning::" + line)
     for line in problems:
         print("PROBLEM", line)
     sys.exit(1 if problems else 0)
