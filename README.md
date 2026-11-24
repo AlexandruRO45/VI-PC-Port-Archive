@@ -52,8 +52,8 @@ What each part does today and what it still needs:
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`). On Linux, see
-[docs/linux-proton.md](docs/linux-proton.md) for tests, cross-building and
-running under Proton.
+[docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
+natively today, cross-building `victory.exe` and running it under Proton.
 
 On Windows 10 the in-box D3D12 runtime stops at shader model 6.5, so the host
 refuses every translated pipeline. `cargo xtask agility` fetches Microsoft's
