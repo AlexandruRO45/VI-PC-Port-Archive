@@ -198,6 +198,36 @@ fn wait_by_duration() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_BY_DURATION").is_none_or(|v| v != "0"))
 }
 
+/// Waits skipped since the start.
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Skip lines written, so that a run logs the first few and the rest is
+/// counted.
+static SKIP_LINES: AtomicU64 = AtomicU64::new(0);
+/// The first skip lines of a run.
+const SKIP_LINES_AT: u64 = 8;
+
+/// A wait was skipped because the pipeline takes longer to make than the
+/// frame has budget left: logged for the first few (the pipeline, the
+/// typical make, what was left), counted for all of them. Without it a
+/// skipped wait leaves no trace, and a draw that was never waited for reads
+/// exactly like one that timed out.
+fn note_skipped(p: &Pending, typical: Duration, left: Duration) {
+    SKIPPED.fetch_add(1, Ordering::Relaxed);
+    if SKIP_LINES.fetch_add(1, Ordering::Relaxed) < SKIP_LINES_AT {
+        tracing::info!(
+            typical_ms = typical.as_secs_f64() * 1e3,
+            left_ms = left.as_secs_f64() * 1e3,
+            shaders = %format!("{:?}", p.shaders),
+            "no wait for a host pipeline: it takes longer to make than the frame's budget has left"
+        );
+    }
+}
+
+/// Waits skipped since the start, or 0 with the duration rule off.
+pub(crate) fn skipped() -> u64 {
+    SKIPPED.load(Ordering::Relaxed)
+}
+
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
 /// use. Counted only when a wait had ended, the budget was one per thread:
@@ -235,8 +265,12 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
-    if wait_by_duration() && !worth_waiting(Duration::from_micros(TYPICAL_US.load(Ordering::Relaxed)), left) {
-        return;
+    if wait_by_duration() {
+        let typical = Duration::from_micros(TYPICAL_US.load(Ordering::Relaxed));
+        if !worth_waiting(typical, left) {
+            note_skipped(p, typical, left);
+            return;
+        }
     }
     let started = Instant::now();
     let (lock, done) = &DONE;
@@ -452,6 +486,20 @@ mod tests {
         assert!(!worth_waiting(Duration::from_millis(2700), budget));
         // And the same when most of the frame's budget is spent.
         assert!(!worth_waiting(Duration::from_millis(300), Duration::from_millis(120)));
+    }
+
+    /// A skipped wait is counted, and only the first few are logged: a
+    /// world frame skips thousands a second, and "a skip is a finding" is
+    /// true of the reason, not of 4,000 lines a second.
+    #[test]
+    fn skipped_waits_are_counted_and_the_first_few_logged() {
+        let before = skipped();
+        let lines_before = SKIP_LINES.load(Ordering::Relaxed);
+        let p = Pending::new(Vec::new(), None);
+        note_skipped(&p, Duration::from_millis(2_700), Duration::from_millis(10));
+        assert_eq!(skipped(), before + 1);
+        let logged = SKIP_LINES.load(Ordering::Relaxed) - lines_before;
+        assert!(logged <= SKIP_LINES_AT, "at most the first {SKIP_LINES_AT} are logged: {logged}");
     }
 
     /// The typical make is an average of the recent ones, weighted to the

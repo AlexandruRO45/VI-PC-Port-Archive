@@ -160,13 +160,14 @@ fn report(now: &Snapshot, over: Duration) {
         waiting as f64 / (made as f64 / secs)
     };
     let longest = LONGEST.swap(0, Relaxed) as f64 / 1e3;
+    let skipped = super::make::skipped();
     tracing::info!(
         "pipelines {made_per_s:.1}/s made ({made} made, {refused} refused), \
          {translated_per_s:.1} shaders translated/s; \
          per pipeline: whole {whole:.1} ms ({wholes}), queue {queue:.1} ms ({queued}, longest {longest:.0} ms), \
          translate {translate:.1} ms ({translated}), waiting for a translation {wait:.1} ms ({waits}), \
          root {root:.1} ms, library load {load:.1} ms ({loads}), create {create:.1} ms ({creates}), store {store:.1} ms; \
-         {waiting} queued, {workers} workers {busy:.0}% busy, drains in {drain:.0} s",
+         {waiting} queued, {workers} workers {busy:.0}% busy, drains in {drain:.0} s,          {skipped} waits skipped since the start",
         made_per_s = made as f64 / secs,
         translated_per_s = translated as f64 / secs,
     );
