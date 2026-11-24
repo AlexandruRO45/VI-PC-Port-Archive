@@ -958,16 +958,20 @@ impl State {
 }
 
 impl State {
-    /// Indirect execution of a one-argument signature of `kind` (PC
-    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
-    /// records `stride` bytes apart at title address `arguments`, and the
-    /// record count at `count` if the title gives one: the GPU reads them
-    /// from the buffer's host copy, where earlier dispatches may have
-    /// written them. False if it cannot run on the host.
+    /// Indirect execution of a title command signature (`args`, records
+    /// `stride` bytes apart) at title address `arguments`, and the record
+    /// count at `count` if the title gives one: the GPU reads them from the
+    /// buffer's host copy, where earlier dispatches may have written them.
+    /// Supports single-argument draw/dispatch/mesh signatures and
+    /// multi-argument signatures whose prefix arguments are root constants
+    /// mapped onto the bound pipeline's user data. False if it cannot run
+    /// on the host.
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
+        stride: u32,
+        title_args: &[[u32; 4]],
+        max: u32,
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
@@ -981,6 +985,30 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        let stage_ud: Vec<crate::indirect::StageUserData<'_>> = pipeline
+            .map(|p| {
+                p.stages
+                    .iter()
+                    .filter_map(|s| {
+                        let (param, dwords) = s.user_data?;
+                        Some(crate::indirect::StageUserData {
+                            param,
+                            dwords,
+                            entries: &s.translated().host.user_data,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(plan) = crate::indirect::plan_indirect(stride, title_args, &stage_ud) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "indirect signature {title_args:?}: cannot map onto host pipeline"
+            ));
+            return false;
+        };
+        let kind = plan.kind;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1000,10 +1028,12 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let signature = if plan.args.len() == 1 {
+            host_signature(kind, stride)
+        } else {
+            pipeline.and_then(|p| pipeline_signature(p, &plan.args, stride))
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -1012,7 +1042,12 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            (kind, stride, max, plan.arg_offset),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1021,7 +1056,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+            DISPATCH => match pipeline {
                 Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
@@ -1030,11 +1065,14 @@ impl State {
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
+            match pipeline {
                 None => crate::pipeline::note_drop(self.pipeline as This),
                 Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
             }
             return false;
+        }
+        if plan.args.len() > 1 {
+            list.keep(&signature);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1060,6 +1098,41 @@ impl State {
         }
         true
     }
+}
+
+/// A multi-argument host command signature bound to `p.root`, cached on `p`.
+fn pipeline_signature(
+    p: &HostPipeline,
+    args: &[crate::indirect::HostIndirectArg],
+    stride: u32,
+) -> Option<ID3D12CommandSignature> {
+    let mut cache = p.signatures.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, s)) = cache.iter().find(|(a, st, _)| *st == stride && a == args) {
+        return Some(s.clone());
+    }
+    let descs = crate::indirect::to_d3d12_descs(args);
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: stride,
+        NumArgumentDescs: descs.len() as u32,
+        pArgumentDescs: descs.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: `descs` lives through the call; `p.root` is a live root signature.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(
+            &desc,
+            Some(&p.root),
+            &mut signature,
+        )
+    };
+    if let Err(e) = result {
+        once!(error = %e, ?args, stride, "host multi-argument command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    cache.push((args.to_vec(), stride, signature.clone()));
+    Some(signature)
 }
 
 /// The host command signature for one argument of `kind` with records
