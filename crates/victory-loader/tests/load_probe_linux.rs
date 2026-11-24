@@ -239,6 +239,11 @@ fn maps_binds_and_calls_probe_on_guest_threads() {
 
     let image = Arc::new(image);
     let export = |name: &str| image.export(name).unwrap_or_else(|| panic!("{name}"));
+    // The export directory read from memory agrees with the parsed one.
+    // SAFETY: a mapped image.
+    let at = |name: &str| unsafe { victory_loader::linux::image::export_at(image.base(), name) };
+    assert_eq!(at("probe_tick"), Some(export("probe_tick")));
+    assert_eq!(at("probe_tic"), None);
     let (xgr, tick, pid, title_fn, delayed, missing, starts) = (
         export("probe_xgameruntime_init"),
         export("probe_tick"),
