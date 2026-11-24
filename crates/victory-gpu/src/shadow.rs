@@ -264,6 +264,12 @@ impl Shadow {
             .unwrap_or_else(|e| e.into_inner())
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
+        if self.is_mirrored() && from < to {
+            // Other copies share these mirror pages: their refreshes must leave them alone until
+            // the copy-back (`Shadow::update_mirrored`).
+            let at = self.start as usize;
+            lock_pending().push((at + from, at + to));
+        }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
@@ -322,10 +328,9 @@ impl Shadow {
             && to <= snap.to
             && from < to
         {
+            // (`[from, to)` is inside the snapshot's filled part; nothing else touches it while
+            // the lock is held)
             let base = snap.ptr() as usize;
-            // SAFETY: `[from, to)` is inside the snapshot's filled part; nothing writes it
-            // while the lock is held.
-            let before_at = |at: usize, n: usize| unsafe { std::slice::from_raw_parts((base + at) as *const u8, n) };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -344,25 +349,38 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.ptr(at), n) };
-                let old = before_at(at, n);
+                // SAFETY: inside the snapshot's filled part; the lock is held, so it may be updated.
+                let old = unsafe { std::slice::from_raw_parts_mut((base + at) as *mut u8, n) };
                 let title = &mut title[..n];
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                    // Only the dwords the GPU changed go to title memory, each run written by
+                    // itself: the title's threads keep writing the rest of the piece while we
+                    // work (a whole 64 KiB piece read, patched and written back lost their
+                    // writes made in between: the world's root UAVs reach to the end of big
+                    // heaps the title's own records live in).
+                    let runs = gpu_runs(start + at, host, old);
+                    let mut opened = false;
+                    for &(a, b) in &runs {
+                        if title[a..b] == host[a..b] {
+                            continue;
                         }
-                        *h = *t;
+                        if !opened {
+                            crate::watch::writing(start + at, n);
+                            opened = true;
+                        }
+                        crate::host::write_mapped((start + at + a) as *mut u8, host[a..b].as_ptr(), b - a);
+                        title[a..b].copy_from_slice(&host[a..b]);
+                        written += b - a;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if !self.is_mirrored() {
+                        // The copy takes the title's bytes in turn (its own buffer: no other
+                        // copy compares against it).
+                        host.copy_from_slice(title);
+                        synced.push((start + at) / PAGE);
                     }
-                    synced.push((start + at) / PAGE);
+                    // Done with the piece: another range of this copy declared in the same
+                    // submission finds nothing more to write here.
+                    old.copy_from_slice(host);
                 }
                 at += n;
             }
@@ -501,6 +519,18 @@ impl Shadow {
     /// another copy (`MIRROR_CHECKED`): the world's copies overlap, and the same 174 MB heap
     /// was checked 20 times a frame (9 GB checked, 879 ms a frame).
     fn update_mirrored(&self, from: usize, to: usize) -> usize {
+        // Not over ranges any copy's shaders of this submission write: that copy's snapshot
+        // tells what the GPU wrote, and title bytes brought in after it would be taken for the
+        // GPU's and written back over newer title writes.
+        let pending = lock_pending().clone();
+        if pending.iter().any(|&(a, e)| a < to && e > from) {
+            return gaps(from, to, pending).into_iter().map(|(a, b)| self.update_mirrored_free(a, b)).sum();
+        }
+        self.update_mirrored_free(from, to)
+    }
+
+    /// [`Shadow::update_mirrored`] of a range no shader of the submission writes.
+    fn update_mirrored_free(&self, from: usize, to: usize) -> usize {
         let sub = SUBMISSION.load(Ordering::Relaxed);
         let first = from / PAGE;
         let last = (to - 1) / PAGE;
@@ -707,6 +737,60 @@ pub(crate) fn refresh_mirror(from: usize, to: usize) -> usize {
     let mut view = Shadow::new(m.buffer.clone(), std::ptr::null_mut(), m.va + from as u64, from as u64, (to - from) as u64);
     view.pages = pages.into_iter().map(|(cpu, _, _)| cpu).collect();
     view.update_free(from, to)
+}
+
+/// Title ranges that mirrored copies' shaders write in the submission being prepared
+/// (`Shadow::writing`): refreshes of other copies over the same mirror pages leave them alone.
+static MIRROR_PENDING: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+fn lock_pending() -> std::sync::MutexGuard<'static, Vec<(usize, usize)>> {
+    MIRROR_PENDING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A submission's preparation begins (the previous one is copied back): no mirrored range
+/// is being written.
+pub(crate) fn submission_begins() {
+    lock_pending().clear();
+}
+
+/// The parts of `[from, to)` outside every range of `holes`, in order.
+fn gaps(from: usize, to: usize, mut holes: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    holes.sort_unstable();
+    let mut out = Vec::new();
+    let mut at = from;
+    for (a, e) in holes {
+        if e <= at || a >= to {
+            continue;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(e);
+    }
+    if at < to {
+        out.push((at, to));
+    }
+    out
+}
+
+/// The runs (offsets in the piece, end exclusive) of the dwords of a piece at title address
+/// `address` whose bytes in `host` differ from `old`: what the GPU wrote. Dwords are aligned
+/// to title memory; a piece's partial first and last dwords count by themselves.
+fn gpu_runs(address: usize, host: &[u8], old: &[u8]) -> Vec<(usize, usize)> {
+    let n = host.len().min(old.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < n {
+        let end = ((address + at) / 4 * 4 + 4 - address).min(n);
+        if host[at..end] != old[at..end] {
+            match runs.last_mut() {
+                Some(r) if r.1 == at => r.1 = end,
+                _ => runs.push((at, end)),
+            }
+        }
+        at = end;
+    }
+    runs
 }
 
 /// The current submission's number (see [`next_submission`]).
@@ -947,6 +1031,56 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_runs_are_the_changed_dwords_only() {
+        let old = [0u8; 32];
+        let mut host = old;
+        assert!(gpu_runs(0x1000, &host, &old).is_empty());
+        // one byte of dword 1, all of dwords 4 and 5, one byte of dword 7
+        host[5] = 1;
+        host[16..24].fill(7);
+        host[31] = 9;
+        assert_eq!(gpu_runs(0x1000, &host, &old), [(4, 8), (16, 24), (28, 32)]);
+        // a piece starting mid-dword: its first two bytes are a dword by themselves
+        let mut host = [0u8; 10];
+        host[1] = 1;
+        host[2] = 1;
+        assert_eq!(gpu_runs(0x1002, &host, &[0u8; 10]), [(0, 6)]);
+        host[1] = 0;
+        assert_eq!(gpu_runs(0x1002, &host, &[0u8; 10]), [(2, 6)]);
+        let mut host = [0u8; 10];
+        host[9] = 1;
+        assert_eq!(gpu_runs(0x1002, &host, &[0u8; 10]), [(6, 10)]);
+    }
+
+    /// The copy-back's rule on a piece: title bytes the GPU did not change are never written,
+    /// so a title write made while the piece is being copied back survives.
+    #[test]
+    fn copy_back_leaves_bytes_the_gpu_did_not_write() {
+        let old = vec![0u8; 64];
+        let mut host = old.clone();
+        host[8..12].copy_from_slice(&[1, 2, 3, 4]);
+        // title memory as read for the copy-back, then written by a title thread meanwhile
+        let mut title = vec![5u8; 64];
+        let runs = gpu_runs(0x2000, &host, &old);
+        title[40] = 0xee;
+        for (a, b) in runs {
+            title[a..b].copy_from_slice(&host[a..b]);
+        }
+        assert_eq!(&title[8..12], &[1, 2, 3, 4]);
+        assert_eq!(title[40], 0xee);
+        assert!(title[..8].iter().chain(&title[12..40]).all(|&b| b == 5));
+    }
+
+    #[test]
+    fn gaps_skip_pending_ranges() {
+        assert_eq!(gaps(0, 100, vec![]), [(0, 100)]);
+        assert_eq!(gaps(0, 100, vec![(40, 60), (10, 20)]), [(0, 10), (20, 40), (60, 100)]);
+        assert_eq!(gaps(0, 100, vec![(0, 50), (30, 120)]), []);
+        assert_eq!(gaps(10, 20, vec![(0, 5), (25, 30)]), [(10, 20)]);
+        assert_eq!(gaps(10, 20, vec![(15, 25)]), [(10, 15)]);
+    }
 
     #[test]
     fn page_table_remembers_and_forgets() {

@@ -889,6 +889,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        crate::shadow::submission_begins();
         crate::shadow::next_submission();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -996,6 +997,7 @@ impl Host {
         for written in written_per_back {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
+        crate::shadow::submission_begins();
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
