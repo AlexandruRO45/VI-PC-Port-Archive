@@ -6,11 +6,15 @@
 //! 64-bit lane-wise SALU ops (`s_mov_b64`, `s_and_b64`, `s_or_b64`, `s_xor_b64`, `s_not_b64`,
 //! `s_andn2_b64`, `s_orn2_b64`, `s_nand_b64`, `s_nor_b64`, `s_xnor_b64`, `s_wqm_b64`,
 //! `s_cselect_b64`, `s_cmov_b64`) whose destination is not whole-live and whose `scc` (if written)
-//! is dead – needs just the reading lane's own bit, which its own half has. This is a backward
-//! liveness analysis over the SGPRs and `scc`: a register is *whole-live* after an instruction
-//! when some path may read its whole value (any non-lane-wise SALU / SMEM / VALU scalar operand,
-//! a branch on VCCZ, a lane-wise op whose destination or written `scc` is live, …) before it is
-//! written again. A mask write whose destination is not whole-live needs no exchange.
+//! is dead – needs just the reading lane's own bit, which its own half has. EXEC is a mask like
+//! the others: every VALU reads it lane by lane, so a `v_cmpx*` or an even-aligned
+//! `s_*_saveexec_b64` / `s_*_wrexec_b64` whose new EXEC (and `scc`) is not read whole needs no
+//! exchange either. This is a backward liveness analysis over the SGPRs and `scc`: a register is
+//! *whole-live* after an instruction when some path may read its whole value (any non-lane-wise
+//! SALU / SMEM / VALU scalar operand, a branch on VCCZ / EXECZ, `v_readfirstlane` and
+//! `ds_(b)permute` for EXEC, a lane-wise op whose destination or written `scc` is live, …)
+//! before it is written again. A mask write whose destination is not whole-live needs no
+//! exchange.
 //!
 //! After a mask stays in its half the two halves hold different values in its registers, so a
 //! whole read that is missed here – or a write taken for a full overwrite that is not one –
@@ -22,9 +26,8 @@
 //! - `s_movrels*` read `s[src + m0]`: every register from `src` up;
 //! - SDWA scalar sources (S0 / S1 bits) and SMEM register offsets are reads.
 //!
-//! Conservative where it cannot see: an indirect jump makes every SGPR whole-live, EXEC is
-//! always whole-live, and so is every SGPR at the end of a kernel-mode program (the runner
-//! reads them back). Every emitted loop may also be left where its iteration budget
+//! Conservative where it cannot see: an indirect jump makes every SGPR whole-live, and so is
+//! every SGPR at the end of a kernel-mode program (the runner reads them back). Every emitted loop may also be left where its iteration budget
 //! (`LOOP_GUARD`) is checked: what is live after a loop, or at the end, is live before each of
 //! its instructions.
 
@@ -213,19 +216,49 @@ struct InstFlow {
     kill: Regs,
     /// Even-aligned 64-bit lane-wise SALU op: `(dst, lane_srcs, sets_scc)`.
     lane_op: Option<(Regs, Regs, bool)>,
+    /// Even-aligned `s_*_saveexec_b64` / `s_*_wrexec_b64`: `(dst, lane_src, is_wrexec)`.
+    save_exec: Option<(Regs, Regs, bool)>,
     reads_scc: bool,
     writes_scc: bool,
+}
+
+/// `s_*_saveexec_b64` / `s_*_wrexec_b64` with even-aligned register operands:
+/// `((dst, lane_src, is_wrexec), read whole whatever is live)`. The new EXEC (and `scc`) is
+/// `op(src, EXEC)` lane by lane; `dst` gets the old EXEC, or the new one for `wrexec`.
+fn save_exec_b64(d: &Decoded) -> Option<((Regs, Regs, bool), Regs)> {
+    let name = d.inst.name;
+    let wrexec = name.contains("_WREXEC");
+    if d.variant != Variant::Plain || !name.ends_with("_B64") || !(wrexec || name.contains("_SAVEEXEC")) {
+        return None;
+    }
+    let dst = match rdna2::field_value(d.enc, &d.words, "SDST")? {
+        125 => 0,
+        v if v < 126 && v & 1 == 0 => range(v, 2),
+        _ => return None,
+    };
+    let (src, whole) = match rdna2::field_value(d.enc, &d.words, "SSRC0")? {
+        251 => (0, VCC),
+        252 => (0, EXEC),
+        125 => (0, 0),
+        v if v <= 126 && v & 1 == 0 => (range(v, 2), 0),
+        v if v <= 127 => return None,
+        _ => (0, 0),
+    };
+    Some(((dst, src, wrexec), whole))
 }
 
 fn flow(d: &Decoded) -> InstFlow {
     let (whole, kill) = uses(d);
     let r_scc = reads_scc(d);
     let w_scc = writes_scc(d);
+    if let Some((se, forced)) = save_exec_b64(d) {
+        return InstFlow { whole: forced, kill: se.0 | EXEC, lane_op: None, save_exec: Some(se), reads_scc: r_scc, writes_scc: w_scc };
+    }
     let Some(sets_scc) = lane_wise_salu64(d.inst.name) else {
-        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
     };
     if d.variant != Variant::Plain {
-        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
     }
     // Verify even SGPR pair alignment on dst and all register sources so low/high half words can
     // never cross-alias; scalar special codes `vccz` (251) / `execz` (252) always read whole.
@@ -246,7 +279,7 @@ fn flow(d: &Decoded) -> InstFlow {
                 continue;
             }
             if code > 126 || code & 1 != 0 || n != 2 {
-                return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
             }
             let r = range(code, 2);
             dst_regs |= r;
@@ -260,7 +293,7 @@ fn flow(d: &Decoded) -> InstFlow {
                 125 => {}
                 c if c <= 127 => {
                     if c > 126 || c & 1 != 0 || n != 2 {
-                        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
                     }
                     lane_srcs |= range(c, 2);
                 }
@@ -268,7 +301,7 @@ fn flow(d: &Decoded) -> InstFlow {
             }
         }
     }
-    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), reads_scc: r_scc, writes_scc: w_scc }
+    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), save_exec: None, reads_scc: r_scc, writes_scc: w_scc }
 }
 
 /// (read whole, overwritten) SGPRs of one instruction. Lane-by-lane mask reads are left out
@@ -331,6 +364,10 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
     if let Some(dst) = sdwa_dst {
         written = (written & !VCC) | dst;
     }
+    // EXEC reads the operand tables leave out: the first active lane, lanes of the other half
+    if matches!(name, "V_READFIRSTLANE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32") {
+        whole |= EXEC;
+    }
     (whole, written)
 }
 
@@ -338,7 +375,7 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let at_end = if end_reads_all { ALL } else { EXEC };
+    let at_end = if end_reads_all { ALL } else { 0 };
     // successors; None = unknown (indirect): everything is live
     let succ: Vec<Option<Vec<usize>>> = insts
         .iter()
@@ -386,7 +423,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             let (out, sout) = match &succ[i] {
                 None => (ALL, true),
                 Some(s) if s.is_empty() => (at_end, scc_at_end),
-                Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
+                Some(s) => s.iter().fold((0, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
             };
             let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
                 (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
@@ -400,7 +437,18 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
                     gen |= srcs;
                 }
             }
-            let inn = gen | (out & !f.kill) | left | EXEC;
+            if let Some((dst, src, wrexec)) = f.save_exec {
+                // the new EXEC (or `scc`, derived from it) read whole needs both inputs whole; the
+                // saved old EXEC read whole needs EXEC whole (the new one for `wrexec`)
+                let (exec_w, dst_w) = ((out & EXEC) != 0 || sout, (out & dst) != 0);
+                if exec_w || dst_w {
+                    gen |= EXEC;
+                }
+                if exec_w || (wrexec && dst_w) {
+                    gen |= src;
+                }
+            }
+            let inn = gen | (out & !f.kill) | left;
             let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
             if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                 live_out[i] = out;
@@ -475,8 +523,7 @@ mod tests {
 
     #[test]
     fn scalar_reads_and_branches_keep_the_exchange() {
-        let readers: [I; 4] = [
-            ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]),
+        let readers: [I; 3] = [
             ("S_CBRANCH_VCCZ", "ENC_SOPP", &[("SIMM16", 0)]),
             ("V_MOV_B32", "ENC_VOP1", &[("VDST", 5), ("SRC0", 106)]),
             ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 106)]),
@@ -485,6 +532,9 @@ mod tests {
             let p = asm(&[CMP, reader, ENDPGM]);
             assert!(mask_needed(&whole_live_out(&p, false), 0, 106), "{}", reader.0);
         }
+        // s_and_saveexec_b64 keeps the exchange when the new EXEC is read whole
+        let p = asm(&[CMP, ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]), CBRANCH_EXECZ, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
         // s_mov_b64 keeps the exchange when its destination is read whole
         let p = asm(&[CMP, MOV_S2_VCC, ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 2)]), ENDPGM]);
         assert!(mask_needed(&whole_live_out(&p, false), 0, 106));
@@ -516,14 +566,64 @@ mod tests {
     }
 
     #[test]
-    fn exec_is_always_exchanged() {
-        let p = asm(&[("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]), ENDPGM]);
-        assert!(whole_live_out(&p, false)[0] & EXEC == EXEC);
+    fn exec_is_exchanged_only_when_read_whole() {
+        let cmpx: I = ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]);
+        // v_cmpx; VALU; EXEC restored before s_cbranch_execz: the v_cmpx's EXEC is read lane by lane
+        let p = asm(&[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)]),
+            cmpx,
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 3), ("VSRC1", 4)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]),
+            CBRANCH_EXECZ,
+            ENDPGM,
+        ]);
+        let live = whole_live_out(&p, false);
+        assert!(!mask_needed(&live, 1, 126));
+        assert!(mask_needed(&live, 0, 10), "the saved EXEC is restored and then read whole");
+        // the kernel runner reads EXEC at the end
+        let p = asm(&[cmpx, ENDPGM]);
+        assert!(!mask_needed(&whole_live_out(&p, false), 0, 126));
+        assert!(mask_needed(&whole_live_out(&p, true), 0, 126));
+        for reader in [
+            CBRANCH_EXECZ,
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]),
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("DATA0", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 252)]),
+            ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 126)]),
+        ] {
+            let p = asm(&[cmpx, reader, ENDPGM]);
+            assert!(mask_needed(&whole_live_out(&p, false), 0, 126), "{}", reader.0);
+        }
+    }
+
+    #[test]
+    fn saveexec_needs_whole_inputs_only_for_a_whole_read() {
+        let saveexec: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)]);
+        let restore: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]);
+        let valu: I = ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 3), ("VSRC1", 4)]);
+        let bcnt_s10: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)]);
+        // predicated region, EXEC restored before it is read whole
+        let p = asm(&[CMP_S20, saveexec, valu, restore, CBRANCH_EXECZ, ENDPGM]);
+        assert!(!mask_needed(&whole_live_out(&p, false), 0, 20));
+        // the new EXEC read whole (branch), or its `scc`
+        let p = asm(&[CMP_S20, saveexec, CBRANCH_EXECZ, valu, restore, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
+        let p = asm(&[CMP_S20, saveexec, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)]), restore, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
+        // the saved value read whole: the old EXEC for saveexec, the new one for wrexec
+        let p = asm(&[CMP_S20, saveexec, valu, bcnt_s10, ENDPGM]);
+        assert!(!mask_needed(&whole_live_out(&p, false), 0, 20));
+        let p = asm(&[CMP_S20, ("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)]), valu, bcnt_s10, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
+        // an odd-aligned source pair is read whole
+        let p = asm(&[CMP_S20, ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 21)]), valu, restore, ENDPGM]);
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20));
     }
 
     const CMP_S20: I = ("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 1)]);
     const BCNT_S20: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)]);
     const BCNT_VCC: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
+    const CBRANCH_EXECZ: I = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)]);
 
     // review findings: writes that are not full overwrites, reads the operand tables miss
 
@@ -726,13 +826,14 @@ mod tests {
             cmp_s22,
             ("S_AND_B64", "ENC_SOP2", &[("SDST", 20), ("SSRC0", 20), ("SSRC1", 22)]),
             ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 24), ("SSRC0", 20)]),
+            CBRANCH_EXECZ,
             ENDPGM,
         ]);
         let live = whole_live_out(&p, false);
         assert!(mask_needed(&live, 0, 20));
         assert!(mask_needed(&live, 1, 22));
-        // Writing EXEC directly
-        let p = asm(&[CMP_S20, cmp_s22, ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 20), ("SSRC1", 22)]), ENDPGM]);
+        // Writing EXEC directly, then reading it whole
+        let p = asm(&[CMP_S20, cmp_s22, ("S_AND_B64", "ENC_SOP2", &[("SDST", 126), ("SSRC0", 20), ("SSRC1", 22)]), CBRANCH_EXECZ, ENDPGM]);
         let live = whole_live_out(&p, false);
         assert!(mask_needed(&live, 0, 20));
         assert!(mask_needed(&live, 1, 22));
