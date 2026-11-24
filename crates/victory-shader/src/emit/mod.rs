@@ -332,6 +332,11 @@ const SIGNATURE_REGISTERS: u32 = 32;
 /// `D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`: an `SV_Target` names one of them.
 const RENDER_TARGETS: u32 = 8;
 
+/// The elements a signature part may list. `PSV0` counts each signature's
+/// elements in a byte, and lowering can add two input rows of its own (the
+/// vertex and instance ids the console signature leaves out).
+const SIGNATURE_ELEMENTS: usize = u8::MAX as usize - 2;
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -346,6 +351,14 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
         .is_none_or(|end| end > part.len())
     {
         return Err(ShaderError::Malformed("signature rows out of bounds"));
+    }
+    // The count is a raw `u32` of the title's part. Past what `PSV0` can
+    // count, the emitted container's byte wrapped (256 rows counted as 0)
+    // and disagreed with its own `ISG1`/`OSG1`, so D3D12 refused it.
+    if count > SIGNATURE_ELEMENTS {
+        return Err(ShaderError::Malformed(
+            "signature with more elements than PSV0 counts",
+        ));
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
@@ -601,6 +614,44 @@ mod tests {
                 signature(&part(register)).unwrap_err().to_string(),
                 refused.to_string(),
                 "register {register:#x}"
+            );
+        }
+    }
+
+    /// `PSV0` counts a signature's elements in a byte. A part listing more
+    /// than fit (with room for the two rows lowering may add) is refused,
+    /// rather than wrapping the emitted count; up to the limit it parses.
+    #[test]
+    fn a_signature_past_psv0s_element_count_is_refused() {
+        // `count` rows without a register, all sharing one name after them.
+        let part = |count: u32| {
+            let base = 8;
+            let name = base + 32 * count;
+            let mut p = Vec::new();
+            for w in [count, base] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            for index in 0..count {
+                for w in [0, name, index, 0, 3, u32::MAX, 0x0F, 0] {
+                    p.extend_from_slice(&u32::to_le_bytes(w));
+                }
+            }
+            p.extend_from_slice(b"TEXCOORD\0");
+            p
+        };
+        let limit = SIGNATURE_ELEMENTS as u32;
+        assert_eq!(limit, 253);
+        for count in [1, limit] {
+            let rows = signature(&part(count)).expect("a count PSV0 can hold");
+            assert_eq!(rows.len(), count as usize);
+            assert!(rows.iter().all(|r| r.row.is_none() && r.name == "TEXCOORD"));
+        }
+        let refused = ShaderError::Malformed("signature with more elements than PSV0 counts");
+        for count in [limit + 1, 255, 256, 300] {
+            assert_eq!(
+                signature(&part(count)).unwrap_err(),
+                refused,
+                "{count} rows"
             );
         }
     }
