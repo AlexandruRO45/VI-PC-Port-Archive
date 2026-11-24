@@ -11,11 +11,15 @@ use std::sync::LazyLock;
 
 use crate::HleModule;
 
+mod audio_out;
+mod combase;
 #[allow(dead_code)] // used by the slices as they land
 pub(crate) mod handles;
+mod mmdevapi;
+mod oleaut32;
 
 fn modules() -> Vec<HleModule> {
-    vec![]
+    vec![combase::module(), oleaut32::module()]
 }
 
 static MODULES: LazyLock<Vec<HleModule>> = LazyLock::new(modules);

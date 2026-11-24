@@ -61,6 +61,48 @@ pub(crate) fn close(handle: Handle) -> bool {
     table.objects.remove(&handle).is_some()
 }
 
+/// An event (`CreateEventW`).
+// ponytail: the audio slice's stand-in, with the signatures of the sync
+// slice's event; that one replaces it.
+pub(crate) struct Event {
+    manual_reset: bool,
+    set: std::sync::atomic::AtomicBool,
+}
+
+impl Event {
+    pub(crate) fn new(manual_reset: bool, initially_set: bool) -> Arc<Event> {
+        Arc::new(Event {
+            manual_reset,
+            set: initially_set.into(),
+        })
+    }
+
+    pub(crate) fn set(&self) {
+        self.set.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn reset(&self) {
+        self.set.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Object for Event {
+    fn as_waitable(&self) -> Option<&dyn Waitable> {
+        Some(self)
+    }
+}
+
+impl Waitable for Event {
+    fn try_acquire(&self) -> bool {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        if self.manual_reset {
+            self.set.load(Acquire)
+        } else {
+            self.set.swap(false, AcqRel)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
