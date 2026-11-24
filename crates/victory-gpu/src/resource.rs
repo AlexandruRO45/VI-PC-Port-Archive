@@ -314,6 +314,14 @@ pub(crate) fn stands_in(this: This) -> bool {
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Views and clears the host refused because the resource was not created
+/// with the flag they need — render targets, then depth. A view of such a
+/// resource is the invalid call that removes the device, so the host leaves
+/// a null view (or skips the clear) instead: the number is what the title
+/// asks for that the console allowed and PC does not.
+pub(crate) static REFUSED_TARGETS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
 pub(crate) fn depth_and_unordered(this: This) -> bool {
@@ -2549,6 +2557,40 @@ mod tests {
         assert!(
             host_texture(&plain, COPY_DEST, given).is_some(),
             "a clear value the device refuses must not cost the whole texture"
+        );
+    }
+
+    /// A clear of a resource created without the flag it needs is the
+    /// invalid call the device is removed for, which is what the host's clear
+    /// sites consult before issuing one. The copies the host makes of a title
+    /// texture carry the title's flags, so the predicate answers on a
+    /// texture the host actually built.
+    #[cfg(windows)]
+    #[test]
+    fn a_clear_is_refused_where_the_texture_cannot_take_the_view() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        const RENDER_TARGET: u32 = 1;
+        const DEPTH: u32 = 2;
+        const COPY_DEST: u32 = 0x400;
+        let copy = |flags: u32, format: u32| {
+            let title = ResourceDesc {
+                flags,
+                ..texture(64, 64, format, 1)
+            };
+            host_texture(&title, COPY_DEST, std::ptr::null()).expect("a host copy")
+        };
+        let plain = copy(0, 28);
+        let target = copy(RENDER_TARGET, 28);
+        let depth = copy(DEPTH, 55);
+        assert!(!crate::host::clears_render_target(&plain), "no flag: no clear");
+        assert!(crate::host::clears_render_target(&target));
+        assert!(!crate::host::clears_depth(&plain), "no flag: no clear");
+        assert!(crate::host::clears_depth(&depth));
+        assert!(
+            !crate::host::clears_depth(&target),
+            "a render target is not a depth target"
         );
     }
 

@@ -36,6 +36,24 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Whether `resource` was created with `flag`.
+fn allows(resource: &ID3D12Resource, flag: D3D12_RESOURCE_FLAGS) -> bool {
+    // SAFETY: a plain read of a live resource's description.
+    unsafe { resource.GetDesc() }.Flags.0 & flag.0 != 0
+}
+
+/// Whether `resource` can take a render target view: a view of one that
+/// cannot is the invalid call the device is removed for, not a no-op.
+pub(crate) fn clears_render_target(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+}
+
+/// Whether `resource` can take a depth view, as [`clears_render_target`].
+pub(crate) fn clears_depth(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+}
+
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -5837,8 +5855,10 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{}; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{}; views and clears of a resource without its permission: {} as a render target, {} as depth; depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
+                    crate::resource::REFUSED_TARGETS[0].load(Ordering::Relaxed),
+                    crate::resource::REFUSED_TARGETS[1].load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),
                     crate::resource::TWINS[1].load(Ordering::Relaxed),
                     crate::resource::PLANES[1].load(Ordering::Relaxed),
