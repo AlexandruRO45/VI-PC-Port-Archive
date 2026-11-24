@@ -168,6 +168,12 @@ impl Layout {
         r
     }
 
+    /// The offset tables (ox, oy, oz, hx, hy, hz) for detiling elsewhere (the GPU,
+    /// `gpu::detile_gpu`): `offset_z` XORs them, the h tables indexed modulo their length.
+    pub fn tables(&self) -> [&[u32]; 6] {
+        [&self.ox, &self.oy, &self.oz, &self.hx, &self.hy, &self.hz]
+    }
+
     /// surface `w` × `h` elements: (blocks per row, blocks per column)
     pub fn blocks(&self, w: usize, h: usize) -> (usize, usize) {
         (w.div_ceil(self.block_w), h.div_ceil(self.block_h))
