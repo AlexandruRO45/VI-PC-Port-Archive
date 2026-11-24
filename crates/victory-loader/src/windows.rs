@@ -83,6 +83,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if std::env::var(crate::hooks::NO_WATCHDOG_ENV).as_deref() == Ok("1") {
+            // SAFETY: this is the main image, mapped before any title code runs.
+            let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
+            tracing::info!(applied, "title watchdog compatibility hook");
+        }
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
