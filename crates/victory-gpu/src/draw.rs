@@ -1213,11 +1213,9 @@ impl State {
                 let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
-                let range = match view {
-                    View::Constant(address, size) => Some((address, u64::from(size))),
-                    ref v => crate::descriptor::host::buffer_range(v),
-                };
-                let Some((at, len)) = range.filter(|r| r.1 <= 64) else {
+                let Some((at, len)) =
+                    crate::descriptor::host::buffer_range(&view).filter(|r| r.1 <= 64)
+                else {
                     continue;
                 };
                 let Some(shadow) = crate::shadow::find(at, len) else { continue };
@@ -1667,18 +1665,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    // Constant buffers (raw views) to their copy's end at most; others in
-    // the copy their host view reads.
-    let range = match *view {
-        View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
-            let len = u64::from(size).min(s.left(address));
-            crate::shadow::find(address, len).map(|s| (s, address, len))
-        }),
-        _ => crate::descriptor::host::view_copy(view),
-    };
-    if let Some((shadow, address, len)) = range
-        && len > 0
-    {
+    // Constant buffers (raw views) are cut to their copy's end at most.
+    if let Some((shadow, address, len)) = crate::descriptor::host::view_copy(view) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
