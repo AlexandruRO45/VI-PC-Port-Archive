@@ -313,7 +313,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -621,6 +621,15 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// The bytes of the host's constant buffer view for a title's of `size`:
+/// whole 256s, and at most the 64 KiB a shader can index. The host removes
+/// the device for a larger view, and the title's heap holds such sizes in
+/// slots it does not use.
+fn constant_bytes(size: u32) -> u32 {
+    const LARGEST: u32 = 64 << 10;
+    size.min(LARGEST).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -639,7 +648,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_bytes(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -941,6 +950,35 @@ mod tests {
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
         // Multisampled UAVs need a cap; they stay 2D.
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// A constant buffer view larger than the host takes is cut to what it
+    /// takes: the device, which such a view removes, stays.
+    #[test]
+    fn an_oversized_constant_buffer_view_leaves_the_device_alive() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // SAFETY: a plain device query.
+        let alive = || unsafe { host.device.GetDeviceRemovedReason() }.is_ok();
+        // Made first: an allocation that fails on a removed device must not
+        // end the test early.
+        let (buffer, _) = host.upload_buffer(1 << 20).expect("an upload buffer");
+        let memory = vec![0u8; 2 << 20];
+        let at = (memory.as_ptr() as u64).next_multiple_of(64 << 10);
+        for size in [969_472u32, 896_256] {
+            assert!(make(&View::Constant(at, size), heap.cpu(0)).is_some());
+            assert!(alive(), "a view of {size} bytes");
+        }
+        // SAFETY: a live upload buffer.
+        heap.constant_at(1, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        assert!(alive(), "a view of the list's own memory");
+        assert_eq!(constant_bytes(480), 512);
+        assert_eq!(constant_bytes(64 << 10), 64 << 10);
+        assert_eq!(constant_bytes(u32::MAX), 64 << 10);
     }
 
     /// A null 3D UAV made on the real device leaves it alive.
