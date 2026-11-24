@@ -82,6 +82,29 @@ uint AlignBit(uint hi, uint lo, uint s) {
 uint SadU32(uint a, uint b, uint c) {
   return (a > b ? (a - b) : (b - a)) + c;
 }
+// Opérations f32 dans des fonctions `precise` (dxc ne replie plus x + 0, x - x ni 0 × x). Le pilote AMD
+// (RX 9070 XT) replie pourtant fadd x, 0.0 et fsub x, x, et Intel fsub 0.0, x : le signe d'un résultat
+// exactement nul et x - x sont donc fixés en entier.
+uint F32Add(uint a, uint b) {
+  precise float r = asfloat(a) + asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & b & 0x80000000u : asuint(r);    // -0 seulement pour -0 + -0
+}
+uint F32Sub(uint a, uint b) {
+  if (a == b)                                     // NaN : lui-même, rendu silencieux ; ±infini : NaN par défaut
+    return (a & 0x7FFFFFFFu) > 0x7F800000u ? a | 0x400000u : (a & 0x7F800000u) == 0x7F800000u ? 0xFFC00000u : 0u;
+  precise float r = asfloat(a) - asfloat(b);
+  return (asuint(r) & 0x7FFFFFFFu) == 0u ? a & ~b & 0x80000000u : asuint(r);
+}
+uint F32Mul(uint a, uint b) {
+  precise float r = asfloat(a) * asfloat(b);
+  return asuint(r);
+}
+uint F32Fma(uint a, uint b, uint c) {
+  precise float r = mad(asfloat(a), asfloat(b), asfloat(c));
+  bool zeros = ((a & 0x7FFFFFFFu) == 0u || (b & 0x7FFFFFFFu) == 0u) && (a & 0x7F800000u) != 0x7F800000u
+               && (b & 0x7F800000u) != 0x7F800000u && (c & 0x7FFFFFFFu) == 0u;
+  return zeros ? (a ^ b) & c & 0x80000000u : asuint(r);   // produit nul + 0 : signe de la somme exacte
+}
 uint MulLegacyF32(uint a, uint b) {
   float x = asfloat(a), y = asfloat(b);
   return (x == 0.0f || y == 0.0f) ? 0u : asuint(x * y);
@@ -244,20 +267,20 @@ def scalar_statement(name, fields, literal):
 # --- Vectorielles : expressions uint de {a}, {b}, {c} (sources) et {d} (destination) --------
 VECTOR = {
     "v_mov_b32": "{a}",
-    "v_add_f32": "asuint(asfloat({a}) + asfloat({b}))",
-    "v_sub_f32": "asuint(asfloat({a}) - asfloat({b}))",
-    "v_subrev_f32": "asuint(asfloat({b}) - asfloat({a}))",
-    "v_mul_f32": "asuint(asfloat({a}) * asfloat({b}))",
+    "v_add_f32": "F32Add({a}, {b})",
+    "v_sub_f32": "F32Sub({a}, {b})",
+    "v_subrev_f32": "F32Sub({b}, {a})",
+    "v_mul_f32": "F32Mul({a}, {b})",
     "v_mul_legacy_f32": "MulLegacyF32({a}, {b})",
     "v_min_f32": "asuint(min(asfloat({a}), asfloat({b})))",
     "v_max_f32": "asuint(max(asfloat({a}), asfloat({b})))",
-    "v_fmac_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({d})))",
-    "v_mac_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({d})))",
-    "v_fma_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))",
-    "v_mad_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({c})))",
+    "v_fmac_f32": "F32Fma({a}, {b}, {d})",
+    "v_mac_f32": "F32Fma({a}, {b}, {d})",
+    "v_fma_f32": "F32Fma({a}, {b}, {c})",
+    "v_mad_f32": "F32Fma({a}, {b}, {c})",
     "v_fma_legacy_f32": "FmaLegacyF32({a}, {b}, {c})",
-    "v_fmamk_f32": "asuint(mad(asfloat({a}), asfloat({k}), asfloat({b})))",
-    "v_fmaak_f32": "asuint(mad(asfloat({a}), asfloat({b}), asfloat({k})))",
+    "v_fmamk_f32": "F32Fma({a}, {k}, {b})",
+    "v_fmaak_f32": "F32Fma({a}, {b}, {k})",
     "v_rcp_f32": "asuint(rcp(asfloat({a})))",
     "v_rsq_f32": "asuint(rsqrt(asfloat({a})))",
     "v_sqrt_f32": "asuint(sqrt(asfloat({a})))",
