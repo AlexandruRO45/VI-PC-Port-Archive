@@ -327,3 +327,178 @@ fn what_is_not_a_pe32_plus_image_is_an_error() {
     put16(&mut x86, FILE_HEADER, 0x014C);
     assert!(prepare(&x86).is_err());
 }
+
+/// Applies every DIR64 base relocation in `bytes` for a load `delta` bytes
+/// above the preferred base, as the Windows or Wine loader does on a rebase.
+fn rebase(bytes: &mut [u8], delta: u64) {
+    let info = ImageInfo::parse(bytes).unwrap();
+    let d = dir_offset(dir::BASERELOC);
+    let (rva, size) = (
+        layout::read_u32(bytes, d).unwrap(),
+        layout::read_u32(bytes, d + 4).unwrap(),
+    );
+    if rva == 0 || size == 0 {
+        return;
+    }
+    let start = info.rva_to_file_offset(rva).unwrap() as usize;
+    let end = start + size as usize;
+    let mut at = start;
+    while at + 8 <= end {
+        let page = layout::read_u32(bytes, at).unwrap();
+        let block = layout::read_u32(bytes, at + 4).unwrap() as usize;
+        assert!(block >= 8 && at + block <= end, "well-formed blocks only");
+        for entry in (at + 8..at + block).step_by(2) {
+            let e = u16::from_le_bytes([bytes[entry], bytes[entry + 1]]);
+            if e >> 12 == 10 {
+                let target = info
+                    .rva_to_file_offset(page + u32::from(e & 0xFFF))
+                    .unwrap() as usize;
+                let v = layout::read_u64(bytes, target).unwrap();
+                put64(bytes, target, v.wrapping_add(delta));
+            }
+        }
+        at += block;
+    }
+}
+
+#[test]
+fn a_rebase_keeps_the_cleared_callback_pointer_at_zero() {
+    // Wine maps DYNAMIC_BASE images away from their preferred base, so the
+    // loader applies every relocation before it looks at the TLS directory.
+    let delta = 0x7_0000_0000;
+    let original = image();
+    let mut mapped = prepare(&original).unwrap().bytes;
+    rebase(&mut mapped, delta);
+    let tls = file(TLS);
+    assert_eq!(
+        layout::read_u64(&mapped, tls + layout::TLS64_ADDRESS_OF_CALLBACKS),
+        Some(0),
+        "a relocated 0 would point the loader at callbacks below the image"
+    );
+    // The other pointers still move with the image.
+    assert_eq!(
+        layout::read_u64(&mapped, tls + 16),
+        Some(IMAGE_BASE + u64::from(TLS_INDEX) + delta)
+    );
+    assert_eq!(
+        layout::read_u64(&mapped, file(CALLBACKS)),
+        Some(IMAGE_BASE + u64::from(CODE) + delta)
+    );
+
+    // Without prepare's no-op, the same rebase would leave `delta` there.
+    let mut unpatched = original;
+    put64(
+        &mut unpatched,
+        file(callbacks_field()),
+        0, // what prepare writes, relocation left alone
+    );
+    rebase(&mut unpatched, delta);
+    assert_eq!(
+        layout::read_u64(&unpatched, file(callbacks_field())),
+        Some(delta)
+    );
+}
+
+#[test]
+fn the_callback_relocation_is_found_in_a_later_block() {
+    // Two blocks: the first covers the import page with a HIGHLOW entry for
+    // the same RVA (not a 64-bit pointer, so not ours to touch), the second
+    // holds the DIR64 entry for the callbacks pointer.
+    let mut original = image();
+    let first = file(RELOCS);
+    put32(&mut original, first, SECTION_RVA);
+    put32(&mut original, first + 4, 12);
+    put16(
+        &mut original,
+        first + 8,
+        (3 << 12) | (callbacks_field() - SECTION_RVA) as u16,
+    );
+    put16(&mut original, first + 10, dir64(TLS + 16));
+    let second = first + 12;
+    put32(&mut original, second, SECTION_RVA);
+    put32(&mut original, second + 4, 12);
+    put16(&mut original, second + 8, dir64(callbacks_field()));
+    put16(&mut original, second + 10, 0); // ABSOLUTE padding
+    set_dir(&mut original, dir::BASERELOC, RELOCS, 24);
+
+    let prepared = prepare(&original).unwrap();
+    assert_eq!(&prepared.bytes[second + 8..][..2], &[0, 0]);
+    assert_eq!(
+        &prepared.bytes[first + 8..first + 12],
+        &original[first + 8..first + 12],
+        "the HIGHLOW entry and the index pointer's entry are left alone"
+    );
+}
+
+#[test]
+fn damaged_or_missing_relocations_still_clear_the_callback_pointer() {
+    type Damage = (&'static str, fn(&mut Vec<u8>));
+    let cases: [Damage; 5] = [
+        ("no relocation directory", |b| {
+            set_dir(b, dir::BASERELOC, 0, 0)
+        }),
+        ("relocation directory of size 0", |b| {
+            set_dir(b, dir::BASERELOC, RELOCS, 0)
+        }),
+        ("relocation directory outside the file", |b| {
+            set_dir(b, dir::BASERELOC, 0x8000, 16)
+        }),
+        ("block shorter than its header", |b| {
+            put32(b, file(RELOCS) + 4, 4)
+        }),
+        ("block longer than the directory", |b| {
+            put32(b, file(RELOCS) + 4, 0x1000)
+        }),
+    ];
+    for (what, damage) in cases {
+        let mut original = image();
+        damage(&mut original);
+        let prepared = prepare(&original).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(
+            layout::read_u64(&prepared.bytes, file(callbacks_field())),
+            Some(0),
+            "{what}"
+        );
+        // No relocation entry was rewritten from a block that was not read.
+        assert_eq!(
+            &prepared.bytes[file(RELOCS)..file(RELOCS) + 16],
+            &original[file(RELOCS)..file(RELOCS) + 16],
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn tls_without_callbacks_leaves_its_relocations_alone() {
+    let mut original = image();
+    put64(&mut original, file(callbacks_field()), 0);
+    let prepared = prepare(&original).unwrap();
+    assert!(prepared.info.tls.as_ref().unwrap().callback_rvas.is_empty());
+    assert_eq!(
+        &prepared.bytes[file(RELOCS)..file(RELOCS) + 16],
+        &original[file(RELOCS)..file(RELOCS) + 16]
+    );
+}
+
+#[test]
+fn preparing_a_prepared_image_changes_nothing() {
+    let once = prepare(&image()).unwrap();
+    let twice = prepare(&once.bytes).unwrap();
+    assert_eq!(twice.bytes, once.bytes);
+    assert!(twice.info.is_dll());
+    assert!(twice.info.imports.is_empty());
+    assert_ne!(twice.file_name(), once.file_name());
+}
+
+#[test]
+fn a_title_dll_stays_a_dll_with_its_other_flags() {
+    let mut original = image();
+    let flags = FILE_HEADER + layout::FILE_HEADER_CHARACTERISTICS;
+    put16(&mut original, flags, 0x0022 | file_flags::DLL);
+    let prepared = prepare(&original).unwrap();
+    assert!(prepared.info.is_dll());
+    assert_eq!(
+        ImageInfo::parse(&prepared.bytes).unwrap().characteristics,
+        0x0022 | file_flags::DLL
+    );
+}
