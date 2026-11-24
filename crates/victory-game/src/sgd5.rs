@@ -2401,4 +2401,61 @@ mod tests {
             assert_eq!(found.last().unwrap().name, Some("PS_after"), "keep {keep}");
         }
     }
+
+    #[test]
+    fn stream_broken_where_the_probe_ends_is_noise_only_if_the_probe_sees_the_break() {
+        // A stored block's header is 5 bytes; a broken one (its NLEN not
+        // the complement of its LEN) is told only once all 5 are read. Put
+        // just inside the probe, the break makes the outer record noise and
+        // the record it stores wins; one byte later, the probe ends inside
+        // the broken header, which reads as a stream cut off, and the outer
+        // record wins over the one it stores.
+        let inner = record_bytes("PS_inner", 0x32, b"stored early");
+        let bad_header = [1, 4, 0, 4, 0];
+        for broken_at in [PROBE - 6, PROBE - 5, PROBE - 4, PROBE - 1, PROBE] {
+            let mut first = b"DXBC head ".to_vec();
+            let inner_at = first.len();
+            first.extend_from_slice(&inner);
+            first.resize(broken_at - 5, b'.');
+            let mut packed = stored_block(&first);
+            assert_eq!(packed.len(), broken_at);
+            packed.extend_from_slice(&bad_header);
+            packed.extend_from_slice(b"wxyz");
+            let stated = first.len() + 4;
+            let seen = broken_at + bad_header.len() <= PROBE;
+            assert_eq!(
+                starts_stream(&packed, stated),
+                !seen,
+                "break at {broken_at}"
+            );
+
+            let (file, marker) = outer_then_after(&packed, stated);
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            let stored =
+                marker + 12 + 5 + inner_at + memchr::memmem::find(&inner, &MARKER).unwrap();
+            assert_eq!(&file[stored..stored + 4], &MARKER);
+            if seen {
+                assert_eq!(
+                    names,
+                    [Some("PS_inner"), Some("PS_after")],
+                    "break at {broken_at}"
+                );
+                assert_eq!(found[0].offset, stored, "break at {broken_at}");
+                assert_eq!(found[0].unpack().as_deref(), Some(&b"stored early"[..]));
+                assert!(!in_record(&found, marker), "break at {broken_at}");
+            } else {
+                assert_eq!(
+                    names,
+                    [Some("PS_outer"), Some("PS_after")],
+                    "break at {broken_at}"
+                );
+                assert_eq!(found[0].span(), marker..marker + 12 + packed.len());
+                assert_eq!(found[0].unpack(), None, "break at {broken_at}");
+                assert!(in_record(&found, stored), "break at {broken_at}");
+            }
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
+            assert_eq!(found[1].span().end, file.len(), "break at {broken_at}");
+        }
+    }
 }
