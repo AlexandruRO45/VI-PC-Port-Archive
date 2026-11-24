@@ -26,6 +26,8 @@
 
 
 use crate::ShaderError;
+use std::collections::{HashMap, HashSet};
+
 use crate::hash::{Map, Set};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, VCC, Value};
@@ -253,7 +255,7 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget, &mut Set::default())
+        self.meet_in(all.to_vec(), &mut budget, &mut HashSet::new())
     }
 
     /// `refuted`: conditions no lane meets, so a split reaching them again
@@ -262,7 +264,7 @@ impl Bools {
         &self,
         mut all: Vec<(Bool, bool)>,
         budget: &mut usize,
-        refuted: &mut Set<Vec<(Bool, bool)>>,
+        refuted: &mut HashSet<Vec<(Bool, bool)>>,
     ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
@@ -317,7 +319,7 @@ impl Bools {
 
     /// `b` with every atom born at reverse-postorder index `from` or later
     /// existentially quantified: what still holds once those are redefined.
-    fn forget(&mut self, b: Bool, from: usize, memo: &mut Map<Bool, Bool>) -> Bool {
+    fn forget(&mut self, b: Bool, from: usize, memo: &mut HashMap<Bool, Bool>) -> Bool {
         if self.overflow {
             return Bool::FALSE;
         }
@@ -342,7 +344,7 @@ impl Bools {
     /// `b` with every variable in `values` (sorted by variable) replaced by
     /// its value. Nothing below a node testing a later variable than the
     /// last of them changes.
-    fn restrict(&mut self, b: Bool, values: &[(u32, bool)], memo: &mut Map<Bool, Bool>) -> Bool {
+    fn restrict(&mut self, b: Bool, values: &[(u32, bool)], memo: &mut HashMap<Bool, Bool>) -> Bool {
         let (v, lo, hi) = self.nodes[b.0 as usize];
         if v == TERMINAL || values.last().is_none_or(|&(last, _)| v > last) {
             return b;
@@ -386,7 +388,7 @@ impl Bools {
             return b;
         }
         values.sort_unstable();
-        self.restrict(b, &values, &mut Map::default())
+        self.restrict(b, &values, &mut HashMap::new())
     }
 }
 
@@ -420,24 +422,24 @@ pub struct Structured {
     /// edges; a loop header forgets what its loop redefines).
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
-    pub masks: Map<Value, Bool>,
+    pub masks: HashMap<Value, Bool>,
     /// Lane masks not derived from EXEC or VALU results (constants, opaque
     /// values, uniform selects) resolved at uses such as `v_cndmask_b32`.
-    pub other: Map<Value, Bool>,
+    pub other: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
-    paired_masks: Map<Key, Bool>,
+    paired_masks: HashMap<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
-    pub highs: Map<Value, Value>,
+    pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
-    pub active: Set<Value>,
+    pub active: HashSet<Value>,
     /// `v_readlane_b32` results of a constant lane: the SGPR value that
     /// `v_writelane_b32` spilled to that lane, the same along every path.
-    pub restored: Map<Value, Value>,
+    pub restored: HashMap<Value, Value>,
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
-    pub discards: Map<(usize, usize), Bool>,
+    pub discards: HashMap<(usize, usize), Bool>,
 }
 
 impl Structured {
@@ -492,19 +494,19 @@ struct Lanes<'a> {
     /// Per block, in predecessor order: (block, over its taken edge).
     incoming: Vec<Vec<(usize, bool)>>,
     /// Block and instruction index writing each value.
-    defs: Map<Value, (usize, usize)>,
+    defs: HashMap<Value, (usize, usize)>,
     /// Block and index of each phi value.
-    phis: Map<Value, (usize, usize)>,
+    phis: HashMap<Value, (usize, usize)>,
     /// Mask joins found wrong when resolved to a constant: atoms instead.
-    unresolved: Set<Value>,
+    unresolved: HashSet<Value>,
     b: Bools,
     /// Masks derived from EXEC and VALU results.
-    masks: Map<Key, Bool>,
+    masks: HashMap<Key, Bool>,
     /// Other values read as masks: constants, uniform selects, opaque ones.
-    other: Map<Key, Bool>,
+    other: HashMap<Key, Bool>,
     /// For branches: SCC of a mask operation ("some lane is set") as the
     /// lane's own bit.
-    scc_lane: Map<Value, Bool>,
+    scc_lane: HashMap<Value, Bool>,
     /// Joins resolved to a constant, to check once all edges are known.
     joins: Vec<Join>,
     /// Per block: what a lane knows on entry, over forward edges only.
@@ -512,12 +514,12 @@ struct Lanes<'a> {
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
-    active: Set<Value>,
+    active: HashSet<Value>,
     /// See [`Structured::restored`].
-    restored: Map<Value, Value>,
+    restored: HashMap<Value, Value>,
     /// A pixel's discards (see [`Structured::discards`]) by block and
     /// instruction.
-    kills: Set<(usize, usize)>,
+    kills: HashSet<(usize, usize)>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -551,7 +553,7 @@ impl<'a> Lanes<'a> {
         }
         check_reducible(p, &order, &index)?;
         let mut incoming = vec![Vec::new(); blocks.len()];
-        let (mut defs, mut phis) = (Map::default(), Map::default());
+        let (mut defs, mut phis) = (HashMap::new(), HashMap::new());
         for (b, block) in blocks.iter().enumerate() {
             for (k, s) in block.exit.successors().into_iter().enumerate() {
                 incoming[s].push((b, k == 0));
@@ -572,17 +574,17 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
-            unresolved: Set::default(),
+            unresolved: HashSet::new(),
             b: Bools::new(),
-            masks: Map::default(),
-            other: Map::default(),
-            scc_lane: Map::default(),
+            masks: HashMap::new(),
+            other: HashMap::new(),
+            scc_lane: HashMap::new(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
-            active: Set::default(),
-            restored: Map::default(),
-            kills: Set::default(),
+            active: HashSet::new(),
+            restored: HashMap::new(),
+            kills: HashSet::new(),
         };
         for block in blocks {
             if let Exit::Branch { taken, not_taken } = block.exit
@@ -845,7 +847,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 { self.masks } else { HashMap::new() },
             active: self.active,
             restored: self.restored.into_iter().collect(),
             discards: self
@@ -1344,7 +1346,7 @@ impl<'a> Lanes<'a> {
                     let (q, taken) = self.incoming[s][k];
                     let mut e = self.edge(cond[q], q, taken);
                     if i <= self.index[q] {
-                        e = self.b.forget(e, i, &mut Map::default());
+                        e = self.b.forget(e, i, &mut HashMap::new());
                     }
                     c = self.b.or(c, e);
                 }
@@ -1642,7 +1644,7 @@ mod tests {
         f: Bool,
         v: u32,
         value: bool,
-        memo: &mut Map<Bool, Bool>,
+        memo: &mut HashMap<Bool, Bool>,
     ) -> Bool {
         let (bv, lo, hi) = b.nodes[f.0 as usize];
         if bv == TERMINAL || bv > v {
@@ -1667,9 +1669,9 @@ mod tests {
             let x = b.mk(v, Bool::FALSE, Bool::TRUE);
             let nx = b.not(x);
             if b.implies(known, x) {
-                f = restrict_one(b, f, v, true, &mut Map::default());
+                f = restrict_one(b, f, v, true, &mut HashMap::new());
             } else if b.implies(known, nx) {
-                f = restrict_one(b, f, v, false, &mut Map::default());
+                f = restrict_one(b, f, v, false, &mut HashMap::new());
             }
         }
         f
@@ -1796,7 +1798,7 @@ mod tests {
             let f = pairs_equal(&mut b, &xs, n);
             let count = vars_by_scan(&b, f).len();
             let size = {
-                let (mut seen, mut stack) = (Set::default(), vec![f]);
+                let (mut seen, mut stack) = (HashSet::new(), vec![f]);
                 while let Some(g) = stack.pop() {
                     let (v, lo, hi) = b.nodes[g.0 as usize];
                     if v != TERMINAL && seen.insert(g) {
