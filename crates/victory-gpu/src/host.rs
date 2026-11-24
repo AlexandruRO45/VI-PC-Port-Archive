@@ -406,6 +406,9 @@ mod tests {
         use windows::core::s;
 
         let Some(host) = host() else {
+            if std::env::var_os("VICTORY_REQUIRE_UNIFIED_ARENA").is_some() {
+                panic!("D3D12 host device unavailable while VICTORY_REQUIRE_UNIFIED_ARENA=1");
+            }
             eprintln!("no D3D12 device; skipped");
             return;
         };
@@ -417,6 +420,11 @@ mod tests {
         // not depend on being the first caller of Host::unified_buffer.
         let arena = match UnifiedArena::new(&host.device) {
             Ok(arena) => arena,
+            Err(error) if std::env::var_os("VICTORY_REQUIRE_UNIFIED_ARENA").is_some() => {
+                panic!(
+                    "CPU-visible custom placed heaps are unavailable while VICTORY_REQUIRE_UNIFIED_ARENA=1: {error}"
+                );
+            }
             Err(error) => {
                 eprintln!("CPU-visible custom placed heaps are not supported; skipped: {error}");
                 return;
