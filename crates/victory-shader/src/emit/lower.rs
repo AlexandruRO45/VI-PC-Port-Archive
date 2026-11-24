@@ -45,6 +45,13 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Mesh: whether this program bounds its vertex and primitive lanes
+    /// (its group is larger than the outputs it declares).
+    #[cfg(test)]
+    pub mesh_bounds: (bool, bool),
+    /// Mesh: the vertex count `exp prim`'s indices are culled against.
+    #[cfg(test)]
+    pub mesh_index_bound: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -208,6 +215,9 @@ struct Lower<'a> {
     mesh_vertex_ok: Option<V>,
     /// Mesh: likewise for its primitive index.
     mesh_primitive_ok: Option<V>,
+    /// Mesh: the vertex count primitive indices are culled against.
+    #[cfg(test)]
+    mesh_index_bound: Option<u32>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -657,6 +667,8 @@ impl<'a> Lower<'a> {
             flat: None,
             mesh_vertex_ok: None,
             mesh_primitive_ok: None,
+            #[cfg(test)]
+            mesh_index_bound: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -1202,6 +1214,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            mesh_bounds: (self.mesh_vertex_ok.is_some(), self.mesh_primitive_ok.is_some()),
+            #[cfg(test)]
+            mesh_index_bound: self.mesh_index_bound,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -8292,7 +8308,12 @@ impl<'a> Lower<'a> {
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let n = self.s.m.i32(self.s.mesh.expect("mesh").max_vertices);
+        let max_vertices = self.s.mesh.expect("mesh").max_vertices;
+        #[cfg(test)]
+        {
+            self.mesh_index_bound = Some(max_vertices);
+        }
+        let n = self.s.m.i32(max_vertices);
         let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
@@ -9217,5 +9238,94 @@ mod tests {
             ],
             "the pointer's dwords feed the root view"
         );
+    }
+
+    /// Lowers a mesh program exporting position (`exp pos0`) and a
+    /// primitive from v9 (`exp prim`), in a group of `threads` threads
+    /// declaring `max_vertices` vertices and `max_primitives` primitives.
+    fn lower_mesh(
+        threads: u32,
+        max_vertices: u32,
+        max_primitives: u32,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let words = [
+            0x7E04_0505,             // v_readfirstlane_b32 s2, v5
+            0xF800_08CF, 0x0302_0100, // exp pos0, v0, v1, v2, v3
+            0xF800_0941, 0x0000_0009, // exp prim, v9, off, off, off done
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads,
+                max_vertices,
+                max_primitives,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let position = crate::emit::container::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 2,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![position],
+            prims: vec![],
+            mesh_stride: threads,
+        })
+    }
+
+    #[test]
+    fn a_mesh_shader_beyond_the_hosts_limits_is_refused() {
+        // `setMeshOutputCounts` is emitted with the program's declared
+        // maxima, so they have to be the host's too (128 threads, 256
+        // vertices and primitives).
+        assert!(lower_mesh(128, 256, 256).is_ok());
+        assert!(lower_mesh(256, 128, 128).is_err());
+        assert!(lower_mesh(32, 512, 128).is_err());
+        assert!(lower_mesh(32, 128, 512).is_err());
+    }
+
+    #[test]
+    fn a_mesh_group_larger_than_its_declaration_bounds_its_lanes() {
+        // The console's `exp prim` carries 10-bit indices, which can name up
+        // to 1023 vertices, and a group may run more threads than the program
+        // declares outputs. Both are undefined behaviour on the host (AMD
+        // hardware hangs on a primitive naming a vertex it does not have), so
+        // a group larger than its declaration has to bound its lanes and cull
+        // the indices past the vertices it declares.
+        let narrow = lower_mesh(128, 64, 32).unwrap();
+        assert_eq!(narrow.mesh_bounds, (true, true), "both lane bounds");
+        assert_eq!(narrow.mesh_index_bound, Some(64), "the declared vertices");
+
+        let exact = lower_mesh(128, 128, 128).unwrap();
+        assert_eq!(exact.mesh_bounds, (false, false), "nothing to bound");
+        assert_eq!(exact.mesh_index_bound, Some(128), "the declared vertices");
     }
 }
