@@ -655,6 +655,58 @@ mod tests {
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
     }
 
+    // Both branches feed the accumulator in v4 to one interpolation at the join.
+    fn joined_interpolation(taken: u32) -> Result<Io, ShaderError> {
+        let p = program(&[
+            0xBF85_0002, // s_cbranch_scc1 -> 12
+            0xC810_0000, // v_interp_p1_f32 v4, v0, attr0.x
+            0xBF82_0001, // s_branch -> 16
+            taken,
+            0xC811_0001, // v_interp_p2_f32 v4, v1, attr0.x
+            S_ENDPGM,
+        ]);
+        // Perspective center in v0/v1, linear center in v2/v3.
+        raise(&p, &pixel(vec![TEXCOORD], (1 << 1) | (1 << 5)))
+    }
+
+    #[test]
+    fn interpolation_at_a_join_records_both_first_halves() {
+        let io = joined_interpolation(0xC810_0000).unwrap();
+        let [
+            (
+                (3, 0),
+                Interp::Interpolated {
+                    attribute,
+                    barycentric,
+                    first,
+                },
+            ),
+        ] = io.interps.as_slice()
+        else {
+            panic!("unexpected interpolation sites: {:?}", io.interps);
+        };
+        assert_eq!(*barycentric, Barycentric::PerspectiveCenter);
+        assert_eq!((attribute.row, attribute.channel), (TEXCOORD.row, 0));
+        let mut first = first.clone();
+        first.sort_unstable();
+        assert_eq!(first, [(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn interpolation_at_a_join_checks_each_incoming_value() {
+        for (taken, what) in [
+            (0xC810_0100, "interpolation halves of different attributes"), // attr0.y
+            (0xC810_0002, "an interpolation with computed barycentrics"),  // linear i
+            (0x7E08_0300, "an interpolation without its first half"),      // v_mov_b32 v4, v0
+        ] {
+            assert_eq!(
+                joined_interpolation(taken),
+                Err(ShaderError::Unsupported { offset: 16, what }),
+                "taken instruction {taken:#x}"
+            );
+        }
+    }
+
     #[test]
     fn unpaired_or_unknown_interpolation_fails() {
         // p2 alone: its old dst is no p1's result.
