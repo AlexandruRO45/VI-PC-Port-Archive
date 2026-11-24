@@ -132,10 +132,10 @@ impl Tracker {
             state.queued_with_dependency_wait_periods =
                 state.queued_with_dependency_wait_periods.saturating_add(1);
         }
-        let entered_all_registered_workers_backlog =
+        let entered_full_pool_backlog =
             !had_full_pool_backlog
                 && state.has_full_pool_backlog();
-        if entered_all_registered_workers_backlog {
+        if entered_full_pool_backlog {
             state.all_pool_workers_waiting_with_queue_periods = state
                 .all_pool_workers_waiting_with_queue_periods
                 .saturating_add(1);
@@ -146,7 +146,7 @@ impl Tracker {
         state.peak_dependency_waiters =
             state.peak_dependency_waiters.max(state.dependency_waiters);
 
-        entered_all_registered_workers_backlog
+        entered_full_pool_backlog
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -184,7 +184,7 @@ fn tracker() -> &'static Tracker {
     TRACKER.get_or_init(Tracker::new)
 }
 
-/// Applies a state change and reports immediately when every registered
+/// Applies a state change and reports immediately when every spawned pool
 /// worker becomes dependency-blocked while at least one pipeline remains queued.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn update(change: impl FnOnce(&mut State)) {
