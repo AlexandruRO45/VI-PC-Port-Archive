@@ -2390,6 +2390,42 @@ mod tests {
         super::run(root, false).unwrap();
     }
 
+    /// A `/**/` between two components matches zero or more directories,
+    /// so `/a/**/deep/` takes both `a/deep` and `a/b/c/deep`, but never a
+    /// partial component: `ab/deep` stays visible. A range `[0-9]` takes
+    /// `run7` and refuses `runx`. Asterisks not set off by slashes are
+    /// plain `*`, so `/x**y/` takes `xzzy` but never spans `x/y`.
+    #[cfg(unix)]
+    #[test]
+    fn temporary_directories_are_matched_by_double_stars_and_ranges() {
+        let repo = tempdir();
+        let root = repo.path();
+        git_str(root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "/a/**/deep/\n/run[0-9]/\n/x**y/\n").unwrap();
+        let taken = ["a/deep", "a/b/c/deep", "run7", "xzzy"].map(|d| root.join(d));
+        let refused = ["ab/deep", "ab/deep", "runx", "x/y"].map(|d| root.join(d));
+        for dir in taken.iter().chain(&refused) {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut tmps = Vec::new();
+        for (seen, hidden) in refused.iter().zip(&taken) {
+            let tmp = tempdir_in_first(root, [seen.clone(), hidden.clone()]);
+            assert_eq!(tmp.path().parent(), Some(hidden.as_path()));
+            assert_eq!(std::fs::read_dir(seen).unwrap().count(), 0);
+            std::fs::write(tmp.path().join("game.bin"), b"MZ\x90\0fixture").unwrap();
+            tmps.push(tmp);
+        }
+        for dir in ["ab/deep", "runx", "x/y"] {
+            std::fs::write(root.join(dir).join("f.rs"), b"fn f() {}\n").unwrap();
+        }
+        assert_eq!(
+            names(root, false),
+            [".gitignore", "ab/deep/f.rs", "runx/f.rs", "x/y/f.rs"]
+        );
+        super::run(root, false).unwrap();
+    }
+
     /// A CARGO_TARGET_DIR that is the checkout itself is never passed over,
     /// whatever its tag says: the whole tree would go unchecked. What is
     /// built there is listed, in a repository and outside one, and passing
