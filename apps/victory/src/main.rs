@@ -6,6 +6,7 @@
 mod census;
 mod inspect;
 mod run;
+mod session;
 mod shader;
 mod translate;
 
@@ -160,7 +161,12 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            // One session at a time, held by the operating system: a second
+            // process leaves here, before it touches the GPU (CREW.md).
+            let _session = session::take()?;
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }
