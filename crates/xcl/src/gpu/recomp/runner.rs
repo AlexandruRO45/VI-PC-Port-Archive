@@ -454,21 +454,29 @@ pub fn mesh_shaders_supported() -> Result<bool, String> {
 /// "no wave64", "no mesh shaders": `SKIPPED <test>: <reason>` written to stderr itself, so the
 /// line shows without `--nocapture` (libtest captures only `print!` / `eprint!`), and
 /// `scripts/test.ps1` counts them. `XCL_REQUIRE_GPU=wave64` or `=mesh` (or both, comma-separated)
-/// turns a skip that leaves that coverage out into a failure.
+/// turns a skip that leaves that coverage out into a failure. A skip because an opt-in feature
+/// is off ("no heap windows": `XCL_HEAP_WINDOWS`) says nothing about the adapter and never fails.
 pub fn skip_test(reason: &str) {
     use std::io::Write;
     let thread = std::thread::current();
     let test = thread.name().unwrap_or("?");
     let required = std::env::var("XCL_REQUIRE_GPU").unwrap_or_default();
-    let fails = required.split(',').map(str::trim).any(|r| match r {
-        "wave64" => reason != "no mesh shaders",
-        "mesh" => reason != "no wave64",
-        _ => false,
-    });
-    if fails {
+    if skip_fails(reason, &required) {
         panic!("{test}: {reason}, but XCL_REQUIRE_GPU={required}");
     }
     let _ = writeln!(std::io::stderr(), "SKIPPED {test}: {reason}");
+}
+
+/// Whether a skip for `reason` fails under `XCL_REQUIRE_GPU=required`.
+fn skip_fails(reason: &str, required: &str) -> bool {
+    if reason == "no heap windows" {
+        return false;
+    }
+    required.split(',').map(str::trim).any(|r| match r {
+        "wave64" => reason != "no mesh shaders",
+        "mesh" => reason != "no wave64",
+        _ => false,
+    })
 }
 
 /// Run a compiled kernel (DXIL) with `state` and flat memory `mem`.
@@ -1591,5 +1599,28 @@ fn dispatch_with(
             stamps_buf.Unmap(0, None);
         }
         Ok((out, ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skip_fails;
+
+    #[test]
+    fn require_gpu_fails_skips_that_leave_its_coverage_out() {
+        assert!(!skip_fails("no GPU", ""));
+        assert!(skip_fails("no GPU", "mesh"));
+        assert!(skip_fails("no mesh shaders", "mesh"));
+        assert!(!skip_fails("no wave64", "mesh"));
+        assert!(skip_fails("no wave64", "wave64"));
+        assert!(!skip_fails("no mesh shaders", "wave64"));
+        assert!(skip_fails("no wave64", "mesh, wave64"));
+    }
+
+    #[test]
+    fn require_gpu_passes_an_opt_in_feature_that_is_off() {
+        for required in ["", "mesh", "wave64", "wave64,mesh"] {
+            assert!(!skip_fails("no heap windows", required), "XCL_REQUIRE_GPU={required}");
+        }
     }
 }
