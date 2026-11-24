@@ -718,6 +718,17 @@ fn allows(resource: &ID3D12Resource, flag: D3D12_RESOURCE_FLAGS) -> bool {
     unsafe { resource.GetDesc() }.Flags.0 & flag.0 != 0
 }
 
+/// Whether `resource` can take a render target view: a clear of one it cannot
+/// take is an invalid call, not a no-op.
+pub(crate) fn clears_render_target(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)
+}
+
+/// Whether `resource` can take a depth view, as [`clears_render_target`].
+pub(crate) fn clears_depth(resource: &ID3D12Resource) -> bool {
+    allows(resource, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+}
+
 /// Says once for each kind which view was made null for lack of permission.
 fn once_render(resource: &ID3D12Resource, kind: &'static str) {
     static ONCE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
