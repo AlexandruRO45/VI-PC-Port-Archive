@@ -6360,6 +6360,16 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A person's keyboard and an injected `SendInput` both arrive here and
+    // only while this window is foreground; the async key state a real
+    // keyboard updates never sees the injected ones. The input source reads
+    // this set, so both reach the title by the same route.
+    match message {
+        WM_KEYDOWN | WM_SYSKEYDOWN => crate::keys::down(wparam.0 as u8),
+        WM_KEYUP | WM_SYSKEYUP => crate::keys::up(wparam.0 as u8),
+        WM_KILLFOCUS => crate::keys::release_all(),
+        _ => {}
+    }
     // SAFETY: the default handling for our window.
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
