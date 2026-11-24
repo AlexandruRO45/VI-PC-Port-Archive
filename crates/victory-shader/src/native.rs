@@ -894,16 +894,16 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
         if offset == u32::MAX {
             continue;
         }
-        if (offset as usize + size) * 4 > code_len {
+        let start = u64::from(offset);
+        let end = start + size as u64;
+        if end > (code_len / 4) as u64 {
             return Err(Malformed("export patch outside the code"));
         }
         // `patched_code` writes the patches in MRT order: a later one over an
         // earlier one's dwords would clobber that export with no error.
-        let (start, end) = (offset as usize, offset as usize + size);
-        if patches
-            .iter()
-            .any(|p: &ExportPatch| start < p.offset as usize + size && (p.offset as usize) < end)
-        {
+        if patches.iter().any(|p: &ExportPatch| {
+            start < u64::from(p.offset) + size as u64 && u64::from(p.offset) < end
+        }) {
             return Err(Malformed("export patches overlap"));
         }
         let full = at + 4 + PATCH_FULL * PATCH_SLOT_DWORDS * 4;
@@ -1458,6 +1458,35 @@ mod tests {
 
         blob[patch..][..4].copy_from_slice(&3u32.to_le_bytes());
         assert!(native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).is_err());
+    }
+
+    #[test]
+    fn export_patches_use_complete_dwords_at_their_stated_offsets() {
+        let size = PATCH_SLOT_DWORDS;
+        let code = vec![0x55; 2 * size * 4 + 3];
+        let mut blob = fssm(&[(HwStage::Ps, &code)]);
+        let data = stage_data_at(&blob, HwStage::Ps);
+        blob[data + PS_PATCH_SIZE..][..4].copy_from_slice(&(size as u32).to_le_bytes());
+        // The last MRT patches the first half, and MRT0 patches the second.
+        let last = data + PS_PATCHES + (MRTS - 1) * PATCH_BYTES;
+        for (at, offset, fill) in [(data + PS_PATCHES, size as u32, 0xaa), (last, 0, 0xbb)] {
+            blob[at..][..4].copy_from_slice(&offset.to_le_bytes());
+            let full = at + 4 + PATCH_FULL * size * 4;
+            blob[full..][..size * 4].fill(fill);
+        }
+        let programs = native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap();
+        let mut expected = code.clone();
+        expected[..size * 4].fill(0xbb);
+        expected[size * 4..2 * size * 4].fill(0xaa);
+        assert_eq!(programs[0].patched_code(), expected);
+        assert_eq!(programs[0].code, code);
+
+        // Moving MRT0 one dword would leave only three bytes for its last word.
+        // Large offsets must also be refused on hosts with 32-bit byte indices.
+        for offset in [size as u32 + 1, 1 << 30, u32::MAX - 1] {
+            blob[data + PS_PATCHES..][..4].copy_from_slice(&offset.to_le_bytes());
+            assert_eq!(refused_blob(&xbch(&blob)), "export patch outside the code");
+        }
     }
 
     #[test]
