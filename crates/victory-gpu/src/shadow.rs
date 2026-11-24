@@ -597,6 +597,11 @@ pub(crate) fn refresh_mirror(from: usize, to: usize) -> usize {
     view.update_free(from, to)
 }
 
+/// The current submission's number (see [`next_submission`]).
+pub(crate) fn current_submission() -> u64 {
+    SUBMISSION.load(Ordering::Relaxed)
+}
+
 /// A new submission begins: pages must be checked again.
 pub(crate) fn next_submission() {
     SUBMISSION.fetch_add(1, Ordering::Relaxed);

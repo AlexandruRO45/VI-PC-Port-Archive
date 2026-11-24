@@ -48,7 +48,75 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+/// Local build: what was asked of the kernel in the current submission: ranges covered (their
+/// journal is current), and the extents of private allocations (one asking covers them whole).
+struct Cover {
+    submission: u64,
+    ranges: Vec<(usize, usize)>,
+}
+static COVER: Mutex<Cover> = Mutex::new(Cover { submission: 0, ranges: Vec::new() });
+static EXTENTS: Mutex<Option<std::collections::HashMap<usize, (usize, usize, bool)>>> = Mutex::new(None);
+
+/// The allocation holding `at`: (base, end, private), cached by base.
+fn allocation(at: usize) -> Option<(usize, usize, bool)> {
+    use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let n = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    // SAFETY: queries only.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { VirtualQuery(at as *const _, &mut info, n) } == 0 {
+        return None;
+    }
+    let base = info.AllocationBase as usize;
+    if base == 0 {
+        return None;
+    }
+    if let Some(&e) = EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&base) {
+        return Some(e);
+    }
+    let private = info.Type == MEM_PRIVATE;
+    let mut end = base;
+    loop {
+        // SAFETY: a query only.
+        if unsafe { VirtualQuery(end as *const _, &mut info, n) } == 0 || info.AllocationBase as usize != base {
+            break;
+        }
+        end = info.BaseAddress as usize + info.RegionSize;
+    }
+    let e = (base, end, private);
+    EXTENTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(base, e);
+    Some(e)
+}
+
+/// Local build: [`writes_kernel`], asked once per submission for what it covers: a private
+/// allocation is asked whole (one call instead of the ~1,300 a world frame made on its
+/// pieces), and a range already covered in this submission is answered from the journal.
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let sub = crate::shadow::current_submission();
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let (a, b) = (first * PAGE, last * PAGE);
+    {
+        let mut c = COVER.lock().unwrap_or_else(|e| e.into_inner());
+        if c.submission != sub {
+            c.submission = sub;
+            c.ranges.clear();
+        }
+        if c.ranges.iter().any(|&(x, y)| x <= a && b <= y) {
+            let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            return Some((j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        }
+    }
+    // a private allocation of at most 2 GiB is asked whole
+    let (qa, qb) = match allocation(a) {
+        Some((base, top, true)) if top - base <= (2 << 30) && base <= a && b <= top => (base, top),
+        _ => (a, b),
+    };
+    let (now, _) = writes_kernel(qa, qb, guarded)?;
+    COVER.lock().unwrap_or_else(|e| e.into_inner()).ranges.push((qa / PAGE * PAGE, qb.div_ceil(PAGE) * PAGE));
+    let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    Some((now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+}
+
+fn writes_kernel(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
