@@ -337,6 +337,9 @@ const RENDER_TARGETS: u32 = 8;
 /// vertex and instance ids the console signature leaves out).
 const SIGNATURE_ELEMENTS: usize = u8::MAX as usize - 2;
 
+/// The longest semantic name DXC's validator accepts.
+const SEMANTIC_LEN: usize = 64;
+
 /// The rows of an `ISG1`/`OSG1` part.
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
@@ -371,6 +374,14 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             .get(name_at..)
             .and_then(|s| s.iter().position(|&b| b == 0).map(|end| &s[..end]))
             .ok_or(ShaderError::Malformed("signature name out of bounds"))?;
+        // The name goes into the emitted signature metadata as it is, and
+        // DXC's validator refuses a semantic outside 1 to 64 characters
+        // (`Meta.SemanticLen`), so the pipeline was lost after translation.
+        if !(1..=SEMANTIC_LEN).contains(&name.len()) {
+            return Err(ShaderError::Malformed(
+                "signature name outside 1 to 64 characters",
+            ));
+        }
         let mask = *part
             .get(at + 24)
             .ok_or(ShaderError::Malformed("truncated"))?;
@@ -862,6 +873,33 @@ mod tests {
                 signature(&part(name)).unwrap_err().to_string(),
                 ShaderError::Malformed("signature name out of bounds").to_string(),
                 "name {name:?}"
+            );
+        }
+    }
+
+    /// DXC's validator refuses a semantic name that is empty or longer
+    /// than 64 characters, so one is refused while the part is read.
+    #[test]
+    fn a_signature_name_outside_1_to_64_characters_is_refused() {
+        let part = |name: &[u8]| {
+            let mut p = Vec::new();
+            for w in [1, 8, 0, 40, 0, 0, 3, 1, 0x3, 0] {
+                p.extend_from_slice(&u32::to_le_bytes(w));
+            }
+            p.extend_from_slice(name);
+            p.push(0);
+            p
+        };
+        let longest = vec![b'A'; 64];
+        let rows = signature(&part(&longest)).expect("a 64-character name");
+        assert_eq!(rows[0].name.len(), 64);
+        assert_eq!(signature(&part(b"T")).unwrap()[0].name, "T");
+        for name in [&b""[..], &[b'A'; 65][..]] {
+            assert_eq!(
+                signature(&part(name)).unwrap_err().to_string(),
+                ShaderError::Malformed("signature name outside 1 to 64 characters").to_string(),
+                "name of {} characters",
+                name.len()
             );
         }
     }
