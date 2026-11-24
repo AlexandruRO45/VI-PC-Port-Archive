@@ -1582,4 +1582,50 @@ mod tests {
             assert_eq!(found[1].unpack().as_deref(), Some(&b"after"[..]));
         }
     }
+
+    #[test]
+    fn marker_straddling_a_records_end_is_neither_a_record_nor_hides_the_next() {
+        // A record's packed bytes (past the end of its deflate stream, which
+        // ignores them) end with the first bytes of a marker, and the next
+        // record's header supplies the rest: 3 bytes and its NUL, or 2 bytes
+        // and its NUL and kind. With all 4 in the packed bytes, the marker
+        // reads its sizes from the next record's header. Whichever, the
+        // marker lies in the first record, and both records are found.
+        let first = miniz_oxide::deflate::compress_to_vec(b"first", 6);
+        for (tail, nul, kind) in [
+            (&MARKER[..3], 0x00, 0x32),
+            (&MARKER[..2], MARKER[2], MARKER[3]),
+            (&MARKER[..], 0x00, 0x41),
+        ] {
+            let mut packed = first.clone();
+            packed.extend_from_slice(tail);
+            let n = (packed.len() + 12) as u32;
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x09PS_first\0\x32");
+            for v in [n, 0x000D_DCE7, n, 5] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&packed);
+            let end = file.len();
+            file.extend(bare_record(nul, kind, b"second"));
+            let straddling = end - tail.len();
+            assert_eq!(
+                file[straddling..straddling + 4],
+                MARKER,
+                "{} bytes",
+                tail.len()
+            );
+
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 2, "{} bytes", tail.len());
+            assert_eq!(found[0].name, Some("PS_first"));
+            assert_eq!(found[0].span().end, end);
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"first"[..]));
+            assert!(in_record(&found, straddling));
+            assert_eq!(found[1].offset, end + 6);
+            assert_eq!(found[1].kind, kind);
+            assert_eq!(found[1].name, None, "{} bytes", tail.len());
+            assert_eq!(found[1].unpack().as_deref(), Some(&b"second"[..]));
+        }
+    }
 }
