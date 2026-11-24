@@ -1300,4 +1300,62 @@ mod tests {
             assert_eq!(names, [Some("PS_after")], "n {n}");
         }
     }
+
+    #[test]
+    fn packed_bytes_at_the_lower_bound_are_a_record_and_one_fewer_is_not() {
+        // A 10320-byte container needs at least 10 packed bytes: 10 bytes
+        // that are no deflate stream (block type 3 is reserved) and cover no
+        // record are a corrupt record; 9 are not a record at all. Either
+        // way the real record right after them is found.
+        let unpacked = 1032 * 10;
+        assert_eq!(min_packed(unpacked), 10);
+        for (packed_len, corrupt) in [(10_u32, true), (9, false)] {
+            let mut file = MAGIC.to_vec();
+            file.extend_from_slice(b"\x05PS_l\0\x32");
+            let n = 12 + packed_len;
+            for v in [n, 0x000D_DCE7, n, unpacked as u32] {
+                file.extend_from_slice(&v.to_le_bytes());
+            }
+            file.extend_from_slice(&vec![0x07; packed_len as usize]);
+            file.extend(record_bytes("PS_after", 0x32, b"after"));
+            let found: Vec<_> = records(&file).collect();
+            let names: Vec<_> = found.iter().map(|r| r.name).collect();
+            if corrupt {
+                assert_eq!(names, [Some("PS_l"), Some("PS_after")]);
+                assert_eq!(found[0].unpack(), None);
+            } else {
+                assert_eq!(names, [Some("PS_after")]);
+            }
+            let last = found.last().expect("PS_after");
+            assert_eq!(
+                last.unpack().as_deref(),
+                Some(&b"after"[..]),
+                "{packed_len}"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_at_the_end_without_its_sizes_is_not_a_record() {
+        // A marker in the file's last bytes, with its header before it but
+        // none, some or all of its second `n` and unpacked size cut off: not
+        // a record, not a truncated one, and no out-of-bounds read. The
+        // record before it is still yielded.
+        let mut whole = MAGIC.to_vec();
+        whole.extend(record_bytes("PS_first", 0x32, b"first"));
+        let first_end = whole.len();
+        let mut tail = vec![0, 0x32];
+        for v in [64_u32, 0x000D_DCE7, 64, 64] {
+            tail.extend_from_slice(&v.to_le_bytes());
+        }
+        // Header and marker (10 bytes), then up to 7 of the 8 size bytes.
+        for keep in 10..tail.len() {
+            let mut file = whole.clone();
+            file.extend_from_slice(&tail[..keep]);
+            let found: Vec<_> = records(&file).collect();
+            assert_eq!(found.len(), 1, "{keep} bytes");
+            assert_eq!(found[0].span().end, first_end, "{keep} bytes");
+            assert_eq!(found[0].unpack().as_deref(), Some(&b"first"[..]));
+        }
+    }
 }
