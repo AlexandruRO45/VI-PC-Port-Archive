@@ -139,6 +139,23 @@ pub(crate) fn said(resource: usize, desc: &str, memory: usize, size: usize, host
         }
     }
     let plane = overlaps(memory, size);
+    // Whether the second view is *recorded*: a detector that cannot fire is
+    // the bug this crew has paid for, so both ends of it say what the view
+    // table holds before anything is made to depend on it.
+    if let Some(plane) = plane {
+        let mine = crate::inplace::views_at(memory, size);
+        let theirs = crate::inplace::views_at(plane.at, plane.size);
+        tracing::info!(
+            texture_at = format_args!("{memory:#x}"),
+            plane_at = format_args!("{:#x}", plane.at),
+            texture_views = mine.len(),
+            plane_views = theirs.len(),
+            second_view = crate::inplace::another_view(memory, size),
+            texture_view_entries = ?mine.iter().map(|(base, bytes, section, offset)| format!("{base:#x}+{bytes:#x} s{section} o{offset:#x}")).collect::<Vec<_>>(),
+            plane_view_entries = ?theirs.iter().map(|(base, bytes, section, offset)| format!("{base:#x}+{bytes:#x} s{section} o{offset:#x}")).collect::<Vec<_>>(),
+            "movie surface: what the view table holds at both ends"
+        );
+    }
     let plane_at = format!("{:#x}", plane.map_or(0, |p| p.at));
     let plane_name = plane.map_or("-", |p| p.name);
     tracing::info!(
