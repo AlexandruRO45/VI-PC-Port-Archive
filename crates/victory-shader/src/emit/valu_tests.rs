@@ -1064,9 +1064,10 @@ fn root_uav_validates_and_dispatches_on_gpu_and_warp() {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let container = crate::dxbc::build(&[]);
     let c = crate::Container::parse(&container).expect("container");
     let shader = super::emit(&c, &native, &p, &st, &io, &res).expect("emit");
