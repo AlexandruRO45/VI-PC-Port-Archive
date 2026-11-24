@@ -129,6 +129,11 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
     if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
         let probe = 0usize;
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
+        if crate::util::under_wine() {
+            // Under Wine, an exe's TLS callbacks never receive DLL_PROCESS_DETACH at process exit (#1461).
+            // Write the final report before NtTerminateProcess terminates the process.
+            crate::report::write_final(None);
+        }
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
             dump_threads();
@@ -1150,5 +1155,12 @@ mod tests {
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn terminate_process_report_invocation_is_safe_under_wine() {
+        // Under Wine, hk_nt_terminate_process triggers write_final(None) at process termination (#1461).
+        // Verify write_final(None) executes cleanly without panic, even in uninitialized test environments.
+        crate::report::write_final(None);
     }
 }
