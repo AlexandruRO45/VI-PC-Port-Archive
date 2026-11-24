@@ -272,6 +272,8 @@ impl Layout {
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
             && matches!(d.block, 1 | 4)
+            // GFX10 Z swizzles require uncompressed elements of up to 64 bits.
+            && (!d.swizzle.z_order() || (d.block == 1 && d.element_bytes <= 8))
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
@@ -1028,6 +1030,26 @@ mod tests {
         for (i, mip) in layout.mips.iter().enumerate() {
             assert_eq!(mip.depth, d.depth >> i);
             assert_eq!(mip.depth_pitch, d.depth);
+        }
+    }
+
+    #[test]
+    fn z_order_rejects_compressed_and_wide_elements() {
+        let mut d = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 32,
+            height: 32,
+            depth_or_array: 1,
+            mips: 1,
+            format: 40, // D32_FLOAT
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_Z_X,
+        };
+        assert!(Texture::new(&d).is_ok());
+        // BC1_UNORM, R32G32B32A32_FLOAT
+        for format in [71, 2] {
+            d.format = format;
+            assert_eq!(Texture::new(&d), Err(Error::Invalid), "format {format}");
         }
     }
 
