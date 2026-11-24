@@ -510,8 +510,10 @@ impl State {
                     // pointer lives as `((dword + 1) << 8) | slot`: the root
                     // view is the buffer the pointer holds, not a root the
                     // title set.
+                    let mut chased = false;
                     let address = match reg.checked_sub(256) {
                         Some(at) => {
+                            chased = true;
                             // Subtracting 256 removed the encoder's + 1, so
                             // the high half already is the dword.
                             let (slot, dword) = ((reg & 0xFF) as u8, (at >> 8) as u32);
@@ -528,6 +530,18 @@ impl State {
                             }
                         },
                     };
+                    // A chased pointer holds a console value the title can
+                    // set to anything, and a root view of an address that is
+                    // not on 16 bytes is the invalid call the README records:
+                    // leave that one unbound, as the root UAV path does. A
+                    // root view the title set itself is bound as it was.
+                    if chased && address % 16 != 0 {
+                        once!(
+                            address = format_args!("{address:#x}"),
+                            "a chased pointer not on 16 bytes is left unbound"
+                        );
+                        continue;
+                    }
                     let Some(gpu) = root_view(list, address, srv) else {
                         continue;
                     };
@@ -1173,7 +1187,7 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1189,7 +1203,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args, &args.buffer);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1220,7 +1234,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args, &args.buffer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
