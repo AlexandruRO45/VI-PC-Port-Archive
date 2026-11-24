@@ -903,6 +903,21 @@ fn inside(path: &Path, parent: &Path) -> Option<String> {
     })
 }
 
+/// Whether `a` and `b` are the same folder, for [`ensure_titles_distinct`]:
+/// `Some("")` when they are as written ([`is_within`] both ways, lexically),
+/// and otherwise, when they are only once links are followed ([`on_disk`]),
+/// `Some` of a note naming where both are, to put after the folders in the
+/// error. `None` when they are different folders either way.
+fn same(a: &Path, b: &Path) -> Option<String> {
+    let both = |a: &Path, b: &Path| is_within(a, b, FOLD_CASE) && is_within(b, a, FOLD_CASE);
+    if both(a, b) {
+        return Some(String::new());
+    }
+    let real = on_disk(a);
+    both(&real, &on_disk(b))
+        .then(|| format!(" once links are followed (both are {})", real.display()))
+}
+
 /// [`ensure_data_outside_cache`] for the user's whole cache, not only
 /// Victory's: `$XDG_CACHE_HOME` (else `~/.cache`) is what desktop cleaners
 /// and users empty, so data under it is lost with it even when it is not
@@ -1136,30 +1151,35 @@ fn ensure_titles_apart(
 /// to a copied `VICTORY_TEST_TITLES` line, the same folder written two ways
 /// (`/x/a` and `/x/a/`, or `C:\Xbox\A` and `c:\xbox\a` on Windows), or
 /// the game folder pasted into the list of other titles. Compared like the
-/// other folder checks: lexically, without the disk. A title inside another
-/// title or inside the game folder is left alone: it is a different folder.
+/// other folder checks: lexically, then where the folders are on disk as far
+/// as they exist (see [`same`]), so a title that is a link to the game
+/// folder or to another title (`~/xbox/current` pointing at `~/xbox/a`, both
+/// listed) is refused too. A title inside another title or inside the game
+/// folder is left alone: it is a different folder.
 fn ensure_titles_distinct(
     game: Option<&Path>,
     titles: &[PathBuf],
     origins: &Origins,
 ) -> Result<()> {
-    let same = |a: &Path, b: &Path| is_within(a, b, FOLD_CASE) && is_within(b, a, FOLD_CASE);
     for (i, title) in titles.iter().enumerate() {
-        if let Some(game) = game.filter(|game| same(title, game)) {
+        if let Some((game, links)) = game.and_then(|game| same(title, game).map(|l| (game, l))) {
             anyhow::bail!(
-                "the test title {} (from {}) is the game folder {} (from {}); the test titles \
-                 are other dumps, and the game folder is already used, so remove it from \
-                 VICTORY_TEST_TITLES or [paths].test_titles",
+                "the test title {} (from {}) is the game folder {} (from {}){links}; the test \
+                 titles are other dumps, and the game folder is already used, so remove it \
+                 from VICTORY_TEST_TITLES or [paths].test_titles",
                 title.display(),
                 origins.test_titles,
                 game.display(),
                 origins.game_dir
             );
         }
-        if let Some(first) = titles[..i].iter().find(|earlier| same(title, earlier)) {
+        if let Some((first, links)) = titles[..i]
+            .iter()
+            .find_map(|earlier| same(title, earlier).map(|l| (earlier, l)))
+        {
             anyhow::bail!(
-                "the test title {} (from {}) is listed twice (also as {}); remove one from \
-                 VICTORY_TEST_TITLES or [paths].test_titles",
+                "the test title {} (from {}) is listed twice (also as {}){links}; remove one \
+                 from VICTORY_TEST_TITLES or [paths].test_titles",
                 title.display(),
                 origins.test_titles,
                 first.display()
@@ -5774,6 +5794,101 @@ mod tests {
         } else {
             assert!(got.is_ok());
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_titles_that_are_the_same_folder_only_through_a_link_are_refused() {
+        // A scratch folder under the system temp folder, never the
+        // repository; removed at the end.
+        let scratch = std::env::temp_dir().join(format!(
+            "victory-config-titles-linked-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let (a, b) = (scratch.join("a"), scratch.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        // `current` is a link to title `a`; `xbox` a link to the folder
+        // holding both titles.
+        std::os::unix::fs::symlink("a", scratch.join("current")).unwrap();
+        std::os::unix::fs::symlink(".", scratch.join("xbox")).unwrap();
+        let current = scratch.join("current");
+        let with = |titles: Vec<PathBuf>, game: Option<PathBuf>| {
+            move |k: &str| match k {
+                "VICTORY_TEST_TITLES" => Some(std::env::join_paths(&titles).unwrap()),
+                "VICTORY_GAME_DIR" => game.clone().map(PathBuf::into_os_string),
+                "VICTORY_CACHE_DIR" => Some(abs("c")),
+                "VICTORY_DATA_DIR" => Some(abs("d")),
+                _ => None,
+            }
+        };
+        let err = |env| {
+            Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string()
+        };
+        let real_a = std::fs::canonicalize(&a).unwrap();
+
+        // A title listed again through a link: the later entry is named,
+        // with the earlier spelling and where both are on disk.
+        let e = err(with(vec![a.clone(), b.clone(), current.clone()], None));
+        assert_eq!(
+            e,
+            format!(
+                "the test title {} (from VICTORY_TEST_TITLES) is listed twice (also as {}) \
+                 once links are followed (both are {}); remove one from VICTORY_TEST_TITLES \
+                 or [paths].test_titles",
+                current.display(),
+                a.display(),
+                real_a.display()
+            )
+        );
+        // Through a link to a folder above it, with a trailing slash.
+        let e = err(with(
+            vec![scratch.join("xbox").join("b").join(""), b.clone()],
+            None,
+        ));
+        assert!(e.contains("is listed twice"), "{e}");
+        assert!(e.contains("once links are followed"), "{e}");
+
+        // The game folder reached through a link in the list.
+        let e = err(with(vec![b.clone(), current.clone()], Some(a.clone())));
+        assert_eq!(
+            e,
+            format!(
+                "the test title {} (from VICTORY_TEST_TITLES) is the game folder {} (from \
+                 VICTORY_GAME_DIR) once links are followed (both are {}); the test titles are \
+                 other dumps, and the game folder is already used, so remove it from \
+                 VICTORY_TEST_TITLES or [paths].test_titles",
+                current.display(),
+                a.display(),
+                real_a.display()
+            )
+        );
+        // As written the lexical message is unchanged, with no note.
+        let e = err(with(vec![a.clone(), a.clone()], None));
+        assert!(
+            e.ends_with(&format!(
+                "(also as {}); remove one from VICTORY_TEST_TITLES or [paths].test_titles",
+                a.display()
+            )),
+            "{e}"
+        );
+
+        // A title inside a linked title, and a title and game folder not
+        // made yet under a link, are different folders and fine.
+        let ok = with(
+            vec![
+                current.join("dlc"),
+                b.clone(),
+                scratch.join("xbox").join("new"),
+            ],
+            Some(scratch.join("xbox").join("other")),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        assert!(!a.join("dlc").exists());
+        std::fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
