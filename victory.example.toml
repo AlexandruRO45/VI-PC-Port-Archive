@@ -10,6 +10,8 @@
 
 [paths]
 # Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
+# It is only read: it must not be inside cache_dir, and neither cache_dir nor
+# data_dir may be inside it.
 game_dir = 'D:\victory-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache, or without LOCALAPPDATA

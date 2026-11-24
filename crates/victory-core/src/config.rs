@@ -190,6 +190,9 @@ impl Config {
             test_titles: test_titles_origin,
         };
         ensure_data_outside_cache(&cache_dir, &data_dir, &origins)?;
+        if let Some(game) = &game_dir {
+            ensure_game_apart(game, &cache_dir, &data_dir, &origins)?;
+        }
         Ok(Config {
             game_dir,
             cache_dir,
@@ -314,6 +317,56 @@ fn ensure_data_outside_cache(cache_dir: &Path, data_dir: &Path, origins: &Origin
             cache_dir.display(),
             origins.cache_dir
         );
+    }
+    Ok(())
+}
+
+/// The game folder is the user's own dump: Victory reads it and never
+/// writes there, and it must survive the cache being cleared. So it may not
+/// be inside (or equal to) the cache folder, where clearing the cache would
+/// delete it, and neither the cache nor the data folder may be inside it,
+/// where derived files and saves would be mixed into the dump. Each is an
+/// easy slip with one parent folder for everything, e.g.
+/// `VICTORY_CACHE_DIR=~/gta` with `VICTORY_GAME_DIR=~/gta/game`, or
+/// `[paths].cache_dir = "cache"` in a `victory.toml` kept inside the dump.
+/// Compared like [`ensure_data_outside_cache`]: lexically, without the disk.
+fn ensure_game_apart(game: &Path, cache: &Path, data: &Path, origins: &Origins) -> Result<()> {
+    let g = lexical(game);
+    let c = lexical(cache);
+    if g.starts_with(&c) {
+        anyhow::bail!(
+            "the game folder {} (from {}) is inside the cache folder {} (from {}), which may \
+             be deleted at any time; set VICTORY_CACHE_DIR or [paths].cache_dir to a folder \
+             outside the game folder",
+            game.display(),
+            origins.game_dir,
+            cache.display(),
+            origins.cache_dir
+        );
+    }
+    for (name, dir, origin, setting) in [
+        (
+            "cache",
+            cache,
+            origins.cache_dir,
+            "VICTORY_CACHE_DIR or [paths].cache_dir",
+        ),
+        (
+            "data",
+            data,
+            origins.data_dir,
+            "VICTORY_DATA_DIR or [paths].data_dir",
+        ),
+    ] {
+        if lexical(dir).starts_with(&g) {
+            anyhow::bail!(
+                "the {name} folder {} (from {origin}) is inside the game folder {} (from {}), \
+                 which holds your dump and is only read; set {setting} to a folder outside it",
+                dir.display(),
+                game.display(),
+                origins.game_dir
+            );
+        }
     }
     Ok(())
 }
@@ -744,6 +797,82 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("inside the cache folder"), "{err}");
+    }
+
+    #[test]
+    fn game_folder_is_kept_apart_from_cache_and_data() {
+        let with = |game: PathBuf, cache: PathBuf, data: PathBuf| {
+            move |k: &str| match k {
+                "VICTORY_GAME_DIR" => Some(game.clone().into_os_string()),
+                "VICTORY_CACHE_DIR" => Some(cache.clone().into_os_string()),
+                "VICTORY_DATA_DIR" => Some(data.clone().into_os_string()),
+                _ => None,
+            }
+        };
+        let v = PathBuf::from(abs("v"));
+        let err = |env| {
+            Config::resolve(FilePaths::default(), None, env)
+                .unwrap_err()
+                .to_string()
+        };
+
+        // The game inside (or equal to) the cache would go with it.
+        let e = err(with(v.join("game"), v.clone(), v.join("..").join("data")));
+        assert!(e.contains("game folder"), "{e}");
+        assert!(e.contains("inside the cache folder"), "{e}");
+        assert!(e.contains("(from VICTORY_GAME_DIR)"), "{e}");
+        let e = err(with(v.clone(), v.clone(), PathBuf::from(abs("d"))));
+        assert!(e.contains("inside the cache folder"), "{e}");
+
+        // The cache or the data inside the game would write into the dump.
+        let e = err(with(v.clone(), v.join("cache"), PathBuf::from(abs("d"))));
+        assert!(e.contains("cache folder"), "{e}");
+        assert!(e.contains("inside the game folder"), "{e}");
+        let e = err(with(v.clone(), PathBuf::from(abs("c")), v.join("saves")));
+        assert!(e.contains("data folder"), "{e}");
+        assert!(e.contains("(from VICTORY_DATA_DIR)"), "{e}");
+        // `.` and `..` are folded first: `v/../c` is outside `v`.
+        let e = err(with(
+            v.join("."),
+            v.join("x").join("..").join("c"),
+            v.join("..").join("d"),
+        ));
+        assert!(e.contains("inside the game folder"), "{e}");
+
+        // Siblings are fine, including one whose name starts with the game's.
+        let ok = with(
+            v.clone(),
+            PathBuf::from(abs("v-cache")),
+            PathBuf::from(abs("v-data")),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+        let ok = with(
+            v.join("game"),
+            v.join("cache"),
+            v.join("game").join("..").join("data"),
+        );
+        assert!(Config::resolve(FilePaths::default(), None, ok).is_ok());
+
+        // Without a game folder there is nothing to check.
+        let none = |k: &str| match k {
+            "VICTORY_CACHE_DIR" => Some(abs("c")),
+            "VICTORY_DATA_DIR" => Some(abs("d")),
+            _ => None,
+        };
+        assert!(Config::resolve(FilePaths::default(), None, none).is_ok());
+    }
+
+    #[test]
+    fn a_config_file_inside_the_dump_cannot_put_the_cache_there() {
+        // `victory.toml` kept in the game folder with `cache_dir = "cache"`:
+        // anchored at the file, the cache lands inside the dump.
+        let dump = PathBuf::from(abs("gta"));
+        let parsed = parse_file("[paths]\ngame_dir = '.'\ncache_dir = 'cache'\n").unwrap();
+        let paths = parsed.anchored_at(&dump, None).unwrap();
+        let env = |k: &str| (k == "VICTORY_DATA_DIR").then(|| abs("d"));
+        let err = Config::resolve(paths, None, env).unwrap_err().to_string();
+        assert!(err.contains("inside the game folder"), "{err}");
+        assert!(err.contains("(from config file)"), "{err}");
     }
 
     #[test]
