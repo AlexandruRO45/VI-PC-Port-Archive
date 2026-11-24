@@ -133,6 +133,30 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
+## Testing AMD frame generation
+
+This test branch includes PC FSR and the Series S presentation changes. Tested on an RX 9070 XT with Proton
+Experimental. A native Windows test is still pending.
+
+Build with diagnostics, then point `VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` in AMD’s FidelityFX SDK 2.4.
+Set `VICTORY_FFX_FRAMEGEN=1` and launch with `--console series-s`. Series S selects FSR by default.
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+$env:VICTORY_FFX_DIR = 'C:\FidelityFX-SDK\Kits\FidelityFX\signedbin'
+$env:VICTORY_FFX_FRAMEGEN = '1'
+target\diag\victory.exe run 'C:\path\to\game.exe' --execute --console series-s
+```
+
+On Linux, use the usual VIctory Wine or Proton setup. The Proton Experimental run used `FSR4_UPGRADE=1` for
+FSR 4.1.1 and Microsoft’s `d3dcompiler_47` for this branch’s presentation code. For Series X, add
+`VICTORY_UPSCALER=7E93F0` and `VICTORY_FFX_SCALE=0.6666667` for build 1.0.2.1, and use `--console series-x`.
+
+Look for `ffx framegen: generated game frames` after world loading. That line reports rendered frames,
+generated frames and DXGI presents. The boot screens run at the usual frame rate. The current test uses the
+legacy frame-generation provider. AMD Frame Generation 4 requires camera data the FSR calls do not carry.
+The Series X test logged both effects before the graphics ring timed out.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
