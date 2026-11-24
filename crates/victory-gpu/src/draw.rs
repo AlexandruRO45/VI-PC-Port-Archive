@@ -2163,6 +2163,157 @@ uint ps() : SV_Target { return 1; }
         out
     }
 
+    const WRITE_29: &str = r#"
+RWByteAddressBuffer target : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, 29); }
+"#;
+
+    /// Root CBVs at a console-aligned but host-unaligned address stage
+    /// title bytes on the CPU. A preceding GPU write must reach that fill.
+    #[test]
+    #[ignore = "ordering regression on 70564ae; run on a host D3D12 device"]
+    fn a_gpu_producer_feeds_the_real_root_cbv_staging_path() {
+        const READ: &str = r#"
+cbuffer Input : register(b0) { uint value; }
+RWByteAddressBuffer target : register(u0);
+[RootSignature("CBV(b0), UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { target.Store(0, value); }
+"#;
+        let host = crate::host::host().expect("native D3D12 device");
+        let (write_root, writer) = compile_cs(WRITE_29);
+        let (read_root, reader) = compile_cs(READ);
+        let mut observed = Vec::new();
+        for (offset, scope) in [(0, "same list"), (16, "separate submissions"), (16, "same batch"), (16, "same list")] {
+            let (input, output) = (buffer(512), buffer(4));
+            let (input_bytes, _) = crate::resource::buffer_bytes(input).unwrap();
+            let (output_bytes, _) = crate::resource::buffer_bytes(output).unwrap();
+            let input_address = input_bytes as u64 + offset;
+            let output_address = output_bytes as u64;
+            // SAFETY: both resources own these dwords and no commands have run.
+            unsafe {
+                (input_address as *mut u32).write(11);
+                output_bytes.cast::<u32>().write(0);
+            }
+            let produced = crate::shadow::find(input_address, 4).unwrap();
+            let result = crate::shadow::find(output_address, 4).unwrap();
+            let first = host.new_list().unwrap();
+            produced.refresh(&first, input_address, 4);
+            produced.gpu_writes(&first, input_address, 4);
+            // SAFETY: the open list holds the producer's mapped shadow.
+            unsafe {
+                first.list.SetComputeRootSignature(&write_root);
+                first.list.SetPipelineState(&writer);
+                first.list.SetComputeRootUnorderedAccessView(0, produced.gpu(input_address));
+                first.list.Dispatch(1, 1, 1);
+                if offset == 0 {
+                    first.list.ResourceBarrier(&[crate::host::transition(
+                        &produced.buffer,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER,
+                    )]);
+                }
+            }
+            let second = host.new_list().unwrap();
+            let consumer = if scope != "same list" {
+                first.close();
+                if scope == "separate submissions" {
+                    host.execute(&[&first]);
+                }
+                &second
+            } else {
+                &first
+            };
+            let constant = root_view(consumer, input_address, false, false).unwrap();
+            assert_eq!(constant == produced.gpu(input_address), offset == 0);
+            result.refresh(consumer, output_address, 4);
+            result.gpu_writes(consumer, output_address, 4);
+            // SAFETY: the recording owns the root CBV backing and output shadow.
+            unsafe {
+                consumer.list.SetComputeRootSignature(&read_root);
+                consumer.list.SetPipelineState(&reader);
+                consumer.list.SetComputeRootConstantBufferView(0, constant);
+                consumer.list.SetComputeRootUnorderedAccessView(1, result.gpu(output_address));
+                consumer.list.Dispatch(1, 1, 1);
+            }
+            consumer.close();
+            if scope == "same batch" {
+                host.execute(&[&first, consumer]);
+            } else {
+                host.execute(&[consumer]);
+            }
+            // SAFETY: these mapped title dwords are ours, and the fence completed.
+            let (producer, read) = unsafe {
+                ((input_address as *const u32).read(), output_bytes.cast::<u32>().read())
+            };
+            println!("root CBV byte offset {offset}, {scope}: producer={producer}, consumer={read}");
+            assert_eq!(producer, 29, "the producer executed and copied back");
+            observed.push(read);
+            for resource in [input, output] {
+                crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+            }
+        }
+        assert_eq!(observed, [29, 29, 29, 29], "each root CBV must see its GPU producer");
+    }
+
+    #[test]
+    #[ignore = "ordering regression on 70564ae; run on a host D3D12 device"]
+    fn title_copy_buffer_region_reads_its_earlier_gpu_producer() {
+        let host = crate::host::host().expect("native D3D12 device");
+        let (root, pipeline) = compile_cs(WRITE_29);
+        let (source, dest) = (buffer(4), buffer(4));
+        let (source_bytes, _) = crate::resource::buffer_bytes(source).unwrap();
+        let (dest_bytes, _) = crate::resource::buffer_bytes(dest).unwrap();
+        let source_address = source_bytes as u64;
+        // SAFETY: the committed source and destination each hold one dword.
+        unsafe {
+            source_bytes.cast::<u32>().write(11);
+            dest_bytes.cast::<u32>().write(0);
+        }
+        let null = std::ptr::null();
+        let alloc_iid = crate::object::guid(
+            0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = crate::object::guid(
+            0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut allocator, mut title_list) = (null, null);
+        assert_eq!(crate::list::create_allocator(null, 0, &alloc_iid, &mut allocator), S_OK);
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut title_list),
+            S_OK
+        );
+        let list = crate::list::host_list(title_list).unwrap();
+        let shadow = crate::shadow::find(source_address, 4).unwrap();
+        shadow.refresh(list, source_address, 4);
+        shadow.gpu_writes(list, source_address, 4);
+        // SAFETY: the producer names a live native UAV shadow.
+        unsafe {
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pipeline);
+            list.list.SetComputeRootUnorderedAccessView(0, shadow.gpu(source_address));
+            list.list.Dispatch(1, 1, 1);
+        }
+        let copy = crate::object::slot::<extern "system" fn(This, This, u64, This, u64, u64)>(
+            title_list, 0x78,
+        );
+        copy(title_list, dest, 0, source, 0, 4);
+        list.close();
+        host.execute(&[list]);
+        // SAFETY: both resources remain live and the submission completed.
+        let (produced, copied) = unsafe {
+            (source_bytes.cast::<u32>().read(), dest_bytes.cast::<u32>().read())
+        };
+        println!("title CopyBufferRegion: producer={produced}, destination={copied}");
+        for object in [source, dest, title_list, allocator] {
+            crate::object::slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        assert_eq!(produced, 29, "the producer ran");
+        assert_eq!(copied, 29, "the guest copy must see its GPU producer");
+    }
+
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
     /// brought up to date from there to the copy's end, so data 1.5 MiB past
