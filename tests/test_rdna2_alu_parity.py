@@ -7,6 +7,7 @@ import pytest
 from emu import rdna2_exec, rdna2_exec_ops, rdna2_exec_vop3, rdna2_gpu, rdna2_hlsl
 from emu.rdna2_exec_ops import bits_float, float_bits
 from test_rdna2_exec import OPCODES, V, const, program, sop1, sop2, sopc, vop1, vop2, vop3
+from test_rdna2_exec_memory import OUTPUT
 from test_rdna2_hlsl import compare, store_lane, with_lane_offset
 
 LITERAL = 255
@@ -188,7 +189,7 @@ def test_hlsl_vop3_and_carry_parity_emission():
     assert wave.s[31] == 0xFFFF_FFFF
 
     hlsl = rdna2_hlsl.translate(code)
-    for token in ("MulHiU32(", "MulHiI32(", "BfeI32(", "AlignBit(", "SadU32(", "FmaLegacyF32("):
+    for token in ("MulHiU32(", "MulHiI32(", "BfeI32(", "AlignBit(", "SadU32(", "FmaLegacyF32(", "RndneF32("):
         assert token in hlsl
 
 
@@ -234,4 +235,24 @@ def test_extended_alu_matches_interpreter_on_gpu():
         *store_lane(30, 24),
     )
     expected, actual = compare(code)
+    assert actual == expected
+
+
+@gpu
+def test_v_rndne_f32_rounds_ties_to_even_on_gpu():
+    # Égalités, négatifs, valeurs déjà entières (>= 2^23) et infini pour RndneF32, qui remplace
+    # round() (replié en « moitié loin de zéro » sur RTX 5070, voir le test GPU ci-dessus).
+    values = (0.5, 1.5, 2.5, 3.5, -1.5, -2.5, -3.5, 2.75, -2.25, 8388609.0, math.inf)
+    rounded = (0.0, 2.0, 2.0, 4.0, -2.0, -2.0, -4.0, 3.0, -2.0, 8388609.0, math.inf)
+    words = []
+    for index, value in enumerate(values):
+        words += [vop1("v_mov_b32", 1 + index, LITERAL), float_bits(value)]
+    for index in range(len(values)):
+        words.append(vop1("v_rndne_f32", 12 + index, V + 1 + index))
+    for index in range(len(values)):
+        words += store_lane(12 + index, index)
+    expected, actual = compare(with_lane_offset(*words))
+    lane0 = [int.from_bytes(expected[OUTPUT + slot * 128:OUTPUT + slot * 128 + 4], "little")
+             for slot in range(len(values))]
+    assert tuple(bits_float(bits) for bits in lane0) == rounded
     assert actual == expected

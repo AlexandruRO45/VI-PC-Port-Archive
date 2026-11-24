@@ -90,6 +90,16 @@ uint FmaLegacyF32(uint a, uint b, uint c) {
   float x = asfloat(a), y = asfloat(b);
   return (x == 0.0f || y == 0.0f) ? c : asuint(mad(x, y, asfloat(c)));
 }
+// Arrondi au pair le plus proche sans round() : sur RTX 5070 (pilote 621.40), le pilote replie
+// Round_ne d'une valeur connue à la compilation en arrondi « moitié loin de zéro » (2.5 → 3.0).
+uint RndneF32(uint a) {
+  precise float x = asfloat(a);
+  if (!(abs(x) < 8388608.0f)) return a;                     // déjà entier, infini ou NaN
+  precise float fl = floor(x);
+  precise float rest = x - fl;
+  bool up = rest > 0.5f || (rest == 0.5f && ((int)fl & 1) != 0);
+  return asuint(up ? fl + 1.0f : fl) | (a & 0x80000000u);   // signe gardé : -0.25 → -0.0
+}
 uint PermB32(uint a, uint b, uint c) {
   uint r = 0u;
   [unroll] for (uint i = 0u; i < 4u; ++i) {
@@ -268,7 +278,7 @@ VECTOR = {
     "v_floor_f32": "asuint(floor(asfloat({a})))",
     "v_ceil_f32": "asuint(ceil(asfloat({a})))",
     "v_trunc_f32": "asuint(trunc(asfloat({a})))",
-    "v_rndne_f32": "asuint(round(asfloat({a})))",
+    "v_rndne_f32": "RndneF32({a})",
     "v_fract_f32": "asuint(frac(asfloat({a})))",
     "v_ldexp_f32": "asuint(ldexp(asfloat({a}), (float)asint({b})))",
     "v_cvt_f32_u32": "asuint((float){a})",
