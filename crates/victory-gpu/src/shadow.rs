@@ -62,21 +62,37 @@ struct Part {
 struct Snapshots {
     bytes: Vec<u8>,
     parts: usize,
+    /// Parts given up so far: a count that only grows, so a test can tell
+    /// that a copy released its own however many others are live.
+    #[cfg(test)]
+    forgotten: usize,
 }
 
 static SNAPSHOTS: Mutex<Snapshots> = Mutex::new(Snapshots {
     bytes: Vec::new(),
     parts: 0,
+    #[cfg(test)]
+    forgotten: 0,
 });
 
 fn snapshots() -> std::sync::MutexGuard<'static, Snapshots> {
     SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Parts given up so far, for the tests (only ever grows).
+#[cfg(test)]
+pub(crate) fn forgotten() -> usize {
+    snapshots().forgotten
+}
+
 /// Gives up the snapshots of `parts`.
 fn forget(parts: &mut Vec<Part>) {
     let mut snapshots = snapshots();
     snapshots.parts -= parts.len();
+    #[cfg(test)]
+    {
+        snapshots.forgotten += parts.len();
+    }
     parts.clear();
     if snapshots.parts == 0 {
         snapshots.bytes.clear();
@@ -220,6 +236,7 @@ impl Shadow {
             return;
         }
         let mut snapshots = snapshots();
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let mut kept_bytes = 0;
         for (from, to) in gaps {
@@ -239,6 +256,15 @@ impl Shadow {
             add(C::SnapshotUs, started.elapsed().as_micros() as u64);
         }
         let _ = kept_bytes;
+    }
+
+    /// The parts and bytes this copy keeps of its declared ranges, for the
+    /// tests: the snapshot arena is shared by every copy in the process, so
+    /// what one copy keeps cannot be read from the arena alone.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> (usize, usize) {
+        let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        (before.len(), before.iter().map(|p| p.to - p.from).sum())
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back

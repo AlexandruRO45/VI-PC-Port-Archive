@@ -143,3 +143,27 @@ in this document, and none is claimed: the table is the last set of world
 frames that survived, and it is stable across three builds. The instrument
 below is built so that the first surviving world frame names its own cost
 within one run.
+
+## Two tests that were measuring the machine, not the code
+
+Both are in this crate and both red the suite at random, so a green
+`cargo test --workspace` was luck. Fixed here; the gate is
+`cargo test --workspace -- --test-threads=1`.
+
+- `frame::tests::waits_end_on_ticks_and_count_frames` asserted that four
+  consecutive flip waits land on four consecutive ticks. The contract the
+  clock documents is weaker and is the right one: ticks are absolute, so a
+  late sleep never lets two waits for one event share a tick. A thread
+  descheduled for several intervals is not a bug in the frame clock. The test
+  now asserts flips are strictly increasing and no faster than the clock that
+  made them (measured 4 failures in 20 runs before, DGR-6).
+- The snapshot tests asserted on the process-global snapshot arena
+  (`shadow.rs`). Every test that submits a list with declared GPU-written
+  ranges adds parts to that arena from its own thread — `draw.rs`,
+  `indirect.rs` and `list.rs` all do — so a snapshot test's part count was
+  partly other tests' parts (measured 1 failure in 20 runs). Each copy now
+  reports its own parts (`Shadow::kept`), the tests assert on the copies they
+  made, and the release-on-drop check counts parts given up (monotone, so a
+  concurrent copy can only add to the evidence, never withdraw it).
+
+Both were found by DGR-6, not by me; the numbers above are its measurements.

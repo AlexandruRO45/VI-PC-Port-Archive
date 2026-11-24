@@ -1898,9 +1898,11 @@ impl Meter {
                 }
                 crate::copystat::log(window);
                 for (why, n) in drops.iter().take(40) {
+                    // The drops cover the same multi-second window as the
+                    // submissions and the copy stats.
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        *n as f64 / window
                     );
                 }
             }
