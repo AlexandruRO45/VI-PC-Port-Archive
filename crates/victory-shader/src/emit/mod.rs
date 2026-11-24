@@ -635,6 +635,70 @@ mod tests {
         assert!(mesh_group_threads(Some(cut)).is_err());
     }
 
+    /// Only the runtime info size in `PSV0`'s first word decides whether
+    /// the group sizes are read: any size below version 2's 48 bytes leaves
+    /// the stride to the mesh header, while 48 or more (later versions grow
+    /// the struct) reads them, and then the sizes must be in the part.
+    #[test]
+    fn the_runtime_info_size_gates_the_group_read() {
+        for size in [0, 1, 36, 40, 47] {
+            let psv = psv_with_group(size, [8, 8, 1]);
+            assert_eq!(mesh_group_threads(Some(&psv)), Ok(None), "size {size}");
+            // Bytes past an older struct are not read, even garbage ones.
+            let psv = psv_with_group(size, [0, u32::MAX, 0]);
+            assert_eq!(mesh_group_threads(Some(&psv)), Ok(None), "size {size}");
+        }
+        for size in [48, 52, 4096, u32::MAX] {
+            let psv = psv_with_group(size, [8, 8, 1]);
+            assert_eq!(mesh_group_threads(Some(&psv)), Ok(Some(64)), "size {size}");
+        }
+        // A size word alone, or one cut inside it, says nothing to read.
+        assert_eq!(mesh_group_threads(Some(&[48, 0, 0])), Ok(None));
+        let refused = |d: &[u8]| mesh_group_threads(Some(d)).is_err();
+        assert!(refused(&48u32.to_le_bytes()));
+        let full = psv_with_group(48, [8, 8, 1]);
+        for cut in [4 + 36, 4 + 36 + 3, 4 + 36 + 4, 4 + 36 + 11] {
+            assert!(refused(&full[..cut]), "cut at {cut}");
+        }
+        // Bytes past the z size are never needed.
+        let mut long = full.clone();
+        long.extend([0xFF; 16]);
+        assert_eq!(mesh_group_threads(Some(&long)), Ok(Some(64)));
+    }
+
+    /// The refusal is checked as the product grows, so a zero axis after an
+    /// axis already past 128 is refused for the size, and a product that
+    /// lands exactly on 128 through every axis still runs.
+    #[test]
+    fn the_group_limit_is_checked_axis_by_axis() {
+        for (group, threads) in [
+            ([2, 64, 1], 128),
+            ([2, 2, 32], 128),
+            ([128, 1, 1], 128),
+            ([1, 128, 1], 128),
+            ([3, 5, 7], 105),
+        ] {
+            let psv = psv_with_group(48, group);
+            assert_eq!(
+                mesh_group_threads(Some(&psv)),
+                Ok(Some(threads)),
+                "{group:?}"
+            );
+        }
+        for group in [
+            [129, 0, 1],
+            [2, 65, 1],
+            [2, 2, 33],
+            [1, 129, 0],
+            [0, 0, 0],
+            [0x8000_0000, 2, 1],
+            [3, 5, 9],
+        ] {
+            let psv = psv_with_group(48, group);
+            assert!(mesh_group_threads(Some(&psv)).is_err(), "{group:?}");
+        }
+    }
+
     /// An `ISG1`/`OSG1` part whose row count it cannot hold is refused
     /// before anything is reserved for the rows. A count of 2^32 - 1 asked
     /// for hundreds of gigabytes up front, and the failed allocation took
