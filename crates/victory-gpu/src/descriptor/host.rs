@@ -645,6 +645,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
         }
+        View::NullConstant => {
+            // SAFETY: a null description initializes an unbound CBV.
+            unsafe {
+                device.CreateConstantBufferView(
+                    None::<*const D3D12_CONSTANT_BUFFER_VIEW_DESC>,
+                    at,
+                )
+            };
+            Some(None)
+        }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
@@ -954,6 +964,20 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A null description clears the host CBV slot without removing the device.
+    #[test]
+    fn null_constant_buffer_view_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        assert!(make(&View::NullConstant, heap.cpu(0)).is_some());
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
