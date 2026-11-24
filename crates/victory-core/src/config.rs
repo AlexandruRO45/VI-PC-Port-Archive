@@ -310,11 +310,11 @@ impl Config {
             ),
         ] {
             if let Some(dir) = dir {
-                ensure_not_a_file(&format!("{name} folder"), dir, origin, setting)?;
+                ensure_directory_path(&format!("{name} folder"), dir, origin, setting)?;
             }
         }
         for title in &test_titles {
-            ensure_not_a_file(
+            ensure_directory_path(
                 "test title",
                 title,
                 origins.test_titles,
@@ -872,7 +872,7 @@ fn ensure_titles_distinct(
     Ok(())
 }
 
-/// Refuses a folder setting that names an existing file. The easy slip is
+/// Refuses a folder setting that names or descends from a non-directory. The easy slip is
 /// the game's executable or a file in the dump rather than its folder
 /// (`VICTORY_GAME_DIR=~/games/gta/default.xex`, picked in a file dialog or
 /// pasted from a launcher's target); it was accepted and only failed later,
@@ -883,9 +883,31 @@ fn ensure_titles_distinct(
 /// does not exist yet is fine: the cache and data folders are created when
 /// needed. `what` is the folder ("game folder", "cache folder", "data
 /// folder", "test title") and `setting` the variable and key that set it.
-fn ensure_not_a_file(what: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
-    if !dir.is_file() {
+fn ensure_directory_path(what: &str, dir: &Path, origin: Origin, setting: &str) -> Result<()> {
+    // A missing leaf can be created later, but only if its first existing
+    // ancestor is a directory. Follow symlinks just as create_dir_all does.
+    let existing = dir
+        .ancestors()
+        .find_map(|p| std::fs::metadata(p).ok().map(|m| (p, m)));
+    let Some((path, metadata)) = existing else {
         return Ok(());
+    };
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    if path != dir {
+        anyhow::bail!(
+            "the {what} {} (from {origin}) cannot be a folder because {} is not a directory; \
+             set {setting} to a path under a directory",
+            dir.display(),
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "the {what} {} (from {origin}) is not a directory; set {setting} to a folder",
+            dir.display()
+        );
     }
     let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
     let hint = match (what, parent) {
@@ -2123,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_setting_naming_a_file_is_refused() {
+    fn a_folder_setting_blocked_by_a_file_is_refused() {
         // A scratch folder under the system temp folder, never the
         // repository; removed at the end.
         let scratch = std::env::temp_dir().join(format!(
@@ -2155,6 +2177,23 @@ mod tests {
         assert!(err.contains("(from VICTORY_GAME_DIR) is a file"), "{err}");
         let parent = scratch.join("gta");
         assert!(err.contains(&parent.display().to_string()), "{err}");
+
+        let blocked = exe.join("missing").join("saves");
+        let err = Config::resolve(
+            FilePaths::default(),
+            None,
+            with("VICTORY_DATA_DIR", blocked.clone()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!("{} (from VICTORY_DATA_DIR)", blocked.display())),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{} is not a directory", exe.display())),
+            "{err}"
+        );
 
         // The same file as the cache or data folder, from the file.
         for (key, file) in [
@@ -2238,6 +2277,23 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_folder_setting_naming_a_device_is_refused() {
+        let env = |key: &str| match key {
+            "VICTORY_DATA_DIR" => Some(OsString::from("/dev/null")),
+            "HOME" => Some(abs("home")),
+            _ => None,
+        };
+        let err = Config::resolve(FilePaths::default(), None, env)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("/dev/null (from VICTORY_DATA_DIR) is not a directory"),
+            "{err}"
+        );
     }
 
     #[test]
