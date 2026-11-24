@@ -872,6 +872,25 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            // Console lane numbers: a mesh program that derives them from the
+            // wave (`v_mbcnt` and friends) needs the console's 64 lanes. A
+            // host without 64-lane waves refuses this pipeline instead of
+            // running it with 32-lane lane numbers, which silently corrupts
+            // mesh output and can hang the device.
+            if x.native.wave64
+                && p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                    let n = i.name();
+                    n.starts_with("v_mbcnt")
+                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                        || n.starts_with("ds_swizzle")
+                        || n.contains("permute")
+                        || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || reads_mask_as_data(x.st, i)
+                })
+            {
+                console_lanes = true;
+                s.wave_size = Some(64);
+            }
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
