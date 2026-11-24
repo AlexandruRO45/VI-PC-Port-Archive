@@ -235,11 +235,6 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
-/// Samples whose level comes from derivatives across each quad of lanes.
-fn implicit_derivatives(name: &str) -> bool {
-    matches!(name, "image_sample" | "image_sample_b")
-}
-
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -353,7 +348,6 @@ impl<'a> Lower<'a> {
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || implicit_derivatives(n)
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -5670,7 +5664,16 @@ impl<'a> Lower<'a> {
                     // has no implicit derivatives there, so the quad's
                     // differences become explicit gradients. A bias scales
                     // them by 2^bias, the same level for isotropic filtering.
-                    self.cross_lane(true)?;
+                    // A quad's four lanes share a host wave of any size, so
+                    // this needs neither the console's wave size nor its
+                    // lane order beyond the quad.
+                    if self.s.mesh.is_some() {
+                        return Err("a cross-lane operation in a mesh shader");
+                    }
+                    if self.s.threads.is_none() {
+                        return Err("a cross-lane operation outside compute");
+                    }
+                    self.s.flags |= flags::WAVE_OPS;
                     let scale = if op == 61 {
                         let bias = addr_val(self, 0)?;
                         let bias = self.as_float(bias);
