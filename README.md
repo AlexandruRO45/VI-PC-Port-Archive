@@ -138,7 +138,10 @@ xcl rpf D:\data\shaders.rpf --extract NAME --out folder
   `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
   previous run's: `xcl.prev.log`, `report.prev.json`).
 - Coherent-memory `VirtualFree` rejects nonzero `MEM_RELEASE` sizes and invalid
-  release/decommit combinations without discarding the allocation.
+  release/decommit combinations without discarding the allocation. Decommits clear whole host
+  pages within the allocation; a zero-size decommit at its first page clears the entire block.
+  Out-of-range decommits fail without touching neighboring allocations. Coherent pages stay mapped
+  for the GPU.
 
 ## Tests
 

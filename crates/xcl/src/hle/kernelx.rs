@@ -454,10 +454,13 @@ unsafe fn coherent_virtual_free(u: &crate::gpu::uma::Uma, addr: *mut c_void, siz
     if release {
         return u.free(addr as usize) as BOOL;
     }
-    if size > 0 {
-        std::ptr::write_bytes(addr as *mut u8, 0, size);
+    match u.decommit_coherent(addr as usize, size) {
+        Ok(()) => 1,
+        Err(error) => {
+            fnd::SetLastError(error);
+            0
+        }
     }
-    1
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
@@ -2666,6 +2669,48 @@ mod tests {
             assert!(std::slice::from_raw_parts(p.add(0x1000), grain - 0x1000).iter().all(|&v| v == 0x5A));
             assert_eq!(coherent_virtual_free(&u, p.cast(), 0, mem::MEM_RELEASE), 1);
             assert!(!u.is_title_address(p as usize));
+        }
+    }
+
+    #[test]
+    fn coherent_decommit_matches_native_page_ranges() {
+        struct NativeMemory(*mut c_void);
+        impl Drop for NativeMemory {
+            fn drop(&mut self) {
+                unsafe { mem::VirtualFree(self.0, 0, mem::MEM_RELEASE); }
+            }
+        }
+        let grain = crate::gpu::uma::GRAIN;
+        let len = 2 * grain;
+        let u = crate::gpu::uma::Uma::with_windows(1, 4 * grain).unwrap();
+        let p = u.alloc(len, grain).unwrap();
+        let neighbor = u.alloc(grain, grain).unwrap();
+        assert_eq!(neighbor as usize, p as usize + len);
+        unsafe {
+            let native = NativeMemory(mem::VirtualAlloc(std::ptr::null(), len, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE));
+            assert!(!native.0.is_null());
+            for (offset, size) in [(0, 0), (1, 0), (0x1000, 0), (0xfff, 2), (len - 1, 2)] {
+                std::ptr::write_bytes(native.0.cast::<u8>(), 0xA5, len);
+                std::ptr::write_bytes(p, 0xA5, len);
+                std::ptr::write_bytes(neighbor, 0xA5, grain);
+                fnd::SetLastError(0);
+                let expected = mem::VirtualFree(native.0.cast::<u8>().add(offset).cast(), size, mem::MEM_DECOMMIT);
+                let expected_error = fnd::GetLastError();
+                assert_eq!(mem::VirtualAlloc(native.0, len, mem::MEM_COMMIT, mem::PAGE_READWRITE), native.0);
+                fnd::SetLastError(0);
+                let actual = coherent_virtual_free(&u, p.add(offset).cast(), size, mem::MEM_DECOMMIT);
+                let actual_error = fnd::GetLastError();
+                assert_eq!(actual, expected, "offset {offset:#x}, size {size}");
+                if expected == 0 {
+                    assert_eq!(actual_error, expected_error, "offset {offset:#x}, size {size}");
+                }
+                let expected_bytes = std::slice::from_raw_parts(native.0.cast::<u8>(), len);
+                let actual_bytes = std::slice::from_raw_parts(p, len);
+                let mismatch = actual_bytes.iter().zip(expected_bytes).position(|(a, b)| a != b);
+                assert_eq!(mismatch, None, "offset {offset:#x}, size {size}: first different byte");
+                assert!(std::slice::from_raw_parts(neighbor, grain).iter().all(|&v| v == 0xA5));
+                assert_eq!(u.used(), len + grain);
+            }
         }
     }
 
