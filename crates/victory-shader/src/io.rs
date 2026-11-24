@@ -1073,4 +1073,114 @@ mod tests {
             );
         }
     }
+
+    /// The stage data must be the hardware stage's own: pixel stage data
+    /// on a vertex stage (or none at all) names no input VGPR.
+    #[test]
+    fn stage_data_of_another_stage_is_refused() {
+        let p = program(&[S_ENDPGM]);
+        let refused = Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "I/O of this stage",
+        });
+        let ps_on_vs = NativeProgram {
+            stage: HwStage::Vs,
+            ..pixel(vec![], 2)
+        };
+        assert_eq!(raise(&p, &ps_on_vs), refused);
+        let vs_on_ps = NativeProgram {
+            stage: HwStage::Ps,
+            ..vertex(vec![])
+        };
+        assert_eq!(raise(&p, &vs_on_ps), refused);
+        let none = NativeProgram {
+            io: StageIo::None,
+            ..pixel(vec![], 2)
+        };
+        assert_eq!(raise(&p, &none), refused);
+    }
+
+    /// `v_interp_p1` takes the kind's i and `v_interp_p2` its j: either
+    /// half swapped, or reading a system value, is no barycentric pair.
+    #[test]
+    fn interpolation_halves_read_i_then_j() {
+        // v_interp_p1_f32 v4, v<i>, attr0.x; v_interp_p2_f32 v4, v<j>, attr0.x
+        let pair = |i: u32, j: u32| program(&[0xC810_0000 | i, 0xC811_0000 | j, S_ENDPGM]);
+        // Perspective center in v0/v1, position x in v2.
+        let ps = pixel(vec![TEXCOORD], 1 << 1 | 1 << 8);
+        assert!(raise(&pair(0, 1), &ps).is_ok());
+        for (i, j) in [(1, 1), (0, 0), (1, 0), (2, 1), (0, 2), (3, 1)] {
+            assert_eq!(
+                raise(&pair(i, j), &ps),
+                Err(ShaderError::Unsupported {
+                    offset: 4,
+                    what: "an interpolation with computed barycentrics"
+                }),
+                "i v{i}, j v{j}"
+            );
+        }
+    }
+
+    /// A mesh program's parameter with bit 7 set is a per-primitive output
+    /// of the primitive signature's row; without it, a per-vertex one.
+    #[test]
+    fn mesh_parameters_are_per_vertex_or_per_primitive() {
+        let out = |row, param| crate::native::VsOutput {
+            usage: Usage::Generic,
+            row,
+            param,
+            fp16: false,
+            pack2: false,
+        };
+        let export = |t: u32, outputs| {
+            let code: Vec<u8> = [0xF800_0801 | t << 4, 0x0000_0000, S_ENDPGM]
+                .iter()
+                .flat_map(|w: &u32| w.to_le_bytes())
+                .collect();
+            let p = crate::ir::build(&code, true, 256).unwrap();
+            let native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: true,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs,
+                    clip_cntl: 0,
+                    threads: 64,
+                    max_vertices: 64,
+                    max_primitives: 64,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code,
+            };
+            raise(&p, &native).map(|io| io.exports[0].target)
+        };
+        let outputs = vec![out(3, 0), out(5, 0x81)];
+        let generic = Usage::Generic;
+        assert_eq!(
+            export(32, outputs.clone()),
+            Ok(Target::Param {
+                usage: generic,
+                row: 3
+            })
+        );
+        assert_eq!(
+            export(33, outputs.clone()),
+            Ok(Target::PrimitiveParam {
+                usage: generic,
+                row: 5
+            })
+        );
+        assert_eq!(
+            export(34, outputs),
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "a parameter export the stage data does not list"
+            })
+        );
+        // Without outputs, param0 is the one the hardware wants anyway.
+        assert_eq!(export(32, vec![]), Ok(Target::Unread));
+    }
 }
