@@ -525,6 +525,76 @@ mod tests {
         files
     }
 
+    /// A local debugging aid: dumps the bindings of the mesh (emulated)
+    /// entries in a real run's cache, so the draw path's root parameters can
+    /// be checked against what the title's shaders actually read. Run with
+    /// `cargo test -p victory-gpu dump_cached_mesh -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs a local run's shader cache"]
+    fn dump_cached_mesh_entries() {
+        let Some(local) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let dir = std::path::Path::new(&local).join("victory").join("cache").join("shaders");
+        let entries = walk(&dir);
+        let mut mesh = 0;
+        for e in &entries {
+            let Ok(bytes) = std::fs::read(e) else {
+                continue;
+            };
+            let Some(s) = decode(&bytes) else {
+                continue;
+            };
+            if s.stage != HwStage::Ms {
+                continue;
+            }
+            mesh += 1;
+            println!("=== {} ({}) mesh_emu: {}", e.display(), s.dxil.len(), s.mesh_emu.is_some());
+            println!(
+                "user_data ({}): {:?}",
+                s.user_data.len(),
+                s.user_data
+                    .iter()
+                    .map(|u| format!("dword {} slot {} {:?}+{}", u.index, u.slot, u.root, u.dword))
+                    .collect::<Vec<_>>()
+            );
+            println!("root_cbvs {:?} root_srvs {:?}", s.root_cbvs, s.root_srvs);
+            println!(
+                "samplers {} static {}",
+                s.samplers.len(),
+                s.static_samplers.len()
+            );
+            if let Some(m) = &s.mesh_emu {
+                println!(
+                    "mesh_emu: threads {} verts {} prims {} vert_dwords {} prim_dwords {} \
+                     reads_group_id {} group_bytes {}",
+                    m.threads,
+                    m.max_vertices,
+                    m.max_primitives,
+                    m.vertex_dwords,
+                    m.prim_dwords,
+                    m.reads_group_id,
+                    m.group_bytes()
+                );
+                println!(
+                    "vertex outputs: {:?}",
+                    m.vertex_outputs
+                        .iter()
+                        .map(|o| format!("{}@{}", o.name, o.dword_offset))
+                        .collect::<Vec<_>>()
+                );
+                println!(
+                    "prim outputs: {:?}",
+                    m.prim_outputs
+                        .iter()
+                        .map(|o| format!("{}@{}", o.name, o.dword_offset))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        println!("mesh entries: {mesh} of {}", entries.len());
+    }
+
     #[test]
     fn entries_round_trip_and_reject_damage() {
         for s in [shader(), mesh_emu_shader()] {

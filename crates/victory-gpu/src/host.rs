@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -81,6 +81,10 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Host command lists closed a second time (the title's error paths) since
+/// the run started: tolerated as no-ops.
+static DOUBLE_CLOSED: AtomicU64 = AtomicU64::new(0);
 
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
@@ -301,6 +305,10 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Whether `Close` has sealed the list (until `reset` reopens it): a
+    /// second close is a no-op, as the console API tolerates from the
+    /// title's error paths, instead of the E_FAIL D3D12 gives.
+    closed: AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -522,6 +530,7 @@ impl Host {
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                closed: AtomicBool::new(false),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -901,6 +910,20 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // A second close (the title's error paths close a sealed list again)
+        // is a no-op rather than the E_FAIL D3D12's Close returns for it,
+        // which used to read as an invalid command and end the run.
+        if self.closed.swap(true, Ordering::Relaxed) {
+            static SEEN: std::sync::Once = std::sync::Once::new();
+            DOUBLE_CLOSED.fetch_add(1, Ordering::Relaxed);
+            SEEN.call_once(|| {
+                tracing::warn!(
+                    closed_twice = DOUBLE_CLOSED.load(Ordering::Relaxed),
+                    "a host command list closed twice; the second close does nothing"
+                );
+            });
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -924,6 +947,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.closed.store(false, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
